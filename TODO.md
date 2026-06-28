@@ -58,6 +58,7 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 ## Working Tree Details
 
 - [ ] Validate index paths in `checkout`'s removal loop, as `restore` now does. `checkout::run` calls `remove_worktree_path` on every index path not in the target tree without `validate_path`, so a hostile/corrupt index entry (`../x`) could delete a file outside the work tree. Fold the guard into `remove_worktree_path` (return `Result`) so both commands are covered.
+- [ ] Acquire the index lock before mutating the working tree in `checkout`, `restore`, and `reset`, as `rm` now does via `WorkTree::lock_index`/`commit_index`. They mutate the working tree and only then `save_index`, so a held `.git/index.lock` fails after the tree has changed, leaving it inconsistent with the index. Take the lock up front so a locked index aborts before any filesystem change.
 - [ ] Expand pathspec support beyond simple files, directories, and `.`.
 - [ ] Add more complete `.gitignore` compatibility coverage.
 - [ ] Add attributes support where it affects working-tree behavior.
