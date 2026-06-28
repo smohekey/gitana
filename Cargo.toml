@@ -1,0 +1,37 @@
+[workspace]
+members = ["crates/cli/*", "crates/core/*"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/smohekey/gitana"
+rust-version = "1.96.0"
+
+[workspace.dependencies]
+anyhow = "1.0.103"
+assert_cmd = "2.2.2"
+clap = { version = "4.6.1", features = ["derive"] }
+clap-mcp = "0.0.5"
+flate2 = "1.1.9"
+gitana-config = { path = "crates/core/gitana-config" }
+gitana-file-store = { path = "crates/core/gitana-file-store" }
+gitana-file-store-conformance = { path = "crates/core/gitana-file-store-conformance" }
+gitana-file-store-local = { path = "crates/core/gitana-file-store-local" }
+gitana-file-store-memory = { path = "crates/core/gitana-file-store-memory" }
+gitana-git-http = { path = "crates/core/gitana-git-http" }
+gitana-object = { path = "crates/core/gitana-object" }
+gitana-object-store = { path = "crates/core/gitana-object-store" }
+gitana-repository = { path = "crates/core/gitana-repository" }
+gitana-worktree = { path = "crates/core/gitana-worktree" }
+gta-core = { path = "crates/cli/gta-core" }
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+sha2 = "0.10.0"
+ssh-key = { version = "0.6", features = ["ed25519"] }
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tokio = "1.52.3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

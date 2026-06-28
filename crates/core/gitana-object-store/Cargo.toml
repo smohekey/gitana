@@ -1,0 +1,22 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "gitana-object-store"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+gitana-file-store.workspace = true
+gitana-object.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+flate2.workspace = true
+gitana-file-store-memory.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

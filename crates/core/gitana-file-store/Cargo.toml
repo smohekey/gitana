@@ -1,0 +1,14 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "gitana-file-store"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+
+[dependencies]
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[lints]
+workspace = true

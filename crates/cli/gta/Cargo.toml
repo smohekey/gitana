@@ -1,0 +1,25 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "gta"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap.workspace = true
+gta-core = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+gitana-file-store-local = { workspace = true }
+gitana-object.workspace = true
+gitana-object-store = { workspace = true }
+gitana-repository = { workspace = true }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
