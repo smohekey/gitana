@@ -12,6 +12,7 @@ mod error;
 mod fsmeta;
 mod ignore;
 mod index;
+mod mv;
 mod pathspec;
 mod reset;
 mod restore;

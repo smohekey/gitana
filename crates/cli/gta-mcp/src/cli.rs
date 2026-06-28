@@ -239,6 +239,21 @@ enum Command {
 		#[arg(long)]
 		pathspecs: Vec<String>,
 	},
+	/// Move or rename a tracked file or directory (filesystem move plus index update).
+	Mv {
+		/// Overwrite an existing destination.
+		#[arg(long)]
+		force: bool,
+		/// Show what would be moved without moving it.
+		#[arg(long)]
+		dry_run: bool,
+		/// Report each rename performed.
+		#[arg(long)]
+		verbose: bool,
+		/// One or more sources followed by the destination.
+		#[arg(long)]
+		paths: Vec<String>,
+	},
 	/// Show changes between commits, the index, and the working tree.
 	Diff {
 		/// Show staged changes (HEAD vs index) instead of unstaged.
@@ -342,6 +357,12 @@ impl Cli {
 				dry_run,
 				pathspecs,
 			} => commands::rm::run(&cwd, cached, force, recursive, dry_run, pathspecs).await,
+			Command::Mv {
+				force,
+				dry_run,
+				verbose,
+				paths,
+			} => commands::mv::run(&cwd, force, dry_run, verbose, paths).await,
 			Command::Diff { cached } => commands::diff::run(&cwd, cached).await,
 			Command::Clone { url, path } => commands::clone::run(url, path).await,
 			Command::Fetch => commands::fetch::run(&cwd).await,

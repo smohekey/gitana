@@ -23,7 +23,7 @@ What works today:
   for commits and resets.
 - Revision resolution for common forms such as `HEAD`, branch/tag names,
   abbreviated object IDs, `~`, `^`, and `^{type}`.
-- A Git-compatible index, `.gitignore` handling, `status`, `add`, `rm`,
+- A Git-compatible index, `.gitignore` handling, `status`, `add`, `rm`, `mv`,
   checkout, path restore (working-tree and staged), soft/mixed/hard and
   path-limited reset, and staged/unstaged diff support.
 - Smart HTTP advertisement, fetch/upload-pack, receive-pack, push reports, and
@@ -75,8 +75,8 @@ Implemented command groups:
 - Plumbing: `hash-object`, `cat-file`, `ls-tree`, `rev-parse`, `rev-list`,
   `ls-files`.
 - Ref operations: `update-ref`, `symbolic-ref`, `branch`, `tag`.
-- Working-tree porcelain: `add`, `rm`, `status`, `commit`, `log`, `switch`,
-  `checkout`, `restore`, `reset`, `diff`.
+- Working-tree porcelain: `add`, `rm`, `mv`, `status`, `commit`, `log`,
+  `switch`, `checkout`, `restore`, `reset`, `diff`.
 - Remote operations: `clone`, `fetch`, `pull`, `push`.
 
 ## Crate layout

@@ -52,4 +52,25 @@ pub enum WorktreeError {
 		"'{0}' has staged content different from both the file and the HEAD (use -f to force removal)"
 	)]
 	RmStagedAndLocal(String),
+	/// `mv` source is not tracked (not in the index).
+	#[error("source '{0}' is not under version control")]
+	MvSourceUntracked(String),
+	/// `mv` source is tracked but missing from the working tree.
+	#[error("bad source '{0}': does not exist in the working tree")]
+	MvBadSource(String),
+	/// `mv` destination already exists and `-f` was not given.
+	#[error("destination '{0}' already exists (use -f to overwrite)")]
+	MvDestinationExists(String),
+	/// `mv` destination must be an existing directory (multiple sources, or a trailing slash).
+	#[error("destination '{0}' is not a directory")]
+	MvDestinationNotDir(String),
+	/// `mv` destination's parent directory does not exist.
+	#[error("destination directory for '{0}' does not exist")]
+	MvDestinationDirMissing(String),
+	/// `mv` would move a path into itself (or a subdirectory of itself).
+	#[error("cannot move '{0}' into itself")]
+	MvIntoSelf(String),
+	/// `mv` maps more than one source onto the same destination.
+	#[error("multiple sources map to destination '{0}'")]
+	MvDuplicateDestination(String),
 }

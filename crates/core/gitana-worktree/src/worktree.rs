@@ -94,6 +94,14 @@ impl<F: FileStore> WorkTree<F> {
 		Ok(())
 	}
 
+	/// Release a held index lock (from [`Self::lock_index`]) without writing, removing
+	/// `.git/index.lock`. Use when an operation fails after locking but before
+	/// [`Self::commit_index`], so it does not leave a stale lock behind.
+	pub(crate) fn release_index_lock(&self, lock: std::fs::File) {
+		drop(lock);
+		let _ = std::fs::remove_file(self.git_dir.join("index.lock"));
+	}
+
 	/// Stage `pathspecs`, interpreted relative to `prefix` (a `/`-joined work-tree-relative
 	/// subdirectory, empty at the root). A file is staged directly; a directory (or `.`) is
 	/// walked, applying `.gitignore`, and its non-ignored files are staged; a path that no
@@ -230,6 +238,22 @@ impl<F: FileStore> WorkTree<F> {
 		dry_run: bool,
 	) -> Result<crate::RmOutcome, WorktreeError> {
 		crate::rm::run(self, pathspecs, prefix, cached, force, recursive, dry_run).await
+	}
+
+	/// Move/rename tracked `sources` to `dest` (`git mv`): a filesystem rename plus an index
+	/// update. With one source and a `dest` that is not an existing directory, `dest` is the new
+	/// path; otherwise each source moves into the directory `dest`. The destination must not
+	/// exist unless `force`. With `dry_run`, nothing is moved. Returns the `(from, to)` pairs
+	/// performed. `sources` and `dest` are interpreted relative to `prefix`.
+	pub async fn mv(
+		&self,
+		sources: &[&str],
+		dest: &str,
+		prefix: &str,
+		force: bool,
+		dry_run: bool,
+	) -> Result<Vec<(String, String)>, WorktreeError> {
+		crate::mv::run(self, sources, dest, prefix, force, dry_run).await
 	}
 }
 
