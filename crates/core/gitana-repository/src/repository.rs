@@ -163,6 +163,47 @@ where
 		Ok(commit)
 	}
 
+	/// Move the current branch (or detached `HEAD`) to `commit` via CAS, recording the previous
+	/// tip in `ORIG_HEAD` and appending a reflog entry (`message`, e.g. `reset: moving to
+	/// HEAD~1`) to the branch and `HEAD`. The index and working tree are not touched. Mirrors the
+	/// ref half of [`Self::commit_on_head`], but for a reset rather than a new commit.
+	pub async fn reset_head(
+		&self,
+		commit: ObjectId,
+		committer: &str,
+		message: &str,
+	) -> Result<(), RepositoryError> {
+		let refs = self.refs();
+		let head = refs.read_head().await?;
+		let old = match &head {
+			HeadState::Symbolic(branch) => refs.resolve(branch).await?,
+			HeadState::Detached(id) => Some(*id),
+		};
+
+		// Record the pre-reset tip so `gta reset ORIG_HEAD` can recover it, as git does. There is
+		// nothing to record (and nothing to move from) on an unborn branch.
+		if let Some(old) = old {
+			let current = refs.resolve("ORIG_HEAD").await?;
+			refs.update_ref("ORIG_HEAD", old, current).await?;
+		}
+
+		match head {
+			HeadState::Symbolic(branch) => {
+				refs.update_ref(&branch, commit, old).await?;
+				refs
+					.append_reflog(&branch, old, commit, committer, message)
+					.await?;
+			}
+			HeadState::Detached(_) => {
+				refs.update_ref("HEAD", commit, old).await?;
+			}
+		}
+		refs
+			.append_reflog("HEAD", old, commit, committer, message)
+			.await?;
+		Ok(())
+	}
+
 	/// Resolve a revision spec (`HEAD`, `main`, `<oid>`, `HEAD~2`, `v1^{commit}`, …)
 	/// to an object id.
 	pub async fn rev_parse(&self, spec: &str) -> Result<ObjectId, RepositoryError> {

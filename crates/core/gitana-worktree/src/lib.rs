@@ -13,6 +13,7 @@ mod fsmeta;
 mod ignore;
 mod index;
 mod pathspec;
+mod reset;
 mod restore;
 mod status;
 mod worktree;

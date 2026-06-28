@@ -203,6 +203,24 @@ enum Command {
 		#[arg(long)]
 		paths: Vec<String>,
 	},
+	/// Reset the current branch (and optionally index/working tree) to a commit, or reset paths.
+	Reset {
+		/// Move `HEAD` only, keeping the index and working tree.
+		#[arg(long)]
+		soft: bool,
+		/// Move `HEAD` and reset the index, keeping the working tree (the default).
+		#[arg(long)]
+		mixed: bool,
+		/// Move `HEAD` and reset both the index and the working tree, discarding changes.
+		#[arg(long)]
+		hard: bool,
+		/// Commit to reset to, default `HEAD`.
+		#[arg(long)]
+		target: Option<String>,
+		/// Paths to reset in the index; does not move `HEAD`.
+		#[arg(long)]
+		paths: Vec<String>,
+	},
 	/// Show changes between commits, the index, and the working tree.
 	Diff {
 		/// Show staged changes (HEAD vs index) instead of unstaged.
@@ -292,6 +310,13 @@ impl Cli {
 				source,
 				paths,
 			} => commands::restore::run(&cwd, worktree, staged, source, paths).await,
+			Command::Reset {
+				soft,
+				mixed,
+				hard,
+				target,
+				paths,
+			} => commands::reset::run(&cwd, soft, mixed, hard, target, paths).await,
 			Command::Diff { cached } => commands::diff::run(&cwd, cached).await,
 			Command::Clone { url, path } => commands::clone::run(url, path).await,
 			Command::Fetch => commands::fetch::run(&cwd).await,

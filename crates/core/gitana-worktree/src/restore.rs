@@ -28,6 +28,7 @@ pub(crate) async fn run<F>(
 	staged: bool,
 	pathspecs: &[&str],
 	prefix: &str,
+	require_match: bool,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
@@ -58,7 +59,10 @@ where
 	let mut universe: BTreeSet<&str> = source_entries.iter().map(|(p, _, _)| p.as_str()).collect();
 	universe.extend(index_paths.iter().map(String::as_str));
 
-	// Select the paths each pathspec matches; a pathspec that matches nothing is an error.
+	// Select the paths each pathspec matches. With `require_match`, a pathspec that matches
+	// nothing is an error (`restore`/`checkout`); without it, an unmatched pathspec is silently
+	// skipped (`reset`, which treats `reset -- <untracked-or-missing>` as a no-op, like git).
+	// Either way the pathspec is still normalised, so an unsafe/empty/absolute spec is rejected.
 	let mut selected: BTreeSet<&str> = BTreeSet::new();
 	for &spec in pathspecs {
 		let (normalized, dir_only) = normalize(spec, prefix)?;
@@ -69,7 +73,7 @@ where
 				matched = true;
 			}
 		}
-		if !matched {
+		if require_match && !matched {
 			return Err(WorktreeError::PathspecMatch(spec.to_owned()));
 		}
 	}

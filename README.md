@@ -20,11 +20,12 @@ What works today:
 - Packfile v2 decoding with OFS and REF deltas, plus packfile encoding.
 - Object storage over local and memory file stores.
 - Refs, symbolic `HEAD`, packed-ref reads, ref CAS updates, and reflog writes
-  for commits.
+  for commits and resets.
 - Revision resolution for common forms such as `HEAD`, branch/tag names,
   abbreviated object IDs, `~`, `^`, and `^{type}`.
 - A Git-compatible index, `.gitignore` handling, `status`, `add`, checkout,
-  path restore (working-tree and staged), and staged/unstaged diff support.
+  path restore (working-tree and staged), soft/mixed/hard and path-limited
+  reset, and staged/unstaged diff support.
 - Smart HTTP advertisement, fetch/upload-pack, receive-pack, push reports, and
   fast-forward enforcement.
 - A `gta-mcp` wrapper that exposes the same command implementations as MCP tools.
@@ -75,7 +76,7 @@ Implemented command groups:
   `ls-files`.
 - Ref operations: `update-ref`, `symbolic-ref`, `branch`, `tag`.
 - Working-tree porcelain: `add`, `status`, `commit`, `log`, `switch`,
-  `checkout`, `restore`, `diff`.
+  `checkout`, `restore`, `reset`, `diff`.
 - Remote operations: `clone`, `fetch`, `pull`, `push`.
 
 ## Crate layout

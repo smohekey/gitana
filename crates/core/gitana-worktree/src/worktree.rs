@@ -173,7 +173,27 @@ impl<F: FileStore> WorkTree<F> {
 		pathspecs: &[&str],
 		prefix: &str,
 	) -> Result<(), WorktreeError> {
-		crate::restore::run(self, source, worktree, staged, pathspecs, prefix).await
+		crate::restore::run(self, source, worktree, staged, pathspecs, prefix, true).await
+	}
+
+	/// Reset the index to `tree`, replacing every entry with the tree's content (the index half
+	/// of `git reset --mixed`). The working tree is left untouched, and `HEAD` is not moved.
+	pub async fn reset_index(&self, tree: gitana_object::ObjectId) -> Result<(), WorktreeError> {
+		crate::reset::run(self, tree).await
+	}
+
+	/// Reset the index entries matched by `pathspecs` to their state in `tree` (the index half of
+	/// `git reset [<commit>] -- <paths>`): matched entries present in `tree` are restaged from it,
+	/// matched entries absent from it are unstaged. The working tree and `HEAD` are untouched.
+	/// Unlike [`Self::restore`], a pathspec that matches nothing is a no-op, not an error, so
+	/// `reset -- <untracked-or-missing>` succeeds as in git. `pathspecs` are relative to `prefix`.
+	pub async fn reset_index_paths(
+		&self,
+		tree: gitana_object::ObjectId,
+		pathspecs: &[&str],
+		prefix: &str,
+	) -> Result<(), WorktreeError> {
+		crate::restore::run(self, Some(tree), false, true, pathspecs, prefix, false).await
 	}
 }
 

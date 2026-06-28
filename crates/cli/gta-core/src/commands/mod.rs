@@ -13,6 +13,7 @@ pub mod ls_files;
 pub mod ls_tree;
 pub mod pull;
 pub mod push;
+pub mod reset;
 pub mod restore;
 pub mod rev_list;
 pub mod rev_parse;
