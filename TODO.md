@@ -5,7 +5,7 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 ## Command Surface Correctness
 
 - [x] Fix `checkout` help and behavior mismatch: either make it branch-only, or add path restore semantics.
-- [ ] Add `restore` for working-tree and staged path restoration.
+- [x] Add `restore` for working-tree and staged path restoration.
 - [ ] Add `reset` for soft, mixed, hard, and path-limited resets.
 - [ ] Add `rm` with tracked-file removal and staged deletion behavior.
 - [ ] Add `mv` as tracked rename convenience over filesystem move plus index update.
@@ -57,6 +57,7 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 
 ## Working Tree Details
 
+- [ ] Validate index paths in `checkout`'s removal loop, as `restore` now does. `checkout::run` calls `remove_worktree_path` on every index path not in the target tree without `validate_path`, so a hostile/corrupt index entry (`../x`) could delete a file outside the work tree. Fold the guard into `remove_worktree_path` (return `Result`) so both commands are covered.
 - [ ] Expand pathspec support beyond simple files, directories, and `.`.
 - [ ] Add more complete `.gitignore` compatibility coverage.
 - [ ] Add attributes support where it affects working-tree behavior.

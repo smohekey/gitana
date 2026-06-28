@@ -23,8 +23,8 @@ What works today:
   for commits.
 - Revision resolution for common forms such as `HEAD`, branch/tag names,
   abbreviated object IDs, `~`, `^`, and `^{type}`.
-- A Git-compatible index, `.gitignore` handling, `status`, `add`, checkout, and
-  staged/unstaged diff support.
+- A Git-compatible index, `.gitignore` handling, `status`, `add`, checkout,
+  path restore (working-tree and staged), and staged/unstaged diff support.
 - Smart HTTP advertisement, fetch/upload-pack, receive-pack, push reports, and
   fast-forward enforcement.
 - A `gta-mcp` wrapper that exposes the same command implementations as MCP tools.
@@ -75,7 +75,7 @@ Implemented command groups:
   `ls-files`.
 - Ref operations: `update-ref`, `symbolic-ref`, `branch`, `tag`.
 - Working-tree porcelain: `add`, `status`, `commit`, `log`, `switch`,
-  `checkout`, `diff`.
+  `checkout`, `restore`, `diff`.
 - Remote operations: `clone`, `fetch`, `pull`, `push`.
 
 ## Crate layout

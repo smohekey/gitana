@@ -1,25 +1,31 @@
-//! Restore specific paths into the working tree (the `git checkout -- <paths>` family).
+//! Restore specific paths into the working tree and/or the index (the `git restore` family).
 //!
 //! Unlike `checkout`, which materialises a whole tree and prunes anything absent from it,
-//! `restore` only touches the paths a pathspec selects and never moves `HEAD`. The source is
-//! either a tree (which also updates the matching index entries) or the index itself (which
-//! only rewrites the working-tree files). Path-safety handling is shared with `checkout` via
-//! its `write_entry` helper.
+//! `restore` only touches the paths a pathspec selects and never moves `HEAD`. Two independent
+//! targets may be written: the working tree (`worktree`) and the index (`staged`). The content
+//! comes from `source` — a tree, or `None` for the current index. A selected path present in the
+//! source is written to the chosen targets; a selected path absent from the source but currently
+//! tracked is *removed* from them (e.g. `git restore --staged` unstaging a freshly added file).
 //!
-//! Like stock Git's path checkout, this discards uncommitted working-tree changes to the
-//! selected paths — that is the operation's purpose — so there is no dirty-file guard here
-//! (that guard belongs to branch switching, not path restore).
+//! Like stock Git's path restore, this discards uncommitted working-tree changes to the selected
+//! paths — that is the operation's purpose — so there is no dirty-file guard here (that guard
+//! belongs to branch switching, not path restore).
+
+use std::collections::BTreeSet;
 
 use gitana_file_store::FileStore;
 use gitana_object::ObjectId;
 
-use crate::checkout::write_entry;
+use crate::checkout::{remove_worktree_path, validate_path, write_worktree_file};
+use crate::fsmeta::stat_of;
 use crate::pathspec::normalize;
-use crate::{WorkTree, WorktreeError};
+use crate::{IndexEntry, Stat, WorkTree, WorktreeError};
 
 pub(crate) async fn run<F>(
 	wt: &WorkTree<F>,
 	source: Option<ObjectId>,
+	worktree: bool,
+	staged: bool,
 	pathspecs: &[&str],
 	prefix: &str,
 ) -> Result<(), WorktreeError>
@@ -28,8 +34,9 @@ where
 {
 	let mut index = wt.load_index()?;
 
-	// The candidate `(path, mode, oid)` entries a pathspec may select.
-	let candidates: Vec<(String, String, ObjectId)> = match source {
+	// The `(path, mode, oid)` content a selected path is restored from: the source tree, or the
+	// current index when there is no tree source.
+	let source_entries: Vec<(String, String, ObjectId)> = match source {
 		Some(tree) => wt.repository().read_tree(tree).await?,
 		None => index
 			.entries
@@ -39,14 +46,26 @@ where
 			.collect(),
 	};
 
-	// Select the entries each pathspec matches; a pathspec that matches nothing is an error.
-	let mut selected: Vec<&(String, String, ObjectId)> = Vec::new();
+	// The paths a pathspec may select: everything in the source, plus every currently-tracked
+	// index path. The latter lets a path that exists now but not in the source be matched for
+	// removal (the worktree file deleted, the index entry dropped).
+	let index_paths: Vec<String> = index
+		.entries
+		.iter()
+		.filter(|e| e.stage == 0)
+		.map(|e| e.path.clone())
+		.collect();
+	let mut universe: BTreeSet<&str> = source_entries.iter().map(|(p, _, _)| p.as_str()).collect();
+	universe.extend(index_paths.iter().map(String::as_str));
+
+	// Select the paths each pathspec matches; a pathspec that matches nothing is an error.
+	let mut selected: BTreeSet<&str> = BTreeSet::new();
 	for &spec in pathspecs {
 		let (normalized, dir_only) = normalize(spec, prefix)?;
 		let mut matched = false;
-		for candidate in &candidates {
-			if matches(&candidate.0, &normalized, dir_only) {
-				selected.push(candidate);
+		for &path in &universe {
+			if matches(path, &normalized, dir_only) {
+				selected.insert(path);
 				matched = true;
 			}
 		}
@@ -55,15 +74,57 @@ where
 		}
 	}
 
-	// Drop index entries whose shape conflicts with a selected path (a file replacing a
-	// directory, or vice versa), then write the new entries. The working-tree shape change is
-	// handled lazily by `write_entry`/`ensure_parents`; restore has no removal pass, so the
-	// stale index entries must be cleared here.
-	for (path, _, _) in &selected {
-		index.remove_type_conflicts(path);
+	// Validate every selected path before mutating anything. Source-tree and index paths bypass
+	// the `normalize` guard that only sanitises the user's pathspec, so a hostile source — a
+	// crafted tree or index entry such as `../x` or `.git/config` — could otherwise be upserted
+	// into the index (staged restore never reaches `write_worktree_file`'s check) or used to
+	// delete a file outside the work tree. Failing here also leaves nothing half-applied: the
+	// working tree is untouched and the index is only saved on success.
+	for &path in &selected {
+		validate_path(path)?;
 	}
-	for (path, mode, oid) in &selected {
-		write_entry(wt, path, mode, *oid, &mut index).await?;
+
+	for &path in &selected {
+		match source_entries.iter().find(|(p, _, _)| p == path) {
+			// Present in the source: write the chosen targets from it.
+			Some((_, mode, oid)) => {
+				if staged {
+					// Drop entries whose shape conflicts with recording `path` as a file, the way
+					// `git add` rewrites the index for a type change.
+					index.remove_type_conflicts(path);
+				}
+				if worktree {
+					write_worktree_file(wt, path, mode, *oid).await?;
+				}
+				if staged {
+					// A staged-only restore leaves no fresh working-tree file to stat, so use a
+					// default stat the worktree can never match — forcing `status` to re-hash and
+					// report the entry correctly against the working tree.
+					let stat = if worktree {
+						stat_of(&std::fs::symlink_metadata(wt.work_dir().join(path))?)
+					} else {
+						Stat::default()
+					};
+					index.upsert(IndexEntry {
+						stat,
+						mode: u32::from_str_radix(mode, 8).unwrap_or(0o100644),
+						oid: *oid,
+						stage: 0,
+						assume_valid: false,
+						path: path.to_owned(),
+					});
+				}
+			}
+			// Absent from the source but tracked: remove it from the chosen targets.
+			None => {
+				if worktree {
+					remove_worktree_path(wt, path);
+				}
+				if staged {
+					index.remove(path);
+				}
+			}
+		}
 	}
 
 	wt.save_index(&index)

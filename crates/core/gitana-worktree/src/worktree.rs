@@ -159,18 +159,21 @@ impl<F: FileStore> WorkTree<F> {
 		crate::checkout::run(self, tree, force).await
 	}
 
-	/// Restore `pathspecs` from `source` (a tree; `None` = the current index) into the
-	/// working tree, discarding any uncommitted changes to those paths. With a tree source,
-	/// also update the matching index entries. Does not move `HEAD`. `pathspecs` are
+	/// Restore `pathspecs` from `source` (a tree; `None` = the current index) into the chosen
+	/// targets — the working tree (`worktree`) and/or the index (`staged`) — discarding any
+	/// uncommitted changes to those paths. A selected path absent from the source but currently
+	/// tracked is removed from the chosen targets. Does not move `HEAD`. `pathspecs` are
 	/// interpreted relative to `prefix` (a `/`-joined work-tree-relative subdirectory, empty
 	/// at the root).
 	pub async fn restore(
 		&self,
 		source: Option<gitana_object::ObjectId>,
+		worktree: bool,
+		staged: bool,
 		pathspecs: &[&str],
 		prefix: &str,
 	) -> Result<(), WorktreeError> {
-		crate::restore::run(self, source, pathspecs, prefix).await
+		crate::restore::run(self, source, worktree, staged, pathspecs, prefix).await
 	}
 }
 

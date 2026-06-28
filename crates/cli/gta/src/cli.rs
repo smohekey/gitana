@@ -139,6 +139,21 @@ enum Command {
 		#[arg(last = true, value_name = "path")]
 		paths: Vec<String>,
 	},
+	/// Restore working-tree and/or staged paths from a tree-ish, the index, or `HEAD`.
+	Restore {
+		/// Restore the working tree (the default when neither target is given).
+		#[arg(short = 'W', long)]
+		worktree: bool,
+		/// Restore the index (staging area).
+		#[arg(short = 'S', long)]
+		staged: bool,
+		/// Tree-ish to restore from (default: the index, or `HEAD` with `--staged`).
+		#[arg(short = 's', long, value_name = "tree")]
+		source: Option<String>,
+		/// Paths to restore.
+		#[arg(value_name = "pathspec")]
+		paths: Vec<String>,
+	},
 	/// Show changes between commits, the index, and the working tree.
 	Diff {
 		/// Show staged changes (HEAD vs index) instead of unstaged.
@@ -220,6 +235,12 @@ impl Cli {
 				target,
 				paths,
 			} => commands::checkout::run(&cwd, force, target, paths).await,
+			Command::Restore {
+				worktree,
+				staged,
+				source,
+				paths,
+			} => commands::restore::run(&cwd, worktree, staged, source, paths).await,
 			Command::Diff { cached } => commands::diff::run(&cwd, cached).await,
 			Command::Clone { url, path } => commands::clone::run(url, path).await,
 			Command::Fetch => commands::fetch::run(&cwd).await,

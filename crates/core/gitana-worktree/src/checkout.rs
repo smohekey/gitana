@@ -79,9 +79,7 @@ where
 	}
 	for path in current.keys() {
 		if !target_paths.contains_key(path.as_str()) {
-			let full = wt.work_dir().join(path);
-			let _ = std::fs::remove_file(&full);
-			remove_empty_parents(wt.work_dir(), path);
+			remove_worktree_path(wt, path);
 			index.remove(path);
 		}
 	}
@@ -89,12 +87,39 @@ where
 	wt.save_index(&index)
 }
 
+/// Write `path`'s blob into the working tree and record it in the index. Combines a
+/// working-tree write with the matching index upsert; used to materialise a whole tree.
 pub(crate) async fn write_entry<F>(
 	wt: &WorkTree<F>,
 	path: &str,
 	mode: &str,
 	oid: ObjectId,
 	index: &mut crate::Index,
+) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+{
+	write_worktree_file(wt, path, mode, oid).await?;
+	let meta = std::fs::symlink_metadata(wt.work_dir().join(path))?;
+	index.upsert(IndexEntry {
+		stat: stat_of(&meta),
+		mode: u32::from_str_radix(mode, 8).unwrap_or(0o100644),
+		oid,
+		stage: 0,
+		assume_valid: false,
+		path: path.to_owned(),
+	});
+	Ok(())
+}
+
+/// Write `path`'s blob into the working tree only, without touching the index. Validates the
+/// path against the checkout CVE class, creates parents, and replaces whatever occupies the
+/// destination (a file, symlink, or directory).
+pub(crate) async fn write_worktree_file<F>(
+	wt: &WorkTree<F>,
+	path: &str,
+	mode: &str,
+	oid: ObjectId,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
@@ -117,17 +142,18 @@ where
 		std::fs::write(&full, &content)?;
 		set_mode(&full, mode);
 	}
-
-	let meta = std::fs::symlink_metadata(&full)?;
-	index.upsert(IndexEntry {
-		stat: stat_of(&meta),
-		mode: u32::from_str_radix(mode, 8).unwrap_or(0o100644),
-		oid,
-		stage: 0,
-		assume_valid: false,
-		path: path.to_owned(),
-	});
 	Ok(())
+}
+
+/// Remove `path` from the working tree (ignoring an already-absent file) and prune any
+/// directories left empty above it. Does not touch the index.
+pub(crate) fn remove_worktree_path<F>(wt: &WorkTree<F>, path: &str)
+where
+	F: FileStore,
+{
+	let full = wt.work_dir().join(path);
+	let _ = std::fs::remove_file(&full);
+	remove_empty_parents(wt.work_dir(), path);
 }
 
 fn ensure_no_overwrite<F>(
@@ -173,7 +199,7 @@ fn path_ignored(root: &Path, path: &str) -> Result<bool, WorktreeError> {
 	Ok(ignore::is_ignored(path, false, &stack))
 }
 
-fn validate_path(path: &str) -> Result<(), WorktreeError> {
+pub(crate) fn validate_path(path: &str) -> Result<(), WorktreeError> {
 	for part in path.split('/') {
 		if part.is_empty()
 			|| part == "."

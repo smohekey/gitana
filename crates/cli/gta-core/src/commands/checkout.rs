@@ -32,6 +32,9 @@ pub async fn run(
 		None => None,
 	};
 	let specs: Vec<&str> = paths.iter().map(String::as_str).collect();
-	wt.restore(source, &specs, &prefix).await?;
+	// `checkout -- <paths>` restores the working tree from the index; `checkout <tree> -- <paths>`
+	// restores both the working tree and the index from the tree.
+	wt.restore(source, true, source.is_some(), &specs, &prefix)
+		.await?;
 	Ok(())
 }
