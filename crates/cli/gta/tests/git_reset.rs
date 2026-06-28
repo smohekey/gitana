@@ -241,7 +241,10 @@ fn reset_rejects_mode_flags_with_paths() {
 	let w = work.to_str().unwrap();
 
 	let err = gta_fail(w, &["reset", "--hard", "--", "a.txt"]);
-	assert!(err.contains("cannot be combined with paths"), "stderr: {err}");
+	assert!(
+		err.contains("cannot be combined with paths"),
+		"stderr: {err}"
+	);
 
 	let err = gta_fail(w, &["reset", "--soft", "--mixed", "HEAD~1"]);
 	assert!(err.contains("mutually exclusive"), "stderr: {err}");

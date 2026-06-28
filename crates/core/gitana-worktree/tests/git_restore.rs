@@ -65,7 +65,9 @@ async fn restore_from_index_discards_worktree_changes() {
 	std::fs::write(work.join("a.txt"), b"dirty\n").unwrap();
 	std::fs::remove_file(work.join("c.txt")).unwrap();
 
-	wt.restore(None, true, false, &["a.txt", "c.txt"], "").await.unwrap();
+	wt.restore(None, true, false, &["a.txt", "c.txt"], "")
+		.await
+		.unwrap();
 
 	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"A2\n");
 	assert_eq!(std::fs::read(work.join("c.txt")).unwrap(), b"C\n");
@@ -137,7 +139,9 @@ async fn restore_strips_leading_dot_slash() {
 	let wt = make_repo(&work);
 
 	std::fs::write(work.join("a.txt"), b"dirty\n").unwrap();
-	wt.restore(None, true, false, &["./a.txt"], "").await.unwrap();
+	wt.restore(None, true, false, &["./a.txt"], "")
+		.await
+		.unwrap();
 	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"A2\n");
 
 	std::fs::remove_dir_all(&work).ok();
@@ -161,7 +165,9 @@ async fn restore_with_prefix_is_relative_to_subdirectory() {
 	// From the `sub` directory, `a.txt` means `sub/a.txt`, not the root file.
 	std::fs::write(work.join("a.txt"), b"dirty\n").unwrap();
 	std::fs::write(work.join("sub/a.txt"), b"dirty\n").unwrap();
-	wt.restore(None, true, false, &["a.txt"], "sub").await.unwrap();
+	wt.restore(None, true, false, &["a.txt"], "sub")
+		.await
+		.unwrap();
 	assert_eq!(std::fs::read(work.join("sub/a.txt")).unwrap(), b"SUB\n");
 	assert_eq!(
 		std::fs::read(work.join("a.txt")).unwrap(),
@@ -180,7 +186,9 @@ async fn restore_with_prefix_is_relative_to_subdirectory() {
 	);
 
 	// From `sub`, `../a.txt` resolves to the root file (git accepts parent-relative specs).
-	wt.restore(None, true, false, &["../a.txt"], "sub").await.unwrap();
+	wt.restore(None, true, false, &["../a.txt"], "sub")
+		.await
+		.unwrap();
 	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"ROOT\n");
 
 	std::fs::remove_dir_all(&work).ok();
@@ -327,7 +335,9 @@ async fn restore_rejects_trailing_slash_on_file() {
 	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"dirty\n");
 
 	// `a.txt/..` resolves to the parent directory, which git accepts (restores everything).
-	wt.restore(None, true, false, &["a.txt/.."], "").await.unwrap();
+	wt.restore(None, true, false, &["a.txt/.."], "")
+		.await
+		.unwrap();
 	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"A2\n");
 
 	std::fs::remove_dir_all(&work).ok();
@@ -448,7 +458,10 @@ async fn worktree_restore_from_tree_deletes_absent_path() {
 		.await
 		.unwrap();
 
-	assert!(!work.join("c.txt").exists(), "the working-tree file is deleted");
+	assert!(
+		!work.join("c.txt").exists(),
+		"the working-tree file is deleted"
+	);
 	assert_eq!(
 		git(&["-C", w, "diff", "--name-only"]).trim(),
 		"c.txt",
@@ -522,7 +535,10 @@ async fn worktree_restore_from_unsafe_tree_leaves_filesystem_unchanged() {
 		Err(WorktreeError::UnsafePath(_))
 	));
 	// The real `.git/config` was not overwritten by the hostile entry.
-	assert_eq!(std::fs::read(work.join(".git/config")).unwrap(), config_before);
+	assert_eq!(
+		std::fs::read(work.join(".git/config")).unwrap(),
+		config_before
+	);
 
 	std::fs::remove_dir_all(&work).ok();
 }

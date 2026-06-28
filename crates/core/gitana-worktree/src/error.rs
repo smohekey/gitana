@@ -35,4 +35,21 @@ pub enum WorktreeError {
 	/// supported (unlike git, which relativises absolute paths that point inside the work tree).
 	#[error("absolute pathspecs are not supported: {0}")]
 	AbsolutePathspec(String),
+	/// `rm` matched a tracked directory's contents but `-r` was not given.
+	#[error("not removing '{0}' recursively without -r")]
+	RecursiveRequired(String),
+	/// `rm` would lose working-tree changes not present in the index (without `-f`).
+	#[error("'{0}' has local modifications (use --cached to keep the file, or -f to force removal)")]
+	RmLocalModifications(String),
+	/// `rm` would lose changes staged in the index relative to `HEAD` (without `-f`).
+	#[error(
+		"'{0}' has changes staged in the index (use --cached to keep the file, or -f to force removal)"
+	)]
+	RmStagedChanges(String),
+	/// `rm` would lose index content that differs from both the working tree and `HEAD`
+	/// (without `-f`).
+	#[error(
+		"'{0}' has staged content different from both the file and the HEAD (use -f to force removal)"
+	)]
+	RmStagedAndLocal(String),
 }

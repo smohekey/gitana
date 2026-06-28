@@ -7,7 +7,7 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [x] Fix `checkout` help and behavior mismatch: either make it branch-only, or add path restore semantics.
 - [x] Add `restore` for working-tree and staged path restoration.
 - [x] Add `reset` for soft, mixed, hard, and path-limited resets.
-- [ ] Add `rm` with tracked-file removal and staged deletion behavior.
+- [x] Add `rm` with tracked-file removal and staged deletion behavior.
 - [ ] Add `mv` as tracked rename convenience over filesystem move plus index update.
 - [ ] Add `show` for common commit/object display.
 - [ ] Add `config` read/write support for local repository configuration.

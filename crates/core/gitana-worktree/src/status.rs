@@ -114,7 +114,7 @@ fn at<'a>(merged: &'a mut BTreeMap<String, StatusEntry>, path: &str) -> &'a mut 
 		})
 }
 
-async fn head_entries<F: FileStore>(
+pub(crate) async fn head_entries<F: FileStore>(
 	wt: &WorkTree<F>,
 ) -> Result<HashMap<String, (String, ObjectId)>, WorktreeError> {
 	let Some(commit) = wt.repository().refs().resolve_head().await? else {

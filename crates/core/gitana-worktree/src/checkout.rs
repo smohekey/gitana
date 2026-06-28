@@ -156,6 +156,23 @@ where
 	remove_empty_parents(wt.work_dir(), path);
 }
 
+/// Like [`remove_worktree_path`], but reports a removal failure. An already-absent file is fine;
+/// any other error (e.g. the path is now occupied by a directory) is returned so the caller can
+/// refuse rather than silently leave the file in place.
+pub(crate) fn remove_worktree_file<F>(wt: &WorkTree<F>, path: &str) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+{
+	let full = wt.work_dir().join(path);
+	match std::fs::remove_file(&full) {
+		Ok(()) => {}
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+		Err(error) => return Err(error.into()),
+	}
+	remove_empty_parents(wt.work_dir(), path);
+	Ok(())
+}
+
 fn ensure_no_overwrite<F>(
 	wt: &WorkTree<F>,
 	path: &str,

@@ -12,7 +12,8 @@ use crate::repo::LocalRepository;
 /// operations like `commit` that must record a real identity.
 pub async fn signature(repo: &LocalRepository, role: &str) -> Result<String> {
 	let (name, email) = configured(repo, role).await;
-	let name = name.with_context(|| format!("identity name not set (GIT_{role}_NAME or user.name)"))?;
+	let name =
+		name.with_context(|| format!("identity name not set (GIT_{role}_NAME or user.name)"))?;
 	let email =
 		email.with_context(|| format!("identity email not set (GIT_{role}_EMAIL or user.email)"))?;
 	Ok(format!("{name} <{email}> {}", date(role)))

@@ -171,6 +171,24 @@ enum Command {
 		#[arg(last = true, value_name = "path")]
 		paths: Vec<String>,
 	},
+	/// Remove tracked files from the index and the working tree.
+	Rm {
+		/// Remove from the index only, keeping the working-tree file.
+		#[arg(long)]
+		cached: bool,
+		/// Override the up-to-date safety check.
+		#[arg(short = 'f', long = "force")]
+		force: bool,
+		/// Allow removing a tracked directory's contents recursively.
+		#[arg(short = 'r')]
+		recursive: bool,
+		/// Show what would be removed without removing it.
+		#[arg(short = 'n', long = "dry-run")]
+		dry_run: bool,
+		/// Paths to remove.
+		#[arg(value_name = "pathspec")]
+		pathspecs: Vec<String>,
+	},
 	/// Show changes between commits, the index, and the working tree.
 	Diff {
 		/// Show staged changes (HEAD vs index) instead of unstaged.
@@ -265,6 +283,13 @@ impl Cli {
 				target,
 				paths,
 			} => commands::reset::run(&cwd, soft, mixed, hard, target, paths).await,
+			Command::Rm {
+				cached,
+				force,
+				recursive,
+				dry_run,
+				pathspecs,
+			} => commands::rm::run(&cwd, cached, force, recursive, dry_run, pathspecs).await,
 			Command::Diff { cached } => commands::diff::run(&cwd, cached).await,
 			Command::Clone { url, path } => commands::clone::run(url, path).await,
 			Command::Fetch => commands::fetch::run(&cwd).await,

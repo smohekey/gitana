@@ -119,7 +119,10 @@ fn unique_tmp(tag: &str) -> PathBuf {
 	use std::sync::atomic::{AtomicU64, Ordering};
 	static SEQ: AtomicU64 = AtomicU64::new(0);
 	let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-	let dir = std::env::temp_dir().join(format!("gitana-worktree-{tag}-{}-{seq}", std::process::id()));
+	let dir = std::env::temp_dir().join(format!(
+		"gitana-worktree-{tag}-{}-{seq}",
+		std::process::id()
+	));
 	let _ = std::fs::remove_dir_all(&dir);
 	std::fs::create_dir_all(&dir).unwrap();
 	dir

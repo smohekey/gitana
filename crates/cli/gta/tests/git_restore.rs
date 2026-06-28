@@ -85,7 +85,14 @@ fn restore_staged_and_worktree_from_source() {
 	// `-S -W --source=<c1>` restores both the index and the working tree from the first commit.
 	gta(
 		w,
-		&["restore", "--staged", "--worktree", "--source", &c1, "a.txt"],
+		&[
+			"restore",
+			"--staged",
+			"--worktree",
+			"--source",
+			&c1,
+			"a.txt",
+		],
 		b"",
 	);
 	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"A1\n");

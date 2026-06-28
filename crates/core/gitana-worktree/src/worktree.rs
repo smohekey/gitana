@@ -55,24 +55,42 @@ impl<F: FileStore> WorkTree<F> {
 
 	/// Write the index via `index.lock` create-new + rename (git's protocol).
 	pub fn save_index(&self, index: &Index) -> Result<(), WorktreeError> {
-		let lock = self.git_dir.join("index.lock");
-		let mut file = match std::fs::OpenOptions::new()
+		self.commit_index(self.lock_index()?, index)
+	}
+
+	/// Acquire the index lock (`.git/index.lock`), returning the open lock file. Fails with
+	/// [`WorktreeError::IndexLocked`] if another process already holds it. Pair with
+	/// [`Self::commit_index`] to write through the lock (or drop the handle to release it without
+	/// writing). Taking the lock up front lets a destructive operation fail before it mutates the
+	/// working tree, rather than after.
+	pub(crate) fn lock_index(&self) -> Result<std::fs::File, WorktreeError> {
+		match std::fs::OpenOptions::new()
 			.write(true)
 			.create_new(true)
-			.open(&lock)
+			.open(self.git_dir.join("index.lock"))
 		{
-			Ok(file) => file,
+			Ok(file) => Ok(file),
 			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-				return Err(WorktreeError::IndexLocked);
+				Err(WorktreeError::IndexLocked)
 			}
-			Err(error) => return Err(error.into()),
-		};
-		if let Err(error) = file.write_all(&index.write_v4()) {
-			let _ = std::fs::remove_file(&lock);
+			Err(error) => Err(error.into()),
+		}
+	}
+
+	/// Write `index` through a held `lock` (from [`Self::lock_index`]) and atomically replace the
+	/// index file via rename.
+	pub(crate) fn commit_index(
+		&self,
+		mut lock: std::fs::File,
+		index: &Index,
+	) -> Result<(), WorktreeError> {
+		let lock_path = self.git_dir.join("index.lock");
+		if let Err(error) = lock.write_all(&index.write_v4()) {
+			let _ = std::fs::remove_file(&lock_path);
 			return Err(error.into());
 		}
-		drop(file);
-		std::fs::rename(&lock, self.git_dir.join("index"))?;
+		drop(lock);
+		std::fs::rename(&lock_path, self.git_dir.join("index"))?;
 		Ok(())
 	}
 
@@ -194,6 +212,24 @@ impl<F: FileStore> WorkTree<F> {
 		prefix: &str,
 	) -> Result<(), WorktreeError> {
 		crate::restore::run(self, Some(tree), false, true, pathspecs, prefix, false).await
+	}
+
+	/// Remove the tracked paths matched by `pathspecs` from the index and — unless `cached` —
+	/// from the working tree (`git rm`). Pathspecs match tracked paths only; a directory match
+	/// needs `recursive`. Without `force`, git's data-safety check refuses to lose un-saved
+	/// changes. With `dry_run`, nothing is written. Removal is per-path: see [`RmOutcome`] for the
+	/// removed paths and any failure. `pathspecs` are interpreted relative to `prefix`.
+	#[allow(clippy::too_many_arguments)]
+	pub async fn rm(
+		&self,
+		pathspecs: &[&str],
+		prefix: &str,
+		cached: bool,
+		force: bool,
+		recursive: bool,
+		dry_run: bool,
+	) -> Result<crate::RmOutcome, WorktreeError> {
+		crate::rm::run(self, pathspecs, prefix, cached, force, recursive, dry_run).await
 	}
 }
 
