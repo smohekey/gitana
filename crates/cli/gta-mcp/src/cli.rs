@@ -176,13 +176,17 @@ enum Command {
 		#[arg(long)]
 		start: Option<String>,
 	},
-	/// Switch branches or restore working-tree files (alias of `switch`).
+	/// Switch branches, or restore working-tree files from a tree-ish or the index.
 	Checkout {
 		/// Discard local changes that would be overwritten.
 		#[arg(short = 'f', long = "force")]
 		force: bool,
-		/// Branch to check out.
-		name: String,
+		/// Branch to switch to, or tree-ish to restore paths from.
+		#[arg(long)]
+		target: Option<String>,
+		/// Paths to restore. When given, restore mode; otherwise branch switch.
+		#[arg(long)]
+		paths: Vec<String>,
 	},
 	/// Show changes between commits, the index, and the working tree.
 	Diff {
@@ -262,9 +266,11 @@ impl Cli {
 				name,
 				start,
 			} => commands::switch::run(&cwd, &name, create, start, force).await,
-			Command::Checkout { force, name } => {
-				commands::switch::run(&cwd, &name, false, None, force).await
-			}
+			Command::Checkout {
+				force,
+				target,
+				paths,
+			} => commands::checkout::run(&cwd, force, target, paths).await,
 			Command::Diff { cached } => commands::diff::run(&cwd, cached).await,
 			Command::Clone { url, path } => commands::clone::run(url, path).await,
 			Command::Fetch => commands::fetch::run(&cwd).await,

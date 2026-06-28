@@ -5,13 +5,14 @@
 //! overwrite uncommitted local changes. Paths are validated against traversal,
 //! `.git`, and symlinked ancestors (the git checkout CVE class).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use gitana_file_store::FileStore;
 use gitana_object::ObjectId;
 
 use crate::fsmeta::{blob_of, stat_of};
+use crate::ignore::{self, DirIgnore};
 use crate::{IndexEntry, WorkTree, WorktreeError};
 
 pub(crate) async fn run<F>(
@@ -37,12 +38,33 @@ where
 		.collect();
 
 	if !force {
+		let tracked: HashSet<&str> = current.keys().map(String::as_str).collect();
 		for (path, (mode, oid)) in &target_paths {
 			let differs = current
 				.get(*path)
 				.is_none_or(|(cm, co)| cm != mode || co != oid);
-			if differs {
-				ensure_no_overwrite(wt, path, current.get(*path))?;
+			if !differs {
+				continue;
+			}
+			let full = wt.work_dir().join(path);
+			match std::fs::symlink_metadata(&full) {
+				// A directory occupies this file's slot (a directory->file change). Replacing it
+				// would delete everything under it, so refuse if it holds a non-ignored untracked
+				// file; its tracked contents are validated for cleanliness by the removal loop.
+				Ok(meta) if meta.is_dir() && !meta.is_symlink() => {
+					let mut stack = ignore_prefix(wt.work_dir(), path)?;
+					if let Some(untracked) = first_untracked_under(wt.work_dir(), path, &tracked, &mut stack)?
+					{
+						return Err(WorktreeError::UntrackedOverwrite(untracked));
+					}
+				}
+				_ => ensure_no_overwrite(wt, path, current.get(*path))?,
+			}
+			// A file->directory change removes a file occupying an ancestor slot; refuse if that
+			// file is an untracked, non-ignored file (a tracked ancestor is validated by the
+			// removal loop, an ignored one is expendable).
+			if let Some(untracked) = untracked_file_ancestor(wt.work_dir(), path, &tracked)? {
+				return Err(WorktreeError::UntrackedOverwrite(untracked));
 			}
 		}
 		for path in current.keys() {
@@ -67,7 +89,7 @@ where
 	wt.save_index(&index)
 }
 
-async fn write_entry<F>(
+pub(crate) async fn write_entry<F>(
 	wt: &WorkTree<F>,
 	path: &str,
 	mode: &str,
@@ -82,14 +104,15 @@ where
 	let content = wt.repository().read_blob(oid).await?;
 
 	if mode == "120000" {
-		let _ = std::fs::remove_file(&full);
+		clear_dest(&full)?;
 		symlink(&String::from_utf8_lossy(&content), &full)?;
 	} else {
-		// Never write through an existing symlink at the destination.
-		if let Ok(meta) = std::fs::symlink_metadata(&full)
-			&& meta.is_symlink()
-		{
-			std::fs::remove_file(&full)?;
+		// Replace a directory (a directory->file type change) or a symlink at the destination;
+		// a plain file is overwritten in place by the write below.
+		match std::fs::symlink_metadata(&full) {
+			Ok(meta) if meta.is_dir() && !meta.is_symlink() => std::fs::remove_dir_all(&full)?,
+			Ok(meta) if meta.is_symlink() => std::fs::remove_file(&full)?,
+			_ => {}
 		}
 		std::fs::write(&full, &content)?;
 		set_mode(&full, mode);
@@ -118,7 +141,16 @@ where
 	let full = wt.work_dir().join(path);
 	let meta = match std::fs::symlink_metadata(&full) {
 		Ok(meta) => meta,
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		// Absent, or unreachable because a file occupies an ancestor directory (`ENOTDIR`):
+		// either way there is nothing at `path` to overwrite.
+		Err(error)
+			if matches!(
+				error.kind(),
+				std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+			) =>
+		{
+			return Ok(());
+		}
 		Err(error) => return Err(error.into()),
 	};
 	match current {
@@ -127,9 +159,18 @@ where
 			Some((woid, wmode)) if woid == *oid && format!("{wmode:o}") == *mode => Ok(()),
 			_ => Err(WorktreeError::Conflict(path.to_owned())),
 		},
-		// Untracked file in the way of a checked-out path.
-		None => Err(WorktreeError::Conflict(path.to_owned())),
+		// Untracked file in the way of a checked-out path — refuse unless it is `.gitignore`d
+		// (ignored files are expendable, as git overwrites them).
+		None if path_ignored(wt.work_dir(), path)? => Ok(()),
+		None => Err(WorktreeError::UntrackedOverwrite(path.to_owned())),
 	}
+}
+
+/// Whether `path` (a file) is matched by the `.gitignore` rules from the work-tree root down to
+/// its parent directory.
+fn path_ignored(root: &Path, path: &str) -> Result<bool, WorktreeError> {
+	let stack = ignore_prefix(root, path)?;
+	Ok(ignore::is_ignored(path, false, &stack))
 }
 
 fn validate_path(path: &str) -> Result<(), WorktreeError> {
@@ -147,7 +188,9 @@ fn validate_path(path: &str) -> Result<(), WorktreeError> {
 }
 
 /// Create the parent directories of `path` under `root`, refusing to traverse a
-/// symlinked ancestor, and return the full path.
+/// symlinked ancestor, and return the full path. A regular file occupying a directory slot is
+/// replaced by the directory (a file->directory type change, as git checkout does); a symlink
+/// is never traversed or removed here (the checkout CVE class).
 fn ensure_parents(root: &Path, path: &str) -> Result<PathBuf, WorktreeError> {
 	let mut full = root.to_path_buf();
 	let parts: Vec<&str> = path.split('/').collect();
@@ -155,7 +198,11 @@ fn ensure_parents(root: &Path, path: &str) -> Result<PathBuf, WorktreeError> {
 		full.push(part);
 		match std::fs::symlink_metadata(&full) {
 			Ok(meta) if meta.is_dir() && !meta.is_symlink() => {}
-			Ok(_) => return Err(WorktreeError::UnsafePath(path.to_owned())),
+			Ok(meta) if meta.is_symlink() => return Err(WorktreeError::UnsafePath(path.to_owned())),
+			Ok(_) => {
+				std::fs::remove_file(&full)?;
+				std::fs::create_dir(&full)?;
+			}
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
 				std::fs::create_dir(&full)?;
 			}
@@ -164,6 +211,134 @@ fn ensure_parents(root: &Path, path: &str) -> Result<PathBuf, WorktreeError> {
 	}
 	full.push(parts.last().copied().unwrap_or_default());
 	Ok(full)
+}
+
+/// The first non-ignored untracked path found anywhere under the working-tree directory
+/// `dir_rel` — a file (or symlink) whose path is not a tracked index entry and is not matched
+/// by `.gitignore`. Replacing the directory with a file would delete it, so a no-force checkout
+/// must refuse. `.gitignore`d files (and whole ignored subtrees) are expendable, as in git, so
+/// they don't block. `stack` is the ignore stack accumulated from the work-tree root down to
+/// `dir_rel`'s parent; this descends `dir_rel`, pushing its own `.gitignore`.
+fn first_untracked_under(
+	root: &Path,
+	dir_rel: &str,
+	tracked: &HashSet<&str>,
+	stack: &mut Vec<DirIgnore>,
+) -> Result<Option<String>, WorktreeError> {
+	// A wholly-ignored directory is expendable — git doesn't descend into it.
+	if ignore::is_ignored(dir_rel, true, stack) {
+		return Ok(None);
+	}
+	let pushed = push_gitignore(&root.join(dir_rel), dir_rel, stack)?;
+	let mut found = None;
+	for entry in std::fs::read_dir(root.join(dir_rel))? {
+		let entry = entry?;
+		let name = entry.file_name();
+		let name = name.to_string_lossy();
+		if name == ".git" {
+			continue;
+		}
+		let rel = format!("{dir_rel}/{name}");
+		let is_dir = entry.file_type()?.is_dir();
+		if ignore::is_ignored(&rel, is_dir, stack) {
+			continue; // ignored content is expendable
+		}
+		if is_dir {
+			if let Some(hit) = first_untracked_under(root, &rel, tracked, stack)? {
+				found = Some(hit);
+				break;
+			}
+		} else if !tracked.contains(rel.as_str()) {
+			found = Some(rel);
+			break;
+		}
+	}
+	if pushed {
+		stack.pop();
+	}
+	Ok(found)
+}
+
+/// An untracked, non-ignored file (or symlink) occupying an ancestor directory slot of `path`,
+/// if any. A file->directory checkout removes such a file via `ensure_parents`, so a no-force
+/// checkout must refuse when it is untracked and not `.gitignore`d; a tracked ancestor is
+/// validated by the removal loop, and an ignored one is expendable.
+fn untracked_file_ancestor(
+	root: &Path,
+	path: &str,
+	tracked: &HashSet<&str>,
+) -> Result<Option<String>, WorktreeError> {
+	let mut ancestor = String::new();
+	let mut components = path.split('/').peekable();
+	while let Some(component) = components.next() {
+		if components.peek().is_none() {
+			break; // `path` itself, not an ancestor
+		}
+		if !ancestor.is_empty() {
+			ancestor.push('/');
+		}
+		ancestor.push_str(component);
+		match std::fs::symlink_metadata(root.join(&ancestor)) {
+			// A file/symlink occupies this ancestor; deeper components cannot exist beyond it.
+			Ok(meta) if !meta.is_dir() || meta.is_symlink() => {
+				if tracked.contains(ancestor.as_str()) {
+					return Ok(None); // tracked: validated by the removal loop
+				}
+				let stack = ignore_prefix(root, &ancestor)?;
+				let ignored = ignore::is_ignored(&ancestor, false, &stack);
+				return Ok((!ignored).then(|| ancestor.clone()));
+			}
+			Ok(_) => {}
+			Err(_) => return Ok(None),
+		}
+	}
+	Ok(None)
+}
+
+/// Build the ignore stack for the ancestors of `dir_rel` — the work-tree root's `.gitignore`
+/// and that of each directory strictly above `dir_rel` — ready for matching paths at `dir_rel`.
+fn ignore_prefix(root: &Path, dir_rel: &str) -> Result<Vec<DirIgnore>, WorktreeError> {
+	let mut stack = Vec::new();
+	push_gitignore(root, "", &mut stack)?;
+	let components: Vec<&str> = dir_rel.split('/').filter(|part| !part.is_empty()).collect();
+	let mut ancestor = String::new();
+	for component in &components[..components.len().saturating_sub(1)] {
+		if !ancestor.is_empty() {
+			ancestor.push('/');
+		}
+		ancestor.push_str(component);
+		push_gitignore(&root.join(&ancestor), &ancestor, &mut stack)?;
+	}
+	Ok(stack)
+}
+
+/// Push `dir_path`'s `.gitignore` (parsed relative to `dir_rel`) onto `stack`, returning whether
+/// one was present.
+fn push_gitignore(
+	dir_path: &Path,
+	dir_rel: &str,
+	stack: &mut Vec<DirIgnore>,
+) -> Result<bool, WorktreeError> {
+	match std::fs::read_to_string(dir_path.join(".gitignore")) {
+		Ok(text) => {
+			stack.push(ignore::parse(&text, dir_rel));
+			Ok(true)
+		}
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+		Err(error) => Err(error.into()),
+	}
+}
+
+/// Remove whatever currently occupies `full` — a file, a symlink, or a whole directory —
+/// leaving nothing behind, so a new entry can be written in its place.
+fn clear_dest(full: &Path) -> Result<(), WorktreeError> {
+	match std::fs::symlink_metadata(full) {
+		Ok(meta) if meta.is_dir() && !meta.is_symlink() => std::fs::remove_dir_all(full)?,
+		Ok(_) => std::fs::remove_file(full)?,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+		Err(error) => return Err(error.into()),
+	}
+	Ok(())
 }
 
 fn remove_empty_parents(root: &Path, path: &str) {

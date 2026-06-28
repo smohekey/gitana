@@ -12,6 +12,8 @@ mod error;
 mod fsmeta;
 mod ignore;
 mod index;
+mod pathspec;
+mod restore;
 mod status;
 mod worktree;
 

@@ -4,7 +4,7 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 
 ## Command Surface Correctness
 
-- [ ] Fix `checkout` help and behavior mismatch: either make it branch-only, or add path restore semantics.
+- [x] Fix `checkout` help and behavior mismatch: either make it branch-only, or add path restore semantics.
 - [ ] Add `restore` for working-tree and staged path restoration.
 - [ ] Add `reset` for soft, mixed, hard, and path-limited resets.
 - [ ] Add `rm` with tracked-file removal and staged deletion behavior.

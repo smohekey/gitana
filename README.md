@@ -35,7 +35,8 @@ Major gaps:
   only.
 - There is no rebase, cherry-pick, revert, stash, blame, bisect, submodule, hook,
   or sparse-checkout support.
-- `checkout` currently behaves as a branch switch alias, not as full path restore.
+- `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
+  but switching to a detached commit is not yet supported.
 - Push signing is still incomplete: the CLI has `--signed`, but key loading and
   signature generation are not wired through yet.
 - Remote transport currently supports HTTP(S) Smart HTTP remotes. Other Git URL

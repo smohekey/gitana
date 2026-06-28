@@ -50,6 +50,29 @@ impl Index {
 			.retain(|entry| !(entry.path == path && entry.stage == 0));
 	}
 
+	/// Drop entries whose file/directory shape conflicts with recording `path` as a file:
+	/// an ancestor recorded as a file (`path` is now under a directory), or entries recorded
+	/// beneath `path` as a directory (`path` is now a file). Used when staging a type change,
+	/// the way `git add` rewrites the index to match the working tree.
+	pub fn remove_type_conflicts(&mut self, path: &str) {
+		let mut ancestor = String::new();
+		let mut components = path.split('/').peekable();
+		while let Some(component) = components.next() {
+			if components.peek().is_none() {
+				break; // `path` itself is replaced by the caller's upsert
+			}
+			if !ancestor.is_empty() {
+				ancestor.push('/');
+			}
+			ancestor.push_str(component);
+			self.remove(&ancestor);
+		}
+		let dir_prefix = format!("{path}/");
+		self
+			.entries
+			.retain(|entry| !entry.path.starts_with(&dir_prefix));
+	}
+
 	/// Parse index bytes (DIRC v2–v4), verifying the trailing checksum.
 	pub fn parse(bytes: &[u8]) -> Result<Self, WorktreeError> {
 		if bytes.len() < 12 + CHECKSUM_LEN || &bytes[0..4] != SIGNATURE {

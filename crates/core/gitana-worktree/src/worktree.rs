@@ -76,31 +76,35 @@ impl<F: FileStore> WorkTree<F> {
 		Ok(())
 	}
 
-	/// Stage `pathspecs` (working-tree-relative, `/`-separated). A file is staged
-	/// directly; a directory (or `.`) is walked, applying `.gitignore`, and its
-	/// non-ignored files are staged; a path that no longer exists is removed from
-	/// the index (a staged deletion).
-	pub async fn add(&self, pathspecs: &[&str]) -> Result<(), WorktreeError> {
+	/// Stage `pathspecs`, interpreted relative to `prefix` (a `/`-joined work-tree-relative
+	/// subdirectory, empty at the root). A file is staged directly; a directory (or `.`) is
+	/// walked, applying `.gitignore`, and its non-ignored files are staged; a path that no
+	/// longer exists is removed from the index (a staged deletion).
+	pub async fn add(&self, pathspecs: &[&str], prefix: &str) -> Result<(), WorktreeError> {
 		let mut index = self.load_index()?;
 		let mut ignore_stack: Vec<DirIgnore> = Vec::new();
 		for &spec in pathspecs {
-			let rel = spec.trim_end_matches('/');
-			let rel = if rel == "." { "" } else { rel };
+			let (rel, dir_only) = crate::pathspec::normalize(spec, prefix)?;
 			let full = if rel.is_empty() {
 				self.work_dir.clone()
 			} else {
-				self.work_dir.join(rel)
+				self.work_dir.join(&rel)
 			};
 			match std::fs::symlink_metadata(&full) {
 				Ok(meta) if meta.is_dir() && !meta.is_symlink() => {
 					let mut files = Vec::new();
-					walk_files(&full, rel, &mut ignore_stack, &mut files)?;
+					walk_files(&full, &rel, &mut ignore_stack, &mut files)?;
 					for file in files {
 						self.stage_file(&mut index, &file).await?;
 					}
 				}
-				Ok(_) => self.stage_file(&mut index, rel).await?,
-				Err(error) if error.kind() == std::io::ErrorKind::NotFound => index.remove(rel),
+				// A trailing-slash spec required a directory but resolved to a file or nothing.
+				Ok(_) if dir_only => return Err(WorktreeError::PathspecMatch(spec.to_owned())),
+				Ok(_) => self.stage_file(&mut index, &rel).await?,
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound && dir_only => {
+					return Err(WorktreeError::PathspecMatch(spec.to_owned()));
+				}
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => index.remove(&rel),
 				Err(error) => return Err(error.into()),
 			}
 		}
@@ -113,11 +117,13 @@ impl<F: FileStore> WorkTree<F> {
 			Ok(meta) if meta.is_symlink() => {
 				let target = std::fs::read_link(&full)?;
 				let oid = self.repo.write_blob(path_bytes(&target)).await?;
+				index.remove_type_conflicts(path);
 				index.upsert(entry(path, 0o120000, oid, &meta));
 			}
 			Ok(meta) if meta.is_file() => {
 				let content = std::fs::read(&full)?;
 				let oid = self.repo.write_blob(&content).await?;
+				index.remove_type_conflicts(path);
 				index.upsert(entry(path, file_mode(&meta), oid, &meta));
 			}
 			Ok(_) => {}
@@ -151,6 +157,20 @@ impl<F: FileStore> WorkTree<F> {
 		force: bool,
 	) -> Result<(), WorktreeError> {
 		crate::checkout::run(self, tree, force).await
+	}
+
+	/// Restore `pathspecs` from `source` (a tree; `None` = the current index) into the
+	/// working tree, discarding any uncommitted changes to those paths. With a tree source,
+	/// also update the matching index entries. Does not move `HEAD`. `pathspecs` are
+	/// interpreted relative to `prefix` (a `/`-joined work-tree-relative subdirectory, empty
+	/// at the root).
+	pub async fn restore(
+		&self,
+		source: Option<gitana_object::ObjectId>,
+		pathspecs: &[&str],
+		prefix: &str,
+	) -> Result<(), WorktreeError> {
+		crate::restore::run(self, source, pathspecs, prefix).await
 	}
 }
 
