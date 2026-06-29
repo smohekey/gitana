@@ -68,8 +68,8 @@ impl Origin {
 			std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
 		let mut config =
 			GitConfig::parse(&text).with_context(|| format!("parsing {}", path.display()))?;
-		config.set("remote", Some("origin"), "url", &self.url);
-		config.set("remote", Some("origin"), "fetch", ORIGIN_FETCH_REFSPEC);
+		config.set("remote", Some("origin"), "url", &self.url)?;
+		config.set("remote", Some("origin"), "fetch", ORIGIN_FETCH_REFSPEC)?;
 		std::fs::write(&path, config.render())
 			.with_context(|| format!("writing {}", path.display()))?;
 		Ok(())

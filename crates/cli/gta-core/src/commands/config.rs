@@ -7,16 +7,18 @@ use crate::repo;
 /// Read or write local repository configuration (`.git/config`).
 ///
 /// With a `name` and `value`, sets the variable; with `name` only, prints its value (exit
-/// non-zero if unset). `get_all` prints every value, `add` appends one, `unset` removes the
-/// variable, and `list` prints all variables as `key=value`. `as_bool`/`as_int` interpret the
-/// read value. Note: writing re-renders the whole file, so comments and exact layout are not
-/// preserved.
+/// non-zero if unset). `get_all` prints every value, `add` appends one, `replace_all` overwrites
+/// every value of a (possibly multi-valued) key with one, `unset` removes the variable, and
+/// `list` prints all variables as `key=value`. `as_bool`/`as_int` interpret the read value.
+/// Writes are surgical: they edit the affected line in place and leave comments and the
+/// surrounding layout untouched.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
 	cwd: &Path,
 	get: bool,
 	get_all: bool,
 	add: bool,
+	replace_all: bool,
 	unset: bool,
 	list: bool,
 	as_bool: bool,
@@ -59,13 +61,23 @@ pub async fn run(
 		return repo.write_config(&config).await.map_err(Into::into);
 	}
 
+	if replace_all {
+		// Git treats a trailing value with --replace-all as a value-pattern to match; we do not
+		// implement that, so reject it rather than matching against every value.
+		let value = value.ok_or_else(|| anyhow!("--replace-all requires a value"))?;
+		let mut config = repo.read_config().await?;
+		config.replace_all(section, subsection, var, &value);
+		return repo.write_config(&config).await.map_err(Into::into);
+	}
+
 	// A value (without a read flag) means set.
 	if let Some(value) = value {
 		if get || get_all {
 			bail!("a get option cannot take a value");
 		}
 		let mut config = repo.read_config().await?;
-		config.set(section, subsection, var, &value);
+		// Refuses (leaving the file unchanged) if the key already holds multiple values.
+		config.set(section, subsection, var, &value)?;
 		return repo.write_config(&config).await.map_err(Into::into);
 	}
 

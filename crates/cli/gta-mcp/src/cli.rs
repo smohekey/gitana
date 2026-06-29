@@ -160,6 +160,9 @@ enum Command {
 		/// Append a value to a key.
 		#[arg(long)]
 		add: bool,
+		/// Replace all values of a key with a single value.
+		#[arg(long = "replace-all")]
+		replace_all: bool,
 		/// Remove a key.
 		#[arg(long)]
 		unset: bool,
@@ -365,6 +368,7 @@ impl Cli {
 				get,
 				get_all,
 				add,
+				replace_all,
 				unset,
 				list,
 				as_bool,
@@ -373,7 +377,17 @@ impl Cli {
 				value,
 			} => {
 				commands::config::run(
-					&cwd, get, get_all, add, unset, list, as_bool, as_int, name, value,
+					&cwd,
+					get,
+					get_all,
+					add,
+					replace_all,
+					unset,
+					list,
+					as_bool,
+					as_int,
+					name,
+					value,
 				)
 				.await
 			}

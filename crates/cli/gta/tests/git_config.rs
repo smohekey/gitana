@@ -209,6 +209,111 @@ fn config_missing_key_exits_nonzero() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+#[test]
+fn config_writes_preserve_comments_and_layout() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-config-preserve");
+	let w = work.to_str().unwrap();
+
+	// Seed a config with comments, a blank line, and an inline note around an existing value.
+	let cfg = work.join(".git/config");
+	let mut text = std::fs::read_to_string(&cfg).unwrap();
+	text.push_str("\n# a kept comment\n[user]\n\tname = Old   # inline note\n");
+	std::fs::write(&cfg, &text).unwrap();
+
+	// Change the value, add a sibling, and unset an unrelated key.
+	gta(w, &["config", "user.name", "New Name"], b"");
+	gta(w, &["config", "user.email", "a@example.com"], b"");
+
+	let after = std::fs::read_to_string(&cfg).unwrap();
+	assert!(
+		after.contains("# a kept comment"),
+		"comment dropped:\n{after}"
+	);
+	assert!(
+		after.contains("# inline note"),
+		"inline note dropped:\n{after}"
+	);
+	// The set edited only the value in place.
+	assert!(after.contains("name = New Name   # inline note"), "{after}");
+	// git agrees on the resulting values.
+	assert_eq!(git(w, &["config", "user.name"]).trim(), "New Name");
+	assert_eq!(git(w, &["config", "user.email"]).trim(), "a@example.com");
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn config_set_into_file_without_final_newline() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-config-nonewline");
+	let w = work.to_str().unwrap();
+
+	// A config whose last line has no trailing newline.
+	let cfg = work.join(".git/config");
+	let mut text = std::fs::read_to_string(&cfg).unwrap();
+	if text.ends_with('\n') {
+		text.pop();
+	}
+	std::fs::write(&cfg, &text).unwrap();
+
+	gta(w, &["config", "user.name", "Alice"], b"");
+
+	let after = std::fs::read_to_string(&cfg).unwrap();
+	// The new key must be on its own line, never glued onto the previous one.
+	assert!(
+		!after
+			.lines()
+			.any(|l| l.contains("\tname") && l.matches('=').count() > 1),
+		"keys glued onto one line:\n{after}"
+	);
+	// git reads the result cleanly.
+	assert_eq!(git(w, &["config", "user.name"]).trim(), "Alice");
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn config_set_refuses_to_collapse_multi_valued_key() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-config-multi-set");
+	let w = work.to_str().unwrap();
+
+	gta(w, &["config", "--add", "remote.origin.fetch", "one"], b"");
+	gta(w, &["config", "--add", "remote.origin.fetch", "two"], b"");
+
+	// A plain set over a multi-valued key is refused, leaving both values intact (as git does).
+	let err = gta_fail(w, &["config", "remote.origin.fetch", "three"]);
+	assert!(err.contains("multiple values"), "stderr: {err}");
+	assert_eq!(
+		gta(w, &["config", "--get-all", "remote.origin.fetch"], b""),
+		"one\ntwo\n"
+	);
+
+	// --replace-all collapses the multiple values into one (as git does).
+	gta(
+		w,
+		&["config", "--replace-all", "remote.origin.fetch", "three"],
+		b"",
+	);
+	assert_eq!(
+		gta(w, &["config", "--get-all", "remote.origin.fetch"], b""),
+		"three\n"
+	);
+	assert_eq!(
+		git(w, &["config", "--get-all", "remote.origin.fetch"]),
+		"three\n"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 fn gta(dir: &str, args: &[&str], stdin: &[u8]) -> String {
 	let out = assert_cmd::Command::cargo_bin("gta")
 		.unwrap()

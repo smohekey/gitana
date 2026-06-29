@@ -24,16 +24,30 @@ impl Config {
 
 	/// Render to git config text.
 	pub fn render(&self) -> String {
+		// Each key is set exactly once on a fresh config, so `set` cannot hit the multi-value guard.
 		let mut config = GitConfig::new();
-		config.set(
+		let set = |config: &mut GitConfig, section, subsection, name, value: &str| {
+			config
+				.set(section, subsection, name, value)
+				.expect("unique key on a fresh config");
+		};
+		let version = self.repository_format_version.to_string();
+		set(
+			&mut config,
 			"core",
 			None,
 			"repositoryformatversion",
-			&self.repository_format_version.to_string(),
+			&version,
 		);
-		config.set("core", None, "filemode", "true");
-		config.set("core", None, "bare", "false");
-		config.set("extensions", None, "objectformat", &self.object_format);
+		set(&mut config, "core", None, "filemode", "true");
+		set(&mut config, "core", None, "bare", "false");
+		set(
+			&mut config,
+			"extensions",
+			None,
+			"objectformat",
+			&self.object_format,
+		);
 		config.render()
 	}
 
