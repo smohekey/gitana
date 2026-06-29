@@ -14,8 +14,7 @@ pub async fn run(
 	pretty: bool,
 	object: &str,
 ) -> Result<()> {
-	let repo = repo::open_here(cwd)?;
-	let oid = repo.rev_parse(object).await?;
+	let (repo, oid) = repo::resolve_object(cwd, object).await?;
 	let (kind, payload) = repo.objects().read_object(&oid).await?;
 
 	if show_type {

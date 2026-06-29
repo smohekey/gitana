@@ -40,6 +40,51 @@ impl<F: FileStore> WorkTree<F> {
 		&self.repo
 	}
 
+	/// Resolve a revision spec, including the index-relative forms the repository resolver cannot:
+	/// `:<path>` (the staged blob, stage 0) and `:<n>:<path>` (merge stage `n`). Every other spec
+	/// — refs, oids, `HEAD`, `~`/`^`/`^{type}`, and `<rev>:<path>` — is delegated to
+	/// [`Repository::rev_parse`]. The path is repository-root-relative.
+	pub async fn rev_parse(&self, spec: &str) -> Result<gitana_object::ObjectId, WorktreeError> {
+		match spec.strip_prefix(':') {
+			Some(rest) => self.resolve_index_spec(rest),
+			None => Ok(self.repository().rev_parse(spec).await?),
+		}
+	}
+
+	/// Resolve the part of an index spec after the leading `:` to the staged blob's id.
+	fn resolve_index_spec(&self, rest: &str) -> Result<gitana_object::ObjectId, WorktreeError> {
+		// `:/text` (commit-message search) is not an index lookup.
+		if rest.starts_with('/') {
+			return Err(WorktreeError::InvalidIndexSpec(rest.to_owned()));
+		}
+		// `:<n>:<path>` selects merge stage `n` (0–3); otherwise stage 0.
+		let bytes = rest.as_bytes();
+		let (stage, path) = match bytes {
+			[digit, b':', ..] if digit.is_ascii_digit() => {
+				let stage = digit - b'0';
+				if stage > 3 {
+					return Err(WorktreeError::InvalidIndexSpec(rest.to_owned()));
+				}
+				(stage, &rest[2..])
+			}
+			_ => (0, rest),
+		};
+		self
+			.load_index()?
+			.entries
+			.iter()
+			.find(|entry| entry.path == path && entry.stage == stage)
+			.map(|entry| entry.oid)
+			.ok_or_else(|| {
+				let at = if stage == 0 {
+					String::new()
+				} else {
+					format!(" at stage {stage}")
+				};
+				WorktreeError::IndexPathMissing(path.to_owned(), at)
+			})
+	}
+
 	pub(crate) fn work_dir(&self) -> &Path {
 		&self.work_dir
 	}

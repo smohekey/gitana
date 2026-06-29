@@ -9,7 +9,7 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [x] Add `reset` for soft, mixed, hard, and path-limited resets.
 - [x] Add `rm` with tracked-file removal and staged deletion behavior.
 - [x] Add `mv` as tracked rename convenience over filesystem move plus index update.
-- [ ] Add `show` for common commit/object display.
+- [x] Add `show` for common commit/object display.
 - [ ] Add `config` read/write support for local repository configuration.
 - [ ] Keep `gta` and `gta-mcp` command surfaces in lockstep as each command lands.
 

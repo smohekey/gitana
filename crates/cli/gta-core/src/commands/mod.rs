@@ -19,6 +19,7 @@ pub mod restore;
 pub mod rev_list;
 pub mod rev_parse;
 pub mod rm;
+pub mod show;
 pub mod status;
 pub mod switch;
 pub mod symbolic_ref;

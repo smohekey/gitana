@@ -75,7 +75,7 @@ Implemented command groups:
 - Plumbing: `hash-object`, `cat-file`, `ls-tree`, `rev-parse`, `rev-list`,
   `ls-files`.
 - Ref operations: `update-ref`, `symbolic-ref`, `branch`, `tag`.
-- Working-tree porcelain: `add`, `rm`, `mv`, `status`, `commit`, `log`,
+- Working-tree porcelain: `add`, `rm`, `mv`, `status`, `commit`, `log`, `show`,
   `switch`, `checkout`, `restore`, `reset`, `diff`.
 - Remote operations: `clone`, `fetch`, `pull`, `push`.
 

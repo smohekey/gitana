@@ -13,6 +13,7 @@ use crate::transport::{self, Origin, local_haves};
 /// Pull `HEAD`'s branch from the origin.
 pub async fn run(cwd: &Path) -> Result<()> {
 	let (work, git_dir) = repo::discover(cwd)?;
+	let work = work.ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?;
 	let repository = repo::open(&git_dir);
 	let origin = Origin::load(&git_dir)?;
 

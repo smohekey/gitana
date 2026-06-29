@@ -8,7 +8,7 @@
 use std::collections::{BinaryHeap, HashSet};
 
 use gitana_file_store::FileStore;
-use gitana_object::{Commit, ObjectId, ObjectKind, Signature, parse_commit, parse_tag};
+use gitana_object::{Commit, ObjectId, ObjectKind, Signature, parse_commit, parse_tag, parse_tree};
 
 use crate::{Repository, RepositoryError};
 
@@ -26,6 +26,22 @@ pub(crate) async fn rev_parse(
 	repo: &Repository<impl FileStore>,
 	spec: &str,
 ) -> Result<ObjectId, RepositoryError> {
+	// `<rev>:<path>` — the blob or tree at `<path>` within `<rev>`'s tree. (The `:path`/`:n:path`
+	// index forms, which start with `:`, are not supported.)
+	if let Some(colon) = spec.find(':')
+		&& colon > 0
+	{
+		let base = resolve_rev(repo, &spec[..colon]).await?;
+		return object_at_path(repo, base, &spec[colon + 1..]).await;
+	}
+	resolve_rev(repo, spec).await
+}
+
+/// Resolve a revision spec without a `:path` suffix: a base (ref/oid/`HEAD`) and `~`/`^` ops.
+async fn resolve_rev(
+	repo: &Repository<impl FileStore>,
+	spec: &str,
+) -> Result<ObjectId, RepositoryError> {
 	let (base, ops) = parse_spec(spec)?;
 	let mut id = resolve_base(repo, base).await?;
 	for op in ops {
@@ -36,6 +52,68 @@ pub(crate) async fn rev_parse(
 		};
 	}
 	Ok(id)
+}
+
+/// Resolve `<path>` within the tree of `base` (a commit, tag, or tree) to its blob or tree id. An
+/// empty path yields the tree itself; descending through a non-directory is an error.
+async fn object_at_path(
+	repo: &Repository<impl FileStore>,
+	base: ObjectId,
+	path: &str,
+) -> Result<ObjectId, RepositoryError> {
+	let mut tree = peel_to_tree(repo, base).await?;
+	// A trailing slash (`<rev>:<path>/`) requires the path to name a directory.
+	let require_dir = path.ends_with('/');
+	let path = path.trim_end_matches('/');
+	if path.is_empty() {
+		return Ok(tree);
+	}
+	let parts: Vec<&str> = path.split('/').collect();
+	for (depth, part) in parts.iter().enumerate() {
+		let (kind, payload) = repo.objects().read_object(&tree).await?;
+		if kind != ObjectKind::Tree {
+			return Err(RepositoryError::InvalidRef(format!(
+				"path '{path}': '{}' is not a directory",
+				parts[..depth].join("/")
+			)));
+		}
+		let entry = parse_tree(&payload)?
+			.into_iter()
+			.find(|entry| entry.name == *part)
+			.ok_or_else(|| {
+				RepositoryError::InvalidRef(format!("path '{path}' does not exist in {base}"))
+			})?;
+		if depth + 1 == parts.len() {
+			if require_dir && entry.mode != "40000" {
+				return Err(RepositoryError::InvalidRef(format!(
+					"path '{path}/' is not a directory"
+				)));
+			}
+			return Ok(entry.id);
+		}
+		tree = entry.id;
+	}
+	unreachable!("the last component returns")
+}
+
+/// Peel a commit/tag/tree id to a tree id (dereferencing tags), erroring on a blob.
+async fn peel_to_tree(
+	repo: &Repository<impl FileStore>,
+	mut id: ObjectId,
+) -> Result<ObjectId, RepositoryError> {
+	loop {
+		let (kind, payload) = repo.objects().read_object(&id).await?;
+		match kind {
+			ObjectKind::Tree => return Ok(id),
+			ObjectKind::Commit => return Ok(parse_commit(&payload)?.tree),
+			ObjectKind::Tag => id = parse_tag(&payload)?.object,
+			ObjectKind::Blob => {
+				return Err(RepositoryError::InvalidRef(format!(
+					"{id} is not a tree-ish"
+				)));
+			}
+		}
+	}
 }
 
 /// Walk commits reachable from `tips` in committer-date order (newest first).

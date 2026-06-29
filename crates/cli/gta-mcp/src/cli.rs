@@ -143,6 +143,12 @@ enum Command {
 	},
 	/// Show the commit history of HEAD (one line per commit).
 	Log,
+	/// Show an object: a commit and its diff, a tag, a tree, or a blob (default: HEAD).
+	Show {
+		/// The object to show (default: HEAD).
+		#[arg(long)]
+		object: Option<String>,
+	},
 	/// List branches, or create one.
 	Branch {
 		/// Branch to create. With none, list branches.
@@ -324,6 +330,7 @@ impl Cli {
 			Command::Status => commands::status::run(&cwd).await,
 			Command::Commit { message } => commands::commit::run(&cwd, &message).await,
 			Command::Log => commands::log::run(&cwd).await,
+			Command::Show { object } => commands::show::run(&cwd, object).await,
 			Command::Branch { name, start } => commands::branch::run(&cwd, name, start).await,
 			Command::Tag { name, target } => commands::tag::run(&cwd, name, target).await,
 			Command::Switch {

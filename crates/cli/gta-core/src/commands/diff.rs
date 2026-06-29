@@ -31,7 +31,7 @@ pub async fn run(cwd: &Path, cached: bool) -> Result<()> {
 	Ok(())
 }
 
-fn format_file(out: &mut Vec<u8>, file: &FileDiff) {
+pub(crate) fn format_file(out: &mut Vec<u8>, file: &FileDiff) {
 	let path = &file.path;
 	let old = file.old.as_ref();
 	let new = file.new.as_ref();
