@@ -149,6 +149,36 @@ enum Command {
 		#[arg(long)]
 		object: Option<String>,
 	},
+	/// Read or write local repository configuration (`.git/config`).
+	Config {
+		/// Read the value of a key (the default with a key and no value).
+		#[arg(long)]
+		get: bool,
+		/// Print every value of a multi-valued key.
+		#[arg(long = "get-all")]
+		get_all: bool,
+		/// Append a value to a key.
+		#[arg(long)]
+		add: bool,
+		/// Remove a key.
+		#[arg(long)]
+		unset: bool,
+		/// List all variables as `key=value`.
+		#[arg(long)]
+		list: bool,
+		/// Interpret the read value as a boolean.
+		#[arg(long = "bool")]
+		as_bool: bool,
+		/// Interpret the read value as an integer.
+		#[arg(long = "int")]
+		as_int: bool,
+		/// The dotted key (`section[.subsection].name`).
+		#[arg(long)]
+		name: Option<String>,
+		/// The value to set or add.
+		#[arg(long)]
+		value: Option<String>,
+	},
 	/// List branches, or create one.
 	Branch {
 		/// Branch to create. With none, list branches.
@@ -331,6 +361,22 @@ impl Cli {
 			Command::Commit { message } => commands::commit::run(&cwd, &message).await,
 			Command::Log => commands::log::run(&cwd).await,
 			Command::Show { object } => commands::show::run(&cwd, object).await,
+			Command::Config {
+				get,
+				get_all,
+				add,
+				unset,
+				list,
+				as_bool,
+				as_int,
+				name,
+				value,
+			} => {
+				commands::config::run(
+					&cwd, get, get_all, add, unset, list, as_bool, as_int, name, value,
+				)
+				.await
+			}
 			Command::Branch { name, start } => commands::branch::run(&cwd, name, start).await,
 			Command::Tag { name, target } => commands::tag::run(&cwd, name, target).await,
 			Command::Switch {

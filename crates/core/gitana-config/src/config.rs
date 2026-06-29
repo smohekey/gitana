@@ -63,6 +63,33 @@ impl GitConfig {
 			.collect()
 	}
 
+	/// The last matching variable's value, keeping "absent" distinct from "present but valueless":
+	/// outer `None` if the variable is unset, inner `None` for a bare (valueless) variable.
+	pub fn get_raw(
+		&self,
+		section: &str,
+		subsection: Option<&str>,
+		name: &str,
+	) -> Option<Option<&str>> {
+		self
+			.matches(section, subsection, name)
+			.last()
+			.map(|v| v.value.as_deref())
+	}
+
+	/// Every matching variable in order (inner `None` for a valueless one); empty if unset.
+	pub fn get_all_raw(
+		&self,
+		section: &str,
+		subsection: Option<&str>,
+		name: &str,
+	) -> Vec<Option<&str>> {
+		self
+			.matches(section, subsection, name)
+			.map(|v| v.value.as_deref())
+			.collect()
+	}
+
 	/// Interpret the last value as a git boolean (`true/yes/on/1`, `false/no/off/0/""`,
 	/// or a bare name as true). `None` if the variable is unset.
 	pub fn get_bool(
@@ -77,16 +104,18 @@ impl GitConfig {
 		}
 	}
 
-	/// Interpret the last value as a git integer (optional `k`/`m`/`g` 1024-multiplier).
+	/// Interpret the last value as a git integer (optional `k`/`m`/`g` 1024-multiplier). A bare
+	/// (valueless) variable is present, not absent, so it interprets as `""` — a parse error,
+	/// as git reports — rather than `None`.
 	pub fn get_int(
 		&self,
 		section: &str,
 		subsection: Option<&str>,
 		name: &str,
 	) -> Result<Option<i64>, ConfigError> {
-		match self.get_string(section, subsection, name) {
+		match self.get_raw(section, subsection, name) {
 			None => Ok(None),
-			Some(v) => interpret_int(v).map(Some),
+			Some(value) => interpret_int(value.unwrap_or("")).map(Some),
 		}
 	}
 
@@ -103,6 +132,29 @@ impl GitConfig {
 			name: name_lc,
 			value: Some(value.to_owned()),
 		});
+	}
+
+	/// Remove every value of a variable, returning whether anything was removed.
+	pub fn unset(&mut self, section: &str, subsection: Option<&str>, name: &str) -> bool {
+		let section_lc = section.to_ascii_lowercase();
+		let name_lc = name.to_ascii_lowercase();
+		let before = self.variables.len();
+		self.variables.retain(|v| {
+			!(v.section == section_lc && v.name == name_lc && v.subsection.as_deref() == subsection)
+		});
+		self.variables.len() != before
+	}
+
+	/// All variables in order, as a dotted key (`section[.subsection].name`, with the section and
+	/// name lower-cased) and its value (`None` for a boolean-true variable). For `--list`.
+	pub fn entries(&self) -> impl Iterator<Item = (String, Option<&str>)> {
+		self.variables.iter().map(|v| {
+			let key = match &v.subsection {
+				Some(sub) => format!("{}.{}.{}", v.section, sub, v.name),
+				None => format!("{}.{}", v.section, v.name),
+			};
+			(key, v.value.as_deref())
+		})
 	}
 
 	/// Append a value (for multi-valued variables); `None` value is boolean-true.

@@ -77,6 +77,7 @@ Implemented command groups:
 - Ref operations: `update-ref`, `symbolic-ref`, `branch`, `tag`.
 - Working-tree porcelain: `add`, `rm`, `mv`, `status`, `commit`, `log`, `show`,
   `switch`, `checkout`, `restore`, `reset`, `diff`.
+- Repository setup: `config` (local read/write).
 - Remote operations: `clone`, `fetch`, `pull`, `push`.
 
 ## Crate layout

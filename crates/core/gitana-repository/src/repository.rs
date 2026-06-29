@@ -75,6 +75,31 @@ where
 			.map_err(|error| RepositoryError::UnsupportedFormat(error.to_string()))
 	}
 
+	/// Write `config` to the `config` file, replacing its contents (last-writer-wins, retrying on
+	/// a concurrent change).
+	pub async fn write_config(
+		&self,
+		config: &gitana_config::GitConfig,
+	) -> Result<(), RepositoryError> {
+		let bytes = config.render().into_bytes();
+		let store = self.objects.file_store();
+		loop {
+			let expected = match store.read_path_versioned("config").await {
+				Ok((_, version)) => Some(version),
+				Err(FileStoreError::NotFound) => None,
+				Err(error) => return Err(error.into()),
+			};
+			match store
+				.write_path_cas("config", &bytes, expected.as_ref())
+				.await
+			{
+				Ok(_) => return Ok(()),
+				Err(FileStoreError::VersionMismatch) => continue,
+				Err(error) => return Err(error.into()),
+			}
+		}
+	}
+
 	/// Read a blob's content.
 	pub async fn read_blob(&self, id: ObjectId) -> Result<Vec<u8>, RepositoryError> {
 		let (kind, payload) = self.objects.read_object(&id).await?;

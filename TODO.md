@@ -10,7 +10,8 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [x] Add `rm` with tracked-file removal and staged deletion behavior.
 - [x] Add `mv` as tracked rename convenience over filesystem move plus index update.
 - [x] Add `show` for common commit/object display.
-- [ ] Add `config` read/write support for local repository configuration.
+- [x] Add `config` read/write support for local repository configuration.
+- [ ] Make `config` writes preserve comments and layout. `Repository::write_config` re-renders the whole file from the parsed model, so a `config` write drops comments and reformats, unlike git's in-place edits. Teach the config crate to edit the original text surgically (or retain raw spans).
 - [ ] Keep `gta` and `gta-mcp` command surfaces in lockstep as each command lands.
 
 ## Merge And History Editing
