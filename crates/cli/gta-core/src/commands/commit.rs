@@ -10,6 +10,13 @@ use crate::repo;
 pub async fn run(cwd: &Path, message: &str) -> Result<()> {
 	let wt = repo::open_worktree(cwd)?;
 	let index = wt.load_index()?;
+	// An unmerged index would otherwise silently drop conflicted paths (they have no stage-0 entry)
+	// from the tree, so refuse — as git does — until they are resolved.
+	if index.has_conflicts() {
+		bail!(
+			"committing is not possible because you have unmerged files; resolve them and mark resolution with `gta add`/`gta rm`"
+		);
+	}
 	let entries: Vec<TreeBuildEntry> = index
 		.entries
 		.iter()

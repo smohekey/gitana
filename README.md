@@ -23,8 +23,9 @@ What works today:
   for commits and resets.
 - Revision resolution for common forms such as `HEAD`, branch/tag names,
   abbreviated object IDs, `~`, `^`, and `^{type}`.
-- A Git-compatible index, `.gitignore` handling, `status`, `add`, `rm`, `mv`,
-  checkout, path restore (working-tree and staged), soft/mixed/hard and
+- A Git-compatible index (including conflict stages / unmerged paths), `.gitignore`
+  handling, `status` (reporting `UU`/`AA`/`DD`/etc. conflict codes), `add`, `rm`,
+  `mv`, checkout, path restore (working-tree and staged), soft/mixed/hard and
   path-limited reset, and staged/unstaged diff support.
 - Smart HTTP advertisement, fetch/upload-pack, receive-pack, push reports, and
   fast-forward enforcement.

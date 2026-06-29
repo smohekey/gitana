@@ -23,7 +23,7 @@ mod worktree;
 pub use diff::FileDiff;
 pub use entry::{IndexEntry, Stat};
 pub use error::WorktreeError;
-pub use index::Index;
+pub use index::{Conflict, Index};
 pub use rm::RmOutcome;
 pub use status::{Status, StatusEntry};
 pub use worktree::WorkTree;

@@ -18,6 +18,15 @@ pub struct Index {
 	pub entries: Vec<IndexEntry>,
 }
 
+/// The unmerged index stages for a path: the common ancestor (stage 1), our side (stage 2), and
+/// their side (stage 3). Any may be absent (e.g. a side that deleted the path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Conflict<'a> {
+	pub base: Option<&'a IndexEntry>,
+	pub ours: Option<&'a IndexEntry>,
+	pub theirs: Option<&'a IndexEntry>,
+}
+
 impl Index {
 	/// An empty index.
 	pub fn new() -> Self {
@@ -32,22 +41,103 @@ impl Index {
 			.find(|entry| entry.path == path && entry.stage == 0)
 	}
 
-	/// Insert or replace an entry, keeping the entries sorted.
+	/// Insert or replace the entry for its path, keeping the entries sorted. Any other stages for the
+	/// path (a recorded conflict) are dropped, so staging a resolved file collapses it to stage 0.
 	pub fn upsert(&mut self, entry: IndexEntry) {
+		self.remove(&entry.path);
+		self.insert_sorted(entry);
+	}
+
+	/// Remove every entry for `path` (all stages), if any.
+	pub fn remove(&mut self, path: &str) {
+		self.entries.retain(|entry| entry.path != path);
+	}
+
+	/// Record a merge conflict for `path`, replacing any existing entries with the present stages:
+	/// base (stage 1), ours (stage 2), theirs (stage 3), each `(mode, oid)` or absent.
+	pub fn record_conflict(
+		&mut self,
+		path: &str,
+		base: Option<(u32, ObjectId)>,
+		ours: Option<(u32, ObjectId)>,
+		theirs: Option<(u32, ObjectId)>,
+	) {
+		self.remove(path);
+		for (stage, side) in [(1u8, base), (2, ours), (3, theirs)] {
+			if let Some((mode, oid)) = side {
+				self.insert_sorted(IndexEntry {
+					stat: Stat::default(),
+					mode,
+					oid,
+					stage,
+					assume_valid: false,
+					path: path.to_owned(),
+				});
+			}
+		}
+	}
+
+	/// The unmerged stages for `path` (base/ours/theirs), or `None` if it is not conflicted.
+	pub fn conflict(&self, path: &str) -> Option<Conflict<'_>> {
+		let stage = |stage: u8| {
+			self
+				.entries
+				.iter()
+				.find(|entry| entry.path == path && entry.stage == stage)
+		};
+		let conflict = Conflict {
+			base: stage(1),
+			ours: stage(2),
+			theirs: stage(3),
+		};
+		match conflict {
+			Conflict {
+				base: None,
+				ours: None,
+				theirs: None,
+			} => None,
+			conflict => Some(conflict),
+		}
+	}
+
+	/// Whether `path` has any conflict (stage > 0) entry.
+	pub fn is_unmerged(&self, path: &str) -> bool {
 		self
 			.entries
-			.retain(|existing| !(existing.path == entry.path && existing.stage == entry.stage));
+			.iter()
+			.any(|entry| entry.path == path && entry.stage != 0)
+	}
+
+	/// Whether the index holds any unmerged path.
+	pub fn has_conflicts(&self) -> bool {
+		self.entries.iter().any(|entry| entry.stage != 0)
+	}
+
+	/// The distinct paths with a conflict (stage > 0) entry, in sorted order. Entries are sorted by
+	/// `(path, stage)`, so same-path stages are adjacent.
+	pub fn unmerged_paths(&self) -> impl Iterator<Item = &str> {
+		let mut last: Option<&str> = None;
+		self
+			.entries
+			.iter()
+			.filter(|entry| entry.stage != 0)
+			.filter_map(move |entry| {
+				let path = entry.path.as_str();
+				if last == Some(path) {
+					None
+				} else {
+					last = Some(path);
+					Some(path)
+				}
+			})
+	}
+
+	/// Insert `entry` at its sorted `(path, stage)` position.
+	fn insert_sorted(&mut self, entry: IndexEntry) {
 		let position = self
 			.entries
 			.partition_point(|existing| key(existing) < key(&entry));
 		self.entries.insert(position, entry);
-	}
-
-	/// Remove the stage-0 entry for `path`, if any.
-	pub fn remove(&mut self, path: &str) {
-		self
-			.entries
-			.retain(|entry| !(entry.path == path && entry.stage == 0));
 	}
 
 	/// Drop entries whose file/directory shape conflicts with recording `path` as a file:
@@ -316,6 +406,76 @@ mod tests {
 		// Sorted by path.
 		let paths: Vec<&str> = parsed.entries.iter().map(|e| e.path.as_str()).collect();
 		assert_eq!(paths, ["README.md", "src/lib.rs", "src/main.rs"]);
+	}
+
+	fn oid(content: &[u8]) -> ObjectId {
+		ObjectId::compute(ObjectKind::Blob, content)
+	}
+
+	#[test]
+	fn record_conflict_round_trips_and_queries() {
+		let mut index = Index::new();
+		index.upsert(entry("clean.txt", b"x"));
+		index.record_conflict(
+			"f.txt",
+			Some((0o100644, oid(b"base"))),
+			Some((0o100644, oid(b"ours"))),
+			Some((0o100644, oid(b"theirs"))),
+		);
+
+		assert!(index.has_conflicts());
+		assert!(index.is_unmerged("f.txt"));
+		assert!(!index.is_unmerged("clean.txt"));
+		assert_eq!(index.unmerged_paths().collect::<Vec<_>>(), ["f.txt"]);
+
+		let conflict = index.conflict("f.txt").unwrap();
+		assert_eq!(conflict.base.unwrap().stage, 1);
+		assert_eq!(conflict.ours.unwrap().oid, oid(b"ours"));
+		assert_eq!(conflict.theirs.unwrap().oid, oid(b"theirs"));
+
+		// All stages survive the on-disk round-trip.
+		assert_eq!(Index::parse(&index.write_v4()).unwrap(), index);
+	}
+
+	#[test]
+	fn upsert_and_remove_resolve_a_conflict() {
+		let mut index = Index::new();
+		index.record_conflict(
+			"f.txt",
+			Some((0o100644, oid(b"b"))),
+			Some((0o100644, oid(b"o"))),
+			Some((0o100644, oid(b"t"))),
+		);
+
+		// Staging the resolved file collapses every stage to a single stage-0 entry.
+		index.upsert(entry("f.txt", b"resolved"));
+		assert!(!index.is_unmerged("f.txt"));
+		assert!(index.conflict("f.txt").is_none());
+		assert_eq!(
+			index.entries.iter().filter(|e| e.path == "f.txt").count(),
+			1
+		);
+		assert_eq!(index.entry("f.txt").unwrap().stage, 0);
+
+		// Removing drops the path entirely, even when conflicted.
+		index.record_conflict("f.txt", None, Some((0o100644, oid(b"o"))), None);
+		assert!(index.is_unmerged("f.txt"));
+		index.remove("f.txt");
+		assert!(index.entries.iter().all(|e| e.path != "f.txt"));
+	}
+
+	#[test]
+	fn partial_conflict_reports_absent_stages() {
+		// modify/delete: base and ours present, theirs deleted.
+		let mut index = Index::new();
+		index.record_conflict(
+			"f.txt",
+			Some((0o100644, oid(b"b"))),
+			Some((0o100644, oid(b"o"))),
+			None,
+		);
+		let conflict = index.conflict("f.txt").unwrap();
+		assert!(conflict.base.is_some() && conflict.ours.is_some() && conflict.theirs.is_none());
 	}
 
 	#[test]

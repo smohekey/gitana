@@ -45,12 +45,15 @@ where
 	F: FileStore,
 {
 	let mut index = wt.load_index()?;
-	let tracked: Vec<String> = index
+	// Tracked = stage-0 entries plus unmerged paths (which have only stage 1/2/3 entries); removing
+	// an unmerged path is a valid way to resolve its conflict.
+	let mut tracked: Vec<String> = index
 		.entries
 		.iter()
 		.filter(|e| e.stage == 0)
 		.map(|e| e.path.clone())
 		.collect();
+	tracked.extend(index.unmerged_paths().map(str::to_owned));
 
 	// Match each pathspec against tracked paths: an exact file, or — needing `recursive` — the
 	// contents of a directory (the empty spec from `.` matches every tracked path).
@@ -86,9 +89,11 @@ where
 	if !force {
 		let head = head_entries(wt).await?;
 		for &path in &selected {
-			let entry = index
-				.entry(path)
-				.expect("selected path is a stage-0 index entry");
+			// An unmerged path (no stage-0 entry) is always removable — the removal resolves the
+			// conflict, as `git rm` allows without `--force`.
+			let Some(entry) = index.entry(path) else {
+				continue;
+			};
 			let full = wt.work_dir().join(path);
 			let meta = match std::fs::symlink_metadata(&full) {
 				Ok(meta) => meta,
