@@ -10,6 +10,7 @@
 mod config;
 mod error;
 mod head;
+mod merge_base;
 mod mode;
 mod refs;
 mod repository;

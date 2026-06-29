@@ -240,6 +240,20 @@ where
 		crate::revision::rev_list(self, tips).await
 	}
 
+	/// The best common ancestor(s) — merge bases — of `commits`; empty if they share no ancestor.
+	pub async fn merge_base(&self, commits: &[ObjectId]) -> Result<Vec<ObjectId>, RepositoryError> {
+		crate::merge_base::merge_base(self, commits).await
+	}
+
+	/// Whether `ancestor` is an ancestor of (or equal to) `descendant`.
+	pub async fn is_ancestor(
+		&self,
+		ancestor: ObjectId,
+		descendant: ObjectId,
+	) -> Result<bool, RepositoryError> {
+		crate::merge_base::is_ancestor(self, ancestor, descendant).await
+	}
+
 	/// Read and validate the repository config; refuse non-sha256 / unknown formats.
 	pub async fn open(&self) -> Result<Config, RepositoryError> {
 		let files = self.objects.file_store();

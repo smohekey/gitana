@@ -251,7 +251,7 @@ async fn resolve_abbrev(
 	}
 }
 
-async fn read_commit(
+pub(crate) async fn read_commit(
 	repo: &Repository<impl FileStore>,
 	id: ObjectId,
 ) -> Result<Commit, RepositoryError> {
@@ -262,7 +262,7 @@ async fn read_commit(
 	Ok(parse_commit(&payload)?)
 }
 
-async fn peel_to_commit(
+pub(crate) async fn peel_to_commit(
 	repo: &Repository<impl FileStore>,
 	mut id: ObjectId,
 ) -> Result<ObjectId, RepositoryError> {
@@ -351,7 +351,7 @@ async fn peel_type(
 	}
 }
 
-async fn committer_seconds(
+pub(crate) async fn committer_seconds(
 	repo: &Repository<impl FileStore>,
 	id: ObjectId,
 ) -> Result<i64, RepositoryError> {

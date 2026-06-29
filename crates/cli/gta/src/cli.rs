@@ -69,6 +69,18 @@ enum Command {
 		/// The starting revision.
 		spec: String,
 	},
+	/// Find the best common ancestor(s) of two or more commits.
+	MergeBase {
+		/// Print all merge bases, not just one.
+		#[arg(long)]
+		all: bool,
+		/// Test if the first commit is an ancestor of the second (exit 0/1, no output).
+		#[arg(long = "is-ancestor")]
+		is_ancestor: bool,
+		/// The commits (two or more).
+		#[arg(required = true)]
+		commits: Vec<String>,
+	},
 	/// List the paths tracked in the index.
 	LsFiles,
 	/// Point a ref at an object.
@@ -299,6 +311,11 @@ impl Cli {
 			}
 			Command::RevParse { spec } => commands::rev_parse::run(&cwd, &spec).await,
 			Command::RevList { spec } => commands::rev_list::run(&cwd, &spec).await,
+			Command::MergeBase {
+				all,
+				is_ancestor,
+				commits,
+			} => commands::merge_base::run(&cwd, all, is_ancestor, commits).await,
 			Command::LsFiles => commands::ls_files::run(&cwd).await,
 			Command::UpdateRef { name, value } => commands::update_ref::run(&cwd, &name, &value).await,
 			Command::SymbolicRef { name, target } => {

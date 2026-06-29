@@ -73,7 +73,7 @@ cargo run -p gta -- log
 Implemented command groups:
 
 - Plumbing: `hash-object`, `cat-file`, `ls-tree`, `rev-parse`, `rev-list`,
-  `ls-files`.
+  `merge-base`, `ls-files`.
 - Ref operations: `update-ref`, `symbolic-ref`, `branch`, `tag`.
 - Working-tree porcelain: `add`, `rm`, `mv`, `status`, `commit`, `log`, `show`,
   `switch`, `checkout`, `restore`, `reset`, `diff`.
