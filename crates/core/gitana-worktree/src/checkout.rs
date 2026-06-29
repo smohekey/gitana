@@ -75,6 +75,16 @@ where
 	}
 
 	for (path, mode, oid) in &target {
+		// Without `force`, leave a path unchanged from the index alone — so a local edit to a file
+		// the checkout does not touch (e.g. an unrelated dirty file during a merge) is preserved,
+		// the way git does. `force` (re)writes everything, restoring such files.
+		if !force
+			&& current
+				.get(path)
+				.is_some_and(|(cm, co)| cm == mode && co == oid)
+		{
+			continue;
+		}
 		write_entry(wt, path, mode, *oid, &mut index).await?;
 	}
 	for path in current.keys() {

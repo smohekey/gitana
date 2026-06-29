@@ -153,6 +153,21 @@ enum Command {
 		#[arg(short = 'm', long = "message")]
 		message: String,
 	},
+	/// Merge a commit into the current branch (fast-forward or a true merge commit).
+	Merge {
+		/// The commit (or branch) to merge into the current branch.
+		#[arg(long)]
+		commit: String,
+		/// Merge commit message.
+		#[arg(short = 'm', long = "message")]
+		message: Option<String>,
+		/// Always create a merge commit, even when a fast-forward is possible.
+		#[arg(long = "no-ff")]
+		no_ff: bool,
+		/// Refuse to merge unless a fast-forward is possible.
+		#[arg(long = "ff-only")]
+		ff_only: bool,
+	},
 	/// Show the commit history of HEAD (one line per commit).
 	Log,
 	/// Show an object: a commit and its diff, a tag, a tree, or a blob (default: HEAD).
@@ -379,6 +394,12 @@ impl Cli {
 			Command::Add { pathspecs } => commands::add::run(&cwd, &pathspecs).await,
 			Command::Status => commands::status::run(&cwd).await,
 			Command::Commit { message } => commands::commit::run(&cwd, &message).await,
+			Command::Merge {
+				commit,
+				message,
+				no_ff,
+				ff_only,
+			} => commands::merge::run(&cwd, commit, message, no_ff, ff_only).await,
 			Command::Log => commands::log::run(&cwd).await,
 			Command::Show { object } => commands::show::run(&cwd, object).await,
 			Command::Config {
