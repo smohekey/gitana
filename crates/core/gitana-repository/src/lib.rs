@@ -10,6 +10,7 @@
 mod config;
 mod error;
 mod head;
+mod merge;
 mod merge_base;
 mod mode;
 mod refs;
@@ -18,6 +19,6 @@ mod revision;
 mod tree;
 
 pub use self::{
-	config::Config, error::RepositoryError, head::HeadState, mode::FileMode, refs::RefStore,
-	repository::Repository, tree::TreeBuildEntry,
+	config::Config, error::RepositoryError, head::HeadState, merge::TreeMerge, mode::FileMode,
+	refs::RefStore, repository::Repository, tree::TreeBuildEntry,
 };

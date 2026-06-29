@@ -32,8 +32,9 @@ What works today:
 
 Major gaps:
 
-- Merge and conflict handling are not implemented. `gta pull` is fast-forward
-  only.
+- A three-way tree merge engine exists (`Repository::merge_trees`, with diff3
+  content merging), but it is not yet wired into a `merge` command or the index;
+  `gta pull` is still fast-forward only.
 - There is no rebase, cherry-pick, revert, stash, blame, bisect, submodule, hook,
   or sparse-checkout support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
@@ -96,6 +97,7 @@ Implemented command groups:
 - `crates/core/gitana-worktree`: Git index, worktree scanning, status, add,
   checkout, and diff support.
 - `crates/core/gitana-config`: Git config parser.
+- `crates/core/gitana-diff`: Myers line diff and diff3 three-way line merge.
 - `crates/core/gitana-git-http`: Transport-agnostic Smart HTTP protocol helpers.
 - `crates/cli/gta-core`: Shared command implementations.
 - `crates/cli/gta`: User-facing CLI.

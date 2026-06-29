@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 gitana-config.workspace = true
+gitana-diff.workspace = true
 gitana-file-store.workspace = true
 gitana-object.workspace = true
 gitana-object-store.workspace = true

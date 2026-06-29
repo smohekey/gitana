@@ -254,6 +254,17 @@ where
 		crate::merge_base::is_ancestor(self, ancestor, descendant).await
 	}
 
+	/// Three-way merge the `ours` and `theirs` trees against their common `base` tree, returning the
+	/// merged tree and the conflicted paths.
+	pub async fn merge_trees(
+		&self,
+		base: ObjectId,
+		ours: ObjectId,
+		theirs: ObjectId,
+	) -> Result<crate::TreeMerge, RepositoryError> {
+		crate::merge::merge_trees(self, base, ours, theirs).await
+	}
+
 	/// Read and validate the repository config; refuse non-sha256 / unknown formats.
 	pub async fn open(&self) -> Result<Config, RepositoryError> {
 		let files = self.objects.file_store();

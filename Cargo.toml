@@ -15,6 +15,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 clap-mcp = "0.0.5"
 flate2 = "1.1.9"
 gitana-config = { path = "crates/core/gitana-config" }
+gitana-diff = { path = "crates/core/gitana-diff" }
 gitana-file-store = { path = "crates/core/gitana-file-store" }
 gitana-file-store-conformance = { path = "crates/core/gitana-file-store-conformance" }
 gitana-file-store-local = { path = "crates/core/gitana-file-store-local" }

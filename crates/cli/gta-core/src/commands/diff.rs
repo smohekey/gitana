@@ -2,13 +2,10 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
+use gitana_diff::Edit;
 use gitana_worktree::FileDiff;
 
 use crate::repo;
-
-mod myers;
-
-use myers::Edit;
 
 /// Number of unchanged context lines shown around each change (git's default).
 const CONTEXT: usize = 3;
@@ -64,7 +61,7 @@ pub(crate) fn format_file(out: &mut Vec<u8>, file: &FileDiff) {
 
 	let old_lines: Vec<&[u8]> = lines(old_bytes);
 	let new_lines: Vec<&[u8]> = lines(new_bytes);
-	let edits = myers::diff(&old_lines, &new_lines);
+	let edits = gitana_diff::diff(&old_lines, &new_lines);
 	emit_hunks(out, &edits, &old_lines, &new_lines);
 }
 

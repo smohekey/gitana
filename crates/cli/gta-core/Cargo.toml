@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 gitana-config.workspace = true
+gitana-diff.workspace = true
 gitana-file-store.workspace = true
 gitana-file-store-local.workspace = true
 gitana-git-http.workspace = true

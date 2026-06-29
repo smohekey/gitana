@@ -17,7 +17,7 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 ## Merge And History Editing
 
 - [x] Add merge-base computation. `Repository::merge_base`/`is_ancestor` (paint-down-to-common-ancestors with redundancy removal and octopus reduction) plus a `gta merge-base [--all] [--is-ancestor]` command, oracle-tested against stock git.
-- [ ] Add a three-way tree merge engine.
+- [x] Add a three-way tree merge engine. `Repository::merge_trees` recursively merges trees with diff3 line-level content merge (in the new `gitana-diff` crate); clean merges match `git merge-tree --write-tree` byte-for-byte, conflicts are reported per path. Not yet wired to the index/`merge` command.
 - [ ] Extend the index and status surfaces for conflict stages and unmerged paths.
 - [ ] Add `merge` for fast-forward and true merge commits.
 - [ ] Teach `pull` to merge when fast-forward is impossible.
