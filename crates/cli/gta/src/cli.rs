@@ -11,7 +11,7 @@ pub async fn run() -> Result<()> {
 
 #[derive(Parser)]
 #[command(name = "gta", version, about = "A git-compatible, SHA-256 CLI")]
-struct Cli {
+pub(crate) struct Cli {
 	/// Run as if started in `<dir>`.
 	#[arg(short = 'C', value_name = "dir", global = true)]
 	directory: Option<PathBuf>,

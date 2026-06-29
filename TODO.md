@@ -12,7 +12,7 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [x] Add `show` for common commit/object display.
 - [x] Add `config` read/write support for local repository configuration.
 - [x] Make `config` writes preserve comments and layout. The config crate now retains each element's raw text and a value byte-span, so `set` edits the value in place and `add`/`unset` touch only their own line; comments and layout survive.
-- [ ] Keep `gta` and `gta-mcp` command surfaces in lockstep as each command lands.
+- [x] Keep `gta` and `gta-mcp` command surfaces in lockstep as each command lands. Enforced by a `surface_parity` test that compares a normalized spec of both clap command trees — recursively, including root/global args, and per argument its required-ness, action (arity), allowed values, defaults, and groups — whitelisting only the intended positional-vs-named presentation and the mcp-only serving flags.
 
 ## Merge And History Editing
 

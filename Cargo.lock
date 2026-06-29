@@ -904,6 +904,7 @@ dependencies = [
  "gitana-object-store",
  "gitana-repository",
  "gta-core",
+ "gta-mcp",
  "tempfile",
  "tokio",
 ]

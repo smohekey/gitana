@@ -290,7 +290,7 @@ enum Command {
 		#[arg(long)]
 		verbose: bool,
 		/// One or more sources followed by the destination.
-		#[arg(long)]
+		#[arg(long, required = true)]
 		paths: Vec<String>,
 	},
 	/// Show changes between commits, the index, and the working tree.
