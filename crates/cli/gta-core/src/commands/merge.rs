@@ -115,7 +115,16 @@ impl WorkTreeCommand for Merge {
 
 		// Fast-forward (always for an unborn branch — there is no commit to be a merge parent).
 		if can_fast_forward && (!self.no_ff || head_tip.is_none()) {
-			wt.checkout(theirs_tree, false).await?;
+			// Apply only the HEAD→theirs diff (git's two-way merge), so unrelated staged or dirty files
+			// survive; a local change to a path the fast-forward updates is refused, not clobbered.
+			let from_tree = match head_tip {
+				Some(head) => repository.commit_tree(head).await?,
+				None => repository.write_tree(&[]).await?,
+			};
+			let overwrite = wt.twoway_merge(from_tree, theirs_tree).await?;
+			if !overwrite.is_empty() {
+				bail!("{}", would_overwrite_message(&overwrite));
+			}
 			let committer = identity::signature_or_default(repository, "COMMITTER").await;
 			repository
 				.reset_head(theirs, &committer, &format!("merge {commit}: Fast-forward"))
@@ -133,6 +142,15 @@ impl WorkTreeCommand for Merge {
 
 		// A real merge commit needs the current tip as its first parent.
 		let head = head_tip.expect("non-fast-forward merge has a current commit");
+		let head_tree = repository.commit_tree(head).await?;
+
+		// A true merge rewrites the whole index from the merged tree, so git refuses any staged change
+		// (the index must equal HEAD) — otherwise the materialising checkout would silently drop it.
+		let staged = tree_diff_paths(repository, head_tree, conflict::index_tree(&wt).await?).await?;
+		if !staged.is_empty() {
+			bail!("{}", would_overwrite_message(&staged));
+		}
+
 		let message = match self.message {
 			Some(message) => message,
 			None => default_message(repository, &commit).await,
@@ -152,7 +170,6 @@ impl WorkTreeCommand for Merge {
 			// Reduce multiple merge bases (a criss-cross history) to one virtual base tree, as git's
 			// recursive strategy does — otherwise such merges report false conflicts.
 			let base_tree = virtual_base_tree(repository, &bases).await?;
-			let head_tree = repository.commit_tree(head).await?;
 			let merge = repository
 				.merge_trees(base_tree, head_tree, theirs_tree)
 				.await?;
@@ -273,6 +290,41 @@ async fn abort_merge<H: HashAlgorithm>(wt: &WorkTree<LocalFileStore, H>) -> Resu
 	conflict::restore_to_head(wt).await?;
 	repository.clear_merge().await?;
 	Ok(())
+}
+
+/// git's "your local changes would be overwritten" refusal, listing the offending paths.
+fn would_overwrite_message(paths: &[String]) -> String {
+	format!(
+		"Your local changes to the following files would be overwritten by merge:\n  {}\nPlease commit your changes or stash them before you merge.",
+		paths.join("\n  ")
+	)
+}
+
+/// The paths that differ between two trees (added/removed/modified), sorted.
+async fn tree_diff_paths<H: HashAlgorithm>(
+	repository: &Repository<LocalFileStore, H>,
+	a: ObjectId<H>,
+	b: ObjectId<H>,
+) -> Result<Vec<String>> {
+	use std::collections::{HashMap, HashSet};
+	let map = |entries: Vec<(String, String, ObjectId<H>)>| {
+		entries
+			.into_iter()
+			.map(|(path, mode, oid)| (path, (mode, oid)))
+			.collect::<HashMap<_, _>>()
+	};
+	let am = map(repository.read_tree(a).await?);
+	let bm = map(repository.read_tree(b).await?);
+	let mut paths: Vec<String> = am
+		.keys()
+		.chain(bm.keys())
+		.cloned()
+		.collect::<HashSet<_>>()
+		.into_iter()
+		.filter(|path| am.get(path) != bm.get(path))
+		.collect();
+	paths.sort();
+	Ok(paths)
 }
 
 /// git's default merge message: `Merge branch '<name>'` when the argument names a local branch,

@@ -227,6 +227,18 @@ impl<F: FileStore, H: HashAlgorithm> WorkTree<F, H> {
 		crate::checkout::run(self, tree, force).await
 	}
 
+	/// Apply only the `from_tree` → `to_tree` diff (git's `read-tree -m -u` two-way merge, for a
+	/// fast-forward): touch just the changed paths, leaving unrelated staged or dirty entries alone.
+	/// Returns the changed paths whose local state would be overwritten (empty = applied; nothing is
+	/// applied when non-empty). Does not move `HEAD`.
+	pub async fn twoway_merge(
+		&self,
+		from_tree: ObjectId<H>,
+		to_tree: ObjectId<H>,
+	) -> Result<Vec<String>, WorktreeError> {
+		crate::checkout::twoway_merge(self, from_tree, to_tree).await
+	}
+
 	/// Restore `pathspecs` from `source` (a tree; `None` = the current index) into the chosen
 	/// targets — the working tree (`worktree`) and/or the index (`staged`) — discarding any
 	/// uncommitted changes to those paths. A selected path absent from the source but currently

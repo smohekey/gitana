@@ -108,6 +108,115 @@ where
 	wt.save_index(&index)
 }
 
+/// Apply only the `from_tree` → `to_tree` diff to the work tree and index — git's `read-tree -m -u`
+/// two-way merge, used for a fast-forward. Paths unchanged between the two trees (including unrelated
+/// staged or dirty entries) are left untouched. A *changed* path that is not clean — its stage-0
+/// index entry differs from `from` (a staged change), its work-tree file differs from the index (a
+/// local edit), or an untracked file sits where `to` adds one — would be overwritten; all such paths
+/// are returned (sorted) and **nothing** is applied. An empty result means the diff was applied.
+pub(crate) async fn twoway_merge<F, H>(
+	wt: &WorkTree<F, H>,
+	from_tree: ObjectId<H>,
+	to_tree: ObjectId<H>,
+) -> Result<Vec<String>, WorktreeError>
+where
+	F: FileStore,
+	H: HashAlgorithm,
+{
+	let from = tree_map(wt.repository().read_tree(from_tree).await?);
+	let to = tree_map(wt.repository().read_tree(to_tree).await?);
+
+	// The only paths this update touches: those that differ between the two trees.
+	let mut changed: Vec<&str> = from
+		.keys()
+		.chain(to.keys())
+		.map(String::as_str)
+		.collect::<HashSet<_>>()
+		.into_iter()
+		.filter(|path| from.get(*path) != to.get(*path))
+		.collect();
+	changed.sort_unstable();
+
+	let mut index = wt.load_index()?;
+	let staged: HashMap<String, (String, ObjectId<H>)> = index
+		.entries
+		.iter()
+		.filter(|e| e.stage == 0)
+		.map(|e| (e.path.clone(), (format!("{:o}", e.mode), e.oid)))
+		.collect();
+
+	// Refuse any changed path whose local state (index or work tree) would be overwritten.
+	let mut would_overwrite = Vec::new();
+	for &path in &changed {
+		let current = staged.get(path);
+		if from.get(path) != current || !is_clean(wt, path, current)? {
+			would_overwrite.push(path.to_owned());
+		}
+	}
+	if !would_overwrite.is_empty() {
+		return Ok(would_overwrite);
+	}
+
+	// Apply only the diff; everything else (unrelated staged/dirty entries) is left as-is.
+	for &path in &changed {
+		match to.get(path) {
+			Some((mode, oid)) => write_entry(wt, path, mode, *oid, &mut index).await?,
+			None => {
+				remove_worktree_file(wt, path)?;
+				index.remove(path);
+			}
+		}
+	}
+	wt.save_index(&index)?;
+	Ok(Vec::new())
+}
+
+/// A recursive tree listing as `path -> (mode, oid)`.
+fn tree_map<H: HashAlgorithm>(
+	entries: Vec<(String, String, ObjectId<H>)>,
+) -> HashMap<String, (String, ObjectId<H>)> {
+	entries
+		.into_iter()
+		.map(|(path, mode, oid)| (path, (mode, oid)))
+		.collect()
+}
+
+/// Whether `path` is clean enough to overwrite: a tracked path's work-tree file matches the index
+/// (`current`), an added path has no untracked file in the way (unless `.gitignore`d), and an absent
+/// file is always fine. The index-vs-`HEAD` (staged) check is the caller's. Mirrors
+/// [`ensure_no_overwrite`] but as a boolean for the two-way merge's batch check.
+fn is_clean<F, H>(
+	wt: &WorkTree<F, H>,
+	path: &str,
+	current: Option<&(String, ObjectId<H>)>,
+) -> Result<bool, WorktreeError>
+where
+	F: FileStore,
+	H: HashAlgorithm,
+{
+	let full = wt.work_dir().join(path);
+	let meta = match std::fs::symlink_metadata(&full) {
+		Ok(meta) => meta,
+		Err(error)
+			if matches!(
+				error.kind(),
+				std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+			) =>
+		{
+			return Ok(true);
+		}
+		Err(error) => return Err(error.into()),
+	};
+	match current {
+		Some((mode, oid)) => Ok(matches!(
+			blob_of(&full, &meta)?,
+			Some((woid, wmode)) if woid == *oid && format!("{wmode:o}") == *mode
+		)),
+		// An untracked file sits where `to` adds a path: refuse unless it is `.gitignore`d.
+		None => path_ignored(wt.work_dir(), path),
+	}
+}
+
 /// Write `path`'s blob into the working tree and record it in the index. Combines a
 /// working-tree write with the matching index upsert; used to materialise a whole tree.
 pub(crate) async fn write_entry<F, H>(

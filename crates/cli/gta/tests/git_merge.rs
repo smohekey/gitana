@@ -508,6 +508,95 @@ fn refuses_to_merge_with_an_unconcluded_merge() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+#[test]
+fn fast_forward_preserves_an_unrelated_staged_file() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-merge-ff-staged");
+	let w = work.to_str().unwrap();
+	let main = head_branch(w);
+
+	write(&work, "a.txt", "a\n");
+	commit_all(w, "A");
+	git(w, &["checkout", "-q", "-b", "feature"]);
+	write(&work, "b.txt", "b\n"); // feature adds b.txt; the FF updates only b.txt
+	let b = commit_all(w, "B");
+	git(w, &["checkout", "-q", &main]);
+	// Stage an unrelated new file; git's FF keeps it, so gta must too (not delete it).
+	write(&work, "staged.txt", "s\n");
+	gta(w, &["add", "staged.txt"], b"");
+
+	gta(w, &["merge", "feature"], b"");
+	assert_eq!(gta(w, &["rev-parse", "HEAD"], b"").trim(), b); // fast-forwarded
+	assert!(work.join("staged.txt").exists(), "staged file preserved");
+	assert!(
+		git(w, &["status", "--porcelain"]).contains("A  staged.txt"),
+		"still staged"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn fast_forward_refuses_a_staged_change_to_a_touched_path() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-merge-ff-touched");
+	let w = work.to_str().unwrap();
+	let main = head_branch(w);
+
+	write(&work, "f.txt", "base\n");
+	let a = commit_all(w, "A");
+	git(w, &["checkout", "-q", "-b", "feature"]);
+	write(&work, "f.txt", "feature\n"); // the FF updates f.txt
+	commit_all(w, "B");
+	git(w, &["checkout", "-q", &main]);
+	// Stage a different change to f.txt — git refuses the FF (would be overwritten).
+	write(&work, "f.txt", "staged\n");
+	gta(w, &["add", "f.txt"], b"");
+
+	gta_fail(w, &["merge", "feature"]);
+	assert_eq!(gta(w, &["rev-parse", "HEAD"], b"").trim(), a); // unchanged
+	assert_eq!(
+		std::fs::read_to_string(work.join("f.txt")).unwrap(),
+		"staged\n" // staged change intact
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn true_merge_refuses_any_staged_change() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-merge-staged-true");
+	let w = work.to_str().unwrap();
+	let main = head_branch(w);
+
+	write(&work, "base.txt", "base\n");
+	commit_all(w, "base");
+	git(w, &["checkout", "-q", "-b", "feature"]);
+	write(&work, "f.txt", "f\n");
+	commit_all(w, "F");
+	git(w, &["checkout", "-q", &main]);
+	write(&work, "m.txt", "m\n");
+	let main_tip = commit_all(w, "M"); // diverged -> a true merge
+
+	// Stage an unrelated new file; git refuses a true merge with any staged change.
+	write(&work, "staged.txt", "s\n");
+	gta(w, &["add", "staged.txt"], b"");
+
+	gta_fail(w, &["merge", "feature"]);
+	assert_eq!(gta(w, &["rev-parse", "HEAD"], b"").trim(), main_tip); // unmoved
+	assert!(work.join("staged.txt").exists(), "staged file intact");
+	assert!(!work.join(".git/MERGE_HEAD").exists(), "no merge started");
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 fn init(tag: &str) -> PathBuf {
 	let work = unique_tmp(tag);
 	let w = work.to_str().unwrap();
