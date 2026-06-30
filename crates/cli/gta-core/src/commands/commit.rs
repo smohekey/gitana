@@ -40,6 +40,12 @@ impl WorkTreeCommand for Commit<'_> {
 			return crate::commands::merge::complete_merge(&worktree, Some(self.message.to_owned()))
 				.await;
 		}
+		// Concluding a cherry-pick: a single-parent commit preserving the picked author (clears
+		// `CHERRY_PICK_HEAD`).
+		if repo.cherry_pick_head().await?.is_some() {
+			return crate::commands::cherry_pick::complete(&worktree, Some(self.message.to_owned()))
+				.await;
+		}
 
 		let entries = index_tree_entries(&index);
 		if entries.is_empty() {

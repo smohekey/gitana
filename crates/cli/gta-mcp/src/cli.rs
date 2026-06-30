@@ -177,6 +177,18 @@ enum Command {
 		#[arg(long = "continue")]
 		continue_: bool,
 	},
+	/// Re-apply a commit's change onto the current branch (preserving its author).
+	CherryPick {
+		/// The commit to cherry-pick (omit with --abort/--continue).
+		#[arg(long)]
+		commit: Option<String>,
+		/// Abort an in-progress cherry-pick, restoring the pre-pick state.
+		#[arg(long = "abort")]
+		abort: bool,
+		/// Conclude an in-progress cherry-pick after resolving its conflicts.
+		#[arg(long = "continue")]
+		continue_: bool,
+	},
 	/// Show the commit history of HEAD (one line per commit).
 	Log,
 	/// Show an object: a commit and its diff, a tag, a tree, or a blob (default: HEAD).
@@ -414,6 +426,11 @@ impl Cli {
 				abort,
 				continue_,
 			} => commands::merge::run(&cwd, commit, message, no_ff, ff_only, abort, continue_).await,
+			Command::CherryPick {
+				commit,
+				abort,
+				continue_,
+			} => commands::cherry_pick::run(&cwd, commit, abort, continue_).await,
 			Command::Log => commands::log::run(&cwd).await,
 			Command::Show { object } => commands::show::run(&cwd, object).await,
 			Command::Config {

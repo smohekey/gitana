@@ -309,6 +309,25 @@ where
 		crate::merge_state::clear_merge(self).await
 	}
 
+	/// Record an in-progress cherry-pick: `CHERRY_PICK_HEAD` (the commit being picked) and `MERGE_MSG`.
+	pub async fn start_cherry_pick(
+		&self,
+		commit: ObjectId<H>,
+		message: &str,
+	) -> Result<(), RepositoryError> {
+		crate::merge_state::start_cherry_pick(self, commit, message).await
+	}
+
+	/// The commit recorded in `CHERRY_PICK_HEAD`, or `None` when no cherry-pick is in progress.
+	pub async fn cherry_pick_head(&self) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		crate::merge_state::cherry_pick_head(self).await
+	}
+
+	/// Clear the in-progress cherry-pick state (`CHERRY_PICK_HEAD`, `MERGE_MSG`).
+	pub async fn clear_cherry_pick(&self) -> Result<(), RepositoryError> {
+		crate::merge_state::clear_cherry_pick(self).await
+	}
+
 	/// Resolve a revision spec (`HEAD`, `main`, `<oid>`, `HEAD~2`, `v1^{commit}`, …)
 	/// to an object id.
 	pub async fn rev_parse(&self, spec: &str) -> Result<ObjectId<H>, RepositoryError> {

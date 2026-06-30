@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -7,7 +6,7 @@ use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
 
-use crate::commands::commit::index_tree_entries;
+use crate::commands::conflict::{self, ensure_trailing_newline};
 use crate::dispatch::{self, WorkTreeCommand};
 use crate::identity;
 
@@ -76,9 +75,13 @@ impl WorkTreeCommand for Merge {
 
 		// Refuse to start a new merge before the previous one is concluded: `MERGE_HEAD` persists until
 		// the merge is committed or aborted, even once its conflicts have been resolved and the index is
-		// clean again. (cherry-pick/revert state files would be added with those commands.)
+		// clean again.
 		if repository.merge_head().await?.is_some() {
 			bail!("you have not concluded your merge (MERGE_HEAD exists)");
+		}
+		// Symmetrically, refuse to start a merge while a cherry-pick is unconcluded (as git does).
+		if repository.cherry_pick_head().await?.is_some() {
+			bail!("you have not concluded your cherry-pick (CHERRY_PICK_HEAD exists)");
 		}
 		// Likewise refuse an index that still carries unmerged stages.
 		if wt.load_index()?.has_conflicts() {
@@ -197,9 +200,9 @@ impl WorkTreeCommand for Merge {
 	}
 }
 
-/// Materialise a conflicting merge: write the merged work tree (conflict files carry markers) and a
-/// conflicted index (stages 1/2/3 from base/ours/theirs), record `MERGE_HEAD`/`MERGE_MSG`/`ORIG_HEAD`,
-/// report the conflicts, and exit non-zero — leaving the state for the user to resolve, as git does.
+/// Materialise a conflicting merge: write the merged work tree and conflicted index, record
+/// `MERGE_HEAD`/`MERGE_MSG`/`ORIG_HEAD`, report the conflicts, and exit non-zero — leaving the state
+/// for the user to resolve, as git does.
 #[allow(clippy::too_many_arguments)]
 async fn materialise_conflict<H: HashAlgorithm>(
 	wt: &WorkTree<LocalFileStore, H>,
@@ -212,36 +215,19 @@ async fn materialise_conflict<H: HashAlgorithm>(
 	conflicts: &[String],
 	message: &str,
 ) -> Result<()> {
+	conflict::write_conflicted_state(
+		wt,
+		merged_tree,
+		base_tree,
+		head_tree,
+		theirs_tree,
+		conflicts,
+	)
+	.await?;
 	let repository = wt.repository();
-
-	// Write the merged result (markers in conflicted files) and a stage-0 index, refusing — before
-	// any state is recorded — if it would clobber a touched local change.
-	wt.checkout(merged_tree, false).await?;
-
-	let base = tree_entry_map(repository, base_tree).await?;
-	let ours = tree_entry_map(repository, head_tree).await?;
-	let theirs_entries = tree_entry_map(repository, theirs_tree).await?;
-	let mut index = wt.load_index()?;
-	for path in conflicts {
-		index.record_conflict(
-			path,
-			base.get(path).copied(),
-			ours.get(path).copied(),
-			theirs_entries.get(path).copied(),
-		);
-	}
-	wt.save_index(&index)?;
-
 	repository.set_orig_head(head).await?;
 	repository.start_merge(theirs, message).await?;
-
-	for path in conflicts {
-		println!("CONFLICT (content): Merge conflict in {path}");
-	}
-	// Signal the conflict as a typed outcome; the front-end turns it into a non-zero exit (`gta`) or a
-	// tool error (`gta-mcp`). A library function must not decide the process's fate with `exit`, which
-	// would terminate a long-lived `gta-mcp` server.
-	Err(crate::MergeConflict.into())
+	Err(conflict::report_conflicts(conflicts))
 }
 
 /// Conclude an in-progress merge: a two-parent commit from the resolved index. Shared by
@@ -256,16 +242,7 @@ pub(crate) async fn complete_merge<H: HashAlgorithm>(
 		bail!("there is no merge in progress (MERGE_HEAD is missing)");
 	};
 
-	let index = wt.load_index()?;
-	if index.has_conflicts() {
-		bail!(
-			"committing is not possible because you have unmerged files; resolve them and mark resolution with `gta add`/`gta rm`"
-		);
-	}
-	// An empty index is a valid result here (e.g. a delete/modify conflict resolved by deleting the
-	// file): git records a two-parent merge commit with an empty tree, unlike an ordinary commit.
-	let entries = index_tree_entries(&index);
-	let tree = repository.write_tree(&entries).await?;
+	let tree = conflict::resolved_tree(wt).await?;
 	let author = identity::signature(repository, "AUTHOR").await?;
 	let committer = identity::signature(repository, "COMMITTER").await?;
 	let message = match message_override {
@@ -292,12 +269,8 @@ async fn abort_merge<H: HashAlgorithm>(wt: &WorkTree<LocalFileStore, H>) -> Resu
 	if repository.merge_head().await?.is_none() {
 		bail!("there is no merge to abort (MERGE_HEAD is missing)");
 	}
-	// HEAD does not move while a merge is in progress, so its tree is the pre-merge state.
-	let Some(head) = repository.refs().resolve_head().await? else {
-		bail!("there is no merge to abort (HEAD is unborn)");
-	};
-	let head_tree = repository.commit_tree(head).await?;
-	wt.checkout(head_tree, true).await?;
+	// HEAD does not move while a merge is in progress, so restoring it is the pre-merge state.
+	conflict::restore_to_head(wt).await?;
 	repository.clear_merge().await?;
 	Ok(())
 }
@@ -319,27 +292,6 @@ async fn default_message<H: HashAlgorithm>(
 		format!("Merge branch '{arg}'")
 	} else {
 		format!("Merge commit '{arg}'")
-	}
-}
-
-/// A tree's entries as `path -> (mode, oid)`, for recording conflict stages.
-async fn tree_entry_map<H: HashAlgorithm>(
-	repository: &Repository<LocalFileStore, H>,
-	tree: ObjectId<H>,
-) -> Result<HashMap<String, (u32, ObjectId<H>)>> {
-	let mut map = HashMap::new();
-	for (path, mode, oid) in repository.read_tree(tree).await? {
-		let mode = u32::from_str_radix(&mode, 8).unwrap_or(0o100644);
-		map.insert(path, (mode, oid));
-	}
-	Ok(map)
-}
-
-fn ensure_trailing_newline(message: String) -> String {
-	if message.ends_with('\n') {
-		message
-	} else {
-		format!("{message}\n")
 	}
 }
 

@@ -9,6 +9,7 @@ use crate::{Repository, RepositoryError};
 
 const MERGE_HEAD: &str = "MERGE_HEAD";
 const MERGE_MSG: &str = "MERGE_MSG";
+const CHERRY_PICK_HEAD: &str = "CHERRY_PICK_HEAD";
 
 /// Record an in-progress merge: `MERGE_HEAD` (the commit being merged) and `MERGE_MSG` (the prepared
 /// commit message).
@@ -25,10 +26,45 @@ pub(crate) async fn start_merge<H: HashAlgorithm>(
 pub(crate) async fn merge_head<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 ) -> Result<Option<ObjectId<H>>, RepositoryError> {
-	match repo.objects().file_store().read_path(MERGE_HEAD).await {
+	read_oid_file(repo, MERGE_HEAD).await
+}
+
+/// Record an in-progress cherry-pick: `CHERRY_PICK_HEAD` (the commit being picked) and `MERGE_MSG`
+/// (its message, reused on completion).
+pub(crate) async fn start_cherry_pick<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	commit: ObjectId<H>,
+	message: &str,
+) -> Result<(), RepositoryError> {
+	force_write(repo, CHERRY_PICK_HEAD, format!("{commit}\n").as_bytes()).await?;
+	force_write(repo, MERGE_MSG, message.as_bytes()).await
+}
+
+/// The commit recorded in `CHERRY_PICK_HEAD`, or `None` when no cherry-pick is in progress.
+pub(crate) async fn cherry_pick_head<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+) -> Result<Option<ObjectId<H>>, RepositoryError> {
+	read_oid_file(repo, CHERRY_PICK_HEAD).await
+}
+
+/// Clear the in-progress cherry-pick state (`CHERRY_PICK_HEAD`, `MERGE_MSG`).
+pub(crate) async fn clear_cherry_pick<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+) -> Result<(), RepositoryError> {
+	delete_if_present(repo, CHERRY_PICK_HEAD).await?;
+	delete_if_present(repo, MERGE_MSG).await
+}
+
+/// Read an object id from a state file holding one on its first line (`MERGE_HEAD`,
+/// `CHERRY_PICK_HEAD`), or `None` when the file is absent.
+async fn read_oid_file<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	path: &str,
+) -> Result<Option<ObjectId<H>>, RepositoryError> {
+	match repo.objects().file_store().read_path(path).await {
 		Ok(bytes) => {
 			let text = std::str::from_utf8(&bytes)
-				.map_err(|_| RepositoryError::UnsupportedFormat("MERGE_HEAD is not UTF-8".to_owned()))?;
+				.map_err(|_| RepositoryError::UnsupportedFormat(format!("{path} is not UTF-8")))?;
 			Ok(Some(ObjectId::from_hex(text.trim())?))
 		}
 		Err(FileStoreError::NotFound) => Ok(None),
