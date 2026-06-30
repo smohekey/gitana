@@ -1,62 +1,36 @@
-//! `gta pull` — fetch the current branch from the origin, fast-forward it, and update
-//! the working tree. Merge (non-fast-forward) is not supported.
+//! `gta pull` — fetch from the origin (updating remote-tracking refs) and integrate the current
+//! branch's upstream: fast-forward, or a true merge commit when the histories have diverged.
 
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use gitana_repository::HeadState;
-use gitana_worktree::WorkTree;
 
+use crate::commands::{fetch, merge};
 use crate::repo;
-use crate::transport::{self, Origin, local_haves};
+use crate::transport::Origin;
 
 /// Pull `HEAD`'s branch from the origin.
 pub async fn run(cwd: &Path) -> Result<()> {
-	let (work, git_dir) = repo::discover(cwd)?;
-	let work = work.ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?;
+	let (_, git_dir) = repo::discover(cwd)?;
 	let repository = repo::open(&git_dir);
-	let origin = Origin::load(&git_dir)?;
 
 	let branch = match repository.refs().read_head().await? {
 		HeadState::Symbolic(branch) => branch,
 		HeadState::Detached(_) => bail!("cannot pull onto a detached HEAD"),
 	};
 
-	let advertised = transport::discover_upload(&origin).await?;
+	// Fetch all branches and update the remote-tracking refs (`refs/remotes/origin/*`), like git —
+	// so the fetched tip is recorded under a ref even if the integration below fails.
+	let advertised = fetch::run(cwd).await?;
+
+	// Take the branch's tip from the *current* advertisement, so an upstream branch that no longer
+	// exists is reported rather than integrating a possibly-stale remote-tracking ref.
 	let remote_tip = advertised
 		.oid_of(&branch)
 		.with_context(|| format!("origin has no {branch}"))?;
-	let local = repository.refs().resolve(&branch).await?;
 
-	let haves = local_haves(&repository).await?;
-	transport::fetch_pack(&origin, &repository, &[remote_tip], &haves).await?;
-
-	match local {
-		Some(old) if old == remote_tip => {
-			println!("Already up to date.");
-			return Ok(());
-		}
-		Some(old) => {
-			if !repository.rev_list(&[remote_tip]).await?.contains(&old) {
-				bail!("cannot fast-forward {branch}; merge is not supported");
-			}
-			repository
-				.refs()
-				.update_ref(&branch, remote_tip, Some(old))
-				.await?;
-		}
-		None => {
-			repository
-				.refs()
-				.update_ref(&branch, remote_tip, None)
-				.await?;
-		}
-	}
-
-	let tree = repository.commit_tree(remote_tip).await?;
-	let worktree = WorkTree::new(repository, &work, &git_dir);
-	worktree.checkout(tree, true).await?;
-
-	println!("Updated {branch} -> {remote_tip}");
-	Ok(())
+	let short = branch.strip_prefix("refs/heads/").unwrap_or(&branch);
+	let message = format!("Merge branch '{short}' of {}", Origin::load(&git_dir)?.url);
+	merge::run(cwd, remote_tip.to_hex(), Some(message), false, false).await
 }

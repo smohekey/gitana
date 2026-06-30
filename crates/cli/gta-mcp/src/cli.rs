@@ -470,7 +470,7 @@ impl Cli {
 			} => commands::mv::run(&cwd, force, dry_run, verbose, paths).await,
 			Command::Diff { cached } => commands::diff::run(&cwd, cached).await,
 			Command::Clone { url, path } => commands::clone::run(url, path).await,
-			Command::Fetch => commands::fetch::run(&cwd).await,
+			Command::Fetch => commands::fetch::run(&cwd).await.map(|_| ()),
 			Command::Pull => commands::pull::run(&cwd).await,
 			Command::Push {
 				signed,

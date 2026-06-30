@@ -4,12 +4,14 @@
 use std::path::Path;
 
 use anyhow::Result;
+use gitana_git_http::Advertised;
 
 use crate::repo;
 use crate::transport::{self, Origin, advertised_oids, local_haves};
 
-/// Fetch all branches from the origin into `refs/remotes/origin/*`.
-pub async fn run(cwd: &Path) -> Result<()> {
+/// Fetch all branches from the origin into `refs/remotes/origin/*`, returning the origin's
+/// advertisement (so a caller like `pull` can read the current upstream tips).
+pub async fn run(cwd: &Path) -> Result<Advertised> {
 	let (_work, git_dir) = repo::discover(cwd)?;
 	let repository = repo::open(&git_dir);
 	let origin = Origin::load(&git_dir)?;
@@ -32,5 +34,5 @@ pub async fn run(cwd: &Path) -> Result<()> {
 	}
 
 	println!("Fetched from {}", origin.url);
-	Ok(())
+	Ok(advertised)
 }
