@@ -19,6 +19,7 @@ pub mod merge_base;
 pub mod mv;
 pub mod pull;
 pub mod push;
+pub mod rebase;
 pub mod reset;
 pub mod restore;
 pub mod rev_list;

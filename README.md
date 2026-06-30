@@ -48,8 +48,11 @@ Major gaps:
   one (authored by the current user). Both use the same conflict lifecycle
   (`--abort` / `--continue` / `gta commit`, via `CHERRY_PICK_HEAD` /
   `REVERT_HEAD`). Multi-commit/range forms are not yet supported.
-- There is no rebase, stash, blame, bisect, submodule, hook, or sparse-checkout
-  support.
+- `gta rebase <upstream> [--onto <newbase>]` replays the branch's commits onto a
+  new base (linear histories only), with `--continue` / `--skip` / `--abort`.
+  Non-interactive: no `-i`, autosquash, or `--rebase-merges`.
+- There is no interactive rebase, stash, blame, bisect, submodule, hook, or
+  sparse-checkout support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
 - Push signing is still incomplete: the CLI has `--signed`, but key loading and

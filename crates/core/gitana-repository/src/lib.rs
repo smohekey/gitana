@@ -14,6 +14,7 @@ mod merge;
 mod merge_base;
 mod merge_state;
 mod mode;
+mod rebase_state;
 mod refs;
 mod repository;
 mod revision;
@@ -21,5 +22,5 @@ mod tree;
 
 pub use self::{
 	config::Config, error::RepositoryError, head::HeadState, merge::TreeMerge, mode::FileMode,
-	refs::RefStore, repository::Repository, tree::TreeBuildEntry,
+	rebase_state::RebaseState, refs::RefStore, repository::Repository, tree::TreeBuildEntry,
 };

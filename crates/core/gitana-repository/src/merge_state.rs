@@ -121,7 +121,7 @@ pub(crate) async fn clear_merge<H: HashAlgorithm>(
 }
 
 /// Overwrite `path` unconditionally (retrying on a concurrent change), like `write_config`.
-async fn force_write<H: HashAlgorithm>(
+pub(crate) async fn force_write<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	path: &str,
 	bytes: &[u8],
@@ -142,7 +142,7 @@ async fn force_write<H: HashAlgorithm>(
 }
 
 /// Delete `path` if it exists (retrying on a concurrent change); a missing path is fine.
-async fn delete_if_present<H: HashAlgorithm>(
+pub(crate) async fn delete_if_present<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	path: &str,
 ) -> Result<(), RepositoryError> {

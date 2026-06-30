@@ -53,15 +53,9 @@ impl WorkTreeCommand for CherryPick {
 		};
 		let repository = wt.repository();
 
-		// Refuse to start a new operation before the previous one is concluded.
-		if repository.cherry_pick_head().await?.is_some() {
-			bail!("a cherry-pick is already in progress (CHERRY_PICK_HEAD exists)");
-		}
-		if repository.merge_head().await?.is_some() {
-			bail!("you have not concluded your merge (MERGE_HEAD exists)");
-		}
-		if repository.revert_head().await?.is_some() {
-			bail!("you have not concluded your revert (REVERT_HEAD exists)");
+		// Refuse to start while another history-editing operation is unconcluded.
+		if let Some(op) = conflict::operation_in_progress(repository).await? {
+			bail!("a {op} is already in progress; conclude it (`--continue`) or abort it (`--abort`)");
 		}
 		if wt.load_index()?.has_conflicts() {
 			bail!("cherry-pick is not possible because you have unmerged files");

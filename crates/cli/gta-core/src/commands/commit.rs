@@ -34,6 +34,13 @@ impl WorkTreeCommand for Commit<'_> {
 		}
 
 		let repo = worktree.repository();
+		// A rebase replays commits itself; a plain `gta commit` would create a stray commit that the
+		// sequencer doesn't track, so direct the user to `gta rebase --continue`.
+		if repo.rebase_in_progress().await? {
+			bail!(
+				"you are in the middle of a rebase; run `gta rebase --continue` instead of `gta commit`"
+			);
+		}
 		// Concluding a merge: produce a two-parent merge commit (and clear `MERGE_HEAD`), so resolving
 		// and `gta commit` does not silently drop the merge's second parent.
 		if repo.merge_head().await?.is_some() {

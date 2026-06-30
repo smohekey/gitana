@@ -69,18 +69,10 @@ impl WorkTreeCommand for Merge {
 		}
 		let repository = wt.repository();
 
-		// Refuse to start a new merge before the previous one is concluded: `MERGE_HEAD` persists until
-		// the merge is committed or aborted, even once its conflicts have been resolved and the index is
-		// clean again.
-		if repository.merge_head().await?.is_some() {
-			bail!("you have not concluded your merge (MERGE_HEAD exists)");
-		}
-		// Symmetrically, refuse to start a merge while a cherry-pick or revert is unconcluded.
-		if repository.cherry_pick_head().await?.is_some() {
-			bail!("you have not concluded your cherry-pick (CHERRY_PICK_HEAD exists)");
-		}
-		if repository.revert_head().await?.is_some() {
-			bail!("you have not concluded your revert (REVERT_HEAD exists)");
+		// Refuse to start while another history-editing operation (merge/cherry-pick/revert/rebase) is
+		// unconcluded; its state must be committed or aborted first.
+		if let Some(op) = conflict::operation_in_progress(repository).await? {
+			bail!("a {op} is already in progress; conclude it (`--continue`) or abort it (`--abort`)");
 		}
 		// Likewise refuse an index that still carries unmerged stages.
 		if wt.load_index()?.has_conflicts() {

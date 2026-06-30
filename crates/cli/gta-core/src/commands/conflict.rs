@@ -14,6 +14,28 @@ use gitana_worktree::WorkTree;
 
 use crate::commands::commit::index_tree_entries;
 
+/// The merge-like operation currently in progress (`merge` / `cherry-pick` / `revert` / `rebase`), or
+/// `None` when the work tree is idle. The history-editing commands call this before starting so that
+/// only one operation is ever underway, and each is concluded (`--continue`) or discarded (`--abort`)
+/// before another begins.
+pub(crate) async fn operation_in_progress<H: HashAlgorithm>(
+	repository: &Repository<Backend, H>,
+) -> Result<Option<&'static str>> {
+	if repository.merge_head().await?.is_some() {
+		return Ok(Some("merge"));
+	}
+	if repository.cherry_pick_head().await?.is_some() {
+		return Ok(Some("cherry-pick"));
+	}
+	if repository.revert_head().await?.is_some() {
+		return Ok(Some("revert"));
+	}
+	if repository.rebase_in_progress().await? {
+		return Ok(Some("rebase"));
+	}
+	Ok(None)
+}
+
 /// Write the merged result to the work tree (conflicted files carry markers) and record the conflict
 /// stages (1/2/3 from base/ours/theirs) in the index. Refuses — before any caller records operation
 /// state — if the checkout would clobber a touched local change.

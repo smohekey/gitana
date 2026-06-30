@@ -347,6 +347,31 @@ where
 		crate::merge_state::clear_revert(self).await
 	}
 
+	/// Record the start of a rebase (the `rebase-merge/` state directory).
+	pub async fn start_rebase(&self, state: &crate::RebaseState<H>) -> Result<(), RepositoryError> {
+		crate::rebase_state::start_rebase(self, state).await
+	}
+
+	/// The in-progress rebase state, or `None` when no rebase is underway.
+	pub async fn rebase_state(&self) -> Result<Option<crate::RebaseState<H>>, RepositoryError> {
+		crate::rebase_state::rebase_state(self).await
+	}
+
+	/// Whether a rebase is in progress.
+	pub async fn rebase_in_progress(&self) -> Result<bool, RepositoryError> {
+		crate::rebase_state::rebase_in_progress(self).await
+	}
+
+	/// Replace the rebase's remaining-commit list (oldest-first; current step first).
+	pub async fn set_rebase_todo(&self, todo: &[ObjectId<H>]) -> Result<(), RepositoryError> {
+		crate::rebase_state::set_rebase_todo(self, todo).await
+	}
+
+	/// Clear the in-progress rebase state.
+	pub async fn clear_rebase(&self) -> Result<(), RepositoryError> {
+		crate::rebase_state::clear_rebase(self).await
+	}
+
 	/// Resolve a revision spec (`HEAD`, `main`, `<oid>`, `HEAD~2`, `v1^{commit}`, …)
 	/// to an object id.
 	pub async fn rev_parse(&self, spec: &str) -> Result<ObjectId<H>, RepositoryError> {

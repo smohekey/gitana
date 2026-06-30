@@ -156,6 +156,24 @@ enum Command {
 		#[arg(long = "continue")]
 		continue_: bool,
 	},
+	/// Replay the current branch's commits onto another base.
+	Rebase {
+		/// The upstream branch/commit to rebase onto (omit with --abort/--continue/--skip).
+		upstream: Option<String>,
+		/// Rebase onto this commit instead of <upstream> (the commits replayed are still
+		/// <upstream>..HEAD).
+		#[arg(long)]
+		onto: Option<String>,
+		/// Abort an in-progress rebase, restoring the original branch.
+		#[arg(long = "abort")]
+		abort: bool,
+		/// Continue an in-progress rebase after resolving conflicts.
+		#[arg(long = "continue")]
+		continue_: bool,
+		/// Skip the current commit and continue an in-progress rebase.
+		#[arg(long = "skip")]
+		skip: bool,
+	},
 	/// Show the commit history of HEAD (one line per commit).
 	Log,
 	/// Show an object: a commit and its diff, a tag, a tree, or a blob (default: HEAD).
@@ -390,6 +408,13 @@ impl Cli {
 				abort,
 				continue_,
 			} => commands::revert::run(&cwd, commit, abort, continue_).await,
+			Command::Rebase {
+				upstream,
+				onto,
+				abort,
+				continue_,
+				skip,
+			} => commands::rebase::run(&cwd, upstream, onto, abort, continue_, skip).await,
 			Command::Log => commands::log::run(&cwd).await,
 			Command::Show { object } => commands::show::run(&cwd, object).await,
 			Command::Config {
