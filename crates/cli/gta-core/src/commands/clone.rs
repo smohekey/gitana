@@ -4,12 +4,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use gitana_git_http::parse_advertisement;
-use gitana_object::{HashAlgorithm, Sha1, Sha256};
+use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
+use gitana_remote::{self as transport, Origin};
 use gitana_worktree::WorkTree;
 
-use crate::dispatch::HashKind;
 use crate::repo;
-use crate::transport::{self, Origin};
 
 /// Clone the repository at `url` into `dir` (default: the repo slug). Anonymous: works
 /// for public repos. The local repository is created in whatever object format the

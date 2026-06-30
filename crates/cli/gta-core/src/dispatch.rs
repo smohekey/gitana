@@ -10,30 +10,12 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
-use gitana_object::{HashAlgorithm, ObjectId, Sha1, Sha256};
+use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
 
 use crate::Backend;
 use crate::repo::{self, Discovered};
-
-/// Runtime tag for a repository's object hash — the value-level counterpart to the
-/// type-level [`Sha1`]/[`Sha256`] markers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HashKind {
-	Sha1,
-	Sha256,
-}
-
-impl HashKind {
-	/// The git `extensions.objectformat` name (`"sha1"` / `"sha256"`).
-	pub fn name(self) -> &'static str {
-		match self {
-			HashKind::Sha1 => "sha1",
-			HashKind::Sha256 => "sha256",
-		}
-	}
-}
 
 /// Read a repository's object-hash algorithm from `<common_dir>/config` without committing to a
 /// type. `common_dir` is the repository's shared git directory (the same as the git directory for

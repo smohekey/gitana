@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use gitana_object::{Sha1, Sha256};
+use gitana_object::{HashKind, Sha1, Sha256};
 
-use crate::dispatch::HashKind;
 use crate::repo;
 
 /// Create a git-compatible repository under `target/.git` in the `object_format` hash

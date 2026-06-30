@@ -7,9 +7,7 @@ pub mod commands;
 mod dispatch;
 mod error;
 mod identity;
-mod remote;
 mod repo;
-mod transport;
 
 pub use error::MergeConflict;
 use gitana_file_store_local::WorktreeFileStore;

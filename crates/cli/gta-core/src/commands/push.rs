@@ -11,13 +11,12 @@ use gitana_git_http::{
 	CertCommand, PushCert, RefUpdate, build_pack, build_push_cert, build_receive_pack_request,
 	parse_advertisement, parse_report_status,
 };
-use gitana_object::{HashAlgorithm, ObjectId, Sha1, Sha256};
+use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
+use gitana_remote::{self as transport, Origin, RECEIVE_PACK_REQUEST, http_post};
 use gitana_repository::{HeadState, Repository};
 
-use crate::dispatch::{self, HashKind};
-use crate::remote::http_post;
+use crate::dispatch;
 use crate::repo;
-use crate::transport::{self, Origin, RECEIVE_PACK_REQUEST};
 
 /// Push `HEAD`'s branch to the origin. `signed` attaches a push certificate; `force`
 /// permits a non-fast-forward update; `delete` removes a remote branch instead of

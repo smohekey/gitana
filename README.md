@@ -115,6 +115,8 @@ Implemented command groups:
 - `crates/core/gitana-config`: Git config parser.
 - `crates/core/gitana-diff`: Myers line diff and diff3 three-way line merge.
 - `crates/core/gitana-git-http`: Transport-agnostic Smart HTTP protocol helpers.
+- `crates/core/gitana-remote`: Remote operations over the `gitana-git-http` codec —
+  origin config, ref discovery, the HTTP client, and pack transfer.
 - `crates/cli/gta-core`: Shared command implementations.
 - `crates/cli/gta`: User-facing CLI.
 - `crates/cli/gta-mcp`: MCP wrapper around the same command surface.

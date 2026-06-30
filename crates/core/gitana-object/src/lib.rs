@@ -27,7 +27,7 @@ mod tree;
 pub use commit::{Commit, commit_signed_payload, encode_commit, parse_commit};
 pub use delta::apply_delta;
 pub use enumerate::{enumerate_objects, referenced_ids};
-pub use hash_algorithm::HashAlgorithm;
+pub use hash_algorithm::{HashAlgorithm, HashKind};
 pub use id::ObjectId;
 pub use kind::ObjectKind;
 pub use loose::{MAX_OBJECT_SIZE, decode_loose, encode_loose, loose_object_path};

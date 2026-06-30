@@ -4,13 +4,13 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use gitana_object::{HashAlgorithm, Sha1, Sha256};
+use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
+use gitana_remote::Origin;
 use gitana_repository::HeadState;
 
 use crate::commands::{fetch, merge};
-use crate::dispatch::{self, HashKind};
+use crate::dispatch;
 use crate::repo;
-use crate::transport::Origin;
 
 /// Pull `HEAD`'s branch from the origin.
 pub async fn run(cwd: &Path) -> Result<()> {

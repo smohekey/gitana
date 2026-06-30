@@ -36,3 +36,37 @@ pub trait HashAlgorithm:
 	/// clashing with the [`Hash`](std::hash::Hash) supertrait's `hash` method.)
 	fn digest(parts: &[&[u8]]) -> Self::Output;
 }
+
+/// The runtime tag for a repository's object-hash algorithm — the value-level counterpart to the
+/// type-level [`HashAlgorithm`] markers ([`crate::Sha1`] / [`crate::Sha256`]). Used where the
+/// algorithm is a runtime fact (a repo's config, a remote's advertised `object-format`) before a
+/// concrete `H` is chosen and threaded through the generic engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashKind {
+	Sha1,
+	Sha256,
+}
+
+impl HashKind {
+	/// The git `extensions.objectformat` name (`"sha1"` / `"sha256"`).
+	pub fn name(self) -> &'static str {
+		match self {
+			HashKind::Sha1 => "sha1",
+			HashKind::Sha256 => "sha256",
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::HashKind;
+	use crate::{HashAlgorithm, Sha1, Sha256};
+
+	#[test]
+	fn kind_name_matches_the_type_level_marker() {
+		assert_eq!(HashKind::Sha1.name(), Sha1::NAME);
+		assert_eq!(HashKind::Sha256.name(), Sha256::NAME);
+		assert_eq!(HashKind::Sha1.name(), "sha1");
+		assert_eq!(HashKind::Sha256.name(), "sha256");
+	}
+}

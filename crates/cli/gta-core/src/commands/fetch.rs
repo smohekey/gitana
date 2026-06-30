@@ -5,11 +5,11 @@ use std::path::Path;
 
 use anyhow::Result;
 use gitana_git_http::parse_advertisement;
-use gitana_object::{HashAlgorithm, Sha1, Sha256};
+use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
+use gitana_remote::{self as transport, Origin};
 
-use crate::dispatch::{self, HashKind};
+use crate::dispatch;
 use crate::repo;
-use crate::transport::{self, Origin};
 
 /// Fetch all branches from the origin into `refs/remotes/origin/*`.
 pub async fn run(cwd: &Path) -> Result<()> {

@@ -2,24 +2,25 @@
 //! download/upload.
 //!
 //! The wire codec lives in `gitana-git-http` (protocol v0 client helpers); this
-//! module pairs it with `gta`'s HTTP client and local repository. Object ids are
+//! crate pairs it with an HTTP client ([`http`]) and a local repository. Object ids are
 //! generic over the negotiated hash algorithm `H`: a caller first reads the remote's
 //! advertised `object-format` ([`negotiated_kind`]) and then runs the rest under that
 //! `H`.
 
+mod http;
+
 use std::path::Path;
 
-use crate::Backend;
 use anyhow::{Context, Result, bail};
 use gitana_config::GitConfig;
+use gitana_file_store::FileStore;
 use gitana_git_http::{
 	Advertised, build_upload_pack_request, parse_upload_pack_response, peek_object_format,
 };
-use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_object::{HashAlgorithm, HashKind, ObjectId};
 use gitana_repository::Repository;
 
-use crate::dispatch::HashKind;
-use crate::remote::{http_get, http_post};
+pub use http::{http_get, http_post};
 
 const UPLOAD_PACK_REQUEST: &str = "application/x-git-upload-pack-request";
 /// Content type for a `git-receive-pack` request body.
@@ -140,7 +141,7 @@ pub fn ensure_same_format(local: HashKind, remote: HashKind) -> Result<()> {
 /// Download the objects reachable from `wants` but not `haves` into `repo`.
 pub async fn fetch_pack<H: HashAlgorithm>(
 	origin: &Origin,
-	repo: &Repository<Backend, H>,
+	repo: &Repository<impl FileStore, H>,
 	wants: &[ObjectId<H>],
 	haves: &[ObjectId<H>],
 ) -> Result<()> {
@@ -177,7 +178,7 @@ pub fn advertised_oids<H: HashAlgorithm>(advertised: &Advertised<H>) -> Vec<Obje
 /// The unique tips of every local ref, sent as fetch `have`s so the server omits
 /// objects we already hold.
 pub async fn local_haves<H: HashAlgorithm>(
-	repo: &Repository<Backend, H>,
+	repo: &Repository<impl FileStore, H>,
 ) -> Result<Vec<ObjectId<H>>> {
 	let mut oids: Vec<ObjectId<H>> = repo
 		.refs()

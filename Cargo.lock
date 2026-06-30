@@ -859,6 +859,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitana-remote"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gitana-config",
+ "gitana-file-store",
+ "gitana-git-http",
+ "gitana-object",
+ "gitana-repository",
+ "reqwest 0.12.28",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "gitana-repository"
 version = "0.1.0"
 dependencies = [
@@ -927,9 +942,9 @@ dependencies = [
  "gitana-git-http",
  "gitana-object",
  "gitana-object-store",
+ "gitana-remote",
  "gitana-repository",
  "gitana-worktree",
- "reqwest 0.12.28",
  "sha2",
  "ssh-key",
  "tempfile",
