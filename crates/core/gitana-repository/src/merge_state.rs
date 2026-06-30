@@ -10,6 +10,7 @@ use crate::{Repository, RepositoryError};
 const MERGE_HEAD: &str = "MERGE_HEAD";
 const MERGE_MSG: &str = "MERGE_MSG";
 const CHERRY_PICK_HEAD: &str = "CHERRY_PICK_HEAD";
+const REVERT_HEAD: &str = "REVERT_HEAD";
 
 /// Record an in-progress merge: `MERGE_HEAD` (the commit being merged) and `MERGE_MSG` (the prepared
 /// commit message).
@@ -52,6 +53,32 @@ pub(crate) async fn clear_cherry_pick<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 ) -> Result<(), RepositoryError> {
 	delete_if_present(repo, CHERRY_PICK_HEAD).await?;
+	delete_if_present(repo, MERGE_MSG).await
+}
+
+/// Record an in-progress revert: `REVERT_HEAD` (the commit being reverted) and `MERGE_MSG` (the
+/// prepared message, reused on completion).
+pub(crate) async fn start_revert<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	commit: ObjectId<H>,
+	message: &str,
+) -> Result<(), RepositoryError> {
+	force_write(repo, REVERT_HEAD, format!("{commit}\n").as_bytes()).await?;
+	force_write(repo, MERGE_MSG, message.as_bytes()).await
+}
+
+/// The commit recorded in `REVERT_HEAD`, or `None` when no revert is in progress.
+pub(crate) async fn revert_head<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+) -> Result<Option<ObjectId<H>>, RepositoryError> {
+	read_oid_file(repo, REVERT_HEAD).await
+}
+
+/// Clear the in-progress revert state (`REVERT_HEAD`, `MERGE_MSG`).
+pub(crate) async fn clear_revert<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+) -> Result<(), RepositoryError> {
+	delete_if_present(repo, REVERT_HEAD).await?;
 	delete_if_present(repo, MERGE_MSG).await
 }
 

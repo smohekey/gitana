@@ -328,6 +328,25 @@ where
 		crate::merge_state::clear_cherry_pick(self).await
 	}
 
+	/// Record an in-progress revert: `REVERT_HEAD` (the commit being reverted) and `MERGE_MSG`.
+	pub async fn start_revert(
+		&self,
+		commit: ObjectId<H>,
+		message: &str,
+	) -> Result<(), RepositoryError> {
+		crate::merge_state::start_revert(self, commit, message).await
+	}
+
+	/// The commit recorded in `REVERT_HEAD`, or `None` when no revert is in progress.
+	pub async fn revert_head(&self) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		crate::merge_state::revert_head(self).await
+	}
+
+	/// Clear the in-progress revert state (`REVERT_HEAD`, `MERGE_MSG`).
+	pub async fn clear_revert(&self) -> Result<(), RepositoryError> {
+		crate::merge_state::clear_revert(self).await
+	}
+
 	/// Resolve a revision spec (`HEAD`, `main`, `<oid>`, `HEAD~2`, `v1^{commit}`, …)
 	/// to an object id.
 	pub async fn rev_parse(&self, spec: &str) -> Result<ObjectId<H>, RepositoryError> {

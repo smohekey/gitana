@@ -189,6 +189,18 @@ enum Command {
 		#[arg(long = "continue")]
 		continue_: bool,
 	},
+	/// Record a new commit that undoes a previous commit's change.
+	Revert {
+		/// The commit to revert (omit with --abort/--continue).
+		#[arg(long)]
+		commit: Option<String>,
+		/// Abort an in-progress revert, restoring the pre-revert state.
+		#[arg(long = "abort")]
+		abort: bool,
+		/// Conclude an in-progress revert after resolving its conflicts.
+		#[arg(long = "continue")]
+		continue_: bool,
+	},
 	/// Show the commit history of HEAD (one line per commit).
 	Log,
 	/// Show an object: a commit and its diff, a tag, a tree, or a blob (default: HEAD).
@@ -431,6 +443,11 @@ impl Cli {
 				abort,
 				continue_,
 			} => commands::cherry_pick::run(&cwd, commit, abort, continue_).await,
+			Command::Revert {
+				commit,
+				abort,
+				continue_,
+			} => commands::revert::run(&cwd, commit, abort, continue_).await,
 			Command::Log => commands::log::run(&cwd).await,
 			Command::Show { object } => commands::show::run(&cwd, object).await,
 			Command::Config {

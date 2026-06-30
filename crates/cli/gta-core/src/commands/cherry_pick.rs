@@ -60,6 +60,9 @@ impl WorkTreeCommand for CherryPick {
 		if repository.merge_head().await?.is_some() {
 			bail!("you have not concluded your merge (MERGE_HEAD exists)");
 		}
+		if repository.revert_head().await?.is_some() {
+			bail!("you have not concluded your revert (REVERT_HEAD exists)");
+		}
 		if wt.load_index()?.has_conflicts() {
 			bail!("cherry-pick is not possible because you have unmerged files");
 		}

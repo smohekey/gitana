@@ -46,6 +46,10 @@ impl WorkTreeCommand for Commit<'_> {
 			return crate::commands::cherry_pick::complete(&worktree, Some(self.message.to_owned()))
 				.await;
 		}
+		// Concluding a revert: a single-parent commit authored by the current user (clears `REVERT_HEAD`).
+		if repo.revert_head().await?.is_some() {
+			return crate::commands::revert::complete(&worktree, Some(self.message.to_owned())).await;
+		}
 
 		let entries = index_tree_entries(&index);
 		if entries.is_empty() {

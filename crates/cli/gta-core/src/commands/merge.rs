@@ -75,9 +75,12 @@ impl WorkTreeCommand for Merge {
 		if repository.merge_head().await?.is_some() {
 			bail!("you have not concluded your merge (MERGE_HEAD exists)");
 		}
-		// Symmetrically, refuse to start a merge while a cherry-pick is unconcluded (as git does).
+		// Symmetrically, refuse to start a merge while a cherry-pick or revert is unconcluded.
 		if repository.cherry_pick_head().await?.is_some() {
 			bail!("you have not concluded your cherry-pick (CHERRY_PICK_HEAD exists)");
+		}
+		if repository.revert_head().await?.is_some() {
+			bail!("you have not concluded your revert (REVERT_HEAD exists)");
 		}
 		// Likewise refuse an index that still carries unmerged stages.
 		if wt.load_index()?.has_conflicts() {

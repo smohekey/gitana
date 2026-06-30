@@ -44,11 +44,12 @@ Major gaps:
   with `gta merge --continue` (or `gta commit`), or discard it with
   `gta merge --abort`.
 - `gta cherry-pick <commit>` re-applies a single (non-merge) commit's change,
-  preserving its author, with the same conflict lifecycle (`--abort` /
-  `--continue` / `gta commit`, via `CHERRY_PICK_HEAD`). Multi-commit/range picking
-  is not yet supported.
-- There is no rebase, revert, stash, blame, bisect, submodule, hook, or
-  sparse-checkout support.
+  preserving its author; `gta revert <commit>` records a new commit that undoes
+  one (authored by the current user). Both use the same conflict lifecycle
+  (`--abort` / `--continue` / `gta commit`, via `CHERRY_PICK_HEAD` /
+  `REVERT_HEAD`). Multi-commit/range forms are not yet supported.
+- There is no rebase, stash, blame, bisect, submodule, hook, or sparse-checkout
+  support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
 - Push signing is still incomplete: the CLI has `--signed`, but key loading and
