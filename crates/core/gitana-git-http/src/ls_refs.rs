@@ -2,7 +2,7 @@
 //! symref targets and peeled tags), invoked by `POST /git-upload-pack`.
 
 use gitana_file_store::FileStore;
-use gitana_object::{PktLine, parse_pkt, write_flush, write_pkt};
+use gitana_object::{HashAlgorithm, PktLine, parse_pkt, write_flush, write_pkt};
 use gitana_repository::Repository;
 
 use crate::GitHttpError;
@@ -19,8 +19,8 @@ struct LsRefsArgs {
 }
 
 /// Handle an `ls-refs` request body, returning the v2 ref-listing response.
-pub async fn ls_refs(
-	repo: &Repository<impl FileStore>,
+pub async fn ls_refs<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
 	request: &[u8],
 ) -> Result<Vec<u8>, GitHttpError> {
 	let args = parse_ls_refs(request)?;

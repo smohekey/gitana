@@ -1,8 +1,11 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
+use gitana_file_store_local::LocalFileStore;
+use gitana_object::HashAlgorithm;
+use gitana_worktree::WorkTree;
 
-use crate::repo;
+use crate::dispatch::{self, WorkTreeCommand};
 
 /// Remove tracked paths from the index and (unless `cached`) the working tree.
 ///
@@ -17,21 +20,55 @@ pub async fn run(
 	dry_run: bool,
 	pathspecs: Vec<String>,
 ) -> Result<()> {
-	if pathspecs.is_empty() {
-		bail!("no pathspec given");
+	dispatch::on_worktree(
+		cwd,
+		Rm {
+			cached,
+			force,
+			recursive,
+			dry_run,
+			pathspecs,
+		},
+	)
+	.await
+}
+
+struct Rm {
+	cached: bool,
+	force: bool,
+	recursive: bool,
+	dry_run: bool,
+	pathspecs: Vec<String>,
+}
+
+impl WorkTreeCommand for Rm {
+	async fn run<H: HashAlgorithm>(
+		self,
+		worktree: WorkTree<LocalFileStore, H>,
+		prefix: String,
+	) -> Result<()> {
+		if self.pathspecs.is_empty() {
+			bail!("no pathspec given");
+		}
+		let specs: Vec<&str> = self.pathspecs.iter().map(String::as_str).collect();
+		let outcome = worktree
+			.rm(
+				&specs,
+				&prefix,
+				self.cached,
+				self.force,
+				self.recursive,
+				self.dry_run,
+			)
+			.await?;
+		// Report the removals that did happen first, then surface a per-path failure — so the side
+		// effects are visible even when a later path could not be removed.
+		for path in &outcome.removed {
+			println!("rm '{path}'");
+		}
+		if let Some(error) = outcome.failure {
+			return Err(error.into());
+		}
+		Ok(())
 	}
-	let specs: Vec<&str> = pathspecs.iter().map(String::as_str).collect();
-	let (wt, prefix) = repo::open_worktree_with_prefix(cwd)?;
-	let outcome = wt
-		.rm(&specs, &prefix, cached, force, recursive, dry_run)
-		.await?;
-	// Report the removals that did happen first, then surface a per-path failure — so the side
-	// effects are visible even when a later path could not be removed.
-	for path in &outcome.removed {
-		println!("rm '{path}'");
-	}
-	if let Some(error) = outcome.failure {
-		return Err(error.into());
-	}
-	Ok(())
 }

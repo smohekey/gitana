@@ -1,68 +1,71 @@
 use gitana_file_store::{FileStore, FileStoreError};
-use gitana_object::{Commit, ObjectId, ObjectKind, encode_commit, parse_commit};
+use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit, parse_commit};
 use gitana_object_store::ObjectStore;
 
-use crate::tree::build_tree;
+use crate::tree::{FlatEntry, build_tree};
 use crate::{Config, HeadState, RefStore, RepositoryError, TreeBuildEntry};
 
 /// A git repository: the object graph plus refs, over one repo-scoped store.
 ///
-/// The engine is storage-agnostic. The local profile points the file store at a
-/// `.git` directory (with a sentinel repo-id) so the on-disk bytes are exactly
-/// what `git --object-format=sha256` expects. `init` writes the metadata files
-/// (`config`, `HEAD`); creating the empty `objects/`/`refs/` directory skeleton a
-/// real git repo needs is a filesystem concern handled by the local wiring.
-pub struct Repository<F> {
-	objects: ObjectStore<F>,
+/// The engine is storage-agnostic and generic over the object-hash algorithm `H`. The
+/// local profile points the file store at a `.git` directory (with a sentinel repo-id)
+/// so the on-disk bytes are exactly what `git` expects for that object format. `init`
+/// writes the metadata files (`config`, `HEAD`); creating the empty `objects/`/`refs/`
+/// directory skeleton a real git repo needs is a filesystem concern handled by the
+/// local wiring.
+pub struct Repository<F, H: HashAlgorithm> {
+	objects: ObjectStore<F, H>,
 }
 
-impl<F> Repository<F>
+impl<F, H> Repository<F, H>
 where
 	F: FileStore,
+	H: HashAlgorithm,
 {
 	/// Wrap a repo-scoped object store as a repository.
-	pub fn new(objects: ObjectStore<F>) -> Self {
+	pub fn new(objects: ObjectStore<F, H>) -> Self {
 		Self { objects }
 	}
 
 	/// The object store (read/write objects, packs).
-	pub fn objects(&self) -> &ObjectStore<F> {
+	pub fn objects(&self) -> &ObjectStore<F, H> {
 		&self.objects
 	}
 
 	/// The ref store (HEAD, branches, tags).
-	pub fn refs(&self) -> RefStore<'_, F> {
+	pub fn refs(&self) -> RefStore<'_, F, H> {
 		RefStore::new(self.objects.file_store())
 	}
 
-	/// Write the metadata files for a fresh sha256 repo: `config` and a symbolic
-	/// `HEAD → refs/heads/main`. Idempotent — existing files are left untouched.
+	/// Write the metadata files for a fresh repo: a `config` matching the hash algorithm
+	/// `H` and a symbolic `HEAD → refs/heads/main`. Idempotent — existing files are left
+	/// untouched.
 	pub async fn init(&self) -> Result<(), RepositoryError> {
 		let files = self.objects.file_store();
 
 		files
-			.write_path_if_absent("config", Config::sha256().render().as_bytes())
+			.write_path_if_absent("config", Config::for_algorithm::<H>().render().as_bytes())
 			.await?;
-		let head = HeadState::Symbolic("refs/heads/main".to_owned()).render();
+		let head = HeadState::<H>::Symbolic("refs/heads/main".to_owned()).render();
 		files.write_path_if_absent("HEAD", head.as_bytes()).await?;
 		Ok(())
 	}
 
 	/// Write a blob object, returning its id.
-	pub async fn write_blob(&self, data: &[u8]) -> Result<ObjectId, RepositoryError> {
+	pub async fn write_blob(&self, data: &[u8]) -> Result<ObjectId<H>, RepositoryError> {
 		Ok(self.objects.write_object(ObjectKind::Blob, data).await?)
 	}
 
 	/// Build the nested tree objects for `entries` and return the root tree id.
-	pub async fn write_tree(&self, entries: &[TreeBuildEntry]) -> Result<ObjectId, RepositoryError> {
+	pub async fn write_tree(
+		&self,
+		entries: &[TreeBuildEntry<H>],
+	) -> Result<ObjectId<H>, RepositoryError> {
 		build_tree(&self.objects, entries).await
 	}
 
 	/// Recursively read a tree into `(path, mode, oid)` entries (`ls-tree -r`).
-	pub async fn read_tree(
-		&self,
-		tree: ObjectId,
-	) -> Result<Vec<crate::tree::FlatEntry>, RepositoryError> {
+	pub async fn read_tree(&self, tree: ObjectId<H>) -> Result<Vec<FlatEntry<H>>, RepositoryError> {
 		crate::tree::read_tree_recursive(&self.objects, tree).await
 	}
 
@@ -101,7 +104,7 @@ where
 	}
 
 	/// Read a blob's content.
-	pub async fn read_blob(&self, id: ObjectId) -> Result<Vec<u8>, RepositoryError> {
+	pub async fn read_blob(&self, id: ObjectId<H>) -> Result<Vec<u8>, RepositoryError> {
 		let (kind, payload) = self.objects.read_object(&id).await?;
 		if kind != ObjectKind::Blob {
 			return Err(RepositoryError::InvalidRef(format!("{id} is not a blob")));
@@ -110,26 +113,26 @@ where
 	}
 
 	/// Read a commit and return the tree it points at.
-	pub async fn commit_tree(&self, commit: ObjectId) -> Result<ObjectId, RepositoryError> {
+	pub async fn commit_tree(&self, commit: ObjectId<H>) -> Result<ObjectId<H>, RepositoryError> {
 		let (kind, payload) = self.objects.read_object(&commit).await?;
 		if kind != ObjectKind::Commit {
 			return Err(RepositoryError::InvalidRef(format!(
 				"{commit} is not a commit"
 			)));
 		}
-		Ok(parse_commit(&payload)?.tree)
+		Ok(parse_commit::<H>(&payload)?.tree)
 	}
 
 	/// Write a commit object (no ref update), returning its id. `author` and
 	/// `committer` are git identity lines (`Name <email> seconds ±hhmm`).
 	pub async fn create_commit(
 		&self,
-		tree: ObjectId,
-		parents: Vec<ObjectId>,
+		tree: ObjectId<H>,
+		parents: Vec<ObjectId<H>>,
 		author: &str,
 		committer: &str,
 		message: &str,
-	) -> Result<ObjectId, RepositoryError> {
+	) -> Result<ObjectId<H>, RepositoryError> {
 		let commit = Commit {
 			tree,
 			parents,
@@ -151,11 +154,11 @@ where
 	/// Detached HEAD is not yet supported.
 	pub async fn commit_on_head(
 		&self,
-		tree: ObjectId,
+		tree: ObjectId<H>,
 		author: &str,
 		committer: &str,
 		message: &str,
-	) -> Result<ObjectId, RepositoryError> {
+	) -> Result<ObjectId<H>, RepositoryError> {
 		let refs = self.refs();
 		let target = match refs.read_head().await? {
 			HeadState::Symbolic(target) => target,
@@ -194,12 +197,12 @@ where
 	/// unborn branch are not supported.
 	pub async fn commit_merge(
 		&self,
-		tree: ObjectId,
-		merge_head: ObjectId,
+		tree: ObjectId<H>,
+		merge_head: ObjectId<H>,
 		author: &str,
 		committer: &str,
 		message: &str,
-	) -> Result<ObjectId, RepositoryError> {
+	) -> Result<ObjectId<H>, RepositoryError> {
 		let refs = self.refs();
 		let target = match refs.read_head().await? {
 			HeadState::Symbolic(target) => target,
@@ -237,7 +240,7 @@ where
 	/// ref half of [`Self::commit_on_head`], but for a reset rather than a new commit.
 	pub async fn reset_head(
 		&self,
-		commit: ObjectId,
+		commit: ObjectId<H>,
 		committer: &str,
 		message: &str,
 	) -> Result<(), RepositoryError> {
@@ -274,7 +277,7 @@ where
 
 	/// Record `commit` as `ORIG_HEAD` so it can be recovered (`gta reset ORIG_HEAD`), as git does
 	/// when starting an operation that may move or replace `HEAD`.
-	pub async fn set_orig_head(&self, commit: ObjectId) -> Result<(), RepositoryError> {
+	pub async fn set_orig_head(&self, commit: ObjectId<H>) -> Result<(), RepositoryError> {
 		let refs = self.refs();
 		let current = refs.resolve("ORIG_HEAD").await?;
 		refs.update_ref("ORIG_HEAD", commit, current).await?;
@@ -285,14 +288,14 @@ where
 	/// prepared commit message).
 	pub async fn start_merge(
 		&self,
-		merge_head: ObjectId,
+		merge_head: ObjectId<H>,
 		message: &str,
 	) -> Result<(), RepositoryError> {
 		crate::merge_state::start_merge(self, merge_head, message).await
 	}
 
 	/// The commit recorded in `MERGE_HEAD`, or `None` when no merge is in progress.
-	pub async fn merge_head(&self) -> Result<Option<ObjectId>, RepositoryError> {
+	pub async fn merge_head(&self) -> Result<Option<ObjectId<H>>, RepositoryError> {
 		crate::merge_state::merge_head(self).await
 	}
 
@@ -308,25 +311,28 @@ where
 
 	/// Resolve a revision spec (`HEAD`, `main`, `<oid>`, `HEAD~2`, `v1^{commit}`, …)
 	/// to an object id.
-	pub async fn rev_parse(&self, spec: &str) -> Result<ObjectId, RepositoryError> {
+	pub async fn rev_parse(&self, spec: &str) -> Result<ObjectId<H>, RepositoryError> {
 		crate::revision::rev_parse(self, spec).await
 	}
 
 	/// Walk commits reachable from `tips` in committer-date order (newest first).
-	pub async fn rev_list(&self, tips: &[ObjectId]) -> Result<Vec<ObjectId>, RepositoryError> {
+	pub async fn rev_list(&self, tips: &[ObjectId<H>]) -> Result<Vec<ObjectId<H>>, RepositoryError> {
 		crate::revision::rev_list(self, tips).await
 	}
 
 	/// The best common ancestor(s) — merge bases — of `commits`; empty if they share no ancestor.
-	pub async fn merge_base(&self, commits: &[ObjectId]) -> Result<Vec<ObjectId>, RepositoryError> {
+	pub async fn merge_base(
+		&self,
+		commits: &[ObjectId<H>],
+	) -> Result<Vec<ObjectId<H>>, RepositoryError> {
 		crate::merge_base::merge_base(self, commits).await
 	}
 
 	/// Whether `ancestor` is an ancestor of (or equal to) `descendant`.
 	pub async fn is_ancestor(
 		&self,
-		ancestor: ObjectId,
-		descendant: ObjectId,
+		ancestor: ObjectId<H>,
+		descendant: ObjectId<H>,
 	) -> Result<bool, RepositoryError> {
 		crate::merge_base::is_ancestor(self, ancestor, descendant).await
 	}
@@ -335,14 +341,16 @@ where
 	/// merged tree and the conflicted paths.
 	pub async fn merge_trees(
 		&self,
-		base: ObjectId,
-		ours: ObjectId,
-		theirs: ObjectId,
-	) -> Result<crate::TreeMerge, RepositoryError> {
+		base: ObjectId<H>,
+		ours: ObjectId<H>,
+		theirs: ObjectId<H>,
+	) -> Result<crate::TreeMerge<H>, RepositoryError> {
 		crate::merge::merge_trees(self, base, ours, theirs).await
 	}
 
-	/// Read and validate the repository config; refuse non-sha256 / unknown formats.
+	/// Read and validate the repository config, requiring its object format to match the
+	/// hash algorithm `H` this repository was opened as. Refuses unknown formats and a
+	/// format/`H` mismatch (e.g. opening a sha1 repo as `Repository<_, Sha256>`).
 	pub async fn open(&self) -> Result<Config, RepositoryError> {
 		let files = self.objects.file_store();
 
@@ -357,6 +365,14 @@ where
 		};
 		let text = std::str::from_utf8(&bytes)
 			.map_err(|_| RepositoryError::UnsupportedFormat("config is not UTF-8".to_owned()))?;
-		Config::parse(text)
+		let config = Config::parse(text)?;
+		if config.object_format != H::NAME {
+			return Err(RepositoryError::UnsupportedFormat(format!(
+				"repository is {}, opened as {}",
+				config.object_format,
+				H::NAME
+			)));
+		}
+		Ok(config)
 	}
 }

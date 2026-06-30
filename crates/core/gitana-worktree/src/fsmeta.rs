@@ -3,23 +3,26 @@
 use std::fs::Metadata;
 use std::path::Path;
 
-use gitana_object::{ObjectId, ObjectKind};
+use gitana_object::{HashAlgorithm, ObjectId, ObjectKind};
 
 use crate::Stat;
 
 /// Hash a working-tree file into a blob id (without writing it) with its git mode.
 /// `None` for anything that is neither a regular file nor a symlink.
-pub(crate) fn blob_of(full: &Path, meta: &Metadata) -> std::io::Result<Option<(ObjectId, u32)>> {
+pub(crate) fn blob_of<H: HashAlgorithm>(
+	full: &Path,
+	meta: &Metadata,
+) -> std::io::Result<Option<(ObjectId<H>, u32)>> {
 	if meta.is_symlink() {
 		let target = std::fs::read_link(full)?;
 		Ok(Some((
-			ObjectId::compute(ObjectKind::Blob, path_bytes(&target)),
+			ObjectId::<H>::compute(ObjectKind::Blob, path_bytes(&target)),
 			0o120000,
 		)))
 	} else if meta.is_file() {
 		let content = std::fs::read(full)?;
 		Ok(Some((
-			ObjectId::compute(ObjectKind::Blob, &content),
+			ObjectId::<H>::compute(ObjectKind::Blob, &content),
 			file_mode(meta),
 		)))
 	} else {

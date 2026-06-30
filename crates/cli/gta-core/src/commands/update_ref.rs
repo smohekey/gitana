@@ -1,14 +1,27 @@
 use std::path::Path;
 
 use anyhow::Result;
+use gitana_file_store_local::LocalFileStore;
+use gitana_object::HashAlgorithm;
+use gitana_repository::Repository;
 
-use crate::repo;
+use crate::dispatch::{self, RepoCommand};
 
 /// Point `name` at the object `value` resolves to (creating the ref if absent).
 pub async fn run(cwd: &Path, name: &str, value: &str) -> Result<()> {
-	let repo = repo::open_here(cwd)?;
-	let new = repo.rev_parse(value).await?;
-	let current = repo.refs().resolve(name).await?;
-	repo.refs().update_ref(name, new, current).await?;
-	Ok(())
+	dispatch::on_repo(cwd, UpdateRef { name, value }).await
+}
+
+struct UpdateRef<'a> {
+	name: &'a str,
+	value: &'a str,
+}
+
+impl RepoCommand for UpdateRef<'_> {
+	async fn run<H: HashAlgorithm>(self, repo: Repository<LocalFileStore, H>) -> Result<()> {
+		let new = repo.rev_parse(self.value).await?;
+		let current = repo.refs().resolve(self.name).await?;
+		repo.refs().update_ref(self.name, new, current).await?;
+		Ok(())
+	}
 }

@@ -5,16 +5,16 @@
 //! owns the HTTP. Builds upload-pack (fetch) and receive-pack (push) requests, and
 //! parses their responses; pairs with the server side in this crate.
 
-use gitana_object::{ObjectId, PktLine, parse_pkt, write_flush, write_pkt};
+use gitana_object::{HashAlgorithm, ObjectId, PktLine, parse_pkt, write_flush, write_pkt};
 
 use crate::GitHttpError;
 use crate::advertise::AGENT;
 
 /// The refs (and HEAD target) parsed from a `GET /info/refs` advertisement.
-#[derive(Debug, Clone, Default)]
-pub struct Advertised {
+#[derive(Debug, Clone)]
+pub struct Advertised<H: HashAlgorithm> {
 	/// `(ref name, oid)` pairs, including `HEAD` when present.
-	pub refs: Vec<(String, ObjectId)>,
+	pub refs: Vec<(String, ObjectId<H>)>,
 	/// The branch `HEAD` points at, from the `symref=HEAD:<ref>` capability.
 	pub head_target: Option<String>,
 	/// The push-certificate nonce, from the `push-cert=<nonce>` capability (receive-pack
@@ -22,9 +22,20 @@ pub struct Advertised {
 	pub push_cert_nonce: Option<String>,
 }
 
-impl Advertised {
+// Manual `Default` (not derived) so it does not impose `H: Default`.
+impl<H: HashAlgorithm> Default for Advertised<H> {
+	fn default() -> Self {
+		Advertised {
+			refs: Vec::new(),
+			head_target: None,
+			push_cert_nonce: None,
+		}
+	}
+}
+
+impl<H: HashAlgorithm> Advertised<H> {
 	/// The oid of a named ref, if advertised.
-	pub fn oid_of(&self, name: &str) -> Option<ObjectId> {
+	pub fn oid_of(&self, name: &str) -> Option<ObjectId<H>> {
 		self
 			.refs
 			.iter()
@@ -33,7 +44,7 @@ impl Advertised {
 	}
 
 	/// Branch refs (`refs/heads/*`) and their tips.
-	pub fn branches(&self) -> impl Iterator<Item = (&str, ObjectId)> {
+	pub fn branches(&self) -> impl Iterator<Item = (&str, ObjectId<H>)> {
 		self
 			.refs
 			.iter()
@@ -42,9 +53,36 @@ impl Advertised {
 	}
 }
 
+/// Peek the advertised `object-format` capability from a `GET /info/refs` advertisement
+/// **without** committing to a hash type — the bridge that lets a client choose the
+/// negotiated algorithm before it can parse the oid lines. The capability trails the
+/// first ref line after a NUL; returns its value (e.g. `"sha1"`/`"sha256"`), or `None`
+/// when the server advertised none (treat as git's default, sha1).
+pub fn peek_object_format(body: &[u8]) -> Option<String> {
+	let mut cursor = 0;
+	while cursor < body.len() {
+		let (line, consumed) = parse_pkt(&body[cursor..]).ok()?;
+		cursor += consumed;
+		let PktLine::Data(data) = line else {
+			continue;
+		};
+		// Skip the smart-http service banner; the capabilities trail the first ref line.
+		if data.starts_with(b"# service=") {
+			continue;
+		}
+		let nul = data.iter().position(|&b| b == 0)?;
+		let caps = std::str::from_utf8(&data[nul + 1..]).ok()?;
+		return caps
+			.split([' ', '\n'])
+			.find_map(|cap| cap.strip_prefix("object-format="))
+			.map(str::to_owned);
+	}
+	None
+}
+
 /// Parse a `GET /info/refs` v0 advertisement (the `# service` banner, a flush, then
 /// `<oid> <ref>` lines with capabilities trailing the first after a NUL).
-pub fn parse_advertisement(body: &[u8]) -> Result<Advertised, GitHttpError> {
+pub fn parse_advertisement<H: HashAlgorithm>(body: &[u8]) -> Result<Advertised<H>, GitHttpError> {
 	let mut result = Advertised::default();
 	let mut cursor = 0;
 	while cursor < body.len() {
@@ -99,13 +137,17 @@ fn capability_value(caps: &[u8], prefix: &str) -> Option<String> {
 
 /// Build a v0 upload-pack request: `want`s (the first carrying capabilities), a
 /// flush, the `have`s, then `done`.
-pub fn build_upload_pack_request(wants: &[ObjectId], haves: &[ObjectId]) -> Vec<u8> {
+pub fn build_upload_pack_request<H: HashAlgorithm>(
+	wants: &[ObjectId<H>],
+	haves: &[ObjectId<H>],
+) -> Vec<u8> {
 	let mut out = Vec::new();
 	for (index, want) in wants.iter().enumerate() {
 		let line = if index == 0 {
 			format!(
-				"want {} side-band-64k ofs-delta agent={AGENT}\n",
-				want.to_hex()
+				"want {} side-band-64k ofs-delta object-format={} agent={AGENT}\n",
+				want.to_hex(),
+				H::NAME
 			)
 		} else {
 			format!("want {}\n", want.to_hex())
@@ -148,18 +190,21 @@ pub fn parse_upload_pack_response(body: &[u8]) -> Result<Vec<u8>, GitHttpError> 
 }
 
 /// A ref-update to push: the expected remote value, the new value, and the ref name.
-pub struct RefUpdate {
+pub struct RefUpdate<H: HashAlgorithm> {
 	/// Expected current remote value (`None` to create).
-	pub old: Option<ObjectId>,
+	pub old: Option<ObjectId<H>>,
 	/// New value (`None` to delete — not supported by the server yet).
-	pub new: Option<ObjectId>,
+	pub new: Option<ObjectId<H>>,
 	/// The ref name.
 	pub name: String,
 }
 
 /// Build a receive-pack request: `<old> <new> <ref>` command lines (the first
 /// carrying capabilities), a flush, then the raw packfile.
-pub fn build_receive_pack_request(updates: &[RefUpdate], pack: &[u8]) -> Vec<u8> {
+pub fn build_receive_pack_request<H: HashAlgorithm>(
+	updates: &[RefUpdate<H>],
+	pack: &[u8],
+) -> Vec<u8> {
 	let mut out = Vec::new();
 	for (index, update) in updates.iter().enumerate() {
 		let command = format!(
@@ -169,7 +214,10 @@ pub fn build_receive_pack_request(updates: &[RefUpdate], pack: &[u8]) -> Vec<u8>
 			update.name
 		);
 		let line = if index == 0 {
-			format!("{command}\0report-status ofs-delta agent={AGENT}\n")
+			format!(
+				"{command}\0report-status object-format={} ofs-delta agent={AGENT}\n",
+				H::NAME
+			)
 		} else {
 			format!("{command}\n")
 		};
@@ -221,18 +269,53 @@ pub fn parse_report_status(body: &[u8]) -> Result<(), GitHttpError> {
 	Ok(())
 }
 
-/// Render an oid as hex, or the all-zero id for `None`.
-fn oid_or_zero(oid: Option<ObjectId>) -> String {
-	oid.map(|id| id.to_hex()).unwrap_or_else(|| "0".repeat(64))
+/// Render an oid as hex, or the all-zero id (sized for `H`) for `None`.
+fn oid_or_zero<H: HashAlgorithm>(oid: Option<ObjectId<H>>) -> String {
+	oid
+		.map(|id| id.to_hex())
+		.unwrap_or_else(|| "0".repeat(H::RAW_LEN * 2))
 }
 
 #[cfg(test)]
 mod tests {
+	use gitana_object::{ObjectKind, Sha1, Sha256};
+
 	use super::*;
 
 	#[test]
+	fn client_requests_advertise_the_object_format() {
+		// Both push and fetch command packets must name the hash so the server agrees on
+		// the format (and signed/unsigned pushes negotiate the same capability set).
+		let sha256 = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"c");
+		let push = build_receive_pack_request(
+			&[RefUpdate {
+				old: None,
+				new: Some(sha256),
+				name: "refs/heads/main".to_owned(),
+			}],
+			&[],
+		);
+		assert!(String::from_utf8_lossy(&push).contains("object-format=sha256"));
+		let fetch = build_upload_pack_request(&[sha256], &[]);
+		assert!(String::from_utf8_lossy(&fetch).contains("object-format=sha256"));
+
+		let sha1 = ObjectId::<Sha1>::compute(ObjectKind::Commit, b"c");
+		let push1 = build_receive_pack_request(
+			&[RefUpdate {
+				old: None,
+				new: Some(sha1),
+				name: "refs/heads/main".to_owned(),
+			}],
+			&[],
+		);
+		assert!(String::from_utf8_lossy(&push1).contains("object-format=sha1"));
+		let fetch1 = build_upload_pack_request(&[sha1], &[]);
+		assert!(String::from_utf8_lossy(&fetch1).contains("object-format=sha1"));
+	}
+
+	#[test]
 	fn parses_advertisement_with_head_symref() {
-		let oid = ObjectId::compute(gitana_object::ObjectKind::Commit, b"c").to_hex();
+		let oid = ObjectId::<Sha256>::compute(gitana_object::ObjectKind::Commit, b"c").to_hex();
 		let mut body = Vec::new();
 		write_pkt(&mut body, b"# service=git-upload-pack\n").unwrap();
 		write_flush(&mut body);
@@ -244,7 +327,7 @@ mod tests {
 		write_pkt(&mut body, format!("{oid} refs/heads/main\n").as_bytes()).unwrap();
 		write_flush(&mut body);
 
-		let adv = parse_advertisement(&body).expect("parse");
+		let adv = parse_advertisement::<Sha256>(&body).expect("parse");
 		assert_eq!(adv.head_target.as_deref(), Some("refs/heads/main"));
 		assert_eq!(adv.branches().count(), 1);
 		assert!(adv.oid_of("refs/heads/main").is_some());

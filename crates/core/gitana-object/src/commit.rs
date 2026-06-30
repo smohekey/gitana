@@ -1,17 +1,13 @@
 use crate::text::{as_str, split_message};
-use crate::{ObjectError, ObjectId};
-
-/// The commit signature header. SHA-256 repositories use `gpgsig-sha256` (the bare
-/// `gpgsig` header carries the SHA-1 object's signature, which gitana never writes).
-const GPGSIG_HEADER: &str = "gpgsig-sha256";
+use crate::{HashAlgorithm, ObjectError, ObjectId};
 
 /// A parsed commit object.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Commit {
+pub struct Commit<H: HashAlgorithm> {
 	/// The tree this commit points at.
-	pub tree: ObjectId,
+	pub tree: ObjectId<H>,
 	/// Parent commits (zero for a root commit, one normally, more for merges).
-	pub parents: Vec<ObjectId>,
+	pub parents: Vec<ObjectId<H>>,
 	/// The raw `author` line (name, email, time).
 	pub author: String,
 	/// The raw `committer` line.
@@ -24,7 +20,7 @@ pub struct Commit {
 }
 
 /// Parse a commit payload.
-pub fn parse_commit(payload: &[u8]) -> Result<Commit, ObjectError> {
+pub fn parse_commit<H: HashAlgorithm>(payload: &[u8]) -> Result<Commit<H>, ObjectError> {
 	let (header, message) = split_message(payload)?;
 
 	let mut tree = None;
@@ -33,6 +29,7 @@ pub fn parse_commit(payload: &[u8]) -> Result<Commit, ObjectError> {
 	let mut committer = None;
 	let mut signature = None;
 
+	let gpgsig_prefix = format!("{} ", H::GPGSIG_HEADER);
 	let mut lines = header.split(|&b| b == b'\n').peekable();
 	while let Some(line) = lines.next() {
 		if let Some(rest) = line.strip_prefix(b"tree ") {
@@ -43,7 +40,7 @@ pub fn parse_commit(payload: &[u8]) -> Result<Commit, ObjectError> {
 			author = Some(as_str(rest)?.to_owned());
 		} else if let Some(rest) = line.strip_prefix(b"committer ") {
 			committer = Some(as_str(rest)?.to_owned());
-		} else if let Some(rest) = line.strip_prefix(format!("{GPGSIG_HEADER} ").as_bytes()) {
+		} else if let Some(rest) = line.strip_prefix(gpgsig_prefix.as_bytes()) {
 			// A multi-line header: the value continues on lines starting with a space.
 			let mut value = as_str(rest)?.to_owned();
 			while let Some(next) = lines.peek() {
@@ -71,7 +68,7 @@ pub fn parse_commit(payload: &[u8]) -> Result<Commit, ObjectError> {
 /// Encode a commit to its canonical git payload: `tree`, `parent`*, `author`,
 /// `committer`, optional `gpgsig`, blank line, message. Byte-exact with git, so a
 /// signed commit round-trips and [`commit_signed_payload`] reproduces the signed bytes.
-pub fn encode_commit(commit: &Commit) -> Vec<u8> {
+pub fn encode_commit<H: HashAlgorithm>(commit: &Commit<H>) -> Vec<u8> {
 	let mut out = Vec::new();
 	out.extend_from_slice(format!("tree {}\n", commit.tree).as_bytes());
 	for parent in &commit.parents {
@@ -80,10 +77,10 @@ pub fn encode_commit(commit: &Commit) -> Vec<u8> {
 	out.extend_from_slice(format!("author {}\n", commit.author).as_bytes());
 	out.extend_from_slice(format!("committer {}\n", commit.committer).as_bytes());
 	if let Some(signature) = &commit.signature {
-		// First line trails `gpgsig-sha256 `; continuations a single space (git's format).
+		// First line trails `<gpgsig header> `; continuations a single space (git's format).
 		let mut signature_lines = signature.split('\n');
 		if let Some(first) = signature_lines.next() {
-			out.extend_from_slice(format!("{GPGSIG_HEADER} {first}\n").as_bytes());
+			out.extend_from_slice(format!("{} {first}\n", H::GPGSIG_HEADER).as_bytes());
 		}
 		for line in signature_lines {
 			out.extend_from_slice(format!(" {line}\n").as_bytes());
@@ -96,7 +93,7 @@ pub fn encode_commit(commit: &Commit) -> Vec<u8> {
 
 /// The bytes a signed commit's signature is computed over: the commit re-encoded
 /// without its `gpgsig` header. Matches what git signs/verifies.
-pub fn commit_signed_payload(commit: &Commit) -> Vec<u8> {
+pub fn commit_signed_payload<H: HashAlgorithm>(commit: &Commit<H>) -> Vec<u8> {
 	if commit.signature.is_none() {
 		return encode_commit(commit);
 	}
@@ -108,19 +105,19 @@ pub fn commit_signed_payload(commit: &Commit) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::ObjectKind;
+	use crate::{ObjectKind, Sha256};
 
 	#[test]
 	fn parses_a_merge_commit() {
-		let tree = ObjectId::compute(ObjectKind::Tree, b"t");
-		let p1 = ObjectId::compute(ObjectKind::Commit, b"a");
-		let p2 = ObjectId::compute(ObjectKind::Commit, b"b");
+		let tree = ObjectId::<Sha256>::compute(ObjectKind::Tree, b"t");
+		let p1 = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"a");
+		let p2 = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"b");
 		let payload = format!(
 			"tree {tree}\nparent {p1}\nparent {p2}\n\
              author A <a@x> 1 +0000\ncommitter C <c@x> 2 +0000\n\nmerge\n",
 		);
 
-		let commit = parse_commit(payload.as_bytes()).expect("parse");
+		let commit = parse_commit::<Sha256>(payload.as_bytes()).expect("parse");
 		assert_eq!(commit.tree, tree);
 		assert_eq!(commit.parents, vec![p1, p2]);
 		assert_eq!(commit.author, "A <a@x> 1 +0000");
@@ -130,9 +127,10 @@ mod tests {
 	#[test]
 	fn commit_matches_git_sha256() {
 		// Fixture from `git commit-tree` (sha256) with fixed author/committer dates.
-		let tree =
-			ObjectId::from_hex("b5f4f26b2641070724725ca76c135b9ff2a94b3573a1cdb04223a198cfe53804")
-				.unwrap();
+		let tree = ObjectId::<Sha256>::from_hex(
+			"b5f4f26b2641070724725ca76c135b9ff2a94b3573a1cdb04223a198cfe53804",
+		)
+		.unwrap();
 		let commit = Commit {
 			tree,
 			parents: vec![],
@@ -141,7 +139,7 @@ mod tests {
 			signature: None,
 			message: "first commit\n".to_owned(),
 		};
-		let id = ObjectId::compute(ObjectKind::Commit, &encode_commit(&commit));
+		let id = ObjectId::<Sha256>::compute(ObjectKind::Commit, &encode_commit(&commit));
 		assert_eq!(
 			id.to_hex(),
 			"a2dd0047ccdabef362d8a41ee931f28847d11073a75c7eb3cee9028d03b017df"
@@ -154,7 +152,7 @@ mod tests {
 			author A U Thor <author@example.com> 1700000000 +1000\n\
 			committer C O Mitter <committer@example.com> 1700000005 -0500\n\n\
 			first commit\n";
-		let commit = parse_commit(payload).expect("parse");
+		let commit = parse_commit::<Sha256>(payload).expect("parse");
 		assert_eq!(encode_commit(&commit), payload);
 	}
 
@@ -164,7 +162,7 @@ mod tests {
 		// writes it. The signature bytes here are illustrative, not a real signature.
 		// Written on one line (with explicit `\n `) so the continuation spaces survive.
 		let payload: &[u8] = b"tree b5f4f26b2641070724725ca76c135b9ff2a94b3573a1cdb04223a198cfe53804\nauthor A U Thor <author@example.com> 1700000000 +1000\ncommitter C O Mitter <committer@example.com> 1700000005 -0500\ngpgsig-sha256 -----BEGIN SSH SIGNATURE-----\n U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg\n AAAABHNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA\n -----END SSH SIGNATURE-----\n\nsigned commit\n";
-		let commit = parse_commit(payload).expect("parse");
+		let commit = parse_commit::<Sha256>(payload).expect("parse");
 
 		let signature = commit.signature.clone().expect("has a signature");
 		assert!(signature.starts_with("-----BEGIN SSH SIGNATURE-----"));
@@ -180,7 +178,7 @@ mod tests {
 			!signed.windows(6).any(|w| w == b"gpgsig"),
 			"no gpgsig in payload"
 		);
-		let reparsed = parse_commit(&signed).expect("reparse signed payload");
+		let reparsed = parse_commit::<Sha256>(&signed).expect("reparse signed payload");
 		assert_eq!(reparsed.signature, None);
 		assert_eq!(reparsed.tree, commit.tree);
 		assert_eq!(reparsed.message, commit.message);

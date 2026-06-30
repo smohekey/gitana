@@ -14,6 +14,7 @@
 use std::collections::BTreeSet;
 
 use gitana_file_store::FileStore;
+use gitana_object::HashAlgorithm;
 
 use crate::checkout::{remove_worktree_file, validate_path};
 use crate::fsmeta::blob_of;
@@ -32,8 +33,8 @@ pub struct RmOutcome {
 	pub failure: Option<WorktreeError>,
 }
 
-pub(crate) async fn run<F>(
-	wt: &WorkTree<F>,
+pub(crate) async fn run<F, H>(
+	wt: &WorkTree<F, H>,
 	pathspecs: &[&str],
 	prefix: &str,
 	cached: bool,
@@ -43,6 +44,7 @@ pub(crate) async fn run<F>(
 ) -> Result<RmOutcome, WorktreeError>
 where
 	F: FileStore,
+	H: HashAlgorithm,
 {
 	let mut index = wt.load_index()?;
 	// Tracked = stage-0 entries plus unmerged paths (which have only stage 1/2/3 entries); removing

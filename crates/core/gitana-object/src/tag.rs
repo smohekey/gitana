@@ -1,11 +1,11 @@
 use crate::text::{as_str, split_message};
-use crate::{ObjectError, ObjectId, ObjectKind};
+use crate::{HashAlgorithm, ObjectError, ObjectId, ObjectKind};
 
 /// A parsed annotated tag object.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Tag {
+pub struct Tag<H: HashAlgorithm> {
 	/// The object the tag points at.
-	pub object: ObjectId,
+	pub object: ObjectId<H>,
 	/// The kind of the tagged object.
 	pub kind: ObjectKind,
 	/// The tag name.
@@ -17,7 +17,7 @@ pub struct Tag {
 }
 
 /// Parse an annotated tag payload.
-pub fn parse_tag(payload: &[u8]) -> Result<Tag, ObjectError> {
+pub fn parse_tag<H: HashAlgorithm>(payload: &[u8]) -> Result<Tag<H>, ObjectError> {
 	let (header, message) = split_message(payload)?;
 
 	let mut object = None;
@@ -48,7 +48,7 @@ pub fn parse_tag(payload: &[u8]) -> Result<Tag, ObjectError> {
 
 /// Encode an annotated tag to its canonical git payload: `object`, `type`, `tag`,
 /// optional `tagger`, blank line, message (emitted verbatim).
-pub fn encode_tag(tag: &Tag) -> Vec<u8> {
+pub fn encode_tag<H: HashAlgorithm>(tag: &Tag<H>) -> Vec<u8> {
 	let mut out = Vec::new();
 	out.extend_from_slice(format!("object {}\n", tag.object).as_bytes());
 	out.extend_from_slice(format!("type {}\n", tag.kind.as_str()).as_bytes());
@@ -64,14 +64,15 @@ pub fn encode_tag(tag: &Tag) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::Sha256;
 
 	#[test]
 	fn parses_a_tag() {
-		let object = ObjectId::compute(ObjectKind::Commit, b"c");
+		let object = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"c");
 		let payload =
 			format!("object {object}\ntype commit\ntag v1\ntagger T <t@x> 1 +0000\n\nrelease\n");
 
-		let tag = parse_tag(payload.as_bytes()).expect("parse");
+		let tag = parse_tag::<Sha256>(payload.as_bytes()).expect("parse");
 		assert_eq!(tag.object, object);
 		assert_eq!(tag.kind, ObjectKind::Commit);
 		assert_eq!(tag.name, "v1");
@@ -80,10 +81,10 @@ mod tests {
 
 	#[test]
 	fn encode_round_trips_parse() {
-		let object = ObjectId::compute(ObjectKind::Commit, b"c");
+		let object = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"c");
 		let payload =
 			format!("object {object}\ntype commit\ntag v1\ntagger T <t@x> 1 +0000\n\nrelease\n");
-		let tag = parse_tag(payload.as_bytes()).expect("parse");
+		let tag = parse_tag::<Sha256>(payload.as_bytes()).expect("parse");
 		assert_eq!(encode_tag(&tag), payload.as_bytes());
 	}
 }

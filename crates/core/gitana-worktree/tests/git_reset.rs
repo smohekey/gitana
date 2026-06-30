@@ -4,14 +4,14 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use gitana_file_store_local::LocalFileStore;
-use gitana_object::ObjectId;
+use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 use gitana_worktree::{WorkTree, WorktreeError};
 
-fn make_repo(work: &std::path::Path) -> WorkTree<LocalFileStore> {
+fn make_repo(work: &std::path::Path) -> WorkTree<LocalFileStore, Sha256> {
 	let git_dir = work.join(".git");
-	let repo = Repository::new(ObjectStore::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
 	WorkTree::new(repo, work, git_dir)
 }
 
@@ -38,7 +38,7 @@ async fn reset_index_replaces_index_with_tree() {
 	let wt = make_repo(&work);
 	let tree1 = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&first).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&first).unwrap())
 		.await
 		.unwrap();
 

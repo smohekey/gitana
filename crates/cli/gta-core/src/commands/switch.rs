@@ -1,8 +1,11 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
+use gitana_file_store_local::LocalFileStore;
+use gitana_object::HashAlgorithm;
+use gitana_worktree::WorkTree;
 
-use crate::repo;
+use crate::dispatch::{self, WorkTreeCommand};
 
 /// Switch the working tree and `HEAD` to branch `name`. With `create`, make the
 /// branch (at `start`, default `HEAD`) first. With `force`, overwrite local changes.
@@ -13,24 +16,55 @@ pub async fn run(
 	start: Option<String>,
 	force: bool,
 ) -> Result<()> {
-	let wt = repo::open_worktree(cwd)?;
-	let repo = wt.repository();
-	let branch = format!("refs/heads/{name}");
+	dispatch::on_worktree(
+		cwd,
+		Switch {
+			name,
+			create,
+			start,
+			force,
+		},
+	)
+	.await
+}
 
-	if create {
-		if repo.refs().resolve(&branch).await?.is_some() {
-			bail!("a branch named '{name}' already exists");
+struct Switch<'a> {
+	name: &'a str,
+	create: bool,
+	start: Option<String>,
+	force: bool,
+}
+
+impl WorkTreeCommand for Switch<'_> {
+	async fn run<H: HashAlgorithm>(
+		self,
+		worktree: WorkTree<LocalFileStore, H>,
+		_prefix: String,
+	) -> Result<()> {
+		let repo = worktree.repository();
+		let branch = format!("refs/heads/{}", self.name);
+
+		if self.create {
+			if repo.refs().resolve(&branch).await?.is_some() {
+				bail!("a branch named '{}' already exists", self.name);
+			}
+			let target = repo
+				.rev_parse(self.start.as_deref().unwrap_or("HEAD"))
+				.await?;
+			repo.refs().update_ref(&branch, target, None).await?;
 		}
-		let target = repo.rev_parse(start.as_deref().unwrap_or("HEAD")).await?;
-		repo.refs().update_ref(&branch, target, None).await?;
-	}
 
-	let Some(commit) = repo.refs().resolve(&branch).await? else {
-		bail!("invalid reference: {name}");
-	};
-	let tree = repo.commit_tree(commit).await?;
-	wt.checkout(tree, force).await?;
-	repo.refs().set_head_symbolic(&branch).await?;
-	eprintln!("Switched to branch '{name}'");
-	Ok(())
+		let Some(commit) = repo.refs().resolve(&branch).await? else {
+			bail!("invalid reference: {}", self.name);
+		};
+		let tree = repo.commit_tree(commit).await?;
+		worktree.checkout(tree, self.force).await?;
+		worktree
+			.repository()
+			.refs()
+			.set_head_symbolic(&branch)
+			.await?;
+		eprintln!("Switched to branch '{}'", self.name);
+		Ok(())
+	}
 }

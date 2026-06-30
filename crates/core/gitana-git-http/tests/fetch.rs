@@ -5,16 +5,17 @@
 
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_git_http::{fetch, upload_pack_v0};
+use gitana_object::Sha256;
 use gitana_object::{ObjectId, PktLine, decode_pack, parse_pkt};
 use gitana_object_store::ObjectStore;
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 
-fn repo() -> Repository<MemoryFileStore> {
-	Repository::new(ObjectStore::new(MemoryFileStore::new()))
+fn repo() -> Repository<MemoryFileStore, Sha256> {
+	Repository::new(ObjectStore::<_, Sha256>::new(MemoryFileStore::new()))
 }
 
 /// Init a repo and commit one file on `main`, returning the repo and commit id.
-async fn repo_with_commit() -> (Repository<MemoryFileStore>, ObjectId) {
+async fn repo_with_commit() -> (Repository<MemoryFileStore, Sha256>, ObjectId<Sha256>) {
 	let repo = repo();
 	repo.init().await.expect("init");
 	let blob = repo.write_blob(b"hello\n").await.expect("blob");
@@ -86,7 +87,7 @@ async fn fetch_with_done_returns_a_pack_of_the_wants() {
 
 	let response = fetch(&repo, &request).await.expect("fetch");
 	let pack = extract_pack(&response);
-	let objects = decode_pack(&pack).expect("decode");
+	let objects = decode_pack::<Sha256>(&pack).expect("decode");
 	// commit + its tree + the blob.
 	assert_eq!(objects.len(), 3);
 	assert!(objects.iter().any(|o| o.id == commit));
@@ -97,7 +98,7 @@ async fn fetch_without_haves_acks_nak() {
 	let (repo, commit) = repo_with_commit().await;
 
 	// No `done`, and a `have` the server lacks: it cannot find a cut point yet.
-	let phantom = ObjectId::compute(gitana_object::ObjectKind::Commit, b"absent");
+	let phantom = ObjectId::<Sha256>::compute(gitana_object::ObjectKind::Commit, b"absent");
 	let mut request = pkt("command=fetch\n");
 	request.extend_from_slice(b"0001");
 	request.extend_from_slice(&pkt(&format!("want {commit}\n")));
@@ -137,8 +138,8 @@ async fn fetch_excludes_objects_reachable_from_haves() {
 	request.extend_from_slice(b"0000");
 
 	let response = fetch(&repo, &request).await.expect("fetch");
-	let objects = decode_pack(&extract_pack(&response)).expect("decode");
-	let ids: Vec<ObjectId> = objects.iter().map(|o| o.id).collect();
+	let objects = decode_pack::<Sha256>(&extract_pack(&response)).expect("decode");
+	let ids: Vec<ObjectId<Sha256>> = objects.iter().map(|o| o.id).collect();
 	// Only the new commit, its tree, and the new blob — not the first commit.
 	assert!(ids.contains(&second));
 	assert!(!ids.contains(&first));
@@ -156,7 +157,7 @@ async fn v0_upload_pack_returns_nak_then_pack() {
 	let response = upload_pack_v0(&repo, &request).await.expect("v0");
 	let lines = pkt_lines(&response);
 	assert_eq!(lines[0], b"NAK\n");
-	let objects = decode_pack(&extract_pack_v0(&response)).expect("decode");
+	let objects = decode_pack::<Sha256>(&extract_pack_v0(&response)).expect("decode");
 	assert!(objects.iter().any(|o| o.id == commit));
 }
 

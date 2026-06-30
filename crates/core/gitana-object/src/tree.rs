@@ -1,21 +1,22 @@
 use crate::text::as_str;
-use crate::{ObjectError, ObjectId};
+use crate::{HashAlgorithm, ObjectError, ObjectId};
 
 /// One entry in a tree object.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TreeEntry {
+pub struct TreeEntry<H: HashAlgorithm> {
 	/// The octal mode string (e.g. `100644`, `40000`).
 	pub mode: String,
 	/// The entry name.
 	pub name: String,
 	/// The id of the referenced object.
-	pub id: ObjectId,
+	pub id: ObjectId<H>,
 }
 
 /// Parse a tree payload into its entries.
 ///
-/// Each entry is `<mode> <name>\0<32 raw id bytes>`.
-pub fn parse_tree(payload: &[u8]) -> Result<Vec<TreeEntry>, ObjectError> {
+/// Each entry is `<mode> <name>\0<raw id bytes>`, where the id width is the hash
+/// algorithm's [`HashAlgorithm::RAW_LEN`].
+pub fn parse_tree<H: HashAlgorithm>(payload: &[u8]) -> Result<Vec<TreeEntry<H>>, ObjectError> {
 	let mut entries = Vec::new();
 	let mut rest = payload;
 
@@ -34,18 +35,13 @@ pub fn parse_tree(payload: &[u8]) -> Result<Vec<TreeEntry>, ObjectError> {
 		let name = as_str(&rest[..nul])?.to_owned();
 		rest = &rest[nul + 1..];
 
-		if rest.len() < 32 {
+		if rest.len() < H::RAW_LEN {
 			return Err(ObjectError::MalformedHeader);
 		}
-		let mut id = [0u8; 32];
-		id.copy_from_slice(&rest[..32]);
-		rest = &rest[32..];
+		let id = ObjectId::from_bytes(&rest[..H::RAW_LEN])?;
+		rest = &rest[H::RAW_LEN..];
 
-		entries.push(TreeEntry {
-			mode,
-			name,
-			id: ObjectId::from_bytes(id),
-		});
+		entries.push(TreeEntry { mode, name, id });
 	}
 
 	Ok(entries)
@@ -54,10 +50,10 @@ pub fn parse_tree(payload: &[u8]) -> Result<Vec<TreeEntry>, ObjectError> {
 /// Encode tree `entries` to the canonical git tree payload.
 ///
 /// Entries are sorted by git's rule: by name bytes, with directory (`40000`)
-/// names compared as if they ended in `/`. Each entry is `<mode> <name>\0<32
-/// raw id bytes>`.
-pub fn encode_tree(entries: &[TreeEntry]) -> Vec<u8> {
-	let mut sorted: Vec<&TreeEntry> = entries.iter().collect();
+/// names compared as if they ended in `/`. Each entry is `<mode> <name>\0<raw
+/// id bytes>`.
+pub fn encode_tree<H: HashAlgorithm>(entries: &[TreeEntry<H>]) -> Vec<u8> {
+	let mut sorted: Vec<&TreeEntry<H>> = entries.iter().collect();
 	sorted.sort_by_cached_key(|entry| tree_sort_key(entry));
 
 	let mut out = Vec::new();
@@ -71,7 +67,7 @@ pub fn encode_tree(entries: &[TreeEntry]) -> Vec<u8> {
 	out
 }
 
-fn tree_sort_key(entry: &TreeEntry) -> Vec<u8> {
+fn tree_sort_key<H: HashAlgorithm>(entry: &TreeEntry<H>) -> Vec<u8> {
 	let mut key = entry.name.as_bytes().to_vec();
 	if entry.mode == "40000" {
 		key.push(b'/');
@@ -82,18 +78,18 @@ fn tree_sort_key(entry: &TreeEntry) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::ObjectKind;
+	use crate::{ObjectKind, Sha1, Sha256};
 
 	#[test]
 	fn parses_a_tree() {
-		let blob = ObjectId::compute(ObjectKind::Blob, b"x");
+		let blob = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"x");
 		let mut payload = b"100644 file.txt\0".to_vec();
 		payload.extend_from_slice(blob.as_bytes());
 		payload.extend_from_slice(b"40000 dir\0");
-		let dir = ObjectId::compute(ObjectKind::Tree, b"d");
+		let dir = ObjectId::<Sha256>::compute(ObjectKind::Tree, b"d");
 		payload.extend_from_slice(dir.as_bytes());
 
-		let entries = parse_tree(&payload).expect("parse");
+		let entries = parse_tree::<Sha256>(&payload).expect("parse");
 		assert_eq!(entries.len(), 2);
 		assert_eq!(entries[0].mode, "100644");
 		assert_eq!(entries[0].name, "file.txt");
@@ -104,7 +100,7 @@ mod tests {
 
 	#[test]
 	fn empty_tree_matches_git_sha256() {
-		let id = ObjectId::compute(ObjectKind::Tree, &encode_tree(&[]));
+		let id = ObjectId::<Sha256>::compute(ObjectKind::Tree, &encode_tree::<Sha256>(&[]));
 		assert_eq!(
 			id.to_hex(),
 			"6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
@@ -114,15 +110,16 @@ mod tests {
 	#[test]
 	fn tree_with_one_blob_matches_git_sha256() {
 		// Fixture from `git mktree` (sha256): 100644 greeting.txt -> blob("hello").
-		let blob =
-			ObjectId::from_hex("8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60")
-				.unwrap();
+		let blob = ObjectId::<Sha256>::from_hex(
+			"8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60",
+		)
+		.unwrap();
 		let tree = encode_tree(&[TreeEntry {
 			mode: "100644".to_owned(),
 			name: "greeting.txt".to_owned(),
 			id: blob,
 		}]);
-		let id = ObjectId::compute(ObjectKind::Tree, &tree);
+		let id = ObjectId::<Sha256>::compute(ObjectKind::Tree, &tree);
 		assert_eq!(
 			id.to_hex(),
 			"b5f4f26b2641070724725ca76c135b9ff2a94b3573a1cdb04223a198cfe53804"
@@ -130,9 +127,10 @@ mod tests {
 	}
 
 	#[test]
-	fn encode_round_trips_parse() {
-		let blob = ObjectId::compute(ObjectKind::Blob, b"x");
-		let dir = ObjectId::compute(ObjectKind::Tree, b"d");
+	fn sha1_tree_round_trips() {
+		// A SHA-1 tree must use 20-byte ids end to end.
+		let blob = ObjectId::<Sha1>::compute(ObjectKind::Blob, b"x");
+		let dir = ObjectId::<Sha1>::compute(ObjectKind::Tree, b"d");
 		let entries = vec![
 			TreeEntry {
 				mode: "40000".to_owned(),
@@ -145,7 +143,31 @@ mod tests {
 				id: blob,
 			},
 		];
-		let reparsed = parse_tree(&encode_tree(&entries)).expect("parse");
+		let encoded = encode_tree(&entries);
+		let reparsed = parse_tree::<Sha1>(&encoded).expect("parse");
+		assert_eq!(reparsed[0].name, "dir");
+		assert_eq!(reparsed[0].id, dir);
+		assert_eq!(reparsed[1].name, "file.txt");
+		assert_eq!(reparsed[1].id, blob);
+	}
+
+	#[test]
+	fn encode_round_trips_parse() {
+		let blob = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"x");
+		let dir = ObjectId::<Sha256>::compute(ObjectKind::Tree, b"d");
+		let entries = vec![
+			TreeEntry {
+				mode: "40000".to_owned(),
+				name: "dir".to_owned(),
+				id: dir,
+			},
+			TreeEntry {
+				mode: "100644".to_owned(),
+				name: "file.txt".to_owned(),
+				id: blob,
+			},
+		];
+		let reparsed = parse_tree::<Sha256>(&encode_tree(&entries)).expect("parse");
 		// Sorted: "dir" (as "dir/") sorts after "file.txt"? No — 'd' < 'f', so dir first.
 		assert_eq!(reparsed[0].name, "dir");
 		assert_eq!(reparsed[1].name, "file.txt");

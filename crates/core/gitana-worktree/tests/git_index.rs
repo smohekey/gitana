@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use gitana_object::Sha256;
 use gitana_worktree::Index;
 
 #[test]
@@ -23,7 +24,8 @@ fn round_trips_a_real_git_index() {
 	let git_listing = ls_files(w);
 
 	// Our parser reads git's v4 index and agrees on mode/oid/path.
-	let index = Index::parse(&std::fs::read(work.join(".git/index")).unwrap()).expect("parse");
+	let index =
+		Index::<Sha256>::parse(&std::fs::read(work.join(".git/index")).unwrap()).expect("parse");
 	let ours: Vec<String> = index
 		.entries
 		.iter()

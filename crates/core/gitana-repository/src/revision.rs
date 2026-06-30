@@ -8,7 +8,9 @@
 use std::collections::{BinaryHeap, HashSet};
 
 use gitana_file_store::FileStore;
-use gitana_object::{Commit, ObjectId, ObjectKind, Signature, parse_commit, parse_tag, parse_tree};
+use gitana_object::{
+	Commit, HashAlgorithm, ObjectId, ObjectKind, Signature, parse_commit, parse_tag, parse_tree,
+};
 
 use crate::{Repository, RepositoryError};
 
@@ -22,10 +24,10 @@ enum Op {
 }
 
 /// Resolve a revision spec to an object id.
-pub(crate) async fn rev_parse(
-	repo: &Repository<impl FileStore>,
+pub(crate) async fn rev_parse<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
 	spec: &str,
-) -> Result<ObjectId, RepositoryError> {
+) -> Result<ObjectId<H>, RepositoryError> {
 	// `<rev>:<path>` — the blob or tree at `<path>` within `<rev>`'s tree. (The `:path`/`:n:path`
 	// index forms, which start with `:`, are not supported.)
 	if let Some(colon) = spec.find(':')
@@ -38,10 +40,10 @@ pub(crate) async fn rev_parse(
 }
 
 /// Resolve a revision spec without a `:path` suffix: a base (ref/oid/`HEAD`) and `~`/`^` ops.
-async fn resolve_rev(
-	repo: &Repository<impl FileStore>,
+async fn resolve_rev<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
 	spec: &str,
-) -> Result<ObjectId, RepositoryError> {
+) -> Result<ObjectId<H>, RepositoryError> {
 	let (base, ops) = parse_spec(spec)?;
 	let mut id = resolve_base(repo, base).await?;
 	for op in ops {
@@ -56,11 +58,11 @@ async fn resolve_rev(
 
 /// Resolve `<path>` within the tree of `base` (a commit, tag, or tree) to its blob or tree id. An
 /// empty path yields the tree itself; descending through a non-directory is an error.
-async fn object_at_path(
-	repo: &Repository<impl FileStore>,
-	base: ObjectId,
+async fn object_at_path<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	base: ObjectId<H>,
 	path: &str,
-) -> Result<ObjectId, RepositoryError> {
+) -> Result<ObjectId<H>, RepositoryError> {
 	let mut tree = peel_to_tree(repo, base).await?;
 	// A trailing slash (`<rev>:<path>/`) requires the path to name a directory.
 	let require_dir = path.ends_with('/');
@@ -77,7 +79,7 @@ async fn object_at_path(
 				parts[..depth].join("/")
 			)));
 		}
-		let entry = parse_tree(&payload)?
+		let entry = parse_tree::<H>(&payload)?
 			.into_iter()
 			.find(|entry| entry.name == *part)
 			.ok_or_else(|| {
@@ -97,16 +99,16 @@ async fn object_at_path(
 }
 
 /// Peel a commit/tag/tree id to a tree id (dereferencing tags), erroring on a blob.
-async fn peel_to_tree(
-	repo: &Repository<impl FileStore>,
-	mut id: ObjectId,
-) -> Result<ObjectId, RepositoryError> {
+async fn peel_to_tree<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	mut id: ObjectId<H>,
+) -> Result<ObjectId<H>, RepositoryError> {
 	loop {
 		let (kind, payload) = repo.objects().read_object(&id).await?;
 		match kind {
 			ObjectKind::Tree => return Ok(id),
-			ObjectKind::Commit => return Ok(parse_commit(&payload)?.tree),
-			ObjectKind::Tag => id = parse_tag(&payload)?.object,
+			ObjectKind::Commit => return Ok(parse_commit::<H>(&payload)?.tree),
+			ObjectKind::Tag => id = parse_tag::<H>(&payload)?.object,
 			ObjectKind::Blob => {
 				return Err(RepositoryError::InvalidRef(format!(
 					"{id} is not a tree-ish"
@@ -117,12 +119,12 @@ async fn peel_to_tree(
 }
 
 /// Walk commits reachable from `tips` in committer-date order (newest first).
-pub(crate) async fn rev_list(
-	repo: &Repository<impl FileStore>,
-	tips: &[ObjectId],
-) -> Result<Vec<ObjectId>, RepositoryError> {
-	let mut heap: BinaryHeap<(i64, ObjectId)> = BinaryHeap::new();
-	let mut seen: HashSet<ObjectId> = HashSet::new();
+pub(crate) async fn rev_list<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	tips: &[ObjectId<H>],
+) -> Result<Vec<ObjectId<H>>, RepositoryError> {
+	let mut heap: BinaryHeap<(i64, ObjectId<H>)> = BinaryHeap::new();
+	let mut seen: HashSet<ObjectId<H>> = HashSet::new();
 
 	for tip in tips {
 		let commit = peel_to_commit(repo, *tip).await?;
@@ -180,10 +182,10 @@ fn leading_number(s: &str) -> (Option<u32>, usize) {
 	(digits.parse().ok(), len)
 }
 
-async fn resolve_base(
-	repo: &Repository<impl FileStore>,
+async fn resolve_base<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
 	base: &str,
-) -> Result<ObjectId, RepositoryError> {
+) -> Result<ObjectId<H>, RepositoryError> {
 	if base == "HEAD" || base == "@" {
 		return repo
 			.refs()
@@ -204,8 +206,9 @@ async fn resolve_base(
 		}
 	}
 
-	if is_hex(base) && (4..=64).contains(&base.len()) {
-		if base.len() == 64 {
+	let full_len = H::RAW_LEN * 2;
+	if is_hex(base) && (4..=full_len).contains(&base.len()) {
+		if base.len() == full_len {
 			let id =
 				ObjectId::from_hex(base).map_err(|_| RepositoryError::InvalidRef(base.to_owned()))?;
 			if repo.objects().exists_object(&id).await? {
@@ -220,10 +223,10 @@ async fn resolve_base(
 	)))
 }
 
-async fn resolve_abbrev(
-	repo: &Repository<impl FileStore>,
+async fn resolve_abbrev<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
 	hex: &str,
-) -> Result<ObjectId, RepositoryError> {
+) -> Result<ObjectId<H>, RepositoryError> {
 	let (dir, rest) = hex.split_at(2);
 	let entries = repo
 		.objects()
@@ -231,7 +234,7 @@ async fn resolve_abbrev(
 		.list_prefix(&format!("objects/{dir}/"))
 		.await?;
 
-	let mut matches: Vec<ObjectId> = Vec::new();
+	let mut matches: Vec<ObjectId<H>> = Vec::new();
 	for path in entries {
 		let name = path.rsplit('/').next().unwrap_or_default();
 		if name.starts_with(rest)
@@ -251,36 +254,36 @@ async fn resolve_abbrev(
 	}
 }
 
-pub(crate) async fn read_commit(
-	repo: &Repository<impl FileStore>,
-	id: ObjectId,
-) -> Result<Commit, RepositoryError> {
+pub(crate) async fn read_commit<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	id: ObjectId<H>,
+) -> Result<Commit<H>, RepositoryError> {
 	let (kind, payload) = repo.objects().read_object(&id).await?;
 	if kind != ObjectKind::Commit {
 		return Err(RepositoryError::InvalidRef(format!("{id} is not a commit")));
 	}
-	Ok(parse_commit(&payload)?)
+	Ok(parse_commit::<H>(&payload)?)
 }
 
-pub(crate) async fn peel_to_commit(
-	repo: &Repository<impl FileStore>,
-	mut id: ObjectId,
-) -> Result<ObjectId, RepositoryError> {
+pub(crate) async fn peel_to_commit<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	mut id: ObjectId<H>,
+) -> Result<ObjectId<H>, RepositoryError> {
 	loop {
 		let (kind, payload) = repo.objects().read_object(&id).await?;
 		match kind {
 			ObjectKind::Commit => return Ok(id),
-			ObjectKind::Tag => id = parse_tag(&payload)?.object,
+			ObjectKind::Tag => id = parse_tag::<H>(&payload)?.object,
 			_ => return Err(RepositoryError::InvalidRef(format!("{id} is not a commit"))),
 		}
 	}
 }
 
-async fn nth_parent(
-	repo: &Repository<impl FileStore>,
-	id: ObjectId,
+async fn nth_parent<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	id: ObjectId<H>,
 	n: u32,
-) -> Result<ObjectId, RepositoryError> {
+) -> Result<ObjectId<H>, RepositoryError> {
 	let commit_id = peel_to_commit(repo, id).await?;
 	if n == 0 {
 		return Ok(commit_id);
@@ -293,11 +296,11 @@ async fn nth_parent(
 		.ok_or_else(|| RepositoryError::InvalidRef(format!("{commit_id} has no parent {n}")))
 }
 
-async fn first_parent_n(
-	repo: &Repository<impl FileStore>,
-	id: ObjectId,
+async fn first_parent_n<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	id: ObjectId<H>,
 	n: u32,
-) -> Result<ObjectId, RepositoryError> {
+) -> Result<ObjectId<H>, RepositoryError> {
 	let mut current = peel_to_commit(repo, id).await?;
 	for _ in 0..n {
 		current = *read_commit(repo, current)
@@ -309,11 +312,11 @@ async fn first_parent_n(
 	Ok(current)
 }
 
-async fn peel_type(
-	repo: &Repository<impl FileStore>,
-	id: ObjectId,
+async fn peel_type<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	id: ObjectId<H>,
 	kind: &str,
-) -> Result<ObjectId, RepositoryError> {
+) -> Result<ObjectId<H>, RepositoryError> {
 	match kind {
 		"" => {
 			// Deref tags to a non-tag object.
@@ -321,7 +324,7 @@ async fn peel_type(
 			loop {
 				let (object_kind, payload) = repo.objects().read_object(&current).await?;
 				if object_kind == ObjectKind::Tag {
-					current = parse_tag(&payload)?.object;
+					current = parse_tag::<H>(&payload)?.object;
 				} else {
 					return Ok(current);
 				}
@@ -351,9 +354,9 @@ async fn peel_type(
 	}
 }
 
-pub(crate) async fn committer_seconds(
-	repo: &Repository<impl FileStore>,
-	id: ObjectId,
+pub(crate) async fn committer_seconds<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	id: ObjectId<H>,
 ) -> Result<i64, RepositoryError> {
 	let commit = read_commit(repo, id).await?;
 	Ok(Signature::parse(&commit.committer)?.seconds)

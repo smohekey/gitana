@@ -5,24 +5,37 @@ use std::path::Path;
 use std::pin::Pin;
 
 use anyhow::Result;
-use gitana_object::{ObjectId, ObjectKind, parse_commit, parse_tag, parse_tree};
+use gitana_file_store_local::LocalFileStore;
+use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_commit, parse_tag, parse_tree};
+use gitana_repository::Repository;
 use gitana_worktree::FileDiff;
 
 use crate::commands::diff;
-use crate::repo::{self, LocalRepository};
+use crate::dispatch::{self, ObjectCommand};
 
 /// Show an object: a commit (header plus its diff against the first parent), an annotated tag
 /// (header plus the object it points at), a tree (its entries), or a blob (its raw bytes).
 /// Defaults to `HEAD`.
 pub async fn run(cwd: &Path, object: Option<String>) -> Result<()> {
-	let (repo, oid) = repo::resolve_object(cwd, object.as_deref().unwrap_or("HEAD")).await?;
-	show_object(&repo, oid).await
+	dispatch::on_object(cwd, object.as_deref().unwrap_or("HEAD"), Show).await
+}
+
+struct Show;
+
+impl ObjectCommand for Show {
+	async fn run<H: HashAlgorithm>(
+		self,
+		repo: Repository<LocalFileStore, H>,
+		oid: ObjectId<H>,
+	) -> Result<()> {
+		show_object(&repo, oid).await
+	}
 }
 
 /// Display the object `oid` according to its kind (boxed so a tag can recurse into its target).
-fn show_object<'a>(
-	repo: &'a LocalRepository,
-	oid: ObjectId,
+fn show_object<'a, H: HashAlgorithm>(
+	repo: &'a Repository<LocalFileStore, H>,
+	oid: ObjectId<H>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
 	Box::pin(async move {
 		let (kind, payload) = repo.objects().read_object(&oid).await?;
@@ -35,8 +48,12 @@ fn show_object<'a>(
 	})
 }
 
-async fn show_commit(repo: &LocalRepository, oid: ObjectId, payload: &[u8]) -> Result<()> {
-	let commit = parse_commit(payload)?;
+async fn show_commit<H: HashAlgorithm>(
+	repo: &Repository<LocalFileStore, H>,
+	oid: ObjectId<H>,
+	payload: &[u8],
+) -> Result<()> {
+	let commit = parse_commit::<H>(payload)?;
 	let mut out = Vec::new();
 	out.extend_from_slice(format!("commit {oid}\n").as_bytes());
 	let (ident, date) = split_signature(&commit.author);
@@ -59,8 +76,11 @@ async fn show_commit(repo: &LocalRepository, oid: ObjectId, payload: &[u8]) -> R
 	Ok(())
 }
 
-async fn show_tag(repo: &LocalRepository, payload: &[u8]) -> Result<()> {
-	let tag = parse_tag(payload)?;
+async fn show_tag<H: HashAlgorithm>(
+	repo: &Repository<LocalFileStore, H>,
+	payload: &[u8],
+) -> Result<()> {
+	let tag = parse_tag::<H>(payload)?;
 	let mut out = Vec::new();
 	out.extend_from_slice(format!("tag {}\n", tag.name).as_bytes());
 	if let Some(tagger) = &tag.tagger {
@@ -78,9 +98,9 @@ async fn show_tag(repo: &LocalRepository, payload: &[u8]) -> Result<()> {
 	show_object(repo, tag.object).await
 }
 
-fn show_tree(oid: ObjectId, payload: &[u8]) -> Result<()> {
+fn show_tree<H: HashAlgorithm>(oid: ObjectId<H>, payload: &[u8]) -> Result<()> {
 	let mut out = format!("tree {oid}\n\n");
-	for entry in parse_tree(payload)? {
+	for entry in parse_tree::<H>(payload)? {
 		out.push_str(&entry.name);
 		out.push('\n');
 	}
@@ -90,10 +110,10 @@ fn show_tree(oid: ObjectId, payload: &[u8]) -> Result<()> {
 
 /// A tree flattened to `path -> (mode, oid)`, dropping gitlinks (submodule entries), which have
 /// no blob to diff.
-async fn tree_map(
-	repo: &LocalRepository,
-	tree: ObjectId,
-) -> Result<BTreeMap<String, (String, ObjectId)>> {
+async fn tree_map<H: HashAlgorithm>(
+	repo: &Repository<LocalFileStore, H>,
+	tree: ObjectId<H>,
+) -> Result<BTreeMap<String, (String, ObjectId<H>)>> {
 	Ok(
 		repo
 			.read_tree(tree)
@@ -107,10 +127,10 @@ async fn tree_map(
 
 /// The added, deleted, and modified paths between two flattened trees, with their blob content,
 /// ready for the unified-diff formatter. Paths are sorted (the maps are ordered).
-async fn tree_diff(
-	repo: &LocalRepository,
-	old: &BTreeMap<String, (String, ObjectId)>,
-	new: &BTreeMap<String, (String, ObjectId)>,
+async fn tree_diff<H: HashAlgorithm>(
+	repo: &Repository<LocalFileStore, H>,
+	old: &BTreeMap<String, (String, ObjectId<H>)>,
+	new: &BTreeMap<String, (String, ObjectId<H>)>,
 ) -> Result<Vec<FileDiff>> {
 	let mut diffs = Vec::new();
 	for (path, (omode, ooid)) in old {

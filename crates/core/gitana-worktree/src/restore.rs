@@ -14,16 +14,16 @@
 use std::collections::BTreeSet;
 
 use gitana_file_store::FileStore;
-use gitana_object::ObjectId;
+use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::checkout::{remove_worktree_path, validate_path, write_worktree_file};
 use crate::fsmeta::stat_of;
 use crate::pathspec::normalize;
 use crate::{IndexEntry, Stat, WorkTree, WorktreeError};
 
-pub(crate) async fn run<F>(
-	wt: &WorkTree<F>,
-	source: Option<ObjectId>,
+pub(crate) async fn run<F, H>(
+	wt: &WorkTree<F, H>,
+	source: Option<ObjectId<H>>,
 	worktree: bool,
 	staged: bool,
 	pathspecs: &[&str],
@@ -32,12 +32,13 @@ pub(crate) async fn run<F>(
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
+	H: HashAlgorithm,
 {
 	let mut index = wt.load_index()?;
 
 	// The `(path, mode, oid)` content a selected path is restored from: the source tree, or the
 	// current index when there is no tree source.
-	let source_entries: Vec<(String, String, ObjectId)> = match source {
+	let source_entries: Vec<(String, String, ObjectId<H>)> = match source {
 		Some(tree) => wt.repository().read_tree(tree).await?,
 		None => index
 			.entries

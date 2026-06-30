@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use gitana_file_store::FileStore;
-use gitana_object::ObjectId;
+use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::fsmeta::blob_of;
 use crate::ignore::{self, DirIgnore};
@@ -56,9 +56,11 @@ impl Status {
 	}
 }
 
-pub(crate) async fn compute<F: FileStore>(wt: &WorkTree<F>) -> Result<Status, WorktreeError> {
+pub(crate) async fn compute<F: FileStore, H: HashAlgorithm>(
+	wt: &WorkTree<F, H>,
+) -> Result<Status, WorktreeError> {
 	let index = wt.load_index()?;
-	let index_map: HashMap<String, (String, ObjectId)> = index
+	let index_map: HashMap<String, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
 		.filter(|e| e.stage == 0)
@@ -139,7 +141,7 @@ pub(crate) async fn compute<F: FileStore>(wt: &WorkTree<F>) -> Result<Status, Wo
 
 /// git's `git status --porcelain` two-letter code for an unmerged path, from which of base (1),
 /// ours (2), and theirs (3) are present.
-fn conflict_code(conflict: &Conflict) -> (char, char) {
+fn conflict_code<H: HashAlgorithm>(conflict: &Conflict<H>) -> (char, char) {
 	match (
 		conflict.base.is_some(),
 		conflict.ours.is_some(),
@@ -166,9 +168,9 @@ fn at<'a>(merged: &'a mut BTreeMap<String, StatusEntry>, path: &str) -> &'a mut 
 		})
 }
 
-pub(crate) async fn head_entries<F: FileStore>(
-	wt: &WorkTree<F>,
-) -> Result<HashMap<String, (String, ObjectId)>, WorktreeError> {
+pub(crate) async fn head_entries<F: FileStore, H: HashAlgorithm>(
+	wt: &WorkTree<F, H>,
+) -> Result<HashMap<String, (String, ObjectId<H>)>, WorktreeError> {
 	let Some(commit) = wt.repository().refs().resolve_head().await? else {
 		return Ok(HashMap::new());
 	};
@@ -238,7 +240,10 @@ fn collect_untracked(
 	Ok(())
 }
 
-fn worktree_change(entry: &IndexEntry, full: &Path) -> Result<char, WorktreeError> {
+fn worktree_change<H: HashAlgorithm>(
+	entry: &IndexEntry<H>,
+	full: &Path,
+) -> Result<char, WorktreeError> {
 	let meta = match std::fs::symlink_metadata(full) {
 		Ok(meta) => meta,
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok('D'),
@@ -255,14 +260,14 @@ fn worktree_change(entry: &IndexEntry, full: &Path) -> Result<char, WorktreeErro
 
 #[cfg(test)]
 mod tests {
-	use gitana_object::ObjectKind;
+	use gitana_object::{ObjectKind, Sha256};
 
 	use super::*;
 	use crate::Index;
 
 	/// The porcelain code for a conflict with the given stages present.
 	fn code(base: bool, ours: bool, theirs: bool) -> (char, char) {
-		let oid = ObjectId::compute(ObjectKind::Blob, b"x");
+		let oid = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"x");
 		let stage = |present: bool| present.then_some((0o100644u32, oid));
 		let mut index = Index::new();
 		index.record_conflict("f", stage(base), stage(ours), stage(theirs));

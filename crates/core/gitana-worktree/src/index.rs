@@ -1,40 +1,45 @@
-use sha2::{Digest, Sha256};
-
-use gitana_object::ObjectId;
+use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::{IndexEntry, Stat, WorktreeError};
 
 const SIGNATURE: &[u8; 4] = b"DIRC";
-const CHECKSUM_LEN: usize = 32;
-const OID_LEN: usize = 32;
 
 /// The git index (`.git/index`, the "DIRC" file): the staging area.
 ///
-/// Reads versions 2–4 and writes version 4 (prefix-compressed paths), in sha256.
-/// Entries are kept sorted by `(path, stage)`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Index {
+/// Reads versions 2–4 and writes version 4 (prefix-compressed paths). Object ids and
+/// the trailing checksum are sized by the hash algorithm `H`. Entries are kept sorted
+/// by `(path, stage)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Index<H: HashAlgorithm> {
 	/// Staged entries, sorted by `(path, stage)`.
-	pub entries: Vec<IndexEntry>,
+	pub entries: Vec<IndexEntry<H>>,
 }
 
 /// The unmerged index stages for a path: the common ancestor (stage 1), our side (stage 2), and
 /// their side (stage 3). Any may be absent (e.g. a side that deleted the path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Conflict<'a> {
-	pub base: Option<&'a IndexEntry>,
-	pub ours: Option<&'a IndexEntry>,
-	pub theirs: Option<&'a IndexEntry>,
+pub struct Conflict<'a, H: HashAlgorithm> {
+	pub base: Option<&'a IndexEntry<H>>,
+	pub ours: Option<&'a IndexEntry<H>>,
+	pub theirs: Option<&'a IndexEntry<H>>,
 }
 
-impl Index {
+impl<H: HashAlgorithm> Default for Index<H> {
+	fn default() -> Self {
+		Index {
+			entries: Vec::new(),
+		}
+	}
+}
+
+impl<H: HashAlgorithm> Index<H> {
 	/// An empty index.
 	pub fn new() -> Self {
 		Self::default()
 	}
 
 	/// The stage-0 entry for `path`, if present.
-	pub fn entry(&self, path: &str) -> Option<&IndexEntry> {
+	pub fn entry(&self, path: &str) -> Option<&IndexEntry<H>> {
 		self
 			.entries
 			.iter()
@@ -43,7 +48,7 @@ impl Index {
 
 	/// Insert or replace the entry for its path, keeping the entries sorted. Any other stages for the
 	/// path (a recorded conflict) are dropped, so staging a resolved file collapses it to stage 0.
-	pub fn upsert(&mut self, entry: IndexEntry) {
+	pub fn upsert(&mut self, entry: IndexEntry<H>) {
 		self.remove(&entry.path);
 		self.insert_sorted(entry);
 	}
@@ -58,9 +63,9 @@ impl Index {
 	pub fn record_conflict(
 		&mut self,
 		path: &str,
-		base: Option<(u32, ObjectId)>,
-		ours: Option<(u32, ObjectId)>,
-		theirs: Option<(u32, ObjectId)>,
+		base: Option<(u32, ObjectId<H>)>,
+		ours: Option<(u32, ObjectId<H>)>,
+		theirs: Option<(u32, ObjectId<H>)>,
 	) {
 		self.remove(path);
 		for (stage, side) in [(1u8, base), (2, ours), (3, theirs)] {
@@ -78,7 +83,7 @@ impl Index {
 	}
 
 	/// The unmerged stages for `path` (base/ours/theirs), or `None` if it is not conflicted.
-	pub fn conflict(&self, path: &str) -> Option<Conflict<'_>> {
+	pub fn conflict(&self, path: &str) -> Option<Conflict<'_, H>> {
 		let stage = |stage: u8| {
 			self
 				.entries
@@ -133,7 +138,7 @@ impl Index {
 	}
 
 	/// Insert `entry` at its sorted `(path, stage)` position.
-	fn insert_sorted(&mut self, entry: IndexEntry) {
+	fn insert_sorted(&mut self, entry: IndexEntry<H>) {
 		let position = self
 			.entries
 			.partition_point(|existing| key(existing) < key(&entry));
@@ -165,7 +170,8 @@ impl Index {
 
 	/// Parse index bytes (DIRC v2–v4), verifying the trailing checksum.
 	pub fn parse(bytes: &[u8]) -> Result<Self, WorktreeError> {
-		if bytes.len() < 12 + CHECKSUM_LEN || &bytes[0..4] != SIGNATURE {
+		let checksum_len = H::RAW_LEN;
+		if bytes.len() < 12 + checksum_len || &bytes[0..4] != SIGNATURE {
 			return Err(WorktreeError::Malformed("bad signature".to_owned()));
 		}
 		let version = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
@@ -174,8 +180,8 @@ impl Index {
 		}
 		let count = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
 
-		let body_end = bytes.len() - CHECKSUM_LEN;
-		if Sha256::digest(&bytes[..body_end]).as_slice() != &bytes[body_end..] {
+		let body_end = bytes.len() - checksum_len;
+		if H::digest(&[&bytes[..body_end]]).as_ref() != &bytes[body_end..] {
 			return Err(WorktreeError::ChecksumMismatch);
 		}
 
@@ -204,7 +210,7 @@ impl Index {
 				..stat
 			};
 
-			let oid = read_oid(bytes, &mut cursor)?;
+			let oid = read_oid::<H>(bytes, &mut cursor)?;
 			let flags = read_u16(bytes, &mut cursor)?;
 			let assume_valid = flags & 0x8000 != 0;
 			let stage = ((flags >> 12) & 0x3) as u8;
@@ -250,9 +256,9 @@ impl Index {
 		Ok(Index { entries })
 	}
 
-	/// Serialise to index version 4 (prefix-compressed paths) with a sha256 trailer.
+	/// Serialise to index version 4 (prefix-compressed paths) with an `H` trailer.
 	pub fn write_v4(&self) -> Vec<u8> {
-		let mut sorted: Vec<&IndexEntry> = self.entries.iter().collect();
+		let mut sorted: Vec<&IndexEntry<H>> = self.entries.iter().collect();
 		sorted.sort_by(|a, b| key(a).cmp(&key(b)));
 
 		let mut out = Vec::new();
@@ -293,13 +299,13 @@ impl Index {
 			prev = path;
 		}
 
-		let checksum = Sha256::digest(&out);
-		out.extend_from_slice(&checksum);
+		let checksum = H::digest(&[&out]);
+		out.extend_from_slice(checksum.as_ref());
 		out
 	}
 }
 
-fn key(entry: &IndexEntry) -> (&[u8], u8) {
+fn key<H: HashAlgorithm>(entry: &IndexEntry<H>) -> (&[u8], u8) {
 	(entry.path.as_bytes(), entry.stage)
 }
 
@@ -325,15 +331,16 @@ fn read_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16, WorktreeError> {
 	Ok(u16::from_be_bytes(slice.try_into().unwrap()))
 }
 
-fn read_oid(bytes: &[u8], cursor: &mut usize) -> Result<ObjectId, WorktreeError> {
-	let end = *cursor + OID_LEN;
+fn read_oid<H: HashAlgorithm>(
+	bytes: &[u8],
+	cursor: &mut usize,
+) -> Result<ObjectId<H>, WorktreeError> {
+	let end = *cursor + H::RAW_LEN;
 	let slice = bytes
 		.get(*cursor..end)
 		.ok_or_else(|| WorktreeError::Malformed("truncated oid".to_owned()))?;
 	*cursor = end;
-	let mut id = [0u8; 32];
-	id.copy_from_slice(slice);
-	Ok(ObjectId::from_bytes(id))
+	ObjectId::from_bytes(slice).map_err(|_| WorktreeError::Malformed("bad oid".to_owned()))
 }
 
 fn read_until_nul<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], WorktreeError> {
@@ -379,15 +386,15 @@ fn encode_varint(mut value: u64) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-	use gitana_object::ObjectKind;
+	use gitana_object::{ObjectKind, Sha256};
 
 	use super::*;
 
-	fn entry(path: &str, content: &[u8]) -> IndexEntry {
+	fn entry(path: &str, content: &[u8]) -> IndexEntry<Sha256> {
 		IndexEntry {
 			stat: Stat::default(),
 			mode: 0o100644,
-			oid: ObjectId::compute(ObjectKind::Blob, content),
+			oid: ObjectId::<Sha256>::compute(ObjectKind::Blob, content),
 			stage: 0,
 			assume_valid: false,
 			path: path.to_owned(),
@@ -396,7 +403,7 @@ mod tests {
 
 	#[test]
 	fn v4_round_trips() {
-		let mut index = Index::new();
+		let mut index = Index::<Sha256>::new();
 		index.upsert(entry("src/lib.rs", b"a"));
 		index.upsert(entry("src/main.rs", b"b"));
 		index.upsert(entry("README.md", b"c"));
@@ -408,8 +415,8 @@ mod tests {
 		assert_eq!(paths, ["README.md", "src/lib.rs", "src/main.rs"]);
 	}
 
-	fn oid(content: &[u8]) -> ObjectId {
-		ObjectId::compute(ObjectKind::Blob, content)
+	fn oid(content: &[u8]) -> ObjectId<Sha256> {
+		ObjectId::<Sha256>::compute(ObjectKind::Blob, content)
 	}
 
 	#[test]
@@ -480,11 +487,11 @@ mod tests {
 
 	#[test]
 	fn rejects_bad_checksum() {
-		let mut bytes = Index::new().write_v4();
+		let mut bytes = Index::<Sha256>::new().write_v4();
 		let last = bytes.len() - 1;
 		bytes[last] ^= 0xff;
 		assert!(matches!(
-			Index::parse(&bytes),
+			Index::<Sha256>::parse(&bytes),
 			Err(WorktreeError::ChecksumMismatch)
 		));
 	}

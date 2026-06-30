@@ -12,17 +12,17 @@ use std::collections::HashSet;
 use std::process::Command;
 
 use gitana_object::{
-	Commit, ObjectId, ObjectKind, PackedObject, TreeEntry, decode_pack, encode_commit, encode_pack,
-	encode_tree, enumerate_objects,
+	Commit, ObjectId, ObjectKind, PackedObject, Sha256, TreeEntry, decode_pack, encode_commit,
+	encode_pack, encode_tree, enumerate_objects,
 };
 use tempfile::TempDir;
 
 /// Build a small but realistic object graph: a root commit and a child commit, two
 /// versions of a file (so the blobs are delta-friendly), and their trees.
-fn sample_graph() -> Vec<PackedObject> {
+fn sample_graph() -> Vec<PackedObject<Sha256>> {
 	let mut objects = Vec::new();
 	let mut put = |kind: ObjectKind, data: Vec<u8>| {
-		let id = ObjectId::compute(kind, &data);
+		let id = ObjectId::<Sha256>::compute(kind, &data);
 		objects.push(PackedObject { id, kind, data });
 		id
 	};
@@ -81,9 +81,9 @@ fn produced_pack_round_trips_through_decode() {
 	let objects = sample_graph();
 	let pack = encode_pack(&objects);
 
-	let decoded = decode_pack(&pack).expect("decode our own pack");
-	let want: HashSet<ObjectId> = objects.iter().map(|o| o.id).collect();
-	let got: HashSet<ObjectId> = decoded.iter().map(|o| o.id).collect();
+	let decoded = decode_pack::<Sha256>(&pack).expect("decode our own pack");
+	let want: HashSet<ObjectId<Sha256>> = objects.iter().map(|o| o.id).collect();
+	let got: HashSet<ObjectId<Sha256>> = decoded.iter().map(|o| o.id).collect();
 	assert_eq!(got, want);
 	// Payloads survive intact (ids already cover this, but assert directly too).
 	for original in &objects {
@@ -101,7 +101,7 @@ fn enumerated_pack_round_trips() {
 	// Drive the full pipeline: enumerate from the tip, encode, decode.
 	let objects = sample_graph();
 	let tip = objects.last().expect("non-empty").id;
-	let by_id: std::collections::HashMap<ObjectId, PackedObject> =
+	let by_id: std::collections::HashMap<ObjectId<Sha256>, PackedObject<Sha256>> =
 		objects.iter().cloned().map(|o| (o.id, o)).collect();
 
 	let enumerated = enumerate_objects(&[tip], &[], |id| {
@@ -111,7 +111,7 @@ fn enumerated_pack_round_trips() {
 	assert_eq!(enumerated.len(), objects.len());
 
 	let pack = encode_pack(&enumerated);
-	let decoded = decode_pack(&pack).expect("decode");
+	let decoded = decode_pack::<Sha256>(&pack).expect("decode");
 	assert_eq!(decoded.len(), objects.len());
 }
 

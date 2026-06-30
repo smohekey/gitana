@@ -4,11 +4,11 @@ use std::process::Command;
 use gitana_file_store::FileStore;
 use gitana_file_store_local::LocalFileStore;
 use gitana_file_store_memory::MemoryFileStore;
-use gitana_object::{ObjectId, ObjectKind};
+use gitana_object::{ObjectId, ObjectKind, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::{FileMode, HeadState, Repository, TreeBuildEntry};
 
-fn mem_repo() -> Repository<MemoryFileStore> {
+fn mem_repo() -> Repository<MemoryFileStore, Sha256> {
 	Repository::new(ObjectStore::new(MemoryFileStore::new()))
 }
 
@@ -26,7 +26,7 @@ async fn init_open_and_loose_ref_cas() {
 	// Unborn branch: HEAD resolves to nothing yet.
 	assert_eq!(refs.resolve_head().await.unwrap(), None);
 
-	let first = ObjectId::compute(ObjectKind::Commit, b"c1");
+	let first = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"c1");
 	refs
 		.update_ref("refs/heads/main", first, None)
 		.await
@@ -34,7 +34,7 @@ async fn init_open_and_loose_ref_cas() {
 	assert_eq!(refs.resolve_head().await.unwrap(), Some(first));
 
 	// CAS-create on an existing ref fails; CAS-update with the right expected works.
-	let second = ObjectId::compute(ObjectKind::Commit, b"c2");
+	let second = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"c2");
 	assert!(
 		refs
 			.update_ref("refs/heads/main", second, None)
@@ -78,7 +78,7 @@ async fn git_accepts_an_engine_initialised_repo() {
 	let git_dir = work.join(".git");
 	create_skeleton(&git_dir);
 
-	let repo = Repository::new(ObjectStore::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
 	repo.init().await.unwrap();
 
 	let work = work.to_str().unwrap();
@@ -108,7 +108,7 @@ async fn engine_commit_is_read_by_git() {
 	let git_dir = work.join(".git");
 	create_skeleton(&git_dir);
 
-	let repo = Repository::new(ObjectStore::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
 	repo.init().await.unwrap();
 
 	let blob = repo.write_blob(b"hello\n").await.unwrap();
@@ -164,7 +164,68 @@ async fn engine_commit_is_read_by_git() {
 	std::fs::remove_dir_all(work).ok();
 }
 
-async fn make_commit(repo: &Repository<LocalFileStore>, content: &[u8], secs: i64) -> ObjectId {
+#[tokio::test]
+async fn git_reads_a_sha1_engine_initialised_repo_and_commit() {
+	// sha1 is git's default object format, so this needs only a plain `git`.
+	if Command::new("git").arg("--version").output().is_err() {
+		eprintln!("skipping: no git on PATH");
+		return;
+	}
+	let work = unique_tmp("sha1-commit");
+	let git_dir = work.join(".git");
+	create_skeleton(&git_dir);
+
+	let repo = Repository::new(ObjectStore::<_, Sha1>::new(LocalFileStore::new(&git_dir)));
+	repo.init().await.unwrap();
+
+	let blob = repo.write_blob(b"hello\n").await.unwrap();
+	let tree = repo
+		.write_tree(&[TreeBuildEntry {
+			path: "greeting.txt".to_owned(),
+			mode: FileMode::Regular,
+			id: blob,
+		}])
+		.await
+		.unwrap();
+	let author = "A U Thor <author@example.com> 1700000000 +0000";
+	let committer = "C O Mitter <committer@example.com> 1700000000 +0000";
+	let commit = repo
+		.commit_on_head(tree, author, committer, "first commit\n")
+		.await
+		.unwrap();
+
+	let work = work.to_str().unwrap();
+	// git sees a classic sha1 repo (version 0) and agrees on the 40-hex commit id.
+	assert_eq!(
+		git(&["-C", work, "config", "core.repositoryformatversion"]).trim(),
+		"0"
+	);
+	assert_eq!(commit.to_hex().len(), 40);
+	assert_eq!(
+		git(&["-C", work, "rev-parse", "HEAD"]).trim(),
+		commit.to_hex()
+	);
+	assert_eq!(
+		git(&[
+			"-C",
+			work,
+			"cat-file",
+			"-p",
+			&format!("{}:greeting.txt", commit.to_hex())
+		]),
+		"hello\n"
+	);
+	// git fsck finds no corruption in the engine-written sha1 objects.
+	git(&["-C", work, "fsck", "--no-dangling"]);
+
+	std::fs::remove_dir_all(work).ok();
+}
+
+async fn make_commit(
+	repo: &Repository<LocalFileStore, Sha256>,
+	content: &[u8],
+	secs: i64,
+) -> ObjectId<Sha256> {
 	let blob = repo.write_blob(content).await.unwrap();
 	let tree = repo
 		.write_tree(&[TreeBuildEntry {
@@ -190,7 +251,7 @@ async fn revisions_and_packed_refs_match_git() {
 	let work = unique_tmp("rev");
 	let git_dir = work.join(".git");
 	create_skeleton(&git_dir);
-	let repo = Repository::new(ObjectStore::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
 	repo.init().await.unwrap();
 
 	let c1 = make_commit(&repo, b"a\n", 1_700_000_000).await;

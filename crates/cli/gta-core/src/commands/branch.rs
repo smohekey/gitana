@@ -1,19 +1,32 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
+use gitana_file_store_local::LocalFileStore;
+use gitana_object::HashAlgorithm;
+use gitana_repository::Repository;
 
-use crate::repo;
+use crate::dispatch::{self, RepoCommand};
 
 /// List branches, or create `name` at `start` (default `HEAD`).
 pub async fn run(cwd: &Path, name: Option<String>, start: Option<String>) -> Result<()> {
-	let repo = repo::open_here(cwd)?;
-	match name {
-		None => list(&repo).await,
-		Some(name) => create(&repo, &name, start.as_deref()).await,
+	dispatch::on_repo(cwd, Branch { name, start }).await
+}
+
+struct Branch {
+	name: Option<String>,
+	start: Option<String>,
+}
+
+impl RepoCommand for Branch {
+	async fn run<H: HashAlgorithm>(self, repo: Repository<LocalFileStore, H>) -> Result<()> {
+		match self.name {
+			None => list(&repo).await,
+			Some(name) => create(&repo, &name, self.start.as_deref()).await,
+		}
 	}
 }
 
-async fn list(repo: &repo::LocalRepository) -> Result<()> {
+async fn list<H: HashAlgorithm>(repo: &Repository<LocalFileStore, H>) -> Result<()> {
 	let current = repo
 		.refs()
 		.read_symbolic("HEAD")
@@ -31,7 +44,11 @@ async fn list(repo: &repo::LocalRepository) -> Result<()> {
 	Ok(())
 }
 
-async fn create(repo: &repo::LocalRepository, name: &str, start: Option<&str>) -> Result<()> {
+async fn create<H: HashAlgorithm>(
+	repo: &Repository<LocalFileStore, H>,
+	name: &str,
+	start: Option<&str>,
+) -> Result<()> {
 	let full = format!("refs/heads/{name}");
 	if repo.refs().resolve(&full).await?.is_some() {
 		bail!("a branch named '{name}' already exists");

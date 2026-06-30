@@ -1,19 +1,16 @@
 //! Reader for git packfiles (v2), resolving OFS and REF deltas.
 //!
-//! Decodes a self-contained pack into fully materialised objects with their
-//! SHA-256 ids. Thin packs (REF deltas whose base is not in the pack) are
+//! Decodes a self-contained pack into fully materialised objects with their ids under
+//! the hash algorithm `H`. Thin packs (REF deltas whose base is not in the pack) are
 //! rejected with [`ObjectError::UnresolvedDeltaBase`]. The pack trailer hash is
 //! verified before any entry is read.
 
 use std::collections::HashMap;
 
-use sha2::{Digest, Sha256};
-
 use crate::loose::MAX_OBJECT_SIZE;
-use crate::{ObjectError, ObjectId, ObjectKind, apply_delta};
+use crate::{HashAlgorithm, ObjectError, ObjectId, ObjectKind, apply_delta};
 
 const HEADER_LEN: usize = 12;
-const TRAILER_LEN: usize = 32;
 
 const OBJ_COMMIT: u8 = 1;
 const OBJ_TREE: u8 = 2;
@@ -24,9 +21,9 @@ const OBJ_REF_DELTA: u8 = 7;
 
 /// A fully materialised object decoded from a packfile.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PackedObject {
-	/// The object's SHA-256 id.
-	pub id: ObjectId,
+pub struct PackedObject<H: HashAlgorithm> {
+	/// The object's id.
+	pub id: ObjectId<H>,
 	/// The object kind.
 	pub kind: ObjectKind,
 	/// The object payload (deltas already applied).
@@ -38,7 +35,7 @@ pub struct PackedObject {
 /// Rejects thin packs (REF deltas whose base is absent) with
 /// [`ObjectError::UnresolvedDeltaBase`]; use [`decode_pack_with_bases`] to resolve a
 /// thin pack against objects held elsewhere.
-pub fn decode_pack(bytes: &[u8]) -> Result<Vec<PackedObject>, ObjectError> {
+pub fn decode_pack<H: HashAlgorithm>(bytes: &[u8]) -> Result<Vec<PackedObject<H>>, ObjectError> {
 	decode_pack_with_bases(bytes, &HashMap::new())
 }
 
@@ -49,11 +46,12 @@ pub fn decode_pack(bytes: &[u8]) -> Result<Vec<PackedObject>, ObjectError> {
 /// peer already has and reference them by id. The caller supplies those bases (e.g.
 /// read from the object store). A REF delta whose base is in neither the pack nor
 /// `external_bases` still fails with [`ObjectError::UnresolvedDeltaBase`].
-pub fn decode_pack_with_bases(
+pub fn decode_pack_with_bases<H: HashAlgorithm>(
 	bytes: &[u8],
-	external_bases: &HashMap<ObjectId, (ObjectKind, Vec<u8>)>,
-) -> Result<Vec<PackedObject>, ObjectError> {
-	if bytes.len() < HEADER_LEN + TRAILER_LEN {
+	external_bases: &HashMap<ObjectId<H>, (ObjectKind, Vec<u8>)>,
+) -> Result<Vec<PackedObject<H>>, ObjectError> {
+	let trailer_len = H::RAW_LEN;
+	if bytes.len() < HEADER_LEN + trailer_len {
 		return Err(ObjectError::MalformedPack);
 	}
 	if &bytes[0..4] != b"PACK" || read_u32(&bytes[4..8]) != 2 {
@@ -61,15 +59,15 @@ pub fn decode_pack_with_bases(
 	}
 	let count = read_u32(&bytes[8..12]) as usize;
 
-	let body_end = bytes.len() - TRAILER_LEN;
+	let body_end = bytes.len() - trailer_len;
 	let expected_trailer = &bytes[body_end..];
-	if Sha256::digest(&bytes[..body_end]).as_slice() != expected_trailer {
+	if H::digest(&[&bytes[..body_end]]).as_ref() != expected_trailer {
 		return Err(ObjectError::MalformedPack);
 	}
 
-	let mut objects: Vec<PackedObject> = Vec::with_capacity(count);
+	let mut objects: Vec<PackedObject<H>> = Vec::with_capacity(count);
 	let mut by_offset: HashMap<usize, usize> = HashMap::with_capacity(count);
-	let mut by_id: HashMap<ObjectId, usize> = HashMap::with_capacity(count);
+	let mut by_id: HashMap<ObjectId<H>, usize> = HashMap::with_capacity(count);
 
 	let mut cursor = HEADER_LEN;
 	for _ in 0..count {
@@ -96,7 +94,7 @@ pub fn decode_pack_with_bases(
 				(base.kind, apply_delta(&base.data, &delta)?)
 			}
 			OBJ_REF_DELTA => {
-				let base_id = read_object_id(bytes, &mut cursor)?;
+				let base_id = read_object_id::<H>(bytes, &mut cursor)?;
 				let (delta, consumed) = inflate(&bytes[cursor..body_end], size)?;
 				cursor += consumed;
 				if let Some(&base_index) = by_id.get(&base_id) {
@@ -111,7 +109,7 @@ pub fn decode_pack_with_bases(
 			_ => return Err(ObjectError::MalformedPack),
 		};
 
-		let id = ObjectId::compute(kind, &data);
+		let id = ObjectId::<H>::compute(kind, &data);
 		let index = objects.len();
 		by_offset.insert(entry_start, index);
 		by_id.insert(id, index);
@@ -129,15 +127,16 @@ pub fn decode_pack_with_bases(
 /// Lets a thin-pack receiver pre-fetch the bases it must supply to
 /// [`decode_pack_with_bases`]. Bases that are themselves in the pack are still
 /// listed; the caller simply won't find them in its store, which is harmless.
-pub fn ref_delta_base_ids(bytes: &[u8]) -> Result<Vec<ObjectId>, ObjectError> {
-	if bytes.len() < HEADER_LEN + TRAILER_LEN {
+pub fn ref_delta_base_ids<H: HashAlgorithm>(bytes: &[u8]) -> Result<Vec<ObjectId<H>>, ObjectError> {
+	let trailer_len = H::RAW_LEN;
+	if bytes.len() < HEADER_LEN + trailer_len {
 		return Err(ObjectError::MalformedPack);
 	}
 	if &bytes[0..4] != b"PACK" || read_u32(&bytes[4..8]) != 2 {
 		return Err(ObjectError::MalformedPack);
 	}
 	let count = read_u32(&bytes[8..12]) as usize;
-	let body_end = bytes.len() - TRAILER_LEN;
+	let body_end = bytes.len() - trailer_len;
 
 	let mut ids = Vec::new();
 	let mut cursor = HEADER_LEN;
@@ -154,7 +153,7 @@ pub fn ref_delta_base_ids(bytes: &[u8]) -> Result<Vec<ObjectId>, ObjectError> {
 				cursor += consumed;
 			}
 			OBJ_REF_DELTA => {
-				ids.push(read_object_id(bytes, &mut cursor)?);
+				ids.push(read_object_id::<H>(bytes, &mut cursor)?);
 				let (_, consumed) = inflate(&bytes[cursor..body_end], size)?;
 				cursor += consumed;
 			}
@@ -207,13 +206,17 @@ fn read_offset(bytes: &[u8], cursor: &mut usize) -> Result<usize, ObjectError> {
 	Ok(offset)
 }
 
-fn read_object_id(bytes: &[u8], cursor: &mut usize) -> Result<ObjectId, ObjectError> {
-	let end = cursor.checked_add(32).ok_or(ObjectError::MalformedPack)?;
+fn read_object_id<H: HashAlgorithm>(
+	bytes: &[u8],
+	cursor: &mut usize,
+) -> Result<ObjectId<H>, ObjectError> {
+	let end = cursor
+		.checked_add(H::RAW_LEN)
+		.ok_or(ObjectError::MalformedPack)?;
 	let raw = bytes.get(*cursor..end).ok_or(ObjectError::MalformedPack)?;
-	let mut id = [0u8; 32];
-	id.copy_from_slice(raw);
+	let id = ObjectId::from_bytes(raw)?;
 	*cursor = end;
-	Ok(ObjectId::from_bytes(id))
+	Ok(id)
 }
 
 /// Inflate one zlib stream, returning the data and the number of input bytes used.
@@ -266,6 +269,7 @@ mod tests {
 	use flate2::write::ZlibEncoder;
 
 	use super::*;
+	use crate::{Sha1, Sha256};
 
 	fn zlib(data: &[u8]) -> Vec<u8> {
 		let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -329,21 +333,22 @@ mod tests {
 		d
 	}
 
-	fn finish_pack(body: &[u8], count: u32) -> Vec<u8> {
+	/// Append a `PACK` header, `body`, and the `H` trailer hash.
+	fn finish_pack<H: HashAlgorithm>(body: &[u8], count: u32) -> Vec<u8> {
 		let mut pack = Vec::new();
 		pack.extend_from_slice(b"PACK");
 		pack.extend_from_slice(&2u32.to_be_bytes());
 		pack.extend_from_slice(&count.to_be_bytes());
 		pack.extend_from_slice(body);
-		let trailer = Sha256::digest(&pack);
-		pack.extend_from_slice(&trailer);
+		let trailer = H::digest(&[&pack]);
+		pack.extend_from_slice(trailer.as_ref());
 		pack
 	}
 
 	#[test]
 	fn decodes_base_and_both_delta_kinds() {
 		let base_payload = b"hello world";
-		let base_id = ObjectId::compute(ObjectKind::Blob, base_payload);
+		let base_id = ObjectId::<Sha256>::compute(ObjectKind::Blob, base_payload);
 
 		// B: OFS delta -> "hello!!!"; C: REF delta -> "world?"
 		let b_delta = delta(base_payload.len(), 0, 5, b"!!!");
@@ -363,8 +368,8 @@ mod tests {
 		body.extend(base_id.as_bytes());
 		body.extend(zlib(&c_delta));
 
-		let pack = finish_pack(&body, 3);
-		let objects = decode_pack(&pack).expect("decode");
+		let pack = finish_pack::<Sha256>(&body, 3);
+		let objects = decode_pack::<Sha256>(&pack).expect("decode");
 
 		assert_eq!(objects.len(), 3);
 		assert_eq!(objects[0].data, b"hello world");
@@ -372,10 +377,34 @@ mod tests {
 		assert_eq!(objects[1].data, b"hello!!!");
 		assert_eq!(
 			objects[1].id,
-			ObjectId::compute(ObjectKind::Blob, b"hello!!!")
+			ObjectId::<Sha256>::compute(ObjectKind::Blob, b"hello!!!")
 		);
 		assert_eq!(objects[2].data, b"world?");
 		assert_eq!(objects[2].kind, ObjectKind::Blob);
+	}
+
+	#[test]
+	fn decodes_sha1_ref_delta_pack() {
+		// The same shape as above but under SHA-1: 20-byte ids and a 20-byte trailer.
+		let base_payload = b"hello world";
+		let base_id = ObjectId::<Sha1>::compute(ObjectKind::Blob, base_payload);
+		let c_delta = delta(base_payload.len(), 6, 5, b"?");
+
+		let mut body = Vec::new();
+		body.extend(obj_header(OBJ_BLOB, base_payload.len()));
+		body.extend(zlib(base_payload));
+		body.extend(obj_header(OBJ_REF_DELTA, c_delta.len()));
+		body.extend(base_id.as_bytes());
+		body.extend(zlib(&c_delta));
+
+		let pack = finish_pack::<Sha1>(&body, 2);
+		let objects = decode_pack::<Sha1>(&pack).expect("decode");
+		assert_eq!(objects.len(), 2);
+		assert_eq!(objects[0].id, base_id);
+		assert_eq!(objects[1].data, b"world?");
+
+		let bases = ref_delta_base_ids::<Sha1>(&pack).expect("base ids");
+		assert_eq!(bases, vec![base_id]);
 	}
 
 	#[test]
@@ -383,26 +412,26 @@ mod tests {
 		let mut body = Vec::new();
 		body.extend(obj_header(OBJ_BLOB, 1));
 		body.extend(zlib(b"x"));
-		let mut pack = finish_pack(&body, 1);
+		let mut pack = finish_pack::<Sha256>(&body, 1);
 		let last = pack.len() - 1;
 		pack[last] ^= 0xff; // corrupt the trailer
 		assert!(matches!(
-			decode_pack(&pack),
+			decode_pack::<Sha256>(&pack),
 			Err(ObjectError::MalformedPack)
 		));
 	}
 
 	#[test]
 	fn rejects_thin_pack_ref_delta() {
-		let unknown = ObjectId::compute(ObjectKind::Blob, b"not in pack");
+		let unknown = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"not in pack");
 		let d = delta(11, 0, 1, b"");
 		let mut body = Vec::new();
 		body.extend(obj_header(OBJ_REF_DELTA, d.len()));
 		body.extend(unknown.as_bytes());
 		body.extend(zlib(&d));
-		let pack = finish_pack(&body, 1);
+		let pack = finish_pack::<Sha256>(&body, 1);
 		assert!(matches!(
-			decode_pack(&pack),
+			decode_pack::<Sha256>(&pack),
 			Err(ObjectError::UnresolvedDeltaBase)
 		));
 	}

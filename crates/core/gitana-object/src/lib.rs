@@ -2,18 +2,23 @@
 //!
 //! Pure: this crate turns bytes into git objects and back. It has no knowledge of
 //! where objects are stored — that is the file-store / object-store layers' job.
-//! Content ids are SHA-256 (see docs/hlds/storage-layer.md); there is no hash-kind
-//! type parameter. Leaf crate.
+//! Content ids are generic over the hash algorithm `H` (see [`HashAlgorithm`] and
+//! docs/hlds/storage-layer.md): every object type is parameterised by `H`, and a
+//! concrete algorithm ([`Sha1`] / [`Sha256`]) is chosen at the crate boundary. Leaf
+//! crate.
 
 mod commit;
 mod delta;
 mod enumerate;
+mod hash_algorithm;
 mod id;
 mod kind;
 mod loose;
 mod pack;
 mod pack_encode;
 mod pktline;
+mod sha1;
+mod sha256;
 mod signature;
 mod tag;
 mod text;
@@ -22,6 +27,7 @@ mod tree;
 pub use commit::{Commit, commit_signed_payload, encode_commit, parse_commit};
 pub use delta::apply_delta;
 pub use enumerate::{enumerate_objects, referenced_ids};
+pub use hash_algorithm::HashAlgorithm;
 pub use id::ObjectId;
 pub use kind::ObjectKind;
 pub use loose::{MAX_OBJECT_SIZE, decode_loose, encode_loose, loose_object_path};
@@ -31,6 +37,8 @@ pub use pktline::{
 	DELIM_PKT, FLUSH_PKT, MAX_PKT_DATA, PktLine, RESPONSE_END_PKT, parse_pkt, write_delim,
 	write_flush, write_pkt,
 };
+pub use sha1::Sha1;
+pub use sha256::Sha256;
 pub use signature::Signature;
 pub use tag::{Tag, encode_tag, parse_tag};
 pub use tree::{TreeEntry, encode_tree, parse_tree};
@@ -55,7 +63,8 @@ pub enum ObjectError {
 	/// zlib decompression failed.
 	#[error("zlib error: {0}")]
 	Zlib(String),
-	/// A hex object id was not 64 lowercase hex characters.
+	/// A hex object id was not the algorithm's expected length of lowercase hex
+	/// characters, or raw id bytes were not the algorithm's raw width.
 	#[error("invalid object id")]
 	InvalidObjectId,
 	/// A packfile's structure was invalid (bad signature, header, or trailer).

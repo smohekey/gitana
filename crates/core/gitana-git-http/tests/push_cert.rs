@@ -6,6 +6,7 @@ use gitana_file_store_memory::MemoryFileStore;
 use gitana_git_http::{
 	CertCommand, PushCert, build_push_cert, make_nonce, receive_pack, verify_nonce,
 };
+use gitana_object::Sha256;
 use gitana_object::{
 	Commit, ObjectId, ObjectKind, PackedObject, TreeEntry, encode_commit, encode_pack, encode_tree,
 };
@@ -74,20 +75,20 @@ fn nonce_accepts_fresh_untampered_and_rejects_otherwise() {
 
 // --- integration: a signed push through receive_pack ------------------------------
 
-fn repo() -> Repository<MemoryFileStore> {
-	Repository::new(ObjectStore::new(MemoryFileStore::new()))
+fn repo() -> Repository<MemoryFileStore, Sha256> {
+	Repository::new(ObjectStore::<_, Sha256>::new(MemoryFileStore::new()))
 }
 
 /// Build a blob+tree+commit set and return it with the commit id.
-fn commit_objects(content: &[u8]) -> (Vec<PackedObject>, ObjectId) {
+fn commit_objects(content: &[u8]) -> (Vec<PackedObject<Sha256>>, ObjectId<Sha256>) {
 	let blob = content.to_vec();
-	let blob_id = ObjectId::compute(ObjectKind::Blob, &blob);
+	let blob_id = ObjectId::<Sha256>::compute(ObjectKind::Blob, &blob);
 	let tree = encode_tree(&[TreeEntry {
 		mode: "100644".to_owned(),
 		name: "file.txt".to_owned(),
 		id: blob_id,
 	}]);
-	let tree_id = ObjectId::compute(ObjectKind::Tree, &tree);
+	let tree_id = ObjectId::<Sha256>::compute(ObjectKind::Tree, &tree);
 	let commit = encode_commit(&Commit {
 		tree: tree_id,
 		parents: vec![],
@@ -96,7 +97,7 @@ fn commit_objects(content: &[u8]) -> (Vec<PackedObject>, ObjectId) {
 		signature: None,
 		message: "root\n".to_owned(),
 	});
-	let commit_id = ObjectId::compute(ObjectKind::Commit, &commit);
+	let commit_id = ObjectId::<Sha256>::compute(ObjectKind::Commit, &commit);
 	let objects = vec![
 		PackedObject {
 			id: blob_id,

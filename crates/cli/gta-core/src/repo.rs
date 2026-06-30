@@ -4,16 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
 use gitana_file_store_local::LocalFileStore;
-use gitana_object::ObjectId;
+use gitana_object::HashAlgorithm;
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
-use gitana_worktree::WorkTree;
-
-/// A repository over the local filesystem backend.
-pub type LocalRepository = Repository<LocalFileStore>;
-
-/// A working tree over the local filesystem backend.
-pub type LocalWorkTree = WorkTree<LocalFileStore>;
 
 /// Walk up from `start` to find a repository: the nearest ancestor with a `.git` directory (its
 /// work tree), or a directory that is itself a git directory (a bare repo). Returns
@@ -48,43 +41,19 @@ fn work_tree_required() -> anyhow::Error {
 	anyhow!("this operation must be run in a work tree")
 }
 
-/// Open the repository rooted at `git_dir`.
-pub fn open(git_dir: &Path) -> LocalRepository {
+/// Open the repository rooted at `git_dir` under an explicit hash algorithm `H`. The
+/// runtime dispatch (see [`crate::dispatch`]) picks `H` from the repo's config and calls
+/// this, so each command body is monomorphised once per algorithm.
+pub fn open_generic<H: HashAlgorithm>(git_dir: &Path) -> Repository<LocalFileStore, H> {
 	Repository::new(ObjectStore::new(LocalFileStore::new(git_dir)))
 }
 
-/// Discover and open the repository containing `start`.
-pub fn open_here(start: &Path) -> Result<LocalRepository> {
-	let (_work, git) = discover(start)?;
-	Ok(open(&git))
-}
-
-/// Resolve `spec` to an object id, returning a repository to read it with. An index-relative
-/// spec (`:...`) opens the work tree, which holds the index; every other spec resolves against
-/// the repository alone, so object-only lookups (`<oid>`, `<rev>:<path>`, …) do not require a
-/// work tree.
-pub async fn resolve_object(start: &Path, spec: &str) -> Result<(LocalRepository, ObjectId)> {
-	if spec.starts_with(':') {
-		let oid = open_worktree(start)?.rev_parse(spec).await?;
-		Ok((open_here(start)?, oid))
-	} else {
-		let repo = open_here(start)?;
-		let oid = repo.rev_parse(spec).await?;
-		Ok((repo, oid))
-	}
-}
-
-/// Discover and open the working tree containing `start`. Errors in a bare repo.
-pub fn open_worktree(start: &Path) -> Result<LocalWorkTree> {
-	let (work, git) = discover(start)?;
-	let work = work.ok_or_else(work_tree_required)?;
-	Ok(WorkTree::new(open(&git), work, git))
-}
-
-/// Discover the working tree containing `start`, plus the `/`-joined path from the work-tree
-/// root down to `start` (empty at the root). The prefix makes pathspecs relative to the
-/// caller's subdirectory, the way `git -C <subdir>` interprets them.
-pub fn open_worktree_with_prefix(start: &Path) -> Result<(LocalWorkTree, String)> {
+/// Discover the working tree containing `start` as `(work_dir, git_dir, prefix)`, without
+/// constructing a typed `WorkTree`. The runtime dispatch needs the paths so it can build
+/// a `WorkTree<_, H>` for whichever hash algorithm the repo uses. The prefix is the
+/// `/`-joined path from the work-tree root down to `start` (empty at the root), making
+/// pathspecs relative to the caller's subdirectory, the way `git -C <subdir>` does.
+pub fn discover_worktree_with_prefix(start: &Path) -> Result<(PathBuf, PathBuf, String)> {
 	// Resolve symlinks before discovering, so the prefix reflects the physical location of the
 	// caller's directory under the work tree (e.g. `-C linksub` where `linksub -> sub`).
 	// Otherwise the lexical name would be matched/recorded as a tracked path.
@@ -99,5 +68,5 @@ pub fn open_worktree_with_prefix(start: &Path) -> Result<(LocalWorkTree, String)
 		.map(|component| component.as_os_str().to_string_lossy())
 		.collect::<Vec<_>>()
 		.join("/");
-	Ok((WorkTree::new(open(&git), work, git), prefix))
+	Ok((work, git, prefix))
 }

@@ -2,6 +2,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use gitana_file_store::FileStore;
+use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::Repository;
 
 use crate::fsmeta::{file_mode, mode_of, path_bytes, stat_of};
@@ -14,17 +15,17 @@ use crate::{Index, IndexEntry, Status, WorktreeError};
 /// so it reads/writes them with `std::fs`, while blob objects go through the
 /// repository's object store. The index is written with git's `index.lock`
 /// create-new-then-rename protocol. `add`/`status`/`checkout` build on this.
-pub struct WorkTree<F> {
-	repo: Repository<F>,
+pub struct WorkTree<F, H: HashAlgorithm> {
+	repo: Repository<F, H>,
 	work_dir: PathBuf,
 	git_dir: PathBuf,
 }
 
-impl<F: FileStore> WorkTree<F> {
+impl<F: FileStore, H: HashAlgorithm> WorkTree<F, H> {
 	/// Build a working tree over `repo`, with the working directory at `work_dir`
 	/// and the git directory at `git_dir`.
 	pub fn new(
-		repo: Repository<F>,
+		repo: Repository<F, H>,
 		work_dir: impl Into<PathBuf>,
 		git_dir: impl Into<PathBuf>,
 	) -> Self {
@@ -36,7 +37,7 @@ impl<F: FileStore> WorkTree<F> {
 	}
 
 	/// The underlying repository.
-	pub fn repository(&self) -> &Repository<F> {
+	pub fn repository(&self) -> &Repository<F, H> {
 		&self.repo
 	}
 
@@ -44,7 +45,7 @@ impl<F: FileStore> WorkTree<F> {
 	/// `:<path>` (the staged blob, stage 0) and `:<n>:<path>` (merge stage `n`). Every other spec
 	/// — refs, oids, `HEAD`, `~`/`^`/`^{type}`, and `<rev>:<path>` — is delegated to
 	/// [`Repository::rev_parse`]. The path is repository-root-relative.
-	pub async fn rev_parse(&self, spec: &str) -> Result<gitana_object::ObjectId, WorktreeError> {
+	pub async fn rev_parse(&self, spec: &str) -> Result<ObjectId<H>, WorktreeError> {
 		match spec.strip_prefix(':') {
 			Some(rest) => self.resolve_index_spec(rest),
 			None => Ok(self.repository().rev_parse(spec).await?),
@@ -52,7 +53,7 @@ impl<F: FileStore> WorkTree<F> {
 	}
 
 	/// Resolve the part of an index spec after the leading `:` to the staged blob's id.
-	fn resolve_index_spec(&self, rest: &str) -> Result<gitana_object::ObjectId, WorktreeError> {
+	fn resolve_index_spec(&self, rest: &str) -> Result<ObjectId<H>, WorktreeError> {
 		// `:/text` (commit-message search) is not an index lookup.
 		if rest.starts_with('/') {
 			return Err(WorktreeError::InvalidIndexSpec(rest.to_owned()));
@@ -90,7 +91,7 @@ impl<F: FileStore> WorkTree<F> {
 	}
 
 	/// Read and parse `.git/index`, or an empty index if it does not exist.
-	pub fn load_index(&self) -> Result<Index, WorktreeError> {
+	pub fn load_index(&self) -> Result<Index<H>, WorktreeError> {
 		match std::fs::read(self.git_dir.join("index")) {
 			Ok(bytes) => Ok(Index::parse(&bytes)?),
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Index::new()),
@@ -99,7 +100,7 @@ impl<F: FileStore> WorkTree<F> {
 	}
 
 	/// Write the index via `index.lock` create-new + rename (git's protocol).
-	pub fn save_index(&self, index: &Index) -> Result<(), WorktreeError> {
+	pub fn save_index(&self, index: &Index<H>) -> Result<(), WorktreeError> {
 		self.commit_index(self.lock_index()?, index)
 	}
 
@@ -127,7 +128,7 @@ impl<F: FileStore> WorkTree<F> {
 	pub(crate) fn commit_index(
 		&self,
 		mut lock: std::fs::File,
-		index: &Index,
+		index: &Index<H>,
 	) -> Result<(), WorktreeError> {
 		let lock_path = self.git_dir.join("index.lock");
 		if let Err(error) = lock.write_all(&index.write_v4()) {
@@ -182,7 +183,7 @@ impl<F: FileStore> WorkTree<F> {
 		self.save_index(&index)
 	}
 
-	async fn stage_file(&self, index: &mut Index, path: &str) -> Result<(), WorktreeError> {
+	async fn stage_file(&self, index: &mut Index<H>, path: &str) -> Result<(), WorktreeError> {
 		let full = self.work_dir.join(path);
 		match std::fs::symlink_metadata(&full) {
 			Ok(meta) if meta.is_symlink() => {
@@ -222,11 +223,7 @@ impl<F: FileStore> WorkTree<F> {
 
 	/// Materialise `tree` into the working directory and index. Without `force`,
 	/// refuses to overwrite uncommitted local changes. Does not move `HEAD`.
-	pub async fn checkout(
-		&self,
-		tree: gitana_object::ObjectId,
-		force: bool,
-	) -> Result<(), WorktreeError> {
+	pub async fn checkout(&self, tree: ObjectId<H>, force: bool) -> Result<(), WorktreeError> {
 		crate::checkout::run(self, tree, force).await
 	}
 
@@ -238,7 +235,7 @@ impl<F: FileStore> WorkTree<F> {
 	/// at the root).
 	pub async fn restore(
 		&self,
-		source: Option<gitana_object::ObjectId>,
+		source: Option<ObjectId<H>>,
 		worktree: bool,
 		staged: bool,
 		pathspecs: &[&str],
@@ -249,7 +246,7 @@ impl<F: FileStore> WorkTree<F> {
 
 	/// Reset the index to `tree`, replacing every entry with the tree's content (the index half
 	/// of `git reset --mixed`). The working tree is left untouched, and `HEAD` is not moved.
-	pub async fn reset_index(&self, tree: gitana_object::ObjectId) -> Result<(), WorktreeError> {
+	pub async fn reset_index(&self, tree: ObjectId<H>) -> Result<(), WorktreeError> {
 		crate::reset::run(self, tree).await
 	}
 
@@ -260,7 +257,7 @@ impl<F: FileStore> WorkTree<F> {
 	/// `reset -- <untracked-or-missing>` succeeds as in git. `pathspecs` are relative to `prefix`.
 	pub async fn reset_index_paths(
 		&self,
-		tree: gitana_object::ObjectId,
+		tree: ObjectId<H>,
 		pathspecs: &[&str],
 		prefix: &str,
 	) -> Result<(), WorktreeError> {
@@ -302,12 +299,12 @@ impl<F: FileStore> WorkTree<F> {
 	}
 }
 
-fn entry(
+fn entry<H: HashAlgorithm>(
 	path: &str,
 	mode: u32,
-	oid: gitana_object::ObjectId,
+	oid: ObjectId<H>,
 	meta: &std::fs::Metadata,
-) -> IndexEntry {
+) -> IndexEntry<H> {
 	IndexEntry {
 		stat: stat_of(meta),
 		mode,
@@ -320,7 +317,10 @@ fn entry(
 
 /// Whether a working-tree file matches an index entry by its stat cache and mode
 /// (the fast path that avoids re-hashing).
-pub(crate) fn stat_matches(entry: &IndexEntry, meta: &std::fs::Metadata) -> bool {
+pub(crate) fn stat_matches<H: HashAlgorithm>(
+	entry: &IndexEntry<H>,
+	meta: &std::fs::Metadata,
+) -> bool {
 	entry.mode == mode_of(meta) && entry.stat == stat_of(meta)
 }
 

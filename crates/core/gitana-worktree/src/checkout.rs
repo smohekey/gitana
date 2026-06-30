@@ -9,28 +9,29 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use gitana_file_store::FileStore;
-use gitana_object::ObjectId;
+use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::fsmeta::{blob_of, stat_of};
 use crate::ignore::{self, DirIgnore};
 use crate::{IndexEntry, WorkTree, WorktreeError};
 
-pub(crate) async fn run<F>(
-	wt: &WorkTree<F>,
-	tree: ObjectId,
+pub(crate) async fn run<F, H>(
+	wt: &WorkTree<F, H>,
+	tree: ObjectId<H>,
 	force: bool,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
+	H: HashAlgorithm,
 {
 	let target = wt.repository().read_tree(tree).await?;
-	let target_paths: HashMap<&str, (&str, ObjectId)> = target
+	let target_paths: HashMap<&str, (&str, ObjectId<H>)> = target
 		.iter()
 		.map(|(path, mode, oid)| (path.as_str(), (mode.as_str(), *oid)))
 		.collect();
 
 	let mut index = wt.load_index()?;
-	let current: HashMap<String, (String, ObjectId)> = index
+	let current: HashMap<String, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
 		.filter(|e| e.stage == 0)
@@ -109,15 +110,16 @@ where
 
 /// Write `path`'s blob into the working tree and record it in the index. Combines a
 /// working-tree write with the matching index upsert; used to materialise a whole tree.
-pub(crate) async fn write_entry<F>(
-	wt: &WorkTree<F>,
+pub(crate) async fn write_entry<F, H>(
+	wt: &WorkTree<F, H>,
 	path: &str,
 	mode: &str,
-	oid: ObjectId,
-	index: &mut crate::Index,
+	oid: ObjectId<H>,
+	index: &mut crate::Index<H>,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
+	H: HashAlgorithm,
 {
 	write_worktree_file(wt, path, mode, oid).await?;
 	let meta = std::fs::symlink_metadata(wt.work_dir().join(path))?;
@@ -135,14 +137,15 @@ where
 /// Write `path`'s blob into the working tree only, without touching the index. Validates the
 /// path against the checkout CVE class, creates parents, and replaces whatever occupies the
 /// destination (a file, symlink, or directory).
-pub(crate) async fn write_worktree_file<F>(
-	wt: &WorkTree<F>,
+pub(crate) async fn write_worktree_file<F, H>(
+	wt: &WorkTree<F, H>,
 	path: &str,
 	mode: &str,
-	oid: ObjectId,
+	oid: ObjectId<H>,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
+	H: HashAlgorithm,
 {
 	validate_path(path)?;
 	let full = ensure_parents(wt.work_dir(), path)?;
@@ -167,9 +170,10 @@ where
 
 /// Remove `path` from the working tree (ignoring an already-absent file) and prune any
 /// directories left empty above it. Does not touch the index.
-pub(crate) fn remove_worktree_path<F>(wt: &WorkTree<F>, path: &str)
+pub(crate) fn remove_worktree_path<F, H>(wt: &WorkTree<F, H>, path: &str)
 where
 	F: FileStore,
+	H: HashAlgorithm,
 {
 	let full = wt.work_dir().join(path);
 	let _ = std::fs::remove_file(&full);
@@ -179,9 +183,13 @@ where
 /// Like [`remove_worktree_path`], but reports a removal failure. An already-absent file is fine;
 /// any other error (e.g. the path is now occupied by a directory) is returned so the caller can
 /// refuse rather than silently leave the file in place.
-pub(crate) fn remove_worktree_file<F>(wt: &WorkTree<F>, path: &str) -> Result<(), WorktreeError>
+pub(crate) fn remove_worktree_file<F, H>(
+	wt: &WorkTree<F, H>,
+	path: &str,
+) -> Result<(), WorktreeError>
 where
 	F: FileStore,
+	H: HashAlgorithm,
 {
 	let full = wt.work_dir().join(path);
 	match std::fs::remove_file(&full) {
@@ -193,13 +201,14 @@ where
 	Ok(())
 }
 
-fn ensure_no_overwrite<F>(
-	wt: &WorkTree<F>,
+fn ensure_no_overwrite<F, H>(
+	wt: &WorkTree<F, H>,
 	path: &str,
-	current: Option<&(String, ObjectId)>,
+	current: Option<&(String, ObjectId<H>)>,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
+	H: HashAlgorithm,
 {
 	let full = wt.work_dir().join(path);
 	let meta = match std::fs::symlink_metadata(&full) {

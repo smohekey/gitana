@@ -2,17 +2,19 @@
 //! Byte-level stock-`git` interop belongs in higher-level HTTP integration tests.
 
 use gitana_file_store_memory::MemoryFileStore;
-use gitana_git_http::{ProtocolVersion, Service, advertise, ls_refs};
-use gitana_object::{PktLine, parse_pkt};
+use gitana_git_http::{
+	ProtocolVersion, Service, advertise, ls_refs, parse_advertisement, peek_object_format,
+};
+use gitana_object::{PktLine, Sha1, Sha256, parse_pkt};
 use gitana_object_store::ObjectStore;
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 
-fn repo() -> Repository<MemoryFileStore> {
-	Repository::new(ObjectStore::new(MemoryFileStore::new()))
+fn repo() -> Repository<MemoryFileStore, Sha256> {
+	Repository::new(ObjectStore::<_, Sha256>::new(MemoryFileStore::new()))
 }
 
 /// Init a repo and commit one file on `main`, returning the repo and the commit id.
-async fn repo_with_commit() -> (Repository<MemoryFileStore>, String) {
+async fn repo_with_commit() -> (Repository<MemoryFileStore, Sha256>, String) {
 	let repo = repo();
 	repo.init().await.expect("init");
 	let blob = repo.write_blob(b"hello\n").await.expect("blob");
@@ -45,6 +47,39 @@ fn pkt_lines(body: &[u8]) -> Vec<String> {
 		}
 	}
 	lines
+}
+
+#[tokio::test]
+async fn sha1_advertisement_negotiates_and_parses() {
+	// A sha1 repo advertises object-format=sha1; a client peeks that capability (without
+	// knowing the hash yet), then parses the 40-hex refs under Sha1.
+	let repo = Repository::new(ObjectStore::<_, Sha1>::new(MemoryFileStore::new()));
+	repo.init().await.expect("init");
+	let blob = repo.write_blob(b"hello\n").await.expect("blob");
+	let tree = repo
+		.write_tree(&[TreeBuildEntry {
+			path: "file.txt".to_owned(),
+			mode: FileMode::Regular,
+			id: blob,
+		}])
+		.await
+		.expect("tree");
+	let commit = repo
+		.commit_on_head(tree, "A <a@x> 1 +0000", "A <a@x> 1 +0000", "root\n")
+		.await
+		.expect("commit");
+
+	let body = advertise(&repo, Service::UploadPack, ProtocolVersion::V0, None)
+		.await
+		.expect("advertise");
+
+	// The hash-agnostic peek the client uses to choose its algorithm.
+	assert_eq!(peek_object_format(&body).as_deref(), Some("sha1"));
+
+	let advertised = parse_advertisement::<Sha1>(&body).expect("parse");
+	assert_eq!(advertised.head_target.as_deref(), Some("refs/heads/main"));
+	assert_eq!(advertised.oid_of("refs/heads/main"), Some(commit));
+	assert_eq!(commit.to_hex().len(), 40);
 }
 
 #[tokio::test]

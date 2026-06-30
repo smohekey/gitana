@@ -9,7 +9,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use gitana_file_store::FileStore;
-use gitana_object::ObjectId;
+use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::revision::{committer_seconds, peel_to_commit, read_commit};
 use crate::{Repository, RepositoryError};
@@ -32,10 +32,10 @@ const RESULT: u8 = 8; // already recorded as a candidate base
 /// Bases are returned newest-committer-date first (the date-priority walk discovers them in that
 /// order), matching git's ordering. Among bases that share a commit date the relative order — and
 /// hence git's single-base choice — is unspecified; ours may differ but is an equally valid base.
-pub(crate) async fn merge_base(
-	repo: &Repository<impl FileStore>,
-	commits: &[ObjectId],
-) -> Result<Vec<ObjectId>, RepositoryError> {
+pub(crate) async fn merge_base<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	commits: &[ObjectId<H>],
+) -> Result<Vec<ObjectId<H>>, RepositoryError> {
 	let Some((first, rest)) = commits.split_first() else {
 		return Ok(Vec::new());
 	};
@@ -49,10 +49,10 @@ pub(crate) async fn merge_base(
 }
 
 /// Whether `ancestor` is an ancestor of (or equal to) `descendant`.
-pub(crate) async fn is_ancestor(
-	repo: &Repository<impl FileStore>,
-	ancestor: ObjectId,
-	descendant: ObjectId,
+pub(crate) async fn is_ancestor<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	ancestor: ObjectId<H>,
+	descendant: ObjectId<H>,
 ) -> Result<bool, RepositoryError> {
 	let ancestor = peel_to_commit(repo, ancestor).await?;
 	let descendant = peel_to_commit(repo, descendant).await?;
@@ -76,13 +76,13 @@ pub(crate) async fn is_ancestor(
 /// returning the common-ancestor candidates in discovery order. A commit reached from `one` and
 /// from at least one of `others`, and not yet stale, is a candidate; recording it marks it stale so
 /// its own ancestors are not recorded again. All inputs are already peeled to commits.
-async fn paint_down(
-	repo: &Repository<impl FileStore>,
-	one: ObjectId,
-	others: &[ObjectId],
-) -> Result<Vec<ObjectId>, RepositoryError> {
-	let mut flags: HashMap<ObjectId, u8> = HashMap::new();
-	let mut heap: BinaryHeap<(i64, ObjectId)> = BinaryHeap::new();
+async fn paint_down<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	one: ObjectId<H>,
+	others: &[ObjectId<H>],
+) -> Result<Vec<ObjectId<H>>, RepositoryError> {
+	let mut flags: HashMap<ObjectId<H>, u8> = HashMap::new();
+	let mut heap: BinaryHeap<(i64, ObjectId<H>)> = BinaryHeap::new();
 
 	flags.insert(one, PARENT1);
 	heap.push((committer_seconds(repo, one).await?, one));
@@ -121,10 +121,10 @@ async fn paint_down(
 
 /// Drop any candidate that is an ancestor of another — in a criss-cross history `paint_down` can
 /// surface several candidates, and only the maximal ones are true merge bases.
-async fn remove_redundant(
-	repo: &Repository<impl FileStore>,
-	candidates: Vec<ObjectId>,
-) -> Result<Vec<ObjectId>, RepositoryError> {
+async fn remove_redundant<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	candidates: Vec<ObjectId<H>>,
+) -> Result<Vec<ObjectId<H>>, RepositoryError> {
 	let mut kept = Vec::new();
 	for (i, candidate) in candidates.iter().enumerate() {
 		let mut redundant = false;
@@ -144,20 +144,26 @@ async fn remove_redundant(
 #[cfg(test)]
 mod tests {
 	use gitana_file_store_memory::MemoryFileStore;
+	use gitana_object::Sha256;
 	use gitana_object_store::ObjectStore;
 
 	use super::*;
 
-	type Repo = Repository<MemoryFileStore>;
+	type Repo = Repository<MemoryFileStore, Sha256>;
 
-	async fn new_repo() -> (Repo, ObjectId) {
+	async fn new_repo() -> (Repo, ObjectId<Sha256>) {
 		let repo = Repository::new(ObjectStore::new(MemoryFileStore::new()));
 		let tree = repo.write_tree(&[]).await.unwrap();
 		(repo, tree)
 	}
 
 	/// A commit with the given parents and committer time (the tree is irrelevant to ancestry).
-	async fn commit(repo: &Repo, tree: ObjectId, parents: &[ObjectId], secs: i64) -> ObjectId {
+	async fn commit(
+		repo: &Repo,
+		tree: ObjectId<Sha256>,
+		parents: &[ObjectId<Sha256>],
+		secs: i64,
+	) -> ObjectId<Sha256> {
 		let sig = format!("A U Thor <a@u> {secs} +0000");
 		repo
 			.create_commit(tree, parents.to_vec(), &sig, &sig, &format!("c{secs}\n"))
@@ -165,7 +171,7 @@ mod tests {
 			.unwrap()
 	}
 
-	fn sorted(mut ids: Vec<ObjectId>) -> Vec<ObjectId> {
+	fn sorted(mut ids: Vec<ObjectId<Sha256>>) -> Vec<ObjectId<Sha256>> {
 		ids.sort();
 		ids
 	}

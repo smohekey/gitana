@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gitana_file_store_local::LocalFileStore;
-use gitana_object::ObjectId;
+use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
 
@@ -201,11 +201,11 @@ fn make_executable(work: &Path, name: &str) {
 	std::fs::set_permissions(&path, perms).unwrap();
 }
 
-fn repo(work: &Path) -> Repository<LocalFileStore> {
+fn repo(work: &Path) -> Repository<LocalFileStore, Sha256> {
 	Repository::new(ObjectStore::new(LocalFileStore::new(work.join(".git"))))
 }
 
-fn tree_of(w: &str, commit: &str) -> ObjectId {
+fn tree_of(w: &str, commit: &str) -> ObjectId<Sha256> {
 	ObjectId::from_hex(git(w, &["rev-parse", &format!("{commit}^{{tree}}")]).trim()).unwrap()
 }
 

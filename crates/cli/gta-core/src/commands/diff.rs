@@ -3,9 +3,11 @@ use std::path::Path;
 
 use anyhow::Result;
 use gitana_diff::Edit;
-use gitana_worktree::FileDiff;
+use gitana_file_store_local::LocalFileStore;
+use gitana_object::HashAlgorithm;
+use gitana_worktree::{FileDiff, WorkTree};
 
-use crate::repo;
+use crate::dispatch::{self, WorkTreeCommand};
 
 /// Number of unchanged context lines shown around each change (git's default).
 const CONTEXT: usize = 3;
@@ -13,19 +15,32 @@ const CONTEXT: usize = 3;
 /// Show changes between the index and the working tree, or (with `cached`) between
 /// `HEAD` and the index. Output is gta's own unified-diff form.
 pub async fn run(cwd: &Path, cached: bool) -> Result<()> {
-	let wt = repo::open_worktree(cwd)?;
-	let files = if cached {
-		wt.diff_staged().await?
-	} else {
-		wt.diff_unstaged().await?
-	};
+	dispatch::on_worktree(cwd, Diff { cached }).await
+}
 
-	let mut out = Vec::new();
-	for file in &files {
-		format_file(&mut out, file);
+struct Diff {
+	cached: bool,
+}
+
+impl WorkTreeCommand for Diff {
+	async fn run<H: HashAlgorithm>(
+		self,
+		worktree: WorkTree<LocalFileStore, H>,
+		_prefix: String,
+	) -> Result<()> {
+		let files = if self.cached {
+			worktree.diff_staged().await?
+		} else {
+			worktree.diff_unstaged().await?
+		};
+
+		let mut out = Vec::new();
+		for file in &files {
+			format_file(&mut out, file);
+		}
+		std::io::stdout().write_all(&out)?;
+		Ok(())
 	}
-	std::io::stdout().write_all(&out)?;
-	Ok(())
 }
 
 pub(crate) fn format_file(out: &mut Vec<u8>, file: &FileDiff) {

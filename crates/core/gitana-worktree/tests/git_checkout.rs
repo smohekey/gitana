@@ -6,14 +6,14 @@ use std::process::Command;
 
 use gitana_file_store_local::LocalFileStore;
 
-use gitana_object::ObjectId;
+use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
 use gitana_worktree::{WorkTree, WorktreeError};
 
-fn make_repo(work: &std::path::Path) -> WorkTree<LocalFileStore> {
+fn make_repo(work: &std::path::Path) -> WorkTree<LocalFileStore, Sha256> {
 	let git_dir = work.join(".git");
-	let repo = Repository::new(ObjectStore::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
 	WorkTree::new(repo, work, git_dir)
 }
 
@@ -54,7 +54,7 @@ async fn checkout_materialises_a_tree_like_git() {
 	let wt = make_repo(&work);
 	let tree1 = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&first).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&first).unwrap())
 		.await
 		.unwrap();
 	wt.checkout(tree1, true).await.unwrap();
@@ -97,7 +97,7 @@ async fn checkout_refuses_to_clobber_dirty_files() {
 	let wt = make_repo(&work);
 	let tree1 = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&first).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&first).unwrap())
 		.await
 		.unwrap();
 
@@ -137,12 +137,12 @@ async fn checkout_switches_file_directory_type_without_force() {
 	let wt = make_repo(&work);
 	let tree_a = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&a).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&a).unwrap())
 		.await
 		.unwrap();
 	let tree_b = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&b).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&b).unwrap())
 		.await
 		.unwrap();
 
@@ -192,7 +192,7 @@ async fn checkout_refuses_to_delete_untracked_file_in_replaced_directory() {
 	let wt = make_repo(&work);
 	let tree_a = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&a).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&a).unwrap())
 		.await
 		.unwrap();
 
@@ -242,7 +242,7 @@ async fn checkout_refuses_untracked_file_at_target_path() {
 	let wt = make_repo(&work);
 	let tree_c1 = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&c1).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&c1).unwrap())
 		.await
 		.unwrap();
 	assert!(matches!(
@@ -277,7 +277,7 @@ async fn checkout_overwrites_ignored_untracked_file_at_target_path() {
 	let wt = make_repo(&work);
 	let tree_c1 = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&c1).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&c1).unwrap())
 		.await
 		.unwrap();
 	// The obstruction is ignored, so checkout proceeds and overwrites it, matching git.
@@ -319,7 +319,7 @@ async fn checkout_replaces_wholly_ignored_directory_with_file() {
 	let wt = make_repo(&work);
 	let tree_file = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&afile).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&afile).unwrap())
 		.await
 		.unwrap();
 	// The directory `thing/` is wholly ignored, so it's expendable: checkout proceeds, like git.
@@ -359,7 +359,7 @@ async fn checkout_overwrites_ignored_file_in_replaced_directory() {
 	let wt = make_repo(&work);
 	let tree_a = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&a).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&a).unwrap())
 		.await
 		.unwrap();
 	wt.checkout(tree_a, false).await.unwrap();
@@ -396,7 +396,7 @@ async fn checkout_refuses_to_delete_untracked_ancestor_file() {
 	let wt = make_repo(&work);
 	let tree_c1 = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&c1).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&c1).unwrap())
 		.await
 		.unwrap();
 	assert!(matches!(

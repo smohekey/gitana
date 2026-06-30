@@ -11,7 +11,9 @@
 use std::collections::HashSet;
 
 use crate::pack::PackedObject;
-use crate::{ObjectError, ObjectId, ObjectKind, parse_commit, parse_tag, parse_tree};
+use crate::{
+	HashAlgorithm, ObjectError, ObjectId, ObjectKind, parse_commit, parse_tag, parse_tree,
+};
 
 /// Collect the objects reachable from `wants` but not from `haves`.
 ///
@@ -20,17 +22,17 @@ use crate::{ObjectError, ObjectId, ObjectKind, parse_commit, parse_tag, parse_tr
 /// server lacks); an unknown object reached from a `want` is a connectivity gap and
 /// fails with [`ObjectError::MissingObject`]. The result order is unspecified —
 /// [`crate::encode_pack`] imposes its own.
-pub fn enumerate_objects<F>(
-	wants: &[ObjectId],
-	haves: &[ObjectId],
+pub fn enumerate_objects<H: HashAlgorithm, F>(
+	wants: &[ObjectId<H>],
+	haves: &[ObjectId<H>],
 	mut read: F,
-) -> Result<Vec<PackedObject>, ObjectError>
+) -> Result<Vec<PackedObject<H>>, ObjectError>
 where
-	F: FnMut(ObjectId) -> Result<Option<(ObjectKind, Vec<u8>)>, ObjectError>,
+	F: FnMut(ObjectId<H>) -> Result<Option<(ObjectKind, Vec<u8>)>, ObjectError>,
 {
 	// Pass 1: everything reachable from the haves is uninteresting.
-	let mut excluded: HashSet<ObjectId> = HashSet::new();
-	let mut stack: Vec<ObjectId> = haves.to_vec();
+	let mut excluded: HashSet<ObjectId<H>> = HashSet::new();
+	let mut stack: Vec<ObjectId<H>> = haves.to_vec();
 	while let Some(id) = stack.pop() {
 		if !excluded.insert(id) {
 			continue;
@@ -41,9 +43,9 @@ where
 	}
 
 	// Pass 2: collect reachable-from-wants minus the excluded set.
-	let mut collected: HashSet<ObjectId> = HashSet::new();
-	let mut result: Vec<PackedObject> = Vec::new();
-	let mut stack: Vec<ObjectId> = wants.to_vec();
+	let mut collected: HashSet<ObjectId<H>> = HashSet::new();
+	let mut result: Vec<PackedObject<H>> = Vec::new();
+	let mut stack: Vec<ObjectId<H>> = wants.to_vec();
 	while let Some(id) = stack.pop() {
 		if excluded.contains(&id) || !collected.insert(id) {
 			continue;
@@ -56,10 +58,10 @@ where
 }
 
 /// Push the ids an object directly references onto the walk stack.
-fn push_children(
+fn push_children<H: HashAlgorithm>(
 	kind: ObjectKind,
 	data: &[u8],
-	stack: &mut Vec<ObjectId>,
+	stack: &mut Vec<ObjectId<H>>,
 ) -> Result<(), ObjectError> {
 	stack.extend(referenced_ids(kind, data)?);
 	Ok(())
@@ -70,20 +72,23 @@ fn push_children(
 ///
 /// The building block for any reachability walk — used by [`enumerate_objects`] here
 /// and by the async pack builder in `gitana-git-http`.
-pub fn referenced_ids(kind: ObjectKind, data: &[u8]) -> Result<Vec<ObjectId>, ObjectError> {
+pub fn referenced_ids<H: HashAlgorithm>(
+	kind: ObjectKind,
+	data: &[u8],
+) -> Result<Vec<ObjectId<H>>, ObjectError> {
 	let ids = match kind {
 		ObjectKind::Commit => {
-			let commit = parse_commit(data)?;
+			let commit = parse_commit::<H>(data)?;
 			let mut ids = Vec::with_capacity(commit.parents.len() + 1);
 			ids.push(commit.tree);
 			ids.extend(commit.parents);
 			ids
 		}
-		ObjectKind::Tree => parse_tree(data)?
+		ObjectKind::Tree => parse_tree::<H>(data)?
 			.into_iter()
 			.map(|entry| entry.id)
 			.collect(),
-		ObjectKind::Tag => vec![parse_tag(data)?.object],
+		ObjectKind::Tag => vec![parse_tag::<H>(data)?.object],
 		ObjectKind::Blob => Vec::new(),
 	};
 	Ok(ids)
@@ -94,29 +99,30 @@ mod tests {
 	use std::collections::HashMap;
 
 	use super::*;
-	use crate::{Commit, TreeEntry, encode_commit, encode_tree};
+	use crate::{Commit, Sha256, TreeEntry, encode_commit, encode_tree};
+
+	/// What the test reader yields for an id: its kind and payload, or `None`.
+	type ReadResult = Result<Option<(ObjectKind, Vec<u8>)>, ObjectError>;
 
 	/// A tiny in-memory object store for the walk tests.
 	#[derive(Default)]
 	struct Store {
-		objects: HashMap<ObjectId, (ObjectKind, Vec<u8>)>,
+		objects: HashMap<ObjectId<Sha256>, (ObjectKind, Vec<u8>)>,
 	}
 
 	impl Store {
-		fn put(&mut self, kind: ObjectKind, data: Vec<u8>) -> ObjectId {
-			let id = ObjectId::compute(kind, &data);
+		fn put(&mut self, kind: ObjectKind, data: Vec<u8>) -> ObjectId<Sha256> {
+			let id = ObjectId::<Sha256>::compute(kind, &data);
 			self.objects.insert(id, (kind, data));
 			id
 		}
 
-		fn reader(
-			&self,
-		) -> impl FnMut(ObjectId) -> Result<Option<(ObjectKind, Vec<u8>)>, ObjectError> + '_ {
+		fn reader(&self) -> impl FnMut(ObjectId<Sha256>) -> ReadResult + '_ {
 			move |id| Ok(self.objects.get(&id).cloned())
 		}
 	}
 
-	fn commit(tree: ObjectId, parents: Vec<ObjectId>, msg: &str) -> Vec<u8> {
+	fn commit(tree: ObjectId<Sha256>, parents: Vec<ObjectId<Sha256>>, msg: &str) -> Vec<u8> {
 		encode_commit(&Commit {
 			tree,
 			parents,
@@ -127,7 +133,7 @@ mod tests {
 		})
 	}
 
-	fn tree_with(name: &str, blob: ObjectId) -> Vec<u8> {
+	fn tree_with(name: &str, blob: ObjectId<Sha256>) -> Vec<u8> {
 		encode_tree(&[TreeEntry {
 			mode: "100644".to_owned(),
 			name: name.to_owned(),
@@ -143,7 +149,7 @@ mod tests {
 		let root = store.put(ObjectKind::Commit, commit(tree, vec![], "root"));
 
 		let objects = enumerate_objects(&[root], &[], store.reader()).expect("enumerate");
-		let ids: HashSet<ObjectId> = objects.iter().map(|o| o.id).collect();
+		let ids: HashSet<ObjectId<Sha256>> = objects.iter().map(|o| o.id).collect();
 		assert_eq!(ids, HashSet::from([blob, tree, root]));
 	}
 
@@ -160,7 +166,7 @@ mod tests {
 
 		// have c1 → only the new commit, its tree and blob should be sent.
 		let objects = enumerate_objects(&[c2], &[c1], store.reader()).expect("enumerate");
-		let ids: HashSet<ObjectId> = objects.iter().map(|o| o.id).collect();
+		let ids: HashSet<ObjectId<Sha256>> = objects.iter().map(|o| o.id).collect();
 		assert_eq!(ids, HashSet::from([blob2, tree2, c2]));
 	}
 
@@ -191,7 +197,7 @@ mod tests {
 		let want = store.put(ObjectKind::Commit, commit(want_tree, vec![], "want"));
 
 		let objects = enumerate_objects(&[want], &[have], store.reader()).expect("enumerate");
-		let ids: HashSet<ObjectId> = objects.iter().map(|o| o.id).collect();
+		let ids: HashSet<ObjectId<Sha256>> = objects.iter().map(|o| o.id).collect();
 		assert!(ids.contains(&unique));
 		assert!(ids.contains(&want_tree));
 		assert!(
@@ -203,7 +209,7 @@ mod tests {
 	#[test]
 	fn unknown_want_object_is_a_missing_object_error() {
 		let store = Store::default();
-		let phantom = ObjectId::compute(ObjectKind::Commit, b"nope");
+		let phantom = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"nope");
 		assert!(matches!(
 			enumerate_objects(&[phantom], &[], store.reader()),
 			Err(ObjectError::MissingObject)
@@ -216,7 +222,7 @@ mod tests {
 		let blob = store.put(ObjectKind::Blob, b"x".to_vec());
 		let tree = store.put(ObjectKind::Tree, tree_with("f", blob));
 		let root = store.put(ObjectKind::Commit, commit(tree, vec![], "root"));
-		let phantom = ObjectId::compute(ObjectKind::Commit, b"absent");
+		let phantom = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"absent");
 
 		// A have we don't have must not abort enumeration.
 		let objects = enumerate_objects(&[root], &[phantom], store.reader()).expect("enumerate");

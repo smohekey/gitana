@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use gitana_file_store_local::LocalFileStore;
+use gitana_object::Sha256;
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
@@ -44,7 +45,7 @@ async fn status_matches_git() {
 	std::fs::remove_file(work.join("dir/c.txt")).unwrap();
 	std::fs::write(work.join("new.txt"), b"x\n").unwrap();
 
-	let repo = Repository::new(ObjectStore::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
 	let ours = sorted(
 		&WorkTree::new(repo, &work, &git_dir)
 			.status()
@@ -95,7 +96,7 @@ async fn status_with_gitignore_matches_git() {
 	std::fs::write(work.join("keep.txt"), b"k\n").unwrap();
 	std::fs::write(work.join("a.txt"), b"a changed\n").unwrap();
 
-	let repo = Repository::new(ObjectStore::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
 	let ours = sorted(
 		&WorkTree::new(repo, &work, &git_dir)
 			.status()

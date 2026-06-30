@@ -4,6 +4,7 @@
 
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_git_http::receive_pack;
+use gitana_object::Sha256;
 use gitana_object::{
 	Commit, ObjectId, ObjectKind, PackedObject, PktLine, TreeEntry, encode_commit, encode_pack,
 	encode_tree, parse_pkt,
@@ -13,21 +14,21 @@ use gitana_repository::Repository;
 
 const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-fn repo() -> Repository<MemoryFileStore> {
-	Repository::new(ObjectStore::new(MemoryFileStore::new()))
+fn repo() -> Repository<MemoryFileStore, Sha256> {
+	Repository::new(ObjectStore::<_, Sha256>::new(MemoryFileStore::new()))
 }
 
 /// Build a blob+tree+commit object set and return it with the commit id.
-fn commit_objects(content: &[u8]) -> (Vec<PackedObject>, ObjectId) {
+fn commit_objects(content: &[u8]) -> (Vec<PackedObject<Sha256>>, ObjectId<Sha256>) {
 	let blob = content.to_vec();
-	let blob_id = ObjectId::compute(ObjectKind::Blob, &blob);
+	let blob_id = ObjectId::<Sha256>::compute(ObjectKind::Blob, &blob);
 
 	let tree = encode_tree(&[TreeEntry {
 		mode: "100644".to_owned(),
 		name: "file.txt".to_owned(),
 		id: blob_id,
 	}]);
-	let tree_id = ObjectId::compute(ObjectKind::Tree, &tree);
+	let tree_id = ObjectId::<Sha256>::compute(ObjectKind::Tree, &tree);
 
 	let commit = encode_commit(&Commit {
 		tree: tree_id,
@@ -37,7 +38,7 @@ fn commit_objects(content: &[u8]) -> (Vec<PackedObject>, ObjectId) {
 		signature: None,
 		message: "root\n".to_owned(),
 	});
-	let commit_id = ObjectId::compute(ObjectKind::Commit, &commit);
+	let commit_id = ObjectId::<Sha256>::compute(ObjectKind::Commit, &commit);
 
 	let objects = vec![
 		PackedObject {
@@ -123,7 +124,7 @@ async fn push_with_missing_objects_is_rejected_without_moving_refs() {
 
 	// A command naming a commit, but an empty pack: connectivity fails.
 	let (_, commit) = commit_objects(b"hello\n");
-	let empty_pack = encode_pack(&[]);
+	let empty_pack = encode_pack::<Sha256>(&[]);
 	let request = push_request(ZERO, &commit.to_hex(), "refs/heads/main", &empty_pack);
 
 	let response = receive_pack(&repo, &request, false)
@@ -215,7 +216,12 @@ async fn delete_with_force_removes_the_ref() {
 	receive_pack(&repo, &create, false).await.expect("create");
 
 	// Delete it (new = zero) — allowed with force.
-	let delete = push_request(&commit.to_hex(), ZERO, "refs/heads/main", &encode_pack(&[]));
+	let delete = push_request(
+		&commit.to_hex(),
+		ZERO,
+		"refs/heads/main",
+		&encode_pack::<Sha256>(&[]),
+	);
 	let report = receive_pack(&repo, &delete, true)
 		.await
 		.expect("delete")
@@ -251,7 +257,12 @@ async fn delete_without_force_is_denied() {
 	);
 	receive_pack(&repo, &create, false).await.expect("create");
 
-	let delete = push_request(&commit.to_hex(), ZERO, "refs/heads/main", &encode_pack(&[]));
+	let delete = push_request(
+		&commit.to_hex(),
+		ZERO,
+		"refs/heads/main",
+		&encode_pack::<Sha256>(&[]),
+	);
 	let report = receive_pack(&repo, &delete, false)
 		.await
 		.expect("delete attempt")

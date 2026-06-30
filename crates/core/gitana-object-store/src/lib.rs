@@ -2,20 +2,21 @@
 //!
 //! Composition crate: it wires [`gitana_object`]'s codecs onto a
 //! [`gitana_file_store::GitFileStore`] backend, scoped to one repository. Generic
-//! over the backend `F` — layers are wired with compile-time generics (see
-//! docs/hlds/storage-layer.md). Reads try the loose object first, then stored
-//! packfiles (decoded lazily and cached). Every loose read recomputes the SHA-256
-//! and rejects a mismatch; objects served from a pack are content-addressed by
-//! construction (`decode_pack` computes each id from its bytes).
+//! over the backend `F` and the hash algorithm `H` — layers are wired with
+//! compile-time generics (see docs/hlds/storage-layer.md). Reads try the loose object
+//! first, then stored packfiles (decoded lazily and cached). Every loose read
+//! recomputes the id under `H` and rejects a mismatch; objects served from a pack are
+//! content-addressed by construction (`decode_pack` computes each id from its bytes).
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use gitana_file_store::{FileStore, FileStoreError, WriteOutcome};
 
 use gitana_object::{
-	MAX_OBJECT_SIZE, ObjectError, ObjectId, ObjectKind, PackedObject, decode_loose, decode_pack,
-	encode_loose, loose_object_path,
+	HashAlgorithm, MAX_OBJECT_SIZE, ObjectError, ObjectId, ObjectKind, PackedObject, decode_loose,
+	decode_pack, encode_loose, loose_object_path,
 };
 use tokio::sync::Mutex;
 
@@ -36,10 +37,10 @@ pub enum ObjectStoreError {
 	/// A stored object's recomputed id did not match the id it was read under.
 	#[error("object corruption: stored under {requested}, content hashes to {actual}")]
 	Corruption {
-		/// The id the object was requested/stored under.
-		requested: ObjectId,
-		/// The id its bytes actually hash to.
-		actual: ObjectId,
+		/// The hex id the object was requested/stored under.
+		requested: String,
+		/// The hex id its bytes actually hash to.
+		actual: String,
 	},
 	/// The underlying file store failed.
 	#[error("file store error: {0}")]
@@ -64,24 +65,28 @@ fn ensure_within(len: u64, limit: u64) -> Result<(), ObjectStoreError> {
 }
 
 /// A decoded pack's objects, indexed by id.
-type PackIndex = Arc<HashMap<ObjectId, PackedObject>>;
+type PackIndex<H> = Arc<HashMap<ObjectId<H>, PackedObject<H>>>;
 
-/// Git object storage layered over a file-store backend `F`, scoped to one repo.
-pub struct ObjectStore<F> {
+/// Git object storage layered over a file-store backend `F`, scoped to one repo, with
+/// object ids under the hash algorithm `H`.
+pub struct ObjectStore<F, H: HashAlgorithm> {
 	files: F,
 	/// Decoded packs keyed by their repository-relative path.
-	packs: Mutex<HashMap<String, PackIndex>>,
+	packs: Mutex<HashMap<String, PackIndex<H>>>,
+	_hash: PhantomData<H>,
 }
 
-impl<F> ObjectStore<F>
+impl<F, H> ObjectStore<F, H>
 where
 	F: FileStore,
+	H: HashAlgorithm,
 {
 	/// Build an object store over `files` for repository `repo`.
 	pub fn new(files: F) -> Self {
 		Self {
 			files,
 			packs: Mutex::new(HashMap::new()),
+			_hash: PhantomData,
 		}
 	}
 
@@ -96,9 +101,9 @@ where
 		&self,
 		kind: ObjectKind,
 		payload: &[u8],
-	) -> Result<ObjectId, ObjectStoreError> {
+	) -> Result<ObjectId<H>, ObjectStoreError> {
 		ensure_within(payload.len() as u64, MAX_OBJECT_SIZE)?;
-		let id = ObjectId::compute(kind, payload);
+		let id = ObjectId::<H>::compute(kind, payload);
 		let bytes = encode_loose(kind, payload);
 		let path = loose_object_path(&id);
 		match self.files.write_path_if_absent(&path, &bytes).await? {
@@ -110,9 +115,9 @@ where
 	/// The pack is decoded first, so a malformed pack is never stored.
 	pub async fn write_pack(&self, pack: &[u8]) -> Result<(), ObjectStoreError> {
 		ensure_within(pack.len() as u64, MAX_PACK_SIZE)?;
-		decode_pack(pack)?;
-		let checksum = &pack[pack.len() - 32..];
-		let mut hex = String::with_capacity(64);
+		decode_pack::<H>(pack)?;
+		let checksum = &pack[pack.len() - H::RAW_LEN..];
+		let mut hex = String::with_capacity(H::RAW_LEN * 2);
 		for byte in checksum {
 			hex.push_str(&format!("{byte:02x}"));
 		}
@@ -124,16 +129,16 @@ where
 	/// Read an object by id, from a loose object or a stored pack.
 	pub async fn read_object(
 		&self,
-		id: &ObjectId,
+		id: &ObjectId<H>,
 	) -> Result<(ObjectKind, Vec<u8>), ObjectStoreError> {
 		match self.files.read_path(&loose_object_path(id)).await {
 			Ok(bytes) => {
 				let (kind, payload) = decode_loose(&bytes)?;
-				let actual = ObjectId::compute(kind, &payload);
+				let actual = ObjectId::<H>::compute(kind, &payload);
 				if &actual != id {
 					return Err(ObjectStoreError::Corruption {
-						requested: *id,
-						actual,
+						requested: id.to_hex(),
+						actual: actual.to_hex(),
 					});
 				}
 				Ok((kind, payload))
@@ -147,14 +152,17 @@ where
 	}
 
 	/// Whether an object with `id` is stored, loose or packed.
-	pub async fn exists_object(&self, id: &ObjectId) -> Result<bool, ObjectStoreError> {
+	pub async fn exists_object(&self, id: &ObjectId<H>) -> Result<bool, ObjectStoreError> {
 		if self.files.exists(&loose_object_path(id)).await? {
 			return Ok(true);
 		}
 		Ok(self.find_in_packs(id).await?.is_some())
 	}
 
-	async fn find_in_packs(&self, id: &ObjectId) -> Result<Option<PackedObject>, ObjectStoreError> {
+	async fn find_in_packs(
+		&self,
+		id: &ObjectId<H>,
+	) -> Result<Option<PackedObject<H>>, ObjectStoreError> {
 		let pack_paths = self.files.list_prefix(PACK_PREFIX).await?;
 		for path in pack_paths {
 			if !path.ends_with(".pack") {
@@ -169,12 +177,12 @@ where
 	}
 
 	/// The decoded index for one pack path, decoding and caching it on first use.
-	async fn pack_index(&self, path: &str) -> Result<PackIndex, ObjectStoreError> {
+	async fn pack_index(&self, path: &str) -> Result<PackIndex<H>, ObjectStoreError> {
 		if let Some(index) = self.packs.lock().await.get(path) {
 			return Ok(Arc::clone(index));
 		}
 		let bytes = self.files.read_path(path).await?;
-		let objects = decode_pack(&bytes)?;
+		let objects = decode_pack::<H>(&bytes)?;
 		let mut index = HashMap::with_capacity(objects.len());
 		for object in objects {
 			index.insert(object.id, object);

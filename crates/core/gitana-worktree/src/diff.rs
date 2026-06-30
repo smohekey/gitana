@@ -8,7 +8,7 @@ use std::fs::Metadata;
 use std::path::Path;
 
 use gitana_file_store::FileStore;
-use gitana_object::ObjectId;
+use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::fsmeta::{blob_of, file_mode, path_bytes};
 use crate::worktree::stat_matches;
@@ -28,8 +28,8 @@ pub struct FileDiff {
 
 /// Index vs working tree (the changes `git diff` shows with no args). Untracked
 /// files are not included, matching git's default.
-pub(crate) async fn unstaged<F: FileStore>(
-	wt: &WorkTree<F>,
+pub(crate) async fn unstaged<F: FileStore, H: HashAlgorithm>(
+	wt: &WorkTree<F, H>,
 ) -> Result<Vec<FileDiff>, WorktreeError> {
 	let index = wt.load_index()?;
 	let mut out = Vec::new();
@@ -72,8 +72,10 @@ pub(crate) async fn unstaged<F: FileStore>(
 }
 
 /// HEAD tree vs index (the changes `git diff --cached` shows).
-pub(crate) async fn staged<F: FileStore>(wt: &WorkTree<F>) -> Result<Vec<FileDiff>, WorktreeError> {
-	let index: BTreeMap<String, (u32, ObjectId)> = wt
+pub(crate) async fn staged<F: FileStore, H: HashAlgorithm>(
+	wt: &WorkTree<F, H>,
+) -> Result<Vec<FileDiff>, WorktreeError> {
+	let index: BTreeMap<String, (u32, ObjectId<H>)> = wt
 		.load_index()?
 		.entries
 		.iter()
@@ -81,18 +83,19 @@ pub(crate) async fn staged<F: FileStore>(wt: &WorkTree<F>) -> Result<Vec<FileDif
 		.map(|e| (e.path.clone(), (e.mode, e.oid)))
 		.collect();
 
-	let head: BTreeMap<String, (u32, ObjectId)> = match wt.repository().refs().resolve_head().await? {
-		Some(commit) => {
-			let tree = wt.repository().commit_tree(commit).await?;
-			wt.repository()
-				.read_tree(tree)
-				.await?
-				.into_iter()
-				.map(|(path, mode, oid)| (path, (parse_mode(&mode), oid)))
-				.collect()
-		}
-		None => BTreeMap::new(),
-	};
+	let head: BTreeMap<String, (u32, ObjectId<H>)> =
+		match wt.repository().refs().resolve_head().await? {
+			Some(commit) => {
+				let tree = wt.repository().commit_tree(commit).await?;
+				wt.repository()
+					.read_tree(tree)
+					.await?
+					.into_iter()
+					.map(|(path, mode, oid)| (path, (parse_mode(&mode), oid)))
+					.collect()
+			}
+			None => BTreeMap::new(),
+		};
 
 	let paths: BTreeSet<&String> = index.keys().chain(head.keys()).collect();
 	let mut out = Vec::new();
@@ -112,9 +115,9 @@ pub(crate) async fn staged<F: FileStore>(wt: &WorkTree<F>) -> Result<Vec<FileDif
 }
 
 /// Resolve a `(mode, oid)` reference to its blob content and mode, or `None`.
-async fn side<F: FileStore>(
-	wt: &WorkTree<F>,
-	what: Option<&(u32, ObjectId)>,
+async fn side<F: FileStore, H: HashAlgorithm>(
+	wt: &WorkTree<F, H>,
+	what: Option<&(u32, ObjectId<H>)>,
 ) -> Result<Option<(Vec<u8>, u32)>, WorktreeError> {
 	match what {
 		Some((mode, oid)) => Ok(Some((wt.repository().read_blob(*oid).await?, *mode))),

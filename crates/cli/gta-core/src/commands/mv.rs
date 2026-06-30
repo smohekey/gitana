@@ -1,8 +1,11 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
+use gitana_file_store_local::LocalFileStore;
+use gitana_object::HashAlgorithm;
+use gitana_worktree::WorkTree;
 
-use crate::repo;
+use crate::dispatch::{self, WorkTreeCommand};
 
 /// Move or rename tracked paths: filesystem move plus index update.
 ///
@@ -16,19 +19,46 @@ pub async fn run(
 	verbose: bool,
 	paths: Vec<String>,
 ) -> Result<()> {
-	if paths.len() < 2 {
-		bail!("must specify at least one source and a destination");
-	}
-	let (dest, sources) = paths.split_last().unwrap();
-	let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
+	dispatch::on_worktree(
+		cwd,
+		Mv {
+			force,
+			dry_run,
+			verbose,
+			paths,
+		},
+	)
+	.await
+}
 
-	let (wt, prefix) = repo::open_worktree_with_prefix(cwd)?;
-	let moves = wt.mv(&sources, dest, &prefix, force, dry_run).await?;
+struct Mv {
+	force: bool,
+	dry_run: bool,
+	verbose: bool,
+	paths: Vec<String>,
+}
 
-	if verbose || dry_run {
-		for (from, to) in &moves {
-			println!("Renaming {from} to {to}");
+impl WorkTreeCommand for Mv {
+	async fn run<H: HashAlgorithm>(
+		self,
+		worktree: WorkTree<LocalFileStore, H>,
+		prefix: String,
+	) -> Result<()> {
+		if self.paths.len() < 2 {
+			bail!("must specify at least one source and a destination");
 		}
+		let (dest, sources) = self.paths.split_last().unwrap();
+		let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
+
+		let moves = worktree
+			.mv(&sources, dest, &prefix, self.force, self.dry_run)
+			.await?;
+
+		if self.verbose || self.dry_run {
+			for (from, to) in &moves {
+				println!("Renaming {from} to {to}");
+			}
+		}
+		Ok(())
 	}
-	Ok(())
 }

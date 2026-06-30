@@ -1,5 +1,5 @@
 use gitana_file_store::FileStoreError;
-use gitana_object::{ObjectError, ObjectId};
+use gitana_object::ObjectError;
 use gitana_object_store::ObjectStoreError;
 
 /// Errors from repository operations.
@@ -17,9 +17,9 @@ pub enum RepositoryError {
 		/// The ref whose update was rejected.
 		name: String,
 	},
-	/// A referenced object does not exist.
+	/// A referenced object does not exist (the hex id is recorded for diagnostics).
 	#[error("missing object {0}")]
-	MissingObject(ObjectId),
+	MissingObject(String),
 	/// An operation not supported in the current state (e.g. committing on a
 	/// detached HEAD, not yet implemented).
 	#[error("unsupported operation: {0}")]

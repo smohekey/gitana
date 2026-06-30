@@ -1,31 +1,36 @@
+use std::marker::PhantomData;
+
 use gitana_file_store::{FileStore, FileStoreError};
-use gitana_object::ObjectId;
+use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::{HeadState, RepositoryError};
-
-/// The all-zero object id git uses for "no previous value" in a reflog.
-const ZERO_OID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Reads and updates refs (loose files + symbolic HEAD) over a file store.
 ///
 /// Borrows the repository's file store and id, so it shares the one backend the
 /// object store already holds. packed-refs reading and the reflog land in later
-/// phases (see docs/hlds/repository-engine.md).
-pub struct RefStore<'a, F> {
+/// phases (see docs/hlds/repository-engine.md). Generic over the hash algorithm `H`,
+/// which fixes the width of the object ids refs resolve to.
+pub struct RefStore<'a, F, H> {
 	files: &'a F,
+	_hash: PhantomData<H>,
 }
 
-impl<'a, F> RefStore<'a, F>
+impl<'a, F, H> RefStore<'a, F, H>
 where
 	F: FileStore,
+	H: HashAlgorithm,
 {
 	/// Build a ref store over `files` for `repo`.
 	pub fn new(files: &'a F) -> Self {
-		Self { files }
+		Self {
+			files,
+			_hash: PhantomData,
+		}
 	}
 
 	/// Read and parse `HEAD`.
-	pub async fn read_head(&self) -> Result<HeadState, RepositoryError> {
+	pub async fn read_head(&self) -> Result<HeadState<H>, RepositoryError> {
 		match self.files.read_path("HEAD").await {
 			Ok(bytes) => HeadState::parse(&bytes),
 			Err(FileStoreError::NotFound) => Err(RepositoryError::InvalidRef("no HEAD".to_owned())),
@@ -35,7 +40,7 @@ where
 
 	/// Resolve a ref to its object id, or `None` if it does not exist. Tries the
 	/// loose ref file, then git's `packed-refs` (e.g. after `git pack-refs`).
-	pub async fn resolve(&self, name: &str) -> Result<Option<ObjectId>, RepositoryError> {
+	pub async fn resolve(&self, name: &str) -> Result<Option<ObjectId<H>>, RepositoryError> {
 		match self.files.read_path(name).await {
 			Ok(bytes) => Ok(Some(parse_oid(name, &bytes)?)),
 			Err(FileStoreError::NotFound) => self.resolve_packed(name).await,
@@ -44,7 +49,7 @@ where
 	}
 
 	/// Look up `name` in git's `packed-refs` file.
-	async fn resolve_packed(&self, name: &str) -> Result<Option<ObjectId>, RepositoryError> {
+	async fn resolve_packed(&self, name: &str) -> Result<Option<ObjectId<H>>, RepositoryError> {
 		let bytes = match self.files.read_path("packed-refs").await {
 			Ok(bytes) => bytes,
 			Err(FileStoreError::NotFound) => return Ok(None),
@@ -70,9 +75,9 @@ where
 	/// loose ref files (loose wins). Recurses into subdirectories so hierarchical
 	/// names (`refs/heads/feature/x`) are included. Symbolic loose refs are skipped.
 	/// Returns `(full ref name, oid)` pairs sorted by name.
-	pub async fn list(&self, prefix: &str) -> Result<Vec<(String, ObjectId)>, RepositoryError> {
+	pub async fn list(&self, prefix: &str) -> Result<Vec<(String, ObjectId<H>)>, RepositoryError> {
 		use std::collections::BTreeMap;
-		let mut refs: BTreeMap<String, ObjectId> = BTreeMap::new();
+		let mut refs: BTreeMap<String, ObjectId<H>> = BTreeMap::new();
 
 		// packed-refs first; loose files override.
 		if let Some(bytes) = self.read_opt("packed-refs").await? {
@@ -123,7 +128,7 @@ where
 
 	/// Resolve `HEAD` to a commit id, following its symbolic target. Returns `None`
 	/// for an unborn branch (symbolic target with no ref file yet).
-	pub async fn resolve_head(&self) -> Result<Option<ObjectId>, RepositoryError> {
+	pub async fn resolve_head(&self) -> Result<Option<ObjectId<H>>, RepositoryError> {
 		match self.read_head().await? {
 			HeadState::Detached(id) => Ok(Some(id)),
 			HeadState::Symbolic(target) => self.resolve(&target).await,
@@ -135,8 +140,8 @@ where
 	pub async fn update_ref(
 		&self,
 		name: &str,
-		new: ObjectId,
-		expected: Option<ObjectId>,
+		new: ObjectId<H>,
+		expected: Option<ObjectId<H>>,
 	) -> Result<(), RepositoryError> {
 		let bytes = format!("{new}\n");
 		match self.files.read_path_versioned(name).await {
@@ -178,7 +183,7 @@ where
 	pub async fn delete_ref(
 		&self,
 		name: &str,
-		expected: Option<ObjectId>,
+		expected: Option<ObjectId<H>>,
 	) -> Result<(), RepositoryError> {
 		let current = self.resolve(name).await?;
 		if current != expected {
@@ -248,7 +253,7 @@ where
 
 	/// Point the symbolic ref `name` (e.g. `HEAD`) at `target`.
 	pub async fn set_symbolic(&self, name: &str, target: &str) -> Result<(), RepositoryError> {
-		let bytes = HeadState::Symbolic(target.to_owned()).render();
+		let bytes = HeadState::<H>::Symbolic(target.to_owned()).render();
 		self.force_write(name, bytes.as_bytes()).await
 	}
 
@@ -273,12 +278,12 @@ where
 	pub async fn append_reflog(
 		&self,
 		refname: &str,
-		old: Option<ObjectId>,
-		new: ObjectId,
+		old: Option<ObjectId<H>>,
+		new: ObjectId<H>,
 		committer: &str,
 		message: &str,
 	) -> Result<(), RepositoryError> {
-		let old = old.map_or_else(|| ZERO_OID.to_owned(), |id| id.to_hex());
+		let old = old.map_or_else(|| "0".repeat(H::RAW_LEN * 2), |id| id.to_hex());
 		let line = format!("{old} {new} {committer}\t{message}\n");
 
 		let path = format!("logs/{refname}");
@@ -312,7 +317,7 @@ where
 	}
 }
 
-fn parse_oid(name: &str, bytes: &[u8]) -> Result<ObjectId, RepositoryError> {
+fn parse_oid<H: HashAlgorithm>(name: &str, bytes: &[u8]) -> Result<ObjectId<H>, RepositoryError> {
 	let text = std::str::from_utf8(bytes)
 		.map_err(|_| RepositoryError::InvalidRef(name.to_owned()))?
 		.trim();

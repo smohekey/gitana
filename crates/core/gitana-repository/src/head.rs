@@ -1,18 +1,18 @@
-use gitana_object::ObjectId;
+use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::RepositoryError;
 
 /// The state of `HEAD`: a symbolic ref (normal) or a detached commit id.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HeadState {
+pub enum HeadState<H: HashAlgorithm> {
 	/// `HEAD` points at a ref name, e.g. `refs/heads/main`. The ref may not exist
 	/// yet (an unborn branch on a fresh repo).
 	Symbolic(String),
 	/// `HEAD` holds a raw commit id (detached HEAD).
-	Detached(ObjectId),
+	Detached(ObjectId<H>),
 }
 
-impl HeadState {
+impl<H: HashAlgorithm> HeadState<H> {
 	/// Parse the bytes of a `HEAD` file.
 	pub fn parse(bytes: &[u8]) -> Result<Self, RepositoryError> {
 		let text = std::str::from_utf8(bytes)
@@ -39,13 +39,14 @@ impl HeadState {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use gitana_object::Sha256;
 
 	#[test]
 	fn round_trips_symbolic_and_detached() {
-		let sym = HeadState::Symbolic("refs/heads/main".to_owned());
+		let sym = HeadState::<Sha256>::Symbolic("refs/heads/main".to_owned());
 		assert_eq!(HeadState::parse(sym.render().as_bytes()).unwrap(), sym);
 
-		let id = ObjectId::compute(gitana_object::ObjectKind::Commit, b"c");
+		let id = ObjectId::<Sha256>::compute(gitana_object::ObjectKind::Commit, b"c");
 		let det = HeadState::Detached(id);
 		assert_eq!(HeadState::parse(det.render().as_bytes()).unwrap(), det);
 	}

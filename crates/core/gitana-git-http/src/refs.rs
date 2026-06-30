@@ -2,34 +2,30 @@
 //! the v2 `ls-refs` command.
 
 use gitana_file_store::FileStore;
-use gitana_object::{ObjectId, ObjectKind, parse_tag};
+use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_tag};
 use gitana_repository::Repository;
 
 use crate::GitHttpError;
 
-/// The all-zero object id git uses for "no value" (e.g. an empty repo's tip).
-pub(crate) const ZERO_OID: &str =
-	"0000000000000000000000000000000000000000000000000000000000000000";
-
 /// One advertised ref.
-pub(crate) struct RefLine {
+pub(crate) struct RefLine<H: HashAlgorithm> {
 	/// The full ref name (`HEAD`, `refs/heads/main`, …).
 	pub name: String,
 	/// The object the ref points at.
-	pub oid: ObjectId,
+	pub oid: ObjectId<H>,
 	/// For a symbolic ref (HEAD), the ref it points at.
 	pub symref_target: Option<String>,
 	/// For an annotated tag, the non-tag object it ultimately points at.
-	pub peeled: Option<ObjectId>,
+	pub peeled: Option<ObjectId<H>>,
 }
 
 /// Collect advertised refs in wire order: `HEAD` first (when the repo has commits),
 /// then refs under `refs/` sorted by name. With `peel`, annotated tags carry their
 /// peeled target.
-pub(crate) async fn collect_refs<F: FileStore>(
-	repo: &Repository<F>,
+pub(crate) async fn collect_refs<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
 	peel: bool,
-) -> Result<Vec<RefLine>, GitHttpError> {
+) -> Result<Vec<RefLine<H>>, GitHttpError> {
 	let refs = repo.refs();
 	let mut out = Vec::new();
 
@@ -62,7 +58,10 @@ pub(crate) async fn collect_refs<F: FileStore>(
 /// Follow an annotated-tag chain to the first non-tag object, or `None` if `oid` is
 /// not a tag. Best-effort: a missing or unreadable object yields no peel rather than
 /// an error (the ref itself is still advertised).
-async fn peel_tag<F: FileStore>(repo: &Repository<F>, oid: ObjectId) -> Option<ObjectId> {
+async fn peel_tag<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	oid: ObjectId<H>,
+) -> Option<ObjectId<H>> {
 	let mut current = oid;
 	let mut peeled = None;
 	loop {
@@ -70,7 +69,7 @@ async fn peel_tag<F: FileStore>(repo: &Repository<F>, oid: ObjectId) -> Option<O
 		if kind != ObjectKind::Tag {
 			return peeled;
 		}
-		let tag = parse_tag(&data).ok()?;
+		let tag = parse_tag::<H>(&data).ok()?;
 		current = tag.object;
 		peeled = Some(current);
 	}

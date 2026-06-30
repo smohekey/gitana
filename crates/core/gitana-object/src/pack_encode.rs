@@ -4,19 +4,18 @@
 //! delta-compressing with a git-style sliding window (objects sorted by type then
 //! size, each tried against a small window of earlier objects of the same type).
 //! Deltas are emitted as `OBJ_OFS_DELTA` entries referencing an earlier entry by
-//! byte distance, so the pack is never thin. The trailer is the SHA-256 of the
+//! byte distance, so the pack is never thin. The trailer is the `H` hash of the
 //! whole pack. Round-trips through [`crate::decode_pack`] and is accepted by stock
-//! `git index-pack --object-format=sha256`.
+//! `git index-pack` for the matching object format.
 
 use std::collections::HashMap;
 use std::io::Write;
 
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use sha2::{Digest, Sha256};
 
-use crate::ObjectKind;
 use crate::pack::PackedObject;
+use crate::{HashAlgorithm, ObjectKind};
 
 const OBJ_COMMIT: u8 = 1;
 const OBJ_TREE: u8 = 2;
@@ -50,10 +49,11 @@ enum Encoding {
 	},
 }
 
-/// Encode `objects` into a self-contained, delta-compressed packfile (v2, SHA-256).
+/// Encode `objects` into a self-contained, delta-compressed packfile (v2) under the
+/// hash algorithm `H`.
 ///
 /// Order within `objects` does not matter; the encoder picks its own write order.
-pub fn encode_pack(objects: &[PackedObject]) -> Vec<u8> {
+pub fn encode_pack<H: HashAlgorithm>(objects: &[PackedObject<H>]) -> Vec<u8> {
 	let order = delta_order(objects);
 	let plans = plan_deltas(objects, &order);
 	write_pack(objects, &order, &plans)
@@ -61,7 +61,7 @@ pub fn encode_pack(objects: &[PackedObject]) -> Vec<u8> {
 
 /// Choose the write order: group by type, then largest first (a bigger object is a
 /// better delta base), then by id for determinism.
-fn delta_order(objects: &[PackedObject]) -> Vec<usize> {
+fn delta_order<H: HashAlgorithm>(objects: &[PackedObject<H>]) -> Vec<usize> {
 	let mut order: Vec<usize> = (0..objects.len()).collect();
 	order.sort_by(|&a, &b| {
 		let oa = &objects[a];
@@ -76,7 +76,7 @@ fn delta_order(objects: &[PackedObject]) -> Vec<usize> {
 
 /// For each object in write order, try to delta it against a window of earlier
 /// objects of the same type, keeping the smallest delta that beats the full form.
-fn plan_deltas(objects: &[PackedObject], order: &[usize]) -> Vec<Encoding> {
+fn plan_deltas<H: HashAlgorithm>(objects: &[PackedObject<H>], order: &[usize]) -> Vec<Encoding> {
 	let mut plans = Vec::with_capacity(order.len());
 	let mut depth = vec![0usize; order.len()];
 
@@ -108,7 +108,11 @@ fn plan_deltas(objects: &[PackedObject], order: &[usize]) -> Vec<Encoding> {
 }
 
 /// Serialise the planned objects, computing OFS distances and the trailer hash.
-fn write_pack(objects: &[PackedObject], order: &[usize], plans: &[Encoding]) -> Vec<u8> {
+fn write_pack<H: HashAlgorithm>(
+	objects: &[PackedObject<H>],
+	order: &[usize],
+	plans: &[Encoding],
+) -> Vec<u8> {
 	let mut pack = Vec::new();
 	pack.extend_from_slice(b"PACK");
 	pack.extend_from_slice(&2u32.to_be_bytes());
@@ -132,8 +136,8 @@ fn write_pack(objects: &[PackedObject], order: &[usize], plans: &[Encoding]) -> 
 		}
 	}
 
-	let trailer = Sha256::digest(&pack);
-	pack.extend_from_slice(&trailer);
+	let trailer = H::digest(&[&pack]);
+	pack.extend_from_slice(trailer.as_ref());
 	pack
 }
 
@@ -331,11 +335,11 @@ fn type_rank(kind: ObjectKind) -> u8 {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{ObjectId, apply_delta, decode_pack};
+	use crate::{ObjectId, Sha1, Sha256, apply_delta, decode_pack};
 
-	fn blob(data: &[u8]) -> PackedObject {
+	fn blob(data: &[u8]) -> PackedObject<Sha256> {
 		PackedObject {
-			id: ObjectId::compute(ObjectKind::Blob, data),
+			id: ObjectId::<Sha256>::compute(ObjectKind::Blob, data),
 			kind: ObjectKind::Blob,
 			data: data.to_vec(),
 		}
@@ -345,14 +349,26 @@ mod tests {
 	fn single_object_round_trips() {
 		let object = blob(b"hello world");
 		let pack = encode_pack(std::slice::from_ref(&object));
-		let decoded = decode_pack(&pack).expect("decode");
+		let decoded = decode_pack::<Sha256>(&pack).expect("decode");
 		assert_eq!(decoded, vec![object]);
 	}
 
 	#[test]
 	fn empty_pack_round_trips() {
-		let pack = encode_pack(&[]);
-		assert_eq!(decode_pack(&pack).expect("decode"), vec![]);
+		let pack = encode_pack::<Sha256>(&[]);
+		assert_eq!(decode_pack::<Sha256>(&pack).expect("decode"), vec![]);
+	}
+
+	#[test]
+	fn sha1_pack_round_trips() {
+		let object = PackedObject::<Sha1> {
+			id: ObjectId::<Sha1>::compute(ObjectKind::Blob, b"hello world"),
+			kind: ObjectKind::Blob,
+			data: b"hello world".to_vec(),
+		};
+		let pack = encode_pack(std::slice::from_ref(&object));
+		let decoded = decode_pack::<Sha1>(&pack).expect("decode");
+		assert_eq!(decoded, vec![object]);
 	}
 
 	#[test]
@@ -366,7 +382,7 @@ mod tests {
 
 		let objects = vec![blob(&a), blob(&b)];
 		let pack = encode_pack(&objects);
-		let mut decoded = decode_pack(&pack).expect("decode");
+		let mut decoded = decode_pack::<Sha256>(&pack).expect("decode");
 		decoded.sort_by_key(|o| o.data.len());
 		let mut expected = objects.clone();
 		expected.sort_by_key(|o| o.data.len());

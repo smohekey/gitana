@@ -4,14 +4,14 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use gitana_file_store_local::LocalFileStore;
-use gitana_object::ObjectId;
+use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 use gitana_worktree::{IndexEntry, Stat, WorkTree, WorktreeError};
 
-fn make_repo(work: &std::path::Path) -> WorkTree<LocalFileStore> {
+fn make_repo(work: &std::path::Path) -> WorkTree<LocalFileStore, Sha256> {
 	let git_dir = work.join(".git");
-	let repo = Repository::new(ObjectStore::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
 	WorkTree::new(repo, work, git_dir)
 }
 
@@ -87,7 +87,7 @@ async fn restore_from_tree_updates_index_and_worktree() {
 	let wt = make_repo(&work);
 	let tree1 = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&first).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&first).unwrap())
 		.await
 		.unwrap();
 
@@ -297,7 +297,7 @@ async fn restore_handles_file_directory_type_changes() {
 	// the file and drops the stale `thing/child.txt` index entry.
 	let tree_a = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&a).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&a).unwrap())
 		.await
 		.unwrap();
 	wt.restore(Some(tree_a), true, true, &["thing"], "")
@@ -447,7 +447,7 @@ async fn worktree_restore_from_tree_deletes_absent_path() {
 	// The first commit's tree has `a.txt` and `sub/b.txt`, but no `c.txt`.
 	let tree1 = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&first).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&first).unwrap())
 		.await
 		.unwrap();
 	assert!(work.join("c.txt").exists());
@@ -600,7 +600,7 @@ async fn staged_restore_cleans_type_conflicts() {
 	// `thing/child.txt` index entry and stage `thing`, without touching the working tree.
 	let tree_a = wt
 		.repository()
-		.commit_tree(ObjectId::from_hex(&a).unwrap())
+		.commit_tree(ObjectId::<Sha256>::from_hex(&a).unwrap())
 		.await
 		.unwrap();
 	wt.restore(Some(tree_a), false, true, &["thing"], "")

@@ -1,53 +1,69 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
+use gitana_file_store_local::LocalFileStore;
+use gitana_object::HashAlgorithm;
 use gitana_repository::{FileMode, TreeBuildEntry};
-use gitana_worktree::Index;
+use gitana_worktree::{Index, WorkTree};
 
+use crate::dispatch::{self, WorkTreeCommand};
 use crate::identity;
-use crate::repo;
 
 /// Create a commit from the index on the current branch.
 pub async fn run(cwd: &Path, message: &str) -> Result<()> {
-	let wt = repo::open_worktree(cwd)?;
-	let index = wt.load_index()?;
-	// An unmerged index would otherwise silently drop conflicted paths (they have no stage-0 entry)
-	// from the tree, so refuse — as git does — until they are resolved.
-	if index.has_conflicts() {
-		bail!(
-			"committing is not possible because you have unmerged files; resolve them and mark resolution with `gta add`/`gta rm`"
-		);
-	}
+	dispatch::on_worktree(cwd, Commit { message }).await
+}
 
-	let repo = wt.repository();
-	// Concluding a merge: produce a two-parent merge commit (and clear `MERGE_HEAD`), so resolving
-	// and `gta commit` does not silently drop the merge's second parent.
-	if repo.merge_head().await?.is_some() {
-		return crate::commands::merge::complete_merge(&wt, Some(message.to_owned())).await;
-	}
+struct Commit<'a> {
+	message: &'a str,
+}
 
-	let entries = index_tree_entries(&index);
-	if entries.is_empty() {
-		bail!("nothing to commit (empty index)");
-	}
+impl WorkTreeCommand for Commit<'_> {
+	async fn run<H: HashAlgorithm>(
+		self,
+		worktree: WorkTree<LocalFileStore, H>,
+		_prefix: String,
+	) -> Result<()> {
+		let index = worktree.load_index()?;
+		// An unmerged index would otherwise silently drop conflicted paths (they have no stage-0 entry)
+		// from the tree, so refuse — as git does — until they are resolved.
+		if index.has_conflicts() {
+			bail!(
+				"committing is not possible because you have unmerged files; resolve them and mark resolution with `gta add`/`gta rm`"
+			);
+		}
 
-	let tree = repo.write_tree(&entries).await?;
-	let author = identity::signature(repo, "AUTHOR").await?;
-	let committer = identity::signature(repo, "COMMITTER").await?;
-	let message = if message.ends_with('\n') {
-		message.to_owned()
-	} else {
-		format!("{message}\n")
-	};
-	let commit = repo
-		.commit_on_head(tree, &author, &committer, &message)
-		.await?;
-	println!("{commit}");
-	Ok(())
+		let repo = worktree.repository();
+		// Concluding a merge: produce a two-parent merge commit (and clear `MERGE_HEAD`), so resolving
+		// and `gta commit` does not silently drop the merge's second parent.
+		if repo.merge_head().await?.is_some() {
+			return crate::commands::merge::complete_merge(&worktree, Some(self.message.to_owned()))
+				.await;
+		}
+
+		let entries = index_tree_entries(&index);
+		if entries.is_empty() {
+			bail!("nothing to commit (empty index)");
+		}
+
+		let tree = repo.write_tree(&entries).await?;
+		let author = identity::signature(repo, "AUTHOR").await?;
+		let committer = identity::signature(repo, "COMMITTER").await?;
+		let message = if self.message.ends_with('\n') {
+			self.message.to_owned()
+		} else {
+			format!("{}\n", self.message)
+		};
+		let commit = repo
+			.commit_on_head(tree, &author, &committer, &message)
+			.await?;
+		println!("{commit}");
+		Ok(())
+	}
 }
 
 /// The stage-0 index entries as tree-build entries — the content a commit captures.
-pub(crate) fn index_tree_entries(index: &Index) -> Vec<TreeBuildEntry> {
+pub(crate) fn index_tree_entries<H: HashAlgorithm>(index: &Index<H>) -> Vec<TreeBuildEntry<H>> {
 	index
 		.entries
 		.iter()

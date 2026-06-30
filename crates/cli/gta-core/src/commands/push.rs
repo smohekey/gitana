@@ -6,20 +6,18 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use gitana_file_store_local::LocalFileStore;
 use gitana_git_http::{
 	CertCommand, PushCert, RefUpdate, build_pack, build_push_cert, build_receive_pack_request,
-	parse_report_status,
+	parse_advertisement, parse_report_status,
 };
-use gitana_object::ObjectId;
-use gitana_repository::HeadState;
+use gitana_object::{HashAlgorithm, ObjectId, Sha1, Sha256};
+use gitana_repository::{HeadState, Repository};
 
+use crate::dispatch::{self, HashKind};
 use crate::remote::http_post;
-use crate::repo::{self, LocalRepository};
-use crate::transport::{self, Origin, RECEIVE_PACK_REQUEST, advertised_oids};
-
-const ZERO_OID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-/// Capabilities echoed on the push request's first line / cert marker.
-const PUSH_CAPS: &str = "report-status object-format=sha256";
+use crate::repo;
+use crate::transport::{self, Origin, RECEIVE_PACK_REQUEST};
 
 /// Push `HEAD`'s branch to the origin. `signed` attaches a push certificate; `force`
 /// permits a non-fast-forward update; `delete` removes a remote branch instead of
@@ -32,11 +30,49 @@ pub async fn run(
 	delete: Option<String>,
 ) -> Result<()> {
 	let (_work, git_dir) = repo::discover(cwd)?;
-	let repository = repo::open(&git_dir);
 	let origin = Origin::load(&git_dir)?;
+	let body = transport::fetch_advertisement(&origin, "git-receive-pack").await?;
+
+	let local = dispatch::detect_algorithm(&git_dir)?;
+	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
+
+	match local {
+		HashKind::Sha1 => {
+			push_impl::<Sha1>(&origin, &git_dir, &body, signed, signing_key, force, delete).await
+		}
+		HashKind::Sha256 => {
+			push_impl::<Sha256>(&origin, &git_dir, &body, signed, signing_key, force, delete).await
+		}
+	}
+}
+
+async fn push_impl<H: HashAlgorithm>(
+	origin: &Origin,
+	git_dir: &Path,
+	body: &[u8],
+	signed: bool,
+	signing_key: Option<PathBuf>,
+	force: bool,
+	delete: Option<String>,
+) -> Result<()> {
+	let repository = repo::open_generic::<H>(git_dir);
+	let advertised = parse_advertisement::<H>(body)?;
 
 	if let Some(target) = delete {
-		return delete_branch(&origin, &normalize_branch(&target)).await;
+		let refname = normalize_branch(&target);
+		let remote = advertised
+			.oid_of(&refname)
+			.with_context(|| format!("the remote has no {refname}"))?;
+		let update = RefUpdate {
+			old: Some(remote),
+			new: None,
+			name: refname.clone(),
+		};
+		let request = build_receive_pack_request(std::slice::from_ref(&update), &[]);
+		let response = http_post(&origin.receive_pack(), RECEIVE_PACK_REQUEST, request).await?;
+		parse_report_status(&response)?;
+		println!("Deleted {refname} on {}", origin.url);
+		return Ok(());
 	}
 
 	let branch = match repository.refs().read_head().await? {
@@ -49,7 +85,6 @@ pub async fn run(
 		.await?
 		.context("nothing to push (the branch is unborn)")?;
 
-	let advertised = transport::discover_receive(&origin).await?;
 	let remote_old = advertised.oid_of(&branch);
 	if remote_old == Some(local_tip) {
 		println!("Everything up-to-date");
@@ -57,7 +92,7 @@ pub async fn run(
 	}
 
 	// Pack the objects the remote lacks (reachable from the tip, minus its refs).
-	let haves = advertised_oids(&advertised);
+	let haves = transport::advertised_oids(&advertised);
 	let pack = build_pack(&repository, &[local_tip], &haves).await?;
 
 	let request = if signed {
@@ -67,7 +102,7 @@ pub async fn run(
 			.context("the server does not accept signed pushes")?;
 		let cert = sign_push(
 			&repository,
-			&origin,
+			origin,
 			signing_key,
 			nonce,
 			remote_old,
@@ -75,7 +110,7 @@ pub async fn run(
 			&branch,
 		)
 		.await?;
-		build_push_cert(&cert, PUSH_CAPS, &pack)
+		build_push_cert(&cert, &push_caps::<H>(), &pack)
 	} else {
 		let update = RefUpdate {
 			old: remote_old,
@@ -97,22 +132,9 @@ pub async fn run(
 	Ok(())
 }
 
-/// Delete a remote ref.
-async fn delete_branch(origin: &Origin, refname: &str) -> Result<()> {
-	let advertised = transport::discover_receive(origin).await?;
-	let remote = advertised
-		.oid_of(refname)
-		.with_context(|| format!("the remote has no {refname}"))?;
-	let update = RefUpdate {
-		old: Some(remote),
-		new: None,
-		name: refname.to_owned(),
-	};
-	let request = build_receive_pack_request(std::slice::from_ref(&update), &[]);
-	let response = http_post(&origin.receive_pack(), RECEIVE_PACK_REQUEST, request).await?;
-	parse_report_status(&response)?;
-	println!("Deleted {refname} on {}", origin.url);
-	Ok(())
+/// Capabilities echoed on the push request's first line / cert marker, for hash `H`.
+fn push_caps<H: HashAlgorithm>() -> String {
+	format!("report-status object-format={}", H::NAME)
 }
 
 /// Expand a branch name to a full ref (`main` → `refs/heads/main`); pass full refs through.
@@ -125,15 +147,17 @@ fn normalize_branch(name: &str) -> String {
 }
 
 /// Build and sign a push certificate for a single-branch update.
-async fn sign_push(
-	repository: &LocalRepository,
+async fn sign_push<H: HashAlgorithm>(
+	repository: &Repository<LocalFileStore, H>,
 	origin: &Origin,
 	_signing_key: Option<PathBuf>,
 	nonce: String,
-	remote_old: Option<ObjectId>,
-	local_tip: ObjectId,
+	remote_old: Option<ObjectId<H>>,
+	local_tip: ObjectId<H>,
 	branch: &str,
 ) -> Result<PushCert> {
+	// The "no previous value" oid for a create is the all-zero id at the hash's width.
+	let zero = "0".repeat(H::RAW_LEN * 2);
 	// Signing key loading is not wired yet; keep the certificate payload explicit.
 	let cert = PushCert {
 		version: "0.1".to_owned(),
@@ -142,7 +166,7 @@ async fn sign_push(
 		nonce,
 		push_options: Vec::new(),
 		commands: vec![CertCommand {
-			old: remote_old.map_or_else(|| ZERO_OID.to_owned(), |oid| oid.to_hex()),
+			old: remote_old.map_or(zero, |oid| oid.to_hex()),
 			new: local_tip.to_hex(),
 			refname: branch.to_owned(),
 		}],
@@ -152,7 +176,7 @@ async fn sign_push(
 }
 
 /// The pusher identity for a certificate: `Name <email> <unix-ts> +0000`.
-async fn pusher_ident(repo: &LocalRepository) -> Result<String> {
+async fn pusher_ident<H: HashAlgorithm>(repo: &Repository<LocalFileStore, H>) -> Result<String> {
 	let config = repo.read_config().await.ok();
 	let from_config = |key: &str| {
 		config

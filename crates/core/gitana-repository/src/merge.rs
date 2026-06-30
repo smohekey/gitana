@@ -12,24 +12,24 @@ use std::future::Future;
 use std::pin::Pin;
 
 use gitana_file_store::FileStore;
-use gitana_object::{ObjectId, ObjectKind, TreeEntry, encode_tree, parse_tree};
+use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, TreeEntry, encode_tree, parse_tree};
 
 use crate::{FileMode, Repository, RepositoryError};
 
 /// The outcome of a three-way tree merge: the merged tree and the conflicted paths (sorted).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TreeMerge {
-	pub tree: ObjectId,
+pub struct TreeMerge<H: HashAlgorithm> {
+	pub tree: ObjectId<H>,
 	pub conflicts: Vec<String>,
 }
 
 /// Three-way merge the `ours` and `theirs` trees against their common `base` tree.
-pub(crate) async fn merge_trees(
-	repo: &Repository<impl FileStore>,
-	base: ObjectId,
-	ours: ObjectId,
-	theirs: ObjectId,
-) -> Result<TreeMerge, RepositoryError> {
+pub(crate) async fn merge_trees<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	base: ObjectId<H>,
+	ours: ObjectId<H>,
+	theirs: ObjectId<H>,
+) -> Result<TreeMerge<H>, RepositoryError> {
 	let (id, mut conflicts) = merge_tree(repo, Some(base), Some(ours), Some(theirs)).await?;
 	conflicts.sort();
 	let tree = match id {
@@ -42,17 +42,17 @@ pub(crate) async fn merge_trees(
 
 /// Boxed recursive future for [`merge_tree`]: the merged subtree id (`None` if empty) and the
 /// conflicted paths relative to that subtree.
-type MergeTreeFuture<'a> =
-	Pin<Box<dyn Future<Output = Result<(Option<ObjectId>, Vec<String>), RepositoryError>> + 'a>>;
+type MergeTreeFuture<'a, H> =
+	Pin<Box<dyn Future<Output = Result<(Option<ObjectId<H>>, Vec<String>), RepositoryError>> + 'a>>;
 
 /// How an entry of a given name appears on one side of the merge.
-enum Side<'a> {
+enum Side<'a, H: HashAlgorithm> {
 	Absent,
-	Blob(&'a TreeEntry),
-	Tree(&'a TreeEntry),
+	Blob(&'a TreeEntry<H>),
+	Tree(&'a TreeEntry<H>),
 }
 
-fn classify(entry: Option<&TreeEntry>) -> Side<'_> {
+fn classify<H: HashAlgorithm>(entry: Option<&TreeEntry<H>>) -> Side<'_, H> {
 	match entry {
 		None => Side::Absent,
 		Some(entry) if entry.mode == FileMode::Directory.as_str() => Side::Tree(entry),
@@ -62,12 +62,12 @@ fn classify(entry: Option<&TreeEntry>) -> Side<'_> {
 
 /// Merge one tree level, returning the merged tree id (`None` if it has no entries, so a parent can
 /// omit it) and the conflicted paths *relative to this subtree*.
-fn merge_tree<'a>(
-	repo: &'a Repository<impl FileStore>,
-	base: Option<ObjectId>,
-	ours: Option<ObjectId>,
-	theirs: Option<ObjectId>,
-) -> MergeTreeFuture<'a> {
+fn merge_tree<'a, H: HashAlgorithm>(
+	repo: &'a Repository<impl FileStore, H>,
+	base: Option<ObjectId<H>>,
+	ours: Option<ObjectId<H>>,
+	theirs: Option<ObjectId<H>>,
+) -> MergeTreeFuture<'a, H> {
 	Box::pin(async move {
 		let base_entries = read_entries(repo, base).await?;
 		let ours_entries = read_entries(repo, ours).await?;
@@ -81,7 +81,7 @@ fn merge_tree<'a>(
 		names.extend(ours_map.keys().copied());
 		names.extend(theirs_map.keys().copied());
 
-		let mut entries: Vec<TreeEntry> = Vec::new();
+		let mut entries: Vec<TreeEntry<H>> = Vec::new();
 		let mut conflicts: Vec<String> = Vec::new();
 
 		for name in names {
@@ -159,14 +159,14 @@ fn merge_tree<'a>(
 /// other side's content), falling back to a diff3 line merge when both sides changed the content —
 /// or, when that content is binary, to a conflict that keeps ours (git's merge-tree does the same).
 /// The mode resolves three-way via [`resolve_mode`].
-async fn merge_blobs(
-	repo: &Repository<impl FileStore>,
+async fn merge_blobs<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
 	name: &str,
-	base: Option<&TreeEntry>,
-	ours: &TreeEntry,
-	theirs: &TreeEntry,
+	base: Option<&TreeEntry<H>>,
+	ours: &TreeEntry<H>,
+	theirs: &TreeEntry<H>,
 	conflicts: &mut Vec<String>,
-) -> Result<TreeEntry, RepositoryError> {
+) -> Result<TreeEntry<H>, RepositoryError> {
 	let base_id = base.map(|entry| entry.id);
 	let (id, content_conflict) = if ours.id == theirs.id || Some(theirs.id) == base_id {
 		(ours.id, false) // theirs did not change the content (or both sides match)
@@ -225,10 +225,10 @@ fn resolve_mode(ours: &str, theirs: &str, base: Option<&str>) -> (String, bool) 
 	}
 }
 
-async fn read_entries(
-	repo: &Repository<impl FileStore>,
-	tree: Option<ObjectId>,
-) -> Result<Vec<TreeEntry>, RepositoryError> {
+async fn read_entries<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	tree: Option<ObjectId<H>>,
+) -> Result<Vec<TreeEntry<H>>, RepositoryError> {
 	let Some(tree) = tree else {
 		return Ok(Vec::new());
 	};
@@ -236,14 +236,14 @@ async fn read_entries(
 	if kind != ObjectKind::Tree {
 		return Err(RepositoryError::InvalidRef(format!("{tree} is not a tree")));
 	}
-	Ok(parse_tree(&payload)?)
+	Ok(parse_tree::<H>(&payload)?)
 }
 
-fn by_name(entries: &[TreeEntry]) -> HashMap<&str, &TreeEntry> {
+fn by_name<H: HashAlgorithm>(entries: &[TreeEntry<H>]) -> HashMap<&str, &TreeEntry<H>> {
 	entries.iter().map(|e| (e.name.as_str(), e)).collect()
 }
 
-fn tree_entry(name: &str, id: ObjectId) -> TreeEntry {
+fn tree_entry<H: HashAlgorithm>(name: &str, id: ObjectId<H>) -> TreeEntry<H> {
 	TreeEntry {
 		mode: FileMode::Directory.as_str().to_owned(),
 		name: name.to_owned(),
@@ -251,10 +251,10 @@ fn tree_entry(name: &str, id: ObjectId) -> TreeEntry {
 	}
 }
 
-async fn write_tree(
-	repo: &Repository<impl FileStore>,
-	entries: &[TreeEntry],
-) -> Result<ObjectId, RepositoryError> {
+async fn write_tree<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	entries: &[TreeEntry<H>],
+) -> Result<ObjectId<H>, RepositoryError> {
 	Ok(
 		repo
 			.objects()
@@ -266,19 +266,20 @@ async fn write_tree(
 #[cfg(test)]
 mod tests {
 	use gitana_file_store_memory::MemoryFileStore;
+	use gitana_object::Sha256;
 	use gitana_object_store::ObjectStore;
 
 	use super::*;
 	use crate::TreeBuildEntry;
 
-	type Repo = Repository<MemoryFileStore>;
+	type Repo = Repository<MemoryFileStore, Sha256>;
 
 	fn new_repo() -> Repo {
 		Repository::new(ObjectStore::new(MemoryFileStore::new()))
 	}
 
 	/// Build a tree from `(path, content)` files (all regular blobs).
-	async fn tree(repo: &Repo, files: &[(&str, &str)]) -> ObjectId {
+	async fn tree(repo: &Repo, files: &[(&str, &str)]) -> ObjectId<Sha256> {
 		let mut entries = Vec::new();
 		for (path, content) in files {
 			let id = repo.write_blob(content.as_bytes()).await.unwrap();
@@ -292,12 +293,12 @@ mod tests {
 	}
 
 	/// A tree with a single `f.bin` blob of raw bytes (regular mode).
-	async fn bin_tree(repo: &Repo, content: &[u8]) -> ObjectId {
+	async fn bin_tree(repo: &Repo, content: &[u8]) -> ObjectId<Sha256> {
 		file_tree(repo, FileMode::Regular, content).await
 	}
 
 	/// A tree with a single `f.bin` blob of raw bytes and an explicit mode.
-	async fn file_tree(repo: &Repo, mode: FileMode, content: &[u8]) -> ObjectId {
+	async fn file_tree(repo: &Repo, mode: FileMode, content: &[u8]) -> ObjectId<Sha256> {
 		let id = repo.write_blob(content).await.unwrap();
 		repo
 			.write_tree(&[TreeBuildEntry {
@@ -309,7 +310,7 @@ mod tests {
 			.unwrap()
 	}
 
-	async fn paths(repo: &Repo, tree: ObjectId) -> Vec<String> {
+	async fn paths(repo: &Repo, tree: ObjectId<Sha256>) -> Vec<String> {
 		let mut paths: Vec<String> = repo
 			.read_tree(tree)
 			.await
@@ -321,7 +322,7 @@ mod tests {
 		paths
 	}
 
-	async fn file(repo: &Repo, tree: ObjectId, path: &str) -> Option<String> {
+	async fn file(repo: &Repo, tree: ObjectId<Sha256>, path: &str) -> Option<String> {
 		for (entry_path, _, id) in repo.read_tree(tree).await.unwrap() {
 			if entry_path == path {
 				return Some(String::from_utf8(repo.read_blob(id).await.unwrap()).unwrap());

@@ -4,22 +4,34 @@
 use std::path::Path;
 
 use anyhow::Result;
-use gitana_git_http::Advertised;
+use gitana_git_http::parse_advertisement;
+use gitana_object::{HashAlgorithm, Sha1, Sha256};
 
+use crate::dispatch::{self, HashKind};
 use crate::repo;
-use crate::transport::{self, Origin, advertised_oids, local_haves};
+use crate::transport::{self, Origin};
 
-/// Fetch all branches from the origin into `refs/remotes/origin/*`, returning the origin's
-/// advertisement (so a caller like `pull` can read the current upstream tips).
-pub async fn run(cwd: &Path) -> Result<Advertised> {
+/// Fetch all branches from the origin into `refs/remotes/origin/*`.
+pub async fn run(cwd: &Path) -> Result<()> {
 	let (_work, git_dir) = repo::discover(cwd)?;
-	let repository = repo::open(&git_dir);
 	let origin = Origin::load(&git_dir)?;
+	let body = transport::fetch_advertisement(&origin, "git-upload-pack").await?;
 
-	let advertised = transport::discover_upload(&origin).await?;
-	let wants = advertised_oids(&advertised);
-	let haves = local_haves(&repository).await?;
-	transport::fetch_pack(&origin, &repository, &wants, &haves).await?;
+	let local = dispatch::detect_algorithm(&git_dir)?;
+	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
+
+	match local {
+		HashKind::Sha1 => fetch_into::<Sha1>(&origin, &git_dir, &body).await,
+		HashKind::Sha256 => fetch_into::<Sha256>(&origin, &git_dir, &body).await,
+	}
+}
+
+async fn fetch_into<H: HashAlgorithm>(origin: &Origin, git_dir: &Path, body: &[u8]) -> Result<()> {
+	let repository = repo::open_generic::<H>(git_dir);
+	let advertised = parse_advertisement::<H>(body)?;
+	let wants = transport::advertised_oids(&advertised);
+	let haves = transport::local_haves(&repository).await?;
+	transport::fetch_pack(origin, &repository, &wants, &haves).await?;
 
 	for (name, oid) in advertised.branches() {
 		let short = name.strip_prefix("refs/heads/").unwrap_or(name);
@@ -34,5 +46,5 @@ pub async fn run(cwd: &Path) -> Result<Advertised> {
 	}
 
 	println!("Fetched from {}", origin.url);
-	Ok(advertised)
+	Ok(())
 }

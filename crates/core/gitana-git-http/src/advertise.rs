@@ -2,10 +2,10 @@
 //! advertisement, both prefixed by the smart-http service banner.
 
 use gitana_file_store::FileStore;
-use gitana_object::{write_flush, write_pkt};
+use gitana_object::{HashAlgorithm, write_flush, write_pkt};
 use gitana_repository::Repository;
 
-use crate::refs::{ZERO_OID, collect_refs};
+use crate::refs::collect_refs;
 use crate::{GitHttpError, ProtocolVersion, Service};
 
 /// The agent string gitana reports in capability advertisements.
@@ -17,8 +17,8 @@ pub const AGENT: &str = concat!("gitana/", env!("CARGO_PKG_VERSION"));
 /// either the v2 capability advertisement or the v0 ref advertisement. A
 /// `push_cert_nonce`, when present on a receive-pack advertisement, is advertised as the
 /// `push-cert=<nonce>` capability so clients can sign their push (`git push --signed`).
-pub async fn advertise(
-	repo: &Repository<impl FileStore>,
+pub async fn advertise<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
 	service: Service,
 	version: ProtocolVersion,
 	push_cert_nonce: Option<&str>,
@@ -30,7 +30,7 @@ pub async fn advertise(
 	)?;
 	write_flush(&mut out);
 	match version {
-		ProtocolVersion::V2 => write_v2_capabilities(&mut out)?,
+		ProtocolVersion::V2 => write_v2_capabilities::<H>(&mut out)?,
 		ProtocolVersion::V0 => write_v0_refs(&mut out, repo, service, push_cert_nonce).await?,
 	}
 	Ok(out)
@@ -38,12 +38,12 @@ pub async fn advertise(
 
 /// The protocol-v2 capability advertisement: `ls-refs` for ref discovery and `fetch`
 /// for object transfer (refs and objects are requested via follow-up commands).
-fn write_v2_capabilities(out: &mut Vec<u8>) -> Result<(), GitHttpError> {
+fn write_v2_capabilities<H: HashAlgorithm>(out: &mut Vec<u8>) -> Result<(), GitHttpError> {
 	write_pkt(out, b"version 2\n")?;
 	write_pkt(out, format!("agent={AGENT}\n").as_bytes())?;
 	write_pkt(out, b"ls-refs=unborn\n")?;
 	write_pkt(out, b"fetch=ofs-delta\n")?;
-	write_pkt(out, b"object-format=sha256\n")?;
+	write_pkt(out, format!("object-format={}\n", H::NAME).as_bytes())?;
 	write_flush(out);
 	Ok(())
 }
@@ -51,14 +51,14 @@ fn write_v2_capabilities(out: &mut Vec<u8>) -> Result<(), GitHttpError> {
 /// The protocol-v0 ref advertisement: each ref on its own pkt-line, the capabilities
 /// trailing the first line after a NUL. An empty repo emits the `capabilities^{}`
 /// placeholder so the capability list still reaches the client.
-async fn write_v0_refs(
+async fn write_v0_refs<H: HashAlgorithm>(
 	out: &mut Vec<u8>,
-	repo: &Repository<impl FileStore>,
+	repo: &Repository<impl FileStore, H>,
 	service: Service,
 	push_cert_nonce: Option<&str>,
 ) -> Result<(), GitHttpError> {
 	let refs = collect_refs(repo, true).await?;
-	let mut caps = base_capabilities(service);
+	let mut caps = base_capabilities::<H>(service);
 	if let Some(nonce) = push_cert_nonce {
 		caps = format!("{caps} push-cert={nonce}");
 	}
@@ -71,9 +71,10 @@ async fn write_v0_refs(
 	}
 
 	if refs.is_empty() {
+		let zero = "0".repeat(H::RAW_LEN * 2);
 		write_pkt(
 			out,
-			format!("{ZERO_OID} capabilities^{{}}\0{caps}\n").as_bytes(),
+			format!("{zero} capabilities^{{}}\0{caps}\n").as_bytes(),
 		)?;
 	} else {
 		for (index, line) in refs.iter().enumerate() {
@@ -94,17 +95,18 @@ async fn write_v0_refs(
 	Ok(())
 }
 
-/// The v0 capability list for a service (SHA-256, with the codec features the encoder
-/// supports).
-fn base_capabilities(service: Service) -> String {
+/// The v0 capability list for a service, with the codec features the encoder supports
+/// and the `object-format` for the hash algorithm `H`.
+fn base_capabilities<H: HashAlgorithm>(service: Service) -> String {
+	let object_format = H::NAME;
 	match service {
 		Service::UploadPack => {
 			format!(
-				"multi_ack_detailed side-band-64k thin-pack ofs-delta object-format=sha256 agent={AGENT}"
+				"multi_ack_detailed side-band-64k thin-pack ofs-delta object-format={object_format} agent={AGENT}"
 			)
 		}
 		Service::ReceivePack => {
-			format!("report-status delete-refs ofs-delta object-format=sha256 agent={AGENT}")
+			format!("report-status delete-refs ofs-delta object-format={object_format} agent={AGENT}")
 		}
 	}
 }

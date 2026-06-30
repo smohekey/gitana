@@ -1,8 +1,11 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
+use gitana_file_store_local::LocalFileStore;
+use gitana_object::HashAlgorithm;
+use gitana_worktree::WorkTree;
 
-use crate::repo;
+use crate::dispatch::{self, WorkTreeCommand};
 
 /// `restore` selected paths into the working tree and/or the index, without moving `HEAD`.
 ///
@@ -17,27 +20,54 @@ pub async fn run(
 	source: Option<String>,
 	paths: Vec<String>,
 ) -> Result<()> {
-	if paths.is_empty() {
-		bail!("you must specify path(s) to restore");
+	dispatch::on_worktree(
+		cwd,
+		Restore {
+			worktree,
+			staged,
+			source,
+			paths,
+		},
+	)
+	.await
+}
+
+struct Restore {
+	worktree: bool,
+	staged: bool,
+	source: Option<String>,
+	paths: Vec<String>,
+}
+
+impl WorkTreeCommand for Restore {
+	async fn run<H: HashAlgorithm>(
+		self,
+		worktree: WorkTree<LocalFileStore, H>,
+		prefix: String,
+	) -> Result<()> {
+		if self.paths.is_empty() {
+			bail!("you must specify path(s) to restore");
+		}
+
+		// Neither flag means the working tree, as in `git restore`.
+		let restore_worktree = self.worktree || !self.staged;
+
+		let tree = match self.source {
+			Some(treeish) => Some(
+				worktree
+					.repository()
+					.rev_parse(&format!("{treeish}^{{tree}}"))
+					.await?,
+			),
+			// Restoring the index defaults to `HEAD`; a worktree-only restore defaults to the index.
+			None if self.staged => Some(worktree.repository().rev_parse("HEAD^{tree}").await?),
+			None => None,
+		};
+
+		let specs: Vec<&str> = self.paths.iter().map(String::as_str).collect();
+		worktree
+			.restore(tree, restore_worktree, self.staged, &specs, &prefix)
+			.await?;
+		Ok(())
 	}
-
-	// Neither flag means the working tree, as in `git restore`.
-	let restore_worktree = worktree || !staged;
-
-	let (wt, prefix) = repo::open_worktree_with_prefix(cwd)?;
-	let tree = match source {
-		Some(treeish) => Some(
-			wt.repository()
-				.rev_parse(&format!("{treeish}^{{tree}}"))
-				.await?,
-		),
-		// Restoring the index defaults to `HEAD`; a worktree-only restore defaults to the index.
-		None if staged => Some(wt.repository().rev_parse("HEAD^{tree}").await?),
-		None => None,
-	};
-
-	let specs: Vec<&str> = paths.iter().map(String::as_str).collect();
-	wt.restore(tree, restore_worktree, staged, &specs, &prefix)
-		.await?;
-	Ok(())
 }

@@ -4,7 +4,7 @@ use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 
-use crate::{ObjectError, ObjectId, ObjectKind};
+use crate::{HashAlgorithm, ObjectError, ObjectId, ObjectKind};
 
 /// Maximum decompressed object size (1 GiB). Bounds the loose decoder's output so
 /// a crafted zlib stream cannot exhaust memory (see docs/hlds/storage-layer.md).
@@ -56,7 +56,7 @@ pub fn decode_loose(compressed: &[u8]) -> Result<(ObjectKind, Vec<u8>), ObjectEr
 }
 
 /// The repository-relative path of a loose object: `objects/<aa>/<rest>`.
-pub fn loose_object_path(id: &ObjectId) -> String {
+pub fn loose_object_path<H: HashAlgorithm>(id: &ObjectId<H>) -> String {
 	let hex = id.to_hex();
 	format!("objects/{}/{}", &hex[..2], &hex[2..])
 }
@@ -91,6 +91,7 @@ fn inflate_capped(compressed: &[u8], cap: u64) -> Result<Vec<u8>, ObjectError> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::Sha256;
 
 	#[test]
 	fn loose_round_trips_all_kinds() {
@@ -109,7 +110,7 @@ mod tests {
 
 	#[test]
 	fn loose_path_splits_first_byte() {
-		let id = ObjectId::compute(ObjectKind::Blob, b"x");
+		let id = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"x");
 		let hex = id.to_hex();
 		assert_eq!(
 			loose_object_path(&id),

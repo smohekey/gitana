@@ -4,6 +4,7 @@
 //! gitana engine and working tree in-process and print their results to stdout.
 
 pub mod commands;
+mod dispatch;
 mod error;
 mod identity;
 mod remote;
@@ -11,3 +12,8 @@ mod repo;
 mod transport;
 
 pub use error::MergeConflict;
+
+/// The object-id type the CLI works with where no repository is in scope to read the hash
+/// format from (e.g. `hash-object` outside a repo). Every command that opens a repository
+/// instead routes through the runtime hash dispatch (see [`dispatch`]).
+pub type Oid = gitana_object::ObjectId<gitana_object::Sha256>;

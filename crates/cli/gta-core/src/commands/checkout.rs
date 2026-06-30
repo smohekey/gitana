@@ -1,8 +1,12 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
+use gitana_file_store_local::LocalFileStore;
+use gitana_object::HashAlgorithm;
+use gitana_worktree::WorkTree;
 
-use crate::{commands::switch, repo};
+use crate::commands::switch;
+use crate::dispatch::{self, WorkTreeCommand};
 
 /// `checkout` in two modes. With no `paths`, switch to branch `target` (moving `HEAD`),
 /// identical to `switch`; `force` discards local changes that would be overwritten. With
@@ -22,19 +26,35 @@ pub async fn run(
 		return switch::run(cwd, &name, false, None, force).await;
 	}
 
-	let (wt, prefix) = repo::open_worktree_with_prefix(cwd)?;
-	let source = match target {
-		Some(treeish) => Some(
-			wt.repository()
-				.rev_parse(&format!("{treeish}^{{tree}}"))
-				.await?,
-		),
-		None => None,
-	};
-	let specs: Vec<&str> = paths.iter().map(String::as_str).collect();
-	// `checkout -- <paths>` restores the working tree from the index; `checkout <tree> -- <paths>`
-	// restores both the working tree and the index from the tree.
-	wt.restore(source, true, source.is_some(), &specs, &prefix)
-		.await?;
-	Ok(())
+	dispatch::on_worktree(cwd, Checkout { target, paths }).await
+}
+
+struct Checkout {
+	target: Option<String>,
+	paths: Vec<String>,
+}
+
+impl WorkTreeCommand for Checkout {
+	async fn run<H: HashAlgorithm>(
+		self,
+		worktree: WorkTree<LocalFileStore, H>,
+		prefix: String,
+	) -> Result<()> {
+		let source = match self.target {
+			Some(treeish) => Some(
+				worktree
+					.repository()
+					.rev_parse(&format!("{treeish}^{{tree}}"))
+					.await?,
+			),
+			None => None,
+		};
+		let specs: Vec<&str> = self.paths.iter().map(String::as_str).collect();
+		// `checkout -- <paths>` restores the working tree from the index; `checkout <tree> -- <paths>`
+		// restores both the working tree and the index from the tree.
+		worktree
+			.restore(source, true, source.is_some(), &specs, &prefix)
+			.await?;
+		Ok(())
+	}
 }

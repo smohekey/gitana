@@ -2,19 +2,24 @@
 //! download/upload.
 //!
 //! The wire codec lives in `gitana-git-http` (protocol v0 client helpers); this
-//! module pairs it with `gta`'s HTTP client and local repository.
+//! module pairs it with `gta`'s HTTP client and local repository. Object ids are
+//! generic over the negotiated hash algorithm `H`: a caller first reads the remote's
+//! advertised `object-format` ([`negotiated_kind`]) and then runs the rest under that
+//! `H`.
 
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use gitana_config::GitConfig;
+use gitana_file_store_local::LocalFileStore;
 use gitana_git_http::{
-	Advertised, build_upload_pack_request, parse_advertisement, parse_upload_pack_response,
+	Advertised, build_upload_pack_request, parse_upload_pack_response, peek_object_format,
 };
-use gitana_object::ObjectId;
+use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_repository::Repository;
 
+use crate::dispatch::HashKind;
 use crate::remote::{http_get, http_post};
-use crate::repo::LocalRepository;
 
 const UPLOAD_PACK_REQUEST: &str = "application/x-git-upload-pack-request";
 /// Content type for a `git-receive-pack` request body.
@@ -102,24 +107,42 @@ impl Origin {
 	}
 }
 
-/// Fetch the `upload-pack` (fetch-side) ref advertisement.
-pub async fn discover_upload(origin: &Origin) -> Result<Advertised> {
-	let body = http_get(&origin.info_refs("git-upload-pack")).await?;
-	Ok(parse_advertisement(&body)?)
+/// Fetch the raw `GET /info/refs` advertisement bytes for `service` (`git-upload-pack`
+/// or `git-receive-pack`). Hash-agnostic: the caller reads the advertised object-format
+/// from the result ([`negotiated_kind`]) before parsing oids under a concrete `H`.
+pub async fn fetch_advertisement(origin: &Origin, service: &str) -> Result<Vec<u8>> {
+	http_get(&origin.info_refs(service)).await
 }
 
-/// Fetch the `receive-pack` (push-side) ref advertisement.
-pub async fn discover_receive(origin: &Origin) -> Result<Advertised> {
-	let body = http_get(&origin.info_refs("git-receive-pack")).await?;
-	Ok(parse_advertisement(&body)?)
+/// The hash algorithm a remote advertises, from the `object-format` capability in its
+/// advertisement. An absent capability (or an explicit `sha1`) is git's default.
+pub fn negotiated_kind(body: &[u8]) -> Result<HashKind> {
+	match peek_object_format(body).as_deref() {
+		Some("sha256") => Ok(HashKind::Sha256),
+		None | Some("sha1") => Ok(HashKind::Sha1),
+		Some(other) => bail!("remote advertises unsupported object-format: {other}"),
+	}
+}
+
+/// Require the remote's advertised object format to match the local repository's, since
+/// objects of one hash cannot be stored in a repository of the other.
+pub fn ensure_same_format(local: HashKind, remote: HashKind) -> Result<()> {
+	if local != remote {
+		bail!(
+			"remote object-format is {}, but the local repository is {}",
+			remote.name(),
+			local.name()
+		);
+	}
+	Ok(())
 }
 
 /// Download the objects reachable from `wants` but not `haves` into `repo`.
-pub async fn fetch_pack(
+pub async fn fetch_pack<H: HashAlgorithm>(
 	origin: &Origin,
-	repo: &LocalRepository,
-	wants: &[ObjectId],
-	haves: &[ObjectId],
+	repo: &Repository<LocalFileStore, H>,
+	wants: &[ObjectId<H>],
+	haves: &[ObjectId<H>],
 ) -> Result<()> {
 	if wants.is_empty() {
 		return Ok(());
@@ -144,8 +167,8 @@ fn pack_object_count(pack: &[u8]) -> u32 {
 }
 
 /// The unique object ids advertised across all refs (fetch wants / push haves).
-pub fn advertised_oids(advertised: &Advertised) -> Vec<ObjectId> {
-	let mut oids: Vec<ObjectId> = advertised.refs.iter().map(|(_, oid)| *oid).collect();
+pub fn advertised_oids<H: HashAlgorithm>(advertised: &Advertised<H>) -> Vec<ObjectId<H>> {
+	let mut oids: Vec<ObjectId<H>> = advertised.refs.iter().map(|(_, oid)| *oid).collect();
 	oids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 	oids.dedup();
 	oids
@@ -153,8 +176,10 @@ pub fn advertised_oids(advertised: &Advertised) -> Vec<ObjectId> {
 
 /// The unique tips of every local ref, sent as fetch `have`s so the server omits
 /// objects we already hold.
-pub async fn local_haves(repo: &LocalRepository) -> Result<Vec<ObjectId>> {
-	let mut oids: Vec<ObjectId> = repo
+pub async fn local_haves<H: HashAlgorithm>(
+	repo: &Repository<LocalFileStore, H>,
+) -> Result<Vec<ObjectId<H>>> {
+	let mut oids: Vec<ObjectId<H>> = repo
 		.refs()
 		.list("refs/")
 		.await?

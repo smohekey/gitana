@@ -63,6 +63,9 @@ enum Command {
 	Init {
 		/// Directory to create the repository in (default: current directory).
 		path: Option<PathBuf>,
+		/// Object hash format for the new repository.
+		#[arg(long, value_name = "format", default_value = "sha256")]
+		object_format: String,
 	},
 	/// Compute (and optionally write) an object id.
 	HashObject {
@@ -369,7 +372,10 @@ impl Cli {
 			None => std::env::current_dir()?,
 		};
 		match self.command {
-			Command::Init { path } => commands::init::run(path.unwrap_or(cwd)).await,
+			Command::Init {
+				path,
+				object_format,
+			} => commands::init::run(path.unwrap_or(cwd), &object_format).await,
 			Command::HashObject {
 				kind,
 				write,

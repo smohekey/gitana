@@ -11,7 +11,9 @@
 //!   negotiates another round.
 
 use gitana_file_store::FileStore;
-use gitana_object::{ObjectId, PktLine, parse_pkt, write_delim, write_flush, write_pkt};
+use gitana_object::{
+	HashAlgorithm, ObjectId, PktLine, parse_pkt, write_delim, write_flush, write_pkt,
+};
 use gitana_repository::Repository;
 
 use crate::GitHttpError;
@@ -19,18 +21,18 @@ use crate::pack::build_pack;
 use crate::sideband::write_sideband_pack;
 
 /// Parsed `fetch` arguments.
-struct FetchArgs {
+struct FetchArgs<H: HashAlgorithm> {
 	/// The objects the client wants.
-	wants: Vec<ObjectId>,
+	wants: Vec<ObjectId<H>>,
 	/// The objects the client claims to already have.
-	haves: Vec<ObjectId>,
+	haves: Vec<ObjectId<H>>,
 	/// The client has finished negotiating.
 	done: bool,
 }
 
 /// Handle a v2 `fetch` request body, returning the negotiation + packfile response.
-pub async fn fetch(
-	repo: &Repository<impl FileStore>,
+pub async fn fetch<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
 	request: &[u8],
 ) -> Result<Vec<u8>, GitHttpError> {
 	let args = parse_fetch(request)?;
@@ -66,10 +68,10 @@ pub async fn fetch(
 }
 
 /// Append the `packfile` section (side-band pack) and close the response.
-async fn finish_with_pack(
+async fn finish_with_pack<H: HashAlgorithm>(
 	mut out: Vec<u8>,
-	repo: &Repository<impl FileStore>,
-	args: &FetchArgs,
+	repo: &Repository<impl FileStore, H>,
+	args: &FetchArgs<H>,
 ) -> Result<Vec<u8>, GitHttpError> {
 	write_pkt(&mut out, b"packfile\n")?;
 	let pack = build_pack(repo, &args.wants, &args.haves).await?;
@@ -79,10 +81,10 @@ async fn finish_with_pack(
 }
 
 /// The subset of `haves` the server actually has (its negotiation cut points).
-async fn common_haves(
-	repo: &Repository<impl FileStore>,
-	haves: &[ObjectId],
-) -> Result<Vec<ObjectId>, GitHttpError> {
+async fn common_haves<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	haves: &[ObjectId<H>],
+) -> Result<Vec<ObjectId<H>>, GitHttpError> {
 	let store = repo.objects();
 	let mut common = Vec::new();
 	for &have in haves {
@@ -95,7 +97,7 @@ async fn common_haves(
 
 /// Parse the `fetch` body: the `command=fetch` line and capabilities, a delimiter,
 /// then `want <oid>` / `have <oid>` / `done` arguments.
-fn parse_fetch(request: &[u8]) -> Result<FetchArgs, GitHttpError> {
+fn parse_fetch<H: HashAlgorithm>(request: &[u8]) -> Result<FetchArgs<H>, GitHttpError> {
 	let mut args = FetchArgs {
 		wants: Vec::new(),
 		haves: Vec::new(),
@@ -136,8 +138,8 @@ fn parse_fetch(request: &[u8]) -> Result<FetchArgs, GitHttpError> {
 	Ok(args)
 }
 
-/// Parse a 64-hex object id (trimming any trailing token, e.g. v0 capabilities).
-fn parse_oid(text: &str) -> Result<ObjectId, GitHttpError> {
+/// Parse a hex object id (trimming any trailing token, e.g. v0 capabilities).
+fn parse_oid<H: HashAlgorithm>(text: &str) -> Result<ObjectId<H>, GitHttpError> {
 	let hex = text.split_whitespace().next().unwrap_or("");
 	ObjectId::from_hex(hex).map_err(GitHttpError::from)
 }

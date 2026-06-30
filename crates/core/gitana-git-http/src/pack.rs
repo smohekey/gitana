@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 
 use gitana_file_store::FileStore;
-use gitana_object::{ObjectId, PackedObject, encode_pack, referenced_ids};
+use gitana_object::{HashAlgorithm, ObjectId, PackedObject, encode_pack, referenced_ids};
 use gitana_object_store::ObjectStoreError;
 use gitana_repository::Repository;
 
@@ -19,33 +19,33 @@ use crate::GitHttpError;
 ///
 /// Used server-side to answer a fetch, and client-side (`gta push`) to pack the
 /// objects a push must send.
-pub async fn build_pack(
-	repo: &Repository<impl FileStore>,
-	wants: &[ObjectId],
-	haves: &[ObjectId],
+pub async fn build_pack<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	wants: &[ObjectId<H>],
+	haves: &[ObjectId<H>],
 ) -> Result<Vec<u8>, GitHttpError> {
 	let objects = collect_objects(repo, wants, haves).await?;
 	Ok(encode_pack(&objects))
 }
 
 /// Collect the objects to send: reachable-from-`wants` minus reachable-from-`haves`.
-async fn collect_objects(
-	repo: &Repository<impl FileStore>,
-	wants: &[ObjectId],
-	haves: &[ObjectId],
-) -> Result<Vec<PackedObject>, GitHttpError> {
+async fn collect_objects<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	wants: &[ObjectId<H>],
+	haves: &[ObjectId<H>],
+) -> Result<Vec<PackedObject<H>>, GitHttpError> {
 	let store = repo.objects();
 
 	// Pass 1: mark everything reachable from the haves we actually have. An unknown
 	// have is ignored (the client may report objects the server lacks).
-	let mut excluded: HashSet<ObjectId> = HashSet::new();
-	let mut stack: Vec<ObjectId> = haves.to_vec();
+	let mut excluded: HashSet<ObjectId<H>> = HashSet::new();
+	let mut stack: Vec<ObjectId<H>> = haves.to_vec();
 	while let Some(id) = stack.pop() {
 		if !excluded.insert(id) {
 			continue;
 		}
 		match store.read_object(&id).await {
-			Ok((kind, data)) => stack.extend(referenced_ids(kind, &data)?),
+			Ok((kind, data)) => stack.extend(referenced_ids::<H>(kind, &data)?),
 			Err(ObjectStoreError::NotFound) => {}
 			Err(other) => return Err(other.into()),
 		}
@@ -53,15 +53,15 @@ async fn collect_objects(
 
 	// Pass 2: collect reachable-from-wants minus the excluded set. An object reached
 	// from a want must exist (connectivity); a missing one is a real error.
-	let mut collected: HashSet<ObjectId> = HashSet::new();
-	let mut result: Vec<PackedObject> = Vec::new();
-	let mut stack: Vec<ObjectId> = wants.to_vec();
+	let mut collected: HashSet<ObjectId<H>> = HashSet::new();
+	let mut result: Vec<PackedObject<H>> = Vec::new();
+	let mut stack: Vec<ObjectId<H>> = wants.to_vec();
 	while let Some(id) = stack.pop() {
 		if excluded.contains(&id) || !collected.insert(id) {
 			continue;
 		}
 		let (kind, data) = store.read_object(&id).await?;
-		stack.extend(referenced_ids(kind, &data)?);
+		stack.extend(referenced_ids::<H>(kind, &data)?);
 		result.push(PackedObject { id, kind, data });
 	}
 	Ok(result)

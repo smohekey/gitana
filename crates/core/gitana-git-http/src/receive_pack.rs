@@ -12,35 +12,31 @@ use std::collections::{HashMap, HashSet};
 
 use gitana_file_store::FileStore;
 use gitana_object::{
-	ObjectId, ObjectKind, PktLine, decode_pack_with_bases, parse_pkt, ref_delta_base_ids,
-	referenced_ids, write_flush, write_pkt,
+	HashAlgorithm, ObjectId, ObjectKind, PktLine, decode_pack_with_bases, parse_pkt,
+	ref_delta_base_ids, referenced_ids, write_flush, write_pkt,
 };
 use gitana_repository::{Repository, RepositoryError};
 
 use crate::GitHttpError;
 use crate::push_cert::{self, PushCert};
 
-/// The all-zero object id: a command's "no value" (create has zero old, delete has
-/// zero new).
-const ZERO_OID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-
 /// One ref-update command from the client.
-struct Command {
+struct Command<H: HashAlgorithm> {
 	/// Expected current value (`None` when creating a new ref).
-	old: Option<ObjectId>,
+	old: Option<ObjectId<H>>,
 	/// New value (`None` when deleting the ref).
-	new: Option<ObjectId>,
+	new: Option<ObjectId<H>>,
 	/// The ref name (`refs/heads/main`, …).
 	name: String,
 }
 
 /// The result of a receive-pack: the `report-status` bytes and the refs that were
 /// successfully updated so the host can react to accepted ref changes.
-pub struct ReceiveOutcome {
+pub struct ReceiveOutcome<H: HashAlgorithm> {
 	/// The `report-status` response body.
 	pub report: Vec<u8>,
 	/// `(ref name, new oid)` for each accepted (non-delete) update.
-	pub updated: Vec<(String, ObjectId)>,
+	pub updated: Vec<(String, ObjectId<H>)>,
 	/// The push certificate, if the client signed the push (`git push --signed`). The
 	/// wire codec only surfaces it; policy belongs to the embedding host.
 	pub push_cert: Option<PushCert>,
@@ -51,11 +47,11 @@ pub struct ReceiveOutcome {
 /// `force` permits the destructive updates git withholds by default: non-fast-forward
 /// ref updates and ref deletions. The host grants it only to a sufficiently privileged
 /// capability (the trust/security model gates it on `admin`).
-pub async fn receive_pack<F: FileStore>(
-	repo: &Repository<F>,
+pub async fn receive_pack<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
 	request: &[u8],
 	force: bool,
-) -> Result<ReceiveOutcome, GitHttpError> {
+) -> Result<ReceiveOutcome<H>, GitHttpError> {
 	let ParsedRequest {
 		commands,
 		push_cert,
@@ -81,9 +77,9 @@ pub async fn receive_pack<F: FileStore>(
 			});
 		}
 	};
-	let by_id: HashMap<ObjectId, &(ObjectKind, Vec<u8>)> =
+	let by_id: HashMap<ObjectId<H>, &(ObjectKind, Vec<u8>)> =
 		objects.iter().map(|(id, obj)| (*id, obj)).collect();
-	let new_tips: Vec<ObjectId> = commands.iter().filter_map(|command| command.new).collect();
+	let new_tips: Vec<ObjectId<H>> = commands.iter().filter_map(|command| command.new).collect();
 	if let Err(reason) = check_connectivity(repo, &by_id, &new_tips).await? {
 		return Ok(ReceiveOutcome {
 			report: report_unpack_failure(out, &commands, &reason),
@@ -124,8 +120,8 @@ pub async fn receive_pack<F: FileStore>(
 
 /// The ref names a request would update (signed `push-cert` or plain command list),
 /// parsed without applying anything — for policy decisions and rejection reports.
-pub fn command_ref_names(request: &[u8]) -> Vec<String> {
-	match parse_receive(request) {
+pub fn command_ref_names<H: HashAlgorithm>(request: &[u8]) -> Vec<String> {
+	match parse_receive::<H>(request) {
 		Ok(parsed) => parsed.commands.into_iter().map(|c| c.name).collect(),
 		Err(_) => Vec::new(),
 	}
@@ -145,15 +141,15 @@ pub fn rejection_report(ref_names: &[String], reason: &str) -> Vec<u8> {
 
 /// Unpack the pushed pack into `(id, (kind, payload))` objects, resolving thin-pack
 /// bases from the store. An empty pack (delete-only push) yields no objects.
-async fn unpack<F: FileStore>(
-	repo: &Repository<F>,
+async fn unpack<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
 	pack: &[u8],
-) -> Result<Vec<(ObjectId, (ObjectKind, Vec<u8>))>, String> {
+) -> Result<Vec<(ObjectId<H>, (ObjectKind, Vec<u8>))>, String> {
 	if pack.is_empty() {
 		return Ok(Vec::new());
 	}
-	let base_ids = ref_delta_base_ids(pack).map_err(|error| error.to_string())?;
-	let mut bases: HashMap<ObjectId, (ObjectKind, Vec<u8>)> = HashMap::new();
+	let base_ids = ref_delta_base_ids::<H>(pack).map_err(|error| error.to_string())?;
+	let mut bases: HashMap<ObjectId<H>, (ObjectKind, Vec<u8>)> = HashMap::new();
 	for id in base_ids {
 		if let Ok(object) = repo.objects().read_object(&id).await {
 			bases.insert(id, object);
@@ -171,19 +167,19 @@ async fn unpack<F: FileStore>(
 /// Every object reachable from a pushed tip must be in the pack or already stored.
 /// Existing objects are trusted (the store keeps its own connectivity), so the walk
 /// stops at them and only descends into newly pushed objects.
-async fn check_connectivity<F: FileStore>(
-	repo: &Repository<F>,
-	by_id: &HashMap<ObjectId, &(ObjectKind, Vec<u8>)>,
-	tips: &[ObjectId],
+async fn check_connectivity<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	by_id: &HashMap<ObjectId<H>, &(ObjectKind, Vec<u8>)>,
+	tips: &[ObjectId<H>],
 ) -> Result<Result<(), String>, GitHttpError> {
-	let mut seen: HashSet<ObjectId> = HashSet::new();
-	let mut stack: Vec<ObjectId> = tips.to_vec();
+	let mut seen: HashSet<ObjectId<H>> = HashSet::new();
+	let mut stack: Vec<ObjectId<H>> = tips.to_vec();
 	while let Some(id) = stack.pop() {
 		if !seen.insert(id) {
 			continue;
 		}
 		if let Some((kind, data)) = by_id.get(&id) {
-			stack.extend(referenced_ids(*kind, data)?);
+			stack.extend(referenced_ids::<H>(*kind, data)?);
 		} else if !repo.objects().exists_object(&id).await? {
 			return Ok(Err(format!("missing object {id}")));
 		}
@@ -194,9 +190,9 @@ async fn check_connectivity<F: FileStore>(
 /// Apply one ref-update command via compare-and-set. Updates require fast-forward and
 /// deletions are refused unless `force` is granted. Returns a `report-status` reason
 /// string on rejection.
-async fn apply_command<F: FileStore>(
-	repo: &Repository<F>,
-	command: &Command,
+async fn apply_command<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	command: &Command<H>,
 	force: bool,
 ) -> Result<(), String> {
 	let refs = repo.refs();
@@ -232,10 +228,10 @@ async fn apply_command<F: FileStore>(
 }
 
 /// Whether `new` reaches `old` through its history (a fast-forward update).
-async fn is_fast_forward<F: FileStore>(
-	repo: &Repository<F>,
-	old: ObjectId,
-	new: ObjectId,
+async fn is_fast_forward<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	old: ObjectId<H>,
+	new: ObjectId<H>,
 ) -> Result<bool, RepositoryError> {
 	if old == new {
 		return Ok(true);
@@ -252,7 +248,11 @@ fn reason(error: RepositoryError) -> String {
 }
 
 /// Emit a `report-status` for a failed unpack: the error, then `ng` for every command.
-fn report_unpack_failure(mut out: Vec<u8>, commands: &[Command], reason: &str) -> Vec<u8> {
+fn report_unpack_failure<H: HashAlgorithm>(
+	mut out: Vec<u8>,
+	commands: &[Command<H>],
+	reason: &str,
+) -> Vec<u8> {
 	let _ = write_pkt(&mut out, format!("unpack {reason}\n").as_bytes());
 	for command in commands {
 		let _ = write_pkt(
@@ -266,14 +266,14 @@ fn report_unpack_failure(mut out: Vec<u8>, commands: &[Command], reason: &str) -
 
 /// The parsed command section: the ref-update commands, the push certificate (if the
 /// push was signed), and the trailing packfile bytes.
-struct ParsedRequest<'a> {
-	commands: Vec<Command>,
+struct ParsedRequest<'a, H: HashAlgorithm> {
+	commands: Vec<Command<H>>,
 	push_cert: Option<PushCert>,
 	pack: &'a [u8],
 }
 
 /// Parse the command section (a plain command list, or a signed `push-cert` block).
-fn parse_receive(request: &[u8]) -> Result<ParsedRequest<'_>, GitHttpError> {
+fn parse_receive<H: HashAlgorithm>(request: &[u8]) -> Result<ParsedRequest<'_, H>, GitHttpError> {
 	if push_cert::is_push_cert(request) {
 		let (cert, pack) = push_cert::parse(request)?;
 		let commands = cert
@@ -314,7 +314,7 @@ fn parse_receive(request: &[u8]) -> Result<ParsedRequest<'_>, GitHttpError> {
 
 /// Parse one command line: `<old> <new> <ref>`, with capabilities trailing the first
 /// line after a NUL.
-fn parse_command(data: &[u8]) -> Result<Command, GitHttpError> {
+fn parse_command<H: HashAlgorithm>(data: &[u8]) -> Result<Command<H>, GitHttpError> {
 	// Strip the capability list (after a NUL) carried on the first command line.
 	let line = data.split(|&b| b == 0).next().unwrap_or(data);
 	let text = std::str::from_utf8(line)
@@ -336,9 +336,9 @@ fn parse_command(data: &[u8]) -> Result<Command, GitHttpError> {
 	})
 }
 
-/// Parse an object id, mapping the all-zero id to `None`.
-fn parse_oid_opt(text: &str) -> Result<Option<ObjectId>, GitHttpError> {
-	if text == ZERO_OID {
+/// Parse an object id, mapping the all-zero id (sized for `H`) to `None`.
+fn parse_oid_opt<H: HashAlgorithm>(text: &str) -> Result<Option<ObjectId<H>>, GitHttpError> {
+	if text.len() == H::RAW_LEN * 2 && text.bytes().all(|b| b == b'0') {
 		return Ok(None);
 	}
 	Ok(Some(ObjectId::from_hex(text)?))

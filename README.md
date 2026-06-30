@@ -1,8 +1,8 @@
 # Gitana
 
-Gitana is a clean-room Git implementation written in Rust. The project is
-SHA-256-native, builds Git objects and protocol machinery directly, and exposes
-the local command-line experience through `gta`.
+Gitana is a clean-room Git implementation written in Rust. It supports both the
+SHA-1 and SHA-256 object formats, builds Git objects and protocol machinery
+directly, and exposes the local command-line experience through `gta`.
 
 The goal is not to wrap `git`. The core crates implement object codecs, object
 storage, repository refs and revision walking, working-tree/index behavior, and
@@ -10,12 +10,17 @@ Smart HTTP protocol handling in-process.
 
 ## Current status
 
-Gitana is usable for a focused SHA-256 Git workflow, but it is not yet feature
-complete with Git.
+Gitana is usable for a focused Git workflow in either object format, but it is
+not yet feature complete with Git.
 
 What works today:
 
-- Git-compatible SHA-256 repository initialization.
+- Git-compatible repository initialization in either object format
+  (`gta init --object-format=sha1|sha256`, default `sha256`).
+- A hash-generic object layer (`ObjectId<H>`): the object model, codecs,
+  packfiles, index, refs, and Smart HTTP protocol are all parameterized by the
+  hash algorithm, with the concrete algorithm selected at runtime from a repo's
+  config and negotiated with remotes over the wire.
 - Loose object encoding/decoding for blobs, trees, commits, and tags.
 - Packfile v2 decoding with OFS and REF deltas, plus packfile encoding.
 - Object storage over local and memory file stores.
@@ -120,16 +125,22 @@ cargo test -p gitana-worktree
 cargo test -p gitana-git-http
 ```
 
-The Git-oracle tests require a `git` binary with SHA-256 repository support.
-Where that is unavailable, tests that depend on stock Git skip their oracle
-assertions and keep exercising the native implementation where possible.
+The SHA-1 Git-oracle tests run against any `git` (SHA-1 is git's default format).
+The SHA-256 oracle tests require a `git` binary with SHA-256 repository support;
+where that is unavailable, those tests skip their oracle assertions and keep
+exercising the native implementation where possible.
 
 ## Development notes
 
 - The workspace uses Rust 2024 and forbids unsafe code at the workspace lint
   level.
-- Gitana is SHA-256-only by design. Repositories using SHA-1 object format are
-  rejected rather than coerced.
+- Gitana supports both the SHA-1 and SHA-256 object formats. The object layer is
+  generic over the hash algorithm — object types are parameterised by `H` (e.g.
+  `ObjectId<H>`, with `Sha1`/`Sha256` markers behind the `HashAlgorithm` trait).
+  A repository's algorithm is read from its config at runtime and dispatched to
+  the matching `H` (see `gta-core`'s `dispatch` module); remotes negotiate it
+  from the advertised `object-format`. `gta init` defaults to SHA-256 but accepts
+  `--object-format=sha1`.
 - Keep command behavior honest in both `gta` and `gta-mcp`; both delegate to
   `gta-core`, but their argument surfaces differ slightly because MCP tools use
   named arguments.

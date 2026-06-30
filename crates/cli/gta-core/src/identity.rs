@@ -4,13 +4,17 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-
-use crate::repo::LocalRepository;
+use gitana_file_store_local::LocalFileStore;
+use gitana_object::HashAlgorithm;
+use gitana_repository::Repository;
 
 /// Build a `role` (`AUTHOR` or `COMMITTER`) identity line from the `GIT_<role>_*` environment,
 /// falling back to `user.name`/`user.email` in config. Errors when neither is set — for
 /// operations like `commit` that must record a real identity.
-pub async fn signature(repo: &LocalRepository, role: &str) -> Result<String> {
+pub async fn signature<H: HashAlgorithm>(
+	repo: &Repository<LocalFileStore, H>,
+	role: &str,
+) -> Result<String> {
 	let (name, email) = configured(repo, role).await;
 	let name =
 		name.with_context(|| format!("identity name not set (GIT_{role}_NAME or user.name)"))?;
@@ -21,7 +25,10 @@ pub async fn signature(repo: &LocalRepository, role: &str) -> Result<String> {
 
 /// Like [`signature`], but never fails: an unset name or email falls back to a placeholder.
 /// Used for reflog entries (e.g. `reset`), which git records without requiring configuration.
-pub async fn signature_or_default(repo: &LocalRepository, role: &str) -> String {
+pub async fn signature_or_default<H: HashAlgorithm>(
+	repo: &Repository<LocalFileStore, H>,
+	role: &str,
+) -> String {
 	let (name, email) = configured(repo, role).await;
 	let name = name.unwrap_or_else(|| "unknown".to_owned());
 	let email = email.unwrap_or_else(|| "unknown@localhost".to_owned());
@@ -29,7 +36,10 @@ pub async fn signature_or_default(repo: &LocalRepository, role: &str) -> String 
 }
 
 /// The configured `(name, email)` for `role` from the environment, then git config.
-async fn configured(repo: &LocalRepository, role: &str) -> (Option<String>, Option<String>) {
+async fn configured<H: HashAlgorithm>(
+	repo: &Repository<LocalFileStore, H>,
+	role: &str,
+) -> (Option<String>, Option<String>) {
 	let config = repo.read_config().await.ok();
 	let from_config = |key: &str| {
 		config
