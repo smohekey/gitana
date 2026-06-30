@@ -23,6 +23,7 @@ gitana-file-store-memory = { path = "crates/core/gitana-file-store-memory" }
 gitana-git-http = { path = "crates/core/gitana-git-http" }
 gitana-object = { path = "crates/core/gitana-object" }
 gitana-object-store = { path = "crates/core/gitana-object-store" }
+gitana-porcelain = { path = "crates/core/gitana-porcelain" }
 gitana-remote = { path = "crates/core/gitana-remote" }
 gitana-repository = { path = "crates/core/gitana-repository" }
 gitana-worktree = { path = "crates/core/gitana-worktree" }

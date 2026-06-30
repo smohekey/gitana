@@ -3,8 +3,7 @@ use std::path::Path;
 use crate::Backend;
 use anyhow::{Result, bail};
 use gitana_object::HashAlgorithm;
-use gitana_repository::{FileMode, TreeBuildEntry};
-use gitana_worktree::{Index, WorkTree};
+use gitana_worktree::WorkTree;
 
 use crate::dispatch::{self, WorkTreeCommand};
 use crate::identity;
@@ -24,79 +23,37 @@ impl WorkTreeCommand for Commit<'_> {
 		worktree: WorkTree<Backend, H>,
 		_prefix: String,
 	) -> Result<()> {
-		let index = worktree.load_index()?;
-		// An unmerged index would otherwise silently drop conflicted paths (they have no stage-0 entry)
-		// from the tree, so refuse — as git does — until they are resolved.
-		if index.has_conflicts() {
-			bail!(
-				"committing is not possible because you have unmerged files; resolve them and mark resolution with `gta add`/`gta rm`"
-			);
-		}
-
 		let repo = worktree.repository();
-		// A rebase replays commits itself; a plain `gta commit` would create a stray commit that the
+		// A rebase replays commits itself; a plain `gta commit` would create a stray commit the
 		// sequencer doesn't track, so direct the user to `gta rebase --continue`.
 		if repo.rebase_in_progress().await? {
 			bail!(
 				"you are in the middle of a rebase; run `gta rebase --continue` instead of `gta commit`"
 			);
 		}
-		// Concluding a merge: produce a two-parent merge commit (and clear `MERGE_HEAD`), so resolving
-		// and `gta commit` does not silently drop the merge's second parent.
+		// Concluding an in-progress operation: each produces the right shape of commit and clears its
+		// state. (These completions will move to porcelain with the history-editing cluster.)
 		if repo.merge_head().await?.is_some() {
 			return crate::commands::merge::complete_merge(&worktree, Some(self.message.to_owned()))
 				.await;
 		}
-		// Concluding a cherry-pick: a single-parent commit preserving the picked author (clears
-		// `CHERRY_PICK_HEAD`).
 		if repo.cherry_pick_head().await?.is_some() {
 			return crate::commands::cherry_pick::complete(&worktree, Some(self.message.to_owned()))
 				.await;
 		}
-		// Concluding a revert: a single-parent commit authored by the current user (clears `REVERT_HEAD`).
 		if repo.revert_head().await?.is_some() {
 			return crate::commands::revert::complete(&worktree, Some(self.message.to_owned())).await;
 		}
 
-		let entries = index_tree_entries(&index);
-		if entries.is_empty() {
-			bail!("nothing to commit (empty index)");
-		}
-
-		let tree = repo.write_tree(&entries).await?;
-		let author = identity::signature(repo, "AUTHOR").await?;
-		let committer = identity::signature(repo, "COMMITTER").await?;
-		let message = if self.message.ends_with('\n') {
-			self.message.to_owned()
-		} else {
-			format!("{}\n", self.message)
-		};
-		let commit = repo
-			.commit_on_head(tree, &author, &committer, &message)
-			.await?;
-		println!("{commit}");
-		Ok(())
-	}
-}
-
-/// The stage-0 index entries as tree-build entries — the content a commit captures.
-pub(crate) fn index_tree_entries<H: HashAlgorithm>(index: &Index<H>) -> Vec<TreeBuildEntry<H>> {
-	index
-		.entries
-		.iter()
-		.filter(|e| e.stage == 0)
-		.map(|e| TreeBuildEntry {
-			path: e.path.clone(),
-			mode: file_mode(e.mode),
-			id: e.oid,
+		// Plain commit: the porcelain operation records the staged tree (refusing an unmerged or empty
+		// index first), resolving the git identity only if a commit will actually be made.
+		let id = gitana_porcelain::commit(&worktree, self.message, async || {
+			let author = identity::signature(repo, "AUTHOR").await?;
+			let committer = identity::signature(repo, "COMMITTER").await?;
+			Ok((author, committer))
 		})
-		.collect()
-}
-
-fn file_mode(mode: u32) -> FileMode {
-	match mode {
-		0o100755 => FileMode::Executable,
-		0o120000 => FileMode::Symlink,
-		_ => FileMode::Regular,
+		.await?;
+		println!("{id}");
+		Ok(())
 	}
 }

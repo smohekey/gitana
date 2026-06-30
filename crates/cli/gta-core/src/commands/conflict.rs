@@ -12,8 +12,6 @@ use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
 
-use crate::commands::commit::index_tree_entries;
-
 /// The merge-like operation currently in progress (`merge` / `cherry-pick` / `revert` / `rebase`), or
 /// `None` when the work tree is idle. The history-editing commands call this before starting so that
 /// only one operation is ever underway, and each is concluded (`--continue`) or discarded (`--abort`)
@@ -88,14 +86,14 @@ pub(crate) async fn resolved_tree<H: HashAlgorithm>(
 			"committing is not possible because you have unmerged files; resolve them and mark resolution with `gta add`/`gta rm`"
 		);
 	}
-	let entries = index_tree_entries(&index);
+	let entries = index.tree_entries();
 	Ok(wt.repository().write_tree(&entries).await?)
 }
 
 /// The tree the index currently records (stage-0 entries only), assuming no unmerged stages. Used
 /// to require a clean index before starting an operation (the index must equal `HEAD`).
 pub(crate) async fn index_tree<H: HashAlgorithm>(wt: &WorkTree<Backend, H>) -> Result<ObjectId<H>> {
-	let entries = index_tree_entries(&wt.load_index()?);
+	let entries = wt.load_index()?.tree_entries();
 	Ok(wt.repository().write_tree(&entries).await?)
 }
 

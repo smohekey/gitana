@@ -1,8 +1,18 @@
 use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_repository::{FileMode, TreeBuildEntry};
 
 use crate::{IndexEntry, Stat, WorktreeError};
 
 const SIGNATURE: &[u8; 4] = b"DIRC";
+
+/// The tree file mode for a raw index mode (git stores one of three blob modes).
+fn file_mode(mode: u32) -> FileMode {
+	match mode {
+		0o100755 => FileMode::Executable,
+		0o120000 => FileMode::Symlink,
+		_ => FileMode::Regular,
+	}
+}
 
 /// The git index (`.git/index`, the "DIRC" file): the staging area.
 ///
@@ -36,6 +46,21 @@ impl<H: HashAlgorithm> Index<H> {
 	/// An empty index.
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// The stage-0 entries as tree-build entries — the content a commit captures. Conflicted
+	/// (stage > 0) entries have no stage-0 slot and are skipped, so resolve them first.
+	pub fn tree_entries(&self) -> Vec<TreeBuildEntry<H>> {
+		self
+			.entries
+			.iter()
+			.filter(|entry| entry.stage == 0)
+			.map(|entry| TreeBuildEntry {
+				path: entry.path.clone(),
+				mode: file_mode(entry.mode),
+				id: entry.oid,
+			})
+			.collect()
 	}
 
 	/// The stage-0 entry for `path`, if present.

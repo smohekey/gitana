@@ -859,6 +859,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitana-porcelain"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gitana-file-store",
+ "gitana-file-store-local",
+ "gitana-object",
+ "gitana-object-store",
+ "gitana-repository",
+ "gitana-worktree",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "gitana-remote"
 version = "0.1.0"
 dependencies = [
@@ -942,6 +957,7 @@ dependencies = [
  "gitana-git-http",
  "gitana-object",
  "gitana-object-store",
+ "gitana-porcelain",
  "gitana-remote",
  "gitana-repository",
  "gitana-worktree",

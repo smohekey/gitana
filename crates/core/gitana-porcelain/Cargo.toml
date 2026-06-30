@@ -1,7 +1,7 @@
 [package]
 edition.workspace = true
 license.workspace = true
-name = "gta-core"
+name = "gitana-porcelain"
 repository.workspace = true
 rust-version.workspace = true
 version = "0.1.0"
@@ -11,21 +11,13 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-gitana-config.workspace = true
-gitana-diff.workspace = true
 gitana-file-store.workspace = true
-gitana-file-store-local.workspace = true
-gitana-git-http.workspace = true
 gitana-object.workspace = true
-gitana-object-store.workspace = true
-gitana-porcelain.workspace = true
-gitana-remote.workspace = true
 gitana-repository.workspace = true
 gitana-worktree.workspace = true
-sha2.workspace = true
 
 [dev-dependencies]
-gitana-file-store-memory.workspace = true
-ssh-key = { workspace = true, features = ["ed25519", "rand_core"] }
+gitana-file-store-local.workspace = true
+gitana-object-store.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
