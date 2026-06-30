@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::{Result, bail};
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::HashAlgorithm;
 use gitana_worktree::WorkTree;
 
@@ -38,7 +38,7 @@ struct Switch<'a> {
 impl WorkTreeCommand for Switch<'_> {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<LocalFileStore, H>,
+		worktree: WorkTree<Backend, H>,
 		_prefix: String,
 	) -> Result<()> {
 		let repo = worktree.repository();
@@ -57,6 +57,18 @@ impl WorkTreeCommand for Switch<'_> {
 		let Some(commit) = repo.refs().resolve(&branch).await? else {
 			bail!("invalid reference: {}", self.name);
 		};
+
+		// A branch's ref is shared across a repository's worktrees, so git forbids checking the same
+		// branch out in two of them at once (their commits would race on one ref). Refuse before
+		// touching the working tree, as git does.
+		if let Some(other) = crate::repo::branch_checked_out_elsewhere(worktree.git_dir(), &branch) {
+			bail!(
+				"'{}' is already checked out at '{}'",
+				self.name,
+				other.display()
+			);
+		}
+
 		let tree = repo.commit_tree(commit).await?;
 		worktree.checkout(tree, self.force).await?;
 		worktree

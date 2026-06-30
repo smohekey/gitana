@@ -1,8 +1,8 @@
 use std::io::Write;
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::{Result, bail};
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_tree};
 use gitana_repository::Repository;
 
@@ -37,7 +37,7 @@ struct CatFile {
 impl ObjectCommand for CatFile {
 	async fn run<H: HashAlgorithm>(
 		self,
-		repo: Repository<LocalFileStore, H>,
+		repo: Repository<Backend, H>,
 		oid: ObjectId<H>,
 	) -> Result<()> {
 		let (kind, payload) = repo.objects().read_object(&oid).await?;

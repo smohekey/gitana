@@ -41,6 +41,12 @@ impl<F: FileStore, H: HashAlgorithm> WorkTree<F, H> {
 		&self.repo
 	}
 
+	/// This checkout's git directory: where its per-worktree files (`HEAD`, `index`) live. For a
+	/// linked worktree this is `<main>/.git/worktrees/<name>`, not the shared common dir.
+	pub fn git_dir(&self) -> &Path {
+		&self.git_dir
+	}
+
 	/// Resolve a revision spec, including the index-relative forms the repository resolver cannot:
 	/// `:<path>` (the staged blob, stage 0) and `:<n>:<path>` (merge stage `n`). Every other spec
 	/// — refs, oids, `HEAD`, `~`/`^`/`^{type}`, and `<rev>:<path>` — is delegated to

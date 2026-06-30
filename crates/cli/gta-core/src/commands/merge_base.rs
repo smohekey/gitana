@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::{Result, bail};
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::HashAlgorithm;
 use gitana_repository::Repository;
 
@@ -31,7 +31,7 @@ struct MergeBase {
 }
 
 impl RepoCommand for MergeBase {
-	async fn run<H: HashAlgorithm>(self, repo: Repository<LocalFileStore, H>) -> Result<()> {
+	async fn run<H: HashAlgorithm>(self, repo: Repository<Backend, H>) -> Result<()> {
 		if self.is_ancestor {
 			if self.all {
 				bail!("--all cannot be combined with --is-ancestor");

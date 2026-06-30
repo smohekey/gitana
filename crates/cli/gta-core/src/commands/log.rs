@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::Result;
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::{HashAlgorithm, parse_commit};
 use gitana_repository::Repository;
 
@@ -15,7 +15,7 @@ pub async fn run(cwd: &Path) -> Result<()> {
 struct Log;
 
 impl RepoCommand for Log {
-	async fn run<H: HashAlgorithm>(self, repo: Repository<LocalFileStore, H>) -> Result<()> {
+	async fn run<H: HashAlgorithm>(self, repo: Repository<Backend, H>) -> Result<()> {
 		let Some(head) = repo.refs().resolve_head().await? else {
 			return Ok(()); // unborn branch — no commits
 		};

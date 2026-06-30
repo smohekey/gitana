@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::Result;
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::HashAlgorithm;
 use gitana_repository::Repository;
 
@@ -17,7 +17,7 @@ struct RevParse<'a> {
 }
 
 impl RepoCommand for RevParse<'_> {
-	async fn run<H: HashAlgorithm>(self, repo: Repository<LocalFileStore, H>) -> Result<()> {
+	async fn run<H: HashAlgorithm>(self, repo: Repository<Backend, H>) -> Result<()> {
 		let oid = repo.rev_parse(self.spec).await?;
 		println!("{oid}");
 		Ok(())

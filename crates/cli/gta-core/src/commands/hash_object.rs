@@ -1,8 +1,8 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::Backend;
 use anyhow::{Context, Result, anyhow};
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind};
 use gitana_repository::Repository;
 
@@ -62,7 +62,7 @@ struct HashObject {
 }
 
 impl RepoCommand for HashObject {
-	async fn run<H: HashAlgorithm>(self, repo: Repository<LocalFileStore, H>) -> Result<()> {
+	async fn run<H: HashAlgorithm>(self, repo: Repository<Backend, H>) -> Result<()> {
 		let oid = if self.write {
 			repo
 				.objects()

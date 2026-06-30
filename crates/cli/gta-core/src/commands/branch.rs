@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::{Result, bail};
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::HashAlgorithm;
 use gitana_repository::Repository;
 
@@ -18,7 +18,7 @@ struct Branch {
 }
 
 impl RepoCommand for Branch {
-	async fn run<H: HashAlgorithm>(self, repo: Repository<LocalFileStore, H>) -> Result<()> {
+	async fn run<H: HashAlgorithm>(self, repo: Repository<Backend, H>) -> Result<()> {
 		match self.name {
 			None => list(&repo).await,
 			Some(name) => create(&repo, &name, self.start.as_deref()).await,
@@ -26,7 +26,7 @@ impl RepoCommand for Branch {
 	}
 }
 
-async fn list<H: HashAlgorithm>(repo: &Repository<LocalFileStore, H>) -> Result<()> {
+async fn list<H: HashAlgorithm>(repo: &Repository<Backend, H>) -> Result<()> {
 	let current = repo
 		.refs()
 		.read_symbolic("HEAD")
@@ -45,7 +45,7 @@ async fn list<H: HashAlgorithm>(repo: &Repository<LocalFileStore, H>) -> Result<
 }
 
 async fn create<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<Backend, H>,
 	name: &str,
 	start: Option<&str>,
 ) -> Result<()> {

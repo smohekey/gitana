@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::{Result, bail};
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::{HashAlgorithm, ObjectKind, parse_tree};
 use gitana_repository::Repository;
 
@@ -18,7 +18,7 @@ struct LsTree<'a> {
 }
 
 impl RepoCommand for LsTree<'_> {
-	async fn run<H: HashAlgorithm>(self, repo: Repository<LocalFileStore, H>) -> Result<()> {
+	async fn run<H: HashAlgorithm>(self, repo: Repository<Backend, H>) -> Result<()> {
 		let oid = repo.rev_parse(self.treeish).await?;
 		let (kind, _) = repo.objects().read_object(&oid).await?;
 		let tree = match kind {

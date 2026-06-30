@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::Result;
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::HashAlgorithm;
 use gitana_repository::Repository;
 
@@ -18,7 +18,7 @@ struct UpdateRef<'a> {
 }
 
 impl RepoCommand for UpdateRef<'_> {
-	async fn run<H: HashAlgorithm>(self, repo: Repository<LocalFileStore, H>) -> Result<()> {
+	async fn run<H: HashAlgorithm>(self, repo: Repository<Backend, H>) -> Result<()> {
 		let new = repo.rev_parse(self.value).await?;
 		let current = repo.refs().resolve(self.name).await?;
 		repo.refs().update_ref(self.name, new, current).await?;

@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::{Result, bail};
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::HashAlgorithm;
 use gitana_repository::Repository;
 
@@ -18,7 +18,7 @@ struct SymbolicRef<'a> {
 }
 
 impl RepoCommand for SymbolicRef<'_> {
-	async fn run<H: HashAlgorithm>(self, repo: Repository<LocalFileStore, H>) -> Result<()> {
+	async fn run<H: HashAlgorithm>(self, repo: Repository<Backend, H>) -> Result<()> {
 		match self.target {
 			Some(target) => repo.refs().set_symbolic(self.name, &target).await?,
 			None => match repo.refs().read_symbolic(self.name).await? {

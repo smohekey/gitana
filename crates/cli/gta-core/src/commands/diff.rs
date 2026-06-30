@@ -1,9 +1,9 @@
 use std::io::Write;
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::Result;
 use gitana_diff::Edit;
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::HashAlgorithm;
 use gitana_worktree::{FileDiff, WorkTree};
 
@@ -25,7 +25,7 @@ struct Diff {
 impl WorkTreeCommand for Diff {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<LocalFileStore, H>,
+		worktree: WorkTree<Backend, H>,
 		_prefix: String,
 	) -> Result<()> {
 		let files = if self.cached {

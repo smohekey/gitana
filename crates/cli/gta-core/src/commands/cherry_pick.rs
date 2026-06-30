@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::{Result, bail};
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::{Commit, HashAlgorithm, ObjectId, parse_commit};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
@@ -40,11 +40,7 @@ struct CherryPick {
 }
 
 impl WorkTreeCommand for CherryPick {
-	async fn run<H: HashAlgorithm>(
-		self,
-		wt: WorkTree<LocalFileStore, H>,
-		_prefix: String,
-	) -> Result<()> {
+	async fn run<H: HashAlgorithm>(self, wt: WorkTree<Backend, H>, _prefix: String) -> Result<()> {
 		if self.abort {
 			return abort_cherry_pick(&wt).await;
 		}
@@ -145,7 +141,7 @@ impl WorkTreeCommand for CherryPick {
 /// the picked commit's author. Shared by `cherry-pick --continue` (`message_override = None`, uses
 /// `MERGE_MSG`) and `gta commit` during a cherry-pick. Refuses while the index has unmerged stages.
 pub(crate) async fn complete<H: HashAlgorithm>(
-	wt: &WorkTree<LocalFileStore, H>,
+	wt: &WorkTree<Backend, H>,
 	message_override: Option<String>,
 ) -> Result<()> {
 	let repository = wt.repository();
@@ -182,7 +178,7 @@ pub(crate) async fn complete<H: HashAlgorithm>(
 
 /// Abort an in-progress cherry-pick: restore the work tree and index to the (unmoved) `HEAD` and
 /// clear the cherry-pick state. Like `git cherry-pick --abort`.
-async fn abort_cherry_pick<H: HashAlgorithm>(wt: &WorkTree<LocalFileStore, H>) -> Result<()> {
+async fn abort_cherry_pick<H: HashAlgorithm>(wt: &WorkTree<Backend, H>) -> Result<()> {
 	let repository = wt.repository();
 	if repository.cherry_pick_head().await?.is_none() {
 		bail!("there is no cherry-pick to abort (CHERRY_PICK_HEAD is missing)");
@@ -194,7 +190,7 @@ async fn abort_cherry_pick<H: HashAlgorithm>(wt: &WorkTree<LocalFileStore, H>) -
 
 /// Read and parse a commit object.
 async fn read_commit<H: HashAlgorithm>(
-	repository: &Repository<LocalFileStore, H>,
+	repository: &Repository<Backend, H>,
 	oid: ObjectId<H>,
 ) -> Result<Commit<H>> {
 	let (_, payload) = repository.objects().read_object(&oid).await?;

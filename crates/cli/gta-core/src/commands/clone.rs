@@ -62,7 +62,8 @@ async fn clone_into<H: HashAlgorithm>(
 	target: &Path,
 	body: &[u8],
 ) -> Result<()> {
-	let repository = repo::open_generic::<H>(git_dir);
+	// A freshly cloned repository is an ordinary checkout: its per-worktree and common dirs coincide.
+	let repository = repo::open_generic::<H>(git_dir, git_dir);
 	repository.init().await?; // writes a config matching H
 
 	let advertised = parse_advertisement::<H>(body)?;

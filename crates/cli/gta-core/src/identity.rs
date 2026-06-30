@@ -3,8 +3,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::Backend;
 use anyhow::{Context, Result};
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::HashAlgorithm;
 use gitana_repository::Repository;
 
@@ -12,7 +12,7 @@ use gitana_repository::Repository;
 /// falling back to `user.name`/`user.email` in config. Errors when neither is set — for
 /// operations like `commit` that must record a real identity.
 pub async fn signature<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<Backend, H>,
 	role: &str,
 ) -> Result<String> {
 	let (name, email) = configured(repo, role).await;
@@ -26,7 +26,7 @@ pub async fn signature<H: HashAlgorithm>(
 /// Like [`signature`], but never fails: an unset name or email falls back to a placeholder.
 /// Used for reflog entries (e.g. `reset`), which git records without requiring configuration.
 pub async fn signature_or_default<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<Backend, H>,
 	role: &str,
 ) -> String {
 	let (name, email) = configured(repo, role).await;
@@ -37,7 +37,7 @@ pub async fn signature_or_default<H: HashAlgorithm>(
 
 /// The configured `(name, email)` for `role` from the environment, then git config.
 async fn configured<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<Backend, H>,
 	role: &str,
 ) -> (Option<String>, Option<String>) {
 	let config = repo.read_config().await.ok();

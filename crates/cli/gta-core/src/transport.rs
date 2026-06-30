@@ -9,9 +9,9 @@
 
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::{Context, Result, bail};
 use gitana_config::GitConfig;
-use gitana_file_store_local::LocalFileStore;
 use gitana_git_http::{
 	Advertised, build_upload_pack_request, parse_upload_pack_response, peek_object_format,
 };
@@ -140,7 +140,7 @@ pub fn ensure_same_format(local: HashKind, remote: HashKind) -> Result<()> {
 /// Download the objects reachable from `wants` but not `haves` into `repo`.
 pub async fn fetch_pack<H: HashAlgorithm>(
 	origin: &Origin,
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<Backend, H>,
 	wants: &[ObjectId<H>],
 	haves: &[ObjectId<H>],
 ) -> Result<()> {
@@ -177,7 +177,7 @@ pub fn advertised_oids<H: HashAlgorithm>(advertised: &Advertised<H>) -> Vec<Obje
 /// The unique tips of every local ref, sent as fetch `have`s so the server omits
 /// objects we already hold.
 pub async fn local_haves<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<Backend, H>,
 ) -> Result<Vec<ObjectId<H>>> {
 	let mut oids: Vec<ObjectId<H>> = repo
 		.refs()

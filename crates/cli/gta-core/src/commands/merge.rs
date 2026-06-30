@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::{Result, bail};
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
@@ -53,11 +53,7 @@ struct Merge {
 }
 
 impl WorkTreeCommand for Merge {
-	async fn run<H: HashAlgorithm>(
-		self,
-		wt: WorkTree<LocalFileStore, H>,
-		_prefix: String,
-	) -> Result<()> {
+	async fn run<H: HashAlgorithm>(self, wt: WorkTree<Backend, H>, _prefix: String) -> Result<()> {
 		if self.abort {
 			return abort_merge(&wt).await;
 		}
@@ -222,7 +218,7 @@ impl WorkTreeCommand for Merge {
 /// for the user to resolve, as git does.
 #[allow(clippy::too_many_arguments)]
 async fn materialise_conflict<H: HashAlgorithm>(
-	wt: &WorkTree<LocalFileStore, H>,
+	wt: &WorkTree<Backend, H>,
 	merged_tree: ObjectId<H>,
 	base_tree: ObjectId<H>,
 	head_tree: ObjectId<H>,
@@ -251,7 +247,7 @@ async fn materialise_conflict<H: HashAlgorithm>(
 /// `merge --continue` (`message_override = None`, uses `MERGE_MSG`) and `gta commit` during a merge
 /// (`message_override = Some(..)`). Refuses while the index still has unmerged stages.
 pub(crate) async fn complete_merge<H: HashAlgorithm>(
-	wt: &WorkTree<LocalFileStore, H>,
+	wt: &WorkTree<Backend, H>,
 	message_override: Option<String>,
 ) -> Result<()> {
 	let repository = wt.repository();
@@ -281,7 +277,7 @@ pub(crate) async fn complete_merge<H: HashAlgorithm>(
 
 /// Abort an in-progress merge: restore the work tree and index to the (unmoved) `HEAD`, discarding
 /// conflict markers and unmerged stages, and clear the merge state. Like `git merge --abort`.
-async fn abort_merge<H: HashAlgorithm>(wt: &WorkTree<LocalFileStore, H>) -> Result<()> {
+async fn abort_merge<H: HashAlgorithm>(wt: &WorkTree<Backend, H>) -> Result<()> {
 	let repository = wt.repository();
 	if repository.merge_head().await?.is_none() {
 		bail!("there is no merge to abort (MERGE_HEAD is missing)");
@@ -302,7 +298,7 @@ fn would_overwrite_message(paths: &[String]) -> String {
 
 /// The paths that differ between two trees (added/removed/modified), sorted.
 async fn tree_diff_paths<H: HashAlgorithm>(
-	repository: &Repository<LocalFileStore, H>,
+	repository: &Repository<Backend, H>,
 	a: ObjectId<H>,
 	b: ObjectId<H>,
 ) -> Result<Vec<String>> {
@@ -330,7 +326,7 @@ async fn tree_diff_paths<H: HashAlgorithm>(
 /// git's default merge message: `Merge branch '<name>'` when the argument names a local branch,
 /// otherwise `Merge commit '<arg>'`.
 async fn default_message<H: HashAlgorithm>(
-	repository: &Repository<LocalFileStore, H>,
+	repository: &Repository<Backend, H>,
 	arg: &str,
 ) -> String {
 	let is_branch = repository
@@ -353,7 +349,7 @@ async fn default_message<H: HashAlgorithm>(
 /// (Deeply nested criss-crosses are approximated: the virtual base is not re-inserted into the
 /// commit graph for later merge-base queries.)
 async fn virtual_base_tree<H: HashAlgorithm>(
-	repository: &Repository<LocalFileStore, H>,
+	repository: &Repository<Backend, H>,
 	bases: &[ObjectId<H>],
 ) -> Result<ObjectId<H>> {
 	let (first, rest) = bases.split_first().expect("at least one merge base");

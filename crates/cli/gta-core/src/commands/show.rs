@@ -4,8 +4,8 @@ use std::io::Write;
 use std::path::Path;
 use std::pin::Pin;
 
+use crate::Backend;
 use anyhow::Result;
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_commit, parse_tag, parse_tree};
 use gitana_repository::Repository;
 use gitana_worktree::FileDiff;
@@ -25,7 +25,7 @@ struct Show;
 impl ObjectCommand for Show {
 	async fn run<H: HashAlgorithm>(
 		self,
-		repo: Repository<LocalFileStore, H>,
+		repo: Repository<Backend, H>,
 		oid: ObjectId<H>,
 	) -> Result<()> {
 		show_object(&repo, oid).await
@@ -34,7 +34,7 @@ impl ObjectCommand for Show {
 
 /// Display the object `oid` according to its kind (boxed so a tag can recurse into its target).
 fn show_object<'a, H: HashAlgorithm>(
-	repo: &'a Repository<LocalFileStore, H>,
+	repo: &'a Repository<Backend, H>,
 	oid: ObjectId<H>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
 	Box::pin(async move {
@@ -49,7 +49,7 @@ fn show_object<'a, H: HashAlgorithm>(
 }
 
 async fn show_commit<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<Backend, H>,
 	oid: ObjectId<H>,
 	payload: &[u8],
 ) -> Result<()> {
@@ -76,10 +76,7 @@ async fn show_commit<H: HashAlgorithm>(
 	Ok(())
 }
 
-async fn show_tag<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
-	payload: &[u8],
-) -> Result<()> {
+async fn show_tag<H: HashAlgorithm>(repo: &Repository<Backend, H>, payload: &[u8]) -> Result<()> {
 	let tag = parse_tag::<H>(payload)?;
 	let mut out = Vec::new();
 	out.extend_from_slice(format!("tag {}\n", tag.name).as_bytes());
@@ -111,7 +108,7 @@ fn show_tree<H: HashAlgorithm>(oid: ObjectId<H>, payload: &[u8]) -> Result<()> {
 /// A tree flattened to `path -> (mode, oid)`, dropping gitlinks (submodule entries), which have
 /// no blob to diff.
 async fn tree_map<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<Backend, H>,
 	tree: ObjectId<H>,
 ) -> Result<BTreeMap<String, (String, ObjectId<H>)>> {
 	Ok(
@@ -128,7 +125,7 @@ async fn tree_map<H: HashAlgorithm>(
 /// The added, deleted, and modified paths between two flattened trees, with their blob content,
 /// ready for the unified-diff formatter. Paths are sorted (the maps are ordered).
 async fn tree_diff<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<Backend, H>,
 	old: &BTreeMap<String, (String, ObjectId<H>)>,
 	new: &BTreeMap<String, (String, ObjectId<H>)>,
 ) -> Result<Vec<FileDiff>> {

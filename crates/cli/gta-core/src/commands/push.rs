@@ -5,8 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::Backend;
 use anyhow::{Context, Result, bail};
-use gitana_file_store_local::LocalFileStore;
 use gitana_git_http::{
 	CertCommand, PushCert, RefUpdate, build_pack, build_push_cert, build_receive_pack_request,
 	parse_advertisement, parse_report_status,
@@ -29,33 +29,33 @@ pub async fn run(
 	force: bool,
 	delete: Option<String>,
 ) -> Result<()> {
-	let (_work, git_dir) = repo::discover(cwd)?;
-	let origin = Origin::load(&git_dir)?;
+	let found = repo::discover(cwd)?;
+	let origin = Origin::load(&found.common_dir)?;
 	let body = transport::fetch_advertisement(&origin, "git-receive-pack").await?;
 
-	let local = dispatch::detect_algorithm(&git_dir)?;
+	let local = dispatch::detect_algorithm(&found.common_dir)?;
 	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
 
 	match local {
 		HashKind::Sha1 => {
-			push_impl::<Sha1>(&origin, &git_dir, &body, signed, signing_key, force, delete).await
+			push_impl::<Sha1>(&origin, &found, &body, signed, signing_key, force, delete).await
 		}
 		HashKind::Sha256 => {
-			push_impl::<Sha256>(&origin, &git_dir, &body, signed, signing_key, force, delete).await
+			push_impl::<Sha256>(&origin, &found, &body, signed, signing_key, force, delete).await
 		}
 	}
 }
 
 async fn push_impl<H: HashAlgorithm>(
 	origin: &Origin,
-	git_dir: &Path,
+	found: &repo::Discovered,
 	body: &[u8],
 	signed: bool,
 	signing_key: Option<PathBuf>,
 	force: bool,
 	delete: Option<String>,
 ) -> Result<()> {
-	let repository = repo::open_generic::<H>(git_dir);
+	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir);
 	let advertised = parse_advertisement::<H>(body)?;
 
 	if let Some(target) = delete {
@@ -148,7 +148,7 @@ fn normalize_branch(name: &str) -> String {
 
 /// Build and sign a push certificate for a single-branch update.
 async fn sign_push<H: HashAlgorithm>(
-	repository: &Repository<LocalFileStore, H>,
+	repository: &Repository<Backend, H>,
 	origin: &Origin,
 	_signing_key: Option<PathBuf>,
 	nonce: String,
@@ -176,7 +176,7 @@ async fn sign_push<H: HashAlgorithm>(
 }
 
 /// The pusher identity for a certificate: `Name <email> <unix-ts> +0000`.
-async fn pusher_ident<H: HashAlgorithm>(repo: &Repository<LocalFileStore, H>) -> Result<String> {
+async fn pusher_ident<H: HashAlgorithm>(repo: &Repository<Backend, H>) -> Result<String> {
 	let config = repo.read_config().await.ok();
 	let from_config = |key: &str| {
 		config

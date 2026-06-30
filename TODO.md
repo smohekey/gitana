@@ -17,6 +17,7 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 ## Merge And History Editing
 
 - [x] Add merge-base computation. `Repository::merge_base`/`is_ancestor` (paint-down-to-common-ancestors with redundancy removal and octopus reduction) plus a `gta merge-base [--all] [--is-ancestor]` command, oracle-tested against stock git.
+- [ ] Stop `merge-base` from calling `std::process::exit(1)` (for a false `--is-ancestor` or "no common ancestor"). Exiting from command/library code would terminate a long-lived `gta-mcp` server. Return a typed outcome the front-ends map to an exit code, the way `merge` signals a conflict via `MergeConflict` rather than exiting.
 - [x] Add a three-way tree merge engine. `Repository::merge_trees` recursively merges trees with diff3 line-level content merge (in the new `gitana-diff` crate); clean merges match `git merge-tree --write-tree` byte-for-byte, conflicts are reported per path. Not yet wired to the index/`merge` command.
 - [x] Extend the index and status surfaces for conflict stages and unmerged paths. `Index` gains `conflict`/`unmerged_paths`/`is_unmerged`/`record_conflict` (and `upsert`/`remove` now collapse all stages, so `add`/`rm` resolve); `commit` refuses while unmerged; and `status` reports git's `UU`/`AA`/`DD`/`AU`/`UA`/`UD`/`DU` codes and now emits tracked changes before untracked (and both lines for a path that is staged-changed *and* untracked, e.g. after `rm --cached`) — oracle-tested against `git status` on real merge conflicts.
 - [x] Add `merge` for fast-forward and true merge commits. `gta merge [-m] [--no-ff] [--ff-only] <commit>` fast-forwards or builds a two-parent merge commit (composing `merge_base`/`merge_trees`/`create_commit`/`reset_head`/`checkout`), oracle-tested against git (merged tree matches `git merge-tree`). A conflicting merge is refused cleanly; materializing conflicts (`MERGE_HEAD`, abort/continue) is the next item.
@@ -67,7 +68,8 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [ ] Add line-ending normalization support.
 - [ ] Add sparse checkout support.
 - [ ] Add submodule entry handling beyond tree mode representation.
-- [ ] Add worktree command support for multiple linked working trees.
+- [x] Operate correctly inside linked working trees (`git worktree add`): resolve the `.git`-file pointer and route per-worktree files (`HEAD`, `index`) vs. shared common-dir files (`objects`, `refs`, `config`).
+- [ ] Add a `gta worktree` command (`add`/`list`/`remove`) to create and manage linked working trees.
 
 ## User Experience
 

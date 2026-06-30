@@ -18,15 +18,18 @@ pub async fn run(cwd: &Path) -> Result<()> {
 	// (fast-forward, or a true merge commit when the histories have diverged).
 	fetch::run(cwd).await?;
 
-	let (_work, git_dir) = repo::discover(cwd)?;
-	let kind = dispatch::detect_algorithm(&git_dir)?;
+	let found = repo::discover(cwd)?;
+	let kind = dispatch::detect_algorithm(&found.common_dir)?;
 	let (branch, remote_tip) = match kind {
-		HashKind::Sha1 => upstream_tip::<Sha1>(&git_dir).await?,
-		HashKind::Sha256 => upstream_tip::<Sha256>(&git_dir).await?,
+		HashKind::Sha1 => upstream_tip::<Sha1>(&found).await?,
+		HashKind::Sha256 => upstream_tip::<Sha256>(&found).await?,
 	};
 
 	let short = branch.strip_prefix("refs/heads/").unwrap_or(&branch);
-	let message = format!("Merge branch '{short}' of {}", Origin::load(&git_dir)?.url);
+	let message = format!(
+		"Merge branch '{short}' of {}",
+		Origin::load(&found.common_dir)?.url
+	);
 	merge::run(
 		cwd,
 		Some(remote_tip),
@@ -41,8 +44,8 @@ pub async fn run(cwd: &Path) -> Result<()> {
 
 /// The current branch and its upstream tip (`refs/remotes/origin/<branch>`, updated by the
 /// preceding fetch) as a hex id. Errors on a detached HEAD or a missing upstream.
-async fn upstream_tip<H: HashAlgorithm>(git_dir: &Path) -> Result<(String, String)> {
-	let repository = repo::open_generic::<H>(git_dir);
+async fn upstream_tip<H: HashAlgorithm>(found: &repo::Discovered) -> Result<(String, String)> {
+	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir);
 	let branch = match repository.refs().read_head().await? {
 		HeadState::Symbolic(branch) => branch,
 		HeadState::Detached(_) => bail!("cannot pull onto a detached HEAD"),

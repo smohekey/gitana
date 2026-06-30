@@ -13,21 +13,25 @@ use crate::transport::{self, Origin};
 
 /// Fetch all branches from the origin into `refs/remotes/origin/*`.
 pub async fn run(cwd: &Path) -> Result<()> {
-	let (_work, git_dir) = repo::discover(cwd)?;
-	let origin = Origin::load(&git_dir)?;
+	let found = repo::discover(cwd)?;
+	let origin = Origin::load(&found.common_dir)?;
 	let body = transport::fetch_advertisement(&origin, "git-upload-pack").await?;
 
-	let local = dispatch::detect_algorithm(&git_dir)?;
+	let local = dispatch::detect_algorithm(&found.common_dir)?;
 	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
 
 	match local {
-		HashKind::Sha1 => fetch_into::<Sha1>(&origin, &git_dir, &body).await,
-		HashKind::Sha256 => fetch_into::<Sha256>(&origin, &git_dir, &body).await,
+		HashKind::Sha1 => fetch_into::<Sha1>(&origin, &found, &body).await,
+		HashKind::Sha256 => fetch_into::<Sha256>(&origin, &found, &body).await,
 	}
 }
 
-async fn fetch_into<H: HashAlgorithm>(origin: &Origin, git_dir: &Path, body: &[u8]) -> Result<()> {
-	let repository = repo::open_generic::<H>(git_dir);
+async fn fetch_into<H: HashAlgorithm>(
+	origin: &Origin,
+	found: &repo::Discovered,
+	body: &[u8],
+) -> Result<()> {
+	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir);
 	let advertised = parse_advertisement::<H>(body)?;
 	let wants = transport::advertised_oids(&advertised);
 	let haves = transport::local_haves(&repository).await?;

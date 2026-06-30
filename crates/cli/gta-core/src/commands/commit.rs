@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::{Result, bail};
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::HashAlgorithm;
 use gitana_repository::{FileMode, TreeBuildEntry};
 use gitana_worktree::{Index, WorkTree};
@@ -21,7 +21,7 @@ struct Commit<'a> {
 impl WorkTreeCommand for Commit<'_> {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<LocalFileStore, H>,
+		worktree: WorkTree<Backend, H>,
 		_prefix: String,
 	) -> Result<()> {
 		let index = worktree.load_index()?;

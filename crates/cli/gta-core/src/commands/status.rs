@@ -1,7 +1,7 @@
 use std::path::Path;
 
+use crate::Backend;
 use anyhow::Result;
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::HashAlgorithm;
 use gitana_worktree::WorkTree;
 
@@ -17,7 +17,7 @@ struct Status;
 impl WorkTreeCommand for Status {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<LocalFileStore, H>,
+		worktree: WorkTree<Backend, H>,
 		_prefix: String,
 	) -> Result<()> {
 		let status = worktree.status().await?;

@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 
+use crate::Backend;
 use anyhow::{Result, bail};
-use gitana_file_store_local::LocalFileStore;
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
@@ -18,7 +18,7 @@ use crate::commands::commit::index_tree_entries;
 /// stages (1/2/3 from base/ours/theirs) in the index. Refuses — before any caller records operation
 /// state — if the checkout would clobber a touched local change.
 pub(crate) async fn write_conflicted_state<H: HashAlgorithm>(
-	wt: &WorkTree<LocalFileStore, H>,
+	wt: &WorkTree<Backend, H>,
 	merged_tree: ObjectId<H>,
 	base_tree: ObjectId<H>,
 	ours_tree: ObjectId<H>,
@@ -58,7 +58,7 @@ pub(crate) fn report_conflicts(conflicts: &[String]) -> anyhow::Error {
 /// valid here (e.g. a delete/modify conflict resolved by deletion): `write_tree(&[])` is an empty
 /// tree, unlike an ordinary commit which rejects it.
 pub(crate) async fn resolved_tree<H: HashAlgorithm>(
-	wt: &WorkTree<LocalFileStore, H>,
+	wt: &WorkTree<Backend, H>,
 ) -> Result<ObjectId<H>> {
 	let index = wt.load_index()?;
 	if index.has_conflicts() {
@@ -72,18 +72,14 @@ pub(crate) async fn resolved_tree<H: HashAlgorithm>(
 
 /// The tree the index currently records (stage-0 entries only), assuming no unmerged stages. Used
 /// to require a clean index before starting an operation (the index must equal `HEAD`).
-pub(crate) async fn index_tree<H: HashAlgorithm>(
-	wt: &WorkTree<LocalFileStore, H>,
-) -> Result<ObjectId<H>> {
+pub(crate) async fn index_tree<H: HashAlgorithm>(wt: &WorkTree<Backend, H>) -> Result<ObjectId<H>> {
 	let entries = index_tree_entries(&wt.load_index()?);
 	Ok(wt.repository().write_tree(&entries).await?)
 }
 
 /// Restore the work tree and index to the (unmoved) `HEAD`, discarding conflict markers and unmerged
 /// stages — the shared core of `--abort`. The caller clears its own operation state afterwards.
-pub(crate) async fn restore_to_head<H: HashAlgorithm>(
-	wt: &WorkTree<LocalFileStore, H>,
-) -> Result<()> {
+pub(crate) async fn restore_to_head<H: HashAlgorithm>(wt: &WorkTree<Backend, H>) -> Result<()> {
 	let repository = wt.repository();
 	let Some(head) = repository.refs().resolve_head().await? else {
 		bail!("HEAD is unborn");
@@ -95,7 +91,7 @@ pub(crate) async fn restore_to_head<H: HashAlgorithm>(
 
 /// A tree's entries as `path -> (mode, oid)`, for recording conflict stages.
 async fn tree_entry_map<H: HashAlgorithm>(
-	repository: &Repository<LocalFileStore, H>,
+	repository: &Repository<Backend, H>,
 	tree: ObjectId<H>,
 ) -> Result<HashMap<String, (u32, ObjectId<H>)>> {
 	let mut map = HashMap::new();

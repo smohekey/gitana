@@ -31,8 +31,16 @@ pub async fn run(target: PathBuf, object_format: &str) -> Result<()> {
 	// `init` is the one place a repository's hash is chosen rather than detected, so it
 	// dispatches on the requested format and writes a config matching it.
 	match kind {
-		HashKind::Sha1 => repo::open_generic::<Sha1>(&git_dir).init().await?,
-		HashKind::Sha256 => repo::open_generic::<Sha256>(&git_dir).init().await?,
+		HashKind::Sha1 => {
+			repo::open_generic::<Sha1>(&git_dir, &git_dir)
+				.init()
+				.await?
+		}
+		HashKind::Sha256 => {
+			repo::open_generic::<Sha256>(&git_dir, &git_dir)
+				.init()
+				.await?
+		}
 	}
 
 	println!(
