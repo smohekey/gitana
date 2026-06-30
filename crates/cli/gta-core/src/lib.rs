@@ -4,7 +4,10 @@
 //! gitana engine and working tree in-process and print their results to stdout.
 
 pub mod commands;
+mod error;
 mod identity;
 mod remote;
 mod repo;
 mod transport;
+
+pub use error::MergeConflict;

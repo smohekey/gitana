@@ -87,11 +87,21 @@ where
 		}
 		write_entry(wt, path, mode, *oid, &mut index).await?;
 	}
-	for path in current.keys() {
-		if !target_paths.contains_key(path.as_str()) {
-			remove_worktree_path(wt, path);
-			index.remove(path);
-		}
+	// Remove every path the target no longer contains. This spans all stages, not just stage 0, so a
+	// force checkout (e.g. `merge --abort`) also discards leftover conflict stages — such as a
+	// delete/modify conflict, whose path has only stages 1/3 and is absent from the target — fully
+	// resetting the work tree and index. Outside a merge the index is all stage 0, so this is the
+	// same set as before.
+	let tracked: std::collections::BTreeSet<&str> =
+		index.entries.iter().map(|e| e.path.as_str()).collect();
+	let stray: Vec<String> = tracked
+		.into_iter()
+		.filter(|path| !target_paths.contains_key(path))
+		.map(str::to_owned)
+		.collect();
+	for path in stray {
+		remove_worktree_path(wt, &path);
+		index.remove(&path);
 	}
 
 	wt.save_index(&index)

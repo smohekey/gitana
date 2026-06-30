@@ -1,6 +1,8 @@
 //! `gta merge` end-to-end: fast-forward, true two-parent merge commits, `--no-ff` / `--ff-only`,
-//! already-up-to-date, and clean refusal of a conflicting merge — cross-checked against real git
-//! where the result is deterministic (the merged tree matches `git merge-tree --write-tree`).
+//! already-up-to-date, and the conflict lifecycle — materialising an in-progress merge, then
+//! `--abort` / `--continue` / `gta commit`. Cross-checked against real git where the result is
+//! deterministic (the merged tree matches `git merge-tree --write-tree`; git agrees the conflicted
+//! index is `UU`/`DU`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -143,32 +145,183 @@ fn already_up_to_date() {
 }
 
 #[test]
-fn conflicting_merge_is_refused_without_touching_anything() {
+fn conflicting_merge_materialises_in_progress_state() {
 	if !git_supports_sha256() {
 		return;
 	}
 	let work = init("gta-merge-conflict");
+	let w = work.to_str().unwrap();
+	let (main_tip, feature) = setup_content_conflict(&work, w);
+
+	let (stdout, _) = gta_out_fail(w, &["merge", "feature"]);
+	assert!(stdout.contains("CONFLICT"), "conflict reported: {stdout}");
+
+	// HEAD does not move; `MERGE_HEAD` records the merged commit; the work file carries markers.
+	assert_eq!(gta(w, &["rev-parse", "HEAD"], b"").trim(), main_tip);
+	assert_eq!(
+		std::fs::read_to_string(work.join(".git/MERGE_HEAD"))
+			.unwrap()
+			.trim(),
+		feature
+	);
+	let f = std::fs::read_to_string(work.join("f.txt")).unwrap();
+	assert!(
+		f.contains("<<<<<<<") && f.contains(">>>>>>>"),
+		"markers: {f}"
+	);
+
+	// The conflicted index is `UU f.txt` — and git, reading what gta wrote, agrees.
+	assert!(gta(w, &["status"], b"").contains("UU f.txt"));
+	assert!(
+		git(w, &["status", "--porcelain"]).contains("UU f.txt"),
+		"git agrees the index is UU"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn merge_abort_restores_pre_merge_state() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-merge-abort");
+	let w = work.to_str().unwrap();
+	let (main_tip, _) = setup_content_conflict(&work, w);
+
+	gta_out_fail(w, &["merge", "feature"]);
+	gta(w, &["merge", "--abort"], b"");
+
+	assert_eq!(gta(w, &["rev-parse", "HEAD"], b"").trim(), main_tip); // unchanged
+	assert_eq!(
+		std::fs::read_to_string(work.join("f.txt")).unwrap(),
+		"OURS\n" // restored, no markers
+	);
+	assert!(!work.join(".git/MERGE_HEAD").exists());
+	assert!(gta(w, &["status"], b"").is_empty(), "clean after abort");
+	assert!(git(w, &["status", "--porcelain"]).is_empty());
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn merge_continue_creates_a_two_parent_commit() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-merge-continue");
+	let w = work.to_str().unwrap();
+	let (main_tip, feature) = setup_content_conflict(&work, w);
+
+	gta_out_fail(w, &["merge", "feature"]);
+	// Resolve and stage, then conclude the merge.
+	write(&work, "f.txt", "resolved\n");
+	gta(w, &["add", "f.txt"], b"");
+	gta(w, &["merge", "--continue"], b"");
+
+	assert_eq!(gta(w, &["rev-parse", "HEAD^1"], b"").trim(), main_tip);
+	assert_eq!(gta(w, &["rev-parse", "HEAD^2"], b"").trim(), feature);
+	assert!(!work.join(".git/MERGE_HEAD").exists());
+	assert!(gta(w, &["status"], b"").is_empty(), "clean after continue");
+	assert_eq!(
+		std::fs::read_to_string(work.join("f.txt")).unwrap(),
+		"resolved\n"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn commit_concludes_a_merge() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-merge-commit");
+	let w = work.to_str().unwrap();
+	let (main_tip, feature) = setup_content_conflict(&work, w);
+
+	gta_out_fail(w, &["merge", "feature"]);
+	write(&work, "f.txt", "resolved\n");
+	gta(w, &["add", "f.txt"], b"");
+	// `gta commit` during a merge must produce the two-parent commit, not drop the second parent.
+	gta(w, &["commit", "-m", "merged"], b"");
+
+	assert_eq!(gta(w, &["rev-parse", "HEAD^1"], b"").trim(), main_tip);
+	assert_eq!(gta(w, &["rev-parse", "HEAD^2"], b"").trim(), feature);
+	assert!(!work.join(".git/MERGE_HEAD").exists());
+	assert!(gta(w, &["status"], b"").is_empty());
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn merge_abort_cleans_up_a_delete_modify_conflict() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-merge-abort-delmod");
 	let w = work.to_str().unwrap();
 	let main = head_branch(w);
 
 	write(&work, "f.txt", "base\n");
 	commit_all(w, "base");
 	git(w, &["checkout", "-q", "-b", "feature"]);
-	write(&work, "f.txt", "THEIRS\n");
+	write(&work, "f.txt", "THEIRS\n"); // theirs modifies f.txt
 	commit_all(w, "theirs");
 	git(w, &["checkout", "-q", &main]);
-	write(&work, "f.txt", "OURS\n");
-	let main_tip = commit_all(w, "ours");
+	git(w, &["rm", "-q", "f.txt"]); // ours deletes f.txt
+	git(w, &["commit", "-q", "-m", "ours deletes"]);
+	let main_tip = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
 
-	gta_fail(w, &["merge", "feature"]);
-	// HEAD, the working tree, and the merge state are all untouched.
+	// A delete/modify conflict: f.txt is unmerged (`DU`) but absent from our tree, so its index has
+	// only stages 1/3 — the case a stage-0-only cleanup would miss.
+	gta_out_fail(w, &["merge", "feature"]);
+	assert!(git(w, &["status", "--porcelain"]).contains("DU f.txt"));
+
+	gta(w, &["merge", "--abort"], b"");
 	assert_eq!(gta(w, &["rev-parse", "HEAD"], b"").trim(), main_tip);
-	assert_eq!(
-		std::fs::read_to_string(work.join("f.txt")).unwrap(),
-		"OURS\n"
+	assert!(!work.join("f.txt").exists(), "deleted file stays deleted");
+	assert!(!work.join(".git/MERGE_HEAD").exists());
+	assert!(gta(w, &["status"], b"").is_empty(), "clean after abort");
+	assert!(git(w, &["status", "--porcelain"]).is_empty());
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn merge_continue_allows_an_empty_resolved_tree() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-merge-empty-resolved");
+	let w = work.to_str().unwrap();
+	let main = head_branch(w);
+
+	write(&work, "f.txt", "base\n");
+	commit_all(w, "base");
+	git(w, &["checkout", "-q", "-b", "feature"]);
+	write(&work, "f.txt", "THEIRS\n"); // theirs modifies f.txt (the only file)
+	let feature = commit_all(w, "theirs");
+	git(w, &["checkout", "-q", &main]);
+	git(w, &["rm", "-q", "f.txt"]); // ours deletes it
+	git(w, &["commit", "-q", "-m", "ours deletes"]);
+	let main_tip = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+
+	// Resolve the delete/modify conflict by keeping the deletion: the resolved index is empty, which
+	// is a valid (empty-tree) merge commit — not "nothing to commit".
+	gta_out_fail(w, &["merge", "feature"]);
+	gta(w, &["rm", "f.txt"], b"");
+	gta(w, &["merge", "--continue"], b"");
+
+	assert_eq!(gta(w, &["rev-parse", "HEAD^1"], b"").trim(), main_tip);
+	assert_eq!(gta(w, &["rev-parse", "HEAD^2"], b"").trim(), feature);
+	// An empty tree — and git, reading gta's commit, agrees it has no entries.
+	assert!(
+		git(w, &["cat-file", "-p", "HEAD^{tree}"]).trim().is_empty(),
+		"merge commit has an empty tree"
 	);
 	assert!(!work.join(".git/MERGE_HEAD").exists());
-	assert!(gta(w, &["status"], b"").is_empty(), "still clean");
+	assert!(gta(w, &["status"], b"").is_empty());
 
 	std::fs::remove_dir_all(&work).ok();
 }
@@ -380,6 +533,21 @@ fn commit_all(w: &str, msg: &str) -> String {
 	git(w, &["rev-parse", "HEAD"]).trim().to_owned()
 }
 
+/// Build a content conflict on `f.txt`: base, then `feature` edits it (THEIRS) and the main branch
+/// edits it (OURS). Leaves the main branch checked out at OURS; returns `(main_tip, feature_tip)`.
+fn setup_content_conflict(work: &Path, w: &str) -> (String, String) {
+	let main = head_branch(w);
+	write(work, "f.txt", "base\n");
+	commit_all(w, "base");
+	git(w, &["checkout", "-q", "-b", "feature"]);
+	write(work, "f.txt", "THEIRS\n");
+	let feature = commit_all(w, "theirs");
+	git(w, &["checkout", "-q", &main]);
+	write(work, "f.txt", "OURS\n");
+	let main_tip = commit_all(w, "ours");
+	(main_tip, feature)
+}
+
 fn gta(dir: &str, args: &[&str], stdin: &[u8]) -> String {
 	let out = assert_cmd::Command::cargo_bin("gta")
 		.unwrap()
@@ -405,6 +573,22 @@ fn gta_fail(dir: &str, args: &[&str]) -> String {
 		.expect("run gta");
 	assert!(!out.status.success(), "gta {args:?} unexpectedly succeeded");
 	String::from_utf8(out.stderr).expect("gta stderr utf8")
+}
+
+/// Run gta expecting a non-zero exit, returning `(stdout, stderr)` — a conflicting merge reports the
+/// conflicts on stdout before exiting non-zero.
+fn gta_out_fail(dir: &str, args: &[&str]) -> (String, String) {
+	let out = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", dir])
+		.args(args)
+		.output()
+		.expect("run gta");
+	assert!(!out.status.success(), "gta {args:?} unexpectedly succeeded");
+	(
+		String::from_utf8(out.stdout).expect("gta stdout utf8"),
+		String::from_utf8(out.stderr).expect("gta stderr utf8"),
+	)
 }
 
 fn git(dir: &str, args: &[&str]) -> String {

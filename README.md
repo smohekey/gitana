@@ -33,10 +33,11 @@ What works today:
 
 Major gaps:
 
-- `gta merge` (and `gta pull`) does fast-forward and clean true (two-parent)
-  merge commits; a merge that conflicts is reported and refused rather than left
-  in progress (conflict materialization and `merge --abort`/`--continue` are not
-  yet done).
+- `gta merge` (and `gta pull`) does fast-forward and true (two-parent) merge
+  commits. A conflicting merge materializes an in-progress state (`MERGE_HEAD`,
+  `MERGE_MSG`, a conflicted index, work-tree markers); resolve it and conclude
+  with `gta merge --continue` (or `gta commit`), or discard it with
+  `gta merge --abort`.
 - There is no rebase, cherry-pick, revert, stash, blame, bisect, submodule, hook,
   or sparse-checkout support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),

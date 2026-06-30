@@ -13,7 +13,13 @@ async fn main() -> ExitCode {
 	match cli::run().await {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(error) => {
-			eprintln!("gta: {error:#}");
+			// A materialised merge conflict is an expected non-zero outcome, not an internal error: the
+			// conflicts were already reported, so print git's summary on stdout without the `gta:` prefix.
+			if let Some(conflict) = error.downcast_ref::<gta_core::MergeConflict>() {
+				println!("{conflict}");
+			} else {
+				eprintln!("gta: {error:#}");
+			}
 			ExitCode::FAILURE
 		}
 	}

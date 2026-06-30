@@ -188,6 +188,49 @@ where
 		Ok(commit)
 	}
 
+	/// Create a two-parent merge commit on the branch `HEAD` points at — first parent the current
+	/// tip, second `merge_head` — advancing the branch via CAS with `commit (merge):` reflog
+	/// entries. Like [`Self::commit_on_head`] but for concluding a merge; detached HEAD and an
+	/// unborn branch are not supported.
+	pub async fn commit_merge(
+		&self,
+		tree: ObjectId,
+		merge_head: ObjectId,
+		author: &str,
+		committer: &str,
+		message: &str,
+	) -> Result<ObjectId, RepositoryError> {
+		let refs = self.refs();
+		let target = match refs.read_head().await? {
+			HeadState::Symbolic(target) => target,
+			HeadState::Detached(_) => {
+				return Err(RepositoryError::Unsupported(
+					"merge commit on detached HEAD".to_owned(),
+				));
+			}
+		};
+		let Some(parent) = refs.resolve(&target).await? else {
+			return Err(RepositoryError::Unsupported(
+				"merge commit on an unborn branch".to_owned(),
+			));
+		};
+
+		let commit = self
+			.create_commit(tree, vec![parent, merge_head], author, committer, message)
+			.await?;
+		refs.update_ref(&target, commit, Some(parent)).await?;
+
+		let subject = message.lines().next().unwrap_or("");
+		let reflog = format!("commit (merge): {subject}");
+		refs
+			.append_reflog(&target, Some(parent), commit, committer, &reflog)
+			.await?;
+		refs
+			.append_reflog("HEAD", Some(parent), commit, committer, &reflog)
+			.await?;
+		Ok(commit)
+	}
+
 	/// Move the current branch (or detached `HEAD`) to `commit` via CAS, recording the previous
 	/// tip in `ORIG_HEAD` and appending a reflog entry (`message`, e.g. `reset: moving to
 	/// HEAD~1`) to the branch and `HEAD`. The index and working tree are not touched. Mirrors the
@@ -227,6 +270,40 @@ where
 			.append_reflog("HEAD", old, commit, committer, message)
 			.await?;
 		Ok(())
+	}
+
+	/// Record `commit` as `ORIG_HEAD` so it can be recovered (`gta reset ORIG_HEAD`), as git does
+	/// when starting an operation that may move or replace `HEAD`.
+	pub async fn set_orig_head(&self, commit: ObjectId) -> Result<(), RepositoryError> {
+		let refs = self.refs();
+		let current = refs.resolve("ORIG_HEAD").await?;
+		refs.update_ref("ORIG_HEAD", commit, current).await?;
+		Ok(())
+	}
+
+	/// Record an in-progress merge: `MERGE_HEAD` (the commit being merged) and `MERGE_MSG` (the
+	/// prepared commit message).
+	pub async fn start_merge(
+		&self,
+		merge_head: ObjectId,
+		message: &str,
+	) -> Result<(), RepositoryError> {
+		crate::merge_state::start_merge(self, merge_head, message).await
+	}
+
+	/// The commit recorded in `MERGE_HEAD`, or `None` when no merge is in progress.
+	pub async fn merge_head(&self) -> Result<Option<ObjectId>, RepositoryError> {
+		crate::merge_state::merge_head(self).await
+	}
+
+	/// The prepared merge message (`MERGE_MSG`), or `None`.
+	pub async fn merge_msg(&self) -> Result<Option<String>, RepositoryError> {
+		crate::merge_state::merge_msg(self).await
+	}
+
+	/// Clear the in-progress merge state (`MERGE_HEAD`, `MERGE_MSG`).
+	pub async fn clear_merge(&self) -> Result<(), RepositoryError> {
+		crate::merge_state::clear_merge(self).await
 	}
 
 	/// Resolve a revision spec (`HEAD`, `main`, `<oid>`, `HEAD~2`, `v1^{commit}`, …)

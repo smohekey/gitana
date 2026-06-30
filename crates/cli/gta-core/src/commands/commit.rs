@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 use gitana_repository::{FileMode, TreeBuildEntry};
+use gitana_worktree::Index;
 
 use crate::identity;
 use crate::repo;
@@ -17,21 +18,19 @@ pub async fn run(cwd: &Path, message: &str) -> Result<()> {
 			"committing is not possible because you have unmerged files; resolve them and mark resolution with `gta add`/`gta rm`"
 		);
 	}
-	let entries: Vec<TreeBuildEntry> = index
-		.entries
-		.iter()
-		.filter(|e| e.stage == 0)
-		.map(|e| TreeBuildEntry {
-			path: e.path.clone(),
-			mode: file_mode(e.mode),
-			id: e.oid,
-		})
-		.collect();
+
+	let repo = wt.repository();
+	// Concluding a merge: produce a two-parent merge commit (and clear `MERGE_HEAD`), so resolving
+	// and `gta commit` does not silently drop the merge's second parent.
+	if repo.merge_head().await?.is_some() {
+		return crate::commands::merge::complete_merge(&wt, Some(message.to_owned())).await;
+	}
+
+	let entries = index_tree_entries(&index);
 	if entries.is_empty() {
 		bail!("nothing to commit (empty index)");
 	}
 
-	let repo = wt.repository();
 	let tree = repo.write_tree(&entries).await?;
 	let author = identity::signature(repo, "AUTHOR").await?;
 	let committer = identity::signature(repo, "COMMITTER").await?;
@@ -45,6 +44,20 @@ pub async fn run(cwd: &Path, message: &str) -> Result<()> {
 		.await?;
 	println!("{commit}");
 	Ok(())
+}
+
+/// The stage-0 index entries as tree-build entries — the content a commit captures.
+pub(crate) fn index_tree_entries(index: &Index) -> Vec<TreeBuildEntry> {
+	index
+		.entries
+		.iter()
+		.filter(|e| e.stage == 0)
+		.map(|e| TreeBuildEntry {
+			path: e.path.clone(),
+			mode: file_mode(e.mode),
+			id: e.oid,
+		})
+		.collect()
 }
 
 fn file_mode(mode: u32) -> FileMode {

@@ -113,8 +113,8 @@ enum Command {
 	},
 	/// Merge a commit into the current branch (fast-forward or a true merge commit).
 	Merge {
-		/// The commit (or branch) to merge into the current branch.
-		commit: String,
+		/// The commit (or branch) to merge into the current branch (omit with --abort/--continue).
+		commit: Option<String>,
 		/// Merge commit message.
 		#[arg(short = 'm', long = "message")]
 		message: Option<String>,
@@ -124,6 +124,12 @@ enum Command {
 		/// Refuse to merge unless a fast-forward is possible.
 		#[arg(long = "ff-only")]
 		ff_only: bool,
+		/// Abort an in-progress merge, restoring the pre-merge state.
+		#[arg(long = "abort")]
+		abort: bool,
+		/// Conclude an in-progress merge after resolving its conflicts.
+		#[arg(long = "continue")]
+		continue_: bool,
 	},
 	/// Show the commit history of HEAD (one line per commit).
 	Log,
@@ -343,7 +349,9 @@ impl Cli {
 				message,
 				no_ff,
 				ff_only,
-			} => commands::merge::run(&cwd, commit, message, no_ff, ff_only).await,
+				abort,
+				continue_,
+			} => commands::merge::run(&cwd, commit, message, no_ff, ff_only, abort, continue_).await,
 			Command::Log => commands::log::run(&cwd).await,
 			Command::Show { object } => commands::show::run(&cwd, object).await,
 			Command::Config {

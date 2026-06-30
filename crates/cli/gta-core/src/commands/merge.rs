@@ -1,37 +1,54 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Result, bail};
 use gitana_object::ObjectId;
 use gitana_repository::HeadState;
 
+use crate::commands::commit::index_tree_entries;
 use crate::identity;
-use crate::repo::{self, LocalRepository};
+use crate::repo::{self, LocalRepository, LocalWorkTree};
 
-/// Merge `commit` into the current branch.
+/// Merge `commit` into the current branch, or carry an in-progress merge to its end.
 ///
 /// Fast-forwards when the current branch is an ancestor of `commit` (unless `--no-ff`), otherwise
 /// creates a true two-parent merge commit. `--ff-only` refuses a non-fast-forward. A merge that
-/// would conflict is detected and refused, leaving the work tree, index, and `HEAD` untouched
-/// (materialising conflicts — `MERGE_HEAD`, the conflicted index — is a separate step).
+/// conflicts materialises an in-progress state (`MERGE_HEAD`, `MERGE_MSG`, a conflicted index, and
+/// work-tree markers) and exits non-zero; the user resolves it and then `--continue`s (or
+/// `gta commit`s), or `--abort`s to discard it.
 pub async fn run(
 	cwd: &Path,
-	commit: String,
+	commit: Option<String>,
 	message: Option<String>,
 	no_ff: bool,
 	ff_only: bool,
+	abort: bool,
+	continue_: bool,
 ) -> Result<()> {
+	if abort && continue_ {
+		bail!("--abort and --continue are incompatible");
+	}
+	let wt = repo::open_worktree(cwd)?;
+
+	if abort {
+		return abort_merge(&wt).await;
+	}
+	if continue_ {
+		return complete_merge(&wt, None).await;
+	}
+
+	let Some(commit) = commit else {
+		bail!("merge requires a commit (or --abort/--continue)");
+	};
 	if no_ff && ff_only {
 		bail!("--no-ff and --ff-only are incompatible");
 	}
-
-	let (_, git_dir) = repo::discover(cwd)?;
-	let wt = repo::open_worktree(cwd)?;
 	let repository = wt.repository();
 
-	// Refuse if a previous merge has not been concluded: `MERGE_HEAD` persists until the merge is
-	// committed or aborted, even once its conflicts have been resolved and the index is clean again.
-	// (cherry-pick/revert state files would be added with those commands.)
-	if git_dir.join("MERGE_HEAD").exists() {
+	// Refuse to start a new merge before the previous one is concluded: `MERGE_HEAD` persists until
+	// the merge is committed or aborted, even once its conflicts have been resolved and the index is
+	// clean again. (cherry-pick/revert state files would be added with those commands.)
+	if repository.merge_head().await?.is_some() {
 		bail!("you have not concluded your merge (MERGE_HEAD exists)");
 	}
 	// Likewise refuse an index that still carries unmerged stages.
@@ -84,9 +101,15 @@ pub async fn run(
 
 	// A real merge commit needs the current tip as its first parent.
 	let head = head_tip.expect("non-fast-forward merge has a current commit");
+	let message = match message {
+		Some(message) => message,
+		None => default_message(repository, &commit).await,
+	};
+	let message = ensure_trailing_newline(message);
 
 	// The merged tree: `theirs` itself for a `--no-ff` of a fast-forwardable history, otherwise the
-	// three-way merge of the branch and `commit` against their best common ancestor.
+	// three-way merge of the branch and `commit` against their best common ancestor. A conflicting
+	// three-way merge materialises an in-progress merge and exits non-zero instead.
 	let merged_tree = if can_fast_forward {
 		theirs_tree
 	} else {
@@ -102,25 +125,24 @@ pub async fn run(
 			.merge_trees(base_tree, head_tree, theirs_tree)
 			.await?;
 		if !merge.conflicts.is_empty() {
-			bail!(
-				"merge conflict in {}; merging with conflicts is not yet supported",
-				merge.conflicts.join(", ")
-			);
+			return materialise_conflict(
+				&wt,
+				merge.tree,
+				base_tree,
+				head_tree,
+				theirs_tree,
+				head,
+				theirs,
+				&merge.conflicts,
+				&message,
+			)
+			.await;
 		}
 		merge.tree
 	};
 
 	let author = identity::signature(repository, "AUTHOR").await?;
 	let committer = identity::signature(repository, "COMMITTER").await?;
-	let message = match message {
-		Some(message) => message,
-		None => default_message(repository, &commit).await,
-	};
-	let message = if message.ends_with('\n') {
-		message
-	} else {
-		format!("{message}\n")
-	};
 
 	// Materialise the result first: a checkout that would clobber a touched local change fails here,
 	// before any commit is created or the ref is moved.
@@ -145,6 +167,111 @@ pub async fn run(
 	Ok(())
 }
 
+/// Materialise a conflicting merge: write the merged work tree (conflict files carry markers) and a
+/// conflicted index (stages 1/2/3 from base/ours/theirs), record `MERGE_HEAD`/`MERGE_MSG`/`ORIG_HEAD`,
+/// report the conflicts, and exit non-zero — leaving the state for the user to resolve, as git does.
+#[allow(clippy::too_many_arguments)]
+async fn materialise_conflict(
+	wt: &LocalWorkTree,
+	merged_tree: ObjectId,
+	base_tree: ObjectId,
+	head_tree: ObjectId,
+	theirs_tree: ObjectId,
+	head: ObjectId,
+	theirs: ObjectId,
+	conflicts: &[String],
+	message: &str,
+) -> Result<()> {
+	let repository = wt.repository();
+
+	// Write the merged result (markers in conflicted files) and a stage-0 index, refusing — before
+	// any state is recorded — if it would clobber a touched local change.
+	wt.checkout(merged_tree, false).await?;
+
+	let base = tree_entry_map(repository, base_tree).await?;
+	let ours = tree_entry_map(repository, head_tree).await?;
+	let theirs_entries = tree_entry_map(repository, theirs_tree).await?;
+	let mut index = wt.load_index()?;
+	for path in conflicts {
+		index.record_conflict(
+			path,
+			base.get(path).copied(),
+			ours.get(path).copied(),
+			theirs_entries.get(path).copied(),
+		);
+	}
+	wt.save_index(&index)?;
+
+	repository.set_orig_head(head).await?;
+	repository.start_merge(theirs, message).await?;
+
+	for path in conflicts {
+		println!("CONFLICT (content): Merge conflict in {path}");
+	}
+	// Signal the conflict as a typed outcome; the front-end turns it into a non-zero exit (`gta`) or a
+	// tool error (`gta-mcp`). A library function must not decide the process's fate with `exit`, which
+	// would terminate a long-lived `gta-mcp` server.
+	Err(crate::MergeConflict.into())
+}
+
+/// Conclude an in-progress merge: a two-parent commit from the resolved index. Shared by
+/// `merge --continue` (`message_override = None`, uses `MERGE_MSG`) and `gta commit` during a merge
+/// (`message_override = Some(..)`). Refuses while the index still has unmerged stages.
+pub(crate) async fn complete_merge(
+	wt: &LocalWorkTree,
+	message_override: Option<String>,
+) -> Result<()> {
+	let repository = wt.repository();
+	let Some(merge_head) = repository.merge_head().await? else {
+		bail!("there is no merge in progress (MERGE_HEAD is missing)");
+	};
+
+	let index = wt.load_index()?;
+	if index.has_conflicts() {
+		bail!(
+			"committing is not possible because you have unmerged files; resolve them and mark resolution with `gta add`/`gta rm`"
+		);
+	}
+	// An empty index is a valid result here (e.g. a delete/modify conflict resolved by deleting the
+	// file): git records a two-parent merge commit with an empty tree, unlike an ordinary commit.
+	let entries = index_tree_entries(&index);
+	let tree = repository.write_tree(&entries).await?;
+	let author = identity::signature(repository, "AUTHOR").await?;
+	let committer = identity::signature(repository, "COMMITTER").await?;
+	let message = match message_override {
+		Some(message) => message,
+		None => repository
+			.merge_msg()
+			.await?
+			.unwrap_or_else(|| format!("Merge commit '{merge_head}'")),
+	};
+	let message = ensure_trailing_newline(message);
+
+	let commit = repository
+		.commit_merge(tree, merge_head, &author, &committer, &message)
+		.await?;
+	repository.clear_merge().await?;
+	println!("{commit}");
+	Ok(())
+}
+
+/// Abort an in-progress merge: restore the work tree and index to the (unmoved) `HEAD`, discarding
+/// conflict markers and unmerged stages, and clear the merge state. Like `git merge --abort`.
+async fn abort_merge(wt: &LocalWorkTree) -> Result<()> {
+	let repository = wt.repository();
+	if repository.merge_head().await?.is_none() {
+		bail!("there is no merge to abort (MERGE_HEAD is missing)");
+	}
+	// HEAD does not move while a merge is in progress, so its tree is the pre-merge state.
+	let Some(head) = repository.refs().resolve_head().await? else {
+		bail!("there is no merge to abort (HEAD is unborn)");
+	};
+	let head_tree = repository.commit_tree(head).await?;
+	wt.checkout(head_tree, true).await?;
+	repository.clear_merge().await?;
+	Ok(())
+}
+
 /// git's default merge message: `Merge branch '<name>'` when the argument names a local branch,
 /// otherwise `Merge commit '<arg>'`.
 async fn default_message(repository: &LocalRepository, arg: &str) -> String {
@@ -159,6 +286,27 @@ async fn default_message(repository: &LocalRepository, arg: &str) -> String {
 		format!("Merge branch '{arg}'")
 	} else {
 		format!("Merge commit '{arg}'")
+	}
+}
+
+/// A tree's entries as `path -> (mode, oid)`, for recording conflict stages.
+async fn tree_entry_map(
+	repository: &LocalRepository,
+	tree: ObjectId,
+) -> Result<HashMap<String, (u32, ObjectId)>> {
+	let mut map = HashMap::new();
+	for (path, mode, oid) in repository.read_tree(tree).await? {
+		let mode = u32::from_str_radix(&mode, 8).unwrap_or(0o100644);
+		map.insert(path, (mode, oid));
+	}
+	Ok(map)
+}
+
+fn ensure_trailing_newline(message: String) -> String {
+	if message.ends_with('\n') {
+		message
+	} else {
+		format!("{message}\n")
 	}
 }
 

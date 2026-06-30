@@ -32,5 +32,14 @@ pub async fn run(cwd: &Path) -> Result<()> {
 
 	let short = branch.strip_prefix("refs/heads/").unwrap_or(&branch);
 	let message = format!("Merge branch '{short}' of {}", Origin::load(&git_dir)?.url);
-	merge::run(cwd, remote_tip.to_hex(), Some(message), false, false).await
+	merge::run(
+		cwd,
+		Some(remote_tip.to_hex()),
+		Some(message),
+		false,
+		false,
+		false,
+		false,
+	)
+	.await
 }

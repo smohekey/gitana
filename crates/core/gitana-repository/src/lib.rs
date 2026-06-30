@@ -12,6 +12,7 @@ mod error;
 mod head;
 mod merge;
 mod merge_base;
+mod merge_state;
 mod mode;
 mod refs;
 mod repository;
