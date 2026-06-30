@@ -10,15 +10,14 @@ mod identity;
 mod remote;
 mod repo;
 mod transport;
-mod worktree_store;
 
 pub use error::MergeConflict;
-use worktree_store::WorktreeStore;
+use gitana_file_store_local::WorktreeFileStore;
 
-/// The local file-store backend every command operates over: a [`WorktreeStore`], which routes
+/// The local file-store backend every command operates over: a [`WorktreeFileStore`], which routes
 /// git's per-worktree files and shared files to the right directory so commands work the same in
 /// an ordinary checkout and in a linked worktree (`git worktree add`).
-pub(crate) type Backend = WorktreeStore;
+pub(crate) type Backend = WorktreeFileStore;
 
 /// The object-id type the CLI works with where no repository is in scope to read the hash
 /// format from (e.g. `hash-object` outside a repo). Every command that opens a repository

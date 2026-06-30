@@ -7,8 +7,9 @@ use gitana_object::HashAlgorithm;
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
 
+use gitana_file_store_local::WorktreeFileStore;
+
 use crate::Backend;
-use crate::worktree_store::WorktreeStore;
 
 /// A discovered repository: where its working tree, its (possibly per-worktree) git directory, and
 /// its shared *common* directory live.
@@ -118,7 +119,9 @@ fn work_tree_required() -> anyhow::Error {
 /// ordinary, non-linked repository.) The runtime dispatch (see [`crate::dispatch`]) picks `H` from
 /// the repo's config and calls this, so each command body is monomorphised once per algorithm.
 pub fn open_generic<H: HashAlgorithm>(git_dir: &Path, common_dir: &Path) -> Repository<Backend, H> {
-	Repository::new(ObjectStore::new(WorktreeStore::new(common_dir, git_dir)))
+	Repository::new(ObjectStore::new(WorktreeFileStore::new(
+		common_dir, git_dir,
+	)))
 }
 
 /// Discover the working tree containing `start` as a [`Discovered`] plus the pathspec `prefix`,

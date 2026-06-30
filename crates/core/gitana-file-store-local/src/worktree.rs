@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use gitana_file_store::{ByteReader, DeleteOutcome, FileStore, Result, Version, WriteOutcome};
-use gitana_file_store_local::LocalFileStore;
+
+use crate::LocalFileStore;
 
 /// A `FileStore` for a working tree that may be *linked* (created by `git worktree add`).
 ///
@@ -15,12 +16,12 @@ use gitana_file_store_local::LocalFileStore;
 ///
 /// For an ordinary (non-linked) repository the two directories coincide, so the routing is a
 /// transparent no-op — every path resolves to the same place either way.
-pub struct WorktreeStore {
+pub struct WorktreeFileStore {
 	common: LocalFileStore,
 	worktree: LocalFileStore,
 }
 
-impl WorktreeStore {
+impl WorktreeFileStore {
 	/// A store whose shared files live under `common_dir` and whose per-worktree files live under
 	/// `worktree_dir`. Pass the same path for both for an ordinary single-directory repository.
 	pub fn new(common_dir: impl Into<PathBuf>, worktree_dir: impl Into<PathBuf>) -> Self {
@@ -42,19 +43,34 @@ impl WorktreeStore {
 }
 
 /// Whether a git-relative `path` is private to one worktree (lives in the worktree's own git dir)
-/// rather than in the shared common dir. Follows git's worktree layout for the paths gitana
-/// touches — gitana's other refs (`refs/heads`, `refs/tags`, `refs/remotes`) are all shared.
+/// rather than in the shared common dir. Follows git's worktree layout for the paths gitana touches:
+/// `HEAD`/`index`, the in-progress operation state (`MERGE_HEAD`/`MERGE_MSG`, `CHERRY_PICK_HEAD`,
+/// `REVERT_HEAD`, and gitana's `REBASE_*` files), and the per-worktree ref namespaces. gitana's other
+/// refs (`refs/heads`, `refs/tags`, `refs/remotes`) are shared.
+///
+/// Routing the operation state per-worktree is critical: otherwise a rebase/cherry-pick/revert
+/// started in one linked worktree would be visible — and `--abort`/`--continue`-able — from another,
+/// mutating the wrong branch.
 fn is_per_worktree(path: &str) -> bool {
 	matches!(
 		path,
-		"HEAD" | "ORIG_HEAD" | "FETCH_HEAD" | "MERGE_HEAD" | "MERGE_MSG" | "COMMIT_EDITMSG" | "index"
+		"HEAD"
+			| "ORIG_HEAD"
+			| "FETCH_HEAD"
+			| "MERGE_HEAD"
+			| "MERGE_MSG"
+			| "CHERRY_PICK_HEAD"
+			| "REVERT_HEAD"
+			| "COMMIT_EDITMSG"
+			| "index"
 	) || path == "logs/HEAD"
+		|| path.starts_with("REBASE_")
 		|| path.starts_with("refs/worktree/")
 		|| path.starts_with("refs/bisect/")
 		|| path.starts_with("refs/rewritten/")
 }
 
-impl FileStore for WorktreeStore {
+impl FileStore for WorktreeFileStore {
 	fn read_path(&self, path: &str) -> impl Future<Output = Result<Vec<u8>>> {
 		self.store(path).read_path(path)
 	}
@@ -118,5 +134,88 @@ impl FileStore for WorktreeStore {
 		self
 			.store(path)
 			.write_path_stream_if_absent(path, reader, max_len)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn classifies_per_worktree_vs_shared_paths() {
+		// Private to one checkout → the worktree dir: HEAD/index and the in-progress operation state
+		// (merge, cherry-pick, revert, rebase), which must never be visible to another worktree.
+		for path in [
+			"HEAD",
+			"ORIG_HEAD",
+			"FETCH_HEAD",
+			"MERGE_HEAD",
+			"MERGE_MSG",
+			"CHERRY_PICK_HEAD",
+			"REVERT_HEAD",
+			"REBASE_HEAD_NAME",
+			"REBASE_ORIG_HEAD",
+			"REBASE_ONTO",
+			"REBASE_TODO",
+			"COMMIT_EDITMSG",
+			"index",
+			"logs/HEAD",
+			"refs/worktree/foo",
+			"refs/bisect/bad",
+			"refs/rewritten/onto",
+		] {
+			assert!(is_per_worktree(path), "{path} should be per-worktree");
+		}
+		// Shared across linked worktrees → the common dir.
+		for path in [
+			"config",
+			"packed-refs",
+			"objects/aa/bbcc",
+			"refs/heads/main",
+			"refs/tags/v1",
+			"refs/remotes/origin/main",
+			"logs/refs/heads/main",
+		] {
+			assert!(!is_per_worktree(path), "{path} should be shared");
+		}
+	}
+
+	#[tokio::test]
+	async fn routes_writes_to_the_owning_directory() {
+		let dir = std::env::temp_dir().join(format!("wfs-route-{}", std::process::id()));
+		let common = dir.join("common");
+		let worktree = dir.join("wt");
+		let _ = std::fs::remove_dir_all(&dir);
+		let store = WorktreeFileStore::new(&common, &worktree);
+
+		// A per-worktree file lands under the worktree store; a shared one under the common store.
+		store
+			.write_path_if_absent("HEAD", b"ref: refs/heads/main\n")
+			.await
+			.unwrap();
+		store
+			.write_path_if_absent("refs/heads/main", b"oid\n")
+			.await
+			.unwrap();
+
+		assert_eq!(
+			LocalFileStore::new(&worktree)
+				.read_path("HEAD")
+				.await
+				.unwrap(),
+			b"ref: refs/heads/main\n"
+		);
+		assert_eq!(
+			LocalFileStore::new(&common)
+				.read_path("refs/heads/main")
+				.await
+				.unwrap(),
+			b"oid\n"
+		);
+		// The router reads them back through the same routing.
+		assert!(store.exists("HEAD").await.unwrap());
+		assert!(store.exists("refs/heads/main").await.unwrap());
+
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

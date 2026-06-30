@@ -184,6 +184,58 @@ fn switch_allows_the_branch_named_by_a_bare_repo_head() {
 	std::fs::remove_dir_all(&base).ok();
 }
 
+/// In-progress operation state (here, a rebase) is per-worktree: a rebase started in a linked
+/// worktree must be invisible to — and not abortable from — another worktree, and must move only its
+/// own branch. (Regression: the state files were once routed to the shared common dir, so an abort in
+/// the main worktree moved the linked worktree's branch.)
+#[test]
+fn rebase_state_is_isolated_per_worktree() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let base = unique_tmp("gta-worktree-rebase");
+	let main = base.join("main");
+	let wt = base.join("wt");
+	let main_s = main.to_str().unwrap();
+	let wt_s = wt.to_str().unwrap();
+
+	// `main` and `feature` diverge on f.txt (so a rebase conflicts); `feature` lives in a linked wt.
+	std::fs::create_dir_all(&main).unwrap();
+	git(main_s, &["init", "-q", "--object-format=sha256", "."]);
+	git(main_s, &["config", "user.name", "T"]);
+	git(main_s, &["config", "user.email", "t@e"]);
+	std::fs::write(main.join("f.txt"), "base\n").unwrap();
+	git(main_s, &["add", "."]);
+	git(main_s, &["commit", "-q", "-m", "A"]);
+	git(main_s, &["branch", "feature"]);
+	git(main_s, &["worktree", "add", "-q", wt_s, "feature"]);
+	std::fs::write(main.join("f.txt"), "main\n").unwrap();
+	git(main_s, &["commit", "-q", "-am", "M"]);
+	let main_tip = git(main_s, &["rev-parse", "main"]).trim().to_owned();
+	std::fs::write(wt.join("f.txt"), "feature\n").unwrap();
+	git(wt_s, &["commit", "-q", "-am", "F"]);
+	let feature_orig = git(wt_s, &["rev-parse", "feature"]).trim().to_owned();
+
+	// Start a rebase in the linked worktree; replaying F onto M conflicts and stops.
+	gta_fail(wt_s, &["rebase", "main"]);
+	assert!(
+		!main.join(".git/REBASE_TODO").exists(),
+		"rebase state must not leak into the shared common dir"
+	);
+
+	// The main worktree has no rebase of its own: an --abort there must refuse and leave `main` put.
+	gta_fail(main_s, &["rebase", "--abort"]);
+	assert_eq!(git(main_s, &["rev-parse", "main"]).trim(), main_tip);
+
+	// The linked worktree aborts its own rebase, restoring `feature` to F.
+	gta(wt_s, &["rebase", "--abort"], b"");
+	assert_eq!(git(main_s, &["rev-parse", "feature"]).trim(), feature_orig);
+	assert_eq!(git(main_s, &["rev-parse", "main"]).trim(), main_tip);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
 fn gta(dir: &str, args: &[&str], stdin: &[u8]) -> String {
 	let out = assert_cmd::Command::cargo_bin("gta")
 		.unwrap()

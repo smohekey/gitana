@@ -20,6 +20,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
 
+mod worktree;
+pub use worktree::WorktreeFileStore;
+
 /// How long to wait for a cross-process ref lock before giving up.
 const LOCK_ATTEMPTS: u32 = 50;
 const LOCK_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
