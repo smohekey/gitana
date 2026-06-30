@@ -6,7 +6,33 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::Backend;
 use anyhow::{Context, Result};
 use gitana_object::HashAlgorithm;
+use gitana_porcelain::Identity;
 use gitana_repository::Repository;
+
+/// The CLI's [`Identity`] for porcelain operations: resolves author/committer from `GIT_*` env and
+/// git config via [`signature`] / [`signature_or_default`]. Holds the repository so config lookups
+/// happen lazily, only when an operation actually asks for a signature.
+pub(crate) struct CliIdentity<'a, H: HashAlgorithm> {
+	repo: &'a Repository<Backend, H>,
+}
+
+impl<'a, H: HashAlgorithm> CliIdentity<'a, H> {
+	pub(crate) fn new(repo: &'a Repository<Backend, H>) -> Self {
+		Self { repo }
+	}
+}
+
+impl<H: HashAlgorithm> Identity for CliIdentity<'_, H> {
+	async fn author(&self) -> Result<String> {
+		signature(self.repo, "AUTHOR").await
+	}
+	async fn committer(&self) -> Result<String> {
+		signature(self.repo, "COMMITTER").await
+	}
+	async fn committer_or_default(&self) -> String {
+		signature_or_default(self.repo, "COMMITTER").await
+	}
+}
 
 /// Build a `role` (`AUTHOR` or `COMMITTER`) identity line from the `GIT_<role>_*` environment,
 /// falling back to `user.name`/`user.email` in config. Errors when neither is set — for

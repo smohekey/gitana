@@ -1,70 +1,74 @@
 //! Porcelain operations — git's user-facing commands as engine functions that *return data* (the CLI
 //! adapter renders it). Each is generic over the file store and hash algorithm, so operations are
 //! backend-agnostic and unit-testable without driving the CLI.
+//!
+//! Operations that record commits take an [`Identity`] rather than reading process env / config
+//! themselves: the CLI adapter implements it over its own `GIT_*` / `user.*` resolution, and the
+//! engine asks for a signature only once a commit is certain to be made.
+#![allow(async_fn_in_trait)]
 
-use anyhow::{Result, bail};
-use gitana_file_store::FileStore;
-use gitana_object::{HashAlgorithm, ObjectId};
-use gitana_worktree::WorkTree;
+use anyhow::Result;
 
-/// Record a commit from the staged index on the current branch, returning the new commit id.
-///
-/// Refuses an unmerged or empty index *before* resolving identity, as git does — so a no-op commit
-/// reports "nothing to commit" rather than an identity error. `identity` yields the git author and
-/// committer lines (`Name <email> seconds ±hhmm`); it is only invoked once a commit will actually be
-/// made, so the caller can resolve `GIT_*` / config lazily.
-pub async fn commit<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
-	message: &str,
-	identity: impl AsyncFnOnce() -> Result<(String, String)>,
-) -> Result<ObjectId<H>> {
-	let index = wt.load_index()?;
-	// An unmerged index would silently drop conflicted paths (they have no stage-0 entry) from the
-	// tree, so refuse — as git does — until they are resolved.
-	if index.has_conflicts() {
-		bail!(
-			"committing is not possible because you have unmerged files; resolve them and mark resolution with `gta add`/`gta rm`"
-		);
-	}
-	let entries = index.tree_entries();
-	if entries.is_empty() {
-		bail!("nothing to commit (empty index)");
-	}
+mod commit;
+pub mod conflict;
+mod merge;
 
-	let (author, committer) = identity().await?;
-	let repo = wt.repository();
-	let tree = repo.write_tree(&entries).await?;
-	let message = if message.ends_with('\n') {
-		message.to_owned()
-	} else {
-		format!("{message}\n")
-	};
-	Ok(
-		repo
-			.commit_on_head(tree, &author, &committer, &message)
-			.await?,
-	)
+pub use commit::commit;
+pub use merge::{MergeOutcome, abort_merge, continue_merge, merge};
+
+/// Resolves the git identity lines (`Name <email> seconds ±hhmm`) for operations that record commits.
+/// The engine never reads process env / config directly; the CLI adapter implements this over its
+/// resolution. Methods are async so resolution stays lazy — an operation asks only once it is certain
+/// to record a commit (e.g. after the empty-index guard).
+pub trait Identity {
+	/// The author line; errors if no identity is configured.
+	async fn author(&self) -> Result<String>;
+	/// The committer line; errors if no identity is configured.
+	async fn committer(&self) -> Result<String>;
+	/// The committer line, falling back to a placeholder rather than failing — for reflog entries
+	/// (fast-forward, abort) that git records without requiring a configured identity.
+	async fn committer_or_default(&self) -> String;
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
+	use std::cell::Cell;
+
+	use anyhow::Result;
 	use gitana_file_store_local::LocalFileStore;
-	use gitana_object::Sha256;
+	use gitana_object::{ObjectId, Sha256};
 	use gitana_object_store::ObjectStore;
 	use gitana_repository::Repository;
 	use gitana_worktree::{Index, IndexEntry, Stat, WorkTree};
 
-	use super::*;
+	use crate::Identity;
 
-	const WHO: &str = "A U Thor <a@example.com> 0 +0000";
+	pub(crate) const WHO: &str = "A U Thor <a@example.com> 0 +0000";
 
-	/// A successful identity resolver.
-	async fn who() -> Result<(String, String)> {
-		Ok((WHO.to_owned(), WHO.to_owned()))
+	/// A test [`Identity`] that yields a fixed signature and records whether it was ever asked to
+	/// resolve — so a test can assert the engine did not resolve identity on a no-op path.
+	#[derive(Default)]
+	pub(crate) struct TestIdentity {
+		pub asked: Cell<bool>,
+	}
+
+	impl Identity for TestIdentity {
+		async fn author(&self) -> Result<String> {
+			self.asked.set(true);
+			Ok(WHO.to_owned())
+		}
+		async fn committer(&self) -> Result<String> {
+			self.asked.set(true);
+			Ok(WHO.to_owned())
+		}
+		async fn committer_or_default(&self) -> String {
+			self.asked.set(true);
+			WHO.to_owned()
+		}
 	}
 
 	/// A fresh repository (config + an unborn `main`) with a work tree, over a temp `LocalFileStore`.
-	async fn fixture() -> (tempfile::TempDir, WorkTree<LocalFileStore, Sha256>) {
+	pub(crate) async fn fixture() -> (tempfile::TempDir, WorkTree<LocalFileStore, Sha256>) {
 		let dir = tempfile::TempDir::new().unwrap();
 		let git_dir = dir.path().join(".git");
 		std::fs::create_dir_all(&git_dir).unwrap();
@@ -74,7 +78,8 @@ mod tests {
 		(dir, wt)
 	}
 
-	fn stage(index: &mut Index<Sha256>, path: &str, oid: ObjectId<Sha256>) {
+	/// Upsert a stage-0 entry for `oid` at `path`.
+	pub(crate) fn stage(index: &mut Index<Sha256>, path: &str, oid: ObjectId<Sha256>) {
 		index.upsert(IndexEntry {
 			stat: Stat::default(),
 			mode: 0o100644,
@@ -83,62 +88,5 @@ mod tests {
 			assume_valid: false,
 			path: path.to_owned(),
 		});
-	}
-
-	#[tokio::test]
-	async fn records_the_staged_tree_on_head() {
-		let (_dir, wt) = fixture().await;
-		let blob = wt.repository().write_blob(b"hello\n").await.unwrap();
-		let mut index = Index::new();
-		stage(&mut index, "f.txt", blob);
-		wt.save_index(&index).unwrap();
-
-		let id = commit(&wt, "first", who).await.unwrap();
-
-		// The branch now points at the commit, whose tree holds the staged blob.
-		assert_eq!(
-			wt.repository()
-				.refs()
-				.resolve("refs/heads/main")
-				.await
-				.unwrap(),
-			Some(id)
-		);
-		let tree = wt.repository().commit_tree(id).await.unwrap();
-		let entries = wt.repository().read_tree(tree).await.unwrap();
-		assert_eq!(entries.len(), 1);
-		assert_eq!(entries[0].0, "f.txt");
-		assert_eq!(entries[0].2, blob);
-	}
-
-	#[tokio::test]
-	async fn refuses_an_empty_index_before_resolving_identity() {
-		let (_dir, wt) = fixture().await;
-		// The identity resolver must not run for a no-op commit (regression: it ran first, so an
-		// unconfigured identity masked "nothing to commit").
-		let resolved = std::cell::Cell::new(false);
-		let err = commit(&wt, "x", async || {
-			resolved.set(true);
-			who().await
-		})
-		.await
-		.unwrap_err();
-		assert!(err.to_string().contains("nothing to commit"), "{err}");
-		assert!(
-			!resolved.get(),
-			"identity resolved before the empty-index guard"
-		);
-	}
-
-	#[tokio::test]
-	async fn refuses_an_unmerged_index() {
-		let (_dir, wt) = fixture().await;
-		let blob = wt.repository().write_blob(b"x\n").await.unwrap();
-		let mut index = Index::new();
-		index.record_conflict("f.txt", Some((0o100644, blob)), None, None); // a stage-1 entry
-		wt.save_index(&index).unwrap();
-
-		let err = commit(&wt, "x", who).await.unwrap_err();
-		assert!(err.to_string().contains("unmerged files"), "{err}");
 	}
 }
