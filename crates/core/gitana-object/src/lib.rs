@@ -39,7 +39,7 @@ pub use pktline::{
 };
 pub use sha1::Sha1;
 pub use sha256::Sha256;
-pub use signature::Signature;
+pub use signature::{Signature, TzOffset};
 pub use tag::{Tag, encode_tag, parse_tag};
 pub use tree::{TreeEntry, encode_tree, parse_tree};
 

@@ -6,7 +6,9 @@ use std::pin::Pin;
 
 use crate::Backend;
 use anyhow::Result;
-use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_commit, parse_tag, parse_tree};
+use gitana_object::{
+	HashAlgorithm, ObjectId, ObjectKind, Signature, parse_commit, parse_tag, parse_tree,
+};
 use gitana_repository::Repository;
 use gitana_worktree::FileDiff;
 
@@ -162,58 +164,11 @@ fn parse_mode(mode: &str) -> u32 {
 	u32::from_str_radix(mode, 8).unwrap_or(0o100644)
 }
 
-/// Split a git signature (`Name <email> <seconds> <±hhmm>`) into the identity (`Name <email>`)
-/// and a rendered date, falling back to the raw trailer if it cannot be parsed.
-fn split_signature(signature: &str) -> (&str, String) {
-	let Some(angle) = signature.rfind('>') else {
-		return (signature, String::new());
-	};
-	let (ident, trailer) = signature.split_at(angle + 1);
-	let ident = ident.trim();
-	let trailer = trailer.trim();
-	let mut parts = trailer.split_whitespace();
-	if let (Some(secs), Some(tz)) = (parts.next(), parts.next())
-		&& let Ok(secs) = secs.parse::<i64>()
-		&& let Some(date) = format_date(secs, tz)
-	{
-		return (ident, date);
+/// The identity (`Name <email>`) and rendered date of a git signature line, falling back to the raw
+/// line with no date if it cannot be parsed.
+fn split_signature(signature: &str) -> (String, String) {
+	match Signature::parse(signature) {
+		Ok(sig) => (format!("{} <{}>", sig.name, sig.email), sig.iso_date()),
+		Err(_) => (signature.to_owned(), String::new()),
 	}
-	(ident, trailer.to_owned())
-}
-
-/// Render `secs` (Unix time) in the timezone `tz` (`±hhmm`) as `YYYY-MM-DD HH:MM:SS ±hhmm`.
-fn format_date(secs: i64, tz: &str) -> Option<String> {
-	let sign = match tz.as_bytes().first()? {
-		b'+' => 1,
-		b'-' => -1,
-		_ => return None,
-	};
-	let digits = &tz[1..];
-	if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-		return None;
-	}
-	let offset =
-		sign * (digits[..2].parse::<i64>().ok()? * 3600 + digits[2..].parse::<i64>().ok()? * 60);
-	let local = secs + offset;
-	let (days, rem) = (local.div_euclid(86400), local.rem_euclid(86400));
-	let (year, month, day) = civil_from_days(days);
-	let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-	Some(format!(
-		"{year:04}-{month:02}-{day:02} {hh:02}:{mm:02}:{ss:02} {tz}"
-	))
-}
-
-/// Civil date `(year, month, day)` from a count of days since the Unix epoch (Howard Hinnant's
-/// algorithm).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-	let z = z + 719468;
-	let era = if z >= 0 { z } else { z - 146096 } / 146097;
-	let doe = z - era * 146097;
-	let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-	let year = yoe + era * 400;
-	let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-	let mp = (5 * doy + 2) / 153;
-	let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-	let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-	(if month <= 2 { year + 1 } else { year }, month, day)
 }
