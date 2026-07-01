@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::Write;
 use std::path::Path;
@@ -10,7 +9,7 @@ use gitana_object::{
 	HashAlgorithm, ObjectId, ObjectKind, Signature, parse_commit, parse_tag, parse_tree,
 };
 use gitana_repository::Repository;
-use gitana_worktree::FileDiff;
+use gitana_worktree::diff_trees;
 
 use crate::commands::diff;
 use crate::dispatch::{self, ObjectCommand};
@@ -65,13 +64,12 @@ async fn show_commit<H: HashAlgorithm>(
 	}
 	out.push(b'\n');
 
-	// Diff the first parent's tree against this commit's tree (the empty tree for a root commit).
-	let old = match commit.parents.first() {
-		Some(parent) => tree_map(repo, repo.commit_tree(*parent).await?).await?,
-		None => BTreeMap::new(),
+	// Diff the first parent's tree against this commit's tree (an empty left side for a root commit).
+	let old_tree = match commit.parents.first() {
+		Some(parent) => Some(repo.commit_tree(*parent).await?),
+		None => None,
 	};
-	let new = tree_map(repo, commit.tree).await?;
-	for file in tree_diff(repo, &old, &new).await? {
+	for file in diff_trees(repo, old_tree, commit.tree).await? {
 		diff::format_file(&mut out, &file);
 	}
 	std::io::stdout().write_all(&out)?;
@@ -105,63 +103,6 @@ fn show_tree<H: HashAlgorithm>(oid: ObjectId<H>, payload: &[u8]) -> Result<()> {
 	}
 	print!("{out}");
 	Ok(())
-}
-
-/// A tree flattened to `path -> (mode, oid)`, dropping gitlinks (submodule entries), which have
-/// no blob to diff.
-async fn tree_map<H: HashAlgorithm>(
-	repo: &Repository<Backend, H>,
-	tree: ObjectId<H>,
-) -> Result<BTreeMap<String, (String, ObjectId<H>)>> {
-	Ok(
-		repo
-			.read_tree(tree)
-			.await?
-			.into_iter()
-			.filter(|(_, mode, _)| mode != "160000")
-			.map(|(path, mode, oid)| (path, (mode, oid)))
-			.collect(),
-	)
-}
-
-/// The added, deleted, and modified paths between two flattened trees, with their blob content,
-/// ready for the unified-diff formatter. Paths are sorted (the maps are ordered).
-async fn tree_diff<H: HashAlgorithm>(
-	repo: &Repository<Backend, H>,
-	old: &BTreeMap<String, (String, ObjectId<H>)>,
-	new: &BTreeMap<String, (String, ObjectId<H>)>,
-) -> Result<Vec<FileDiff>> {
-	let mut diffs = Vec::new();
-	for (path, (omode, ooid)) in old {
-		match new.get(path) {
-			Some((nmode, noid)) if nmode == omode && noid == ooid => {}
-			Some((nmode, noid)) => diffs.push(FileDiff {
-				path: path.clone(),
-				old: Some((repo.read_blob(*ooid).await?, parse_mode(omode))),
-				new: Some((repo.read_blob(*noid).await?, parse_mode(nmode))),
-			}),
-			None => diffs.push(FileDiff {
-				path: path.clone(),
-				old: Some((repo.read_blob(*ooid).await?, parse_mode(omode))),
-				new: None,
-			}),
-		}
-	}
-	for (path, (nmode, noid)) in new {
-		if !old.contains_key(path) {
-			diffs.push(FileDiff {
-				path: path.clone(),
-				old: None,
-				new: Some((repo.read_blob(*noid).await?, parse_mode(nmode))),
-			});
-		}
-	}
-	diffs.sort_by(|a, b| a.path.cmp(&b.path));
-	Ok(diffs)
-}
-
-fn parse_mode(mode: &str) -> u32 {
-	u32::from_str_radix(mode, 8).unwrap_or(0o100644)
 }
 
 /// The identity (`Name <email>`) and rendered date of a git signature line, falling back to the raw

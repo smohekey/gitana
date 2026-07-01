@@ -9,6 +9,7 @@ use std::path::Path;
 
 use gitana_file_store::FileStore;
 use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_repository::Repository;
 
 use crate::fsmeta::{blob_of, file_mode, path_bytes};
 use crate::worktree::stat_matches;
@@ -107,20 +108,67 @@ pub(crate) async fn staged<F: FileStore, H: HashAlgorithm>(
 		}
 		out.push(FileDiff {
 			path: path.clone(),
-			old: self::side(wt, old).await?,
-			new: self::side(wt, new).await?,
+			old: side(wt.repository(), old).await?,
+			new: side(wt.repository(), new).await?,
 		});
 	}
 	Ok(out)
 }
 
+/// The content changes between two tree objects (`old` → `new`), for showing a commit or a
+/// tree-to-tree diff. `old` is `None` for an empty left side (a root commit has no parent) — an
+/// empty side is represented in memory, never materialised, so this stays read-only. Needs only the
+/// repository — no working tree — but produces the same [`FileDiff`]s as the index/working-tree
+/// diffs, so it lives alongside them. Submodule (gitlink) entries are skipped: no blob to diff.
+pub async fn trees<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	old: Option<ObjectId<H>>,
+	new: ObjectId<H>,
+) -> Result<Vec<FileDiff>, WorktreeError> {
+	let old = match old {
+		Some(tree) => tree_entries(repo, tree).await?,
+		None => BTreeMap::new(),
+	};
+	let new = tree_entries(repo, new).await?;
+	let paths: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+	let mut out = Vec::new();
+	for path in paths {
+		let (o, n) = (old.get(path), new.get(path));
+		if o == n {
+			continue;
+		}
+		out.push(FileDiff {
+			path: path.clone(),
+			old: side(repo, o).await?,
+			new: side(repo, n).await?,
+		});
+	}
+	Ok(out)
+}
+
+/// A tree flattened to `path -> (mode, oid)`, dropping gitlinks (submodule entries).
+async fn tree_entries<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	tree: ObjectId<H>,
+) -> Result<BTreeMap<String, (u32, ObjectId<H>)>, WorktreeError> {
+	Ok(
+		repo
+			.read_tree(tree)
+			.await?
+			.into_iter()
+			.filter(|(_, mode, _)| mode != "160000")
+			.map(|(path, mode, oid)| (path, (parse_mode(&mode), oid)))
+			.collect(),
+	)
+}
+
 /// Resolve a `(mode, oid)` reference to its blob content and mode, or `None`.
 async fn side<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+	repo: &Repository<F, H>,
 	what: Option<&(u32, ObjectId<H>)>,
 ) -> Result<Option<(Vec<u8>, u32)>, WorktreeError> {
 	match what {
-		Some((mode, oid)) => Ok(Some((wt.repository().read_blob(*oid).await?, *mode))),
+		Some((mode, oid)) => Ok(Some((repo.read_blob(*oid).await?, *mode))),
 		None => Ok(None),
 	}
 }

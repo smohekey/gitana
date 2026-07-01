@@ -20,7 +20,7 @@ mod rm;
 mod status;
 mod worktree;
 
-pub use diff::FileDiff;
+pub use diff::{FileDiff, trees as diff_trees};
 pub use entry::{IndexEntry, Stat};
 pub use error::WorktreeError;
 pub use index::{Conflict, Index};
