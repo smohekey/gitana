@@ -32,8 +32,9 @@ impl WorkTreeCommand for Commit<'_> {
 				"you are in the middle of a rebase; run `gta rebase --continue` instead of `gta commit`"
 			);
 		}
-		// Concluding an in-progress operation: each produces the right shape of commit and clears its
-		// state. (cherry-pick/revert completions move to porcelain with their slice of the cluster.)
+		// Concluding an in-progress operation: each porcelain `continue_*` produces the right shape of
+		// commit (two-parent merge / author-preserving pick / reverter-authored revert) and clears its
+		// state.
 		if repo.merge_head().await?.is_some() {
 			let commit =
 				gitana_porcelain::continue_merge(&worktree, Some(self.message.to_owned()), &identity)
@@ -42,11 +43,18 @@ impl WorkTreeCommand for Commit<'_> {
 			return Ok(());
 		}
 		if repo.cherry_pick_head().await?.is_some() {
-			return crate::commands::cherry_pick::complete(&worktree, Some(self.message.to_owned()))
-				.await;
+			let commit =
+				gitana_porcelain::continue_cherry_pick(&worktree, Some(self.message.to_owned()), &identity)
+					.await?;
+			println!("{commit}");
+			return Ok(());
 		}
 		if repo.revert_head().await?.is_some() {
-			return crate::commands::revert::complete(&worktree, Some(self.message.to_owned())).await;
+			let commit =
+				gitana_porcelain::continue_revert(&worktree, Some(self.message.to_owned()), &identity)
+					.await?;
+			println!("{commit}");
+			return Ok(());
 		}
 
 		// Plain commit: the porcelain operation records the staged tree (refusing an unmerged or empty

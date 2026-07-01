@@ -9,12 +9,16 @@
 
 use anyhow::Result;
 
+mod cherry_pick;
 mod commit;
 pub mod conflict;
 mod merge;
+mod revert;
 
+pub use cherry_pick::{PickOutcome, abort_cherry_pick, cherry_pick, continue_cherry_pick};
 pub use commit::commit;
 pub use merge::{MergeOutcome, abort_merge, continue_merge, merge};
+pub use revert::{RevertOutcome, abort_revert, continue_revert, revert};
 
 /// Resolves the git identity lines (`Name <email> seconds ±hhmm`) for operations that record commits.
 /// The engine never reads process env / config directly; the CLI adapter implements this over its
@@ -38,7 +42,7 @@ pub(crate) mod test_support {
 	use gitana_file_store_local::LocalFileStore;
 	use gitana_object::{ObjectId, Sha256};
 	use gitana_object_store::ObjectStore;
-	use gitana_repository::Repository;
+	use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 	use gitana_worktree::{Index, IndexEntry, Stat, WorkTree};
 
 	use crate::Identity;
@@ -67,6 +71,22 @@ pub(crate) mod test_support {
 		}
 	}
 
+	/// An [`Identity`] whose author/committer resolution always fails — for asserting a path that does
+	/// not record a commit (e.g. a conflict that only materialises state) never resolves identity.
+	pub(crate) struct FailingIdentity;
+
+	impl Identity for FailingIdentity {
+		async fn author(&self) -> Result<String> {
+			anyhow::bail!("identity name not set")
+		}
+		async fn committer(&self) -> Result<String> {
+			anyhow::bail!("identity name not set")
+		}
+		async fn committer_or_default(&self) -> String {
+			WHO.to_owned()
+		}
+	}
+
 	/// A fresh repository (config + an unborn `main`) with a work tree, over a temp `LocalFileStore`.
 	pub(crate) async fn fixture() -> (tempfile::TempDir, WorkTree<LocalFileStore, Sha256>) {
 		let dir = tempfile::TempDir::new().unwrap();
@@ -88,5 +108,44 @@ pub(crate) mod test_support {
 			assume_valid: false,
 			path: path.to_owned(),
 		});
+	}
+
+	/// Commit `content` at `path` on the current branch via the porcelain `commit`, keeping the work
+	/// tree on disk in sync (write the file, stage it, commit) so later operations see a clean tree.
+	pub(crate) async fn commit_file(
+		dir: &std::path::Path,
+		wt: &WorkTree<LocalFileStore, Sha256>,
+		path: &str,
+		content: &[u8],
+		identity: &TestIdentity,
+	) -> ObjectId<Sha256> {
+		std::fs::write(dir.join(path), content).unwrap();
+		wt.add(&[path], "").await.unwrap();
+		crate::commit(wt, &format!("add {path}"), identity)
+			.await
+			.unwrap()
+	}
+
+	/// An off-branch commit of a single file (a sibling/child not on `main`), for divergent histories.
+	/// Authored by [`WHO`].
+	pub(crate) async fn loose_commit(
+		repo: &Repository<LocalFileStore, Sha256>,
+		parents: Vec<ObjectId<Sha256>>,
+		path: &str,
+		content: &[u8],
+	) -> ObjectId<Sha256> {
+		let blob = repo.write_blob(content).await.unwrap();
+		let tree = repo
+			.write_tree(&[TreeBuildEntry {
+				path: path.to_owned(),
+				mode: FileMode::Regular,
+				id: blob,
+			}])
+			.await
+			.unwrap();
+		repo
+			.create_commit(tree, parents, WHO, WHO, "loose\n")
+			.await
+			.unwrap()
 	}
 }

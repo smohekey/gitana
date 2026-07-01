@@ -13,6 +13,7 @@ use crate::Identity;
 use crate::conflict;
 
 /// The result of starting a [`merge`].
+#[derive(Debug)]
 pub enum MergeOutcome<H: HashAlgorithm> {
 	/// `commit` is already reachable from the current tip; nothing was done.
 	AlreadyUpToDate,
@@ -322,50 +323,8 @@ async fn virtual_base_tree<F: FileStore, H: HashAlgorithm>(
 
 #[cfg(test)]
 mod tests {
-	use gitana_object::{ObjectId, Sha256};
-	use gitana_repository::{FileMode, Repository, TreeBuildEntry};
-	use gitana_worktree::WorkTree;
-
 	use super::*;
-	use crate::test_support::{TestIdentity, WHO, fixture};
-
-	/// Commit `content` at `path` on the current branch via the porcelain `commit`, keeping the work
-	/// tree on disk in sync (write the file, stage it, commit) so later merges see a clean tree.
-	async fn commit_file(
-		dir: &std::path::Path,
-		wt: &WorkTree<impl gitana_file_store::FileStore, Sha256>,
-		path: &str,
-		content: &[u8],
-		identity: &TestIdentity,
-	) -> ObjectId<Sha256> {
-		std::fs::write(dir.join(path), content).unwrap();
-		wt.add(&[path], "").await.unwrap();
-		crate::commit(wt, &format!("add {path}"), identity)
-			.await
-			.unwrap()
-	}
-
-	/// An off-branch commit of a single file (a sibling/child not on `main`), for divergent histories.
-	async fn loose_commit(
-		repo: &Repository<impl gitana_file_store::FileStore, Sha256>,
-		parents: Vec<ObjectId<Sha256>>,
-		path: &str,
-		content: &[u8],
-	) -> ObjectId<Sha256> {
-		let blob = repo.write_blob(content).await.unwrap();
-		let tree = repo
-			.write_tree(&[TreeBuildEntry {
-				path: path.to_owned(),
-				mode: FileMode::Regular,
-				id: blob,
-			}])
-			.await
-			.unwrap();
-		repo
-			.create_commit(tree, parents, WHO, WHO, "loose\n")
-			.await
-			.unwrap()
-	}
+	use crate::test_support::{TestIdentity, commit_file, fixture, loose_commit};
 
 	#[tokio::test]
 	async fn already_up_to_date_when_target_is_reachable() {

@@ -5,7 +5,7 @@
 //! turning the conflict into the process's exit.
 
 pub(crate) use gitana_porcelain::conflict::{
-	ensure_trailing_newline, index_tree, operation_in_progress, resolved_tree, restore_to_head,
+	ensure_trailing_newline, operation_in_progress, resolved_tree, restore_to_head,
 	write_conflicted_state,
 };
 
