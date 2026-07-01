@@ -12,6 +12,7 @@ mod delta;
 mod enumerate;
 mod hash_algorithm;
 mod id;
+mod idx;
 mod kind;
 mod loose;
 mod pack;
@@ -29,9 +30,12 @@ pub use delta::apply_delta;
 pub use enumerate::{enumerate_objects, referenced_ids};
 pub use hash_algorithm::{HashAlgorithm, HashKind};
 pub use id::ObjectId;
+pub use idx::{PackIndex, PackIndexEntry, decode_pack_index, encode_pack_index};
 pub use kind::ObjectKind;
 pub use loose::{MAX_OBJECT_SIZE, decode_loose, encode_loose, loose_object_path};
-pub use pack::{PackedObject, decode_pack, decode_pack_with_bases, ref_delta_base_ids};
+pub use pack::{
+	PackedObject, decode_pack, decode_pack_with_bases, pack_index_entries, ref_delta_base_ids,
+};
 pub use pack_encode::encode_pack;
 pub use pktline::{
 	DELIM_PKT, FLUSH_PKT, MAX_PKT_DATA, PktLine, RESPONSE_END_PKT, parse_pkt, write_delim,
@@ -70,6 +74,11 @@ pub enum ObjectError {
 	/// A packfile's structure was invalid (bad signature, header, or trailer).
 	#[error("malformed packfile")]
 	MalformedPack,
+	/// A pack index (`.idx`) had a bad signature, version, size, duplicate/out-of-order id,
+	/// or trailing checksum — either when decoding one or when asked to encode entries that
+	/// cannot form a valid index.
+	#[error("malformed pack index")]
+	MalformedPackIndex,
 	/// A delta's instructions were invalid or referenced outside the base.
 	#[error("malformed delta")]
 	MalformedDelta,

@@ -1,14 +1,15 @@
 //! Reader for git packfiles (v2), resolving OFS and REF deltas.
 //!
 //! Decodes a self-contained pack into fully materialised objects with their ids under
-//! the hash algorithm `H`. Thin packs (REF deltas whose base is not in the pack) are
-//! rejected with [`ObjectError::UnresolvedDeltaBase`]. The pack trailer hash is
-//! verified before any entry is read.
+//! the hash algorithm `H`. Deltas resolve regardless of order, so a REF delta may precede
+//! its base in the pack (as `git index-pack` allows). Thin packs (REF deltas whose base is
+//! not in the pack) are rejected with [`ObjectError::UnresolvedDeltaBase`]. The pack
+//! trailer hash is verified before any entry is read.
 
 use std::collections::HashMap;
 
 use crate::loose::MAX_OBJECT_SIZE;
-use crate::{HashAlgorithm, ObjectError, ObjectId, ObjectKind, apply_delta};
+use crate::{HashAlgorithm, ObjectError, ObjectId, ObjectKind, PackIndexEntry, apply_delta};
 
 const HEADER_LEN: usize = 12;
 
@@ -50,6 +51,95 @@ pub fn decode_pack_with_bases<H: HashAlgorithm>(
 	bytes: &[u8],
 	external_bases: &HashMap<ObjectId<H>, (ObjectKind, Vec<u8>)>,
 ) -> Result<Vec<PackedObject<H>>, ObjectError> {
+	Ok(
+		decode_entries(bytes, external_bases)?
+			.into_iter()
+			.map(|entry| entry.object)
+			.collect(),
+	)
+}
+
+/// The `.idx` entries for a self-contained pack: each object's id, byte offset, and the
+/// CRC-32 of its packed bytes. Feeds [`crate::encode_pack_index`]. Resolves deltas to
+/// recover ids (like [`decode_pack`]), so a thin pack is rejected with
+/// [`ObjectError::UnresolvedDeltaBase`].
+pub fn pack_index_entries<H: HashAlgorithm>(
+	bytes: &[u8],
+) -> Result<Vec<PackIndexEntry<H>>, ObjectError> {
+	Ok(
+		decode_entries(bytes, &HashMap::new())?
+			.into_iter()
+			.map(|entry| PackIndexEntry {
+				id: entry.object.id,
+				offset: entry.offset,
+				crc32: entry.crc32,
+			})
+			.collect(),
+	)
+}
+
+/// A decoded pack entry: the materialised object plus its pack location — byte offset and
+/// the CRC-32 of its packed bytes — everything both a plain decode and a `.idx` need.
+struct DecodedEntry<H: HashAlgorithm> {
+	object: PackedObject<H>,
+	offset: u64,
+	crc32: u32,
+}
+
+/// Apply `delta` to `base` (borrowed, never copied — a base can be up to `MAX_OBJECT_SIZE`)
+/// and wrap the result as a materialised object of `kind`, computing its id.
+fn apply_delta_object<H: HashAlgorithm>(
+	kind: ObjectKind,
+	base: &[u8],
+	delta: &[u8],
+) -> Result<PackedObject<H>, ObjectError> {
+	let data = apply_delta(base, delta)?;
+	let id = ObjectId::<H>::compute(kind, &data);
+	Ok(PackedObject { id, kind, data })
+}
+
+/// Seed the resolve worklist with REF deltas whose base is only in `external_bases` (a thin
+/// pack): such a base never enters the in-pack `ready` queue, so resolve its waiters here,
+/// removing them from `waiting_by_id` and queueing each so its own dependents unblock in turn.
+fn resolve_external_ref_deltas<H: HashAlgorithm>(
+	external_bases: &HashMap<ObjectId<H>, (ObjectKind, Vec<u8>)>,
+	deltas: &[Option<Vec<u8>>],
+	waiting_by_id: &mut HashMap<ObjectId<H>, Vec<usize>>,
+	resolved: &mut [Option<PackedObject<H>>],
+	ready: &mut Vec<usize>,
+) -> Result<(), ObjectError> {
+	for (base_id, (kind, data)) in external_bases {
+		let Some(waiters) = waiting_by_id.remove(base_id) else {
+			continue;
+		};
+		for waiter in waiters {
+			if resolved[waiter].is_none() {
+				let delta = deltas[waiter]
+					.as_ref()
+					.expect("a filed delta has its bytes");
+				resolved[waiter] = Some(apply_delta_object(*kind, data, delta)?);
+				ready.push(waiter);
+			}
+		}
+	}
+	Ok(())
+}
+
+/// Decode every entry of a self-contained pack: materialise each object and record its byte
+/// offset and the CRC-32 of its packed bytes. Shared by [`decode_pack_with_bases`] and
+/// [`pack_index_entries`]. The pack trailer hash is verified before any entry is read.
+///
+/// Resolution is two-pass so delta order does not matter: the scan pass materialises base
+/// objects and files deltas under their base; a dependency worklist then resolves them in
+/// one linear sweep, letting a REF delta's base appear *later* in the pack (which
+/// `git index-pack` allows and a single forward pass would reject). OFS deltas still
+/// reference a strictly earlier offset. A REF base found in neither the pack nor
+/// `external_bases` (a thin pack), or a delta cycle, fails with
+/// [`ObjectError::UnresolvedDeltaBase`]. Returned in pack order.
+fn decode_entries<H: HashAlgorithm>(
+	bytes: &[u8],
+	external_bases: &HashMap<ObjectId<H>, (ObjectKind, Vec<u8>)>,
+) -> Result<Vec<DecodedEntry<H>>, ObjectError> {
 	let trailer_len = H::RAW_LEN;
 	if bytes.len() < HEADER_LEN + trailer_len {
 		return Err(ObjectError::MalformedPack);
@@ -65,61 +155,114 @@ pub fn decode_pack_with_bases<H: HashAlgorithm>(
 		return Err(ObjectError::MalformedPack);
 	}
 
-	let mut objects: Vec<PackedObject<H>> = Vec::with_capacity(count);
+	// Scan pass: parse every entry's location (byte offset + CRC-32). Base objects are
+	// materialised at once and queued in `ready`; deltas are filed under the base they wait
+	// for — `waiting_by_offset` for OFS (an earlier byte offset), `waiting_by_id` for REF (an
+	// id that may lie later in the pack or in `external_bases`). `deltas[i]` holds the raw delta.
+	let mut resolved: Vec<Option<PackedObject<H>>> = (0..count).map(|_| None).collect();
+	let mut deltas: Vec<Option<Vec<u8>>> = (0..count).map(|_| None).collect();
+	let mut offsets: Vec<usize> = Vec::with_capacity(count);
+	let mut crcs: Vec<u32> = Vec::with_capacity(count);
 	let mut by_offset: HashMap<usize, usize> = HashMap::with_capacity(count);
-	let mut by_id: HashMap<ObjectId<H>, usize> = HashMap::with_capacity(count);
+	let mut waiting_by_offset: HashMap<usize, Vec<usize>> = HashMap::new();
+	let mut waiting_by_id: HashMap<ObjectId<H>, Vec<usize>> = HashMap::new();
+	let mut ready: Vec<usize> = Vec::new();
 
 	let mut cursor = HEADER_LEN;
-	for _ in 0..count {
+	for index in 0..count {
 		let entry_start = cursor;
 		let (raw_type, size) = read_object_header(bytes, &mut cursor)?;
 
-		let (kind, data) = match raw_type {
+		match raw_type {
 			OBJ_COMMIT | OBJ_TREE | OBJ_BLOB | OBJ_TAG => {
 				let (data, consumed) = inflate(&bytes[cursor..body_end], size)?;
 				cursor += consumed;
-				(kind_of(raw_type)?, data)
+				let kind = kind_of(raw_type)?;
+				let id = ObjectId::<H>::compute(kind, &data);
+				resolved[index] = Some(PackedObject { id, kind, data });
+				ready.push(index);
 			}
 			OBJ_OFS_DELTA => {
 				let distance = read_offset(bytes, &mut cursor)?;
 				let base_start = entry_start
 					.checked_sub(distance)
 					.ok_or(ObjectError::MalformedPack)?;
-				let base_index = *by_offset
-					.get(&base_start)
-					.ok_or(ObjectError::MalformedPack)?;
+				// OFS bases point strictly earlier, so a valid one is already in `by_offset`.
+				if base_start >= entry_start || !by_offset.contains_key(&base_start) {
+					return Err(ObjectError::MalformedPack);
+				}
 				let (delta, consumed) = inflate(&bytes[cursor..body_end], size)?;
 				cursor += consumed;
-				let base = &objects[base_index];
-				(base.kind, apply_delta(&base.data, &delta)?)
+				deltas[index] = Some(delta);
+				waiting_by_offset.entry(base_start).or_default().push(index);
 			}
 			OBJ_REF_DELTA => {
 				let base_id = read_object_id::<H>(bytes, &mut cursor)?;
 				let (delta, consumed) = inflate(&bytes[cursor..body_end], size)?;
 				cursor += consumed;
-				if let Some(&base_index) = by_id.get(&base_id) {
-					let base = &objects[base_index];
-					(base.kind, apply_delta(&base.data, &delta)?)
-				} else if let Some((kind, data)) = external_bases.get(&base_id) {
-					(*kind, apply_delta(data, &delta)?)
-				} else {
-					return Err(ObjectError::UnresolvedDeltaBase);
-				}
+				deltas[index] = Some(delta);
+				waiting_by_id.entry(base_id).or_default().push(index);
 			}
 			_ => return Err(ObjectError::MalformedPack),
-		};
+		}
 
-		let id = ObjectId::<H>::compute(kind, &data);
-		let index = objects.len();
 		by_offset.insert(entry_start, index);
-		by_id.insert(id, index);
-		objects.push(PackedObject { id, kind, data });
+		let mut crc = flate2::Crc::new();
+		crc.update(&bytes[entry_start..cursor]);
+		offsets.push(entry_start);
+		crcs.push(crc.sum());
 	}
 
 	if cursor != body_end {
 		return Err(ObjectError::MalformedPack);
 	}
-	Ok(objects)
+
+	// Resolve pass: a worklist over materialised objects. Popping one unblocks exactly the
+	// deltas waiting on its byte offset (OFS) or its id (REF), and each resolved delta is
+	// itself pushed, so a chain unwinds in a single linear sweep whatever its layout. The base
+	// is moved out while its (up to MAX_OBJECT_SIZE) payload feeds the deltas, then restored —
+	// no per-delta copy of the base.
+	resolve_external_ref_deltas(
+		external_bases,
+		&deltas,
+		&mut waiting_by_id,
+		&mut resolved,
+		&mut ready,
+	)?;
+	while let Some(index) = ready.pop() {
+		let base = resolved[index]
+			.take()
+			.expect("a queued entry is materialised");
+		let mut waiters = waiting_by_offset
+			.remove(&offsets[index])
+			.unwrap_or_default();
+		if let Some(mut by_id) = waiting_by_id.remove(&base.id) {
+			waiters.append(&mut by_id);
+		}
+		for waiter in waiters {
+			if resolved[waiter].is_none() {
+				let delta = deltas[waiter]
+					.as_ref()
+					.expect("a filed delta has its bytes");
+				resolved[waiter] = Some(apply_delta_object(base.kind, &base.data, delta)?);
+				ready.push(waiter);
+			}
+		}
+		resolved[index] = Some(base);
+	}
+
+	// Emit in pack order. A slot still empty is a delta whose base is absent (a thin pack) or
+	// part of a cycle — unresolvable.
+	let mut entries = Vec::with_capacity(count);
+	for (index, slot) in resolved.into_iter().enumerate() {
+		let object = slot.ok_or(ObjectError::UnresolvedDeltaBase)?;
+		entries.push(DecodedEntry {
+			object,
+			offset: offsets[index] as u64,
+			crc32: crcs[index],
+		});
+	}
+	Ok(entries)
 }
 
 /// The base ids referenced by a pack's REF-delta entries, without resolving them.
@@ -381,6 +524,42 @@ mod tests {
 		);
 		assert_eq!(objects[2].data, b"world?");
 		assert_eq!(objects[2].kind, ObjectKind::Blob);
+	}
+
+	#[test]
+	fn decodes_out_of_order_ref_delta_chain() {
+		// A chain of REF deltas laid out back-to-front: D2 (index 0) → D1 (index 1) → O
+		// (index 2). Neither delta's base precedes it, so the resolver must iterate — D1
+		// resolves once O is known, then D2 once D1 is. git index-pack accepts this shape;
+		// the old single forward pass rejected it with UnresolvedDeltaBase.
+		let o = b"abcdefgh";
+		let id_o = ObjectId::<Sha256>::compute(ObjectKind::Blob, o);
+		let d1_out = b"abcdefghX";
+		let id_d1 = ObjectId::<Sha256>::compute(ObjectKind::Blob, d1_out);
+
+		let d1 = delta(o.len(), 0, o.len(), b"X");
+		let d2 = delta(d1_out.len(), 0, d1_out.len(), b"Y");
+
+		let mut body = Vec::new();
+		body.extend(obj_header(OBJ_REF_DELTA, d2.len()));
+		body.extend(id_d1.as_bytes());
+		body.extend(zlib(&d2));
+		body.extend(obj_header(OBJ_REF_DELTA, d1.len()));
+		body.extend(id_o.as_bytes());
+		body.extend(zlib(&d1));
+		body.extend(obj_header(OBJ_BLOB, o.len()));
+		body.extend(zlib(o));
+
+		let pack = finish_pack::<Sha256>(&body, 3);
+		let objects = decode_pack::<Sha256>(&pack).expect("decode out-of-order ref-delta chain");
+
+		// Output stays in pack order, each object fully materialised.
+		assert_eq!(objects.len(), 3);
+		assert_eq!(objects[0].data, b"abcdefghXY");
+		assert_eq!(objects[1].data, b"abcdefghX");
+		assert_eq!(objects[1].id, id_d1);
+		assert_eq!(objects[2].data, o);
+		assert_eq!(objects[2].id, id_o);
 	}
 
 	#[test]
