@@ -13,9 +13,12 @@ async fn main() -> ExitCode {
 	match cli::run().await {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(error) => {
-			// A materialised merge conflict is an expected non-zero outcome, not an internal error: the
-			// conflicts were already reported, so print git's summary on stdout without the `gta:` prefix.
-			if let Some(conflict) = error.downcast_ref::<gta_core::MergeConflict>() {
+			if error.downcast_ref::<gta_core::SilentExit>().is_some() {
+				// A false predicate / empty result (e.g. `merge-base --is-ancestor`, or no common
+				// ancestor): git's non-zero-with-no-output convention, not an error. Print nothing.
+			} else if let Some(conflict) = error.downcast_ref::<gta_core::MergeConflict>() {
+				// A materialised merge conflict is an expected non-zero outcome, not an internal error:
+				// the conflicts were already reported, so print git's summary without the `gta:` prefix.
 				println!("{conflict}");
 			} else {
 				eprintln!("gta: {error:#}");

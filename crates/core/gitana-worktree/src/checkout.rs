@@ -75,37 +75,60 @@ where
 		}
 	}
 
-	for (path, mode, oid) in &target {
-		// Without `force`, leave a path unchanged from the index alone — so a local edit to a file
-		// the checkout does not touch (e.g. an unrelated dirty file during a merge) is preserved,
-		// the way git does. `force` (re)writes everything, restoring such files.
-		if !force
-			&& current
-				.get(path)
-				.is_some_and(|(cm, co)| cm == mode && co == oid)
-		{
-			continue;
+	// Take the index lock before touching the working tree, so a held lock aborts here — before any
+	// filesystem change — rather than after, which would leave the tree inconsistent with the index.
+	// On a mid-materialise failure the lock is released (not orphaned) and the index is left unwritten,
+	// matching the pre-lock behaviour of not saving a partially-applied index.
+	let lock = wt.lock_index()?;
+	let result: Result<(), WorktreeError> = async {
+		// The paths the removal loop will prune: index entries (any stage) absent from the target.
+		// Spanning all stages lets a force checkout (e.g. `merge --abort`) discard leftover conflict
+		// stages too. Computed and lexically validated up front, before materialising anything, so a
+		// hostile index path (`../x`, `.git/…`) aborts with the working tree untouched. The set is the
+		// same before and after the writes, which only upsert target entries.
+		let stray: Vec<String> = index
+			.entries
+			.iter()
+			.map(|e| e.path.as_str())
+			.filter(|path| !target_paths.contains_key(path))
+			.collect::<std::collections::BTreeSet<_>>()
+			.into_iter()
+			.map(str::to_owned)
+			.collect();
+		for path in &stray {
+			validate_path(path)?;
 		}
-		write_entry(wt, path, mode, *oid, &mut index).await?;
-	}
-	// Remove every path the target no longer contains. This spans all stages, not just stage 0, so a
-	// force checkout (e.g. `merge --abort`) also discards leftover conflict stages — such as a
-	// delete/modify conflict, whose path has only stages 1/3 and is absent from the target — fully
-	// resetting the work tree and index. Outside a merge the index is all stage 0, so this is the
-	// same set as before.
-	let tracked: std::collections::BTreeSet<&str> =
-		index.entries.iter().map(|e| e.path.as_str()).collect();
-	let stray: Vec<String> = tracked
-		.into_iter()
-		.filter(|path| !target_paths.contains_key(path))
-		.map(str::to_owned)
-		.collect();
-	for path in stray {
-		remove_worktree_path(wt, &path);
-		index.remove(&path);
-	}
 
-	wt.save_index(&index)
+		for (path, mode, oid) in &target {
+			// Without `force`, leave a path unchanged from the index alone — so a local edit to a file
+			// the checkout does not touch (e.g. an unrelated dirty file during a merge) is preserved,
+			// the way git does. `force` (re)writes everything, restoring such files.
+			if !force
+				&& current
+					.get(path)
+					.is_some_and(|(cm, co)| cm == mode && co == oid)
+			{
+				continue;
+			}
+			write_entry(wt, path, mode, *oid, &mut index).await?;
+		}
+		// `remove_worktree_path` re-validates and declines to follow a symlinked ancestor (after a
+		// directory→symlink switch the stale child under the old directory is already gone), so the
+		// removal never escapes the work tree.
+		for path in &stray {
+			remove_worktree_path(wt, path)?;
+			index.remove(path);
+		}
+		Ok(())
+	}
+	.await;
+	match result {
+		Ok(()) => wt.commit_index(lock, &index),
+		Err(error) => {
+			wt.release_index_lock(lock);
+			Err(error)
+		}
+	}
 }
 
 /// Apply only the `from_tree` → `to_tree` diff to the work tree and index — git's `read-tree -m -u`
@@ -278,20 +301,34 @@ where
 }
 
 /// Remove `path` from the working tree (ignoring an already-absent file) and prune any
-/// directories left empty above it. Does not touch the index.
-pub(crate) fn remove_worktree_path<F, H>(wt: &WorkTree<F, H>, path: &str)
+/// directories left empty above it. Does not touch the index. Guards `path` first — lexically and
+/// against symlinked ancestors — so a hostile/corrupt index entry (`../victim`, `.git/…`, or
+/// `link/x` through a symlink to outside) cannot delete a file outside the work tree (the checkout
+/// CVE class); both `checkout`'s removal loop and `restore` rely on this.
+pub(crate) fn remove_worktree_path<F, H>(
+	wt: &WorkTree<F, H>,
+	path: &str,
+) -> Result<(), WorktreeError>
 where
 	F: FileStore,
 	H: HashAlgorithm,
 {
+	validate_path(path)?;
+	// Don't follow a symlinked ancestor out of the work tree: the file it would reach is not ours,
+	// and after a directory→symlink switch the stale child under the old directory is already gone.
+	if has_symlinked_ancestor(wt.work_dir(), path) {
+		return Ok(());
+	}
 	let full = wt.work_dir().join(path);
 	let _ = std::fs::remove_file(&full);
 	remove_empty_parents(wt.work_dir(), path);
+	Ok(())
 }
 
 /// Like [`remove_worktree_path`], but reports a removal failure. An already-absent file is fine;
 /// any other error (e.g. the path is now occupied by a directory) is returned so the caller can
-/// refuse rather than silently leave the file in place.
+/// refuse rather than silently leave the file in place. Validates `path` first (same escape guard
+/// as [`remove_worktree_path`]), for the tree paths the two-way merge removes.
 pub(crate) fn remove_worktree_file<F, H>(
 	wt: &WorkTree<F, H>,
 	path: &str,
@@ -300,6 +337,10 @@ where
 	F: FileStore,
 	H: HashAlgorithm,
 {
+	validate_path(path)?;
+	if has_symlinked_ancestor(wt.work_dir(), path) {
+		return Ok(());
+	}
 	let full = wt.work_dir().join(path);
 	match std::fs::remove_file(&full) {
 		Ok(()) => {}
@@ -308,6 +349,27 @@ where
 	}
 	remove_empty_parents(wt.work_dir(), path);
 	Ok(())
+}
+
+/// Whether any ancestor directory of `path` under `root` is a symlink. A removal must not follow
+/// such an ancestor out of the work tree (the checkout CVE class): the file it would reach is not a
+/// real tracked file within the tree — and after a directory→symlink switch the stale child under
+/// the old directory is already gone — so the removal is skipped. Lexical [`validate_path`] cannot
+/// catch this: `link/x` is lexically safe, yet `link` may point outside. A non-existent ancestor is
+/// not a symlink.
+fn has_symlinked_ancestor(root: &Path, path: &str) -> bool {
+	let mut full = root.to_path_buf();
+	let parts: Vec<&str> = path.split('/').collect();
+	for part in &parts[..parts.len().saturating_sub(1)] {
+		full.push(part);
+		if std::fs::symlink_metadata(&full)
+			.map(|meta| meta.is_symlink())
+			.unwrap_or(false)
+		{
+			return true;
+		}
+	}
+	false
 }
 
 fn ensure_no_overwrite<F, H>(

@@ -17,7 +17,7 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 ## Merge And History Editing
 
 - [x] Add merge-base computation. `Repository::merge_base`/`is_ancestor` (paint-down-to-common-ancestors with redundancy removal and octopus reduction) plus a `gta merge-base [--all] [--is-ancestor]` command, oracle-tested against stock git.
-- [ ] Stop `merge-base` from calling `std::process::exit(1)` (for a false `--is-ancestor` or "no common ancestor"). Exiting from command/library code would terminate a long-lived `gta-mcp` server. Return a typed outcome the front-ends map to an exit code, the way `merge` signals a conflict via `MergeConflict` rather than exiting.
+- [x] Stop `merge-base` from calling `std::process::exit(1)` (for a false `--is-ancestor` or "no common ancestor"). It now returns a typed `gta_core::SilentExit { reason }`; `gta` maps it to a non-zero exit with no output (git's convention) and `gta-mcp` surfaces `reason` as a tool error, so a library predicate no longer terminates the long-lived server. Mirrors the `MergeConflict` outcome pattern.
 - [x] Add a three-way tree merge engine. `Repository::merge_trees` recursively merges trees with diff3 line-level content merge (in the new `gitana-diff` crate); clean merges match `git merge-tree --write-tree` byte-for-byte, conflicts are reported per path. Not yet wired to the index/`merge` command.
 - [x] Extend the index and status surfaces for conflict stages and unmerged paths. `Index` gains `conflict`/`unmerged_paths`/`is_unmerged`/`record_conflict` (and `upsert`/`remove` now collapse all stages, so `add`/`rm` resolve); `commit` refuses while unmerged; and `status` reports git's `UU`/`AA`/`DD`/`AU`/`UA`/`UD`/`DU` codes and now emits tracked changes before untracked (and both lines for a path that is staged-changed *and* untracked, e.g. after `rm --cached`) — oracle-tested against `git status` on real merge conflicts.
 - [x] Add `merge` for fast-forward and true merge commits. `gta merge [-m] [--no-ff] [--ff-only] <commit>` fast-forwards or builds a two-parent merge commit (composing `merge_base`/`merge_trees`/`create_commit`/`reset_head`/`checkout`), oracle-tested against git (merged tree matches `git merge-tree`). A conflicting merge is refused cleanly; materializing conflicts (`MERGE_HEAD`, abort/continue) is the next item.
@@ -46,7 +46,7 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [ ] Add refspec parsing beyond the default `origin` fetch mapping.
 - [ ] Support explicit push refspecs.
 - [ ] Support tags in fetch and push flows.
-- [ ] Add stock `git clone` interoperability tests against a small HTTP harness.
+- [ ] Add stock `git clone` interoperability tests against a small HTTP harness. (The in-process harness in `git_smart_http.rs` is gta-to-gta; these still need stock `git` as the interop peer — likewise for fetch/push below.)
 - [ ] Add stock `git fetch` interoperability tests against a small HTTP harness.
 - [ ] Add stock `git push` interoperability tests against a small HTTP harness.
 
@@ -60,8 +60,8 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 
 ## Working Tree Details
 
-- [ ] Validate index paths in `checkout`'s removal loop, as `restore` now does. `checkout::run` calls `remove_worktree_path` on every index path not in the target tree without `validate_path`, so a hostile/corrupt index entry (`../x`) could delete a file outside the work tree. Fold the guard into `remove_worktree_path` (return `Result`) so both commands are covered.
-- [ ] Acquire the index lock before mutating the working tree in `checkout`, `restore`, and `reset`, as `rm` now does via `WorkTree::lock_index`/`commit_index`. They mutate the working tree and only then `save_index`, so a held `.git/index.lock` fails after the tree has changed, leaving it inconsistent with the index. Take the lock up front so a locked index aborts before any filesystem change.
+- [x] Validate index paths in `checkout`'s removal loop, as `restore` now does. `validate_path` is folded into `remove_worktree_path` (now `Result`-returning), so a hostile/corrupt index entry (`../victim`, `.git/…`) is refused rather than deleting a file outside the work tree; `remove_worktree_file` (the two-way-merge remove path) validates too. Regression-tested by `checkout_refuses_a_traversal_index_entry`.
+- [x] Acquire the index lock before mutating the working tree in `checkout` and `restore`, as `rm`/`mv` do via `WorkTree::lock_index`/`commit_index`. Both now take the lock up front and `commit_index` on success / `release_index_lock` on error, so a held `.git/index.lock` aborts before any filesystem change (never leaving the tree inconsistent with an unwritten index) and a mid-apply failure does not orphan the lock. `reset --hard` materialises through `checkout` (covered); `reset --mixed`/path is index-only. Regression-tested by `checkout_aborts_before_mutating_on_a_held_index_lock`.
 - [ ] Expand pathspec support beyond simple files, directories, and `.`.
 - [ ] Add more complete `.gitignore` compatibility coverage.
 - [ ] Add attributes support where it affects working-tree behavior.
@@ -83,7 +83,15 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 
 - [ ] Keep adding stock-Git oracle tests for each implemented command.
 - [ ] Add fixture repositories with branches, tags, merges, packed refs, and packs.
-- [ ] Add end-to-end clone/fetch/push tests over a local Smart HTTP harness.
+- [x] Add end-to-end clone/fetch/push tests over a local Smart HTTP harness. `gta/tests/git_smart_http.rs` runs `clone`/`fetch`/`push`/`pull` against a gta-served repo over an in-process Smart-HTTP loopback harness.
 - [ ] Add regression tests for SHA-256 repository config compatibility.
 - [ ] Track unsupported Git features explicitly in README and this checklist.
 - [ ] Periodically run the full workspace test suite before cutting milestones.
+
+## WASI / Component Target
+
+- [x] Compile the object-database layer to a `wasm32-wasip2` component. `gitana-file-store-local` runs on an internal `Backend` trait — cap-std on native, `std::fs` on wasm (cap-std's WASI deps don't build on stable) — behind the async `FileStore` facade; `crates/demo/wasm-object-db` round-trips a blob under wasmtime. See `docs/hlds/wasi-capstd-file-store.md`.
+- [ ] Thread a capability root through `gitana-worktree` (its 60+ direct `std::fs` calls) so offline work-tree operations (`add`/`status`/`checkout`/`diff`) run in a component. WASI symlink creation and the executable bit are limited and need validation there.
+- [ ] Add an HTTP transport trait over a `wasi:http` host import so `clone`/`fetch`/`push` work on the wasm target, replacing `reqwest`→`ring` (which does not build for wasip2; `gta` is native-only for the same reason).
+- [ ] Author a first-class WIT world and a reusable host-embedding crate (the demo is a wasip2 target binary, already a component on current toolchains).
+- [ ] Stream large packfile writes through a single long-lived `spawn_blocking` pump instead of one per 64 KiB chunk (a micro-optimisation of the current correct, bounded-memory streaming).

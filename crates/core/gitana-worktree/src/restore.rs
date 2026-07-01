@@ -89,50 +89,63 @@ where
 		validate_path(path)?;
 	}
 
-	for &path in &selected {
-		match source_entries.iter().find(|(p, _, _)| p == path) {
-			// Present in the source: write the chosen targets from it.
-			Some((_, mode, oid)) => {
-				if staged {
-					// Drop entries whose shape conflicts with recording `path` as a file, the way
-					// `git add` rewrites the index for a type change.
-					index.remove_type_conflicts(path);
+	// Take the index lock before mutating the working tree, so a held lock aborts before any change
+	// (as `rm`/`checkout` do) rather than after `save_index`. On a mid-apply failure the lock is
+	// released (not orphaned) and the index is left unwritten.
+	let lock = wt.lock_index()?;
+	let result: Result<(), WorktreeError> = async {
+		for &path in &selected {
+			match source_entries.iter().find(|(p, _, _)| p == path) {
+				// Present in the source: write the chosen targets from it.
+				Some((_, mode, oid)) => {
+					if staged {
+						// Drop entries whose shape conflicts with recording `path` as a file, the way
+						// `git add` rewrites the index for a type change.
+						index.remove_type_conflicts(path);
+					}
+					if worktree {
+						write_worktree_file(wt, path, mode, *oid).await?;
+					}
+					if staged {
+						// A staged-only restore leaves no fresh working-tree file to stat, so use a
+						// default stat the worktree can never match — forcing `status` to re-hash and
+						// report the entry correctly against the working tree.
+						let stat = if worktree {
+							stat_of(&std::fs::symlink_metadata(wt.work_dir().join(path))?)
+						} else {
+							Stat::default()
+						};
+						index.upsert(IndexEntry {
+							stat,
+							mode: u32::from_str_radix(mode, 8).unwrap_or(0o100644),
+							oid: *oid,
+							stage: 0,
+							assume_valid: false,
+							path: path.to_owned(),
+						});
+					}
 				}
-				if worktree {
-					write_worktree_file(wt, path, mode, *oid).await?;
-				}
-				if staged {
-					// A staged-only restore leaves no fresh working-tree file to stat, so use a
-					// default stat the worktree can never match — forcing `status` to re-hash and
-					// report the entry correctly against the working tree.
-					let stat = if worktree {
-						stat_of(&std::fs::symlink_metadata(wt.work_dir().join(path))?)
-					} else {
-						Stat::default()
-					};
-					index.upsert(IndexEntry {
-						stat,
-						mode: u32::from_str_radix(mode, 8).unwrap_or(0o100644),
-						oid: *oid,
-						stage: 0,
-						assume_valid: false,
-						path: path.to_owned(),
-					});
-				}
-			}
-			// Absent from the source but tracked: remove it from the chosen targets.
-			None => {
-				if worktree {
-					remove_worktree_path(wt, path);
-				}
-				if staged {
-					index.remove(path);
+				// Absent from the source but tracked: remove it from the chosen targets.
+				None => {
+					if worktree {
+						remove_worktree_path(wt, path)?;
+					}
+					if staged {
+						index.remove(path);
+					}
 				}
 			}
 		}
+		Ok(())
 	}
-
-	wt.save_index(&index)
+	.await;
+	match result {
+		Ok(()) => wt.commit_index(lock, &index),
+		Err(error) => {
+			wt.release_index_lock(lock);
+			Err(error)
+		}
+	}
 }
 
 /// Whether `path` is matched by an already-normalised `spec`. The empty spec matches

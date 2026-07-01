@@ -19,7 +19,15 @@ fn main() -> ExitCode {
 	match cli::execute(cli) {
 		Ok(_) => ExitCode::SUCCESS,
 		Err(error) => {
-			eprintln!("gta-mcp: {:#}", error.0);
+			if let Some(silent) = error.0.downcast_ref::<gta_core::SilentExit>() {
+				// A false predicate / empty result (e.g. `merge-base --is-ancestor`, or no common
+				// ancestor): git's non-zero-with-no-output. Print the bare reason (no `gta-mcp:`
+				// prefix) so an MCP tool call — which re-invokes this binary and builds its error from
+				// the child's stderr — surfaces "not an ancestor" / "no common ancestor" to the client.
+				eprintln!("{}", silent.reason);
+			} else {
+				eprintln!("gta-mcp: {:#}", error.0);
+			}
 			ExitCode::FAILURE
 		}
 	}

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::Backend;
+use crate::{Backend, SilentExit};
 use anyhow::{Result, bail};
 use gitana_object::HashAlgorithm;
 use gitana_repository::Repository;
@@ -44,8 +44,14 @@ impl RepoCommand for MergeBase {
 			if repo.is_ancestor(ancestor, descendant).await? {
 				return Ok(());
 			}
-			// Not an ancestor: exit 1 with no output, like git.
-			std::process::exit(1);
+			// Not an ancestor: git's exit-1-with-no-output, returned as a typed outcome rather than
+			// a process exit, so a long-lived `gta-mcp` server is not terminated.
+			return Err(
+				SilentExit {
+					reason: "not an ancestor",
+				}
+				.into(),
+			);
 		}
 
 		if self.commits.len() < 2 {
@@ -62,8 +68,14 @@ impl RepoCommand for MergeBase {
 		// order rather than sorting.
 		let bases = repo.merge_base(&ids).await?;
 		let Some(first) = bases.first() else {
-			// No common ancestor: exit 1 with no output, like git.
-			std::process::exit(1);
+			// No common ancestor: git's exit-1-with-no-output, as a typed outcome (not a process
+			// exit, so `gta-mcp` survives).
+			return Err(
+				SilentExit {
+					reason: "no common ancestor",
+				}
+				.into(),
+			);
 		};
 		if self.all {
 			for base in &bases {

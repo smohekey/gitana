@@ -20,3 +20,22 @@ impl fmt::Display for MergeConflict {
 }
 
 impl std::error::Error for MergeConflict {}
+
+/// A command result that is a non-zero exit with no CLI output — git's convention for a false
+/// predicate or an empty result (e.g. `merge-base --is-ancestor` returning false, or no common
+/// ancestor). `gta` maps it to a failing exit code and prints nothing; `gta-mcp` surfaces `reason`
+/// as the tool error. Returned instead of `std::process::exit`, so a long-lived `gta-mcp` server is
+/// not terminated by a library function deciding the process's fate.
+#[derive(Debug)]
+pub struct SilentExit {
+	/// A short explanation for structured front-ends (`gta-mcp`); `gta` ignores it and stays silent.
+	pub reason: &'static str,
+}
+
+impl fmt::Display for SilentExit {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "{}", self.reason)
+	}
+}
+
+impl std::error::Error for SilentExit {}

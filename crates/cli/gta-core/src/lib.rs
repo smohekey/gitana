@@ -9,7 +9,7 @@ mod error;
 mod identity;
 mod repo;
 
-pub use error::MergeConflict;
+pub use error::{MergeConflict, SilentExit};
 use gitana_file_store_local::WorktreeFileStore;
 
 /// The local file-store backend every command operates over: a [`WorktreeFileStore`], which routes

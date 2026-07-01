@@ -9,7 +9,7 @@ use gitana_file_store_local::LocalFileStore;
 use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
-use gitana_worktree::{WorkTree, WorktreeError};
+use gitana_worktree::{IndexEntry, Stat, WorkTree, WorktreeError};
 
 fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
 	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
@@ -469,4 +469,193 @@ fn git_supports_sha256() -> bool {
 		let _ = std::fs::remove_dir_all(&probe);
 		ok
 	})
+}
+
+/// A crafted index entry must never let a checkout delete a file outside the work tree (the
+/// checkout CVE class): the removal loop's path guard refuses `../victim` and the outside file
+/// survives.
+#[tokio::test]
+async fn checkout_refuses_a_traversal_index_entry() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("checkout-traversal");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"A\n").unwrap();
+	git(&["-C", w, "add", "."]);
+	commit(w, "one");
+	let head = git(&["-C", w, "rev-parse", "HEAD"]).trim().to_owned();
+
+	let wt = make_repo(&work);
+	let tree = wt
+		.repository()
+		.commit_tree(ObjectId::<Sha256>::from_hex(&head).unwrap())
+		.await
+		.unwrap();
+
+	// A file just outside the work tree, and an index entry crafted to unlink it on checkout.
+	let victim = work.parent().unwrap().join("victim-checkout-traversal");
+	std::fs::write(&victim, b"do not delete\n").unwrap();
+	let mut index = wt.load_index().unwrap();
+	index.upsert(IndexEntry {
+		stat: Stat::default(),
+		mode: 0o100644,
+		oid: ObjectId::<Sha256>::from_hex(&head).unwrap(),
+		stage: 0,
+		assume_valid: false,
+		path: "../victim-checkout-traversal".to_owned(),
+	});
+	wt.save_index(&index).unwrap();
+
+	// `../victim…` is absent from the target tree, so checkout's removal loop would unlink it —
+	// but the path guard refuses, leaving the outside file untouched.
+	assert!(matches!(
+		wt.checkout(tree, true).await,
+		Err(WorktreeError::UnsafePath(_))
+	));
+	assert!(
+		victim.exists(),
+		"a checkout must never delete a file outside the work tree"
+	);
+
+	std::fs::remove_file(&victim).ok();
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// A held `index.lock` must abort a checkout *before* it mutates the working tree — the lock is
+/// taken up front — so the tree is never left inconsistent with an index that could not be written.
+#[tokio::test]
+async fn checkout_aborts_before_mutating_on_a_held_index_lock() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let (work, first) = two_commits("checkout-locked");
+	// The work tree currently holds the second commit's a.txt (A2); tree1 would restore A1.
+	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"A2\n");
+
+	let wt = make_repo(&work);
+	let tree1 = wt
+		.repository()
+		.commit_tree(ObjectId::<Sha256>::from_hex(&first).unwrap())
+		.await
+		.unwrap();
+
+	// Another holder owns the index lock.
+	let lock_path = work.join(".git").join("index.lock");
+	std::fs::write(&lock_path, b"").unwrap();
+
+	assert!(matches!(
+		wt.checkout(tree1, true).await,
+		Err(WorktreeError::IndexLocked)
+	));
+	assert_eq!(
+		std::fs::read(work.join("a.txt")).unwrap(),
+		b"A2\n",
+		"a locked index must abort checkout before it mutates the working tree"
+	);
+	// The other holder's lock is left intact by the aborted attempt.
+	assert!(lock_path.exists());
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// A removal must not follow a symlinked ancestor out of the work tree: `link/x` is lexically safe
+/// but `link` may point outside, so the guard refuses it and the outside file survives.
+#[tokio::test]
+async fn checkout_refuses_removal_through_a_symlinked_ancestor() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("checkout-symlink-ancestor");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"A\n").unwrap();
+	git(&["-C", w, "add", "."]);
+	commit(w, "one");
+	let head = git(&["-C", w, "rev-parse", "HEAD"]).trim().to_owned();
+
+	// A directory outside the work tree holding a victim file, and a symlink `link` -> it inside.
+	let outside = unique_tmp("checkout-symlink-outside");
+	std::fs::create_dir_all(&outside).unwrap();
+	std::fs::write(outside.join("victim"), b"do not delete\n").unwrap();
+	std::os::unix::fs::symlink(&outside, work.join("link")).unwrap();
+
+	let wt = make_repo(&work);
+	let tree = wt
+		.repository()
+		.commit_tree(ObjectId::<Sha256>::from_hex(&head).unwrap())
+		.await
+		.unwrap();
+
+	// A crafted `link/victim` entry (absent from the target) would be unlinked through the symlink;
+	// the removal declines to follow the symlinked ancestor instead.
+	let mut index = wt.load_index().unwrap();
+	index.upsert(IndexEntry {
+		stat: Stat::default(),
+		mode: 0o100644,
+		oid: ObjectId::<Sha256>::from_hex(&head).unwrap(),
+		stage: 0,
+		assume_valid: false,
+		path: "link/victim".to_owned(),
+	});
+	wt.save_index(&index).unwrap();
+
+	// Checkout completes (dropping the crafted entry) without following the symlink, so the outside
+	// file survives.
+	wt.checkout(tree, true).await.unwrap();
+	assert!(
+		outside.join("victim").exists(),
+		"a checkout must not delete through a symlinked ancestor"
+	);
+
+	std::fs::remove_dir_all(&outside).ok();
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// A branch switch that replaces a tracked directory with a symlink must complete: checkout writes
+/// the parent symlink, then prunes the now-stale child under it *without* following the new symlink
+/// (regression: the removal guard once aborted on the just-written symlink).
+#[tokio::test]
+async fn checkout_switches_a_directory_to_a_symlink() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("checkout-dir-to-symlink");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	// Tree A: `dir` is a directory with a child.
+	std::fs::create_dir(work.join("dir")).unwrap();
+	std::fs::write(work.join("dir/file"), b"CHILD\n").unwrap();
+	git(&["-C", w, "add", "."]);
+	commit(w, "A");
+	let a = git(&["-C", w, "rev-parse", "HEAD"]).trim().to_owned();
+	// Tree B: `dir` is a symlink.
+	std::fs::remove_dir_all(work.join("dir")).unwrap();
+	std::os::unix::fs::symlink("elsewhere", work.join("dir")).unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "B");
+	let b = git(&["-C", w, "rev-parse", "HEAD"]).trim().to_owned();
+
+	// Back to A (directory) via git, so the gitana checkout to B is a clean dir→symlink switch.
+	git(&["-C", w, "reset", "--hard", &a]);
+	assert!(work.join("dir").is_dir());
+
+	let wt = make_repo(&work);
+	let tree_b = wt
+		.repository()
+		.commit_tree(ObjectId::<Sha256>::from_hex(&b).unwrap())
+		.await
+		.unwrap();
+	// The stale `dir/file` is pruned cleanly (without following the just-written `dir` symlink).
+	wt.checkout(tree_b, true).await.unwrap();
+	assert!(
+		std::fs::symlink_metadata(work.join("dir"))
+			.unwrap()
+			.is_symlink(),
+		"dir must now be a symlink"
+	);
+	assert_eq!(git(&["-C", w, "ls-files"]).trim(), "dir");
+
+	std::fs::remove_dir_all(&work).ok();
 }
