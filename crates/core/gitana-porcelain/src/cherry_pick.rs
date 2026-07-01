@@ -173,7 +173,7 @@ async fn read_commit<F: FileStore, H: HashAlgorithm>(
 	Ok(parse_commit::<H>(&payload)?)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use gitana_object::{ObjectId, Sha256, parse_commit};
 	use gitana_repository::{FileMode, Repository, TreeBuildEntry};

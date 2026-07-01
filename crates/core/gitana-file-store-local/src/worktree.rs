@@ -1,7 +1,6 @@
 //! A [`FileStore`] that understands git's *linked worktree* layout.
 
-use std::path::PathBuf;
-
+use cap_std::fs::Dir;
 use gitana_file_store::{ByteReader, DeleteOutcome, FileStore, Result, Version, WriteOutcome};
 
 use crate::LocalFileStore;
@@ -22,12 +21,13 @@ pub struct WorktreeFileStore {
 }
 
 impl WorktreeFileStore {
-	/// A store whose shared files live under `common_dir` and whose per-worktree files live under
-	/// `worktree_dir`. Pass the same path for both for an ordinary single-directory repository.
-	pub fn new(common_dir: impl Into<PathBuf>, worktree_dir: impl Into<PathBuf>) -> Self {
+	/// A store whose shared files live under the `common` capability and whose per-worktree files
+	/// live under the `worktree` capability. Pass a clone of the same `Dir` for both for an ordinary
+	/// single-directory repository.
+	pub fn new(common: Dir, worktree: Dir) -> Self {
 		Self {
-			common: LocalFileStore::new(common_dir),
-			worktree: LocalFileStore::new(worktree_dir),
+			common: LocalFileStore::from_dir(common),
+			worktree: LocalFileStore::from_dir(worktree),
 		}
 	}
 
@@ -180,13 +180,20 @@ mod tests {
 		}
 	}
 
+	/// Ambient-open a directory for a test, creating it first (the store is capability-pure and
+	/// requires an already-open `Dir`).
+	fn open_dir(path: &std::path::Path) -> Dir {
+		std::fs::create_dir_all(path).unwrap();
+		Dir::open_ambient_dir(path, cap_std::ambient_authority()).unwrap()
+	}
+
 	#[tokio::test]
 	async fn routes_writes_to_the_owning_directory() {
 		let dir = std::env::temp_dir().join(format!("wfs-route-{}", std::process::id()));
 		let common = dir.join("common");
 		let worktree = dir.join("wt");
 		let _ = std::fs::remove_dir_all(&dir);
-		let store = WorktreeFileStore::new(&common, &worktree);
+		let store = WorktreeFileStore::new(open_dir(&common), open_dir(&worktree));
 
 		// A per-worktree file lands under the worktree store; a shared one under the common store.
 		store
@@ -199,14 +206,14 @@ mod tests {
 			.unwrap();
 
 		assert_eq!(
-			LocalFileStore::new(&worktree)
+			LocalFileStore::from_dir(open_dir(&worktree))
 				.read_path("HEAD")
 				.await
 				.unwrap(),
 			b"ref: refs/heads/main\n"
 		);
 		assert_eq!(
-			LocalFileStore::new(&common)
+			LocalFileStore::from_dir(open_dir(&common))
 				.read_path("refs/heads/main")
 				.await
 				.unwrap(),

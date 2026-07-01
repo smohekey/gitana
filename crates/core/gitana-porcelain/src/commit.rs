@@ -47,7 +47,7 @@ pub async fn commit<F: FileStore, H: HashAlgorithm>(
 	)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use gitana_object::Sha256;
 	use gitana_worktree::Index;

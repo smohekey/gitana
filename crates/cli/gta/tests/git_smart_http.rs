@@ -29,7 +29,13 @@ const WHO: &str = "A U Thor <a@example.com> 0 +0000";
 /// Open the server repo fresh from its git dir. Handlers re-open per request so pushes persist on
 /// disk between requests; the tests never touch it concurrently.
 fn open(git_dir: &Path) -> Repository<LocalFileStore, Sha256> {
-	Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(git_dir)))
+	Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(git_dir),
+	)))
+}
+
+fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
+	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
 }
 
 /// `GET /info/refs?service=…` — the v0 ref advertisement.

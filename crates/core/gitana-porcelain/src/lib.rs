@@ -38,7 +38,9 @@ pub trait Identity {
 	async fn committer_or_default(&self) -> String;
 }
 
-#[cfg(test)]
+// The fixtures build a native cap-std `LocalFileStore` (`from_dir`), so the test module is
+// native-only — keeping `--target wasm32-wasip2 --all-targets` clean.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod test_support {
 	use std::cell::Cell;
 
@@ -91,12 +93,18 @@ pub(crate) mod test_support {
 		}
 	}
 
+	pub(crate) fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
+		cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
+	}
+
 	/// A fresh repository (config + an unborn `main`) with a work tree, over a temp `LocalFileStore`.
 	pub(crate) async fn fixture() -> (tempfile::TempDir, WorkTree<LocalFileStore, Sha256>) {
 		let dir = tempfile::TempDir::new().unwrap();
 		let git_dir = dir.path().join(".git");
 		std::fs::create_dir_all(&git_dir).unwrap();
-		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			open_dir(&git_dir),
+		)));
 		repo.init().await.unwrap();
 		let wt = WorkTree::new(repo, dir.path().to_path_buf(), git_dir);
 		(dir, wt)

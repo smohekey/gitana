@@ -174,7 +174,7 @@ async fn read_commit<F: FileStore, H: HashAlgorithm>(
 	Ok(parse_commit::<H>(&payload)?)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use super::*;
 	use crate::test_support::{FailingIdentity, TestIdentity, commit_file, fixture};

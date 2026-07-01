@@ -30,7 +30,7 @@ async fn fetch_into<H: HashAlgorithm>(
 	found: &repo::Discovered,
 	body: &[u8],
 ) -> Result<()> {
-	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir);
+	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
 	gitana_porcelain::fetch(&repository, origin, body).await?;
 	println!("Fetched from {}", origin.url);
 	Ok(())

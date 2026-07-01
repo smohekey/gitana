@@ -41,7 +41,7 @@ async fn pull_into<H: HashAlgorithm>(
 		.work
 		.clone()
 		.context("cannot pull in a bare repository")?;
-	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir);
+	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
 	let worktree = WorkTree::new(repository, work, found.git_dir.clone());
 
 	gitana_porcelain::fetch(worktree.repository(), origin, body).await?;

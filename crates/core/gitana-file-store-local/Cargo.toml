@@ -12,9 +12,21 @@ workspace = true
 [dependencies]
 gitana-file-store.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
+# `io-util` (AsyncReadExt) is needed on every target to drain streamed writes.
+tokio = { workspace = true, features = ["io-util"] }
 
-[dev-dependencies]
+# Native-only: cap-std is the capability backend (its WASI deps don't build on stable),
+# `spawn_blocking` keeps the reactor unblocked while the sync backend runs, and `sync`
+# backs the per-path CAS mutex. On wasm the backend is `std::fs` and the store runs the
+# sync calls directly (single-threaded), carrying no tokio runtime.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cap-std.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+# The tests exercise the native cap-std backend (`from_dir`), so they and their deps are
+# native-only — keeping `cargo check --target wasm32-wasip2 --all-targets` clean.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+cap-std.workspace = true
 gitana-file-store-conformance.workspace = true
 tokio = { workspace = true, features = [
 	"macros",

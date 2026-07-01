@@ -321,7 +321,7 @@ async fn virtual_base_tree<F: FileStore, H: HashAlgorithm>(
 	Ok(base_tree)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use super::*;
 	use crate::test_support::{TestIdentity, commit_file, fixture, loose_commit};

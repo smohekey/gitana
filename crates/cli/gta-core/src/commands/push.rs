@@ -46,7 +46,7 @@ async fn push_into<H: HashAlgorithm>(
 	force: bool,
 	delete: Option<String>,
 ) -> Result<()> {
-	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir);
+	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
 	let outcome = gitana_porcelain::push(
 		&repository,
 		origin,

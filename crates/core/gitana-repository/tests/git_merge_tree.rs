@@ -1,6 +1,7 @@
 //! `Repository::merge_trees` cross-checked against `git merge-tree --write-tree`: a clean,
 //! well-separated three-way merge must produce the byte-identical tree git does, and a divergent
 //! edit must be reported as a conflict (which git also rejects).
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,6 +10,10 @@ use gitana_file_store_local::LocalFileStore;
 use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
+
+fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
+	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
+}
 
 #[tokio::test]
 async fn clean_merge_matches_git_merge_tree() {
@@ -202,7 +207,9 @@ fn make_executable(work: &Path, name: &str) {
 }
 
 fn repo(work: &Path) -> Repository<LocalFileStore, Sha256> {
-	Repository::new(ObjectStore::new(LocalFileStore::new(work.join(".git"))))
+	Repository::new(ObjectStore::new(LocalFileStore::from_dir(open_dir(
+		work.join(".git"),
+	))))
 }
 
 fn tree_of(w: &str, commit: &str) -> ObjectId<Sha256> {

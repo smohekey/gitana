@@ -56,8 +56,8 @@ pub trait WorkTreeCommand {
 pub async fn on_repo<C: RepoCommand>(cwd: &Path, command: C) -> Result<()> {
 	let found = repo::discover(cwd)?;
 	match detect_algorithm(&found.common_dir)? {
-		HashKind::Sha1 => command.run(open::<Sha1>(&found)).await,
-		HashKind::Sha256 => command.run(open::<Sha256>(&found)).await,
+		HashKind::Sha1 => command.run(open::<Sha1>(&found)?).await,
+		HashKind::Sha256 => command.run(open::<Sha256>(&found)?).await,
 	}
 }
 
@@ -68,18 +68,18 @@ pub async fn on_worktree<C: WorkTreeCommand>(cwd: &Path, command: C) -> Result<(
 	let work = found.work.clone().expect("discovered work tree");
 	match detect_algorithm(&found.common_dir)? {
 		HashKind::Sha1 => {
-			let wt = WorkTree::new(open::<Sha1>(&found), work, found.git_dir);
+			let wt = WorkTree::new(open::<Sha1>(&found)?, work, found.git_dir);
 			command.run(wt, prefix).await
 		}
 		HashKind::Sha256 => {
-			let wt = WorkTree::new(open::<Sha256>(&found), work, found.git_dir);
+			let wt = WorkTree::new(open::<Sha256>(&found)?, work, found.git_dir);
 			command.run(wt, prefix).await
 		}
 	}
 }
 
 /// Open the discovered repository under `H`, routing per-worktree and shared files correctly.
-fn open<H: HashAlgorithm>(found: &Discovered) -> Repository<Backend, H> {
+fn open<H: HashAlgorithm>(found: &Discovered) -> Result<Repository<Backend, H>> {
 	repo::open_generic::<H>(&found.git_dir, &found.common_dir)
 }
 
@@ -117,13 +117,13 @@ async fn resolve_object<H: HashAlgorithm>(
 	found: &Discovered,
 	spec: &str,
 ) -> Result<(Repository<Backend, H>, ObjectId<H>)> {
-	let repo = open::<H>(found);
+	let repo = open::<H>(found)?;
 	let oid = if spec.starts_with(':') {
 		let work = found
 			.work
 			.clone()
 			.ok_or_else(|| anyhow!("this operation must be run in a work tree"))?;
-		WorkTree::new(open::<H>(found), work, found.git_dir.clone())
+		WorkTree::new(open::<H>(found)?, work, found.git_dir.clone())
 			.rev_parse(spec)
 			.await?
 	} else {

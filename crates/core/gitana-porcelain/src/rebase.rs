@@ -341,7 +341,7 @@ fn short<H: HashAlgorithm>(id: ObjectId<H>) -> String {
 	hex[..12.min(hex.len())].to_owned()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use gitana_object::{ObjectId, Sha256};
 

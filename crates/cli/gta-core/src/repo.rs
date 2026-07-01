@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use gitana_object::HashAlgorithm;
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
@@ -118,10 +120,20 @@ fn work_tree_required() -> anyhow::Error {
 /// under `common_dir`, under an explicit hash algorithm `H`. (The two are the same path for an
 /// ordinary, non-linked repository.) The runtime dispatch (see [`crate::dispatch`]) picks `H` from
 /// the repo's config and calls this, so each command body is monomorphised once per algorithm.
-pub fn open_generic<H: HashAlgorithm>(git_dir: &Path, common_dir: &Path) -> Repository<Backend, H> {
-	Repository::new(ObjectStore::new(WorktreeFileStore::new(
-		common_dir, git_dir,
-	)))
+pub fn open_generic<H: HashAlgorithm>(
+	git_dir: &Path,
+	common_dir: &Path,
+) -> Result<Repository<Backend, H>> {
+	// The store is capability-pure: open the (already-created) directories here, at the
+	// program edge, and hand the capabilities in. This is the one place gta mints ambient
+	// filesystem authority from a path.
+	let common = Dir::open_ambient_dir(common_dir, ambient_authority())
+		.map_err(|error| anyhow!("opening {}: {error}", common_dir.display()))?;
+	let git = Dir::open_ambient_dir(git_dir, ambient_authority())
+		.map_err(|error| anyhow!("opening {}: {error}", git_dir.display()))?;
+	Ok(Repository::new(ObjectStore::new(WorktreeFileStore::new(
+		common, git,
+	))))
 }
 
 /// Discover the working tree containing `start` as a [`Discovered`] plus the pathspec `prefix`,

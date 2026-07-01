@@ -1,5 +1,10 @@
+// Exercises the native cap-std backend; the wasm target has no `from_dir`.
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::sync::Arc;
 
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use gitana_file_store::{FileStore, FileStoreError};
 use gitana_file_store_local::LocalFileStore;
 
@@ -12,10 +17,17 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 	dir
 }
 
+/// Create `dir` and open it as a capability for a test (the store is capability-pure, so
+/// tests mint the ambient authority themselves).
+fn open_store(dir: &std::path::Path) -> LocalFileStore {
+	std::fs::create_dir_all(dir).unwrap();
+	LocalFileStore::from_dir(Dir::open_ambient_dir(dir, ambient_authority()).unwrap())
+}
+
 #[tokio::test]
 async fn rejects_path_traversal() {
 	let dir = temp_dir("traversal");
-	let store = LocalFileStore::new(&dir);
+	let store = open_store(&dir);
 
 	for bad in ["../escape", "a/../../escape", "/etc/passwd", "a//b"] {
 		assert!(
@@ -44,7 +56,7 @@ async fn rejects_symlink_escape() {
 	// A symlink inside the store that points outside it.
 	std::os::unix::fs::symlink(&outside, dir.join("evil")).unwrap();
 
-	let store = LocalFileStore::new(&dir);
+	let store = open_store(&dir);
 
 	assert!(
 		matches!(
@@ -61,7 +73,7 @@ async fn rejects_symlink_escape() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_cas_has_no_lost_updates() {
 	let dir = temp_dir("cas");
-	let store = Arc::new(LocalFileStore::new(&dir));
+	let store = Arc::new(open_store(&dir));
 	let path = "refs/heads/counter";
 
 	const TASKS: u64 = 8;

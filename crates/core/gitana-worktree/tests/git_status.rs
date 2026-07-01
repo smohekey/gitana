@@ -9,6 +9,10 @@ use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
 
+fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
+	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
+}
+
 #[tokio::test]
 async fn status_matches_git() {
 	if !git_supports_sha256() {
@@ -45,7 +49,9 @@ async fn status_matches_git() {
 	std::fs::remove_file(work.join("dir/c.txt")).unwrap();
 	std::fs::write(work.join("new.txt"), b"x\n").unwrap();
 
-	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
 	let ours = sorted(
 		&WorkTree::new(repo, &work, &git_dir)
 			.status()
@@ -96,7 +102,9 @@ async fn status_with_gitignore_matches_git() {
 	std::fs::write(work.join("keep.txt"), b"k\n").unwrap();
 	std::fs::write(work.join("a.txt"), b"a changed\n").unwrap();
 
-	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
 	let ours = sorted(
 		&WorkTree::new(repo, &work, &git_dir)
 			.status()

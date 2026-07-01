@@ -10,6 +10,10 @@ use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
 
+fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
+	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
+}
+
 #[tokio::test]
 async fn add_stages_like_git() {
 	if !git_supports_sha256() {
@@ -32,7 +36,9 @@ async fn add_stages_like_git() {
 	let paths = ["README.md", "src/lib.rs", "run.sh", "link"];
 
 	// Stage with our worktree.
-	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
 	WorkTree::new(repo, &work, &git_dir)
 		.add(&paths, "")
 		.await
@@ -77,7 +83,9 @@ async fn add_with_prefix_is_relative_to_subdirectory() {
 	std::fs::write(work.join("sub/a.txt"), b"SUB\n").unwrap();
 
 	// From the `sub` directory, `a.txt` means `sub/a.txt`, like `git -C sub add a.txt`.
-	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
 	WorkTree::new(repo, &work, &git_dir)
 		.add(&["a.txt"], "sub")
 		.await
@@ -99,7 +107,9 @@ async fn add_with_prefix_is_relative_to_subdirectory() {
 	// From `sub`, `../a.txt` resolves to the root file and is stored as `a.txt`, not
 	// `sub/../a.txt`, matching `git -C sub add ../a.txt`.
 	std::fs::remove_file(git_dir.join("index")).unwrap();
-	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
 	WorkTree::new(repo, &work, &git_dir)
 		.add(&["../a.txt"], "sub")
 		.await
@@ -132,7 +142,9 @@ async fn add_trailing_slash_requires_a_directory() {
 	std::fs::write(work.join("a.txt"), b"v1\n").unwrap();
 	std::fs::create_dir_all(work.join("sub")).unwrap();
 	std::fs::write(work.join("sub/x.txt"), b"s1\n").unwrap();
-	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
 	let wt = WorkTree::new(repo, &work, &git_dir);
 
 	// `a.txt/` and `a.txt/.` name a file as a directory: git rejects them, and so do we.
@@ -167,7 +179,9 @@ async fn add_rewrites_index_on_file_directory_type_change() {
 	let git_dir = work.join(".git");
 	let w = work.to_str().unwrap();
 	git(&["init", "--object-format=sha256", "-q", w]);
-	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
 	let wt = WorkTree::new(repo, &work, &git_dir);
 
 	// Stage `thing` as a file.

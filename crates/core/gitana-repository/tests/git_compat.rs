@@ -1,3 +1,7 @@
+// Cross-checked against real `git` and built on the native cap-std store (`from_dir`), so
+// this suite is native-only.
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -7,6 +11,10 @@ use gitana_file_store_memory::MemoryFileStore;
 use gitana_object::{ObjectId, ObjectKind, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::{FileMode, HeadState, Repository, TreeBuildEntry};
+
+fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
+	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
+}
 
 fn mem_repo() -> Repository<MemoryFileStore, Sha256> {
 	Repository::new(ObjectStore::new(MemoryFileStore::new()))
@@ -78,7 +86,9 @@ async fn git_accepts_an_engine_initialised_repo() {
 	let git_dir = work.join(".git");
 	create_skeleton(&git_dir);
 
-	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
 	repo.init().await.unwrap();
 
 	let work = work.to_str().unwrap();
@@ -108,7 +118,9 @@ async fn engine_commit_is_read_by_git() {
 	let git_dir = work.join(".git");
 	create_skeleton(&git_dir);
 
-	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
 	repo.init().await.unwrap();
 
 	let blob = repo.write_blob(b"hello\n").await.unwrap();
@@ -175,7 +187,9 @@ async fn git_reads_a_sha1_engine_initialised_repo_and_commit() {
 	let git_dir = work.join(".git");
 	create_skeleton(&git_dir);
 
-	let repo = Repository::new(ObjectStore::<_, Sha1>::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha1>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
 	repo.init().await.unwrap();
 
 	let blob = repo.write_blob(b"hello\n").await.unwrap();
@@ -251,7 +265,9 @@ async fn revisions_and_packed_refs_match_git() {
 	let work = unique_tmp("rev");
 	let git_dir = work.join(".git");
 	create_skeleton(&git_dir);
-	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::new(&git_dir)));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
 	repo.init().await.unwrap();
 
 	let c1 = make_commit(&repo, b"a\n", 1_700_000_000).await;
