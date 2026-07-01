@@ -80,8 +80,9 @@ impl WorkTreeCommand for Merge {
 	}
 }
 
-/// Render a merge outcome to stdout, or turn a conflict into the process's exit.
-fn render<H: HashAlgorithm>(outcome: MergeOutcome<H>) -> Result<()> {
+/// Render a merge outcome to stdout, or turn a conflict into the process's exit. Shared with `pull`,
+/// which integrates the fetched upstream via the same merge.
+pub(crate) fn render<H: HashAlgorithm>(outcome: MergeOutcome<H>) -> Result<()> {
 	match outcome {
 		MergeOutcome::AlreadyUpToDate => println!("Already up to date."),
 		MergeOutcome::FastForward { from, to } => match from {

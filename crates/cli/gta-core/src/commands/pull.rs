@@ -5,57 +5,72 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
-use gitana_remote::Origin;
+use gitana_remote::{self as transport, Origin};
 use gitana_repository::HeadState;
+use gitana_worktree::WorkTree;
 
-use crate::commands::{fetch, merge};
+use crate::commands::merge;
 use crate::dispatch;
+use crate::identity::CliIdentity;
 use crate::repo;
 
 /// Pull `HEAD`'s branch from the origin.
 pub async fn run(cwd: &Path) -> Result<()> {
-	// Fetch into the remote-tracking refs, then integrate the upstream tip via `merge`
-	// (fast-forward, or a true merge commit when the histories have diverged).
-	fetch::run(cwd).await?;
-
 	let found = repo::discover(cwd)?;
-	let kind = dispatch::detect_algorithm(&found.common_dir)?;
-	let (branch, remote_tip) = match kind {
-		HashKind::Sha1 => upstream_tip::<Sha1>(&found).await?,
-		HashKind::Sha256 => upstream_tip::<Sha256>(&found).await?,
-	};
+	let origin = Origin::load(&found.common_dir)?;
+	let body = transport::fetch_advertisement(&origin, "git-upload-pack").await?;
 
-	let short = branch.strip_prefix("refs/heads/").unwrap_or(&branch);
-	let message = format!(
-		"Merge branch '{short}' of {}",
-		Origin::load(&found.common_dir)?.url
-	);
-	merge::run(
-		cwd,
-		Some(remote_tip),
-		Some(message),
-		false,
-		false,
-		false,
-		false,
-	)
-	.await
+	let local = dispatch::detect_algorithm(&found.common_dir)?;
+	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
+
+	match local {
+		HashKind::Sha1 => pull_into::<Sha1>(&origin, &found, &body).await,
+		HashKind::Sha256 => pull_into::<Sha256>(&origin, &found, &body).await,
+	}
 }
 
-/// The current branch and its upstream tip (`refs/remotes/origin/<branch>`, updated by the
-/// preceding fetch) as a hex id. Errors on a detached HEAD or a missing upstream.
-async fn upstream_tip<H: HashAlgorithm>(found: &repo::Discovered) -> Result<(String, String)> {
+/// Fetch into the remote-tracking refs, then merge the current branch's upstream tip. Both are the
+/// porcelain composites; this composes them, printing the "Fetched from" line *between* — so a merge
+/// that then fails (e.g. a dirty work tree) still reports the completed fetch, as git does.
+async fn pull_into<H: HashAlgorithm>(
+	origin: &Origin,
+	found: &repo::Discovered,
+	body: &[u8],
+) -> Result<()> {
+	let work = found
+		.work
+		.clone()
+		.context("cannot pull in a bare repository")?;
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir);
-	let branch = match repository.refs().read_head().await? {
+	let worktree = WorkTree::new(repository, work, found.git_dir.clone());
+
+	gitana_porcelain::fetch(worktree.repository(), origin, body).await?;
+	println!("Fetched from {}", origin.url);
+
+	// The upstream tip: the current branch's `refs/remotes/origin/<branch>`, just updated by the fetch.
+	let branch = match worktree.repository().refs().read_head().await? {
 		HeadState::Symbolic(branch) => branch,
 		HeadState::Detached(_) => bail!("cannot pull onto a detached HEAD"),
 	};
 	let short = branch.strip_prefix("refs/heads/").unwrap_or(&branch);
 	let tracking = format!("refs/remotes/origin/{short}");
-	let tip = repository
+	let upstream = worktree
+		.repository()
 		.refs()
 		.resolve(&tracking)
 		.await?
 		.with_context(|| format!("origin has no {short}"))?;
-	Ok((branch, tip.to_hex()))
+	let message = format!("Merge branch '{short}' of {}", origin.url);
+
+	let identity = CliIdentity::new(worktree.repository());
+	let outcome = gitana_porcelain::merge(
+		&worktree,
+		&upstream.to_hex(),
+		Some(message),
+		false,
+		false,
+		&identity,
+	)
+	.await?;
+	merge::render(outcome)
 }
