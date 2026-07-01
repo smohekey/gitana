@@ -13,11 +13,13 @@ mod cherry_pick;
 mod commit;
 pub mod conflict;
 mod merge;
+mod rebase;
 mod revert;
 
 pub use cherry_pick::{PickOutcome, abort_cherry_pick, cherry_pick, continue_cherry_pick};
 pub use commit::commit;
 pub use merge::{MergeOutcome, abort_merge, continue_merge, merge};
+pub use rebase::{RebaseOutcome, abort_rebase, continue_rebase, rebase, skip_rebase};
 pub use revert::{RevertOutcome, abort_revert, continue_revert, revert};
 
 /// Resolves the git identity lines (`Name <email> seconds ±hhmm`) for operations that record commits.
