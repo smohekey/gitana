@@ -4,7 +4,6 @@
 use std::path::Path;
 
 use anyhow::Result;
-use gitana_git_http::parse_advertisement;
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_remote::{self as transport, Origin};
 
@@ -32,23 +31,7 @@ async fn fetch_into<H: HashAlgorithm>(
 	body: &[u8],
 ) -> Result<()> {
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir);
-	let advertised = parse_advertisement::<H>(body)?;
-	let wants = transport::advertised_oids(&advertised);
-	let haves = transport::local_haves(&repository).await?;
-	transport::fetch_pack(origin, &repository, &wants, &haves).await?;
-
-	for (name, oid) in advertised.branches() {
-		let short = name.strip_prefix("refs/heads/").unwrap_or(name);
-		let tracking = format!("refs/remotes/origin/{short}");
-		let current = repository.refs().resolve(&tracking).await?;
-		if current != Some(oid) {
-			repository
-				.refs()
-				.update_ref(&tracking, oid, current)
-				.await?;
-		}
-	}
-
+	gitana_porcelain::fetch(&repository, origin, body).await?;
 	println!("Fetched from {}", origin.url);
 	Ok(())
 }

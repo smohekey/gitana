@@ -12,7 +12,9 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 gitana-file-store.workspace = true
+gitana-git-http.workspace = true
 gitana-object.workspace = true
+gitana-remote.workspace = true
 gitana-repository.workspace = true
 gitana-worktree.workspace = true
 
