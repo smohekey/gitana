@@ -174,25 +174,19 @@ async fn sign_push<H: HashAlgorithm>(
 	Ok(cert)
 }
 
-/// The pusher identity for a certificate: `Name <email> <unix-ts> +0000`.
+/// The pusher identity for a certificate: `Name <email> <unix-ts> +0000`. Always stamped with the
+/// push time, so unlike a commit it ignores any `GIT_AUTHOR_DATE`.
 async fn pusher_ident<H: HashAlgorithm>(repo: &Repository<Backend, H>) -> Result<String> {
 	let config = repo.read_config().await.ok();
-	let from_config = |key: &str| {
-		config
-			.as_ref()
-			.and_then(|c| c.get_string("user", None, key).map(str::to_owned))
-	};
-	let name = std::env::var("GIT_AUTHOR_NAME")
-		.ok()
-		.or_else(|| from_config("name"))
-		.context("identity name not set (GIT_AUTHOR_NAME or user.name)")?;
-	let email = std::env::var("GIT_AUTHOR_EMAIL")
-		.ok()
-		.or_else(|| from_config("email"))
-		.context("identity email not set (GIT_AUTHOR_EMAIL or user.email)")?;
-	let ts = SystemTime::now()
+	let secs = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.map(|d| d.as_secs())
 		.unwrap_or(0);
-	Ok(format!("{name} <{email}> {ts} +0000"))
+	gitana_identity::signature(
+		"AUTHOR",
+		std::env::var("GIT_AUTHOR_NAME").ok(),
+		std::env::var("GIT_AUTHOR_EMAIL").ok(),
+		config.as_ref(),
+		&format!("{secs} +0000"),
+	)
 }

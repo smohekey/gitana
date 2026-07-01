@@ -16,6 +16,7 @@ gitana-diff.workspace = true
 gitana-file-store.workspace = true
 gitana-file-store-local.workspace = true
 gitana-git-http.workspace = true
+gitana-identity.workspace = true
 gitana-object.workspace = true
 gitana-object-store.workspace = true
 gitana-porcelain.workspace = true

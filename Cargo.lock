@@ -835,6 +835,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitana-identity"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gitana-config",
+]
+
+[[package]]
 name = "gitana-object"
 version = "0.1.0"
 dependencies = [
@@ -955,6 +963,7 @@ dependencies = [
  "gitana-file-store-local",
  "gitana-file-store-memory",
  "gitana-git-http",
+ "gitana-identity",
  "gitana-object",
  "gitana-object-store",
  "gitana-porcelain",
