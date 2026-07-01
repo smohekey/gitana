@@ -6,14 +6,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::Backend;
-use anyhow::{Context, Result, bail};
-use gitana_git_http::{
-	CertCommand, PushCert, RefUpdate, build_pack, build_push_cert, build_receive_pack_request,
-	parse_advertisement, parse_report_status,
-};
-use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
-use gitana_remote::{self as transport, Origin, RECEIVE_PACK_REQUEST, http_post};
-use gitana_repository::{HeadState, Repository};
+use anyhow::Result;
+use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
+use gitana_porcelain::PushOutcome;
+use gitana_remote::{self as transport, Origin};
+use gitana_repository::Repository;
 
 use crate::dispatch;
 use crate::repo;
@@ -24,7 +21,7 @@ use crate::repo;
 pub async fn run(
 	cwd: &Path,
 	signed: bool,
-	signing_key: Option<PathBuf>,
+	_signing_key: Option<PathBuf>,
 	force: bool,
 	delete: Option<String>,
 ) -> Result<()> {
@@ -36,142 +33,48 @@ pub async fn run(
 	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
 
 	match local {
-		HashKind::Sha1 => {
-			push_impl::<Sha1>(&origin, &found, &body, signed, signing_key, force, delete).await
-		}
-		HashKind::Sha256 => {
-			push_impl::<Sha256>(&origin, &found, &body, signed, signing_key, force, delete).await
-		}
+		HashKind::Sha1 => push_into::<Sha1>(&origin, &found, &body, signed, force, delete).await,
+		HashKind::Sha256 => push_into::<Sha256>(&origin, &found, &body, signed, force, delete).await,
 	}
 }
 
-async fn push_impl<H: HashAlgorithm>(
+async fn push_into<H: HashAlgorithm>(
 	origin: &Origin,
 	found: &repo::Discovered,
 	body: &[u8],
 	signed: bool,
-	signing_key: Option<PathBuf>,
 	force: bool,
 	delete: Option<String>,
 ) -> Result<()> {
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir);
-	let advertised = parse_advertisement::<H>(body)?;
+	let outcome = gitana_porcelain::push(
+		&repository,
+		origin,
+		body,
+		force,
+		delete,
+		signed,
+		async || pusher_ident(&repository).await,
+	)
+	.await?;
 
-	if let Some(target) = delete {
-		let refname = normalize_branch(&target);
-		let remote = advertised
-			.oid_of(&refname)
-			.with_context(|| format!("the remote has no {refname}"))?;
-		let update = RefUpdate {
-			old: Some(remote),
-			new: None,
-			name: refname.clone(),
-		};
-		let request = build_receive_pack_request(std::slice::from_ref(&update), &[]);
-		let response = http_post(&origin.receive_pack(), RECEIVE_PACK_REQUEST, request).await?;
-		parse_report_status(&response)?;
-		println!("Deleted {refname} on {}", origin.url);
-		return Ok(());
+	match outcome {
+		PushOutcome::Deleted { refname } => println!("Deleted {refname} on {}", origin.url),
+		PushOutcome::UpToDate => println!("Everything up-to-date"),
+		PushOutcome::Pushed {
+			branch,
+			signed,
+			forced,
+		} => {
+			let how = match (signed, forced) {
+				(true, _) => " (signed)",
+				(false, true) => " (forced)",
+				_ => "",
+			};
+			println!("Pushed {branch} -> {}{how}", origin.url);
+		}
 	}
-
-	let branch = match repository.refs().read_head().await? {
-		HeadState::Symbolic(branch) => branch,
-		HeadState::Detached(_) => bail!("cannot push a detached HEAD"),
-	};
-	let local_tip = repository
-		.refs()
-		.resolve(&branch)
-		.await?
-		.context("nothing to push (the branch is unborn)")?;
-
-	let remote_old = advertised.oid_of(&branch);
-	if remote_old == Some(local_tip) {
-		println!("Everything up-to-date");
-		return Ok(());
-	}
-
-	// Pack the objects the remote lacks (reachable from the tip, minus its refs).
-	let haves = transport::advertised_oids(&advertised);
-	let pack = build_pack(&repository, &[local_tip], &haves).await?;
-
-	let request = if signed {
-		let nonce = advertised
-			.push_cert_nonce
-			.clone()
-			.context("the server does not accept signed pushes")?;
-		let cert = sign_push(
-			&repository,
-			origin,
-			signing_key,
-			nonce,
-			remote_old,
-			local_tip,
-			&branch,
-		)
-		.await?;
-		build_push_cert(&cert, &push_caps::<H>(), &pack)
-	} else {
-		let update = RefUpdate {
-			old: remote_old,
-			new: Some(local_tip),
-			name: branch.clone(),
-		};
-		build_receive_pack_request(std::slice::from_ref(&update), &pack)
-	};
-
-	let response = http_post(&origin.receive_pack(), RECEIVE_PACK_REQUEST, request).await?;
-	parse_report_status(&response)?;
-
-	let how = match (signed, force) {
-		(true, _) => " (signed)",
-		(false, true) => " (forced)",
-		_ => "",
-	};
-	println!("Pushed {branch} -> {}{how}", origin.url);
 	Ok(())
-}
-
-/// Capabilities echoed on the push request's first line / cert marker, for hash `H`.
-fn push_caps<H: HashAlgorithm>() -> String {
-	format!("report-status object-format={}", H::NAME)
-}
-
-/// Expand a branch name to a full ref (`main` → `refs/heads/main`); pass full refs through.
-fn normalize_branch(name: &str) -> String {
-	if name.starts_with("refs/") {
-		name.to_owned()
-	} else {
-		format!("refs/heads/{name}")
-	}
-}
-
-/// Build and sign a push certificate for a single-branch update.
-async fn sign_push<H: HashAlgorithm>(
-	repository: &Repository<Backend, H>,
-	origin: &Origin,
-	_signing_key: Option<PathBuf>,
-	nonce: String,
-	remote_old: Option<ObjectId<H>>,
-	local_tip: ObjectId<H>,
-	branch: &str,
-) -> Result<PushCert> {
-	// The "no previous value" oid for a create is the all-zero id at the hash's width.
-	let zero = "0".repeat(H::RAW_LEN * 2);
-	// Signing key loading is not wired yet; keep the certificate payload explicit.
-	let cert = PushCert {
-		version: "0.1".to_owned(),
-		pusher: pusher_ident(repository).await?,
-		pushee: origin.url.clone(),
-		nonce,
-		push_options: Vec::new(),
-		commands: vec![CertCommand {
-			old: remote_old.map_or(zero, |oid| oid.to_hex()),
-			new: local_tip.to_hex(),
-			refname: branch.to_owned(),
-		}],
-		signature: String::new(),
-	};
-	Ok(cert)
 }
 
 /// The pusher identity for a certificate: `Name <email> <unix-ts> +0000`. Always stamped with the
