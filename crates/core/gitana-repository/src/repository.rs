@@ -284,6 +284,11 @@ where
 		Ok(())
 	}
 
+	/// The commit recorded in `ORIG_HEAD`, or `None` if it is unset.
+	pub async fn orig_head(&self) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		self.refs().resolve("ORIG_HEAD").await
+	}
+
 	/// Record an in-progress merge: `MERGE_HEAD` (the commit being merged) and `MERGE_MSG` (the
 	/// prepared commit message).
 	pub async fn start_merge(

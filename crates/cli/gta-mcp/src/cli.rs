@@ -222,6 +222,10 @@ enum Command {
 	},
 	/// Consolidate loose objects and existing packs into a single pack.
 	Repack,
+	/// Delete loose objects unreachable from any ref, HEAD, the index, or the reflogs.
+	Prune,
+	/// Delete unreachable loose objects (prune) then consolidate storage (repack).
+	Gc,
 	/// Show the commit history of HEAD (one line per commit).
 	Log,
 	/// Show an object: a commit and its diff, a tag, a tree, or a blob (default: HEAD).
@@ -477,6 +481,8 @@ impl Cli {
 				skip,
 			} => commands::rebase::run(&cwd, upstream, onto, abort, continue_, skip).await,
 			Command::Repack => commands::repack::run(&cwd).await,
+			Command::Prune => commands::prune::run(&cwd).await,
+			Command::Gc => commands::gc::run(&cwd).await,
 			Command::Log => commands::log::run(&cwd).await,
 			Command::Show { object } => commands::show::run(&cwd, object).await,
 			Command::Config {

@@ -95,7 +95,8 @@ Implemented command groups:
 - Working-tree porcelain: `add`, `rm`, `mv`, `status`, `commit`, `merge`, `log`,
   `show`, `switch`, `checkout`, `restore`, `reset`, `diff`.
 - Repository setup: `config` (local read/write).
-- Maintenance: `repack` (consolidate loose objects and packs into a single pack).
+- Maintenance: `repack` (consolidate loose objects and packs into a single pack),
+  `prune` (delete unreachable loose objects), `gc` (prune then repack).
 - Remote operations: `clone`, `fetch`, `pull`, `push`.
 
 ## Crate layout

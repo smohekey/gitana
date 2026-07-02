@@ -43,7 +43,15 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   objects and old packs — data-preserving (no pruning). Writes the new pack before deleting
   sources; a no-op when already a single pack with nothing loose. Oracle-tested: stock `git fsck`
   reads the result and the full object set is unchanged.
-- [ ] Add prune/gc safety rules for unreachable objects.
+- [x] Add prune/gc safety rules for unreachable objects. `gta prune` deletes loose objects
+  unreachable from *every* root — refs, HEAD, the index (all stages), the reflogs (new
+  `RefStore::reflog_object_ids` reader), `ORIG_HEAD`, and the merge/cherry-pick/revert/rebase
+  heads — and refuses while an operation is in progress. `gta gc` prunes then repacks. Deletes
+  only loose objects (packed objects are untouched); conservative and reflog-protected, so
+  `reset`/`amend` orphans survive (reclaiming those needs future reflog-expiry). No mtime grace
+  (the file store exposes no mtime). Refuses in a repository that has linked worktrees (their
+  per-worktree roots aren't scanned — multi-worktree gc is future work) and requires a work tree.
+  Oracle-tested against stock `git fsck`.
 - [ ] Add multi-pack-index support when multiple packfiles become common.
 - [ ] Add bitmap or reachability acceleration after pack indexing is stable.
 - [ ] Resolve abbreviated object IDs across packed objects, not only loose objects.

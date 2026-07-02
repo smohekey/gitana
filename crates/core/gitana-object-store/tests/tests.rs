@@ -2,6 +2,8 @@
 //! locate objects through the index (and materialise base + delta objects on demand), a
 //! miss is `NotFound`, and reads still succeed when the sidecar is absent.
 
+use std::collections::HashSet;
+
 use gitana_file_store::FileStore;
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_object::{
@@ -300,6 +302,83 @@ async fn repack_regenerates_a_missing_pack_index() {
 	for object in &objects {
 		assert_eq!(
 			store.read_object(&object.id).await.expect("read").1,
+			object.data
+		);
+	}
+}
+
+#[tokio::test]
+async fn prune_loose_deletes_only_objects_absent_from_keep() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let keep_a = store
+		.write_object(ObjectKind::Blob, b"keep a")
+		.await
+		.expect("write keep a");
+	let keep_b = store
+		.write_object(ObjectKind::Blob, b"keep b")
+		.await
+		.expect("write keep b");
+	let drop_a = store
+		.write_object(ObjectKind::Blob, b"drop a")
+		.await
+		.expect("write drop a");
+	let drop_b = store
+		.write_object(ObjectKind::Blob, b"drop b")
+		.await
+		.expect("write drop b");
+
+	let keep: HashSet<ObjectId<Sha256>> = [keep_a, keep_b].into_iter().collect();
+	let report = store.prune_loose(&keep).await.expect("prune");
+	assert_eq!(report.pruned, 2);
+
+	// Kept objects still read; dropped objects are gone.
+	assert_eq!(
+		store.read_object(&keep_a).await.expect("keep a").1,
+		b"keep a"
+	);
+	assert_eq!(
+		store.read_object(&keep_b).await.expect("keep b").1,
+		b"keep b"
+	);
+	assert!(!store.exists_object(&drop_a).await.expect("exists drop a"));
+	assert!(!store.exists_object(&drop_b).await.expect("exists drop b"));
+
+	// Idempotent: with the same keep set, nothing more is pruned.
+	assert_eq!(
+		store.prune_loose(&keep).await.expect("prune again").pruned,
+		0
+	);
+}
+
+#[tokio::test]
+async fn prune_loose_with_empty_keep_removes_all_loose() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	for content in [b"one".as_slice(), b"two", b"three"] {
+		store
+			.write_object(ObjectKind::Blob, content)
+			.await
+			.expect("write");
+	}
+	let report = store.prune_loose(&HashSet::new()).await.expect("prune all");
+	assert_eq!(report.pruned, 3);
+	assert!(!has_loose_objects(&store).await);
+}
+
+#[tokio::test]
+async fn prune_loose_leaves_packed_objects_untouched() {
+	// prune only deletes loose objects; a packed object absent from `keep` must survive.
+	let objects = sample_graph();
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	store
+		.write_pack(&encode_pack(&objects))
+		.await
+		.expect("write pack");
+
+	let report = store.prune_loose(&HashSet::new()).await.expect("prune");
+	assert_eq!(report.pruned, 0, "no loose objects to prune");
+	for object in &objects {
+		assert_eq!(
+			store.read_object(&object.id).await.expect("read packed").1,
 			object.data
 		);
 	}

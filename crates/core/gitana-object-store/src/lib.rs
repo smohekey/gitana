@@ -10,7 +10,7 @@
 //! and rejects a mismatch; objects served from a pack are content-addressed by
 //! construction (`decode_object_at` computes each id from its bytes).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -94,6 +94,13 @@ pub struct RepackReport {
 	pub packs_removed: usize,
 	/// Loose objects deleted.
 	pub loose_removed: usize,
+}
+
+/// What a [`ObjectStore::prune_loose`] removed: the number of unreachable loose objects deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneReport {
+	/// Loose objects deleted (those absent from the caller's keep set).
+	pub pruned: usize,
 }
 
 /// Git object storage layered over a file-store backend `F`, scoped to one repo, with
@@ -376,5 +383,28 @@ where
 			}
 		}
 		Ok(ids)
+	}
+
+	/// Delete every loose object whose id is **not** in `keep`. `keep` is the caller's set of
+	/// reachable object ids (see the prune safety rules); anything loose and absent from it is
+	/// unreferenced and removed. Packed objects are never touched — only loose deletion. The
+	/// caller is responsible for computing a complete `keep` set; there is no time-based grace,
+	/// so a loose object written concurrently after `keep` was computed could be removed (prune
+	/// is an explicit, quiescent-repo operation).
+	pub async fn prune_loose(
+		&self,
+		keep: &HashSet<ObjectId<H>>,
+	) -> Result<PruneReport, ObjectStoreError> {
+		let mut pruned = 0;
+		for id in self.loose_object_ids().await? {
+			if !keep.contains(&id) {
+				self
+					.files
+					.delete_path(&loose_object_path(&id), None)
+					.await?;
+				pruned += 1;
+			}
+		}
+		Ok(PruneReport { pruned })
 	}
 }

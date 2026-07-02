@@ -5,6 +5,9 @@ use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::{HeadState, RepositoryError};
 
+/// The maximum symbolic-ref chain depth to follow (git's limit), a guard against a cycle.
+const MAX_SYMREF_DEPTH: usize = 5;
+
 /// Reads and updates refs (loose files + symbolic HEAD) over a file store.
 ///
 /// Borrows the repository's file store and id, so it shares the one backend the
@@ -126,13 +129,64 @@ where
 		}
 	}
 
-	/// Resolve `HEAD` to a commit id, following its symbolic target. Returns `None`
-	/// for an unborn branch (symbolic target with no ref file yet).
+	/// Resolve `HEAD` to a commit id, following its symbolic target (through a chain of symbolic
+	/// refs, as git does). Returns `None` for an unborn branch (symbolic target with no ref file
+	/// yet).
 	pub async fn resolve_head(&self) -> Result<Option<ObjectId<H>>, RepositoryError> {
 		match self.read_head().await? {
 			HeadState::Detached(id) => Ok(Some(id)),
-			HeadState::Symbolic(target) => self.resolve(&target).await,
+			HeadState::Symbolic(target) => self.follow_symref(&target).await,
 		}
+	}
+
+	/// The object ids that symbolic refs under `prefix` resolve to (following `ref:` chains).
+	/// [`Self::list`] returns only direct refs and skips symbolic ones; this recovers those, so a
+	/// prune keeps a commit reachable only through a symbolic ref (e.g. `refs/heads/alias` →
+	/// `CUSTOM_REF`). A symbolic ref whose chain ends nowhere resolves to nothing and is ignored.
+	pub async fn symbolic_ref_targets(
+		&self,
+		prefix: &str,
+	) -> Result<Vec<ObjectId<H>>, RepositoryError> {
+		let mut ids = Vec::new();
+		let mut stack = vec![prefix.to_owned()];
+		while let Some(dir) = stack.pop() {
+			for path in self.files.list_prefix(&dir).await? {
+				match self.files.read_path(&path).await {
+					Ok(bytes) => {
+						let text = std::str::from_utf8(&bytes).map(str::trim).unwrap_or("");
+						if let Some(target) = text.strip_prefix("ref:")
+							&& let Some(id) = self.follow_symref(target.trim()).await?
+						{
+							ids.push(id);
+						}
+					}
+					// A read failure here means `path` is a subdirectory; descend (as `list` does).
+					Err(_) => stack.push(format!("{path}/")),
+				}
+			}
+		}
+		Ok(ids)
+	}
+
+	/// Resolve `name` to an object id, following a bounded chain of symbolic (`ref:`) refs and
+	/// consulting `packed-refs` for a target with no loose file. `None` if the chain ends at a
+	/// missing ref or exceeds the depth bound (a cycle).
+	async fn follow_symref(&self, name: &str) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		let mut name = name.to_owned();
+		for _ in 0..MAX_SYMREF_DEPTH {
+			match self.files.read_path(&name).await {
+				Ok(bytes) => {
+					let text = std::str::from_utf8(&bytes).map(str::trim).unwrap_or("");
+					match text.strip_prefix("ref:") {
+						Some(target) => name = target.trim().to_owned(),
+						None => return Ok(Some(parse_oid(&name, &bytes)?)),
+					}
+				}
+				Err(FileStoreError::NotFound) => return self.resolve_packed(&name).await,
+				Err(other) => return Err(other.into()),
+			}
+		}
+		Ok(None)
 	}
 
 	/// Compare-and-set a ref. `expected == None` requires the ref to be absent;
@@ -296,6 +350,45 @@ where
 		self.force_write(&path, &content).await
 	}
 
+	/// Every object id referenced by any reflog entry under `logs/`: the `<old>` and `<new>`
+	/// id of each line (skipping the all-zero null id of a creation/deletion entry). A prune
+	/// keeps these so a commit a reflog can still reach (e.g. before a `reset`) is never deleted.
+	pub async fn reflog_object_ids(&self) -> Result<Vec<ObjectId<H>>, RepositoryError> {
+		let mut ids = Vec::new();
+		let mut stack = vec!["logs/".to_owned()];
+		while let Some(dir) = stack.pop() {
+			for path in self.files.list_prefix(&dir).await? {
+				match self.files.read_path(&path).await {
+					Ok(bytes) => {
+						// Each line is `<old> <new> <committer>\t<message>`; only the first two
+						// whitespace-delimited fields are ids. Parse on raw bytes — the committer and
+						// message may hold arbitrary, non-UTF-8 bytes (e.g. a `-m` with binary), so we
+						// must not require the whole reflog to be UTF-8.
+						for line in bytes.split(|&b| b == b'\n') {
+							for token in line
+								.split(|b: &u8| b.is_ascii_whitespace())
+								.filter(|field| !field.is_empty())
+								.take(2)
+							{
+								if token.iter().all(|&b| b == b'0') {
+									continue;
+								}
+								if let Ok(text) = std::str::from_utf8(token)
+									&& let Ok(id) = ObjectId::<H>::from_hex(text)
+								{
+									ids.push(id);
+								}
+							}
+						}
+					}
+					// A read failure here means `path` is a subdirectory; descend (as `list` does).
+					Err(_) => stack.push(format!("{path}/")),
+				}
+			}
+		}
+		Ok(ids)
+	}
+
 	/// Unconditional last-writer-wins write, retrying on a concurrent change.
 	async fn force_write(&self, path: &str, bytes: &[u8]) -> Result<(), RepositoryError> {
 		loop {
@@ -330,5 +423,102 @@ fn map_cas(name: &str) -> impl Fn(FileStoreError) -> RepositoryError + '_ {
 			name: name.to_owned(),
 		},
 		other => other.into(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use gitana_file_store::FileStore;
+	use gitana_file_store_memory::MemoryFileStore;
+	use gitana_object::{ObjectId, ObjectKind, Sha256};
+
+	use super::RefStore;
+
+	#[tokio::test]
+	async fn reflog_object_ids_collects_ids_despite_a_non_utf8_message() {
+		let files = MemoryFileStore::new();
+		let old = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"old tip");
+		let new = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"new tip");
+
+		// A reflog line whose message carries a raw non-UTF-8 byte (git allows arbitrary bytes
+		// there): the object ids are still ASCII hex and must be read regardless.
+		let mut line =
+			format!("{} {} C <c@e> 0 +0000\treset: ", old.to_hex(), new.to_hex()).into_bytes();
+		line.push(0xff);
+		line.push(b'\n');
+		// A creation line whose all-zero `<old>` must be skipped.
+		line.extend_from_slice(
+			format!(
+				"{} {} C <c@e> 0 +0000\tcommit\n",
+				"0".repeat(64),
+				new.to_hex()
+			)
+			.as_bytes(),
+		);
+		files
+			.write_path_if_absent("logs/HEAD", &line)
+			.await
+			.unwrap();
+
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let ids = store.reflog_object_ids().await.expect("read reflog ids");
+		assert!(ids.contains(&old), "old id read");
+		assert!(ids.contains(&new), "new id read");
+		let zero = ObjectId::<Sha256>::from_hex(&"0".repeat(64)).unwrap();
+		assert!(!ids.contains(&zero), "the null id is skipped");
+	}
+
+	#[tokio::test]
+	async fn symbolic_ref_targets_follows_ref_chains() {
+		let files = MemoryFileStore::new();
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"symref target");
+		let direct = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"direct");
+		// `refs/heads/alias` → `CUSTOM_REF` → an object id (a chain resolving outside refs/).
+		files
+			.write_path_if_absent("CUSTOM_REF", format!("{}\n", target.to_hex()).as_bytes())
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent("refs/heads/alias", b"ref: CUSTOM_REF\n")
+			.await
+			.unwrap();
+		// A direct ref is left to `list`, not returned here.
+		files
+			.write_path_if_absent(
+				"refs/heads/main",
+				format!("{}\n", direct.to_hex()).as_bytes(),
+			)
+			.await
+			.unwrap();
+
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let ids = store
+			.symbolic_ref_targets("refs/")
+			.await
+			.expect("resolve symbolic refs");
+		assert!(ids.contains(&target), "symbolic ref target resolved");
+		assert!(!ids.contains(&direct), "direct refs are left to list()");
+	}
+
+	#[tokio::test]
+	async fn resolve_head_follows_a_symref_chain() {
+		let files = MemoryFileStore::new();
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+		// HEAD → refs/heads/alias → refs/heads/main → an object id.
+		files
+			.write_path_if_absent("HEAD", b"ref: refs/heads/alias\n")
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent("refs/heads/alias", b"ref: refs/heads/main\n")
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent("refs/heads/main", format!("{}\n", tip.to_hex()).as_bytes())
+			.await
+			.unwrap();
+
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		assert_eq!(store.resolve_head().await.expect("resolve head"), Some(tip));
 	}
 }
