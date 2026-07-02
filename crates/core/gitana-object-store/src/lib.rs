@@ -17,9 +17,9 @@ use std::sync::Arc;
 use gitana_file_store::{FileStore, FileStoreError, WriteOutcome};
 
 use gitana_object::{
-	HashAlgorithm, MAX_OBJECT_SIZE, ObjectError, ObjectId, ObjectKind, PackIndex, decode_loose,
-	decode_object_at, decode_pack_index, encode_loose, encode_pack_index, loose_object_path,
-	pack_index_entries,
+	HashAlgorithm, MAX_OBJECT_SIZE, ObjectError, ObjectId, ObjectKind, PackIndex, PackedObject,
+	decode_loose, decode_object_at, decode_pack_index, encode_loose, encode_pack, encode_pack_index,
+	loose_object_path, pack_index_entries,
 };
 use tokio::sync::Mutex;
 
@@ -73,6 +73,27 @@ fn ensure_within(len: u64, limit: u64) -> Result<(), ObjectStoreError> {
 fn index_path(pack_path: &str) -> String {
 	let stem = pack_path.strip_suffix(PACK_SUFFIX).unwrap_or(pack_path);
 	format!("{stem}{IDX_SUFFIX}")
+}
+
+/// The `objects/pack/pack-<hex>.pack` path for a pack whose trailer checksum is `checksum`.
+fn pack_path_for(checksum: &[u8]) -> String {
+	let mut hex = String::with_capacity(checksum.len() * 2);
+	for byte in checksum {
+		hex.push_str(&format!("{byte:02x}"));
+	}
+	format!("{PACK_PREFIX}pack-{hex}{PACK_SUFFIX}")
+}
+
+/// What a [`ObjectStore::repack`] consolidated: how many objects went into the new pack, and
+/// how many now-redundant packs and loose objects it removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepackReport {
+	/// Objects written into the single new pack.
+	pub packed_objects: usize,
+	/// Old packs deleted (each with its `.idx`).
+	pub packs_removed: usize,
+	/// Loose objects deleted.
+	pub loose_removed: usize,
 }
 
 /// Git object storage layered over a file-store backend `F`, scoped to one repo, with
@@ -133,12 +154,8 @@ where
 		// One decode both validates the pack and yields the `.idx` entries.
 		let entries = pack_index_entries::<H>(pack)?;
 		let checksum = &pack[pack.len() - H::RAW_LEN..];
-		let mut hex = String::with_capacity(H::RAW_LEN * 2);
-		for byte in checksum {
-			hex.push_str(&format!("{byte:02x}"));
-		}
 		let idx_bytes = encode_pack_index::<H>(&entries, checksum)?;
-		let pack_path = format!("{PACK_PREFIX}pack-{hex}{PACK_SUFFIX}");
+		let pack_path = pack_path_for(checksum);
 		self.files.write_path_if_absent(&pack_path, pack).await?;
 		self
 			.files
@@ -251,5 +268,113 @@ where
 			.await
 			.insert(pack_path.to_owned(), Arc::clone(&bytes));
 		Ok(bytes)
+	}
+
+	/// Consolidate storage: gather every loose object and every object in every existing pack
+	/// into one new pack, then delete the now-redundant loose objects and old packs. No object
+	/// is dropped — this changes only how objects are stored, not which exist (pruning
+	/// unreachable objects is a separate concern). Returns `None` when nothing needs doing
+	/// (already a single pack with no loose objects).
+	///
+	/// The new pack is written before anything is deleted, so an object is never momentarily
+	/// unreferenced on disk; a crash mid-way leaves redundant-but-correct storage that a re-run
+	/// cleans up. Objects are materialised in memory together (inherent to [`encode_pack`]'s
+	/// slice input) — streaming a repack is a future refinement.
+	pub async fn repack(&self) -> Result<Option<RepackReport>, ObjectStoreError> {
+		// Snapshot the packs to consolidate before writing the new one.
+		let old_packs: Vec<String> = self
+			.files
+			.list_prefix(PACK_PREFIX)
+			.await?
+			.into_iter()
+			.filter(|path| path.ends_with(PACK_SUFFIX))
+			.collect();
+		let loose_ids = self.loose_object_ids().await?;
+
+		// Already consolidated: nothing loose and at most one pack — but only a no-op if that
+		// lone pack still has its `.idx`. A pack without its sidecar is readable by our own
+		// fallback yet not by stock git, so fall through and let the repack regenerate it.
+		let single_pack_indexed = match old_packs.as_slice() {
+			[] => true,
+			[only] => self.files.exists(&index_path(only)).await?,
+			_ => false,
+		};
+		if loose_ids.is_empty() && single_pack_indexed {
+			return Ok(None);
+		}
+
+		// Union of every stored id: each pack's index entries plus the loose objects.
+		let mut ids: std::collections::HashSet<ObjectId<H>> = std::collections::HashSet::new();
+		for path in &old_packs {
+			for entry in self.pack_index(path).await?.entries() {
+				ids.insert(entry.id);
+			}
+		}
+		ids.extend(loose_ids.iter().copied());
+		if ids.is_empty() {
+			return Ok(None);
+		}
+
+		// Materialise every object, then encode a single pack and store it (with its `.idx`).
+		let mut objects: Vec<PackedObject<H>> = Vec::with_capacity(ids.len());
+		for id in &ids {
+			let (kind, data) = self.read_object(id).await?;
+			objects.push(PackedObject {
+				id: *id,
+				kind,
+				data,
+			});
+		}
+		let pack = encode_pack(&objects);
+		let new_pack_path = pack_path_for(&pack[pack.len() - H::RAW_LEN..]);
+		self.write_pack(&pack).await?;
+
+		// Delete the old packs (except the one we just wrote, if a re-encode reproduced it) and
+		// every loose object — all now redundant with the new pack.
+		let mut packs_removed = 0;
+		for path in &old_packs {
+			if *path == new_pack_path {
+				continue;
+			}
+			self.files.delete_path(path, None).await?;
+			self.files.delete_path(&index_path(path), None).await?;
+			packs_removed += 1;
+		}
+		for id in &loose_ids {
+			self.files.delete_path(&loose_object_path(id), None).await?;
+		}
+
+		// The caches may name deleted packs; drop them (reads re-list and reload lazily).
+		self.indexes.lock().await.clear();
+		self.pack_bytes.lock().await.clear();
+
+		Ok(Some(RepackReport {
+			packed_objects: objects.len(),
+			packs_removed,
+			loose_removed: loose_ids.len(),
+		}))
+	}
+
+	/// Every loose object id on disk, by scanning the `objects/<aa>/<rest>` fan-out (skipping
+	/// the `pack`/`info` directories and any non-hex names).
+	async fn loose_object_ids(&self) -> Result<Vec<ObjectId<H>>, ObjectStoreError> {
+		let hex_len = H::RAW_LEN * 2;
+		let mut ids = Vec::new();
+		for dir in self.files.list_prefix("objects/").await? {
+			let name = dir.rsplit('/').next().unwrap_or_default();
+			if name.len() != 2 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+				continue;
+			}
+			for entry in self.files.list_prefix(&format!("{dir}/")).await? {
+				let rest = entry.rsplit('/').next().unwrap_or_default();
+				if rest.len() != hex_len - 2 || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+					continue;
+				}
+				if let Ok(id) = ObjectId::<H>::from_hex(&format!("{name}{rest}")) {
+					ids.push(id);
+				}
+			}
+		}
+		Ok(ids)
 	}
 }

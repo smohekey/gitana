@@ -20,6 +20,7 @@ pub mod mv;
 pub mod pull;
 pub mod push;
 pub mod rebase;
+pub mod repack;
 pub mod reset;
 pub mod restore;
 pub mod rev_list;

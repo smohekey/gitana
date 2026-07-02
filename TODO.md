@@ -38,7 +38,11 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   (id → offset, cached; a miss reads no `.pack`) and materialises just that object plus its
   delta chain via the new `decode_object_at`, so a pack is no longer decoded in full to serve
   (or miss) one object. A pack lacking its `.idx` falls back to a one-time full decode.
-- [ ] Add repack support.
+- [x] Add repack support. `gta repack` (backed by `ObjectStore::repack`) consolidates every
+  loose object and all existing packs into one new pack, then deletes the now-redundant loose
+  objects and old packs — data-preserving (no pruning). Writes the new pack before deleting
+  sources; a no-op when already a single pack with nothing loose. Oracle-tested: stock `git fsck`
+  reads the result and the full object set is unchanged.
 - [ ] Add prune/gc safety rules for unreachable objects.
 - [ ] Add multi-pack-index support when multiple packfiles become common.
 - [ ] Add bitmap or reachability acceleration after pack indexing is stable.

@@ -220,6 +220,8 @@ enum Command {
 		#[arg(long = "skip")]
 		skip: bool,
 	},
+	/// Consolidate loose objects and existing packs into a single pack.
+	Repack,
 	/// Show the commit history of HEAD (one line per commit).
 	Log,
 	/// Show an object: a commit and its diff, a tag, a tree, or a blob (default: HEAD).
@@ -474,6 +476,7 @@ impl Cli {
 				continue_,
 				skip,
 			} => commands::rebase::run(&cwd, upstream, onto, abort, continue_, skip).await,
+			Command::Repack => commands::repack::run(&cwd).await,
 			Command::Log => commands::log::run(&cwd).await,
 			Command::Show { object } => commands::show::run(&cwd, object).await,
 			Command::Config {
