@@ -35,7 +35,8 @@ pub async fn gc<F: FileStore, H: HashAlgorithm>(
 	wt: &WorkTree<F, H>,
 ) -> Result<(PruneReport, Option<RepackReport>)> {
 	let prune = prune(wt).await?;
-	let repack = wt.repository().objects().repack().await?;
+	let max_pack_size = wt.repository().pack_size_limit().await?;
+	let repack = wt.repository().objects().repack(max_pack_size).await?;
 	Ok((prune, repack))
 }
 

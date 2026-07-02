@@ -188,6 +188,67 @@ fn read_raw_entry<H: HashAlgorithm>(
 	}
 }
 
+/// One packfile entry decoded from just its own bytes: a whole object, or a delta together with an
+/// *unresolved* reference to its base — an OFS `distance` (subtract from this entry's own byte
+/// offset) or a REF `base` id. Leaving the base unresolved lets a caller fetch each object's bytes
+/// lazily (e.g. one `read_path_range` per entry) rather than holding the whole pack in memory.
+pub enum PackEntry<H: HashAlgorithm> {
+	/// A complete object.
+	Base {
+		/// The object kind.
+		kind: ObjectKind,
+		/// The object payload.
+		data: Vec<u8>,
+	},
+	/// A delta against the base `distance` bytes earlier in the pack.
+	OfsDelta {
+		/// Byte distance from this entry's offset back to its base.
+		distance: u64,
+		/// The delta instructions.
+		delta: Vec<u8>,
+	},
+	/// A delta against the base object named by `base`.
+	RefDelta {
+		/// The base object's id.
+		base: ObjectId<H>,
+		/// The delta instructions.
+		delta: Vec<u8>,
+	},
+}
+
+/// Decode a single packfile entry from `entry` — a slice that begins at the entry's byte offset
+/// and contains at least its full compressed data (e.g. the `[offset, next_offset)` span computed
+/// from a `.idx`'s offsets). Returns the base object, or the delta with its unresolved base
+/// reference; the caller resolves the base and applies the delta with [`apply_delta`]. Touches no
+/// other part of the pack, so it underpins a lazy, memory-bounded read path.
+pub fn decode_pack_entry<H: HashAlgorithm>(entry: &[u8]) -> Result<PackEntry<H>, ObjectError> {
+	let mut cursor = 0;
+	let (raw_type, size) = read_object_header(entry, &mut cursor)?;
+	match raw_type {
+		OBJ_COMMIT | OBJ_TREE | OBJ_BLOB | OBJ_TAG => {
+			let (data, _) = inflate(&entry[cursor..], size)?;
+			Ok(PackEntry::Base {
+				kind: kind_of(raw_type)?,
+				data,
+			})
+		}
+		OBJ_OFS_DELTA => {
+			let distance = read_offset(entry, &mut cursor)?;
+			let (delta, _) = inflate(&entry[cursor..], size)?;
+			Ok(PackEntry::OfsDelta {
+				distance: distance as u64,
+				delta,
+			})
+		}
+		OBJ_REF_DELTA => {
+			let base = read_object_id::<H>(entry, &mut cursor)?;
+			let (delta, _) = inflate(&entry[cursor..], size)?;
+			Ok(PackEntry::RefDelta { base, delta })
+		}
+		_ => Err(ObjectError::MalformedPack),
+	}
+}
+
 /// A decoded pack entry: the materialised object plus its pack location — byte offset and
 /// the CRC-32 of its packed bytes — everything both a plain decode and a `.idx` need.
 struct DecodedEntry<H: HashAlgorithm> {
@@ -730,6 +791,46 @@ mod tests {
 		let entries = pack_index_entries::<H>(pack).expect("index entries");
 		let checksum = pack[pack.len() - H::RAW_LEN..].to_vec();
 		PackIndex::from_entries(entries, checksum).expect("build index")
+	}
+
+	#[test]
+	fn decode_pack_entry_reads_base_ofs_and_ref() {
+		let base = b"hello world";
+
+		let mut base_entry = obj_header(OBJ_BLOB, base.len());
+		base_entry.extend(zlib(base));
+		match decode_pack_entry::<Sha256>(&base_entry).expect("base") {
+			PackEntry::Base { kind, data } => {
+				assert_eq!(kind, ObjectKind::Blob);
+				assert_eq!(data, base);
+			}
+			_ => panic!("expected a base entry"),
+		}
+
+		let ofs = delta(base.len(), 0, 5, b"!!!");
+		let mut ofs_entry = obj_header(OBJ_OFS_DELTA, ofs.len());
+		ofs_entry.extend(encode_offset(42));
+		ofs_entry.extend(zlib(&ofs));
+		match decode_pack_entry::<Sha256>(&ofs_entry).expect("ofs") {
+			PackEntry::OfsDelta { distance, delta } => {
+				assert_eq!(distance, 42);
+				assert_eq!(delta, ofs);
+			}
+			_ => panic!("expected an OFS delta"),
+		}
+
+		let base_id = ObjectId::<Sha256>::compute(ObjectKind::Blob, base);
+		let refd = delta(base.len(), 6, 5, b"?");
+		let mut ref_entry = obj_header(OBJ_REF_DELTA, refd.len());
+		ref_entry.extend(base_id.as_bytes());
+		ref_entry.extend(zlib(&refd));
+		match decode_pack_entry::<Sha256>(&ref_entry).expect("ref") {
+			PackEntry::RefDelta { base, delta } => {
+				assert_eq!(base, base_id);
+				assert_eq!(delta, refd);
+			}
+			_ => panic!("expected a REF delta"),
+		}
 	}
 
 	#[test]

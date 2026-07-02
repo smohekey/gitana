@@ -101,7 +101,78 @@ fn repack_merges_an_existing_pack_with_new_loose_objects() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+#[test]
+fn repack_splits_into_multiple_size_bounded_packs_git_reads_them() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-repack-split");
+	let w = work.to_str().unwrap();
+	gta(w, &["init"], b"");
+	git(w, &["config", "user.name", "T"]);
+	git(w, &["config", "user.email", "t@e"]);
+	// stock git writes the key; gta reads the same `.git/config`. 1 MiB is git's documented floor
+	// for pack.packSizeLimit, so use it (and enough data to exceed it several times over).
+	git(w, &["config", "pack.packSizeLimit", "1m"]);
+
+	// Commit incompressible files whose blobs total ~2.4 MiB — well over the 1 MiB limit.
+	for i in 0..8u64 {
+		std::fs::write(
+			work.join(format!("big{i}.bin")),
+			incompressible(i, 300 * 1024),
+		)
+		.unwrap();
+	}
+	git(w, &["add", "."]);
+	git_id(w, &["commit", "-q", "-m", "big files"]);
+	let before = all_object_ids(w);
+
+	let out = gta(w, &["repack"], b"");
+
+	// The repo split into multiple packs, each within the limit.
+	let limit = 1024 * 1024;
+	let packs: Vec<String> = pack_files(&work)
+		.into_iter()
+		.filter(|p| p.ends_with(".pack"))
+		.collect();
+	assert!(
+		packs.len() > 1,
+		"expected a split into multiple packs, got {packs:?}; output: {out}"
+	);
+	for p in &packs {
+		let size = std::fs::metadata(work.join(".git/objects/pack").join(p))
+			.unwrap()
+			.len();
+		assert!(
+			size <= limit,
+			"pack {p} is {size} bytes, over the 1 MiB limit"
+		);
+	}
+	assert!(!has_loose_objects(&work), "loose objects packed away");
+
+	// Stock git reads the multi-pack repo: fsck clean, object set unchanged, history intact.
+	assert!(git_ok(w, &["fsck", "--full", "--strict"]), "git fsck");
+	assert_eq!(all_object_ids(w), before, "every object preserved");
+	assert!(git_ok(w, &["rev-list", "--all"]));
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 // --- helpers -------------------------------------------------------------------------------
+
+/// Deterministic, effectively-incompressible bytes (xorshift64 over a mixed seed).
+fn incompressible(seed: u64, len: usize) -> Vec<u8> {
+	let mut x = seed.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+	let mut out = Vec::with_capacity(len);
+	for _ in 0..len {
+		x ^= x << 13;
+		x ^= x >> 7;
+		x ^= x << 17;
+		out.push((x & 0xff) as u8);
+	}
+	out
+}
 
 /// Whether any loose object (`.git/objects/<aa>/…`) exists in the repo at `work`.
 fn has_loose_objects(work: &Path) -> bool {

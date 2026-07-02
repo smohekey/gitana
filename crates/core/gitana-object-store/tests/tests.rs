@@ -182,7 +182,7 @@ async fn repack_consolidates_loose_and_packed_objects() {
 		.expect("write loose b");
 
 	let report = store
-		.repack()
+		.repack(u64::MAX)
 		.await
 		.expect("repack")
 		.expect("repack did work");
@@ -216,7 +216,13 @@ async fn repack_consolidates_loose_and_packed_objects() {
 	);
 
 	// A second repack has nothing to do.
-	assert!(store.repack().await.expect("repack again").is_none());
+	assert!(
+		store
+			.repack(u64::MAX)
+			.await
+			.expect("repack again")
+			.is_none()
+	);
 }
 
 #[tokio::test]
@@ -226,7 +232,7 @@ async fn repack_of_a_single_pack_is_a_noop() {
 		.write_pack(&encode_pack(&sample_graph()))
 		.await
 		.expect("write pack");
-	assert!(store.repack().await.expect("repack").is_none());
+	assert!(store.repack(u64::MAX).await.expect("repack").is_none());
 }
 
 #[tokio::test]
@@ -242,7 +248,7 @@ async fn repack_packs_loose_only_stores() {
 		.expect("write b");
 
 	let report = store
-		.repack()
+		.repack(u64::MAX)
 		.await
 		.expect("repack")
 		.expect("repack did work");
@@ -286,7 +292,7 @@ async fn repack_regenerates_a_missing_pack_index() {
 		.expect("delete idx");
 
 	let report = store
-		.repack()
+		.repack(u64::MAX)
 		.await
 		.expect("repack")
 		.expect("regenerating the index is not a no-op");
@@ -379,6 +385,215 @@ async fn prune_loose_leaves_packed_objects_untouched() {
 	for object in &objects {
 		assert_eq!(
 			store.read_object(&object.id).await.expect("read packed").1,
+			object.data
+		);
+	}
+}
+
+/// Deterministic, effectively-incompressible bytes (xorshift64), so a blob's packed size stays
+/// close to its length and a size limit actually forces a split.
+fn incompressible(seed: u64, len: usize) -> Vec<u8> {
+	// Mix the seed (bijective ×odd) so distinct seeds yield distinct, non-colliding streams.
+	let mut x = seed.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+	let mut out = Vec::with_capacity(len);
+	for _ in 0..len {
+		x ^= x << 13;
+		x ^= x >> 7;
+		x ^= x << 17;
+		out.push((x & 0xff) as u8);
+	}
+	out
+}
+
+#[tokio::test]
+async fn repack_splits_into_size_bounded_packs() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let mut ids = Vec::new();
+	let mut contents = Vec::new();
+	for seed in 1..=6u64 {
+		let data = incompressible(seed, 200 * 1024);
+		ids.push(
+			store
+				.write_object(ObjectKind::Blob, &data)
+				.await
+				.expect("write blob"),
+		);
+		contents.push(data);
+	}
+
+	let limit = 512 * 1024;
+	let report = store
+		.repack(limit)
+		.await
+		.expect("repack")
+		.expect("repack did work");
+	assert_eq!(report.packed_objects, 6);
+	assert!(
+		report.packs_written > 1,
+		"1.2 MiB of incompressible blobs under a 512 KiB limit must split: got {} pack(s)",
+		report.packs_written
+	);
+
+	// Every stored pack is within the limit, and every blob still reads back unchanged.
+	let packs: Vec<String> = store
+		.file_store()
+		.list_prefix("objects/pack/")
+		.await
+		.expect("list")
+		.into_iter()
+		.filter(|p| p.ends_with(".pack"))
+		.collect();
+	assert_eq!(packs.len(), report.packs_written);
+	for path in &packs {
+		let bytes = store.file_store().read_path(path).await.expect("read pack");
+		assert!(
+			bytes.len() as u64 <= limit,
+			"pack {path} is {} bytes, over the {limit} limit",
+			bytes.len()
+		);
+	}
+	assert!(!has_loose_objects(&store).await);
+	for (id, data) in ids.iter().zip(&contents) {
+		assert_eq!(&store.read_object(id).await.expect("read").1, data);
+	}
+
+	// Deterministic and idempotent: a second repack re-partitions to exactly the same pack set
+	// (a multi-pack repo re-packs so repack can consolidate, but here it is already optimal).
+	let before: std::collections::BTreeSet<String> = packs.iter().cloned().collect();
+	store.repack(limit).await.expect("repack again");
+	let after: std::collections::BTreeSet<String> = store
+		.file_store()
+		.list_prefix("objects/pack/")
+		.await
+		.expect("list")
+		.into_iter()
+		.filter(|p| p.ends_with(".pack"))
+		.collect();
+	assert_eq!(before, after, "split repack reproduces the same pack set");
+}
+
+#[tokio::test]
+async fn repack_with_a_large_limit_makes_one_pack() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	for seed in 1..=4u64 {
+		store
+			.write_object(ObjectKind::Blob, &incompressible(seed, 100 * 1024))
+			.await
+			.expect("write blob");
+	}
+	let report = store
+		.repack(u64::MAX)
+		.await
+		.expect("repack")
+		.expect("repack did work");
+	assert_eq!(report.packs_written, 1, "a large limit keeps a single pack");
+}
+
+#[tokio::test]
+async fn repack_splits_an_existing_oversized_pack() {
+	// A single already-indexed pack that exceeds a (newly set, smaller) limit must be re-split,
+	// not skipped as a no-op.
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let objects: Vec<PackedObject<Sha256>> = (1..=6u64)
+		.map(|seed| {
+			let data = incompressible(seed, 200 * 1024);
+			let id = ObjectId::<Sha256>::compute(ObjectKind::Blob, &data);
+			PackedObject {
+				id,
+				kind: ObjectKind::Blob,
+				data,
+			}
+		})
+		.collect();
+	store
+		.write_pack(&encode_pack(&objects))
+		.await
+		.expect("write single pack");
+	assert_eq!(
+		pack_count(
+			&store
+				.file_store()
+				.list_prefix("objects/pack/")
+				.await
+				.unwrap()
+		),
+		1
+	);
+
+	let report = store
+		.repack(512 * 1024)
+		.await
+		.expect("repack")
+		.expect("an oversized single pack is not a no-op");
+	assert!(
+		report.packs_written > 1,
+		"a single pack over the limit must be split: got {} pack(s)",
+		report.packs_written
+	);
+	for object in &objects {
+		assert_eq!(
+			store.read_object(&object.id).await.expect("read").1,
+			object.data
+		);
+	}
+}
+
+#[tokio::test]
+async fn repack_consolidates_multiple_small_packs_into_one() {
+	// Several small packs (no loose) that fit within the limit must be consolidated into one, not
+	// treated as a no-op just because each is individually within the limit.
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let mut all = Vec::new();
+	for group in 0..3u64 {
+		let objects: Vec<PackedObject<Sha256>> = (0..2u64)
+			.map(|i| {
+				let data = incompressible(group * 10 + i, 8 * 1024);
+				let id = ObjectId::<Sha256>::compute(ObjectKind::Blob, &data);
+				PackedObject {
+					id,
+					kind: ObjectKind::Blob,
+					data,
+				}
+			})
+			.collect();
+		store
+			.write_pack(&encode_pack(&objects))
+			.await
+			.expect("write pack");
+		all.extend(objects);
+	}
+	assert_eq!(
+		pack_count(
+			&store
+				.file_store()
+				.list_prefix("objects/pack/")
+				.await
+				.unwrap()
+		),
+		3,
+		"three separate packs to start",
+	);
+
+	let report = store
+		.repack(u64::MAX)
+		.await
+		.expect("repack")
+		.expect("multiple packs must consolidate, not no-op");
+	assert_eq!(report.packs_written, 1, "consolidated into a single pack");
+	assert_eq!(report.packs_removed, 3);
+	assert_eq!(
+		pack_count(
+			&store
+				.file_store()
+				.list_prefix("objects/pack/")
+				.await
+				.unwrap()
+		),
+		1,
+	);
+	for object in &all {
+		assert_eq!(
+			store.read_object(&object.id).await.expect("read").1,
 			object.data
 		);
 	}

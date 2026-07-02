@@ -98,6 +98,9 @@ pub trait FileStore {
 	/// Whether a value exists at `path` within `repo`.
 	fn exists(&self, path: &str) -> impl Future<Output = Result<bool>>;
 
+	/// The byte length of the value at `path`. [`FileStoreError::NotFound`] if it is absent.
+	fn size(&self, path: &str) -> impl Future<Output = Result<u64>>;
+
 	/// List repository-relative paths within `repo` that begin with `prefix`.
 	///
 	/// `prefix` is treated as a directory boundary at its last `/`: the directory

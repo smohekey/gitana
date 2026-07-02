@@ -78,6 +78,25 @@ where
 			.map_err(|error| RepositoryError::UnsupportedFormat(error.to_string()))
 	}
 
+	/// The maximum pack size `repack` should target (`pack.packSizeLimit`), clamped to
+	/// `[1 MiB, MAX_PACK_SIZE]`. Unset or non-positive falls back to `MAX_PACK_SIZE`, i.e. a single
+	/// pack. Blob-store or memory-constrained deployments set a lower value to split into several
+	/// packs.
+	pub async fn pack_size_limit(&self) -> Result<u64, RepositoryError> {
+		const MIN_PACK_SIZE: u64 = 1 << 20;
+		let config = self.read_config().await?;
+		let configured = config
+			.get_int("pack", None, "packsizelimit")
+			.map_err(|error| {
+				RepositoryError::UnsupportedFormat(format!("pack.packSizeLimit: {error}"))
+			})?;
+		let limit = match configured {
+			Some(value) if value > 0 => value as u64,
+			_ => gitana_object_store::MAX_PACK_SIZE,
+		};
+		Ok(limit.clamp(MIN_PACK_SIZE, gitana_object_store::MAX_PACK_SIZE))
+	}
+
 	/// Write `config` to the `config` file, replacing its contents (last-writer-wins, retrying on
 	/// a concurrent change).
 	pub async fn write_config(

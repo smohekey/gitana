@@ -108,6 +108,10 @@ impl FileStore for WorktreeFileStore {
 		self.store(path).exists(path)
 	}
 
+	fn size(&self, path: &str) -> impl Future<Output = Result<u64>> {
+		self.store(path).size(path)
+	}
+
 	fn list_prefix(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> {
 		self.store(prefix).list_prefix(prefix)
 	}

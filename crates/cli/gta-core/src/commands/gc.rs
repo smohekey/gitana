@@ -24,8 +24,8 @@ impl WorkTreeCommand for Gc {
 		println!("Pruned {} unreachable object(s).", prune.pruned);
 		match repack {
 			Some(report) => println!(
-				"Packed {} objects into 1 pack (removed {} pack(s), {} loose object(s)).",
-				report.packed_objects, report.packs_removed, report.loose_removed
+				"Packed {} objects into {} pack(s) (removed {} pack(s), {} loose object(s)).",
+				report.packed_objects, report.packs_written, report.packs_removed, report.loose_removed
 			),
 			None => println!("Nothing to repack."),
 		}

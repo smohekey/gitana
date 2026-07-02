@@ -112,6 +112,16 @@ impl FileStore for MemoryFileStore {
 		)
 	}
 
+	async fn size(&self, path: &str) -> Result<u64> {
+		self
+			.files
+			.read()
+			.expect("file store lock poisoned")
+			.get(&path.to_owned())
+			.map(|(bytes, _)| bytes.len() as u64)
+			.ok_or(FileStoreError::NotFound)
+	}
+
 	async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
 		let (dir, frag) = gitana_file_store::split_prefix(prefix);
 		// Return the immediate children of `dir`: a stored file becomes its full path; a

@@ -57,6 +57,19 @@ async fn check_streaming(store: &impl FileStore) {
 	assert_eq!(got, data, "streamed read must return what was written");
 
 	assert_eq!(
+		store.size(path).await.expect("size"),
+		data.len() as u64,
+		"size must report the byte length",
+	);
+	assert!(
+		matches!(
+			store.size("no/such/path").await,
+			Err(FileStoreError::NotFound)
+		),
+		"size of a missing path is NotFound",
+	);
+
+	assert_eq!(
 		store
 			.read_path_range(path, 100, 50)
 			.await

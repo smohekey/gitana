@@ -198,6 +198,12 @@ impl FileStore for LocalFileStore {
 		blocking(move || exists_at(&*fs, &path)).await
 	}
 
+	async fn size(&self, path: &str) -> Result<u64> {
+		let path = self.resolve(path)?.to_owned();
+		let fs = Arc::clone(&self.backend);
+		blocking(move || fs.size(&path).map_err(read_err)).await
+	}
+
 	async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
 		let (dir_part, frag) = split_prefix(prefix);
 		let dir_rel = dir_part.trim_end_matches('/');
@@ -337,6 +343,8 @@ trait Backend: Send + Sync + 'static {
 	fn rename(&self, from: &str, to: &str) -> std::io::Result<()>;
 	fn remove_file(&self, path: &str) -> std::io::Result<()>;
 	fn exists(&self, path: &str) -> std::io::Result<bool>;
+	/// The byte length of the value at `path`.
+	fn size(&self, path: &str) -> std::io::Result<u64>;
 	/// Raw entry names directly under `dir_rel` (`""` = root); empty if the dir is absent.
 	fn list_names(&self, dir_rel: &str) -> std::io::Result<Vec<String>>;
 }
@@ -394,6 +402,10 @@ impl Backend for CapBackend {
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
 			Err(error) => Err(error),
 		}
+	}
+
+	fn size(&self, path: &str) -> std::io::Result<u64> {
+		Ok(self.dir.metadata(path)?.len())
 	}
 
 	fn list_names(&self, dir_rel: &str) -> std::io::Result<Vec<String>> {
@@ -477,6 +489,10 @@ impl Backend for StdBackend {
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
 			Err(error) => Err(error),
 		}
+	}
+
+	fn size(&self, path: &str) -> std::io::Result<u64> {
+		Ok(std::fs::metadata(self.full(path))?.len())
 	}
 
 	fn list_names(&self, dir_rel: &str) -> std::io::Result<Vec<String>> {
