@@ -6,10 +6,12 @@
 //! not in the pack) are rejected with [`ObjectError::UnresolvedDeltaBase`]. The pack
 //! trailer hash is verified before any entry is read.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::loose::MAX_OBJECT_SIZE;
-use crate::{HashAlgorithm, ObjectError, ObjectId, ObjectKind, PackIndexEntry, apply_delta};
+use crate::{
+	HashAlgorithm, ObjectError, ObjectId, ObjectKind, PackIndex, PackIndexEntry, apply_delta,
+};
 
 const HEADER_LEN: usize = 12;
 
@@ -76,6 +78,114 @@ pub fn pack_index_entries<H: HashAlgorithm>(
 			})
 			.collect(),
 	)
+}
+
+/// Decode a single object at byte `offset` within a self-contained pack, resolving only its
+/// own delta chain (not the whole pack). `index` (the pack's `.idx`) locates REF-delta bases
+/// by id; OFS-delta bases are found by their relative offset. This is the random-access read
+/// path: with a `.idx` to map id → offset, an object is materialised without decoding every
+/// other object in the pack.
+///
+/// A REF-delta base absent from `index` fails with [`ObjectError::UnresolvedDeltaBase`] (our
+/// stored packs are self-contained, so every base is in the same pack). A delta chain that
+/// revisits an offset (a cycle) or a structurally malformed entry fails with
+/// [`ObjectError::MalformedPack`]. The pack's trailer hash is *not* re-verified here (that is
+/// O(pack) per read); the returned id is recomputed from the materialised bytes, so a
+/// corrupt object is still caught by its content address.
+pub fn decode_object_at<H: HashAlgorithm>(
+	pack: &[u8],
+	index: &PackIndex<H>,
+	offset: u64,
+) -> Result<PackedObject<H>, ObjectError> {
+	let trailer_len = H::RAW_LEN;
+	if pack.len() < HEADER_LEN + trailer_len {
+		return Err(ObjectError::MalformedPack);
+	}
+	if &pack[0..4] != b"PACK" || read_u32(&pack[4..8]) != 2 {
+		return Err(ObjectError::MalformedPack);
+	}
+	let body_end = pack.len() - trailer_len;
+
+	// Walk from `offset` down the delta chain to a base object, collecting each delta
+	// outermost-first, then apply them base-outward. `visited` catches a REF-delta cycle
+	// (OFS bases point strictly earlier and cannot cycle, but a REF base may point anywhere).
+	let mut deltas: Vec<Vec<u8>> = Vec::new();
+	let mut visited: HashSet<u64> = HashSet::new();
+	let mut cursor_offset = offset;
+	let (kind, mut data) = loop {
+		if !visited.insert(cursor_offset) {
+			return Err(ObjectError::MalformedPack);
+		}
+		match read_raw_entry::<H>(pack, body_end, cursor_offset, index)? {
+			RawEntry::Base { kind, data } => break (kind, data),
+			RawEntry::Delta { base_offset, delta } => {
+				deltas.push(delta);
+				cursor_offset = base_offset;
+			}
+		}
+	};
+	for delta in deltas.iter().rev() {
+		data = apply_delta(&data, delta)?;
+	}
+	let id = ObjectId::<H>::compute(kind, &data);
+	Ok(PackedObject { id, kind, data })
+}
+
+/// One pack entry read in isolation for [`decode_object_at`]: either a materialised base
+/// object, or a delta plus the byte offset of the base it applies to.
+enum RawEntry {
+	Base { kind: ObjectKind, data: Vec<u8> },
+	Delta { base_offset: u64, delta: Vec<u8> },
+}
+
+/// Read the single entry at `offset`: inflate a base object, or return a delta with the byte
+/// offset of its base (an OFS distance resolved against `offset`, or a REF id resolved
+/// through `index`). Does not recurse — [`decode_object_at`] drives the chain.
+fn read_raw_entry<H: HashAlgorithm>(
+	pack: &[u8],
+	body_end: usize,
+	offset: u64,
+	index: &PackIndex<H>,
+) -> Result<RawEntry, ObjectError> {
+	let entry_start = usize::try_from(offset).map_err(|_| ObjectError::MalformedPack)?;
+	if entry_start < HEADER_LEN || entry_start >= body_end {
+		return Err(ObjectError::MalformedPack);
+	}
+	let mut cursor = entry_start;
+	let (raw_type, size) = read_object_header(pack, &mut cursor)?;
+	match raw_type {
+		OBJ_COMMIT | OBJ_TREE | OBJ_BLOB | OBJ_TAG => {
+			let (data, _) = inflate(&pack[cursor..body_end], size)?;
+			Ok(RawEntry::Base {
+				kind: kind_of(raw_type)?,
+				data,
+			})
+		}
+		OBJ_OFS_DELTA => {
+			let distance = read_offset(pack, &mut cursor)?;
+			let base_start = entry_start
+				.checked_sub(distance)
+				.ok_or(ObjectError::MalformedPack)?;
+			// OFS bases point strictly earlier, into the body (never the header).
+			if base_start < HEADER_LEN || base_start >= entry_start {
+				return Err(ObjectError::MalformedPack);
+			}
+			let (delta, _) = inflate(&pack[cursor..body_end], size)?;
+			Ok(RawEntry::Delta {
+				base_offset: base_start as u64,
+				delta,
+			})
+		}
+		OBJ_REF_DELTA => {
+			let base_id = read_object_id::<H>(pack, &mut cursor)?;
+			let base_offset = index
+				.offset_of(&base_id)
+				.ok_or(ObjectError::UnresolvedDeltaBase)?;
+			let (delta, _) = inflate(&pack[cursor..body_end], size)?;
+			Ok(RawEntry::Delta { base_offset, delta })
+		}
+		_ => Err(ObjectError::MalformedPack),
+	}
 }
 
 /// A decoded pack entry: the materialised object plus its pack location — byte offset and
@@ -611,6 +721,128 @@ mod tests {
 		let pack = finish_pack::<Sha256>(&body, 1);
 		assert!(matches!(
 			decode_pack::<Sha256>(&pack),
+			Err(ObjectError::UnresolvedDeltaBase)
+		));
+	}
+
+	/// Build an in-memory index for a pack, as the object store does from a `.idx` sidecar.
+	fn index_of<H: HashAlgorithm>(pack: &[u8]) -> PackIndex<H> {
+		let entries = pack_index_entries::<H>(pack).expect("index entries");
+		let checksum = pack[pack.len() - H::RAW_LEN..].to_vec();
+		PackIndex::from_entries(entries, checksum).expect("build index")
+	}
+
+	#[test]
+	fn decode_object_at_reads_base_and_both_deltas() {
+		// Same pack shape as `decodes_base_and_both_delta_kinds`: a blob base, an OFS delta,
+		// and a REF delta. Each object is read individually by its offset from the index.
+		let base_payload = b"hello world";
+		let base_id = ObjectId::<Sha256>::compute(ObjectKind::Blob, base_payload);
+		let b_delta = delta(base_payload.len(), 0, 5, b"!!!");
+		let c_delta = delta(base_payload.len(), 6, 5, b"?");
+
+		let mut body = Vec::new();
+		let a_off = HEADER_LEN + body.len();
+		body.extend(obj_header(OBJ_BLOB, base_payload.len()));
+		body.extend(zlib(base_payload));
+		let b_off = HEADER_LEN + body.len();
+		body.extend(obj_header(OBJ_OFS_DELTA, b_delta.len()));
+		body.extend(encode_offset(b_off - a_off));
+		body.extend(zlib(&b_delta));
+		body.extend(obj_header(OBJ_REF_DELTA, c_delta.len()));
+		body.extend(base_id.as_bytes());
+		body.extend(zlib(&c_delta));
+		let pack = finish_pack::<Sha256>(&body, 3);
+
+		let index = index_of::<Sha256>(&pack);
+		let read = |id: &ObjectId<Sha256>| {
+			let offset = index.offset_of(id).expect("in index");
+			decode_object_at(&pack, &index, offset).expect("decode object")
+		};
+
+		let base = read(&base_id);
+		assert_eq!(base.data, b"hello world");
+		assert_eq!(base.id, base_id);
+
+		let ofs_id = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"hello!!!");
+		let ofs = read(&ofs_id);
+		assert_eq!(ofs.data, b"hello!!!");
+		assert_eq!(ofs.kind, ObjectKind::Blob);
+
+		let ref_id = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"world?");
+		let picked = read(&ref_id);
+		assert_eq!(picked.data, b"world?");
+		assert_eq!(picked.id, ref_id);
+	}
+
+	#[test]
+	fn decode_object_at_reads_sha1_ref_delta() {
+		// A base plus a REF delta under SHA-1 (20-byte ids/trailer), read one at a time.
+		let base_payload = b"hello world";
+		let base_id = ObjectId::<Sha1>::compute(ObjectKind::Blob, base_payload);
+		let c_delta = delta(base_payload.len(), 6, 5, b"?");
+		let mut body = Vec::new();
+		body.extend(obj_header(OBJ_BLOB, base_payload.len()));
+		body.extend(zlib(base_payload));
+		body.extend(obj_header(OBJ_REF_DELTA, c_delta.len()));
+		body.extend(base_id.as_bytes());
+		body.extend(zlib(&c_delta));
+		let pack = finish_pack::<Sha1>(&body, 2);
+
+		let index = index_of::<Sha1>(&pack);
+		let ref_id = ObjectId::<Sha1>::compute(ObjectKind::Blob, b"world?");
+		let offset = index.offset_of(&ref_id).expect("in index");
+		let picked = decode_object_at(&pack, &index, offset).expect("decode");
+		assert_eq!(picked.data, b"world?");
+		assert_eq!(picked.id, ref_id);
+	}
+
+	#[test]
+	fn decode_object_at_rejects_ref_delta_cycle() {
+		// A lone REF delta whose base id is mapped (by a hand-built index) back to the delta's
+		// own offset — a self-cycle. A well-formed pack can't express this (ids are content
+		// derived), so drive it through the index the store would consult; the visited-offset
+		// guard must reject it rather than loop.
+		let base_id = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"anything");
+		let d = delta(1, 0, 1, b"");
+		let mut body = Vec::new();
+		body.extend(obj_header(OBJ_REF_DELTA, d.len()));
+		body.extend(base_id.as_bytes());
+		body.extend(zlib(&d));
+		let pack = finish_pack::<Sha256>(&body, 1);
+
+		let entry_offset = HEADER_LEN as u64;
+		let index = PackIndex::from_entries(
+			vec![PackIndexEntry {
+				id: base_id,
+				offset: entry_offset,
+				crc32: 0,
+			}],
+			pack[pack.len() - 32..].to_vec(),
+		)
+		.expect("index");
+		assert!(matches!(
+			decode_object_at(&pack, &index, entry_offset),
+			Err(ObjectError::MalformedPack)
+		));
+	}
+
+	#[test]
+	fn decode_object_at_rejects_unknown_ref_base() {
+		// A REF delta whose base id is absent from the index (a base the pack does not carry).
+		let base_id = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"missing base");
+		let d = delta(1, 0, 1, b"");
+		let mut body = Vec::new();
+		body.extend(obj_header(OBJ_REF_DELTA, d.len()));
+		body.extend(base_id.as_bytes());
+		body.extend(zlib(&d));
+		let pack = finish_pack::<Sha256>(&body, 1);
+
+		// An empty index carries no base, so the REF delta is unresolvable.
+		let index = PackIndex::<Sha256>::from_entries(Vec::new(), pack[pack.len() - 32..].to_vec())
+			.expect("index");
+		assert!(matches!(
+			decode_object_at(&pack, &index, HEADER_LEN as u64),
 			Err(ObjectError::UnresolvedDeltaBase)
 		));
 	}

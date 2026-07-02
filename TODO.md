@@ -30,8 +30,14 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 
 ## Object And Storage Performance
 
-- [ ] Add pack `.idx` read/write support.
-- [ ] Use pack indexes for object lookup instead of decoding whole packs eagerly.
+- [x] Add pack `.idx` read/write support. A hash-generic v2 `.idx` codec in `gitana-object`
+  (`encode_pack_index`/`decode_pack_index`/`PackIndex`/`pack_index_entries`), oracle-tested
+  byte-for-byte against `git index-pack`.
+- [x] Use pack indexes for object lookup instead of decoding whole packs eagerly. `write_pack`
+  now emits the `.idx` sidecar; the object store locates an object through the pack's `.idx`
+  (id → offset, cached; a miss reads no `.pack`) and materialises just that object plus its
+  delta chain via the new `decode_object_at`, so a pack is no longer decoded in full to serve
+  (or miss) one object. A pack lacking its `.idx` falls back to a one-time full decode.
 - [ ] Add repack support.
 - [ ] Add prune/gc safety rules for unreachable objects.
 - [ ] Add multi-pack-index support when multiple packfiles become common.

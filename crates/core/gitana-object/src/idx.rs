@@ -47,7 +47,7 @@ pub fn encode_pack_index<H: HashAlgorithm>(
 		return Err(ObjectError::MalformedPackIndex);
 	}
 	let mut sorted: Vec<&PackIndexEntry<H>> = entries.iter().collect();
-	sorted.sort_by(|a, b| a.id.cmp(&b.id));
+	sorted.sort_by_key(|entry| entry.id);
 	if sorted.windows(2).any(|pair| pair[0].id == pair[1].id) {
 		return Err(ObjectError::MalformedPackIndex);
 	}
@@ -107,6 +107,28 @@ pub struct PackIndex<H: HashAlgorithm> {
 }
 
 impl<H: HashAlgorithm> PackIndex<H> {
+	/// Build an index directly from a pack's [`PackIndexEntry`]s (from
+	/// [`crate::pack_index_entries`]) and its trailer hash, without a `.idx` round-trip.
+	/// Sorts by id and applies the same invariants as [`decode_pack_index`]: the pack
+	/// checksum must be `H::RAW_LEN` bytes and no id may repeat (a `.idx` maps each id to
+	/// one offset). Lets a caller serve lookups from a pack whose `.idx` sidecar is absent.
+	pub fn from_entries(
+		mut entries: Vec<PackIndexEntry<H>>,
+		pack_checksum: Vec<u8>,
+	) -> Result<Self, ObjectError> {
+		if pack_checksum.len() != H::RAW_LEN {
+			return Err(ObjectError::MalformedPackIndex);
+		}
+		entries.sort_by_key(|entry| entry.id);
+		if entries.windows(2).any(|pair| pair[0].id == pair[1].id) {
+			return Err(ObjectError::MalformedPackIndex);
+		}
+		Ok(Self {
+			entries,
+			pack_checksum,
+		})
+	}
+
 	/// The number of objects the index covers.
 	pub fn len(&self) -> usize {
 		self.entries.len()
@@ -274,6 +296,37 @@ mod tests {
 		// A stranger id is absent.
 		let stranger = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"absent");
 		assert!(parsed.lookup(&stranger).is_none());
+	}
+
+	#[test]
+	fn from_entries_sorts_and_rejects_duplicates() {
+		// Unsorted input still yields a working index (lookup binary-searches on sorted ids).
+		let entries = vec![
+			entry::<Sha256>(b"gamma", 77, 3),
+			entry::<Sha256>(b"alpha", 12, 1),
+			entry::<Sha256>(b"beta", 40, 2),
+		];
+		let idx = PackIndex::from_entries(entries.clone(), vec![0u8; 32]).expect("build");
+		assert_eq!(idx.len(), 3);
+		for original in &entries {
+			assert_eq!(idx.offset_of(&original.id), Some(original.offset));
+		}
+		// A duplicate id has no single offset, so building fails.
+		assert!(matches!(
+			PackIndex::from_entries(
+				vec![
+					entry::<Sha256>(b"same", 12, 1),
+					entry::<Sha256>(b"same", 40, 2)
+				],
+				vec![0u8; 32],
+			),
+			Err(ObjectError::MalformedPackIndex)
+		));
+		// A wrong-length pack checksum is rejected, as in encode/decode.
+		assert!(matches!(
+			PackIndex::from_entries(vec![entry::<Sha256>(b"x", 12, 1)], vec![0u8; 20]),
+			Err(ObjectError::MalformedPackIndex)
+		));
 	}
 
 	#[test]

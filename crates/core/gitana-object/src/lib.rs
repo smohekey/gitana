@@ -34,7 +34,8 @@ pub use idx::{PackIndex, PackIndexEntry, decode_pack_index, encode_pack_index};
 pub use kind::ObjectKind;
 pub use loose::{MAX_OBJECT_SIZE, decode_loose, encode_loose, loose_object_path};
 pub use pack::{
-	PackedObject, decode_pack, decode_pack_with_bases, pack_index_entries, ref_delta_base_ids,
+	PackedObject, decode_object_at, decode_pack, decode_pack_with_bases, pack_index_entries,
+	ref_delta_base_ids,
 };
 pub use pack_encode::encode_pack;
 pub use pktline::{
