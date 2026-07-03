@@ -52,7 +52,12 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   (the file store exposes no mtime). Refuses in a repository that has linked worktrees (their
   per-worktree roots aren't scanned — multi-worktree gc is future work) and requires a work tree.
   Oracle-tested against stock `git fsck`.
-- [ ] Add multi-pack-index support when multiple packfiles become common.
+- [x] Add multi-pack-index support when multiple packfiles become common. A hash-generic v1 MIDX
+  codec in `gitana-object` (`encode/decode_multi_pack_index`, `MultiPackIndex::lookup`); `repack`/`gc`
+  regenerate `objects/pack/multi-pack-index` over the packs they produce (dropping it below two
+  packs), and the object store consults it first — one binary search yielding `(pack, offset)` —
+  scanning only packs it doesn't cover and falling back to per-pack `.idx` when absent/stale.
+  Oracle-tested: stock `git multi-pack-index verify` accepts ours and we read git's.
 - [ ] Add bitmap or reachability acceleration after pack indexing is stable.
 - [ ] Resolve abbreviated object IDs across packed objects, not only loose objects.
 

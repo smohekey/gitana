@@ -598,3 +598,131 @@ async fn repack_consolidates_multiple_small_packs_into_one() {
 		);
 	}
 }
+
+const MIDX_PATH: &str = "objects/pack/multi-pack-index";
+
+/// Six incompressible blobs written loose, so a small-limit repack splits them across packs.
+async fn loose_blobs(store: &ObjectStore<MemoryFileStore, Sha256>) -> Vec<ObjectId<Sha256>> {
+	let mut ids = Vec::new();
+	for seed in 1..=6u64 {
+		ids.push(
+			store
+				.write_object(ObjectKind::Blob, &incompressible(seed, 200 * 1024))
+				.await
+				.expect("write blob"),
+		);
+	}
+	ids
+}
+
+#[tokio::test]
+async fn repack_writes_then_clears_the_multi_pack_index() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let ids = loose_blobs(&store).await;
+
+	// A split (multiple packs) writes a MIDX; every object still reads (through it).
+	let report = store
+		.repack(512 * 1024)
+		.await
+		.expect("repack")
+		.expect("work");
+	assert!(report.packs_written > 1);
+	assert!(
+		store.file_store().exists(MIDX_PATH).await.expect("exists"),
+		"a multi-pack repack writes a multi-pack-index",
+	);
+	for id in &ids {
+		assert!(store.read_object(id).await.is_ok(), "readable via MIDX");
+	}
+
+	// Consolidating back to one pack removes the now-pointless MIDX.
+	store
+		.repack(u64::MAX)
+		.await
+		.expect("repack")
+		.expect("consolidate");
+	assert_eq!(
+		pack_count(
+			&store
+				.file_store()
+				.list_prefix("objects/pack/")
+				.await
+				.unwrap()
+		),
+		1
+	);
+	assert!(
+		!store.file_store().exists(MIDX_PATH).await.expect("exists"),
+		"a single-pack repack clears the MIDX",
+	);
+	for id in &ids {
+		assert!(store.read_object(id).await.is_ok(), "still readable");
+	}
+}
+
+#[tokio::test]
+async fn finds_an_object_in_a_pack_added_after_the_midx() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let midx_ids = loose_blobs(&store).await;
+	store
+		.repack(512 * 1024)
+		.await
+		.expect("repack")
+		.expect("work");
+
+	// A pack added later is not covered by the MIDX; its objects must still be found (scanned).
+	let extra = sample_graph();
+	store
+		.write_pack(&encode_pack(&extra))
+		.await
+		.expect("write extra pack");
+
+	for object in &extra {
+		assert_eq!(
+			store
+				.read_object(&object.id)
+				.await
+				.expect("read uncovered")
+				.1,
+			object.data,
+			"an object in a pack added after the MIDX is found",
+		);
+	}
+	// And a MIDX-covered object still reads.
+	assert!(store.read_object(&midx_ids[0]).await.is_ok());
+}
+
+#[tokio::test]
+async fn a_stale_midx_whose_packs_are_gone_is_ignored() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let ids = loose_blobs(&store).await;
+	store
+		.repack(512 * 1024)
+		.await
+		.expect("repack")
+		.expect("work");
+
+	// Delete every pack (and its .idx) but leave the MIDX, which now names missing packs. A lookup
+	// must ignore the stale MIDX and cleanly report `NotFound`, not error on the absent pack.
+	for path in store
+		.file_store()
+		.list_prefix("objects/pack/")
+		.await
+		.unwrap()
+	{
+		if path.ends_with(".pack") || path.ends_with(".idx") {
+			store
+				.file_store()
+				.delete_path(&path, None)
+				.await
+				.expect("delete");
+		}
+	}
+	assert!(store.file_store().exists(MIDX_PATH).await.unwrap());
+
+	// A fresh store (no cached MIDX) exercises the stale-load path from scratch.
+	assert!(matches!(
+		store.read_object(&ids[0]).await,
+		Err(gitana_object_store::ObjectStoreError::NotFound)
+	));
+}

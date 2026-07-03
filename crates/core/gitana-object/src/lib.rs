@@ -15,6 +15,7 @@ mod id;
 mod idx;
 mod kind;
 mod loose;
+mod midx;
 mod pack;
 mod pack_encode;
 mod pktline;
@@ -33,6 +34,7 @@ pub use id::ObjectId;
 pub use idx::{PackIndex, PackIndexEntry, decode_pack_index, encode_pack_index};
 pub use kind::ObjectKind;
 pub use loose::{MAX_OBJECT_SIZE, decode_loose, encode_loose, loose_object_path};
+pub use midx::{MidxEntry, MultiPackIndex, decode_multi_pack_index, encode_multi_pack_index};
 pub use pack::{
 	PackEntry, PackedObject, decode_object_at, decode_pack, decode_pack_entry,
 	decode_pack_with_bases, pack_index_entries, ref_delta_base_ids,
@@ -80,6 +82,10 @@ pub enum ObjectError {
 	/// cannot form a valid index.
 	#[error("malformed pack index")]
 	MalformedPackIndex,
+	/// A multi-pack-index (`multi-pack-index`) had a bad signature, version, hash version, chunk
+	/// table, size, out-of-order id, pack reference, or trailing checksum — decoding or encoding.
+	#[error("malformed multi-pack-index")]
+	MalformedMultiPackIndex,
 	/// A delta's instructions were invalid or referenced outside the base.
 	#[error("malformed delta")]
 	MalformedDelta,

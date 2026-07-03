@@ -59,8 +59,10 @@ Major gaps:
   signature generation are not wired through yet.
 - Remote transport currently supports HTTP(S) Smart HTTP remotes. Other Git URL
   schemes, such as SSH remotes, are not implemented.
-- Pack lookup is simple: packs are decoded and cached as whole maps rather than
-  using `.idx`, MIDX, bitmaps, or repack/gc machinery.
+- Object storage now uses pack `.idx` and a multi-pack-index for lookup, and
+  `repack`/`gc` consolidate into size-bounded packs (honoring `pack.packSizeLimit`)
+  and regenerate the multi-pack-index. Still missing: reachability bitmaps, and
+  incremental/geometric repack (each `gc` rewrites all packs).
 
 ## `gta` CLI
 
