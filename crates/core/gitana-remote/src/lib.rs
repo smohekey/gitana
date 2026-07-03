@@ -155,7 +155,7 @@ pub async fn fetch_pack<H: HashAlgorithm>(
 	if pack.len() >= 12 && pack_object_count(&pack) > 0 {
 		repo
 			.objects()
-			.write_pack(&pack)
+			.write_pack(pack)
 			.await
 			.context("storing fetched pack")?;
 	}

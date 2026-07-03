@@ -56,7 +56,7 @@ async fn reads_every_object_in_a_stored_pack() {
 	let objects = sample_graph();
 	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
 	store
-		.write_pack(&encode_pack(&objects))
+		.write_pack(encode_pack(&objects))
 		.await
 		.expect("write pack");
 
@@ -75,7 +75,7 @@ async fn reads_every_object_in_a_stored_pack() {
 async fn write_pack_writes_an_idx_sidecar() {
 	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
 	store
-		.write_pack(&encode_pack(&sample_graph()))
+		.write_pack(encode_pack(&sample_graph()))
 		.await
 		.expect("write pack");
 
@@ -102,7 +102,7 @@ async fn reads_when_the_idx_sidecar_is_missing() {
 	let objects = sample_graph();
 	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
 	store
-		.write_pack(&encode_pack(&objects))
+		.write_pack(encode_pack(&objects))
 		.await
 		.expect("write pack");
 
@@ -134,7 +134,7 @@ async fn reads_when_the_idx_sidecar_is_missing() {
 async fn an_unknown_object_is_not_found() {
 	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
 	store
-		.write_pack(&encode_pack(&sample_graph()))
+		.write_pack(encode_pack(&sample_graph()))
 		.await
 		.expect("write pack");
 
@@ -169,7 +169,7 @@ async fn repack_consolidates_loose_and_packed_objects() {
 	let objects = sample_graph();
 	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
 	store
-		.write_pack(&encode_pack(&objects))
+		.write_pack(encode_pack(&objects))
 		.await
 		.expect("write pack");
 	let loose_a = store
@@ -229,7 +229,7 @@ async fn repack_consolidates_loose_and_packed_objects() {
 async fn repack_of_a_single_pack_is_a_noop() {
 	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
 	store
-		.write_pack(&encode_pack(&sample_graph()))
+		.write_pack(encode_pack(&sample_graph()))
 		.await
 		.expect("write pack");
 	assert!(store.repack(u64::MAX).await.expect("repack").is_none());
@@ -274,7 +274,7 @@ async fn repack_regenerates_a_missing_pack_index() {
 	let objects = sample_graph();
 	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
 	store
-		.write_pack(&encode_pack(&objects))
+		.write_pack(encode_pack(&objects))
 		.await
 		.expect("write pack");
 	let idx_path = store
@@ -376,7 +376,7 @@ async fn prune_loose_leaves_packed_objects_untouched() {
 	let objects = sample_graph();
 	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
 	store
-		.write_pack(&encode_pack(&objects))
+		.write_pack(encode_pack(&objects))
 		.await
 		.expect("write pack");
 
@@ -506,7 +506,7 @@ async fn repack_splits_an_existing_oversized_pack() {
 		})
 		.collect();
 	store
-		.write_pack(&encode_pack(&objects))
+		.write_pack(encode_pack(&objects))
 		.await
 		.expect("write single pack");
 	assert_eq!(
@@ -557,7 +557,7 @@ async fn repack_consolidates_multiple_small_packs_into_one() {
 			})
 			.collect();
 		store
-			.write_pack(&encode_pack(&objects))
+			.write_pack(encode_pack(&objects))
 			.await
 			.expect("write pack");
 		all.extend(objects);
@@ -673,7 +673,7 @@ async fn finds_an_object_in_a_pack_added_after_the_midx() {
 	// A pack added later is not covered by the MIDX; its objects must still be found (scanned).
 	let extra = sample_graph();
 	store
-		.write_pack(&encode_pack(&extra))
+		.write_pack(encode_pack(&extra))
 		.await
 		.expect("write extra pack");
 

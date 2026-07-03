@@ -250,17 +250,31 @@ where
 	/// `.idx` sidecar. Computing the index also validates the pack (a malformed or thin pack
 	/// is rejected and never stored). Idempotent, and it writes a missing `.idx` even when the
 	/// `.pack` is already present.
-	pub async fn write_pack(&self, pack: &[u8]) -> Result<(), ObjectStoreError> {
+	///
+	/// Takes the pack by value and **streams** both the pack and its `.idx` to the backend, so the
+	/// write does not hold a second whole-pack copy (and a blob-store backend can multipart-upload
+	/// rather than buffer the whole object).
+	pub async fn write_pack(&self, pack: Vec<u8>) -> Result<(), ObjectStoreError> {
 		ensure_within(pack.len() as u64, MAX_PACK_SIZE)?;
 		// One decode both validates the pack and yields the `.idx` entries.
-		let entries = pack_index_entries::<H>(pack)?;
-		let checksum = &pack[pack.len() - H::RAW_LEN..];
-		let idx_bytes = encode_pack_index::<H>(&entries, checksum)?;
-		let pack_path = pack_path_for(checksum);
-		self.files.write_path_if_absent(&pack_path, pack).await?;
+		let entries = pack_index_entries::<H>(&pack)?;
+		let checksum = pack[pack.len() - H::RAW_LEN..].to_vec();
+		let idx_bytes = encode_pack_index::<H>(&entries, &checksum)?;
+		let pack_path = pack_path_for(&checksum);
+
+		let pack_len = pack.len() as u64;
 		self
 			.files
-			.write_path_if_absent(&index_path(&pack_path), &idx_bytes)
+			.write_path_stream_if_absent(&pack_path, Box::new(std::io::Cursor::new(pack)), pack_len)
+			.await?;
+		let idx_len = idx_bytes.len() as u64;
+		self
+			.files
+			.write_path_stream_if_absent(
+				&index_path(&pack_path),
+				Box::new(std::io::Cursor::new(idx_bytes)),
+				idx_len,
+			)
 			.await?;
 		Ok(())
 	}
@@ -713,7 +727,7 @@ where
 			return Ok(());
 		}
 		let path = pack_path_for(&pack[pack.len() - H::RAW_LEN..]);
-		self.write_pack(&pack).await?;
+		self.write_pack(pack).await?;
 		out.insert(path);
 		Ok(())
 	}
