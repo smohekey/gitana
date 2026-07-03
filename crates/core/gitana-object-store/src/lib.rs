@@ -18,9 +18,10 @@ use gitana_file_store::{FileStore, FileStoreError, WriteOutcome};
 
 use gitana_object::{
 	HashAlgorithm, MAX_OBJECT_SIZE, MidxEntry, MultiPackIndex, ObjectError, ObjectId, ObjectKind,
-	PackEntry, PackIndex, PackedObject, apply_delta, decode_loose, decode_multi_pack_index,
-	decode_object_at, decode_pack_entry, decode_pack_index, encode_loose, encode_multi_pack_index,
-	encode_pack, encode_pack_index, loose_object_path, pack_index_entries,
+	PackEntry, PackIndex, PackedObject, apply_delta, build_reachability_bitmaps, decode_loose,
+	decode_multi_pack_index, decode_object_at, decode_pack_entry, decode_pack_index, encode_loose,
+	encode_multi_pack_index, encode_multi_pack_index_with_reverse_index, encode_pack,
+	encode_pack_index, loose_object_path, pack_index_entries,
 };
 use tokio::sync::Mutex;
 
@@ -169,11 +170,25 @@ fn pack_path_from_midx_name(name: &str) -> String {
 
 /// The `objects/pack/pack-<hex>.pack` path for a pack whose trailer checksum is `checksum`.
 fn pack_path_for(checksum: &[u8]) -> String {
-	let mut hex = String::with_capacity(checksum.len() * 2);
-	for byte in checksum {
-		hex.push_str(&format!("{byte:02x}"));
+	format!("{PACK_PREFIX}pack-{}{PACK_SUFFIX}", hex(checksum))
+}
+
+/// The `objects/pack/multi-pack-index-<hex>.bitmap` path for a MIDX with the given checksum — git
+/// names the reachability bitmap after the MIDX it belongs to.
+fn midx_bitmap_path(midx_checksum: &[u8]) -> String {
+	format!(
+		"{PACK_PREFIX}multi-pack-index-{}.bitmap",
+		hex(midx_checksum)
+	)
+}
+
+/// Lowercase hex of `bytes`.
+fn hex(bytes: &[u8]) -> String {
+	let mut s = String::with_capacity(bytes.len() * 2);
+	for byte in bytes {
+		s.push_str(&format!("{byte:02x}"));
 	}
-	format!("{PACK_PREFIX}pack-{hex}{PACK_SUFFIX}")
+	s
 }
 
 /// What a [`ObjectStore::repack`] / [`ObjectStore::repack_geometric`] consolidated: how many objects
@@ -191,6 +206,16 @@ pub struct RepackReport {
 	pub packs_removed: usize,
 	/// Loose objects deleted.
 	pub loose_removed: usize,
+}
+
+/// What [`ObjectStore::write_reachability_bitmap`] wrote: how many packs the multi-pack-index covers
+/// and how many commits it bitmapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitmapReport {
+	/// Packs covered by the multi-pack-index the bitmap is built over.
+	pub packs: usize,
+	/// Commits given a reachability bitmap.
+	pub bitmapped_commits: usize,
 }
 
 /// What a [`ObjectStore::prune_loose`] removed: the number of unreachable loose objects deleted.
@@ -787,14 +812,17 @@ where
 	/// Write the multi-pack-index covering `pack_paths` (≥ 2 packs), or delete any existing one
 	/// when fewer (a lone pack needs no MIDX). Objects an id maps to are read from each pack's
 	/// cached `.idx`; the pack id is the pack's rank in ASCII-sorted basename order.
+	///
+	/// This writes a *plain* MIDX (no reverse index), so any existing reachability bitmap is now
+	/// bound to a stale MIDX and is removed — [`Self::write_reachability_bitmap`] rewrites both
+	/// together when a bitmap is wanted.
 	async fn write_or_clear_midx(
 		&self,
 		pack_paths: &HashSet<String>,
 	) -> Result<(), ObjectStoreError> {
 		if pack_paths.len() < 2 {
 			match self.files.delete_path(MIDX_PATH, None).await {
-				Ok(_) => return Ok(()),
-				Err(FileStoreError::NotFound) => return Ok(()),
+				Ok(_) | Err(FileStoreError::NotFound) => return self.clear_midx_bitmaps().await,
 				Err(other) => return Err(other.into()),
 			}
 		}
@@ -819,17 +847,148 @@ where
 			}
 		}
 		let bytes = encode_multi_pack_index::<H>(&names, &entries)?;
+		self.overwrite_path(MIDX_PATH, &bytes).await?;
+		self.clear_midx_bitmaps().await
+	}
 
-		// Overwrite the fixed MIDX path with a read-version-then-CAS loop (retry a concurrent write).
+	/// Delete every `multi-pack-index-*.bitmap` — each is named for (and only usable with) a specific
+	/// MIDX, so a MIDX rewrite without a fresh matching bitmap must not leave one behind. A stock-git
+	/// single-pack `pack-<hash>.bitmap` is a different, unrelated artifact and is left untouched.
+	async fn clear_midx_bitmaps(&self) -> Result<(), ObjectStoreError> {
+		for path in self.files.list_prefix(PACK_PREFIX).await? {
+			let name = path.strip_prefix(PACK_PREFIX).unwrap_or(&path);
+			if name.starts_with("multi-pack-index-") && name.ends_with(".bitmap") {
+				match self.files.delete_path(&path, None).await {
+					Ok(_) | Err(FileStoreError::NotFound) => {}
+					Err(other) => return Err(other.into()),
+				}
+			}
+		}
+		Ok(())
+	}
+
+	/// Write a reverse-index-carrying multi-pack-index over the current packs plus a reachability
+	/// `.bitmap` that bitmaps `selected_commits` (typically the ref tips). Git reads the result to
+	/// answer reachability without walking history.
+	///
+	/// The largest pack (by object count) is preferred — it leads the bitmap object order, as git
+	/// does. Any stale `multi-pack-index-*.bitmap` is removed first, so exactly one bitmap remains.
+	/// Returns `None` when there are no packs to index. Reads every object once to classify it and to
+	/// walk commit/tree reachability (blob bodies are never held), so peak memory is the non-blob
+	/// object set plus one bitmap per selected commit as it is built.
+	pub async fn write_reachability_bitmap(
+		&self,
+		selected_commits: &[ObjectId<H>],
+	) -> Result<Option<BitmapReport>, ObjectStoreError> {
+		let pack_paths: Vec<String> = self
+			.files
+			.list_prefix(PACK_PREFIX)
+			.await?
+			.into_iter()
+			.filter(|path| path.ends_with(PACK_SUFFIX))
+			.collect();
+		if pack_paths.is_empty() {
+			return Ok(None);
+		}
+
+		// MIDX pack ids are the rank of each pack's `.idx` basename in ASCII order (git's convention).
+		let mut names: Vec<String> = pack_paths.iter().map(|path| midx_pack_name(path)).collect();
+		names.sort();
+		let name_to_id: HashMap<&str, u32> = names
+			.iter()
+			.enumerate()
+			.map(|(i, name)| (name.as_str(), i as u32))
+			.collect();
+
+		// Gather every object's (pack, offset), and pick the largest pack to prefer in the order.
+		let mut entries: Vec<MidxEntry<H>> = Vec::new();
+		let mut preferred: (u32, usize) = (0, 0);
+		for path in &pack_paths {
+			let pack_id = name_to_id[midx_pack_name(path).as_str()];
+			let meta = self.pack_meta(path).await?;
+			if meta.index.entries().len() > preferred.1 {
+				preferred = (pack_id, meta.index.entries().len());
+			}
+			for entry in meta.index.entries() {
+				entries.push(MidxEntry {
+					id: entry.id,
+					pack_id,
+					offset: entry.offset,
+				});
+			}
+		}
+
+		// Write the MIDX with its reverse index, then invalidate the cache and re-read it back to
+		// drive the builder (it needs the reverse index, object order, and checksum).
+		let midx_bytes =
+			encode_multi_pack_index_with_reverse_index::<H>(&names, &entries, preferred.0)?;
+		self.overwrite_path(MIDX_PATH, &midx_bytes).await?;
+		*self.midx.lock().await = MidxCache::Unloaded;
+		let midx = decode_multi_pack_index::<H>(&midx_bytes)?;
+
+		// Pre-read objects into sync maps for the builder: every object's kind (for the type indexes
+		// and to skip blob bodies) and every non-blob's bytes (to follow reachability).
+		let mut kinds: HashMap<ObjectId<H>, ObjectKind> = HashMap::with_capacity(midx.len());
+		let mut data: HashMap<ObjectId<H>, Vec<u8>> = HashMap::new();
+		for id in midx.object_ids() {
+			let (kind, bytes) = self.read_object_bounded(id).await?;
+			if kind != ObjectKind::Blob {
+				data.insert(*id, bytes);
+			}
+			kinds.insert(*id, kind);
+		}
+
+		// Only the packed commits can be bitmapped — a still-loose ref tip has no MIDX position, so
+		// bitmapping it would fail. It is simply left unbitmapped (a later maintenance run covers it).
+		let selected: Vec<ObjectId<H>> = selected_commits
+			.iter()
+			.copied()
+			.filter(|id| midx.object_position(id).is_some())
+			.collect();
+		let built = build_reachability_bitmaps(
+			&midx,
+			&selected,
+			|id| kinds.get(id).copied(),
+			|id| data.get(id).cloned(),
+		)?;
+		let bitmap_bytes = built.encode::<H>(midx.checksum())?;
+
+		// Publish only if the on-disk MIDX is still the one we built for. A concurrent maintenance
+		// task could have rewritten it; then this bitmap's checksum-name would mismatch the MIDX and
+		// readers would ignore it, so leave the other writer's state intact and report nothing done.
+		let raw = H::RAW_LEN;
+		match self.files.read_path(MIDX_PATH).await {
+			Ok(on_disk) if on_disk.len() >= raw && on_disk[on_disk.len() - raw..] == *midx.checksum() => {
+			}
+			Ok(_) | Err(FileStoreError::NotFound) => return Ok(None),
+			Err(other) => return Err(other.into()),
+		}
+
+		// One bitmap belongs to a MIDX; drop any stale ones, then overwrite the fresh checksum-named
+		// file (a CAS loop, so a concurrent writer's bytes never masquerade as this call's).
+		self.clear_midx_bitmaps().await?;
+		self
+			.overwrite_path(&midx_bitmap_path(midx.checksum()), &bitmap_bytes)
+			.await?;
+
+		Ok(Some(BitmapReport {
+			packs: pack_paths.len(),
+			bitmapped_commits: built.commits().len(),
+		}))
+	}
+
+	/// Overwrite `path` with `bytes`, retrying on a concurrent write (read-version → CAS). Used for
+	/// the multi-pack-index and its reachability bitmap.
+	async fn overwrite_path(&self, path: &str, bytes: &[u8]) -> Result<(), ObjectStoreError> {
 		loop {
-			let expected = match self.files.read_path_versioned(MIDX_PATH).await {
+			let expected = match self.files.read_path_versioned(path).await {
 				Ok((_, version)) => Some(version),
 				Err(FileStoreError::NotFound) => None,
 				Err(other) => return Err(other.into()),
 			};
 			match self
 				.files
-				.write_path_cas(MIDX_PATH, &bytes, expected.as_ref())
+				.write_path_cas(path, bytes, expected.as_ref())
 				.await
 			{
 				Ok(_) => return Ok(()),

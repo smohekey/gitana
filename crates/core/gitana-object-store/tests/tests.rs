@@ -7,8 +7,8 @@ use std::collections::HashSet;
 use gitana_file_store::FileStore;
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_object::{
-	Commit, ObjectId, ObjectKind, PackedObject, Sha256, TreeEntry, encode_commit, encode_pack,
-	encode_tree,
+	Commit, ObjectId, ObjectKind, PackedObject, Sha256, TreeEntry, decode_midx_bitmap,
+	decode_multi_pack_index, encode_commit, encode_pack, encode_tree,
 };
 use gitana_object_store::ObjectStore;
 
@@ -956,4 +956,197 @@ async fn repack_geometric_rebuilds_a_missing_midx_on_a_noop() {
 			"reads via MIDX"
 		);
 	}
+}
+
+#[tokio::test]
+async fn write_reachability_bitmap_is_read_back_by_our_reader() {
+	// A tiny history: blob <- tree <- commit c1 <- commit c2 (reusing c1's tree).
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let blob = store
+		.write_object(ObjectKind::Blob, b"hello\n")
+		.await
+		.expect("blob");
+	let tree = store
+		.write_object(
+			ObjectKind::Tree,
+			&encode_tree(&[TreeEntry {
+				mode: "100644".to_owned(),
+				name: "f".to_owned(),
+				id: blob,
+			}]),
+		)
+		.await
+		.expect("tree");
+	let sig = "A U Thor <a@x> 1700000000 +0000".to_owned();
+	let c1 = store
+		.write_object(
+			ObjectKind::Commit,
+			&encode_commit(&Commit {
+				tree,
+				parents: vec![],
+				author: sig.clone(),
+				committer: sig.clone(),
+				signature: None,
+				message: "one\n".to_owned(),
+			}),
+		)
+		.await
+		.expect("c1");
+	let c2 = store
+		.write_object(
+			ObjectKind::Commit,
+			&encode_commit(&Commit {
+				tree,
+				parents: vec![c1],
+				author: sig.clone(),
+				committer: sig,
+				signature: None,
+				message: "two\n".to_owned(),
+			}),
+		)
+		.await
+		.expect("c2");
+
+	// Pack everything, then write the MIDX + reachability bitmap over the two commits.
+	store
+		.repack(u64::MAX)
+		.await
+		.expect("repack")
+		.expect("did work");
+	let report = store
+		.write_reachability_bitmap(&[c1, c2])
+		.await
+		.expect("write bitmap")
+		.expect("had packs");
+	assert_eq!(report.packs, 1);
+	assert_eq!(report.bitmapped_commits, 2);
+
+	// The MIDX now carries a reverse index, and the bitmap it names reads back through our reader.
+	let midx_bytes = store
+		.file_store()
+		.read_path("objects/pack/multi-pack-index")
+		.await
+		.expect("midx");
+	let midx = decode_multi_pack_index::<Sha256>(&midx_bytes).expect("decode midx");
+	assert!(midx.reverse_index().is_some());
+
+	let bitmap_path = store
+		.file_store()
+		.list_prefix("objects/pack/")
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|p| p.ends_with(".bitmap"))
+		.expect("a .bitmap was written");
+	let bitmap_bytes = store
+		.file_store()
+		.read_path(&bitmap_path)
+		.await
+		.expect("bitmap");
+	let index = decode_midx_bitmap::<Sha256>(&bitmap_bytes).expect("decode bitmap");
+	assert_eq!(index.midx_checksum(), midx.checksum());
+
+	let reachable = |commit: &ObjectId<Sha256>| -> HashSet<ObjectId<Sha256>> {
+		index
+			.reachable_from(commit, &midx)
+			.expect("reachable")
+			.into_iter()
+			.collect()
+	};
+	assert_eq!(reachable(&c1), HashSet::from([c1, tree, blob]));
+	assert_eq!(reachable(&c2), HashSet::from([c2, c1, tree, blob]));
+
+	// A second call replaces the bitmap cleanly (still exactly one).
+	store
+		.write_reachability_bitmap(&[c2])
+		.await
+		.expect("rewrite")
+		.expect("had packs");
+	let count_bitmaps = || async {
+		store
+			.file_store()
+			.list_prefix("objects/pack/")
+			.await
+			.unwrap()
+			.into_iter()
+			.filter(|p| p.ends_with(".bitmap"))
+			.count()
+	};
+	assert_eq!(count_bitmaps().await, 1, "exactly one bitmap remains");
+
+	// A plain repack rewrites the MIDX and must not leave the now-stale bitmap behind.
+	store
+		.write_object(ObjectKind::Blob, b"more\n")
+		.await
+		.expect("loose");
+	store
+		.repack(u64::MAX)
+		.await
+		.expect("repack")
+		.expect("did work");
+	assert_eq!(
+		count_bitmaps().await,
+		0,
+		"a plain repack clears the stale bitmap",
+	);
+}
+
+#[tokio::test]
+async fn write_reachability_bitmap_skips_a_loose_selected_commit() {
+	// c1 is packed; c2 is a still-loose ref tip. Bitmapping must cover c1 and skip c2, not fail.
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let blob = store.write_object(ObjectKind::Blob, b"x\n").await.unwrap();
+	let tree = store
+		.write_object(
+			ObjectKind::Tree,
+			&encode_tree(&[TreeEntry {
+				mode: "100644".to_owned(),
+				name: "f".to_owned(),
+				id: blob,
+			}]),
+		)
+		.await
+		.unwrap();
+	let sig = "A U Thor <a@x> 1700000000 +0000".to_owned();
+	let c1 = store
+		.write_object(
+			ObjectKind::Commit,
+			&encode_commit(&Commit {
+				tree,
+				parents: vec![],
+				author: sig.clone(),
+				committer: sig.clone(),
+				signature: None,
+				message: "one\n".to_owned(),
+			}),
+		)
+		.await
+		.unwrap();
+	store.repack(u64::MAX).await.unwrap().expect("packed c1");
+
+	// c2 stays loose (written after the repack), so it is not in the MIDX.
+	let c2 = store
+		.write_object(
+			ObjectKind::Commit,
+			&encode_commit(&Commit {
+				tree,
+				parents: vec![c1],
+				author: sig.clone(),
+				committer: sig,
+				signature: None,
+				message: "two\n".to_owned(),
+			}),
+		)
+		.await
+		.unwrap();
+
+	let report = store
+		.write_reachability_bitmap(&[c1, c2])
+		.await
+		.expect("write bitmap")
+		.expect("had packs");
+	assert_eq!(
+		report.bitmapped_commits, 1,
+		"only the packed commit is bitmapped"
+	);
 }
