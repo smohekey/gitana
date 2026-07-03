@@ -20,6 +20,7 @@ mod midx;
 mod pack;
 mod pack_encode;
 mod pktline;
+mod revindex;
 mod sha1;
 mod sha256;
 mod signature;
@@ -36,7 +37,10 @@ pub use id::ObjectId;
 pub use idx::{PackIndex, PackIndexEntry, decode_pack_index, encode_pack_index};
 pub use kind::ObjectKind;
 pub use loose::{MAX_OBJECT_SIZE, decode_loose, encode_loose, loose_object_path};
-pub use midx::{MidxEntry, MultiPackIndex, decode_multi_pack_index, encode_multi_pack_index};
+pub use midx::{
+	MidxEntry, MultiPackIndex, decode_multi_pack_index, encode_multi_pack_index,
+	encode_multi_pack_index_with_reverse_index,
+};
 pub use pack::{
 	PackEntry, PackedObject, decode_object_at, decode_pack, decode_pack_entry,
 	decode_pack_with_bases, pack_index_entries, ref_delta_base_ids,
@@ -46,6 +50,7 @@ pub use pktline::{
 	DELIM_PKT, FLUSH_PKT, MAX_PKT_DATA, PktLine, RESPONSE_END_PKT, parse_pkt, write_delim,
 	write_flush, write_pkt,
 };
+pub use revindex::pack_order;
 pub use sha1::Sha1;
 pub use sha256::Sha256;
 pub use signature::{Signature, TzOffset};

@@ -17,6 +17,9 @@ const CHUNK_OIDF: [u8; 4] = *b"OIDF";
 const CHUNK_OIDL: [u8; 4] = *b"OIDL";
 const CHUNK_OOFF: [u8; 4] = *b"OOFF";
 const CHUNK_LOFF: [u8; 4] = *b"LOFF";
+/// The reverse index: the bitmap object order (see [`crate::pack_order`]). Present only in a
+/// MIDX written to carry reachability bitmaps.
+const CHUNK_RIDX: [u8; 4] = *b"RIDX";
 const FANOUT_LEN: usize = 256 * 4;
 /// The 12-byte header: magic, version, hash version, chunk count, base count, pack count.
 const HEADER_LEN: usize = 12;
@@ -52,6 +55,9 @@ pub struct MultiPackIndex<H: HashAlgorithm> {
 	pack_names: Vec<String>,
 	ids: Vec<ObjectId<H>>,
 	locations: Vec<(u32, u64)>,
+	/// The `RIDX` reverse index (bitmap object order), present only in a bitmap-carrying MIDX:
+	/// `reverse_index[bitmap_position]` is the lexical index into [`Self::ids`].
+	reverse_index: Option<Vec<u32>>,
 }
 
 impl<H: HashAlgorithm> MultiPackIndex<H> {
@@ -78,6 +84,25 @@ impl<H: HashAlgorithm> MultiPackIndex<H> {
 			.ok()
 			.map(|i| (self.locations[i].0 as usize, self.locations[i].1))
 	}
+
+	/// The ids in lexical (id-sorted) order — the order a reachability bitmap's positions index
+	/// through [`Self::reverse_index`].
+	pub fn object_ids(&self) -> &[ObjectId<H>] {
+		&self.ids
+	}
+
+	/// The `RIDX` reverse index if this MIDX carries one: `reverse_index()[bitmap_position]` is the
+	/// lexical index into [`Self::object_ids`]. `None` for a MIDX written without bitmaps.
+	pub fn reverse_index(&self) -> Option<&[u32]> {
+		self.reverse_index.as_deref()
+	}
+
+	/// The object at a reachability-bitmap position, via the reverse index. `None` if this MIDX has
+	/// no reverse index or the position is out of range.
+	pub fn object_at_bitmap_position(&self, position: usize) -> Option<&ObjectId<H>> {
+		let lexical = *self.reverse_index()?.get(position)?;
+		self.ids.get(lexical as usize)
+	}
 }
 
 /// Encode a version-1 multi-pack-index over `pack_names` (their basenames, e.g. `pack-<hex>.pack`)
@@ -91,6 +116,25 @@ pub fn encode_multi_pack_index<H: HashAlgorithm>(
 	pack_names: &[String],
 	entries: &[MidxEntry<H>],
 ) -> Result<Vec<u8>, ObjectError> {
+	encode_midx(pack_names, entries, None)
+}
+
+/// Like [`encode_multi_pack_index`], but also emit the `RIDX` reverse-index chunk (the bitmap
+/// object order, see [`crate::pack_order`]) with `preferred_pack` leading the order — as git does
+/// when writing a MIDX that carries reachability bitmaps. `preferred_pack` must index `pack_names`.
+pub fn encode_multi_pack_index_with_reverse_index<H: HashAlgorithm>(
+	pack_names: &[String],
+	entries: &[MidxEntry<H>],
+	preferred_pack: u32,
+) -> Result<Vec<u8>, ObjectError> {
+	encode_midx(pack_names, entries, Some(preferred_pack))
+}
+
+fn encode_midx<H: HashAlgorithm>(
+	pack_names: &[String],
+	entries: &[MidxEntry<H>],
+	preferred_pack: Option<u32>,
+) -> Result<Vec<u8>, ObjectError> {
 	if pack_names.is_empty() {
 		return Err(ObjectError::MalformedMultiPackIndex);
 	}
@@ -98,10 +142,22 @@ pub fn encode_multi_pack_index<H: HashAlgorithm>(
 		return Err(ObjectError::MalformedMultiPackIndex);
 	}
 	let pack_count = pack_names.len();
+	if preferred_pack.is_some_and(|p| p as usize >= pack_count) {
+		return Err(ObjectError::MalformedMultiPackIndex);
+	}
 
-	// Sort by (id, pack_id) then drop duplicate ids, keeping the lowest pack_id.
+	// Sort by id, then drop duplicate ids keeping one copy. Git's rule: the preferred pack's copy
+	// wins when present (so a bitmap position lands on the preferred pack), else the lowest pack_id.
 	let mut sorted: Vec<&MidxEntry<H>> = entries.iter().collect();
-	sorted.sort_by(|a, b| a.id.cmp(&b.id).then(a.pack_id.cmp(&b.pack_id)));
+	sorted.sort_by(|a, b| {
+		a.id.cmp(&b.id).then_with(|| {
+			let a_preferred = preferred_pack == Some(a.pack_id);
+			let b_preferred = preferred_pack == Some(b.pack_id);
+			b_preferred
+				.cmp(&a_preferred)
+				.then(a.pack_id.cmp(&b.pack_id))
+		})
+	});
 	sorted.dedup_by(|a, b| a.id == b.id);
 	if sorted.iter().any(|e| e.pack_id as usize >= pack_count) {
 		return Err(ObjectError::MalformedMultiPackIndex);
@@ -162,6 +218,16 @@ pub fn encode_multi_pack_index<H: HashAlgorithm>(
 	];
 	if !loff.is_empty() {
 		chunks.push((CHUNK_LOFF, loff));
+	}
+	// RIDX: the bitmap object order, appended last as git does. `order[i]` is the lexical index of
+	// the object at bitmap position `i`; the chunk is that table as big-endian u32s.
+	if let Some(preferred) = preferred_pack {
+		let locations: Vec<(u32, u64)> = sorted.iter().map(|e| (e.pack_id, e.offset)).collect();
+		let mut ridx = Vec::with_capacity(locations.len() * 4);
+		for lexical in crate::pack_order(&locations, preferred) {
+			ridx.extend_from_slice(&lexical.to_be_bytes());
+		}
+		chunks.push((CHUNK_RIDX, ridx));
 	}
 
 	let mut out = Vec::new();
@@ -242,6 +308,7 @@ pub fn decode_multi_pack_index<H: HashAlgorithm>(
 	let (oidl_s, oidl_e) = find(&CHUNK_OIDL).ok_or(ObjectError::MalformedMultiPackIndex)?;
 	let (ooff_s, ooff_e) = find(&CHUNK_OOFF).ok_or(ObjectError::MalformedMultiPackIndex)?;
 	let loff = find(&CHUNK_LOFF);
+	let ridx = find(&CHUNK_RIDX);
 
 	// PNAM: split on NUL, skipping padding; must yield exactly `pack_count` ascending names.
 	let mut pack_names = Vec::with_capacity(pack_count);
@@ -308,10 +375,36 @@ pub fn decode_multi_pack_index<H: HashAlgorithm>(
 		}
 	}
 
+	// RIDX (optional): a table of `n` big-endian u32 lexical indices — the bitmap object order. Each
+	// entry must be a valid, unique index into the ids (a permutation of `0..n`).
+	let reverse_index = match ridx {
+		Some((s, e)) => {
+			if e - s != n * 4 {
+				return Err(ObjectError::MalformedMultiPackIndex);
+			}
+			let mut order = Vec::with_capacity(n);
+			let mut seen = vec![false; n];
+			for i in 0..n {
+				let lexical = read_u32(&bytes[s + i * 4..s + i * 4 + 4]);
+				let slot = seen
+					.get_mut(lexical as usize)
+					.ok_or(ObjectError::MalformedMultiPackIndex)?;
+				if *slot {
+					return Err(ObjectError::MalformedMultiPackIndex);
+				}
+				*slot = true;
+				order.push(lexical);
+			}
+			Some(order)
+		}
+		None => None,
+	};
+
 	Ok(MultiPackIndex {
 		pack_names,
 		ids,
 		locations,
+		reverse_index,
 	})
 }
 
@@ -360,6 +453,79 @@ mod tests {
 		}
 		let stranger = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"absent");
 		assert!(midx.lookup(&stranger).is_none());
+	}
+
+	#[test]
+	fn round_trips_the_reverse_index() {
+		let names = vec!["pack-a.pack".to_owned(), "pack-b.pack".to_owned()];
+		let entries = vec![
+			entry::<Sha256>(b"one", 0, 12),
+			entry::<Sha256>(b"two", 1, 40),
+			entry::<Sha256>(b"three", 0, 77),
+			entry::<Sha256>(b"four", 1, 5),
+		];
+
+		// Without a preferred pack there is no reverse index.
+		let plain =
+			decode_multi_pack_index::<Sha256>(&encode_multi_pack_index(&names, &entries).unwrap())
+				.expect("decode plain");
+		assert!(plain.reverse_index().is_none());
+
+		// With one, the RIDX round-trips and equals `pack_order` over the lexical (id-sorted) order.
+		let bytes = encode_multi_pack_index_with_reverse_index(&names, &entries, 1).expect("encode");
+		let midx = decode_multi_pack_index::<Sha256>(&bytes).expect("decode");
+		let locations: Vec<(u32, u64)> = midx
+			.object_ids()
+			.iter()
+			.map(|id| {
+				let (pack, offset) = midx.lookup(id).unwrap();
+				(pack as u32, offset)
+			})
+			.collect();
+		assert_eq!(
+			midx.reverse_index(),
+			Some(crate::pack_order(&locations, 1).as_slice())
+		);
+
+		// Bitmap position 0 is the preferred pack's lowest-offset object ("four", pack 1 @ 5).
+		let four = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"four");
+		assert_eq!(midx.object_at_bitmap_position(0), Some(&four));
+		assert!(midx.object_at_bitmap_position(midx.len()).is_none());
+
+		// A preferred pack outside the pack list is rejected.
+		assert!(encode_multi_pack_index_with_reverse_index(&names, &entries, 2).is_err());
+	}
+
+	#[test]
+	fn reverse_index_dedup_prefers_the_selected_pack() {
+		// An object in both pack 0 and pack 1; with pack 1 preferred, the MIDX must resolve it to
+		// pack 1 (git's rule) rather than the lowest pack id.
+		let names = vec!["pack-a.pack".to_owned(), "pack-b.pack".to_owned()];
+		let dup = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"shared");
+		let entries = vec![
+			MidxEntry {
+				id: dup,
+				pack_id: 0,
+				offset: 12,
+			},
+			MidxEntry {
+				id: dup,
+				pack_id: 1,
+				offset: 99,
+			},
+		];
+		let bytes = encode_multi_pack_index_with_reverse_index(&names, &entries, 1).expect("encode");
+		let midx = decode_multi_pack_index::<Sha256>(&bytes).expect("decode");
+		assert_eq!(
+			midx.lookup(&dup),
+			Some((1, 99)),
+			"resolved to the preferred pack"
+		);
+		// Without a preferred pack the lowest pack id still wins.
+		let plain =
+			decode_multi_pack_index::<Sha256>(&encode_multi_pack_index(&names, &entries).unwrap())
+				.expect("decode plain");
+		assert_eq!(plain.lookup(&dup), Some((0, 12)));
 	}
 
 	#[test]
