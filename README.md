@@ -60,10 +60,12 @@ Major gaps:
 - Remote transport currently supports HTTP(S) Smart HTTP remotes. Other Git URL
   schemes, such as SSH remotes, are not implemented.
 - Object storage now uses pack `.idx` and a multi-pack-index for lookup. `gta repack`
-  consolidates into size-bounded packs (honoring `pack.packSizeLimit`); `gta gc` prunes
-  then repacks *incrementally* (git's geometric strategy — keeping the large packs), as
-  does `gta repack --geometric`. Both regenerate the multi-pack-index. Still missing:
-  reachability bitmaps.
+  consolidates into size-bounded packs (honoring `pack.packSizeLimit`); `gta gc` prunes,
+  repacks *incrementally* (git's geometric strategy — keeping the large packs, as does
+  `gta repack --geometric`), and writes a multi-pack-index reachability bitmap over the
+  ref tips that stock git reads and trusts (`git multi-pack-index verify` /
+  `rev-list --test-bitmap`). Gitana does not yet *consume* bitmaps to accelerate its own
+  reachability queries (fetch negotiation, `rev-list`).
 
 ## `gta` CLI
 
@@ -100,7 +102,8 @@ Implemented command groups:
 - Repository setup: `config` (local read/write).
 - Maintenance: `repack` (consolidate loose objects and packs; honors `pack.packSizeLimit`,
   splitting into multiple size-bounded packs when set; `--geometric` for an incremental
-  repack), `prune` (delete unreachable loose objects), `gc` (prune then geometric repack).
+  repack), `prune` (delete unreachable loose objects), `gc` (prune, geometric repack, then
+  write a multi-pack-index reachability bitmap over the ref tips).
 - Remote operations: `clone`, `fetch`, `pull`, `push`.
 
 ## Crate layout

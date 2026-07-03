@@ -938,12 +938,13 @@ where
 			kinds.insert(*id, kind);
 		}
 
-		// Only the packed commits can be bitmapped — a still-loose ref tip has no MIDX position, so
-		// bitmapping it would fail. It is simply left unbitmapped (a later maintenance run covers it).
+		// Only packed *commits* can be bitmapped: a caller may pass ref tips that are tag objects or
+		// still-loose commits — `kinds` holds a kind only for objects in this MIDX, so this keeps just
+		// the packed commits among the selection (the rest are covered by a later maintenance run).
 		let selected: Vec<ObjectId<H>> = selected_commits
 			.iter()
 			.copied()
-			.filter(|id| midx.object_position(id).is_some())
+			.filter(|id| kinds.get(id) == Some(&ObjectKind::Commit))
 			.collect();
 		let built = build_reachability_bitmaps(
 			&midx,

@@ -232,6 +232,27 @@ fn gc_repacks_and_prunes() {
 	}
 	assert!(git_ok(w, &["fsck", "--full", "--strict"]));
 
+	// gc also wrote a multi-pack-index and a reachability bitmap that stock git reads and trusts.
+	let pack = pack_files(&work);
+	assert!(
+		pack.iter().any(|p| p == "multi-pack-index"),
+		"gc wrote a multi-pack-index: {pack:?}"
+	);
+	assert!(
+		pack
+			.iter()
+			.any(|p| p.starts_with("multi-pack-index-") && p.ends_with(".bitmap")),
+		"gc wrote a reachability bitmap: {pack:?}"
+	);
+	assert!(
+		git_ok(w, &["multi-pack-index", "verify"]),
+		"git multi-pack-index verify accepts gc's output"
+	);
+	assert!(
+		git_ok(w, &["rev-list", "--test-bitmap", "HEAD"]),
+		"git rev-list --test-bitmap accepts gc's bitmap"
+	);
+
 	// Idempotent: already packed, nothing to prune.
 	let out = gta(w, &["gc"], b"");
 	assert!(out.contains("Nothing to repack"), "second gc: {out}");
@@ -242,6 +263,53 @@ fn gc_repacks_and_prunes() {
 			.count(),
 		1
 	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn gc_bitmaps_annotated_tag_commits() {
+	use gitana_object::{ObjectId, Sha256, decode_midx_bitmap, decode_multi_pack_index};
+
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("gta-gc-tag");
+	let w = work.to_str().unwrap();
+	gta(w, &["init"], b"");
+	write_add_commit(w, &work, "a.txt", "alpha", "one");
+	write_add_commit(w, &work, "b.txt", "beta", "two");
+
+	// Annotate the FIRST commit (not HEAD), so only tag-peeling can reach it as a bitmap tip.
+	let mut tag_args = vec!["-c", "user.name=T", "-c", "user.email=t@example.com"];
+	tag_args.extend_from_slice(&["tag", "-a", "-m", "release", "v1", "HEAD~1"]);
+	git(w, &tag_args);
+
+	gta(w, &["gc"], b"");
+
+	// Decode gc's MIDX + bitmap with our own reader; both the HEAD commit and the tagged commit
+	// (reachable only by peeling the annotated tag) must be bitmapped.
+	let pack_dir = work.join(".git/objects/pack");
+	let midx =
+		decode_multi_pack_index::<Sha256>(&std::fs::read(pack_dir.join("multi-pack-index")).unwrap())
+			.unwrap();
+	let bitmap_name = pack_files(&work)
+		.into_iter()
+		.find(|p| p.starts_with("multi-pack-index-") && p.ends_with(".bitmap"))
+		.expect("gc wrote a bitmap");
+	let index =
+		decode_midx_bitmap::<Sha256>(&std::fs::read(pack_dir.join(bitmap_name)).unwrap()).unwrap();
+
+	let head = ObjectId::<Sha256>::from_hex(git(w, &["rev-parse", "HEAD"]).trim()).unwrap();
+	let tagged = ObjectId::<Sha256>::from_hex(git(w, &["rev-parse", "HEAD~1"]).trim()).unwrap();
+	assert!(
+		index.reachable_from(&head, &midx).is_some(),
+		"HEAD commit is bitmapped"
+	);
+	assert!(
+		index.reachable_from(&tagged, &midx).is_some(),
+		"annotated-tag commit is bitmapped via peeling"
+	);
+
 	std::fs::remove_dir_all(&work).ok();
 }
 

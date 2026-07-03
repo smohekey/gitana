@@ -11,8 +11,8 @@ use std::collections::HashSet;
 
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
-use gitana_object::{HashAlgorithm, ObjectId, referenced_ids};
-use gitana_object_store::{ObjectStoreError, PruneReport, RepackReport};
+use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_tag, referenced_ids};
+use gitana_object_store::{BitmapReport, ObjectStoreError, PruneReport, RepackReport};
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
 
@@ -31,22 +31,74 @@ pub async fn prune<F: FileStore, H: HashAlgorithm>(wt: &WorkTree<F, H>) -> Resul
 /// git's default geometric growth factor, used by `gc`'s incremental repack.
 const GEOMETRIC_FACTOR: u64 = 2;
 
-/// Prune, then incrementally repack. Prune must run *first* — repack packs every reachable object,
-/// which would move an unreachable loose object out of prune's loose-only reach and defeat the
-/// reclaim. The repack is *geometric*: it keeps the large packs and rolls only the small packs +
-/// loose into new ones, so `gc` stays cheap as history grows (use `gta repack` for a full
-/// consolidation).
+/// Prune, then incrementally repack, then write a reachability bitmap. Prune must run *first* —
+/// repack packs every reachable object, which would move an unreachable loose object out of prune's
+/// loose-only reach and defeat the reclaim. The repack is *geometric*: it keeps the large packs and
+/// rolls only the small packs + loose into new ones, so `gc` stays cheap as history grows (use
+/// `gta repack` for a full consolidation). Finally the ref tips are bitmapped so later reachability
+/// queries (fetch negotiation, `rev-list`) can skip the history walk.
 pub async fn gc<F: FileStore, H: HashAlgorithm>(
 	wt: &WorkTree<F, H>,
-) -> Result<(PruneReport, Option<RepackReport>)> {
+) -> Result<(PruneReport, Option<RepackReport>, Option<BitmapReport>)> {
 	let prune = prune(wt).await?;
-	let max_pack_size = wt.repository().pack_size_limit().await?;
-	let repack = wt
-		.repository()
+	let repo = wt.repository();
+	let max_pack_size = repo.pack_size_limit().await?;
+	let repack = repo
 		.objects()
 		.repack_geometric(max_pack_size, GEOMETRIC_FACTOR)
 		.await?;
-	Ok((prune, repack))
+	// The store keeps only the packed commits among these tips (a tag object or loose tip is skipped).
+	let tips = ref_tip_ids(wt).await?;
+	let bitmap = repo.objects().write_reachability_bitmap(&tips).await?;
+	Ok((prune, repack, bitmap))
+}
+
+/// The commits the refs and `HEAD` point at — the tips worth bitmapping (git bitmaps ref tips).
+/// Covers direct refs, symbolic-ref targets, and `HEAD` (the same roots `prune` protects), and
+/// peels an annotated tag to the commit it names (as git does), so a tag on an otherwise unselected
+/// commit still gets bitmapped. Deduplicated; the object store filters to packed commits.
+async fn ref_tip_ids<F: FileStore, H: HashAlgorithm>(
+	wt: &WorkTree<F, H>,
+) -> Result<Vec<ObjectId<H>>> {
+	let repo = wt.repository();
+	let refs = repo.refs();
+	let mut raw: Vec<ObjectId<H>> = refs
+		.list("refs/")
+		.await?
+		.into_iter()
+		.map(|(_, id)| id)
+		.collect();
+	raw.extend(refs.symbolic_ref_targets("refs/").await?);
+	raw.extend(refs.resolve_head().await?);
+
+	let mut commits: HashSet<ObjectId<H>> = HashSet::new();
+	for id in raw {
+		if let Some(commit) = peel_to_commit(repo, id).await? {
+			commits.insert(commit);
+		}
+	}
+	Ok(commits.into_iter().collect())
+}
+
+/// Follow annotated-tag objects to the commit they name, returning that commit (or `None` if the
+/// ref resolves to a tree/blob, is missing, or a tag chain cycles).
+async fn peel_to_commit<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	start: ObjectId<H>,
+) -> Result<Option<ObjectId<H>>> {
+	let mut current = start;
+	let mut seen: HashSet<ObjectId<H>> = HashSet::new();
+	loop {
+		if !seen.insert(current) {
+			return Ok(None); // a malformed tag chain that loops
+		}
+		match repo.objects().read_object(&current).await {
+			Ok((ObjectKind::Commit, _)) => return Ok(Some(current)),
+			Ok((ObjectKind::Tag, data)) => current = parse_tag::<H>(&data)?.object,
+			Ok(_) | Err(ObjectStoreError::NotFound) => return Ok(None),
+			Err(other) => return Err(other.into()),
+		}
+	}
 }
 
 /// Each linked worktree (`git worktree add`) keeps its own `HEAD`, index, reflog, and

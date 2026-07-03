@@ -58,7 +58,14 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   packs), and the object store consults it first — one binary search yielding `(pack, offset)` —
   scanning only packs it doesn't cover and falling back to per-pack `.idx` when absent/stale.
   Oracle-tested: stock `git multi-pack-index verify` accepts ours and we read git's.
-- [ ] Add bitmap or reachability acceleration after pack indexing is stable.
+- [x] Add bitmap or reachability acceleration after pack indexing is stable. A hash-generic
+  EWAH codec plus a MIDX reverse-index (`RIDX`) chunk and reachability `.bitmap` reader/writer
+  in `gitana-object`; a builder computes each ref tip's object closure and the type indexes;
+  `ObjectStore::write_reachability_bitmap` writes the reverse-index-carrying MIDX + `.bitmap`,
+  and `gta gc` calls it over the ref tips. Oracle-tested: stock `git multi-pack-index verify`
+  and `git rev-list --test-bitmap` accept what gitana writes, and our reader reproduces
+  `git rev-list --objects`. Not yet consumed by gitana's own reachability queries (fetch
+  negotiation, `rev-list`) — that acceleration is future work.
 - [ ] Resolve abbreviated object IDs across packed objects, not only loose objects.
 
 ## Remote And Protocol Parity

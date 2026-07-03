@@ -20,7 +20,7 @@ impl WorkTreeCommand for Gc {
 		worktree: WorkTree<Backend, H>,
 		_prefix: String,
 	) -> Result<()> {
-		let (prune, repack) = gitana_porcelain::gc(&worktree).await?;
+		let (prune, repack, bitmap) = gitana_porcelain::gc(&worktree).await?;
 		println!("Pruned {} unreachable object(s).", prune.pruned);
 		match repack {
 			Some(report) => println!(
@@ -32,6 +32,12 @@ impl WorkTreeCommand for Gc {
 				report.loose_removed,
 			),
 			None => println!("Nothing to repack."),
+		}
+		if let Some(report) = bitmap {
+			println!(
+				"Wrote a reachability bitmap over {} commit(s) across {} pack(s).",
+				report.bitmapped_commits, report.packs,
+			);
 		}
 		Ok(())
 	}
