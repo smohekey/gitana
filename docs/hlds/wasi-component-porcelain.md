@@ -181,12 +181,47 @@ Does not prove: worktree ops (still ambient `std::fs`), pack-heavy repos at scal
 cross-process lock behavior under wasm hosts, networking, or concurrent multi-store access from
 one component instance.
 
+## Addendum: The 0.2.0 Surface (roadmap item 1, done)
+
+`gitana:repo@0.2.0` grew the `repository` resource to the full repo-level plumbing set — the
+`gta` `on_repo` command set minus prune/gc:
+
+- **Reads**: `read-object` (kind + canonical payload), `read-blob`, `read-commit`, `read-tag`,
+  `ls-tree` (recursive, via the new `Repository::peel_to_tree`), `read-config` (raw text).
+- **Revisions**: `rev-parse`, `rev-list(tips, max-count)` (ids, newest-first), `merge-base`
+  (empty = no common ancestor, data not error), `is-ancestor`.
+- **Refs**: `list-refs(prefix)` (packed-refs merged, loose wins), `head` (unborn / symbolic /
+  detached), `resolve-ref`, CAS `update-ref`/`delete-ref` (`ref-moved` on mismatch; delete
+  rewrites `packed-refs`), `read`/`set-symbolic-ref`.
+- **Writes**: `write-blob`, `write-tree` (`file-mode` enum input), `create-commit` (specs
+  strictly kind-checked; raw identity lines).
+- **Maintenance**: `repack(geometric)` honoring `pack.packSizeLimit` (geometric factor 2, as
+  `gta`).
+- **`init(git-dir, kind)`**: the one export where the algorithm is *chosen*, not detected —
+  lays out git's empty skeleton (via the new `LocalFileStore::create_dir_all`), writes
+  `config`/`HEAD` idempotently, and refuses a different-format re-init with
+  `unsupported-format`.
+- **Errors**: `repo-error` is now `not-found | unknown-revision | ambiguous | invalid |
+  ref-moved | unsupported-format | corruption | backend`, backed by a core split of
+  `RepositoryError::InvalidRef` into `UnknownRevision`/`AmbiguousRevision`.
+
+Findings from this slice:
+
+- **In-guest pack encoding needs a bigger stack**: debug builds materialize miniz_oxide's
+  ~300 KiB compressor state on the wasm shadow stack deep inside the repack chain, blowing the
+  1 MiB default (a `0xffff…` stack-underflow memory fault). The component links with
+  `-zstack-size=8MiB` (build.rs), matching native thread stacks.
+- Post-repack reads through packs + the multi-pack-index work unchanged through the descriptor
+  backend — the spike had only proven loose objects.
+- Abbreviated-id resolution scans **loose objects only** (`objects/xx/` prefix listing); after a
+  repack, abbreviations of packed objects do not resolve. Engine limitation, not a component
+  one; noted for a future engine slice.
+- prune/gc remain excluded: their root collection must include the worktree *index* (staged
+  objects), which is ambient-`std::fs` territory until worktree threading lands.
+
 ## Roadmap
 
-1. **Full repo-level WIT surface** — refs (list/update), `rev-list`/log, `cat-file`-style object
-   reads, prune/gc — same dispatch pattern; richer per-op error variants (the current three-arm
-   `repo-error` folds "unknown revision" into `invalid` because `rev_parse` reports both
-   malformed and unresolved specs as `InvalidRef`).
+1. ~~**Full repo-level WIT surface**~~ — done, see the addendum above.
 2. **Two-descriptor `open`** (`git-dir` + `common-dir`) for linked worktrees — requires making
    `WorktreeFileStore` buildable over any two `LocalFileStore`s rather than two cap-std `Dir`s.
 3. **Worktree capability threading** — the ~58 ambient `std::fs` sites in `gitana-worktree`;

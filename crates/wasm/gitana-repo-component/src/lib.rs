@@ -32,6 +32,8 @@ mod block_on;
 mod component;
 #[cfg(target_arch = "wasm32")]
 mod inner;
+#[cfg(target_arch = "wasm32")]
+mod ops;
 
 #[cfg(target_arch = "wasm32")]
 use self::component::Component;

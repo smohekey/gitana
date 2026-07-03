@@ -190,7 +190,9 @@ where
 	}
 
 	/// Compare-and-set a ref. `expected == None` requires the ref to be absent;
-	/// otherwise the current value must equal `expected`.
+	/// otherwise the current value must equal `expected`. A ref present only in
+	/// `packed-refs` counts as its packed value — updating it writes the loose
+	/// file, which shadows the packed entry from then on (as git does).
 	pub async fn update_ref(
 		&self,
 		name: &str,
@@ -213,7 +215,8 @@ where
 					.map_err(map_cas(name))?;
 			}
 			Err(FileStoreError::NotFound) => {
-				if expected.is_some() {
+				// No loose file: the ref's current value, if any, is its packed one.
+				if expected != self.resolve_packed(name).await? {
 					return Err(RepositoryError::RefMoved {
 						name: name.to_owned(),
 					});
@@ -980,5 +983,49 @@ mod tests {
 
 		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
 		assert_eq!(store.resolve_head().await.expect("resolve head"), Some(tip));
+	}
+
+	#[tokio::test]
+	async fn update_ref_cas_sees_packed_only_refs() {
+		let files = MemoryFileStore::new();
+		let packed = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"packed tip");
+		let new = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"new tip");
+		files
+			.write_path_if_absent(
+				"packed-refs",
+				format!(
+					"# pack-refs with: peeled fully-peeled sorted\n{} refs/heads/packed\n",
+					packed.to_hex()
+				)
+				.as_bytes(),
+			)
+			.await
+			.unwrap();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+
+		// "Must be absent" refuses a ref that exists (packed-only)…
+		assert!(matches!(
+			store.update_ref("refs/heads/packed", new, None).await,
+			Err(crate::RepositoryError::RefMoved { .. })
+		));
+		// …a wrong expected value refuses…
+		assert!(matches!(
+			store.update_ref("refs/heads/packed", new, Some(new)).await,
+			Err(crate::RepositoryError::RefMoved { .. })
+		));
+		// …and the packed value is the compare value: the update writes the
+		// shadowing loose file.
+		store
+			.update_ref("refs/heads/packed", new, Some(packed))
+			.await
+			.expect("CAS over the packed value");
+		assert_eq!(
+			store.resolve("refs/heads/packed").await.expect("resolve"),
+			Some(new)
+		);
+		assert!(
+			files.read_path("refs/heads/packed").await.is_ok(),
+			"a loose file now shadows the packed entry"
+		);
 	}
 }

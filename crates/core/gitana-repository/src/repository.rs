@@ -69,6 +69,12 @@ where
 		crate::tree::read_tree_recursive(&self.objects, tree).await
 	}
 
+	/// Peel `id` — a commit, tag, or tree — to its tree id, dereferencing tags;
+	/// errors on a blob.
+	pub async fn peel_to_tree(&self, id: ObjectId<H>) -> Result<ObjectId<H>, RepositoryError> {
+		crate::revision::peel_to_tree(self, id).await
+	}
+
 	/// Read and parse the full git `config` file.
 	pub async fn read_config(&self) -> Result<gitana_config::GitConfig, RepositoryError> {
 		let bytes = self.objects.file_store().read_path("config").await?;

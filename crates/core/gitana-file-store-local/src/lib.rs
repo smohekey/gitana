@@ -116,6 +116,16 @@ impl LocalFileStore {
 		}
 	}
 
+	/// Create the directory `path` (and any missing parents) inside the store —
+	/// for laying out a repository skeleton (git's empty `objects/`/`refs/`
+	/// directories, which hold no values a [`FileStore`] write would create).
+	/// Idempotent: existing directories are left untouched.
+	pub async fn create_dir_all(&self, path: &str) -> Result<()> {
+		let path = self.resolve(path)?.to_owned();
+		let fs = Arc::clone(&self.backend);
+		blocking(move || fs.create_dir_all(&path).map_err(backend_err)).await
+	}
+
 	/// Lexically validate a git-relative path, returning it unchanged. The backend
 	/// confines paths structurally; this is cheap defence-in-depth that also gives a
 	/// deterministic [`FileStoreError::Backend`] for traversal/empty components.

@@ -35,6 +35,12 @@ What works today:
 - Smart HTTP advertisement, fetch/upload-pack, receive-pack, push reports, and
   fast-forward enforcement.
 - A `gta-mcp` wrapper that exposes the same command implementations as MCP tools.
+- A `wasm32-wasip2` component (`gitana:repo`, `crates/wasm/gitana-repo-component`)
+  exporting the repo-level plumbing set — object reads/writes, revisions, refs
+  (CAS updates), `repack`, and `init` — where the component's only filesystem
+  authority is a `wasi:filesystem` directory descriptor passed in by the host
+  (no preopens, no ambient access). `crates/wasm/gitana-repo-host` embeds it
+  under wasmtime; see `docs/hlds/wasi-component-porcelain.md`.
 
 Major gaps:
 
@@ -130,6 +136,10 @@ Implemented command groups:
 - `crates/cli/gta-core`: Shared command implementations.
 - `crates/cli/gta`: User-facing CLI.
 - `crates/cli/gta-mcp`: MCP wrapper around the same command surface.
+- `crates/wasm/gitana-repo-component`: `wasm32-wasip2` component exporting the
+  repo-level command surface over a passed-in `wasi:filesystem` descriptor.
+- `crates/wasm/gitana-repo-host`: wasmtime host harness and end-to-end tests
+  for the component.
 
 ## Compatibility checks
 

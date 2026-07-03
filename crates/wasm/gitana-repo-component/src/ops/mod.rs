@@ -1,0 +1,21 @@
+//! Generic operation bodies, written once over the hash algorithm `H` and driven by
+//! [`crate::inner::Inner`]'s dispatch. One module per op domain; conversions to the
+//! WIT types happen here, at the boundary.
+
+mod error;
+mod objects;
+mod refs;
+mod repo;
+mod revisions;
+
+pub(crate) use self::{
+	error::repo_error,
+	objects::{
+		create_commit, ls_tree, read_blob, read_commit, read_object, read_tag, write_blob, write_tree,
+	},
+	refs::{
+		delete_ref, head, list_refs, read_symbolic_ref, resolve_ref, set_symbolic_ref, update_ref,
+	},
+	repo::{init_layout, init_repo, read_config, repack},
+	revisions::{is_ancestor, merge_base, rev_list, rev_parse},
+};

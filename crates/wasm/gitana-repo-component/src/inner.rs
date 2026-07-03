@@ -1,18 +1,32 @@
 //! Runtime hash-kind dispatch: one repository value per compile-time `H`.
 
-use gitana_file_store::FileStoreError;
 use gitana_file_store_local::LocalFileStore;
-use gitana_object::{HashAlgorithm, ObjectKind, Sha1, Sha256, parse_commit};
-use gitana_object_store::{ObjectStore, ObjectStoreError};
-use gitana_repository::{Repository, RepositoryError, detect_hash_kind};
+use gitana_object::{Sha1, Sha256};
+use gitana_object_store::ObjectStore;
+use gitana_repository::{Repository, detect_hash_kind};
 use wasip2::filesystem::types::Descriptor;
 
-use crate::bindings::exports::gitana::repo::porcelain::{CommitInfo, HashKind, RepoError};
+use crate::bindings::exports::gitana::repo::porcelain::{
+	CommitInfo, HashKind, HeadState, ObjectInfo, RefEntry, RepackReport, RepoError, TagInfo,
+	TreeBuildEntry, TreeEntry,
+};
 use crate::block_on::block_on;
+use crate::ops;
+
+/// Run `body` once with `repo` bound to whichever concrete `Repository<_, H>` this
+/// value holds — the two-arm runtime→compile-time bridge, written once.
+macro_rules! dispatch {
+	($self:expr, $repo:ident => $body:expr) => {
+		match $self {
+			Self::Sha1($repo) => $body,
+			Self::Sha256($repo) => $body,
+		}
+	};
+}
 
 /// The repository under its runtime-detected hash algorithm. The same
 /// runtime→compile-time bridge as `gta-core`'s dispatch: match once here, and each
-/// operation body is written once, generic over `H`.
+/// operation body is written once, generic over `H` (see [`crate::ops`]).
 pub(crate) enum Inner {
 	Sha1(Repository<LocalFileStore, Sha1>),
 	Sha256(Repository<LocalFileStore, Sha256>),
@@ -23,10 +37,24 @@ impl Inner {
 	/// `config` *through that descriptor*, and open the repository as the matching `H`.
 	pub(crate) fn open(git_dir: Descriptor) -> Result<Self, RepoError> {
 		let store = LocalFileStore::from_descriptor(git_dir);
-		match block_on(detect_hash_kind(&store)).map_err(repo_error)? {
+		match block_on(detect_hash_kind(&store)).map_err(ops::repo_error)? {
 			gitana_object::HashKind::Sha1 => Ok(Self::Sha1(Repository::new(ObjectStore::new(store)))),
 			gitana_object::HashKind::Sha256 => Ok(Self::Sha256(Repository::new(ObjectStore::new(store)))),
 		}
+	}
+
+	/// Lay out git's directory skeleton, write the fresh-repo metadata for the
+	/// *requested* algorithm (idempotent), and open — refusing a directory that
+	/// already holds a repository of a different format.
+	pub(crate) fn init(git_dir: Descriptor, kind: HashKind) -> Result<Self, RepoError> {
+		let store = LocalFileStore::from_descriptor(git_dir);
+		block_on(ops::init_layout(&store))?;
+		let inner = match kind {
+			HashKind::Sha1 => Self::Sha1(Repository::new(ObjectStore::new(store))),
+			HashKind::Sha256 => Self::Sha256(Repository::new(ObjectStore::new(store))),
+		};
+		dispatch!(&inner, repo => block_on(ops::init_repo(repo)))?;
+		Ok(inner)
 	}
 
 	pub(crate) fn hash_kind(&self) -> HashKind {
@@ -36,74 +64,103 @@ impl Inner {
 		}
 	}
 
+	pub(crate) fn read_config(&self) -> Result<String, RepoError> {
+		dispatch!(self, repo => block_on(ops::read_config(repo)))
+	}
+
+	pub(crate) fn read_object(&self, spec: &str) -> Result<ObjectInfo, RepoError> {
+		dispatch!(self, repo => block_on(ops::read_object(repo, spec)))
+	}
+
+	pub(crate) fn read_blob(&self, spec: &str) -> Result<Vec<u8>, RepoError> {
+		dispatch!(self, repo => block_on(ops::read_blob(repo, spec)))
+	}
+
 	pub(crate) fn read_commit(&self, spec: &str) -> Result<CommitInfo, RepoError> {
-		match self {
-			Self::Sha1(repo) => block_on(read_commit(repo, spec)),
-			Self::Sha256(repo) => block_on(read_commit(repo, spec)),
-		}
+		dispatch!(self, repo => block_on(ops::read_commit(repo, spec)))
+	}
+
+	pub(crate) fn read_tag(&self, spec: &str) -> Result<TagInfo, RepoError> {
+		dispatch!(self, repo => block_on(ops::read_tag(repo, spec)))
+	}
+
+	pub(crate) fn ls_tree(&self, spec: &str) -> Result<Vec<TreeEntry>, RepoError> {
+		dispatch!(self, repo => block_on(ops::ls_tree(repo, spec)))
+	}
+
+	pub(crate) fn rev_parse(&self, spec: &str) -> Result<String, RepoError> {
+		dispatch!(self, repo => block_on(ops::rev_parse(repo, spec)))
+	}
+
+	pub(crate) fn rev_list(
+		&self,
+		tips: &[String],
+		max_count: Option<u32>,
+	) -> Result<Vec<String>, RepoError> {
+		dispatch!(self, repo => block_on(ops::rev_list(repo, tips, max_count)))
+	}
+
+	pub(crate) fn merge_base(&self, commits: &[String]) -> Result<Vec<String>, RepoError> {
+		dispatch!(self, repo => block_on(ops::merge_base(repo, commits)))
+	}
+
+	pub(crate) fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, RepoError> {
+		dispatch!(self, repo => block_on(ops::is_ancestor(repo, ancestor, descendant)))
+	}
+
+	pub(crate) fn list_refs(&self, prefix: &str) -> Result<Vec<RefEntry>, RepoError> {
+		dispatch!(self, repo => block_on(ops::list_refs(repo, prefix)))
+	}
+
+	pub(crate) fn head(&self) -> Result<HeadState, RepoError> {
+		dispatch!(self, repo => block_on(ops::head(repo)))
+	}
+
+	pub(crate) fn resolve_ref(&self, name: &str) -> Result<Option<String>, RepoError> {
+		dispatch!(self, repo => block_on(ops::resolve_ref(repo, name)))
+	}
+
+	pub(crate) fn update_ref(
+		&self,
+		name: &str,
+		new: &str,
+		expected: Option<&str>,
+	) -> Result<(), RepoError> {
+		dispatch!(self, repo => block_on(ops::update_ref(repo, name, new, expected)))
+	}
+
+	pub(crate) fn delete_ref(&self, name: &str, expected: &str) -> Result<(), RepoError> {
+		dispatch!(self, repo => block_on(ops::delete_ref(repo, name, expected)))
+	}
+
+	pub(crate) fn read_symbolic_ref(&self, name: &str) -> Result<Option<String>, RepoError> {
+		dispatch!(self, repo => block_on(ops::read_symbolic_ref(repo, name)))
+	}
+
+	pub(crate) fn set_symbolic_ref(&self, name: &str, target: &str) -> Result<(), RepoError> {
+		dispatch!(self, repo => block_on(ops::set_symbolic_ref(repo, name, target)))
 	}
 
 	pub(crate) fn write_blob(&self, data: &[u8]) -> Result<String, RepoError> {
-		match self {
-			Self::Sha1(repo) => block_on(write_blob(repo, data)),
-			Self::Sha256(repo) => block_on(write_blob(repo, data)),
-		}
+		dispatch!(self, repo => block_on(ops::write_blob(repo, data)))
 	}
-}
 
-async fn read_commit<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
-	spec: &str,
-) -> Result<CommitInfo, RepoError> {
-	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
-	let (kind, payload) = repo
-		.objects()
-		.read_object(&id)
-		.await
-		.map_err(|error| repo_error(RepositoryError::ObjectStore(error)))?;
-	if kind != ObjectKind::Commit {
-		return Err(RepoError::Invalid(format!(
-			"{spec} is a {}, not a commit",
-			kind.as_str()
-		)));
+	pub(crate) fn repack(&self, geometric: bool) -> Result<Option<RepackReport>, RepoError> {
+		dispatch!(self, repo => block_on(ops::repack(repo, geometric)))
 	}
-	let commit =
-		parse_commit::<H>(&payload).map_err(|error| repo_error(RepositoryError::Object(error)))?;
-	Ok(CommitInfo {
-		id: id.to_hex(),
-		tree: commit.tree.to_hex(),
-		parents: commit
-			.parents
-			.iter()
-			.map(|parent| parent.to_hex())
-			.collect(),
-		author: commit.author,
-		committer: commit.committer,
-		message: commit.message,
-	})
-}
 
-async fn write_blob<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
-	data: &[u8],
-) -> Result<String, RepoError> {
-	let id = repo.write_blob(data).await.map_err(repo_error)?;
-	Ok(id.to_hex())
-}
+	pub(crate) fn write_tree(&self, entries: Vec<TreeBuildEntry>) -> Result<String, RepoError> {
+		dispatch!(self, repo => block_on(ops::write_tree(repo, entries)))
+	}
 
-/// Map engine errors onto the WIT error surface. Coarse for the spike: `invalid-ref`
-/// covers both malformed and unresolved specs today, so only genuinely absent
-/// objects/files map to `not-found`.
-fn repo_error(error: RepositoryError) -> RepoError {
-	match error {
-		RepositoryError::MissingObject(id) => RepoError::NotFound(format!("missing object {id}")),
-		RepositoryError::FileStore(FileStoreError::NotFound)
-		| RepositoryError::ObjectStore(ObjectStoreError::NotFound) => {
-			RepoError::NotFound("not found".to_owned())
-		}
-		RepositoryError::InvalidRef(message) => RepoError::Invalid(message),
-		RepositoryError::UnsupportedFormat(message) => RepoError::Invalid(message),
-		RepositoryError::Object(error) => RepoError::Invalid(error.to_string()),
-		other => RepoError::Backend(other.to_string()),
+	pub(crate) fn create_commit(
+		&self,
+		tree: &str,
+		parents: &[String],
+		author: &str,
+		committer: &str,
+		message: &str,
+	) -> Result<String, RepoError> {
+		dispatch!(self, repo => block_on(ops::create_commit(repo, tree, parents, author, committer, message)))
 	}
 }

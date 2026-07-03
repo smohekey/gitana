@@ -1,4 +1,4 @@
-package gitana:repo@0.1.0;
+package gitana:repo@0.2.0;
 
 /// Repository operations over a capability-granted git directory.
 ///
@@ -10,10 +10,21 @@ interface porcelain {
 
 	/// Engine failures surfaced across the component boundary.
 	variant repo-error {
-		/// A revision, object, or ref does not exist.
+		/// An object, ref, or repository file does not exist.
 		not-found(string),
-		/// A malformed spec, config, or object.
+		/// A well-formed revision spec did not resolve to any object.
+		unknown-revision(string),
+		/// An abbreviated object id matches more than one object.
+		ambiguous(string),
+		/// A malformed spec, ref name, config, object, or input.
 		invalid(string),
+		/// A conditional ref update or delete lost the race: the ref was not at
+		/// the expected value. The payload is the ref name.
+		ref-moved(string),
+		/// The repository's format or config is not supported.
+		unsupported-format(string),
+		/// A stored object's bytes hash to a different id than requested.
+		corruption(string),
 		/// The underlying file store failed.
 		backend(string),
 	}
@@ -22,6 +33,96 @@ interface porcelain {
 	enum hash-kind {
 		sha1,
 		sha256,
+	}
+
+	/// A git object's type.
+	enum object-kind {
+		blob,
+		tree,
+		commit,
+		tag,
+	}
+
+	/// A raw object: its resolved id, kind, and canonical payload (without the
+	/// loose-object header).
+	record object-info {
+		/// The object id (hex).
+		id: string,
+		/// The object's kind.
+		kind: object-kind,
+		/// The canonical object payload.
+		payload: list<u8>,
+	}
+
+	/// A parsed annotated tag.
+	record tag-info {
+		/// The tag object's own id (hex).
+		id: string,
+		/// The tagged object's id (hex).
+		target: string,
+		/// The tagged object's kind.
+		target-kind: object-kind,
+		/// The tag name recorded in the object.
+		name: string,
+		/// The raw tagger line (`Name <email> epoch offset`), if present.
+		tagger: option<string>,
+		/// The tag message.
+		message: string,
+	}
+
+	/// A tree-entry mode accepted by `write-tree`. Directories are implied by
+	/// entry paths and cannot be written directly; gitlinks are read-only today.
+	enum file-mode {
+		regular,
+		executable,
+		symlink,
+	}
+
+	/// An input entry for `write-tree`.
+	record tree-build-entry {
+		/// Repo-relative path (`/` separators).
+		path: string,
+		/// The entry's mode.
+		mode: file-mode,
+		/// The blob (or, for `symlink`, target-path blob) id (hex).
+		id: string,
+	}
+
+	/// One entry of a recursively flattened tree (`ls-tree -r`).
+	record tree-entry {
+		/// Repo-relative path (`/` separators).
+		path: string,
+		/// The octal mode string as stored (`100644`, `100755`, `120000`, `160000`).
+		mode: string,
+		/// The entry's object id (hex).
+		id: string,
+	}
+
+	/// A direct (non-symbolic) ref and its target id.
+	record ref-entry {
+		/// The full ref name (e.g. `refs/heads/main`).
+		name: string,
+		/// The object id the ref points at (hex).
+		id: string,
+	}
+
+	/// A symbolic HEAD with its resolved commit.
+	record symbolic-head {
+		/// The ref HEAD points at (e.g. `refs/heads/main`).
+		target: string,
+		/// The commit that ref resolves to (hex).
+		id: string,
+	}
+
+	/// The state of `HEAD`.
+	variant head-state {
+		/// HEAD points at a ref that does not exist yet (an unborn branch);
+		/// the payload is the target ref name.
+		unborn(string),
+		/// HEAD points at an existing ref.
+		symbolic(symbolic-head),
+		/// HEAD points directly at a commit (hex id).
+		detached(string),
 	}
 
 	/// A parsed commit.
@@ -40,6 +141,20 @@ interface porcelain {
 		message: string,
 	}
 
+	/// What a repack consolidated.
+	record repack-report {
+		/// Objects written into the new pack(s).
+		packed-objects: u64,
+		/// New packs written (more than one when the set exceeds the size limit).
+		packs-written: u64,
+		/// Existing packs left untouched (only for a geometric repack).
+		packs-kept: u64,
+		/// Old packs deleted (each with its index).
+		packs-removed: u64,
+		/// Loose objects deleted after being packed.
+		loose-removed: u64,
+	}
+
 	resource repository {
 		/// Open the repository whose git directory is `git-dir` — an owned
 		/// directory descriptor granted by the host. Reads `config` through the
@@ -47,16 +162,96 @@ interface porcelain {
 		/// `extensions.objectformat` means sha1, as in git).
 		open: static func(git-dir: descriptor) -> result<repository, repo-error>;
 
+		/// Initialize a fresh repository in `git-dir` with the given object
+		/// format, then open it: git's empty directory skeleton, a `config`,
+		/// and a symbolic `HEAD → refs/heads/main`. Idempotent — existing files
+		/// are left untouched; a directory already holding a repository of a
+		/// *different* format fails with `unsupported-format`.
+		init: static func(git-dir: descriptor, kind: hash-kind) -> result<repository, repo-error>;
+
 		/// The object-hash algorithm detected at `open`.
 		hash-kind: func() -> hash-kind;
 
-		/// Resolve `spec` (`HEAD`, a ref name, a hex or abbreviated id, `~`/`^`
-		/// forms) and read it as a commit.
+		/// The raw text of the repository's `config` file.
+		read-config: func() -> result<string, repo-error>;
+
+		/// Resolve `spec` and read the raw object it names. Every `spec` in this
+		/// interface accepts the full rev-parse syntax (`HEAD`, ref names, hex or
+		/// abbreviated ids, `~`/`^`/`^{type}` forms, `<rev>:<path>`).
+		read-object: func(spec: string) -> result<object-info, repo-error>;
+
+		/// Resolve `spec` and read it as a blob.
+		read-blob: func(spec: string) -> result<list<u8>, repo-error>;
+
+		/// Resolve `spec` and read it as a commit.
 		read-commit: func(spec: string) -> result<commit-info, repo-error>;
+
+		/// Resolve `spec` and read it as an annotated tag.
+		read-tag: func(spec: string) -> result<tag-info, repo-error>;
+
+		/// Recursively list the tree `spec` peels to (a commit, tag, or tree).
+		ls-tree: func(spec: string) -> result<list<tree-entry>, repo-error>;
+
+		/// Resolve `spec` to an object id (hex).
+		rev-parse: func(spec: string) -> result<string, repo-error>;
+
+		/// The commits reachable from `tips` (each a spec), committer-date newest
+		/// first, truncated to `max-count` when given. Returns ids; compose with
+		/// `read-commit` for a log.
+		rev-list: func(tips: list<string>, max-count: option<u32>) -> result<list<string>, repo-error>;
+
+		/// The best common ancestor(s) — merge bases — of `commits`; an empty
+		/// list when they share none (data, not an error).
+		merge-base: func(commits: list<string>) -> result<list<string>, repo-error>;
+
+		/// Whether `ancestor` is reachable from `descendant`.
+		is-ancestor: func(ancestor: string, descendant: string) -> result<bool, repo-error>;
+
+		/// Direct refs under `prefix` (e.g. `refs/heads/`), with packed-refs
+		/// merged in (a loose file wins), sorted by name.
+		list-refs: func(prefix: string) -> result<list<ref-entry>, repo-error>;
+
+		/// The state of `HEAD`.
+		head: func() -> result<head-state, repo-error>;
+
+		/// Resolve the exact ref `name` — loose, then packed-refs. `none` when
+		/// the ref does not exist.
+		resolve-ref: func(name: string) -> result<option<string>, repo-error>;
+
+		/// Compare-and-set `name` to `new` (a spec). `expected` is the ref's
+		/// current value as a full hex id, or absent to require that the ref
+		/// does not exist yet (create). A mismatch fails with `ref-moved`.
+		update-ref: func(name: string, new: string, expected: option<string>) -> result<_, repo-error>;
+
+		/// Compare-and-delete `name`; `expected` is its current full hex id.
+		/// Also removes the name from `packed-refs`.
+		delete-ref: func(name: string, expected: string) -> result<_, repo-error>;
+
+		/// The target of the symbolic ref `name`, or `none` if it is absent or
+		/// not symbolic.
+		read-symbolic-ref: func(name: string) -> result<option<string>, repo-error>;
+
+		/// Point the symbolic ref `name` at `target` (name `HEAD` moves HEAD).
+		set-symbolic-ref: func(name: string, target: string) -> result<_, repo-error>;
 
 		/// Write `data` as a loose blob object; returns its id (hex). Writing a
 		/// blob that already exists is a no-op returning the same id.
 		write-blob: func(data: list<u8>) -> result<string, repo-error>;
+
+		/// Build the nested tree objects for `entries` and return the root tree
+		/// id (hex). Entry ids are full hex ids, not specs.
+		write-tree: func(entries: list<tree-build-entry>) -> result<string, repo-error>;
+
+		/// Write a commit object (no ref update), returning its id (hex).
+		/// `tree` and each parent are specs; `author`/`committer` are raw git
+		/// identity lines (`Name <email> epoch offset`).
+		create-commit: func(tree: string, parents: list<string>, author: string,
+			committer: string, message: string) -> result<string, repo-error>;
+
+		/// Consolidate loose objects and packs into packs bounded by the repo's
+		/// `pack.packSizeLimit`. `geometric` keeps large existing packs (git's
+		/// incremental strategy, factor 2). `none` when there was nothing to do.
+		repack: func(geometric: bool) -> result<option<repack-report>, repo-error>;
 	}
 }
 

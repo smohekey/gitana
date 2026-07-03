@@ -99,7 +99,7 @@ async fn object_at_path<H: HashAlgorithm>(
 }
 
 /// Peel a commit/tag/tree id to a tree id (dereferencing tags), erroring on a blob.
-async fn peel_to_tree<H: HashAlgorithm>(
+pub(crate) async fn peel_to_tree<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	mut id: ObjectId<H>,
 ) -> Result<ObjectId<H>, RepositoryError> {
@@ -191,7 +191,7 @@ async fn resolve_base<H: HashAlgorithm>(
 			.refs()
 			.resolve_head()
 			.await?
-			.ok_or_else(|| RepositoryError::InvalidRef("HEAD (unborn branch)".to_owned()));
+			.ok_or_else(|| RepositoryError::UnknownRevision("HEAD (unborn branch)".to_owned()));
 	}
 
 	// Ref search order, then oid.
@@ -218,9 +218,7 @@ async fn resolve_base<H: HashAlgorithm>(
 			return resolve_abbrev(repo, base).await;
 		}
 	}
-	Err(RepositoryError::InvalidRef(format!(
-		"unknown revision: {base}"
-	)))
+	Err(RepositoryError::UnknownRevision(base.to_owned()))
 }
 
 async fn resolve_abbrev<H: HashAlgorithm>(
@@ -245,12 +243,8 @@ async fn resolve_abbrev<H: HashAlgorithm>(
 	}
 	match matches.as_slice() {
 		[only] => Ok(*only),
-		[] => Err(RepositoryError::InvalidRef(format!(
-			"unknown revision: {hex}"
-		))),
-		_ => Err(RepositoryError::InvalidRef(format!(
-			"ambiguous abbreviation: {hex}"
-		))),
+		[] => Err(RepositoryError::UnknownRevision(hex.to_owned())),
+		_ => Err(RepositoryError::AmbiguousRevision(hex.to_owned())),
 	}
 }
 

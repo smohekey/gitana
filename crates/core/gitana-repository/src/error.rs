@@ -8,9 +8,15 @@ pub enum RepositoryError {
 	/// The repository's config is not a supported format (only sha256 is supported).
 	#[error("unsupported repository format: {0}")]
 	UnsupportedFormat(String),
-	/// HEAD or a ref file could not be parsed.
+	/// HEAD or a ref file could not be parsed, or a revision spec is malformed.
 	#[error("invalid ref content: {0}")]
 	InvalidRef(String),
+	/// A (well-formed) revision spec did not resolve to any object.
+	#[error("unknown revision: {0}")]
+	UnknownRevision(String),
+	/// An abbreviated object id matches more than one object.
+	#[error("ambiguous abbreviation: {0}")]
+	AmbiguousRevision(String),
 	/// A conditional ref update found a different current value than expected.
 	#[error("ref moved: {name} was not at the expected value")]
 	RefMoved {
