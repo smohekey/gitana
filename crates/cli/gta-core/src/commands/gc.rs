@@ -7,7 +7,7 @@ use gitana_worktree::WorkTree;
 use crate::Backend;
 use crate::dispatch::{self, WorkTreeCommand};
 
-/// Delete unreachable loose objects (prune) then consolidate storage (repack).
+/// Delete unreachable loose objects (prune) then incrementally (geometrically) repack.
 pub async fn run(cwd: &Path) -> Result<()> {
 	dispatch::on_worktree(cwd, Gc).await
 }
@@ -24,8 +24,12 @@ impl WorkTreeCommand for Gc {
 		println!("Pruned {} unreachable object(s).", prune.pruned);
 		match repack {
 			Some(report) => println!(
-				"Packed {} objects into {} pack(s) (removed {} pack(s), {} loose object(s)).",
-				report.packed_objects, report.packs_written, report.packs_removed, report.loose_removed
+				"Packed {} objects into {} pack(s) (kept {} pack(s), removed {} pack(s), {} loose object(s)).",
+				report.packed_objects,
+				report.packs_written,
+				report.packs_kept,
+				report.packs_removed,
+				report.loose_removed,
 			),
 			None => println!("Nothing to repack."),
 		}

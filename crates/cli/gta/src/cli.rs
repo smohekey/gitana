@@ -174,8 +174,13 @@ enum Command {
 		#[arg(long = "skip")]
 		skip: bool,
 	},
-	/// Consolidate loose objects and existing packs into a single pack.
-	Repack,
+	/// Consolidate loose objects and existing packs into size-bounded packs.
+	Repack {
+		/// Incremental (geometric) repack: keep the large packs, roll only the small packs and
+		/// loose objects into new ones.
+		#[arg(long)]
+		geometric: bool,
+	},
 	/// Delete loose objects unreachable from any ref, HEAD, the index, or the reflogs.
 	Prune,
 	/// Delete unreachable loose objects (prune) then consolidate storage (repack).
@@ -421,7 +426,7 @@ impl Cli {
 				continue_,
 				skip,
 			} => commands::rebase::run(&cwd, upstream, onto, abort, continue_, skip).await,
-			Command::Repack => commands::repack::run(&cwd).await,
+			Command::Repack { geometric } => commands::repack::run(&cwd, geometric).await,
 			Command::Prune => commands::prune::run(&cwd).await,
 			Command::Gc => commands::gc::run(&cwd).await,
 			Command::Log => commands::log::run(&cwd).await,

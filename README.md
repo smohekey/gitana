@@ -59,10 +59,11 @@ Major gaps:
   signature generation are not wired through yet.
 - Remote transport currently supports HTTP(S) Smart HTTP remotes. Other Git URL
   schemes, such as SSH remotes, are not implemented.
-- Object storage now uses pack `.idx` and a multi-pack-index for lookup, and
-  `repack`/`gc` consolidate into size-bounded packs (honoring `pack.packSizeLimit`)
-  and regenerate the multi-pack-index. Still missing: reachability bitmaps, and
-  incremental/geometric repack (each `gc` rewrites all packs).
+- Object storage now uses pack `.idx` and a multi-pack-index for lookup. `gta repack`
+  consolidates into size-bounded packs (honoring `pack.packSizeLimit`); `gta gc` prunes
+  then repacks *incrementally* (git's geometric strategy — keeping the large packs), as
+  does `gta repack --geometric`. Both regenerate the multi-pack-index. Still missing:
+  reachability bitmaps.
 
 ## `gta` CLI
 
@@ -98,8 +99,8 @@ Implemented command groups:
   `show`, `switch`, `checkout`, `restore`, `reset`, `diff`.
 - Repository setup: `config` (local read/write).
 - Maintenance: `repack` (consolidate loose objects and packs; honors `pack.packSizeLimit`,
-  splitting into multiple size-bounded packs when set), `prune` (delete unreachable loose
-  objects), `gc` (prune then repack).
+  splitting into multiple size-bounded packs when set; `--geometric` for an incremental
+  repack), `prune` (delete unreachable loose objects), `gc` (prune then geometric repack).
 - Remote operations: `clone`, `fetch`, `pull`, `push`.
 
 ## Crate layout

@@ -159,6 +159,83 @@ fn repack_splits_into_multiple_size_bounded_packs_git_reads_them() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+#[test]
+fn geometric_repack_keeps_the_large_pack_and_git_reads_it() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-geometric");
+	let w = work.to_str().unwrap();
+	gta(w, &["init"], b"");
+	git(w, &["config", "user.name", "T"]);
+	git(w, &["config", "user.email", "t@e"]);
+
+	// Commit a body of files and fully pack them into one (large) pack.
+	for i in 0..6u64 {
+		std::fs::write(
+			work.join(format!("a{i}.bin")),
+			incompressible(i, 100 * 1024),
+		)
+		.unwrap();
+	}
+	git(w, &["add", "."]);
+	git_id(w, &["commit", "-q", "-m", "base"]);
+	gta(w, &["repack"], b"");
+	let packs_before: Vec<String> = pack_files(&work)
+		.into_iter()
+		.filter(|p| p.ends_with(".pack"))
+		.collect();
+	assert_eq!(packs_before.len(), 1, "one pack after a full repack");
+	let big = packs_before[0].clone();
+
+	// New commits leave loose objects; a geometric repack must roll only those up, keeping the pack.
+	for i in 0..2u64 {
+		std::fs::write(
+			work.join(format!("b{i}.bin")),
+			incompressible(100 + i, 50 * 1024),
+		)
+		.unwrap();
+	}
+	git(w, &["add", "."]);
+	git_id(w, &["commit", "-q", "-m", "more"]);
+	let before = all_object_ids(w);
+
+	let out = gta(w, &["repack", "--geometric"], b"");
+	assert!(
+		out.contains("kept 1 pack"),
+		"geometric kept the large pack: {out}"
+	);
+
+	// The large pack survives untouched; a new small pack + a MIDX now exist.
+	let after: Vec<String> = pack_files(&work)
+		.into_iter()
+		.filter(|p| p.ends_with(".pack"))
+		.collect();
+	assert!(
+		after.contains(&big),
+		"the large pack {big} was kept in place"
+	);
+	assert!(
+		after.len() >= 2,
+		"a new pack holds the rolled-up objects: {after:?}"
+	);
+	assert!(
+		work.join(".git/objects/pack/multi-pack-index").exists(),
+		"a multi-pack-index was written"
+	);
+
+	// Stock git accepts the MIDX and the repo, and the object set is unchanged.
+	assert!(
+		git_ok(w, &["multi-pack-index", "verify"]),
+		"git multi-pack-index verify"
+	);
+	assert!(git_ok(w, &["fsck", "--full", "--strict"]), "git fsck");
+	assert_eq!(all_object_ids(w), before, "every object preserved");
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 // --- helpers -------------------------------------------------------------------------------
 
 /// Deterministic, effectively-incompressible bytes (xorshift64 over a mixed seed).

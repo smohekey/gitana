@@ -28,15 +28,24 @@ pub async fn prune<F: FileStore, H: HashAlgorithm>(wt: &WorkTree<F, H>) -> Resul
 	Ok(repo.objects().prune_loose(&reachable).await?)
 }
 
-/// Prune, then consolidate: `prune` followed by `repack`. Prune must run *first* — `repack`
-/// packs every stored object (including unreachable loose ones), which would move them out of
-/// prune's loose-only reach and defeat the reclaim.
+/// git's default geometric growth factor, used by `gc`'s incremental repack.
+const GEOMETRIC_FACTOR: u64 = 2;
+
+/// Prune, then incrementally repack. Prune must run *first* — repack packs every reachable object,
+/// which would move an unreachable loose object out of prune's loose-only reach and defeat the
+/// reclaim. The repack is *geometric*: it keeps the large packs and rolls only the small packs +
+/// loose into new ones, so `gc` stays cheap as history grows (use `gta repack` for a full
+/// consolidation).
 pub async fn gc<F: FileStore, H: HashAlgorithm>(
 	wt: &WorkTree<F, H>,
 ) -> Result<(PruneReport, Option<RepackReport>)> {
 	let prune = prune(wt).await?;
 	let max_pack_size = wt.repository().pack_size_limit().await?;
-	let repack = wt.repository().objects().repack(max_pack_size).await?;
+	let repack = wt
+		.repository()
+		.objects()
+		.repack_geometric(max_pack_size, GEOMETRIC_FACTOR)
+		.await?;
 	Ok((prune, repack))
 }
 

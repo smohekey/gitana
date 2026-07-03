@@ -726,3 +726,234 @@ async fn a_stale_midx_whose_packs_are_gone_is_ignored() {
 		Err(gitana_object_store::ObjectStoreError::NotFound)
 	));
 }
+
+/// A small, distinct, effectively-incompressible blob object for a given seed.
+fn blob(seed: u64) -> PackedObject<Sha256> {
+	let data = incompressible(seed, 512);
+	let id = ObjectId::<Sha256>::compute(ObjectKind::Blob, &data);
+	PackedObject {
+		id,
+		kind: ObjectKind::Blob,
+		data,
+	}
+}
+
+fn hex(bytes: &[u8]) -> String {
+	let mut s = String::with_capacity(bytes.len() * 2);
+	for b in bytes {
+		s.push_str(&format!("{b:02x}"));
+	}
+	s
+}
+
+#[tokio::test]
+async fn repack_geometric_keeps_the_large_pack() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+
+	// One large pack (20 objects) and two small packs (2 each), all disjoint, plus a little loose.
+	let big: Vec<PackedObject<Sha256>> = (0..20u64).map(|i| blob(1000 + i)).collect();
+	let small_a: Vec<PackedObject<Sha256>> = (0..2u64).map(|i| blob(2000 + i)).collect();
+	let small_b: Vec<PackedObject<Sha256>> = (0..2u64).map(|i| blob(3000 + i)).collect();
+	let big_pack = encode_pack(&big);
+	let big_path = format!(
+		"objects/pack/pack-{}.pack",
+		hex(&big_pack[big_pack.len() - 32..])
+	);
+	store.write_pack(big_pack).await.expect("write big");
+	store
+		.write_pack(encode_pack(&small_a))
+		.await
+		.expect("write a");
+	store
+		.write_pack(encode_pack(&small_b))
+		.await
+		.expect("write b");
+	let loose = store
+		.write_object(ObjectKind::Blob, &incompressible(4000, 512))
+		.await
+		.expect("write loose");
+
+	let report = store
+		.repack_geometric(u64::MAX, 2)
+		.await
+		.expect("repack")
+		.expect("geometric did work");
+	assert_eq!(report.packs_kept, 1, "the large pack is kept in place");
+
+	// The large pack file is untouched (never rewritten), and no loose objects remain.
+	assert!(
+		store.file_store().exists(&big_path).await.unwrap(),
+		"large pack {big_path} kept in place"
+	);
+	assert!(!has_loose_objects(&store).await);
+	// A multi-pack-index covers the kept + new packs.
+	assert!(store.file_store().exists(MIDX_PATH).await.unwrap());
+
+	// Every object — kept, rolled up, or formerly loose — still reads back.
+	for object in big.iter().chain(&small_a).chain(&small_b) {
+		assert_eq!(
+			store.read_object(&object.id).await.expect("read").1,
+			object.data
+		);
+	}
+	assert!(store.read_object(&loose).await.is_ok());
+
+	// The layout is now geometric (a big pack over a small one), so a second geometric repack is a
+	// no-op.
+	assert!(
+		store
+			.repack_geometric(u64::MAX, 2)
+			.await
+			.expect("repack")
+			.is_none(),
+		"already geometric",
+	);
+}
+
+#[tokio::test]
+async fn repack_geometric_rewrites_a_kept_pack_missing_its_idx() {
+	// A would-be-kept large pack whose `.idx` is gone must not be left in place (stock git needs
+	// the sidecar); it is rolled into the batch and rewritten with a fresh `.idx`.
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let big: Vec<PackedObject<Sha256>> = (0..20u64).map(|i| blob(1000 + i)).collect();
+	let small: Vec<PackedObject<Sha256>> = (0..2u64).map(|i| blob(2000 + i)).collect();
+	let big_pack = encode_pack(&big);
+	let big_path = format!(
+		"objects/pack/pack-{}.pack",
+		hex(&big_pack[big_pack.len() - 32..])
+	);
+	store.write_pack(big_pack).await.expect("write big");
+	store
+		.write_pack(encode_pack(&small))
+		.await
+		.expect("write small");
+
+	// Remove the large pack's sidecar so it cannot be kept as-is.
+	let big_idx = format!("{}.idx", big_path.strip_suffix(".pack").unwrap());
+	store
+		.file_store()
+		.delete_path(&big_idx, None)
+		.await
+		.expect("delete big idx");
+
+	store
+		.repack_geometric(u64::MAX, 2)
+		.await
+		.expect("repack")
+		.expect("did work");
+
+	// Every remaining pack has its `.idx`, and every object still reads.
+	let paths = store
+		.file_store()
+		.list_prefix("objects/pack/")
+		.await
+		.unwrap();
+	for pack in paths.iter().filter(|p| p.ends_with(".pack")) {
+		let idx = format!("{}.idx", pack.strip_suffix(".pack").unwrap());
+		assert!(
+			paths.contains(&idx),
+			"kept/rewritten pack {pack} has its .idx"
+		);
+	}
+	for object in big.iter().chain(&small) {
+		assert_eq!(
+			store.read_object(&object.id).await.expect("read").1,
+			object.data
+		);
+	}
+}
+
+#[tokio::test]
+async fn repack_geometric_folds_loose_weight_into_the_split() {
+	// A lone pack is "already geometric" on its own, but enough loose objects beside it must pull it
+	// into the batch — otherwise gc would write a second same-sized pack and leave a non-geometric
+	// layout. With a 20-object pack and 20 loose, the split rolls both up (nothing kept).
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let packed: Vec<PackedObject<Sha256>> = (0..20u64).map(|i| blob(1000 + i)).collect();
+	store.write_pack(encode_pack(&packed)).await.expect("write");
+	let mut loose = Vec::new();
+	for i in 0..20u64 {
+		let data = incompressible(2000 + i, 512);
+		loose.push(
+			store
+				.write_object(ObjectKind::Blob, &data)
+				.await
+				.expect("loose"),
+		);
+	}
+
+	let report = store
+		.repack_geometric(u64::MAX, 2)
+		.await
+		.expect("repack")
+		.expect("did work");
+	assert_eq!(report.packs_kept, 0, "the old pack is rolled in, not kept");
+
+	// The result is now geometric: a second geometric repack is a no-op.
+	assert!(
+		store
+			.repack_geometric(u64::MAX, 2)
+			.await
+			.expect("repack")
+			.is_none(),
+		"layout is geometric after folding loose in",
+	);
+	for object in &packed {
+		assert!(store.read_object(&object.id).await.is_ok(), "packed reads");
+	}
+	for id in &loose {
+		assert!(store.read_object(id).await.is_ok(), "loose reads");
+	}
+}
+
+#[tokio::test]
+async fn repack_geometric_rebuilds_a_missing_midx_on_a_noop() {
+	// Two packs already in geometric progression (20 and 2 objects) written directly, so no MIDX
+	// exists. A geometric repack does no repacking, but the maintenance command must still leave a
+	// correct MIDX behind rather than skipping it on the no-op path.
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let big: Vec<PackedObject<Sha256>> = (0..20u64).map(|i| blob(1000 + i)).collect();
+	let small: Vec<PackedObject<Sha256>> = (0..2u64).map(|i| blob(2000 + i)).collect();
+	store.write_pack(encode_pack(&big)).await.expect("big");
+	store.write_pack(encode_pack(&small)).await.expect("small");
+	assert!(
+		!store
+			.file_store()
+			.exists("objects/pack/multi-pack-index")
+			.await
+			.unwrap(),
+		"no MIDX before repack",
+	);
+
+	assert!(
+		store
+			.repack_geometric(u64::MAX, 2)
+			.await
+			.expect("repack")
+			.is_none(),
+		"already geometric — no repack",
+	);
+	assert!(
+		store
+			.file_store()
+			.exists("objects/pack/multi-pack-index")
+			.await
+			.unwrap(),
+		"MIDX rebuilt on the no-op path",
+	);
+
+	// A second call is a true no-op: the MIDX now matches, so it is left untouched.
+	assert!(
+		store
+			.repack_geometric(u64::MAX, 2)
+			.await
+			.expect("repack")
+			.is_none(),
+	);
+	for object in big.iter().chain(&small) {
+		assert!(
+			store.read_object(&object.id).await.is_ok(),
+			"reads via MIDX"
+		);
+	}
+}

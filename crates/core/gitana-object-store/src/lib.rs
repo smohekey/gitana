@@ -120,6 +120,35 @@ fn partition_ranges<H: HashAlgorithm>(
 	ranges
 }
 
+/// Git's geometric-repack split: given pack object-counts sorted ascending and a growth `factor`,
+/// return how many of the smallest packs to roll up (the "batch"). The rest are kept untouched.
+/// The batch is the largest prefix such that the kept packs form a geometric progression by count
+/// (each ≥ `factor` × the total of everything smaller). `factor` is treated as ≥ 2; `f × x`
+/// saturates rather than overflowing. `0` means the packs are already geometric.
+fn geometric_split(counts_ascending: &[u64], factor: u64) -> usize {
+	let factor = factor.max(2);
+	let n = counts_ascending.len();
+	if n == 0 {
+		return 0;
+	}
+	// From the top, find where the progression first breaks going down.
+	let mut split = n - 1;
+	while split > 0 {
+		if counts_ascending[split] < factor.saturating_mul(counts_ascending[split - 1]) {
+			break;
+		}
+		split -= 1;
+	}
+	// Roll up everything below the break, then extend upward while the next pack does not itself
+	// dominate the accumulated batch by `factor`.
+	let mut total: u64 = counts_ascending[..split].iter().copied().sum();
+	while split < n && counts_ascending[split] < factor.saturating_mul(total) {
+		total = total.saturating_add(counts_ascending[split]);
+		split += 1;
+	}
+	split
+}
+
 /// A pack's basename (`pack-<hex>.pack`) from its repository-relative path.
 fn pack_basename(pack_path: &str) -> &str {
 	pack_path.strip_prefix(PACK_PREFIX).unwrap_or(pack_path)
@@ -147,14 +176,17 @@ fn pack_path_for(checksum: &[u8]) -> String {
 	format!("{PACK_PREFIX}pack-{hex}{PACK_SUFFIX}")
 }
 
-/// What a [`ObjectStore::repack`] consolidated: how many objects were packed, into how many new
-/// packs, and how many now-redundant packs and loose objects it removed.
+/// What a [`ObjectStore::repack`] / [`ObjectStore::repack_geometric`] consolidated: how many objects
+/// were packed, into how many new packs, how many existing packs it left in place, and how many
+/// now-redundant packs and loose objects it removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepackReport {
 	/// Objects written into the new pack(s).
 	pub packed_objects: usize,
 	/// New packs written (>1 when the object set exceeds the pack-size limit).
 	pub packs_written: usize,
+	/// Existing packs left untouched (>0 only for a geometric repack; 0 for a full repack).
+	pub packs_kept: usize,
 	/// Old packs deleted (each with its `.idx`).
 	pub packs_removed: usize,
 	/// Loose objects deleted.
@@ -576,22 +608,119 @@ where
 			return Ok(None);
 		}
 
-		// Union of every stored id: each pack's index entries plus the loose objects.
+		Ok(Some(
+			self
+				.repack_batch(&old_packs, &[], &loose_ids, max_pack_size)
+				.await?,
+		))
+	}
+
+	/// Incrementally repack: keep the large packs and roll only the small packs — chosen by git's
+	/// geometric split with growth `factor` — plus every loose object into new size-bounded packs,
+	/// regenerating the multi-pack-index. Far cheaper than a full [`Self::repack`]: the kept packs'
+	/// object *data* is never read (only every pack's `.idx`, needed to rebuild the MIDX). Returns
+	/// `None` when nothing needs doing (packs already geometric and nothing loose).
+	pub async fn repack_geometric(
+		&self,
+		max_pack_size: u64,
+		factor: u64,
+	) -> Result<Option<RepackReport>, ObjectStoreError> {
+		let max_pack_size = max_pack_size.min(MAX_PACK_SIZE);
+		let pack_paths: Vec<String> = self
+			.files
+			.list_prefix(PACK_PREFIX)
+			.await?
+			.into_iter()
+			.filter(|path| path.ends_with(PACK_SUFFIX))
+			.collect();
+		let loose_ids = self.loose_object_ids().await?;
+
+		// Order packs by object count (the geometric weight), smallest first, and pick the split.
+		// The loose objects join as a virtual smallest pack: git packs them first and then splits
+		// over the result, so their weight has to count when deciding whether the smallest real pack
+		// still dominates — otherwise `gc` beside an already-geometric layout writes a fresh pack that
+		// leaves the whole set non-geometric. The loose pseudo-pack (`None`) is always rolled in.
+		let mut by_count: Vec<(u64, Option<String>)> = Vec::with_capacity(pack_paths.len() + 1);
+		for path in pack_paths {
+			let count = self.pack_meta(&path).await?.index.entries().len() as u64;
+			by_count.push((count, Some(path)));
+		}
+		if !loose_ids.is_empty() {
+			by_count.push((loose_ids.len() as u64, None));
+		}
+		by_count.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+		let counts: Vec<u64> = by_count.iter().map(|(count, _)| *count).collect();
+		let split = geometric_split(&counts, factor);
+
+		let mut batch: Vec<String> = Vec::new();
+		let mut kept: Vec<String> = Vec::new();
+		for (i, (_, item)) in by_count.iter().enumerate() {
+			let Some(path) = item else { continue };
+			if i < split {
+				batch.push(path.clone());
+			} else if self.files.exists(&index_path(path)).await? {
+				kept.push(path.clone());
+			} else {
+				// A kept pack must have its `.idx` sidecar on disk — stock git needs it even with a
+				// MIDX, and `pack_meta` only rebuilds a missing one in memory. Roll any such pack into
+				// the batch instead, so the rewrite regenerates its sidecar (as a full repack would).
+				batch.push(path.clone());
+			}
+		}
+		if batch.is_empty() && loose_ids.is_empty() {
+			// The packs are already geometric and nothing is loose, so no repack is due. The
+			// maintenance command still owes a correct multi-pack-index, though: rebuild it when the
+			// on-disk MIDX is absent or does not name exactly the current packs (a foreign tool wrote
+			// the packs, or one was removed out-of-band). When it already matches, this is a true
+			// no-op — lookups stay on the fast MIDX path either way.
+			let want: HashSet<String> = kept.iter().map(|p| midx_pack_name(p)).collect();
+			let fresh = match self.multi_pack_index().await? {
+				Some(midx) => midx.pack_names().iter().cloned().collect::<HashSet<_>>() == want,
+				None => kept.len() < 2,
+			};
+			if !fresh {
+				self
+					.write_or_clear_midx(&kept.iter().cloned().collect())
+					.await?;
+				*self.midx.lock().await = MidxCache::Unloaded;
+			}
+			return Ok(None);
+		}
+		Ok(Some(
+			self
+				.repack_batch(&batch, &kept, &loose_ids, max_pack_size)
+				.await?,
+		))
+	}
+
+	/// Rewrite the objects of `batch_packs` (plus `loose_ids`) into new size-bounded packs, delete
+	/// those batch packs and the loose objects, and regenerate the multi-pack-index over
+	/// `kept_packs` (left untouched) together with the new packs. Shared by [`Self::repack`] (batch
+	/// = every pack, kept = none) and [`Self::repack_geometric`] (batch = the small packs).
+	///
+	/// **Memory-bounded**, as documented on [`Self::repack`]: pass 1 records each batch object's
+	/// `(kind, size)` and drops the data; pass 2 encodes/writes/drops one size-bounded partition at
+	/// a time, so peak memory is ≈ one pack plus `O(objects)` metadata — the kept packs are never
+	/// read.
+	async fn repack_batch(
+		&self,
+		batch_packs: &[String],
+		kept_packs: &[String],
+		loose_ids: &[ObjectId<H>],
+		max_pack_size: u64,
+	) -> Result<RepackReport, ObjectStoreError> {
+		// Union of the batch's ids: each batch pack's index entries plus the loose objects.
 		let mut ids: HashSet<ObjectId<H>> = HashSet::new();
-		for path in &old_packs {
+		for path in batch_packs {
 			for entry in self.pack_meta(path).await?.index.entries() {
 				ids.insert(entry.id);
 			}
 		}
 		ids.extend(loose_ids.iter().copied());
-		if ids.is_empty() {
-			return Ok(None);
-		}
 
-		// Pass 1: read each object once for its (kind, size), dropping the data. Sort the small
-		// metadata the way `encode_pack` orders objects (type, then largest-first, then id), so a
-		// contiguous run groups delta-friendly objects into the same size-bounded partition. Reads
-		// are memory-bounded (no whole-pack caching).
+		// Pass 1: read each object once for its (kind, size), dropping the data. Sort like
+		// `encode_pack` orders objects (type, then largest-first, then id) so a contiguous run
+		// groups delta-friendly objects into one size-bounded partition. Reads are memory-bounded.
 		let mut meta: Vec<(ObjectId<H>, ObjectKind, u64)> = Vec::with_capacity(ids.len());
 		for id in &ids {
 			let (kind, data) = self.read_object_bounded(id).await?;
@@ -621,10 +750,9 @@ where
 				.await?;
 		}
 
-		// Delete the old packs (except any a re-encode reproduced) and every loose object — all
-		// now redundant with the new packs.
+		// Delete the batch packs (except any a re-encode reproduced) and every loose object.
 		let mut packs_removed = 0;
-		for path in &old_packs {
+		for path in batch_packs {
 			if new_pack_paths.contains(path) {
 				continue;
 			}
@@ -632,25 +760,28 @@ where
 			self.files.delete_path(&index_path(path), None).await?;
 			packs_removed += 1;
 		}
-		for id in &loose_ids {
+		for id in loose_ids {
 			self.files.delete_path(&loose_object_path(id), None).await?;
 		}
 
-		// Regenerate the multi-pack-index over exactly the packs now on disk (or drop it when a
-		// single pack makes it pointless), before invalidating the caches.
-		self.write_or_clear_midx(&new_pack_paths).await?;
+		// Regenerate the MIDX over the kept packs plus the new ones (or drop it below two packs),
+		// before invalidating the caches.
+		let mut all_packs: HashSet<String> = kept_packs.iter().cloned().collect();
+		all_packs.extend(new_pack_paths.iter().cloned());
+		self.write_or_clear_midx(&all_packs).await?;
 
 		// The caches may name deleted packs (and the MIDX changed); drop them (reads reload lazily).
 		self.packs.lock().await.clear();
 		self.pack_bytes.lock().await.clear();
 		*self.midx.lock().await = MidxCache::Unloaded;
 
-		Ok(Some(RepackReport {
+		Ok(RepackReport {
 			packed_objects: meta.len(),
 			packs_written: new_pack_paths.len(),
+			packs_kept: kept_packs.len(),
 			packs_removed,
 			loose_removed: loose_ids.len(),
-		}))
+		})
 	}
 
 	/// Write the multi-pack-index covering `pack_paths` (≥ 2 packs), or delete any existing one
@@ -776,5 +907,41 @@ where
 			}
 		}
 		Ok(PruneReport { pruned })
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::geometric_split;
+
+	#[test]
+	fn already_geometric_rolls_up_nothing() {
+		// Each pack is ≥ 2× the total below it → no batch.
+		assert_eq!(geometric_split(&[50, 100, 200], 2), 0);
+		assert_eq!(geometric_split(&[1], 2), 0);
+		assert_eq!(geometric_split(&[], 2), 0);
+	}
+
+	#[test]
+	fn rolls_up_the_small_packs_under_a_big_one() {
+		// Three small packs and one large: the small ones become the batch, the large is kept.
+		assert_eq!(geometric_split(&[1, 1, 1, 100], 2), 3);
+		// Two equal small packs under a big one: they roll up together.
+		assert_eq!(geometric_split(&[2, 2, 20], 2), 2);
+	}
+
+	#[test]
+	fn rolls_up_everything_when_no_pack_dominates() {
+		// A flat run (no pack is 2× the batch below it) rolls all of them together.
+		assert_eq!(geometric_split(&[3, 4, 5, 6], 2), 4);
+	}
+
+	#[test]
+	fn a_low_factor_is_clamped_and_huge_counts_saturate() {
+		// factor < 2 is treated as 2.
+		assert_eq!(geometric_split(&[50, 100, 200], 1), 0);
+		// A saturating `factor * x` must not panic on near-`u64::MAX` counts (here it reads as
+		// already geometric — the point is that it terminates without overflow).
+		assert_eq!(geometric_split(&[u64::MAX, u64::MAX], 2), 0);
 	}
 }
