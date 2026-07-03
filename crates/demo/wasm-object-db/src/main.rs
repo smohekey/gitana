@@ -29,11 +29,16 @@ fn main() -> Result<()> {
 	Ok(())
 }
 
-/// The store's confined root. Under `wasm32-wasip2` the host preopens `/store` and the
-/// WASI runtime confines access to it; natively we ambient-open a temp directory.
+/// The store's confined root. Under `wasm32-wasip2` the host preopens `/store`; the
+/// demo takes that preopen's *descriptor* — the same capability handle a component
+/// export would be passed — rather than going through the preopen path table.
 #[cfg(target_arch = "wasm32")]
 fn open_store() -> LocalFileStore {
-	LocalFileStore::from_root("/store")
+	let dir = wasip2::filesystem::preopens::get_directories()
+		.into_iter()
+		.find_map(|(descriptor, path)| (path == "/store").then_some(descriptor))
+		.expect("host must preopen /store (wasmtime run --dir=<host>::/store)");
+	LocalFileStore::from_descriptor(dir)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

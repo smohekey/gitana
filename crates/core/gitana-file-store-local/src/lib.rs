@@ -8,21 +8,24 @@
 //! - **native** (`CapBackend`): a [`cap_std::fs::Dir`] *capability* — the `Dir` *is*
 //!   the sandbox, so traversal and symlink escapes are rejected structurally (no
 //!   `canonicalize` dance, no TOCTOU window).
-//! - **wasm** (`StdBackend`): plain [`std::fs`] rooted at a path. cap-std's WASI
-//!   dependencies do not yet build on stable Rust for `wasm32-wasip2`; there a host
-//!   *preopen* supplies and confines the root, so the WASI runtime enforces the
-//!   sandbox and no ambient authority can escape it.
+//! - **wasm** (`DescriptorBackend`): an open `wasi:filesystem` directory *descriptor*
+//!   (cap-std's WASI dependencies do not yet build on stable Rust for
+//!   `wasm32-wasip2`). The descriptor is the same kind of capability a `Dir` is —
+//!   passed in by the host through a component export, or taken from
+//!   `wasi:filesystem/preopens` — and is the store's entire authority.
 //!
 //! Immutable writes use `create_new` (atomic refuse-if-exists). Conditional writes use
 //! a content-hash [`Version`] made atomic by a per-path in-process lock plus a
-//! `<path>.lock` file (cross-process, like git's ref locks). cap-std/std::fs are
+//! `<path>.lock` file (cross-process, like git's ref locks). The backends are
 //! synchronous; the async [`FileStore`] contract is kept by running each operation
 //! through `blocking` — `spawn_blocking` on native (keeping the reactor free), a
 //! direct call on wasm (single-threaded, where a blocking syscall is the norm). The
 //! crate is *capability-pure*: it never mints ambient authority — callers hand it an
-//! open `Dir` (native) or a preopened root (wasm).
+//! open `Dir` (native) or a descriptor (wasm).
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -41,9 +44,6 @@ use std::sync::Mutex;
 use cap_std::fs::{Dir, OpenOptions};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::Mutex as AsyncMutex;
-
-#[cfg(target_arch = "wasm32")]
-use std::path::PathBuf;
 
 // Linked-worktree routing is a native concern (git worktree layouts); the wasm target
 // uses a single `LocalFileStore`, and cap-std's `Dir` (which this takes) is native-only.
@@ -90,18 +90,10 @@ impl LocalFileStore {
 		Self::with_backend(Arc::new(CapBackend { dir }))
 	}
 
-	/// A store over the directory `root` via `std::fs` (wasm). Under `wasm32-wasip2`
-	/// the host preopens `root` and the WASI runtime confines access to it.
-	#[cfg(target_arch = "wasm32")]
-	pub fn from_root(root: impl Into<PathBuf>) -> Self {
-		Self::with_backend(Arc::new(StdBackend { root: root.into() }))
-	}
-
 	/// A store over `dir`, an open `wasi:filesystem` directory descriptor handed in by
 	/// the host as a capability (wasm) — e.g. minted by a wasmtime embedding and passed
-	/// through a component export, or taken from `wasi:filesystem/preopens`. Unlike
-	/// [`LocalFileStore::from_root`] there is no preopen-path convention: the
-	/// descriptor itself is the entire authority.
+	/// through a component export, or taken from `wasi:filesystem/preopens`. There is
+	/// no preopen-path convention: the descriptor itself is the entire authority.
 	#[cfg(target_arch = "wasm32")]
 	pub fn from_descriptor(dir: wasip2::filesystem::types::Descriptor) -> Self {
 		Self::with_backend(Arc::new(DescriptorBackend { dir }))
@@ -448,93 +440,6 @@ impl Backend for CapBackend {
 			self.dir.read_dir(dir_rel)
 		};
 		let entries = match entries {
-			Ok(entries) => entries,
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-			Err(error) => return Err(error),
-		};
-		let mut names = Vec::new();
-		for entry in entries {
-			names.push(entry?.file_name().to_string_lossy().into_owned());
-		}
-		Ok(names)
-	}
-}
-
-/// Wasm backend: `std::fs` rooted at a host-preopened directory (cap-std's WASI deps do
-/// not yet build on stable Rust; WASI preopens enforce the sandbox in its place).
-#[cfg(target_arch = "wasm32")]
-struct StdBackend {
-	root: PathBuf,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl StdBackend {
-	fn full(&self, path: &str) -> PathBuf {
-		self.root.join(path)
-	}
-}
-
-#[cfg(target_arch = "wasm32")]
-impl Backend for StdBackend {
-	fn read(&self, path: &str) -> std::io::Result<Vec<u8>> {
-		std::fs::read(self.full(path))
-	}
-
-	fn read_range(&self, path: &str, offset: u64, length: u64) -> std::io::Result<Vec<u8>> {
-		let mut file = std::fs::File::open(self.full(path))?;
-		file.seek(SeekFrom::Start(offset))?;
-		let mut buf = Vec::new();
-		file.take(length).read_to_end(&mut buf)?;
-		Ok(buf)
-	}
-
-	fn create_dir_all(&self, path: &str) -> std::io::Result<()> {
-		std::fs::create_dir_all(self.full(path))
-	}
-
-	fn create_new(&self, path: &str) -> std::io::Result<Option<Box<dyn Write + Send>>> {
-		match std::fs::OpenOptions::new()
-			.write(true)
-			.create_new(true)
-			.open(self.full(path))
-		{
-			Ok(file) => Ok(Some(Box::new(file))),
-			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-			Err(error) => Err(error),
-		}
-	}
-
-	fn open_read(&self, path: &str) -> std::io::Result<Box<dyn Read + Send>> {
-		Ok(Box::new(std::fs::File::open(self.full(path))?))
-	}
-
-	fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
-		std::fs::rename(self.full(from), self.full(to))
-	}
-
-	fn remove_file(&self, path: &str) -> std::io::Result<()> {
-		std::fs::remove_file(self.full(path))
-	}
-
-	fn exists(&self, path: &str) -> std::io::Result<bool> {
-		match std::fs::metadata(self.full(path)) {
-			Ok(_) => Ok(true),
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-			Err(error) => Err(error),
-		}
-	}
-
-	fn size(&self, path: &str) -> std::io::Result<u64> {
-		Ok(std::fs::metadata(self.full(path))?.len())
-	}
-
-	fn list_names(&self, dir_rel: &str) -> std::io::Result<Vec<String>> {
-		let dir_full = if dir_rel.is_empty() {
-			self.root.clone()
-		} else {
-			self.full(dir_rel)
-		};
-		let entries = match std::fs::read_dir(dir_full) {
 			Ok(entries) => entries,
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
 			Err(error) => return Err(error),

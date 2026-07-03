@@ -2,9 +2,9 @@
 //!
 //! The descriptor is a *capability*: the host mints it (e.g. a wasmtime embedding
 //! pushing a directory into its resource table) and passes it across the component
-//! boundary; the store can reach exactly that directory tree and nothing else. Unlike
-//! [`crate::LocalFileStore::from_root`]'s preopen convention, no path lookup against
-//! the WASI preopen table is involved at all.
+//! boundary — or a command guest takes it from `wasi:filesystem/preopens`; the store
+//! can reach exactly that directory tree and nothing else. No path lookup against the
+//! WASI preopen table is involved.
 
 use std::io::{Read, Write};
 

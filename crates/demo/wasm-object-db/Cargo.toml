@@ -17,7 +17,10 @@ gitana-object.workspace = true
 gitana-object-store.workspace = true
 
 # Native only: the demo builds and runs on the host too (using an ambient-opened temp
-# dir), which needs cap-std. On wasm the store takes a host preopen via `from_root`.
+# dir), which needs cap-std. On wasm the store takes the `/store` preopen's descriptor.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cap-std.workspace = true
 tokio = { workspace = true, features = ["rt"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasip2.workspace = true

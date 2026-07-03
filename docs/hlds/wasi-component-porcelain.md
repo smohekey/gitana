@@ -138,9 +138,9 @@ Notes:
 - Everything above the `Backend` seam (temp+rename atomic publish, content-hash CAS, `.lock`
   files, path validation, streaming) is untouched — the seam did exactly the job it was built for
   in the previous slice.
-- `StdBackend`/`from_root` are kept for now (`wasm-object-db` still uses the preopen convention);
-  deleting them is on the roadmap since a preopen is *obtainable as a descriptor* via
-  `wasi:filesystem/preopens#get-directories`.
+- `StdBackend`/`from_root` have since been **deleted**: `wasm-object-db` takes its `/store`
+  preopen as a *descriptor* via `wasi:filesystem/preopens#get-directories` →
+  `from_descriptor`, so the descriptor backend is the only wasm backend.
 
 ## The Async Story (WASI 0.2)
 
@@ -228,9 +228,9 @@ Findings from this slice:
    after that, `porcelain::commit`/`merge`/`status` become exportable. WASI symlink/exec-bit
    limits need validation there.
 4. **`wasi:http` transport trait** for `gitana-remote` so fetch/clone/push work in-component.
-5. **Retire `StdBackend`/`from_root`** — port `wasm-object-db` to
-   `preopens#get-directories` → `from_descriptor`, making the descriptor backend the only wasm
-   backend.
+5. ~~**Retire `StdBackend`/`from_root`**~~ — done: `wasm-object-db` takes its preopen as a
+   descriptor (`preopens#get-directories` → `from_descriptor`); the descriptor backend is the
+   only wasm backend.
 6. **WASI 0.3 revisit** — native async exports delete `block_on`; blocked on the Rust `wasip3`
    target maturing past Tier 3.
 7. **Host embedding as a product crate** — `gitana-repo-host` is currently a test harness; a
