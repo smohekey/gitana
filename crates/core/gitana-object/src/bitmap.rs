@@ -25,10 +25,13 @@ use std::collections::HashMap;
 
 use crate::{
 	EwahBitmap, HashAlgorithm, MultiPackIndex, ObjectError, ObjectId, ObjectKind, decode_ewah,
+	encode_ewah,
 };
 
 const SIGNATURE: [u8; 4] = *b"BITM";
 const VERSION: u16 = 1;
+/// Header flag: the bitmaps cover the full closure of each commit (git sets this; we always do).
+const FLAG_FULL_DAG: u16 = 0x1;
 /// Header flag: a lookup table follows (a layout this reader does not yet handle).
 const FLAG_LOOKUP_TABLE: u16 = 0x10;
 /// Per-commit-entry preamble: `u32` object position, `u8` XOR offset, `u8` flags.
@@ -190,6 +193,48 @@ pub fn decode_midx_bitmap<H: HashAlgorithm>(bytes: &[u8]) -> Result<BitmapIndex,
 	})
 }
 
+/// Serialize a version-1 MIDX reachability `.bitmap` for the MIDX identified by `midx_checksum`
+/// (which must be `H::RAW_LEN` bytes). `type_bitmaps` are the four type indexes in git's order —
+/// commits, trees, blobs, tags — over the MIDX bitmap object order; `commits` pairs each bitmapped
+/// commit's lexical object position (see [`MultiPackIndex::object_position`]) with its reachability
+/// bitmap in that same order.
+///
+/// The output is the minimal form stock git accepts: `FLAG_FULL_DAG` set, every commit stored
+/// directly (XOR offset 0), no hash-cache, and an `H` trailer over the preceding bytes. It is the
+/// inverse of [`decode_midx_bitmap`]. The caller writes it to `multi-pack-index-<checksum>.bitmap`.
+///
+/// Fails with [`ObjectError::MalformedBitmap`] if `midx_checksum` is not `H::RAW_LEN` bytes — a
+/// wrong-width checksum would shift the first EWAH off the fixed offset git and the reader expect.
+pub fn encode_midx_bitmap<H: HashAlgorithm>(
+	midx_checksum: &[u8],
+	type_bitmaps: [&EwahBitmap; 4],
+	commits: &[(u32, &EwahBitmap)],
+) -> Result<Vec<u8>, ObjectError> {
+	if midx_checksum.len() != H::RAW_LEN {
+		return Err(ObjectError::MalformedBitmap);
+	}
+	let mut out = Vec::new();
+	out.extend_from_slice(&SIGNATURE);
+	out.extend_from_slice(&VERSION.to_be_bytes());
+	out.extend_from_slice(&FLAG_FULL_DAG.to_be_bytes());
+	out.extend_from_slice(&(commits.len() as u32).to_be_bytes());
+	out.extend_from_slice(midx_checksum);
+
+	for type_bitmap in type_bitmaps {
+		out.extend_from_slice(&encode_ewah(type_bitmap));
+	}
+	for (object_position, reachable) in commits {
+		out.extend_from_slice(&object_position.to_be_bytes());
+		out.push(0); // XOR offset: stored directly
+		out.push(0); // entry flags
+		out.extend_from_slice(&encode_ewah(reachable));
+	}
+
+	let checksum = H::digest(&[&out]);
+	out.extend_from_slice(checksum.as_ref());
+	Ok(out)
+}
+
 /// The word-wise XOR of two bitmaps (the shorter zero-extended).
 fn xor(a: &EwahBitmap, b: &EwahBitmap) -> EwahBitmap {
 	let (a, b) = (a.words(), b.words());
@@ -262,6 +307,45 @@ mod tests {
 		assert_eq!(index.commit_reachability(5), Some(&reach));
 		assert!(index.commit_reachability(99).is_none());
 		assert_eq!(index.bitmapped_commit_positions().collect::<Vec<_>>(), [5]);
+	}
+
+	#[test]
+	fn encode_then_decode_round_trips() {
+		let commits_t = EwahBitmap::from_set_bits([0, 5]);
+		let trees_t = EwahBitmap::from_set_bits([1, 2]);
+		let blobs_t = EwahBitmap::from_set_bits([3, 4]);
+		let tags_t = EwahBitmap::from_set_bits([]);
+		let reach0 = EwahBitmap::from_set_bits([0, 1, 3]);
+		let reach5 = EwahBitmap::from_set_bits([0, 1, 2, 3, 4, 5]);
+
+		let types = [&commits_t, &trees_t, &blobs_t, &tags_t];
+		let entries = [(0u32, &reach0), (5, &reach5)];
+		let bytes = encode_midx_bitmap::<Sha1>(&[9u8; 20], types, &entries).expect("encode");
+		// A wrong-width checksum is rejected rather than written into a malformed header.
+		assert!(matches!(
+			encode_midx_bitmap::<Sha1>(&[9u8; 19], types, &entries),
+			Err(ObjectError::MalformedBitmap)
+		));
+		// The trailer is an H digest over everything before it.
+		assert_eq!(
+			&bytes[bytes.len() - 20..],
+			crate::Sha1::digest(&[&bytes[..bytes.len() - 20]]).as_ref(),
+		);
+
+		let index = decode_midx_bitmap::<Sha1>(&bytes).expect("decode our own bitmap");
+		assert_eq!(index.midx_checksum(), &[9u8; 20]);
+		assert_eq!(
+			index
+				.type_bitmap(ObjectKind::Commit)
+				.set_bits()
+				.collect::<Vec<_>>(),
+			[0, 5]
+		);
+		assert_eq!(index.commit_reachability(0), Some(&reach0));
+		assert_eq!(index.commit_reachability(5), Some(&reach5));
+		let mut positions: Vec<u32> = index.bitmapped_commit_positions().collect();
+		positions.sort_unstable();
+		assert_eq!(positions, [0, 5]);
 	}
 
 	#[test]
