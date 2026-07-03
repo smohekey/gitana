@@ -7,6 +7,7 @@
 //! concrete algorithm ([`Sha1`] / [`Sha256`]) is chosen at the crate boundary. Leaf
 //! crate.
 
+mod bitmap;
 mod commit;
 mod delta;
 mod enumerate;
@@ -28,6 +29,7 @@ mod tag;
 mod text;
 mod tree;
 
+pub use bitmap::{BitmapIndex, decode_midx_bitmap};
 pub use commit::{Commit, commit_signed_payload, encode_commit, parse_commit};
 pub use delta::apply_delta;
 pub use enumerate::{enumerate_objects, referenced_ids};
@@ -97,6 +99,10 @@ pub enum ObjectError {
 	/// size disagreeing with the words it decompresses to.
 	#[error("malformed EWAH bitmap")]
 	MalformedEwah,
+	/// A multi-pack-index reachability `.bitmap` had a bad signature/version, a truncated stream, an
+	/// XOR offset referencing before the first entry, or an unsupported (lookup-table) layout.
+	#[error("malformed reachability bitmap")]
+	MalformedBitmap,
 	/// A delta's instructions were invalid or referenced outside the base.
 	#[error("malformed delta")]
 	MalformedDelta,

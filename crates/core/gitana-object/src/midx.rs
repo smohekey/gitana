@@ -58,6 +58,8 @@ pub struct MultiPackIndex<H: HashAlgorithm> {
 	/// The `RIDX` reverse index (bitmap object order), present only in a bitmap-carrying MIDX:
 	/// `reverse_index[bitmap_position]` is the lexical index into [`Self::ids`].
 	reverse_index: Option<Vec<u32>>,
+	/// The MIDX's trailing checksum — a reachability `.bitmap` names the MIDX it belongs to by this.
+	checksum: Vec<u8>,
 }
 
 impl<H: HashAlgorithm> MultiPackIndex<H> {
@@ -102,6 +104,18 @@ impl<H: HashAlgorithm> MultiPackIndex<H> {
 	pub fn object_at_bitmap_position(&self, position: usize) -> Option<&ObjectId<H>> {
 		let lexical = *self.reverse_index()?.get(position)?;
 		self.ids.get(lexical as usize)
+	}
+
+	/// The lexical (id-sorted) index of `id`, or `None` if absent. This is the position a MIDX
+	/// reachability bitmap records for a bitmapped commit (git's "nth object"), distinct from the
+	/// bitmap object order used by [`Self::object_at_bitmap_position`].
+	pub fn object_position(&self, id: &ObjectId<H>) -> Option<usize> {
+		self.ids.binary_search(id).ok()
+	}
+
+	/// The MIDX's trailing checksum — a reachability `.bitmap` binds to its MIDX by this value.
+	pub fn checksum(&self) -> &[u8] {
+		&self.checksum
 	}
 }
 
@@ -405,6 +419,7 @@ pub fn decode_multi_pack_index<H: HashAlgorithm>(
 		ids,
 		locations,
 		reverse_index,
+		checksum: bytes[body_end..].to_vec(),
 	})
 }
 
