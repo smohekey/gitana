@@ -10,6 +10,7 @@
 mod commit;
 mod delta;
 mod enumerate;
+mod ewah;
 mod hash_algorithm;
 mod id;
 mod idx;
@@ -29,6 +30,7 @@ mod tree;
 pub use commit::{Commit, commit_signed_payload, encode_commit, parse_commit};
 pub use delta::apply_delta;
 pub use enumerate::{enumerate_objects, referenced_ids};
+pub use ewah::{EwahBitmap, decode_ewah, encode_ewah};
 pub use hash_algorithm::{HashAlgorithm, HashKind};
 pub use id::ObjectId;
 pub use idx::{PackIndex, PackIndexEntry, decode_pack_index, encode_pack_index};
@@ -86,6 +88,10 @@ pub enum ObjectError {
 	/// table, size, out-of-order id, pack reference, or trailing checksum — decoding or encoding.
 	#[error("malformed multi-pack-index")]
 	MalformedMultiPackIndex,
+	/// An EWAH-compressed bitmap stream was truncated, had an RLW overrunning its buffer, or a bit
+	/// size disagreeing with the words it decompresses to.
+	#[error("malformed EWAH bitmap")]
+	MalformedEwah,
 	/// A delta's instructions were invalid or referenced outside the base.
 	#[error("malformed delta")]
 	MalformedDelta,
