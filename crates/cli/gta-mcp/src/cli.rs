@@ -444,6 +444,13 @@ enum RemoteAction {
 		#[arg(long)]
 		name: String,
 	},
+	/// Rename the remote <old> to <new>.
+	Rename {
+		#[arg(long)]
+		old: String,
+		#[arg(long)]
+		new: String,
+	},
 	/// Change the URL of the remote named <name>.
 	SetUrl {
 		#[arg(long)]
@@ -614,6 +621,7 @@ fn remote_action(verbose: bool, action: Option<RemoteAction>) -> commands::remot
 		None => Action::List { verbose },
 		Some(RemoteAction::Add { name, url }) => Action::Add { name, url },
 		Some(RemoteAction::Remove { name }) => Action::Remove { name },
+		Some(RemoteAction::Rename { old, new }) => Action::Rename { old, new },
 		Some(RemoteAction::SetUrl { name, url }) => Action::SetUrl { name, url },
 	}
 }

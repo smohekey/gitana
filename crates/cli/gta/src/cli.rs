@@ -376,6 +376,8 @@ enum RemoteAction {
 	/// Remove the remote named <name> (and its remote-tracking refs).
 	#[command(alias = "rm")]
 	Remove { name: String },
+	/// Rename the remote <old> to <new>.
+	Rename { old: String, new: String },
 	/// Change the URL of the remote named <name>.
 	SetUrl { name: String, url: String },
 }
@@ -541,6 +543,7 @@ fn remote_action(verbose: bool, action: Option<RemoteAction>) -> commands::remot
 		None => Action::List { verbose },
 		Some(RemoteAction::Add { name, url }) => Action::Add { name, url },
 		Some(RemoteAction::Remove { name }) => Action::Remove { name },
+		Some(RemoteAction::Rename { old, new }) => Action::Rename { old, new },
 		Some(RemoteAction::SetUrl { name, url }) => Action::SetUrl { name, url },
 	}
 }

@@ -16,6 +16,8 @@ pub enum Action {
 	Add { name: String, url: String },
 	/// Remove a remote and its remote-tracking refs.
 	Remove { name: String },
+	/// Rename a remote, moving its tracking refs and updating config that names it.
+	Rename { old: String, new: String },
 	/// Change a remote's URL.
 	SetUrl { name: String, url: String },
 }
@@ -35,6 +37,7 @@ impl RepoCommand for RemoteCmd {
 			Action::List { verbose } => list(&repo, verbose).await,
 			Action::Add { name, url } => add(&repo, &name, &url).await,
 			Action::Remove { name } => remove(&repo, &name).await,
+			Action::Rename { old, new } => rename(&repo, &old, &new).await,
 			Action::SetUrl { name, url } => set_url(&repo, &name, &url).await,
 		}
 	}
@@ -184,6 +187,73 @@ async fn remove<H: HashAlgorithm>(repo: &Repository<Backend, H>, name: &str) -> 
 	repo
 		.refs()
 		.remove_prefix(&format!("refs/remotes/{name}/"))
+		.await?;
+	Ok(())
+}
+
+async fn rename<H: HashAlgorithm>(
+	repo: &Repository<Backend, H>,
+	old: &str,
+	new: &str,
+) -> Result<()> {
+	validate_name(new)?;
+	let mut config = repo.read_config().await?;
+	let remotes = config.subsections("remote");
+	if !remotes.contains(&old) {
+		bail!("no such remote: '{old}'");
+	}
+	if remotes.contains(&new) {
+		bail!("remote '{new}' already exists");
+	}
+	let (old_tracking, new_tracking) = (
+		format!("refs/remotes/{old}/"),
+		format!("refs/remotes/{new}/"),
+	);
+	config.rename_subsection("remote", old, new);
+
+	// Point the *destination* of each fetch refspec at the new tracking-ref namespace. Only the
+	// `<src>:<dst>` right-hand side is the tracking namespace; git leaves the left (source) side —
+	// what to fetch from the remote — alone, so we must not rewrite a source `refs/remotes/<old>/`.
+	let fetches: Vec<String> = config
+		.get_all("remote", Some(new), "fetch")
+		.iter()
+		.map(|refspec| match refspec.split_once(':') {
+			// Only a destination that *is* the old tracking namespace is repointed — git leaves a
+			// destination that merely contains it as a substring (e.g. `xrefs/remotes/old/*`) alone.
+			Some((src, dst)) if dst.starts_with(&old_tracking) => {
+				format!("{src}:{new_tracking}{}", &dst[old_tracking.len()..])
+			}
+			_ => (*refspec).to_owned(),
+		})
+		.collect();
+	config.unset("remote", Some(new), "fetch");
+	for refspec in &fetches {
+		config.add("remote", Some(new), "fetch", Some(refspec));
+	}
+
+	// Repoint any branch upstream/push config and the repo push default at the new name.
+	let branches: Vec<String> = config
+		.subsections("branch")
+		.into_iter()
+		.map(str::to_owned)
+		.collect();
+	for branch in branches {
+		if config.get_string("branch", Some(&branch), "remote") == Some(old) {
+			config.set("branch", Some(&branch), "remote", new)?;
+		}
+		if config.get_string("branch", Some(&branch), "pushRemote") == Some(old) {
+			config.set("branch", Some(&branch), "pushRemote", new)?;
+		}
+	}
+	if config.get_string("remote", None, "pushDefault") == Some(old) {
+		config.set("remote", None, "pushDefault", new)?;
+	}
+	repo.write_config(&config).await?;
+
+	// Move the tracking refs (and reflogs) to the new namespace.
+	repo
+		.refs()
+		.rename_prefix(&old_tracking, &new_tracking)
 		.await?;
 	Ok(())
 }

@@ -278,6 +278,176 @@ where
 			.await
 	}
 
+	/// Move every ref under `old` to `new` — loose (direct *or* symbolic, rewriting a symbolic target
+	/// that points back under `old`), its reflog, and any packed entry alike. Used to rename a
+	/// remote's whole `refs/remotes/<old>/` tree to `refs/remotes/<new>/`.
+	pub async fn rename_prefix(&self, old: &str, new: &str) -> Result<(), RepositoryError> {
+		// Loose ref files, rewriting a symbolic `ref:` target that itself points under `old`. Keep the
+		// paths we write — they are the destination's *authoritative* loose refs, so the stale-shadow
+		// sweep below must not delete them.
+		let loose_targets = self
+			.move_files_under(old, new, |bytes| {
+				if let Ok(text) = std::str::from_utf8(bytes)
+					&& let Some(target) = text.trim().strip_prefix("ref:")
+					&& let Some(rest) = target.trim().strip_prefix(old)
+				{
+					return format!("ref: {new}{rest}\n").into_bytes();
+				}
+				bytes.to_vec()
+			})
+			.await?;
+		// Reflogs, moved verbatim (a message may carry non-UTF-8 bytes).
+		self
+			.move_files_under(
+				&format!("logs/{old}"),
+				&format!("logs/{new}"),
+				<[u8]>::to_vec,
+			)
+			.await?;
+		// Packed entries: rewrite each `<old>…` ref name to `<new>…`, returning the renamed destinations.
+		let renamed_dests = self.rename_packed_prefix(old, new).await?;
+		// A stale *loose* ref already sitting at a renamed packed ref's destination would shadow it,
+		// leaving the tracking branch on the old commit. Git's rename overwrites the destination, so
+		// drop any such loose ref — except one we just wrote by moving the source remote's own refs.
+		for dest in &renamed_dests {
+			if loose_targets.contains(dest) {
+				continue;
+			}
+			match self.files.delete_path(dest, None).await {
+				Ok(_) | Err(FileStoreError::NotFound) => {}
+				Err(other) => return Err(other.into()),
+			}
+		}
+		Ok(())
+	}
+
+	/// Move every file under `old` to the same relative path under `new`, passing each file's bytes
+	/// through `rewrite`. Descends into subdirectories the way [`Self::delete_files_under`] does.
+	///
+	/// All bytes are buffered first, then every target is written, then each source that is not itself
+	/// a target is deleted. Writing before deleting keeps the move rollback-safe: if a write fails
+	/// (e.g. a directory/file conflict with a stale ref already in the destination namespace), no
+	/// source has been removed yet, so every ref still exists — matching git, which never drops a
+	/// source ref whose destination it could not create. Skipping the delete of a source that is also
+	/// a target keeps an overlapping rename (`new` nested under `old`, e.g. `.../origin/` →
+	/// `.../origin/foo/`) from deleting a ref it just wrote.
+	async fn move_files_under(
+		&self,
+		old: &str,
+		new: &str,
+		rewrite: impl Fn(&[u8]) -> Vec<u8>,
+	) -> Result<Vec<String>, RepositoryError> {
+		let mut stack = vec![old.to_owned()];
+		let mut moves: Vec<(String, Vec<u8>)> = Vec::new();
+		let mut sources: Vec<String> = Vec::new();
+		while let Some(dir) = stack.pop() {
+			for path in self.files.list_prefix(&dir).await? {
+				match self.files.read_path(&path).await {
+					Ok(bytes) => {
+						let target = format!("{new}{}", &path[old.len()..]);
+						moves.push((target, rewrite(&bytes)));
+						sources.push(path);
+					}
+					Err(_) => stack.push(format!("{path}/")),
+				}
+			}
+		}
+		let targets: Vec<String> = moves.iter().map(|(target, _)| target.clone()).collect();
+		for (target, bytes) in &moves {
+			self.force_write(target, bytes).await?;
+		}
+		let target_set: std::collections::HashSet<&str> = targets.iter().map(String::as_str).collect();
+		for path in &sources {
+			if target_set.contains(path.as_str()) {
+				continue;
+			}
+			match self.files.delete_path(path, None).await {
+				Ok(_) | Err(FileStoreError::NotFound) => {}
+				Err(other) => return Err(other.into()),
+			}
+		}
+		Ok(targets)
+	}
+
+	/// Rewrite `packed-refs`, renaming every entry whose name is under `old` to sit under `new`, and
+	/// return the renamed destination names. The file is rebuilt **sorted by ref name** (each entry
+	/// keeps its `^<peeled>` continuation), because renaming can move a name to a different lexical
+	/// position and `packed-refs` must stay sorted (`git fsck --strict` rejects `packedRefUnsorted`).
+	///
+	/// A renamed entry landing on a name that already exists (a stale destination in `packed-refs`)
+	/// **overwrites** it, as git's rename does — so the rebuilt file never carries a duplicate name
+	/// (which `git fsck --strict` would also reject).
+	async fn rename_packed_prefix(
+		&self,
+		old: &str,
+		new: &str,
+	) -> Result<Vec<String>, RepositoryError> {
+		let Some(bytes) = self.read_opt("packed-refs").await? else {
+			return Ok(Vec::new());
+		};
+		let text = std::str::from_utf8(&bytes)
+			.map_err(|_| RepositoryError::InvalidRef("packed-refs not UTF-8".to_owned()))?;
+
+		// Header/comment lines are preserved at the top; each ref line (plus any `^peeled` line) is
+		// collected as one entry keyed by its (possibly renamed) name, tagged with whether it was
+		// renamed so a collision can resolve in the renamed entry's favour.
+		let mut header = String::new();
+		let mut entries: Vec<(String, String, bool)> = Vec::new();
+		let mut renamed_dests: Vec<String> = Vec::new();
+		let mut changed = false;
+		let mut lines = text.lines().peekable();
+		while lines.peek().is_some_and(|line| line.starts_with('#')) {
+			header.push_str(lines.next().unwrap());
+			header.push('\n');
+		}
+		while let Some(line) = lines.next() {
+			let Some((oid, name)) = line.split_once(' ') else {
+				continue; // a stray `^`/blank line with no owning entry — drop it
+			};
+			let (name, renamed) = match name.strip_prefix(old) {
+				Some(rest) => {
+					changed = true;
+					let dest = format!("{new}{rest}");
+					renamed_dests.push(dest.clone());
+					(dest, true)
+				}
+				None => (name.to_owned(), false),
+			};
+			let mut entry = format!("{oid} {name}\n");
+			if lines.peek().is_some_and(|next| next.starts_with('^')) {
+				entry.push_str(lines.next().unwrap());
+				entry.push('\n');
+			}
+			entries.push((name, entry, renamed));
+		}
+		if !changed {
+			return Ok(Vec::new());
+		}
+
+		// Collapse duplicate names: a renamed entry overwrites a pre-existing destination entry with
+		// the same name (either arrival order), so at most one entry survives per name.
+		let mut chosen: Vec<(String, String)> = Vec::new();
+		let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+		for (name, entry, renamed) in entries {
+			match index.get(&name) {
+				Some(&i) if renamed => chosen[i].1 = entry,
+				Some(_) => {}
+				None => {
+					index.insert(name.clone(), chosen.len());
+					chosen.push((name, entry));
+				}
+			}
+		}
+		chosen.sort_by(|a, b| a.0.cmp(&b.0));
+
+		let mut out = header;
+		for (_, entry) in &chosen {
+			out.push_str(entry);
+		}
+		self.force_write("packed-refs", out.as_bytes()).await?;
+		Ok(renamed_dests)
+	}
+
 	/// Delete every file under `prefix`, descending into subdirectories the way [`Self::list`] walks:
 	/// a `read_path` that fails (a real subdirectory, or a synthetic directory entry a backend like
 	/// `MemoryFileStore` returns as `NotFound`) is treated as a subtree to descend into, not a file.
@@ -470,7 +640,7 @@ fn map_cas(name: &str) -> impl Fn(FileStoreError) -> RepositoryError + '_ {
 
 #[cfg(test)]
 mod tests {
-	use gitana_file_store::FileStore;
+	use gitana_file_store::{FileStore, FileStoreError};
 	use gitana_file_store_memory::MemoryFileStore;
 	use gitana_object::{ObjectId, ObjectKind, Sha256};
 
@@ -564,6 +734,197 @@ mod tests {
 		assert!(
 			packed.contains("refs/heads/main"),
 			"unrelated packed ref kept: {packed}"
+		);
+	}
+
+	#[tokio::test]
+	async fn rename_prefix_moves_refs_reflogs_and_rewrites_symbolic_targets() {
+		let files = MemoryFileStore::new();
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+		let put =
+			async |path: &str, bytes: &[u8]| files.write_path_if_absent(path, bytes).await.unwrap();
+		put(
+			"refs/remotes/origin/main",
+			format!("{}\n", tip.to_hex()).as_bytes(),
+		)
+		.await;
+		put(
+			"refs/remotes/origin/HEAD",
+			b"ref: refs/remotes/origin/main\n",
+		)
+		.await;
+		put(
+			"logs/refs/remotes/origin/main",
+			b"0 1 C <c@e> 0 +0000\tfetch\n",
+		)
+		.await;
+
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		store
+			.rename_prefix("refs/remotes/origin/", "refs/remotes/upstream/")
+			.await
+			.unwrap();
+
+		// The old tree is gone.
+		for gone in [
+			"refs/remotes/origin/main",
+			"refs/remotes/origin/HEAD",
+			"logs/refs/remotes/origin/main",
+		] {
+			assert!(!files.exists(gone).await.unwrap(), "{gone} moved away");
+		}
+		// The new tree is present; the direct ref and reflog carried over, and the symbolic target was
+		// rewritten to point under the new prefix.
+		assert_eq!(
+			files.read_path("refs/remotes/upstream/main").await.unwrap(),
+			format!("{}\n", tip.to_hex()).into_bytes()
+		);
+		assert_eq!(
+			files.read_path("refs/remotes/upstream/HEAD").await.unwrap(),
+			b"ref: refs/remotes/upstream/main\n"
+		);
+		assert!(
+			files
+				.exists("logs/refs/remotes/upstream/main")
+				.await
+				.unwrap()
+		);
+	}
+
+	#[tokio::test]
+	async fn rename_prefix_keeps_packed_refs_sorted() {
+		let files = MemoryFileStore::new();
+		let aaa = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"aaa");
+		let zzz = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"zzz");
+		let peeled = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"peeled");
+		files
+			.write_path_if_absent(
+				"packed-refs",
+				format!(
+					"# pack-refs with: peeled fully-peeled sorted\n{} refs/remotes/aaa/main\n{} refs/remotes/zzz/main\n^{}\n",
+					aaa.to_hex(),
+					zzz.to_hex(),
+					peeled.to_hex()
+				)
+				.as_bytes(),
+			)
+			.await
+			.unwrap();
+
+		// Rename zzz → 000, which sorts before aaa: the rebuilt file must be re-sorted, and the moved
+		// entry must keep its `^<peeled>` continuation.
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		store
+			.rename_prefix("refs/remotes/zzz/", "refs/remotes/000/")
+			.await
+			.unwrap();
+
+		let packed = String::from_utf8(files.read_path("packed-refs").await.unwrap()).unwrap();
+		assert_eq!(
+			packed,
+			format!(
+				"# pack-refs with: peeled fully-peeled sorted\n{} refs/remotes/000/main\n^{}\n{} refs/remotes/aaa/main\n",
+				zzz.to_hex(),
+				peeled.to_hex(),
+				aaa.to_hex()
+			)
+		);
+	}
+
+	#[tokio::test]
+	async fn rename_prefix_overwrites_stale_destination_refs() {
+		let files = MemoryFileStore::new();
+		let main = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"main");
+		let dev = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"dev");
+		let stale_packed = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"stale packed");
+		let stale_loose = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"stale loose");
+		// origin's tracking refs are packed; the upstream namespace holds leftover stale refs — one
+		// packed (`upstream/main`) that origin/main will land on, one loose (`upstream/dev`) that would
+		// shadow the renamed packed origin/dev.
+		files
+			.write_path_if_absent(
+				"packed-refs",
+				format!(
+					"# pack-refs with: peeled fully-peeled sorted\n{} refs/remotes/origin/dev\n{} refs/remotes/origin/main\n{} refs/remotes/upstream/main\n",
+					dev.to_hex(),
+					main.to_hex(),
+					stale_packed.to_hex()
+				)
+				.as_bytes(),
+			)
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent(
+				"refs/remotes/upstream/dev",
+				format!("{}\n", stale_loose.to_hex()).as_bytes(),
+			)
+			.await
+			.unwrap();
+
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		store
+			.rename_prefix("refs/remotes/origin/", "refs/remotes/upstream/")
+			.await
+			.unwrap();
+
+		// The renamed entries overwrite the stale packed destination (no duplicate `upstream/main`), and
+		// the file stays sorted.
+		let packed = String::from_utf8(files.read_path("packed-refs").await.unwrap()).unwrap();
+		assert_eq!(
+			packed,
+			format!(
+				"# pack-refs with: peeled fully-peeled sorted\n{} refs/remotes/upstream/dev\n{} refs/remotes/upstream/main\n",
+				dev.to_hex(),
+				main.to_hex()
+			)
+		);
+		// The stale loose ref that would have shadowed the renamed packed `upstream/dev` is gone.
+		assert!(matches!(
+			files.read_path("refs/remotes/upstream/dev").await,
+			Err(FileStoreError::NotFound)
+		));
+	}
+
+	#[tokio::test]
+	async fn rename_prefix_handles_a_target_nested_under_the_source() {
+		let files = MemoryFileStore::new();
+		let a = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"a");
+		let b = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"b");
+		let put =
+			async |path: &str, bytes: &[u8]| files.write_path_if_absent(path, bytes).await.unwrap();
+		put(
+			"refs/remotes/origin/main",
+			format!("{}\n", a.to_hex()).as_bytes(),
+		)
+		.await;
+		put(
+			"refs/remotes/origin/foo/main",
+			format!("{}\n", b.to_hex()).as_bytes(),
+		)
+		.await;
+
+		// Rename origin → origin/foo: the destination nests under the source, so a target overlaps a
+		// source path. Both refs must survive the move.
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		store
+			.rename_prefix("refs/remotes/origin/", "refs/remotes/origin/foo/")
+			.await
+			.unwrap();
+
+		assert_eq!(
+			files
+				.read_path("refs/remotes/origin/foo/main")
+				.await
+				.unwrap(),
+			format!("{}\n", a.to_hex()).into_bytes()
+		);
+		assert_eq!(
+			files
+				.read_path("refs/remotes/origin/foo/foo/main")
+				.await
+				.unwrap(),
+			format!("{}\n", b.to_hex()).into_bytes()
 		);
 	}
 

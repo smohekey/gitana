@@ -75,8 +75,9 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [x] Add `remote` command support for listing, adding, removing, and editing remotes. `gta remote`
   lists the configured remotes (`-v` adds fetch/push URLs); `add <name> <url>` writes the
   `[remote "<name>"]` section with the default fetch refspec; `set-url` retargets it; `remove` drops
-  the section and the remote's `refs/remotes/<name>/*` tracking refs. Oracle-tested against stock git
-  (git reads what gta writes; `git remote -v` matches). `rename` is not yet implemented.
+  the section and the remote's `refs/remotes/<name>/*` tracking refs; `rename` moves both (tracking
+  refs, reflogs, symbolic-ref targets) and repoints the fetch refspec and branch/push-default config.
+  Oracle-tested against stock git (git reads what gta writes; `git remote -v`/`rename` match).
 - [ ] Add refspec parsing beyond the default `origin` fetch mapping.
 - [ ] Support explicit push refspecs.
 - [ ] Support tags in fetch and push flows.

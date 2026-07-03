@@ -395,6 +395,204 @@ fn remote_accepts_git_valid_path_names() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+#[test]
+fn remote_rename_moves_config_and_tracking_refs() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-remote-rename");
+	let w = work.to_str().unwrap();
+
+	gta(
+		w,
+		&["remote", "add", "origin", "https://example.com/a.git"],
+		b"",
+	);
+	git(
+		w,
+		&[
+			"-c",
+			"user.name=T",
+			"-c",
+			"user.email=t@e",
+			"commit",
+			"--allow-empty",
+			"-m",
+			"seed",
+		],
+	);
+	let head = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+	git(w, &["config", "core.logallrefupdates", "true"]);
+	git(w, &["update-ref", "refs/remotes/origin/main", &head]);
+	git(
+		w,
+		&[
+			"symbolic-ref",
+			"refs/remotes/origin/HEAD",
+			"refs/remotes/origin/main",
+		],
+	);
+	git(w, &["config", "branch.main.remote", "origin"]);
+	git(w, &["config", "remote.pushDefault", "origin"]);
+	// A custom mirror refspec with the tracking namespace on *both* sides: only the destination
+	// (right of `:`) is rewritten by a rename, not the source.
+	git(
+		w,
+		&[
+			"config",
+			"--add",
+			"remote.origin.fetch",
+			"+refs/remotes/origin/*:refs/remotes/origin/*",
+		],
+	);
+	// A destination that only *contains* the tracking prefix as a substring — left untouched.
+	git(
+		w,
+		&[
+			"config",
+			"--add",
+			"remote.origin.fetch",
+			"+refs/heads/*:xrefs/remotes/origin/*",
+		],
+	);
+
+	gta(w, &["remote", "rename", "origin", "upstream"], b"");
+
+	// The remote, its fetch refspec, and the config naming it are all under the new name now.
+	assert_eq!(gta(w, &["remote"], b""), "upstream\n");
+	assert_eq!(git(w, &["remote"]), "upstream\n");
+	assert_eq!(
+		git(w, &["config", "remote.upstream.url"]).trim(),
+		"https://example.com/a.git"
+	);
+	// The default refspec's destination is repointed; the custom mirror refspec has only its
+	// destination rewritten (the `refs/remotes/origin/*` source is left as configured).
+	assert_eq!(
+		git(w, &["config", "--get-all", "remote.upstream.fetch"]),
+		"+refs/heads/*:refs/remotes/upstream/*\n\
+		 +refs/remotes/origin/*:refs/remotes/upstream/*\n\
+		 +refs/heads/*:xrefs/remotes/origin/*\n"
+	);
+	assert_eq!(git(w, &["config", "branch.main.remote"]).trim(), "upstream");
+	assert_eq!(git(w, &["config", "remote.pushDefault"]).trim(), "upstream");
+
+	// Tracking refs and reflog moved; the symbolic HEAD's target was rewritten; the old files are gone.
+	assert!(!work.join(".git/refs/remotes/origin/main").exists());
+	assert_eq!(
+		git(w, &["symbolic-ref", "refs/remotes/upstream/HEAD"]).trim(),
+		"refs/remotes/upstream/main"
+	);
+	assert!(work.join(".git/refs/remotes/upstream/main").exists());
+	assert!(work.join(".git/logs/refs/remotes/upstream/main").exists());
+	assert!(!work.join(".git/logs/refs/remotes/origin/main").exists());
+	git(w, &["fsck", "--full", "--strict"]); // asserts success — the repo is clean after the rename
+
+	// Errors: rename a missing remote, or onto an existing one.
+	gta(
+		w,
+		&["remote", "add", "other", "https://example.com/b.git"],
+		b"",
+	);
+	assert!(gta_fail(w, &["remote", "rename", "nope", "x"]).contains("no such remote"));
+	assert!(gta_fail(w, &["remote", "rename", "upstream", "other"]).contains("already exists"));
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn remote_rename_preserves_unrelated_destination_refs() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-remote-rename-stale");
+	let w = work.to_str().unwrap();
+
+	gta(
+		w,
+		&["remote", "add", "origin", "https://example.com/a.git"],
+		b"",
+	);
+	git(
+		w,
+		&[
+			"-c",
+			"user.name=T",
+			"-c",
+			"user.email=t@e",
+			"commit",
+			"--allow-empty",
+			"-m",
+			"seed",
+		],
+	);
+	let head = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+	git(w, &["update-ref", "refs/remotes/origin/main", &head]);
+	// A stray, non-conflicting ref already sitting in the destination namespace: git keeps it and
+	// still renames, so gta must too.
+	git(w, &["update-ref", "refs/remotes/upstream/existing", &head]);
+
+	gta(w, &["remote", "rename", "origin", "upstream"], b"");
+
+	assert_eq!(gta(w, &["remote"], b""), "upstream\n");
+	assert!(
+		work.join(".git/refs/remotes/upstream/main").exists(),
+		"origin's ref moved over"
+	);
+	assert!(
+		work.join(".git/refs/remotes/upstream/existing").exists(),
+		"the unrelated destination ref is preserved"
+	);
+	assert!(!work.join(".git/refs/remotes/origin/main").exists());
+	git(w, &["fsck", "--full", "--strict"]); // asserts success
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn remote_rename_preserves_source_refs_on_a_destination_conflict() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-remote-rename-conflict");
+	let w = work.to_str().unwrap();
+
+	gta(
+		w,
+		&["remote", "add", "origin", "https://example.com/a.git"],
+		b"",
+	);
+	git(
+		w,
+		&[
+			"-c",
+			"user.name=T",
+			"-c",
+			"user.email=t@e",
+			"commit",
+			"--allow-empty",
+			"-m",
+			"seed",
+		],
+	);
+	let head = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+	git(w, &["update-ref", "refs/remotes/origin/main", &head]);
+	// A stale ref makes `refs/remotes/upstream/main` a *directory*, so moving origin/main onto it is a
+	// file/directory conflict. git fails this rename without deleting origin's ref; gta must match —
+	// the move writes the destination before deleting the source, so a failed write loses nothing.
+	git(w, &["update-ref", "refs/remotes/upstream/main/foo", &head]);
+
+	gta_fail(w, &["remote", "rename", "origin", "upstream"]);
+
+	assert!(
+		work.join(".git/refs/remotes/origin/main").exists(),
+		"origin's tracking ref survives the failed rename — no data loss"
+	);
+	assert!(work.join(".git/refs/remotes/upstream/main/foo").exists());
+	git(w, &["fsck", "--full", "--strict"]); // repo stays consistent
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 fn gta(dir: &str, args: &[&str], stdin: &[u8]) -> String {
 	let out = assert_cmd::Command::cargo_bin("gta")
 		.unwrap()

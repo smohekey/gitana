@@ -105,7 +105,7 @@ Implemented command groups:
   repack), `prune` (delete unreachable loose objects), `gc` (prune, geometric repack, then
   write a multi-pack-index reachability bitmap over the ref tips).
 - Remote operations: `clone`, `fetch`, `pull`, `push`, `remote` (list/`-v`, `add`,
-  `remove`, `set-url`).
+  `remove`, `rename`, `set-url`).
 
 ## Crate layout
 

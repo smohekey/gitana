@@ -316,6 +316,29 @@ impl GitConfig {
 		self.elements.len() != before
 	}
 
+	/// Rename a subsection: rewrite its `[section "old"]` header(s) to `[section "new"]` and re-tag
+	/// every variable in it. Returns whether anything was renamed. The variable lines themselves are
+	/// untouched (they do not carry the subsection name); other sections and layout are preserved.
+	/// (Used to rename a `[remote "old"]` to `[remote "new"]`.)
+	pub fn rename_subsection(&mut self, section: &str, old: &str, new: &str) -> bool {
+		let section = section.to_ascii_lowercase();
+		let mut renamed = false;
+		for element in &mut self.elements {
+			match element {
+				Element::Section(s) if s.section == section && s.subsection.as_deref() == Some(old) => {
+					*s = synth_section(&section, Some(new));
+					renamed = true;
+				}
+				Element::Variable(v) if v.section == section && v.subsection.as_deref() == Some(old) => {
+					v.subsection = Some(new.to_owned());
+					renamed = true;
+				}
+				_ => {}
+			}
+		}
+		renamed
+	}
+
 	/// The distinct subsection names that have *at least one variable* under `section`, in first-seen
 	/// order (e.g. the configured remote names from `remote.<name>.*`). A bare `[section "sub"]`
 	/// header with no variables is ignored, matching git — which treats an empty remote section as no
@@ -613,6 +636,25 @@ mod tests {
 			config.variables_named("url", "pushInsteadOf"),
 			vec![(Some("A"), Some("x:"))],
 		);
+	}
+
+	#[test]
+	fn rename_subsection_moves_the_header_and_variables() {
+		let mut config =
+			GitConfig::parse("[remote \"origin\"]\n\turl = u\n\tfetch = f\n[core]\n\tbare = false\n")
+				.unwrap();
+		assert!(config.rename_subsection("remote", "origin", "upstream"));
+		assert_eq!(config.subsections("remote"), vec!["upstream"]);
+		assert_eq!(
+			config.get_string("remote", Some("upstream"), "url"),
+			Some("u")
+		);
+		assert!(config.get_string("remote", Some("origin"), "url").is_none());
+		// The rendered header carries the new name, and unrelated sections survive.
+		assert!(config.render().contains("[remote \"upstream\"]"));
+		assert_eq!(config.get_string("core", None, "bare"), Some("false"));
+		// Renaming an absent subsection reports nothing.
+		assert!(!config.rename_subsection("remote", "origin", "x"));
 	}
 
 	#[test]
