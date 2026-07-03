@@ -23,6 +23,11 @@ tokio = { workspace = true, features = ["io-util"] }
 cap-std.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
 
+# Wasm-only: the WASI 0.2 bindings behind `from_descriptor` — a store over a
+# `wasi:filesystem` directory descriptor handed in by the host as a capability.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasip2.workspace = true
+
 # The tests exercise the native cap-std backend (`from_dir`), so they and their deps are
 # native-only — keeping `cargo check --target wasm32-wasip2 --all-targets` clean.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

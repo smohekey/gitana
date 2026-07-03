@@ -439,20 +439,7 @@ where
 	/// hash algorithm `H` this repository was opened as. Refuses unknown formats and a
 	/// format/`H` mismatch (e.g. opening a sha1 repo as `Repository<_, Sha256>`).
 	pub async fn open(&self) -> Result<Config, RepositoryError> {
-		let files = self.objects.file_store();
-
-		let bytes = match files.read_path("config").await {
-			Ok(bytes) => bytes,
-			Err(FileStoreError::NotFound) => {
-				return Err(RepositoryError::UnsupportedFormat(
-					"no config file".to_owned(),
-				));
-			}
-			Err(other) => return Err(other.into()),
-		};
-		let text = std::str::from_utf8(&bytes)
-			.map_err(|_| RepositoryError::UnsupportedFormat("config is not UTF-8".to_owned()))?;
-		let config = Config::parse(text)?;
+		let config = Config::read(self.objects.file_store()).await?;
 		if config.object_format != H::NAME {
 			return Err(RepositoryError::UnsupportedFormat(format!(
 				"repository is {}, opened as {}",

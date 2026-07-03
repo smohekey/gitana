@@ -1,0 +1,67 @@
+package gitana:repo@0.1.0;
+
+/// Repository operations over a capability-granted git directory.
+///
+/// The host passes an **owned** `wasi:filesystem` directory descriptor to
+/// `repository.open`; that descriptor is the component's entire filesystem
+/// authority — there is no preopen-path convention and no ambient access.
+interface porcelain {
+	use wasi:filesystem/types@0.2.12.{descriptor};
+
+	/// Engine failures surfaced across the component boundary.
+	variant repo-error {
+		/// A revision, object, or ref does not exist.
+		not-found(string),
+		/// A malformed spec, config, or object.
+		invalid(string),
+		/// The underlying file store failed.
+		backend(string),
+	}
+
+	/// The repository's object-hash algorithm, a runtime fact read from its config.
+	enum hash-kind {
+		sha1,
+		sha256,
+	}
+
+	/// A parsed commit.
+	record commit-info {
+		/// The commit id (hex).
+		id: string,
+		/// The tree id (hex).
+		tree: string,
+		/// Parent commit ids (hex).
+		parents: list<string>,
+		/// The raw author line (`Name <email> epoch offset`).
+		author: string,
+		/// The raw committer line.
+		committer: string,
+		/// The commit message.
+		message: string,
+	}
+
+	resource repository {
+		/// Open the repository whose git directory is `git-dir` — an owned
+		/// directory descriptor granted by the host. Reads `config` through the
+		/// descriptor to detect the object format (absent
+		/// `extensions.objectformat` means sha1, as in git).
+		open: static func(git-dir: descriptor) -> result<repository, repo-error>;
+
+		/// The object-hash algorithm detected at `open`.
+		hash-kind: func() -> hash-kind;
+
+		/// Resolve `spec` (`HEAD`, a ref name, a hex or abbreviated id, `~`/`^`
+		/// forms) and read it as a commit.
+		read-commit: func(spec: string) -> result<commit-info, repo-error>;
+
+		/// Write `data` as a loose blob object; returns its id (hex). Writing a
+		/// blob that already exists is a no-op returning the same id.
+		write-blob: func(data: list<u8>) -> result<string, repo-error>;
+	}
+}
+
+world repo {
+	import wasi:filesystem/types@0.2.12;
+
+	export porcelain;
+}

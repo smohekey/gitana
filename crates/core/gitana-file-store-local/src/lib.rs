@@ -52,6 +52,19 @@ mod worktree;
 #[cfg(not(target_arch = "wasm32"))]
 pub use worktree::WorktreeFileStore;
 
+#[cfg(target_arch = "wasm32")]
+mod descriptor_backend;
+#[cfg(target_arch = "wasm32")]
+mod descriptor_reader;
+#[cfg(target_arch = "wasm32")]
+mod descriptor_writer;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use self::{
+	descriptor_backend::{DescriptorBackend, io_error},
+	descriptor_reader::DescriptorReader,
+	descriptor_writer::DescriptorWriter,
+};
+
 /// How many times to retry a cross-process ref lock before giving up.
 const LOCK_ATTEMPTS: u32 = 50;
 const LOCK_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
@@ -82,6 +95,16 @@ impl LocalFileStore {
 	#[cfg(target_arch = "wasm32")]
 	pub fn from_root(root: impl Into<PathBuf>) -> Self {
 		Self::with_backend(Arc::new(StdBackend { root: root.into() }))
+	}
+
+	/// A store over `dir`, an open `wasi:filesystem` directory descriptor handed in by
+	/// the host as a capability (wasm) — e.g. minted by a wasmtime embedding and passed
+	/// through a component export, or taken from `wasi:filesystem/preopens`. Unlike
+	/// [`LocalFileStore::from_root`] there is no preopen-path convention: the
+	/// descriptor itself is the entire authority.
+	#[cfg(target_arch = "wasm32")]
+	pub fn from_descriptor(dir: wasip2::filesystem::types::Descriptor) -> Self {
+		Self::with_backend(Arc::new(DescriptorBackend { dir }))
 	}
 
 	fn with_backend(backend: Arc<dyn Backend>) -> Self {

@@ -1,4 +1,5 @@
 use gitana_config::GitConfig;
+use gitana_file_store::{FileStore, FileStoreError};
 use gitana_object::HashAlgorithm;
 
 use crate::RepositoryError;
@@ -76,6 +77,24 @@ impl Config {
 			);
 		}
 		config.render()
+	}
+
+	/// Read and validate the repository config from `store` (the git directory's file
+	/// store). A missing or non-UTF-8 `config` is reported as
+	/// [`RepositoryError::UnsupportedFormat`], like any other unusable format.
+	pub async fn read(store: &impl FileStore) -> Result<Self, RepositoryError> {
+		let bytes = match store.read_path("config").await {
+			Ok(bytes) => bytes,
+			Err(FileStoreError::NotFound) => {
+				return Err(RepositoryError::UnsupportedFormat(
+					"no config file".to_owned(),
+				));
+			}
+			Err(other) => return Err(other.into()),
+		};
+		let text = std::str::from_utf8(&bytes)
+			.map_err(|_| RepositoryError::UnsupportedFormat("config is not UTF-8".to_owned()))?;
+		Self::parse(text)
 	}
 
 	/// Parse a git config and validate the repository is a supported format (`sha1` or
