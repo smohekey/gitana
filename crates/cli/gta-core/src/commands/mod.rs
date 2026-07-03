@@ -22,6 +22,7 @@ pub mod prune;
 pub mod pull;
 pub mod push;
 pub mod rebase;
+pub mod remote;
 pub mod repack;
 pub mod reset;
 pub mod restore;

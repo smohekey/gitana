@@ -417,6 +417,40 @@ enum Command {
 		#[arg(long, value_name = "branch")]
 		delete: Option<String>,
 	},
+	/// List, add, remove, or retarget the configured remotes.
+	Remote {
+		/// With no sub-command, also print each remote's fetch/push URL.
+		#[arg(short, long)]
+		verbose: bool,
+		#[command(subcommand)]
+		action: Option<RemoteAction>,
+	},
+}
+
+/// A `remote` sub-command. Absent means "list the remotes".
+#[derive(Subcommand, clap_mcp::ClapMcp)]
+#[clap_mcp(schema_only)]
+enum RemoteAction {
+	/// Add a remote named <name> for <url>.
+	Add {
+		#[arg(long)]
+		name: String,
+		#[arg(long)]
+		url: String,
+	},
+	/// Remove the remote named <name> (and its remote-tracking refs).
+	#[command(alias = "rm")]
+	Remove {
+		#[arg(long)]
+		name: String,
+	},
+	/// Change the URL of the remote named <name>.
+	SetUrl {
+		#[arg(long)]
+		name: String,
+		#[arg(long)]
+		url: String,
+	},
 }
 
 impl Cli {
@@ -566,6 +600,20 @@ impl Cli {
 				force,
 				delete,
 			} => commands::push::run(&cwd, signed, signing_key, force, delete).await,
+			Command::Remote { verbose, action } => {
+				commands::remote::run(&cwd, remote_action(verbose, action)).await
+			}
 		}
+	}
+}
+
+/// Map the clap `remote` sub-command to the `gta-core` action (absent means "list").
+fn remote_action(verbose: bool, action: Option<RemoteAction>) -> commands::remote::Action {
+	use commands::remote::Action;
+	match action {
+		None => Action::List { verbose },
+		Some(RemoteAction::Add { name, url }) => Action::Add { name, url },
+		Some(RemoteAction::Remove { name }) => Action::Remove { name },
+		Some(RemoteAction::SetUrl { name, url }) => Action::SetUrl { name, url },
 	}
 }

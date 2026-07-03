@@ -104,7 +104,8 @@ Implemented command groups:
   splitting into multiple size-bounded packs when set; `--geometric` for an incremental
   repack), `prune` (delete unreachable loose objects), `gc` (prune, geometric repack, then
   write a multi-pack-index reachability bitmap over the ref tips).
-- Remote operations: `clone`, `fetch`, `pull`, `push`.
+- Remote operations: `clone`, `fetch`, `pull`, `push`, `remote` (list/`-v`, `add`,
+  `remove`, `set-url`).
 
 ## Crate layout
 

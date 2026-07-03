@@ -264,9 +264,51 @@ where
 		self.remove_from_packed(name).await
 	}
 
+	/// Delete every ref under `prefix` — loose (direct *or* symbolic), its reflog, and any packed
+	/// entry alike. Used to drop a remote's whole `refs/remotes/<name>/` tree, which
+	/// [`Self::delete_ref`] cannot: it resolves and value-checks a single, non-symbolic ref.
+	pub async fn remove_prefix(&self, prefix: &str) -> Result<(), RepositoryError> {
+		// Loose ref files (a symbolic `ref:` file has no oid, so `list` skips it — delete files
+		// directly, so `origin/HEAD` goes too), then their reflogs under `logs/`.
+		self.delete_files_under(prefix).await?;
+		self.delete_files_under(&format!("logs/{prefix}")).await?;
+		// Packed: drop every entry whose name is under the prefix.
+		self
+			.remove_packed_matching(|name| name.starts_with(prefix))
+			.await
+	}
+
+	/// Delete every file under `prefix`, descending into subdirectories the way [`Self::list`] walks:
+	/// a `read_path` that fails (a real subdirectory, or a synthetic directory entry a backend like
+	/// `MemoryFileStore` returns as `NotFound`) is treated as a subtree to descend into, not a file.
+	async fn delete_files_under(&self, prefix: &str) -> Result<(), RepositoryError> {
+		let mut stack = vec![prefix.to_owned()];
+		while let Some(dir) = stack.pop() {
+			for path in self.files.list_prefix(&dir).await? {
+				match self.files.read_path(&path).await {
+					Ok(_) => match self.files.delete_path(&path, None).await {
+						Ok(_) | Err(FileStoreError::NotFound) => {}
+						Err(other) => return Err(other.into()),
+					},
+					Err(_) => stack.push(format!("{path}/")),
+				}
+			}
+		}
+		Ok(())
+	}
+
 	/// Rewrite `packed-refs` without `name` (and its `^<peeled>` continuation line).
 	/// A no-op if there is no packed-refs file or the ref is not packed.
 	async fn remove_from_packed(&self, name: &str) -> Result<(), RepositoryError> {
+		self.remove_packed_matching(|refname| refname == name).await
+	}
+
+	/// Rewrite `packed-refs` without the entries `drop` selects (and their `^<peeled>` continuations).
+	/// A no-op if there is no packed-refs file or nothing matches.
+	async fn remove_packed_matching(
+		&self,
+		drop: impl Fn(&str) -> bool,
+	) -> Result<(), RepositoryError> {
 		let Some(bytes) = self.read_opt("packed-refs").await? else {
 			return Ok(());
 		};
@@ -285,7 +327,7 @@ where
 			if !line.starts_with('#')
 				&& !line.starts_with('^')
 				&& let Some((_, refname)) = line.split_once(' ')
-				&& refname == name
+				&& drop(refname)
 			{
 				changed = true;
 				drop_peeled = true;
@@ -466,6 +508,63 @@ mod tests {
 		assert!(ids.contains(&new), "new id read");
 		let zero = ObjectId::<Sha256>::from_hex(&"0".repeat(64)).unwrap();
 		assert!(!ids.contains(&zero), "the null id is skipped");
+	}
+
+	#[tokio::test]
+	async fn remove_prefix_deletes_nested_refs_reflogs_and_packed() {
+		let files = MemoryFileStore::new();
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+		let main = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"main");
+		// A nested direct ref, a symbolic ref, and a reflog under the remote's tree.
+		let put =
+			async |path: &str, bytes: &[u8]| files.write_path_if_absent(path, bytes).await.unwrap();
+		put(
+			"refs/remotes/origin/feature/x",
+			format!("{}\n", tip.to_hex()).as_bytes(),
+		)
+		.await;
+		put(
+			"refs/remotes/origin/HEAD",
+			b"ref: refs/remotes/origin/feature/x\n",
+		)
+		.await;
+		put(
+			"logs/refs/remotes/origin/feature/x",
+			b"0 1 C <c@e> 0 +0000\tfetch\n",
+		)
+		.await;
+		// A packed entry for the remote, plus an unrelated one that must survive.
+		put(
+			"packed-refs",
+			format!(
+				"# pack-refs with: peeled fully-peeled sorted\n{} refs/remotes/origin/feature/x\n{} refs/heads/main\n",
+				tip.to_hex(),
+				main.to_hex()
+			)
+			.as_bytes(),
+		)
+		.await;
+
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		store.remove_prefix("refs/remotes/origin/").await.unwrap();
+
+		for gone in [
+			"refs/remotes/origin/feature/x",
+			"refs/remotes/origin/HEAD",
+			"logs/refs/remotes/origin/feature/x",
+		] {
+			assert!(!files.exists(gone).await.unwrap(), "{gone} deleted");
+		}
+		// The packed remote ref is gone; the unrelated head survives.
+		let packed = String::from_utf8(files.read_path("packed-refs").await.unwrap()).unwrap();
+		assert!(
+			!packed.contains("refs/remotes/origin"),
+			"packed remote ref removed: {packed}"
+		);
+		assert!(
+			packed.contains("refs/heads/main"),
+			"unrelated packed ref kept: {packed}"
+		);
 	}
 
 	#[tokio::test]

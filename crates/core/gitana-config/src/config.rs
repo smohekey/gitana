@@ -300,6 +300,59 @@ impl GitConfig {
 		self.elements.len() != before
 	}
 
+	/// Remove an entire subsection: its `[section "subsection"]` header line(s) and every variable in
+	/// it. Returns whether anything was removed. Other sections and the surrounding layout are left
+	/// in place. (Used to delete a whole `[remote "name"]`, which `unset` cannot do variable-blind.)
+	pub fn remove_subsection(&mut self, section: &str, subsection: &str) -> bool {
+		let section = section.to_ascii_lowercase();
+		let before = self.elements.len();
+		self.elements.retain(|e| match e {
+			Element::Section(s) => !(s.section == section && s.subsection.as_deref() == Some(subsection)),
+			Element::Variable(v) => {
+				!(v.section == section && v.subsection.as_deref() == Some(subsection))
+			}
+			Element::Filler(_) => true,
+		});
+		self.elements.len() != before
+	}
+
+	/// The distinct subsection names that have *at least one variable* under `section`, in first-seen
+	/// order (e.g. the configured remote names from `remote.<name>.*`). A bare `[section "sub"]`
+	/// header with no variables is ignored, matching git — which treats an empty remote section as no
+	/// remote at all.
+	pub fn subsections(&self, section: &str) -> Vec<&str> {
+		let section = section.to_ascii_lowercase();
+		let mut names: Vec<&str> = Vec::new();
+		for variable in self.variables() {
+			if variable.section == section
+				&& let Some(name) = variable.subsection.as_deref()
+				&& !names.contains(&name)
+			{
+				names.push(name);
+			}
+		}
+		names
+	}
+
+	/// Every variable named `name` under `section`, across all subsections, in file order — as
+	/// `(subsection, value)` pairs (`subsection` is `None` for the section itself, `value` is `None`
+	/// for a bare variable). Unlike [`Self::subsections`] + [`Self::get_all`], this preserves the
+	/// order variables appear across interleaved subsection headers, which git relies on (e.g. to
+	/// pick the first of several tied `url.*.insteadOf` rewrite rules).
+	pub fn variables_named<'a>(
+		&'a self,
+		section: &str,
+		name: &str,
+	) -> Vec<(Option<&'a str>, Option<&'a str>)> {
+		let section = section.to_ascii_lowercase();
+		let name = name.to_ascii_lowercase();
+		self
+			.variables()
+			.filter(|v| v.section == section && v.name == name)
+			.map(|v| (v.subsection.as_deref(), v.value.as_deref()))
+			.collect()
+	}
+
 	/// Append a value (for multi-valued variables); a `None` value is boolean-true. Never replaces
 	/// an existing value: the new line is inserted into the (last) matching section, creating the
 	/// section at end of file if it does not exist.
@@ -529,6 +582,56 @@ mod tests {
 		assert!(!interpret_bool(Some("off")).unwrap());
 		assert!(!interpret_bool(Some("")).unwrap());
 		assert!(interpret_bool(Some("maybe")).is_err());
+	}
+
+	#[test]
+	fn subsections_lists_names_once_in_order() {
+		let config = GitConfig::parse(
+			"[remote \"origin\"]\n\turl = u1\n\tfetch = f1\n[remote \"upstream\"]\n\turl = u2\n[remote \"ghost\"]\n[core]\n\tbare = false\n",
+		)
+		.unwrap();
+		// `ghost` has only a header (no variables), so — like git — it is not a remote.
+		assert_eq!(config.subsections("remote"), vec!["origin", "upstream"]);
+		// Section is case-folded; a section with no subsections yields nothing.
+		assert_eq!(config.subsections("REMOTE"), vec!["origin", "upstream"]);
+		assert!(config.subsections("core").is_empty());
+	}
+
+	#[test]
+	fn variables_named_preserves_file_order_across_subsections() {
+		// Interleaved subsections: the `insteadOf` variables must come back in file order (B then A),
+		// not grouped by subsection — git relies on this to pick the first of tied rewrite rules.
+		let config = GitConfig::parse(
+			"[url \"A\"]\n\tpushInsteadOf = x:\n[url \"B\"]\n\tinsteadOf = xx:\n[url \"A\"]\n\tinsteadOf = xx:\n",
+		)
+		.unwrap();
+		assert_eq!(
+			config.variables_named("url", "insteadOf"),
+			vec![(Some("B"), Some("xx:")), (Some("A"), Some("xx:"))],
+		);
+		assert_eq!(
+			config.variables_named("url", "pushInsteadOf"),
+			vec![(Some("A"), Some("x:"))],
+		);
+	}
+
+	#[test]
+	fn remove_subsection_drops_the_whole_remote() {
+		let mut config = GitConfig::parse(
+			"[core]\n\tbare = false\n[remote \"origin\"]\n\turl = u\n\tfetch = a\n\tfetch = b\n[branch \"main\"]\n\tremote = origin\n",
+		)
+		.unwrap();
+		assert!(config.remove_subsection("remote", "origin"));
+		assert_eq!(config.subsections("remote"), Vec::<&str>::new());
+		assert!(config.get_string("remote", Some("origin"), "url").is_none());
+		// Unrelated sections survive.
+		assert_eq!(config.get_string("core", None, "bare"), Some("false"));
+		assert_eq!(
+			config.get_string("branch", Some("main"), "remote"),
+			Some("origin")
+		);
+		// Removing an absent subsection reports nothing removed.
+		assert!(!config.remove_subsection("remote", "origin"));
 	}
 
 	#[test]
