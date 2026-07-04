@@ -211,6 +211,95 @@ async fn add_rewrites_index_on_file_directory_type_change() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+#[tokio::test]
+async fn add_stages_deletions_under_a_directory_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("add-del");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+
+	std::fs::write(work.join("keep.txt"), b"keep\n").unwrap();
+	std::fs::write(work.join("gone.txt"), b"gone\n").unwrap();
+	std::fs::create_dir_all(work.join("dir")).unwrap();
+	std::fs::write(work.join("dir/leaf.txt"), b"leaf\n").unwrap();
+
+	// Stage everything, then delete a top-level and a nested tracked file and re-run `add .`.
+	let open = || {
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			open_dir(&git_dir),
+		)));
+		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+	};
+	open().add(&["."], "").await.unwrap();
+	std::fs::remove_file(work.join("gone.txt")).unwrap();
+	std::fs::remove_file(work.join("dir/leaf.txt")).unwrap();
+	open().add(&["."], "").await.unwrap();
+	let ours = ls_files(w);
+
+	// git, staging the same on-disk state from an empty index, records exactly the survivor.
+	std::fs::remove_file(git_dir.join("index")).unwrap();
+	git(&["-C", w, "add", "."]);
+	let theirs = ls_files(w);
+
+	assert_eq!(ours, theirs, "`add .` must stage deletions like git");
+	assert_eq!(ours.len(), 1, "only keep.txt survives: {ours:?}");
+	assert!(ours[0].ends_with("\tkeep.txt"));
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn add_directory_pathspec_stages_a_removed_subtree_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("add-rmdir");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+
+	std::fs::write(work.join("top.txt"), b"top\n").unwrap();
+	std::fs::create_dir_all(work.join("pkg")).unwrap();
+	std::fs::write(work.join("pkg/a.rs"), b"a\n").unwrap();
+	std::fs::write(work.join("pkg/b.rs"), b"b\n").unwrap();
+
+	let open = || {
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			open_dir(&git_dir),
+		)));
+		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+	};
+	// Stage everything, then remove the whole `pkg` directory and `add pkg` (a directory pathspec
+	// that no longer resolves on disk): its tracked children must be staged as deletions.
+	open().add(&["."], "").await.unwrap();
+	std::fs::remove_dir_all(work.join("pkg")).unwrap();
+	open().add(&["pkg"], "").await.unwrap();
+	let ours = ls_files(w);
+
+	// git, staging the same on-disk state (only `top.txt` remains) from an empty index.
+	std::fs::remove_file(git_dir.join("index")).unwrap();
+	git(&["-C", w, "add", "."]);
+	let theirs = ls_files(w);
+
+	assert_eq!(
+		ours, theirs,
+		"`add pkg` must stage the removed subtree like git"
+	);
+	assert!(
+		!ours.iter().any(|line| line.contains("\tpkg/")),
+		"no pkg/* entries may remain: {ours:?}"
+	);
+	assert_eq!(ours.len(), 1);
+	assert!(ours[0].ends_with("\ttop.txt"));
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 fn ls_files(work: &str) -> Vec<String> {
 	git(&["-C", work, "ls-files", "--stage"])
 		.lines()

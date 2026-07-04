@@ -217,6 +217,55 @@ gate per the handoff: `cargo build/test --workspace` · the `--target wasm32-was
 Slices 1–3 have value on their own (they remove the `WorkTree` ambient-authority seam and the
 `cfg(unix)` metadata smell) even before the wasm slices land, and they are independently reviewable.
 
+**Status: slices 4 and 5 landed together** (`gitana:repo@0.4.0`). They were merged into one branch
+because they are coupled — the third descriptor and the guest `WorkTree` construction have nothing
+to exercise them without a real worktree export, and the export has nothing to run on without the
+descriptor. Deviations from the plan as written, all deliberate:
+
+- **Only `gitana-worktree` was added to the component — not `gitana-porcelain`.** `status`/`add`/
+  `checkout` already live on `WorkTree`; `commit` is the sole porcelain function needed, and its
+  ~30-line orchestration (`load_index` → conflict/empty guards → `write_tree` →
+  `Repository::commit_on_head`) is reimplemented in the guest instead. Pulling `gitana-porcelain`
+  would drag `gitana-remote → reqwest` (a browser wasm-bindgen HTTP stack) into the wasip2 reactor —
+  no place in a component whose `wasi:http` transport is still a future roadmap item.
+- **No separate work-dir-bearing `open`.** `open-worktree` grew a third `work-dir` descriptor and now
+  serves both linked and ordinary repos-with-a-working-tree (pass the same descriptor as git-dir and
+  common-dir for an ordinary repo). `open`/`init` stay plumbing-only; the resource holds an
+  `Inner::Held` that is either a plumbing `Repository` or a full `WorkTree`, and the worktree exports
+  error on a plumbing-only handle.
+- **`merge` was deferred** — its conflict lifecycle (`MERGE_HEAD`/`MERGE_MSG`, conflicted index,
+  `--continue`/`--abort`) is a slice of its own. The exports landed are `status`, `add`, `checkout`,
+  `commit`, plus a new `conflict(string)` `repo-error` variant for checkout overwrite refusals.
+- **Identity is passed in**, not resolved — `commit(message, author, committer)` takes the raw
+  identity lines, since the component has neither process env nor a wall clock.
+- **`core.fileMode=false` was completed for capability worktrees.** D2 anticipated the WASI exec-bit
+  degradation, and slices 2/3 wrote a `100644` file for an unrepresentable exec bit — but only the
+  *write* side. The *compare* side was missing: `status`/`diff`/`add`/`checkout` still derived the
+  worktree mode as `100644` and flagged a checked-out `100755` file as perpetually dirty (and `add`
+  silently downgraded it). Added `fsmeta::effective_mode(meta, expected)` — when the capability
+  cannot report the mode (`meta.mode == 0`), a regular file inherits the executable bit from the
+  index/tree entry it is compared against — and applied it at the four compare sites. A no-op on
+  unix (`meta.mode` carries the `S_IFREG` bits there, never `0`); the native test suite is unchanged
+  and the host e2e now checks out an executable entry and reads clean.
+- **`commit` now refuses an unchanged tree** (git's "nothing to commit, working tree clean"). This
+  was another pre-existing native gap — `gitana_porcelain::commit` only guarded an *empty index*, so
+  committing a clean tree (index tree == HEAD tree) produced a duplicate empty commit. Added the
+  guard to native `gitana_porcelain::commit` (before identity resolution, like the empty-index guard)
+  and mirrored it in the component's reimplementation, so the CLI and the component stay identical.
+  The initial commit (unborn HEAD) is still allowed.
+- **`add <dir>` / `add .` now stages deletions** (git 2.0+ behaviour). A third pre-existing native
+  gap: `WorkTree::add` walked and staged the files *present* under a directory pathspec but never
+  removed tracked index entries whose working-tree file had vanished, so `rm foo && add .` silently
+  kept the stale entry. Added a `stage_deletions` pass to native `WorkTree::add`, reached from the
+  root, existing-directory, *and* absent-pathspec branches — so `rm -r dir && add dir` (where the
+  directory no longer resolves on disk) also stages its children's deletions, not just the exact
+  path. The component's `add` export delegates to it, so both are fixed at once. Covered by two
+  git-oracle tests (`add_stages_deletions_under_a_directory_like_git`,
+  `add_directory_pathspec_stages_a_removed_subtree_like_git`) and a deletion round in the host e2e.
+  The `core.fileMode=false` diff site also uses the effective (bit-preserving) mode on the *new*
+  side, so a content-only edit of an executable under a mode-silent capability prints no spurious
+  mode change.
+
 ## Decisions
 
 - **D1 — threading style. RESOLVED: new generic parameter `WorkTree<F, W, H>`** (`W: WorkDirFs`).

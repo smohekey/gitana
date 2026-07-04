@@ -246,18 +246,20 @@ impl Session {
 		})
 	}
 
-	/// Instantiate the guest (no preopens), grant both `git_dir` and `common_dir` as
-	/// descriptors, and open a linked worktree that routes across the two.
-	pub async fn open_worktree(git_dir: &Path, common_dir: &Path) -> Result<Self> {
+	/// Instantiate the guest (no preopens), grant `git_dir`, `common_dir`, and
+	/// `work_dir` as descriptors, and open a repository with its working tree that
+	/// routes across the three (`git_dir == common_dir` for an ordinary repository).
+	pub async fn open_worktree(git_dir: &Path, common_dir: &Path, work_dir: &Path) -> Result<Self> {
 		let engine = engine()?;
 		let mut store = store(&engine);
 		let repo = instantiate(&engine, &mut store, build_component()).await?;
 		let git = grant_dir(&mut store, git_dir)?;
 		let common = grant_dir(&mut store, common_dir)?;
+		let work = grant_dir(&mut store, work_dir)?;
 		let handle = repo
 			.gitana_repo_porcelain()
 			.repository()
-			.call_open_worktree(&mut store, git, common)
+			.call_open_worktree(&mut store, git, common, work)
 			.await?
 			.map_err(|error| anyhow!("open-worktree: {error:?}"))?;
 		Ok(Self {

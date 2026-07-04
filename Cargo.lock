@@ -1342,6 +1342,7 @@ dependencies = [
  "gitana-object",
  "gitana-object-store",
  "gitana-repository",
+ "gitana-worktree",
  "wasip2",
  "wit-bindgen 0.58.0",
 ]

@@ -3,6 +3,7 @@
 use gitana_file_store::FileStoreError;
 use gitana_object_store::ObjectStoreError;
 use gitana_repository::RepositoryError;
+use gitana_worktree::WorktreeError;
 
 use crate::bindings::exports::gitana::repo::porcelain::RepoError;
 
@@ -39,6 +40,29 @@ fn object_store_error(error: ObjectStoreError) -> RepoError {
 fn file_store_error(error: FileStoreError) -> RepoError {
 	match error {
 		FileStoreError::NotFound => RepoError::NotFound("not found".to_owned()),
+		other => RepoError::Backend(other.to_string()),
+	}
+}
+
+/// Map a working-tree error onto the WIT `repo-error` surface. Overwrite refusals
+/// (`Conflict`/`UntrackedOverwrite`) map to `conflict`, unsafe or malformed inputs to
+/// `invalid`; file-store and repository errors defer to their own mappings so
+/// not-found/ref-moved stay precise.
+pub(crate) fn worktree_error(error: WorktreeError) -> RepoError {
+	match error {
+		WorktreeError::FileStore(error) => file_store_error(error),
+		WorktreeError::Repository(error) => repo_error(error),
+		conflict @ (WorktreeError::Conflict(_) | WorktreeError::UntrackedOverwrite(_)) => {
+			RepoError::Conflict(conflict.to_string())
+		}
+		WorktreeError::ChecksumMismatch => RepoError::Corruption("index checksum mismatch".to_owned()),
+		invalid @ (WorktreeError::Malformed(_)
+		| WorktreeError::UnsafePath(_)
+		| WorktreeError::PathspecMatch(_)
+		| WorktreeError::EmptyPathspec
+		| WorktreeError::AbsolutePathspec(_)
+		| WorktreeError::IndexPathMissing(..)
+		| WorktreeError::InvalidIndexSpec(_)) => RepoError::Invalid(invalid.to_string()),
 		other => RepoError::Backend(other.to_string()),
 	}
 }

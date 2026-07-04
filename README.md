@@ -37,10 +37,13 @@ What works today:
 - A `gta-mcp` wrapper that exposes the same command implementations as MCP tools.
 - A `wasm32-wasip2` component (`gitana:repo`, `crates/wasm/gitana-repo-component`)
   exporting the repo-level plumbing set — object reads/writes, revisions, refs
-  (CAS updates), `repack`, and `init` — where the component's only filesystem
-  authority is a `wasi:filesystem` directory descriptor passed in by the host
-  (no preopens, no ambient access). `crates/wasm/gitana-repo-host` embeds it
-  under wasmtime; see `docs/hlds/wasi-component-porcelain.md`.
+  (CAS updates), `repack`, and `init` — plus the working-tree porcelain
+  (`status`, `add`, `checkout`, `commit`) over a repository opened with its
+  working tree (`open-worktree`, which grants a third `work-dir` descriptor). The
+  component's only filesystem authority is the `wasi:filesystem` directory
+  descriptors passed in by the host (no preopens, no ambient access).
+  `crates/wasm/gitana-repo-host` embeds it under wasmtime; see
+  `docs/hlds/wasi-component-porcelain.md`.
 
 Major gaps:
 

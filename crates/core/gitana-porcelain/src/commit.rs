@@ -32,10 +32,19 @@ pub async fn commit<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		bail!("nothing to commit (empty index)");
 	}
 
-	let author = identity.author().await?;
-	let committer = identity.committer().await?;
 	let repo = wt.repository();
 	let tree = repo.write_tree(&entries).await?;
+	// Refuse a commit that would not change the tree — git's "nothing to commit, working tree clean".
+	// The initial commit (unborn HEAD) has no parent tree to match, so it is always allowed. Checked
+	// before resolving identity, so a no-op reports "nothing to commit" rather than an identity error.
+	if let Some(head) = repo.refs().resolve_head().await?
+		&& repo.commit_tree(head).await? == tree
+	{
+		bail!("nothing to commit, working tree clean");
+	}
+
+	let author = identity.author().await?;
+	let committer = identity.committer().await?;
 	let message = if message.ends_with('\n') {
 		message.to_owned()
 	} else {
@@ -95,6 +104,29 @@ mod tests {
 		assert!(
 			!identity.asked.get(),
 			"identity resolved before the empty-index guard"
+		);
+	}
+
+	#[tokio::test]
+	async fn refuses_a_commit_that_does_not_change_the_tree() {
+		let (_dir, wt) = fixture().await;
+		let blob = wt.repository().write_blob(b"hello\n").await.unwrap();
+		let mut index = Index::new();
+		stage(&mut index, "f.txt", blob);
+		wt.save_index(&index).await.unwrap();
+		// The first commit establishes HEAD; the index still holds the same staged tree afterwards.
+		commit(&wt, "first", &TestIdentity::default())
+			.await
+			.unwrap();
+
+		// Re-committing the unchanged tree must refuse — and, like the empty-index guard, without
+		// resolving identity (the check precedes it).
+		let identity = TestIdentity::default();
+		let err = commit(&wt, "again", &identity).await.unwrap_err();
+		assert!(err.to_string().contains("nothing to commit"), "{err}");
+		assert!(
+			!identity.asked.get(),
+			"identity resolved before the unchanged-tree guard"
 		);
 	}
 

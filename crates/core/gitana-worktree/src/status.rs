@@ -8,7 +8,7 @@ use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
 
-use crate::fsmeta::{blob_of, join_rel, push_gitignore};
+use crate::fsmeta::{blob_of, effective_mode, join_rel, push_gitignore};
 use crate::ignore::{self, DirIgnore};
 use crate::worktree::stat_matches;
 use crate::{Conflict, IndexEntry, WorkTree, WorktreeError};
@@ -232,7 +232,9 @@ fn worktree_change<W: WorkDirFs, H: HashAlgorithm>(
 		return Ok(' ');
 	}
 	match blob_of(work, path, &meta)? {
-		Some((oid, mode)) if oid == entry.oid && mode == entry.mode => Ok(' '),
+		Some((oid, _)) if oid == entry.oid && effective_mode(&meta, entry.mode) == entry.mode => {
+			Ok(' ')
+		}
 		_ => Ok('M'),
 	}
 }

@@ -14,9 +14,10 @@ pub struct DirEntry {
 }
 
 /// A working-tree directory as a capability: all access is relative to a confined root (the work
-/// tree), with no ambient authority. The native implementation
-/// ([`CapWorkDir`](crate::CapWorkDir)) wraps a `cap_std::fs::Dir`; a WASI implementation (a later
-/// slice) will wrap a `wasi:filesystem` directory descriptor.
+/// tree), with no ambient authority. The native implementation `CapWorkDir` wraps a
+/// `cap_std::fs::Dir`; the wasm implementation `DescriptorWorkDir` wraps a `wasi:filesystem`
+/// directory descriptor. (Both are named as plain code spans, not intra-doc links: each is
+/// `cfg`-gated to a single target, so a link would dangle when documenting the other.)
 ///
 /// Paths are work-tree-relative and `/`-separated. Operations are synchronous — the underlying
 /// syscalls (cap-std, or positional WASI descriptor calls) are themselves synchronous, and the

@@ -1,25 +1,59 @@
 //! Runtime hash-kind dispatch: one repository value per compile-time `H`.
 
-use gitana_file_store_local::{LocalFileStore, WorktreeFileStore};
-use gitana_object::{Sha1, Sha256};
+use gitana_file_store_local::{DescriptorWorkDir, LocalFileStore, WorktreeFileStore};
+use gitana_object::{HashAlgorithm, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::{Repository, detect_hash_kind};
+use gitana_worktree::WorkTree;
 use wasip2::filesystem::types::Descriptor;
 
 use crate::bindings::exports::gitana::repo::porcelain::{
 	CommitInfo, HashKind, HeadState, ObjectInfo, RefEntry, RepackReport, RepoError, TagInfo,
-	TreeBuildEntry, TreeEntry,
+	TreeBuildEntry, TreeEntry, WorktreeStatus,
 };
 use crate::block_on::block_on;
 use crate::ops;
 
-/// Run `body` once with `repo` bound to whichever concrete `Repository<_, H>` this
-/// value holds — the two-arm runtime→compile-time bridge, written once.
+/// What a repository resource holds for one compile-time `H`: either a plumbing-only
+/// [`Repository`] (opened via `open`/`init`, no working tree) or a full [`WorkTree`]
+/// (opened via `open-worktree`, which owns the repository and adds the work-dir
+/// capability). Plumbing operations reach the repository through [`Held::repository`]
+/// either way; working-tree operations require [`Held::worktree`].
+pub(crate) enum Held<H: HashAlgorithm> {
+	/// No working tree — `open`/`init`. Only plumbing operations are available.
+	Plumbing(Repository<WorktreeFileStore, H>),
+	/// A working tree over the wasm descriptor capability — `open-worktree`.
+	Worktree(WorkTree<WorktreeFileStore, DescriptorWorkDir, H>),
+}
+
+impl<H: HashAlgorithm> Held<H> {
+	/// The repository, whichever shape backs it (a `WorkTree` owns its repository).
+	fn repository(&self) -> &Repository<WorktreeFileStore, H> {
+		match self {
+			Held::Plumbing(repo) => repo,
+			Held::Worktree(wt) => wt.repository(),
+		}
+	}
+
+	/// The working tree, or an error if this repository was opened without a work-dir.
+	fn worktree(&self) -> Result<&WorkTree<WorktreeFileStore, DescriptorWorkDir, H>, RepoError> {
+		match self {
+			Held::Worktree(wt) => Ok(wt),
+			Held::Plumbing(_) => Err(RepoError::Invalid(
+				"no working tree; open the repository with open-worktree to grant a work-dir".to_owned(),
+			)),
+		}
+	}
+}
+
+/// Run `body` once with `held` bound to whichever concrete [`Held<H>`] this value
+/// holds — the two-arm runtime→compile-time bridge, written once. Plumbing bodies use
+/// `held.repository()`; working-tree bodies use `held.worktree()?`.
 macro_rules! dispatch {
-	($self:expr, $repo:ident => $body:expr) => {
+	($self:expr, $held:ident => $body:expr) => {
 		match $self {
-			Self::Sha1($repo) => $body,
-			Self::Sha256($repo) => $body,
+			Self::Sha1($held) => $body,
+			Self::Sha256($held) => $body,
 		}
 	};
 }
@@ -28,53 +62,80 @@ macro_rules! dispatch {
 /// runtime→compile-time bridge as `gta-core`'s dispatch: match once here, and each
 /// operation body is written once, generic over `H` (see [`crate::ops`]).
 pub(crate) enum Inner {
-	Sha1(Repository<WorktreeFileStore, Sha1>),
-	Sha256(Repository<WorktreeFileStore, Sha256>),
+	Sha1(Held<Sha1>),
+	Sha256(Held<Sha256>),
 }
 
 impl Inner {
 	/// Open the repository whose git dir *is* its common dir (an ordinary,
-	/// non-linked repository) over the single granted descriptor.
+	/// non-linked repository) over the single granted descriptor — plumbing only, no
+	/// working tree.
 	pub(crate) fn open(git_dir: Descriptor) -> Result<Self, RepoError> {
-		Self::from_store(WorktreeFileStore::single(LocalFileStore::from_descriptor(
-			git_dir,
-		)))
+		let store = WorktreeFileStore::single(LocalFileStore::from_descriptor(git_dir));
+		Self::plumbing(store)
 	}
 
-	/// Open a linked worktree, routing per-worktree paths to `git_dir` and shared
-	/// paths (objects, refs, `packed-refs`, `config`) to `common_dir`.
+	/// Open a repository together with its working tree, routing per-worktree paths to
+	/// `git_dir`, shared paths (objects, refs, `packed-refs`, `config`) to `common_dir`,
+	/// and working-tree access to `work_dir`. For an ordinary repository `git_dir` and
+	/// `common_dir` are the same descriptor; for a linked worktree they differ.
 	pub(crate) fn open_worktree(
 		git_dir: Descriptor,
 		common_dir: Descriptor,
+		work_dir: Descriptor,
 	) -> Result<Self, RepoError> {
-		Self::from_store(WorktreeFileStore::from_stores(
+		let store = WorktreeFileStore::from_stores(
 			LocalFileStore::from_descriptor(common_dir),
 			LocalFileStore::from_descriptor(git_dir),
-		))
+		);
+		let work = DescriptorWorkDir::from_descriptor(work_dir);
+		// The `git_dir` path a `WorkTree` carries is inert here — the crate routes the index and all
+		// git-dir files through the `FileStore`, so a placeholder suffices; the two match arms are
+		// mutually exclusive, so moving `store`/`work` in each is fine.
+		Ok(match Self::detect(&store)? {
+			HashKind::Sha1 => Self::Sha1(Held::Worktree(WorkTree::new(
+				Repository::new(ObjectStore::new(store)),
+				work,
+				"",
+			))),
+			HashKind::Sha256 => Self::Sha256(Held::Worktree(WorkTree::new(
+				Repository::new(ObjectStore::new(store)),
+				work,
+				"",
+			))),
+		})
 	}
 
 	/// Detect the object format from `config` *through the store* (which reads it from
-	/// the common dir) and open the repository as the matching `H`.
-	fn from_store(store: WorktreeFileStore) -> Result<Self, RepoError> {
-		match block_on(detect_hash_kind(&store)).map_err(ops::repo_error)? {
-			gitana_object::HashKind::Sha1 => Ok(Self::Sha1(Repository::new(ObjectStore::new(store)))),
-			gitana_object::HashKind::Sha256 => Ok(Self::Sha256(Repository::new(ObjectStore::new(store)))),
+	/// the common dir) and open a plumbing-only repository as the matching `H`.
+	fn plumbing(store: WorktreeFileStore) -> Result<Self, RepoError> {
+		Ok(match Self::detect(&store)? {
+			HashKind::Sha1 => Self::Sha1(Held::Plumbing(Repository::new(ObjectStore::new(store)))),
+			HashKind::Sha256 => Self::Sha256(Held::Plumbing(Repository::new(ObjectStore::new(store)))),
+		})
+	}
+
+	/// Read the repository's object format from its `config`.
+	fn detect(store: &WorktreeFileStore) -> Result<HashKind, RepoError> {
+		match block_on(detect_hash_kind(store)).map_err(ops::repo_error)? {
+			gitana_object::HashKind::Sha1 => Ok(HashKind::Sha1),
+			gitana_object::HashKind::Sha256 => Ok(HashKind::Sha256),
 		}
 	}
 
 	/// Lay out git's directory skeleton, write the fresh-repo metadata for the
 	/// *requested* algorithm (idempotent), and open — refusing a directory that
-	/// already holds a repository of a different format. A fresh repository is never
-	/// linked, so its git dir and common dir coincide.
+	/// already holds a repository of a different format. A fresh repository has no
+	/// checked-out working tree, so `init` opens it plumbing-only.
 	pub(crate) fn init(git_dir: Descriptor, kind: HashKind) -> Result<Self, RepoError> {
 		let store = LocalFileStore::from_descriptor(git_dir);
 		block_on(ops::init_layout(&store))?;
 		let store = WorktreeFileStore::single(store);
 		let inner = match kind {
-			HashKind::Sha1 => Self::Sha1(Repository::new(ObjectStore::new(store))),
-			HashKind::Sha256 => Self::Sha256(Repository::new(ObjectStore::new(store))),
+			HashKind::Sha1 => Self::Sha1(Held::Plumbing(Repository::new(ObjectStore::new(store)))),
+			HashKind::Sha256 => Self::Sha256(Held::Plumbing(Repository::new(ObjectStore::new(store)))),
 		};
-		dispatch!(&inner, repo => block_on(ops::init_repo(repo)))?;
+		dispatch!(&inner, held => block_on(ops::init_repo(held.repository())))?;
 		Ok(inner)
 	}
 
@@ -86,31 +147,31 @@ impl Inner {
 	}
 
 	pub(crate) fn read_config(&self) -> Result<String, RepoError> {
-		dispatch!(self, repo => block_on(ops::read_config(repo)))
+		dispatch!(self, held => block_on(ops::read_config(held.repository())))
 	}
 
 	pub(crate) fn read_object(&self, spec: &str) -> Result<ObjectInfo, RepoError> {
-		dispatch!(self, repo => block_on(ops::read_object(repo, spec)))
+		dispatch!(self, held => block_on(ops::read_object(held.repository(), spec)))
 	}
 
 	pub(crate) fn read_blob(&self, spec: &str) -> Result<Vec<u8>, RepoError> {
-		dispatch!(self, repo => block_on(ops::read_blob(repo, spec)))
+		dispatch!(self, held => block_on(ops::read_blob(held.repository(), spec)))
 	}
 
 	pub(crate) fn read_commit(&self, spec: &str) -> Result<CommitInfo, RepoError> {
-		dispatch!(self, repo => block_on(ops::read_commit(repo, spec)))
+		dispatch!(self, held => block_on(ops::read_commit(held.repository(), spec)))
 	}
 
 	pub(crate) fn read_tag(&self, spec: &str) -> Result<TagInfo, RepoError> {
-		dispatch!(self, repo => block_on(ops::read_tag(repo, spec)))
+		dispatch!(self, held => block_on(ops::read_tag(held.repository(), spec)))
 	}
 
 	pub(crate) fn ls_tree(&self, spec: &str) -> Result<Vec<TreeEntry>, RepoError> {
-		dispatch!(self, repo => block_on(ops::ls_tree(repo, spec)))
+		dispatch!(self, held => block_on(ops::ls_tree(held.repository(), spec)))
 	}
 
 	pub(crate) fn rev_parse(&self, spec: &str) -> Result<String, RepoError> {
-		dispatch!(self, repo => block_on(ops::rev_parse(repo, spec)))
+		dispatch!(self, held => block_on(ops::rev_parse(held.repository(), spec)))
 	}
 
 	pub(crate) fn rev_list(
@@ -118,27 +179,27 @@ impl Inner {
 		tips: &[String],
 		max_count: Option<u32>,
 	) -> Result<Vec<String>, RepoError> {
-		dispatch!(self, repo => block_on(ops::rev_list(repo, tips, max_count)))
+		dispatch!(self, held => block_on(ops::rev_list(held.repository(), tips, max_count)))
 	}
 
 	pub(crate) fn merge_base(&self, commits: &[String]) -> Result<Vec<String>, RepoError> {
-		dispatch!(self, repo => block_on(ops::merge_base(repo, commits)))
+		dispatch!(self, held => block_on(ops::merge_base(held.repository(), commits)))
 	}
 
 	pub(crate) fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, RepoError> {
-		dispatch!(self, repo => block_on(ops::is_ancestor(repo, ancestor, descendant)))
+		dispatch!(self, held => block_on(ops::is_ancestor(held.repository(), ancestor, descendant)))
 	}
 
 	pub(crate) fn list_refs(&self, prefix: &str) -> Result<Vec<RefEntry>, RepoError> {
-		dispatch!(self, repo => block_on(ops::list_refs(repo, prefix)))
+		dispatch!(self, held => block_on(ops::list_refs(held.repository(), prefix)))
 	}
 
 	pub(crate) fn head(&self) -> Result<HeadState, RepoError> {
-		dispatch!(self, repo => block_on(ops::head(repo)))
+		dispatch!(self, held => block_on(ops::head(held.repository())))
 	}
 
 	pub(crate) fn resolve_ref(&self, name: &str) -> Result<Option<String>, RepoError> {
-		dispatch!(self, repo => block_on(ops::resolve_ref(repo, name)))
+		dispatch!(self, held => block_on(ops::resolve_ref(held.repository(), name)))
 	}
 
 	pub(crate) fn update_ref(
@@ -147,31 +208,31 @@ impl Inner {
 		new: &str,
 		expected: Option<&str>,
 	) -> Result<(), RepoError> {
-		dispatch!(self, repo => block_on(ops::update_ref(repo, name, new, expected)))
+		dispatch!(self, held => block_on(ops::update_ref(held.repository(), name, new, expected)))
 	}
 
 	pub(crate) fn delete_ref(&self, name: &str, expected: &str) -> Result<(), RepoError> {
-		dispatch!(self, repo => block_on(ops::delete_ref(repo, name, expected)))
+		dispatch!(self, held => block_on(ops::delete_ref(held.repository(), name, expected)))
 	}
 
 	pub(crate) fn read_symbolic_ref(&self, name: &str) -> Result<Option<String>, RepoError> {
-		dispatch!(self, repo => block_on(ops::read_symbolic_ref(repo, name)))
+		dispatch!(self, held => block_on(ops::read_symbolic_ref(held.repository(), name)))
 	}
 
 	pub(crate) fn set_symbolic_ref(&self, name: &str, target: &str) -> Result<(), RepoError> {
-		dispatch!(self, repo => block_on(ops::set_symbolic_ref(repo, name, target)))
+		dispatch!(self, held => block_on(ops::set_symbolic_ref(held.repository(), name, target)))
 	}
 
 	pub(crate) fn write_blob(&self, data: &[u8]) -> Result<String, RepoError> {
-		dispatch!(self, repo => block_on(ops::write_blob(repo, data)))
+		dispatch!(self, held => block_on(ops::write_blob(held.repository(), data)))
 	}
 
 	pub(crate) fn repack(&self, geometric: bool) -> Result<Option<RepackReport>, RepoError> {
-		dispatch!(self, repo => block_on(ops::repack(repo, geometric)))
+		dispatch!(self, held => block_on(ops::repack(held.repository(), geometric)))
 	}
 
 	pub(crate) fn write_tree(&self, entries: Vec<TreeBuildEntry>) -> Result<String, RepoError> {
-		dispatch!(self, repo => block_on(ops::write_tree(repo, entries)))
+		dispatch!(self, held => block_on(ops::write_tree(held.repository(), entries)))
 	}
 
 	pub(crate) fn create_commit(
@@ -182,6 +243,27 @@ impl Inner {
 		committer: &str,
 		message: &str,
 	) -> Result<String, RepoError> {
-		dispatch!(self, repo => block_on(ops::create_commit(repo, tree, parents, author, committer, message)))
+		dispatch!(self, held => block_on(ops::create_commit(held.repository(), tree, parents, author, committer, message)))
+	}
+
+	pub(crate) fn status(&self) -> Result<WorktreeStatus, RepoError> {
+		dispatch!(self, held => block_on(ops::status(held.worktree()?)))
+	}
+
+	pub(crate) fn add(&self, pathspecs: &[String], prefix: &str) -> Result<(), RepoError> {
+		dispatch!(self, held => block_on(ops::add(held.worktree()?, pathspecs, prefix)))
+	}
+
+	pub(crate) fn checkout(&self, tree_ish: &str, force: bool) -> Result<(), RepoError> {
+		dispatch!(self, held => block_on(ops::checkout(held.worktree()?, tree_ish, force)))
+	}
+
+	pub(crate) fn commit(
+		&self,
+		message: &str,
+		author: &str,
+		committer: &str,
+	) -> Result<String, RepoError> {
+		dispatch!(self, held => block_on(ops::commit(held.worktree()?, message, author, committer)))
 	}
 }

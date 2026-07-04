@@ -11,7 +11,7 @@ use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
 
-use crate::fsmeta::{blob_of, join_rel, push_gitignore, stat_of};
+use crate::fsmeta::{blob_of, effective_mode, join_rel, push_gitignore, stat_of};
 use crate::ignore::{self, DirIgnore};
 use crate::{IndexEntry, WorkTree, WorktreeError};
 
@@ -223,10 +223,13 @@ where
 		return Ok(true);
 	};
 	match current {
-		Some((mode, oid)) => Ok(matches!(
-			blob_of(wt.work(), path, &meta)?,
-			Some((woid, wmode)) if woid == *oid && format!("{wmode:o}") == *mode
-		)),
+		Some((mode, oid)) => {
+			let expected = u32::from_str_radix(mode, 8).unwrap_or(0);
+			Ok(matches!(
+				blob_of(wt.work(), path, &meta)?,
+				Some((woid, _)) if woid == *oid && effective_mode(&meta, expected) == expected
+			))
+		}
 		// An untracked file sits where `to` adds a path: refuse unless it is `.gitignore`d.
 		None => path_ignored(wt.work(), path),
 	}
@@ -392,10 +395,13 @@ where
 	};
 	match current {
 		// Tracked: a conflict only if the working file is dirty vs the index.
-		Some((mode, oid)) => match blob_of(wt.work(), path, &meta)? {
-			Some((woid, wmode)) if woid == *oid && format!("{wmode:o}") == *mode => Ok(()),
-			_ => Err(WorktreeError::Conflict(path.to_owned())),
-		},
+		Some((mode, oid)) => {
+			let expected = u32::from_str_radix(mode, 8).unwrap_or(0);
+			match blob_of(wt.work(), path, &meta)? {
+				Some((woid, _)) if woid == *oid && effective_mode(&meta, expected) == expected => Ok(()),
+				_ => Err(WorktreeError::Conflict(path.to_owned())),
+			}
+		}
 		// Untracked file in the way of a checked-out path — refuse unless it is `.gitignore`d
 		// (ignored files are expendable, as git overwrites them).
 		None if path_ignored(wt.work(), path)? => Ok(()),

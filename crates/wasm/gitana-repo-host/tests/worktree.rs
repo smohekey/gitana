@@ -30,7 +30,10 @@ async fn routes_across_two_descriptors<H: HashAlgorithm>() -> Result<()> {
 	let wt_dir = worktree.path();
 	std::fs::write(wt_dir.join("HEAD"), "ref: refs/heads/feature\n")?;
 
-	let mut session = Session::open_worktree(wt_dir, common_dir).await?;
+	// This test exercises only the git-dir/common-dir routing, not the working tree, so the
+	// work-dir descriptor is a throwaway empty directory.
+	let work = tempfile::tempdir()?;
+	let mut session = Session::open_worktree(wt_dir, common_dir, work.path()).await?;
 	let porcelain = session.repo.gitana_repo_porcelain().repository();
 	let store = &mut session.store;
 	let handle = session.handle;

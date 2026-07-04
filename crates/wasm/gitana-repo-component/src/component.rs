@@ -4,7 +4,7 @@ use wasip2::filesystem::types::Descriptor;
 
 use crate::bindings::exports::gitana::repo::porcelain::{
 	CommitInfo, Guest, GuestRepository, HashKind, HeadState, ObjectInfo, RefEntry, RepackReport,
-	RepoError, Repository, TagInfo, TreeBuildEntry, TreeEntry,
+	RepoError, Repository, TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
 };
 use crate::inner::Inner;
 
@@ -26,8 +26,12 @@ impl GuestRepository for GitanaRepository {
 		Ok(Repository::new(GitanaRepository { inner }))
 	}
 
-	fn open_worktree(git_dir: Descriptor, common_dir: Descriptor) -> Result<Repository, RepoError> {
-		let inner = Inner::open_worktree(git_dir, common_dir)?;
+	fn open_worktree(
+		git_dir: Descriptor,
+		common_dir: Descriptor,
+		work_dir: Descriptor,
+	) -> Result<Repository, RepoError> {
+		let inner = Inner::open_worktree(git_dir, common_dir, work_dir)?;
 		Ok(Repository::new(GitanaRepository { inner }))
 	}
 
@@ -136,5 +140,26 @@ impl GuestRepository for GitanaRepository {
 		self
 			.inner
 			.create_commit(&tree, &parents, &author, &committer, &message)
+	}
+
+	fn status(&self) -> Result<WorktreeStatus, RepoError> {
+		self.inner.status()
+	}
+
+	fn add(&self, pathspecs: Vec<String>, prefix: String) -> Result<(), RepoError> {
+		self.inner.add(&pathspecs, &prefix)
+	}
+
+	fn checkout(&self, tree_ish: String, force: bool) -> Result<(), RepoError> {
+		self.inner.checkout(&tree_ish, force)
+	}
+
+	fn commit(
+		&self,
+		message: String,
+		author: String,
+		committer: String,
+	) -> Result<String, RepoError> {
+		self.inner.commit(&message, &author, &committer)
 	}
 }

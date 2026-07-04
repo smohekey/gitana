@@ -22,5 +22,11 @@ gitana-file-store-local.workspace = true
 gitana-object.workspace = true
 gitana-object-store.workspace = true
 gitana-repository.workspace = true
+# gitana-worktree gives the component the working-tree porcelain (status/add/checkout/commit) over
+# the `DescriptorWorkDir` capability. It is deliberately the *only* worktree dep pulled in:
+# gitana-porcelain would drag gitana-remote → reqwest (a browser wasm-bindgen HTTP stack) into this
+# wasip2 reactor, so the trivial `commit` orchestration is reimplemented here over
+# `WorkTree` + `Repository::commit_on_head` instead.
+gitana-worktree.workspace = true
 wasip2.workspace = true
 wit-bindgen.workspace = true

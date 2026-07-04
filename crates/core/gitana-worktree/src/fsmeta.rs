@@ -83,6 +83,25 @@ pub(crate) fn mode_of(meta: &Meta) -> u32 {
 	}
 }
 
+/// The git mode to *compare* a working-tree entry against `expected` — the mode of the index (or
+/// tree) entry it stands for. Normally this is just [`mode_of`], but a capability that cannot report
+/// the mode (WASI / non-unix, where `meta.mode` is `0`) cannot represent the executable bit: a
+/// regular file always reads back as `100644`, so treating that as a change from an `expected`
+/// `100755` would make every executable file perpetually dirty. Instead the executable bit is taken
+/// from `expected` — git's `core.fileMode=false` / `trust_executable_bit=false`. Only the regular
+/// `100644`↔`100755` distinction is inherited; a symlink or type change still compares exactly.
+///
+/// On a full-fidelity (unix) capability `meta.mode` is never `0` (it carries the `S_IFREG` type
+/// bits), so this returns the real [`mode_of`] and nothing changes.
+pub(crate) fn effective_mode(meta: &Meta, expected: u32) -> u32 {
+	let actual = mode_of(meta);
+	if meta.mode == 0 && actual == 0o100644 && (expected == 0o100644 || expected == 0o100755) {
+		expected
+	} else {
+		actual
+	}
+}
+
 /// The index stat cache for a working-tree file. A capability that cannot report a field (WASI)
 /// leaves it `0`; the resulting cache never matches a re-`lstat`, so `status`/`diff` re-hash — git's
 /// `core.checkStat=minimal`.
@@ -97,5 +116,51 @@ pub(crate) fn stat_of(meta: &Meta) -> Stat {
 		uid: meta.uid,
 		gid: meta.gid,
 		size: meta.size as u32,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use gitana_file_store_local::FileKind;
+
+	use super::*;
+
+	fn meta(kind: FileKind, mode: u32) -> Meta {
+		Meta {
+			kind,
+			size: 0,
+			mtime: (0, 0),
+			ctime: (0, 0),
+			mode,
+			dev: 0,
+			ino: 0,
+			uid: 0,
+			gid: 0,
+		}
+	}
+
+	#[test]
+	fn full_fidelity_capability_reports_the_real_mode() {
+		// A capability that reports the mode (unix: `meta.mode` carries the `S_IFREG` type bits, so it
+		// is never `0`) is authoritative — `effective_mode` never inherits, whatever `expected` says.
+		let exec = meta(FileKind::File, 0o100755);
+		assert_eq!(effective_mode(&exec, 0o100644), 0o100755);
+		let plain = meta(FileKind::File, 0o100644);
+		assert_eq!(effective_mode(&plain, 0o100755), 0o100644);
+	}
+
+	#[test]
+	fn silent_capability_inherits_only_the_regular_file_exec_bit() {
+		// A capability that cannot report the mode (WASI / non-unix: `meta.mode == 0`) reads every
+		// regular file back as `100644`; it inherits the executable bit from the index/tree entry it is
+		// compared against, so an unrepresentable exec bit is not mistaken for a change.
+		let file = meta(FileKind::File, 0);
+		assert_eq!(effective_mode(&file, 0o100755), 0o100755);
+		assert_eq!(effective_mode(&file, 0o100644), 0o100644);
+		// A symlink is not a regular file, so its mode is exact and never inherits a regular mode.
+		let link = meta(FileKind::Symlink, 0);
+		assert_eq!(effective_mode(&link, 0o100755), 0o120000);
+		// Nor does a regular file inherit a non-regular `expected` (a type change stays a change).
+		assert_eq!(effective_mode(&file, 0o120000), 0o100644);
 	}
 }

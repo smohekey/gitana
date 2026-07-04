@@ -5,7 +5,7 @@ use gitana_file_store_local::{Meta, WorkDirFs};
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::Repository;
 
-use crate::fsmeta::{file_mode, join_rel, mode_of, push_gitignore, stat_of};
+use crate::fsmeta::{effective_mode, join_rel, mode_of, push_gitignore, stat_of};
 use crate::ignore::{self, DirIgnore};
 use crate::{Index, IndexEntry, Status, WorktreeError};
 
@@ -178,6 +178,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				for file in files {
 					self.stage_file(&mut index, &file).await?;
 				}
+				self.stage_deletions(&mut index, "")?;
 				continue;
 			}
 			match self.work().lstat(&rel)? {
@@ -187,13 +188,28 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					for file in files {
 						self.stage_file(&mut index, &file).await?;
 					}
+					self.stage_deletions(&mut index, &rel)?;
 				}
 				// A trailing-slash spec required a directory but resolved to a file.
 				Some(_) if dir_only => return Err(WorktreeError::PathspecMatch(spec.to_owned())),
 				Some(_) => self.stage_file(&mut index, &rel).await?,
-				// Absent: a trailing-slash spec is an error; otherwise stage the deletion.
-				None if dir_only => return Err(WorktreeError::PathspecMatch(spec.to_owned())),
-				None => index.remove(&rel),
+				// Absent from the working tree: stage the deletion of whatever tracked entries the
+				// pathspec covers — the exact path (a removed file) and any children (a removed
+				// directory, `rm -r dir && add dir`). A spec matching no tracked entry did not match
+				// anything; a trailing-slash spec additionally requires it to have named a directory.
+				None => {
+					let child_prefix = format!("{rel}/");
+					let matched = index.entry(&rel).is_some()
+						|| index
+							.entries
+							.iter()
+							.any(|entry| entry.stage == 0 && entry.path.starts_with(&child_prefix));
+					if dir_only && !matched {
+						return Err(WorktreeError::PathspecMatch(spec.to_owned()));
+					}
+					index.remove(&rel);
+					self.stage_deletions(&mut index, &rel)?;
+				}
 			}
 		}
 		self.save_index(&index).await
@@ -210,11 +226,46 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			Some(meta) if meta.kind.is_file() => {
 				let content = self.work().read(path)?;
 				let oid = self.repo.write_blob(&content).await?;
+				// Preserve a tracked file's executable bit when the capability cannot report it (WASI):
+				// staging an otherwise-unchanged executable must not silently downgrade it to `100644` —
+				// git's `core.fileMode=false`. A newly tracked file has no prior mode, so it defaults to
+				// `100644` (git records new files without a trusted exec bit the same way).
+				let expected = index
+					.entry(path)
+					.map(|existing| existing.mode)
+					.unwrap_or(0o100644);
 				index.remove_type_conflicts(path);
-				index.upsert(entry(path, file_mode(&meta), oid, &meta));
+				index.upsert(entry(path, effective_mode(&meta, expected), oid, &meta));
 			}
 			Some(_) => {}
 			None => index.remove(path),
+		}
+		Ok(())
+	}
+
+	/// Stage deletions for a directory pathspec: any tracked entry under `dir_rel` (the empty string
+	/// is the work-tree root, matching everything) whose working-tree file no longer exists is removed
+	/// from the index. This is git 2.0+ `add <dir>` / `add .` behaviour — a walk stages the files that
+	/// are present, and this pass stages the removals of those that vanished, so `rm foo && add .`
+	/// records the deletion rather than silently keeping the stale entry. A single explicit pathspec
+	/// that is absent is handled directly by [`Self::add`]; this pass covers the directory case.
+	fn stage_deletions(&self, index: &mut Index<H>, dir_rel: &str) -> Result<(), WorktreeError> {
+		let prefix = if dir_rel.is_empty() {
+			String::new()
+		} else {
+			format!("{dir_rel}/")
+		};
+		// Snapshot the candidate paths first, since the `lstat` loop mutates the index.
+		let candidates: Vec<String> = index
+			.entries
+			.iter()
+			.filter(|entry| entry.stage == 0 && entry.path.starts_with(&prefix))
+			.map(|entry| entry.path.clone())
+			.collect();
+		for path in candidates {
+			if self.work().lstat(&path)?.is_none() {
+				index.remove(&path);
+			}
 		}
 		Ok(())
 	}

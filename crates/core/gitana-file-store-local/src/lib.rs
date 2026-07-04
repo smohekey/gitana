@@ -54,9 +54,10 @@ pub use worktree::WorktreeFileStore;
 
 // The working-tree filesystem capability: a directory-rooted `lstat`/read/readdir/write/symlink/…
 // surface richer than `FileStore`'s flat byte API, for `gitana-worktree`. The trait and its metadata
-// types are target-agnostic; the native `CapWorkDir` (over a cap-std `Dir`) is native-only, with the
-// unix-vs-other split (real mode/uid/gid and symlink bytes vs a degraded fallback) contained inside
-// it — the platform boundary. A WASI implementation follows in a later slice.
+// types are target-agnostic; the concrete impls are per-target, each containing its own metadata
+// story — the native `CapWorkDir` (over a cap-std `Dir`) reports real mode/uid/gid and symlink
+// bytes (degrading on non-unix), while the wasm `DescriptorWorkDir` (over a `wasi:filesystem`
+// descriptor) reports what `descriptor-stat` provides and leaves the rest `0`.
 mod file_kind;
 mod meta;
 mod work_dir_fs;
@@ -74,6 +75,8 @@ mod descriptor_backend;
 #[cfg(target_arch = "wasm32")]
 mod descriptor_reader;
 #[cfg(target_arch = "wasm32")]
+mod descriptor_work_dir;
+#[cfg(target_arch = "wasm32")]
 mod descriptor_writer;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use self::{
@@ -81,6 +84,8 @@ pub(crate) use self::{
 	descriptor_reader::DescriptorReader,
 	descriptor_writer::DescriptorWriter,
 };
+#[cfg(target_arch = "wasm32")]
+pub use descriptor_work_dir::DescriptorWorkDir;
 
 /// How many times to retry a cross-process ref lock before giving up.
 const LOCK_ATTEMPTS: u32 = 50;

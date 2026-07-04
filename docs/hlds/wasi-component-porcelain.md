@@ -230,9 +230,15 @@ Findings from this slice:
    state) to `git-dir` and shared paths (objects, refs, `packed-refs`, `config`) to `common-dir`;
    `open`/`init` build the same store over a single descriptor (`WorktreeFileStore::single`). The
    host e2e proves the split byte-for-byte in both hash formats (`tests/worktree.rs`).
-3. **Worktree capability threading** — the ~58 ambient `std::fs` sites in `gitana-worktree`;
-   after that, `porcelain::commit`/`merge`/`status` become exportable. WASI symlink/exec-bit
-   limits need validation there.
+3. ~~**Worktree capability threading**~~ — done in `gitana:repo@0.4.0` (see
+   `docs/hlds/worktree-capability-threading.md`). `gitana-worktree`'s ambient `std::fs` was routed
+   through a `WorkDirFs` capability (native `CapWorkDir`, wasm `DescriptorWorkDir`); `open-worktree`
+   grew a third `work-dir` descriptor, and the component now exports the working-tree porcelain
+   `status`/`add`/`checkout`/`commit` (host e2e `tests/porcelain.rs`, both hash formats). WASI's
+   silent exec-bit and minimal stat-cache are handled as documented degradation; symlinks round-trip.
+   Only `gitana-worktree` was pulled in — `commit`'s orchestration is reimplemented over
+   `Repository::commit_on_head` so `gitana-porcelain`'s `reqwest` never reaches the reactor. `merge`
+   (conflict lifecycle) is the remaining worktree export.
 4. **`wasi:http` transport trait** for `gitana-remote` so fetch/clone/push work in-component.
 5. ~~**Retire `StdBackend`/`from_root`**~~ — done: `wasm-object-db` takes its preopen as a
    descriptor (`preopens#get-directories` → `from_descriptor`); the descriptor backend is the

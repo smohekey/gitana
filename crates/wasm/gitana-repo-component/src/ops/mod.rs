@@ -7,9 +7,10 @@ mod objects;
 mod refs;
 mod repo;
 mod revisions;
+mod worktree;
 
 pub(crate) use self::{
-	error::repo_error,
+	error::{repo_error, worktree_error},
 	objects::{
 		create_commit, ls_tree, read_blob, read_commit, read_object, read_tag, write_blob, write_tree,
 	},
@@ -18,4 +19,5 @@ pub(crate) use self::{
 	},
 	repo::{init_layout, init_repo, read_config, repack},
 	revisions::{is_ancestor, merge_base, rev_list, rev_parse},
+	worktree::{add, checkout, commit, status},
 };

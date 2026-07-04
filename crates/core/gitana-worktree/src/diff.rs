@@ -10,7 +10,7 @@ use gitana_file_store_local::{Meta, WorkDirFs};
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::Repository;
 
-use crate::fsmeta::{blob_of, file_mode};
+use crate::fsmeta::{blob_of, effective_mode};
 use crate::worktree::stat_matches;
 use crate::{WorkTree, WorktreeError};
 
@@ -49,14 +49,18 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		}
 		// Re-hash to decide if the content really changed (mtime alone can lie).
 		match blob_of(wt.work(), &entry.path, &meta)? {
-			Some((oid, mode)) if oid == entry.oid && mode == entry.mode => {}
+			Some((oid, _)) if oid == entry.oid && effective_mode(&meta, entry.mode) == entry.mode => {}
 			_ => {
 				let old = wt.repository().read_blob(entry.oid).await?;
 				let new = read_worktree(wt.work(), &entry.path, &meta)?;
 				out.push(FileDiff {
 					path: entry.path.clone(),
 					old: Some((old, entry.mode)),
-					new: Some((new, working_mode(&meta))),
+					// The new-side mode is the *effective* mode: under a capability that cannot report the
+					// executable bit (WASI), it inherits the bit from the index entry, so a content-only
+					// edit of an executable does not print a spurious `100755 → 100644` mode change —
+					// git's `core.fileMode=false`.
+					new: Some((new, effective_mode(&meta, entry.mode))),
 				});
 			}
 		}
@@ -173,14 +177,6 @@ fn read_worktree<W: WorkDirFs>(work: &W, path: &str, meta: &Meta) -> std::io::Re
 		work.read_link(path)
 	} else {
 		work.read(path)
-	}
-}
-
-fn working_mode(meta: &Meta) -> u32 {
-	if meta.kind.is_symlink() {
-		0o120000
-	} else {
-		file_mode(meta)
 	}
 }
 

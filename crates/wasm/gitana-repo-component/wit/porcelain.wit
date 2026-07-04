@@ -1,4 +1,4 @@
-package gitana:repo@0.3.0;
+package gitana:repo@0.4.0;
 
 /// Repository operations over a capability-granted git directory.
 ///
@@ -21,6 +21,9 @@ interface porcelain {
 		/// A conditional ref update or delete lost the race: the ref was not at
 		/// the expected value. The payload is the ref name.
 		ref-moved(string),
+		/// A working-tree operation would overwrite uncommitted local changes or an
+		/// untracked file, and no `force` was given. The payload describes the path.
+		conflict(string),
 		/// The repository's format or config is not supported.
 		unsupported-format(string),
 		/// A stored object's bytes hash to a different id than requested.
@@ -155,6 +158,31 @@ interface porcelain {
 		loose-removed: u64,
 	}
 
+	/// One path's working-tree status, as `git status --porcelain=v1` reports it: an
+	/// index code (staged, index-vs-HEAD — the `X` column) and a worktree code
+	/// (unstaged, worktree-vs-index — the `Y` column). Each code is a single git
+	/// porcelain letter (` `, `A`, `M`, `D`, `R`, …); an unmerged path carries its
+	/// conflict letter (`U`/`A`/`D`) in both.
+	record status-entry {
+		/// Repository-relative path (`/` separators).
+		path: string,
+		/// The index-vs-HEAD code (`X`), a single-character string.
+		index: string,
+		/// The worktree-vs-index code (`Y`), a single-character string.
+		worktree: string,
+	}
+
+	/// A working tree's status: tracked paths whose index or worktree code is not
+	/// clean (or that are unmerged), and untracked paths (a fully-untracked directory
+	/// collapses to a single `dir/` entry, as git's default mode does). Both lists are
+	/// sorted by path.
+	record worktree-status {
+		/// Tracked paths with a non-clean or conflicted status.
+		changed: list<status-entry>,
+		/// Untracked paths and collapsed untracked directories.
+		untracked: list<string>,
+	}
+
 	resource repository {
 		/// Open the repository whose git directory is `git-dir` — an owned
 		/// directory descriptor granted by the host. Reads `config` through the
@@ -162,17 +190,27 @@ interface porcelain {
 		/// `extensions.objectformat` means sha1, as in git). For an ordinary
 		/// repository `git-dir` is also the common directory; use
 		/// `open-worktree` for a linked worktree whose two directories differ.
+		/// A repository opened this way has no working tree, so the working-tree
+		/// operations (`status`/`add`/`checkout`/`commit`) fail on it — use
+		/// `open-worktree` to grant a `work-dir`.
 		open: static func(git-dir: descriptor) -> result<repository, repo-error>;
 
-		/// Open a *linked worktree* (created by `git worktree add`), whose files
-		/// are split across two directories: `git-dir` holds the per-worktree
-		/// state (`HEAD`, `index`, in-progress merge/rebase/cherry-pick), while
-		/// `common-dir` holds the shared objects, refs, `packed-refs`, and
-		/// `config`. Both are owned descriptors granted by the host; each path is
-		/// routed to the directory that owns it. The object format is detected
-		/// from `common-dir`'s `config`. Passing the same directory as both is
-		/// equivalent to `open`.
-		open-worktree: static func(git-dir: descriptor, common-dir: descriptor) -> result<repository, repo-error>;
+		/// Open a repository *together with its working tree*, over three owned
+		/// directory descriptors:
+		///
+		/// - `git-dir` — the per-worktree state (`HEAD`, `index`, in-progress
+		///   merge/rebase/cherry-pick);
+		/// - `common-dir` — the shared objects, refs, `packed-refs`, and `config`;
+		/// - `work-dir` — the checked-out working tree.
+		///
+		/// For a *linked worktree* (created by `git worktree add`) `git-dir` and
+		/// `common-dir` differ and each path is routed to the directory that owns it;
+		/// for an ordinary repository pass the same descriptor as both. The object
+		/// format is detected from `common-dir`'s `config`. Only a repository opened
+		/// this way can run the working-tree operations (`status`, `add`, `checkout`,
+		/// `commit`); one opened via `open`/`init` has no working tree and those
+		/// operations fail.
+		open-worktree: static func(git-dir: descriptor, common-dir: descriptor, work-dir: descriptor) -> result<repository, repo-error>;
 
 		/// Initialize a fresh repository in `git-dir` with the given object
 		/// format, then open it: git's empty directory skeleton, a `config`,
@@ -264,6 +302,34 @@ interface porcelain {
 		/// `pack.packSizeLimit`. `geometric` keeps large existing packs (git's
 		/// incremental strategy, factor 2). `none` when there was nothing to do.
 		repack: func(geometric: bool) -> result<option<repack-report>, repo-error>;
+
+		// -- Working-tree operations (require a repository opened via `open-worktree`).
+
+		/// The three-way working-tree status: the `HEAD` tree vs the index (staged)
+		/// and the index vs the working tree (unstaged), plus untracked paths —
+		/// `git status --porcelain=v1` as structured data.
+		status: func() -> result<worktree-status, repo-error>;
+
+		/// Stage `pathspecs` into the index. Each is a working-tree path (`/`
+		/// separators) interpreted relative to `prefix` (a `/`-joined work-tree
+		/// subdirectory, empty at the root); `.` or a directory is walked (applying
+		/// `.gitignore`) and its files staged, and a path that no longer exists is
+		/// staged as a deletion — `git add`.
+		add: func(pathspecs: list<string>, prefix: string) -> result<_, repo-error>;
+
+		/// Materialise the tree that `tree-ish` peels to (a commit, tag, or tree
+		/// spec) into the working tree and index. Does not move `HEAD`. Without
+		/// `force`, fails with `conflict` rather than overwrite uncommitted local
+		/// changes or an untracked file.
+		checkout: func(tree-ish: string, force: bool) -> result<_, repo-error>;
+
+		/// Record a commit from the staged index on the current branch, returning
+		/// the new commit id (hex). Refuses an unmerged or empty index. `author`
+		/// and `committer` are raw git identity lines (`Name <email> epoch offset`)
+		/// — the component reads no process env or clock, so the host supplies them.
+		/// Requires a symbolic `HEAD` (committing on a detached `HEAD` is not
+		/// supported).
+		commit: func(message: string, author: string, committer: string) -> result<string, repo-error>;
 	}
 }
 
