@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use gitana_object::{HashKind, Sha1, Sha256};
-use gitana_remote::{self as transport, Origin};
+use gitana_remote::{self as transport, Origin, ReqwestTransport};
 
 use crate::repo;
 
@@ -27,7 +27,8 @@ pub async fn run(url: String, dir: Option<PathBuf>) -> Result<()> {
 	}
 
 	// Negotiate the remote's object format before creating anything locally.
-	let body = transport::fetch_advertisement(&origin, "git-upload-pack").await?;
+	let http = ReqwestTransport::new();
+	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
 	let kind = transport::negotiated_kind(&body)?;
 
 	// Create the git directory skeleton, like `init`.
@@ -47,6 +48,7 @@ pub async fn run(url: String, dir: Option<PathBuf>) -> Result<()> {
 		HashKind::Sha1 => {
 			let repo = repo::open_generic::<Sha1>(&git_dir, &git_dir)?;
 			gitana_porcelain::clone(
+				&http,
 				repo,
 				&origin,
 				&body,
@@ -58,6 +60,7 @@ pub async fn run(url: String, dir: Option<PathBuf>) -> Result<()> {
 		HashKind::Sha256 => {
 			let repo = repo::open_generic::<Sha256>(&git_dir, &git_dir)?;
 			gitana_porcelain::clone(
+				&http,
 				repo,
 				&origin,
 				&body,

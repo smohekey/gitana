@@ -9,7 +9,7 @@ use crate::Backend;
 use anyhow::Result;
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_porcelain::PushOutcome;
-use gitana_remote::{self as transport, Origin};
+use gitana_remote::{self as transport, Origin, ReqwestTransport};
 use gitana_repository::Repository;
 
 use crate::dispatch;
@@ -27,18 +27,22 @@ pub async fn run(
 ) -> Result<()> {
 	let found = repo::discover(cwd)?;
 	let origin = Origin::load(&found.common_dir)?;
-	let body = transport::fetch_advertisement(&origin, "git-receive-pack").await?;
+	let http = ReqwestTransport::new();
+	let body = transport::fetch_advertisement(&http, &origin, "git-receive-pack").await?;
 
 	let local = dispatch::detect_algorithm(&found.common_dir)?;
 	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
 
 	match local {
-		HashKind::Sha1 => push_into::<Sha1>(&origin, &found, &body, signed, force, delete).await,
-		HashKind::Sha256 => push_into::<Sha256>(&origin, &found, &body, signed, force, delete).await,
+		HashKind::Sha1 => push_into::<Sha1>(&http, &origin, &found, &body, signed, force, delete).await,
+		HashKind::Sha256 => {
+			push_into::<Sha256>(&http, &origin, &found, &body, signed, force, delete).await
+		}
 	}
 }
 
 async fn push_into<H: HashAlgorithm>(
+	http: &ReqwestTransport,
 	origin: &Origin,
 	found: &repo::Discovered,
 	body: &[u8],
@@ -48,6 +52,7 @@ async fn push_into<H: HashAlgorithm>(
 ) -> Result<()> {
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
 	let outcome = gitana_porcelain::push(
+		http,
 		&repository,
 		origin,
 		body,

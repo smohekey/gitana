@@ -9,6 +9,13 @@ version = "0.1.0"
 [lints]
 workspace = true
 
+[features]
+# The native reqwest-backed `HttpTransport`. On by default so ordinary consumers are unaffected;
+# a wasm build (the `gitana:repo` component, via `gitana-porcelain`) turns it off so `reqwest` — a
+# browser wasm-bindgen HTTP stack — never enters the wasip2 reactor, and supplies its own transport.
+default = ["reqwest-transport"]
+reqwest-transport = ["dep:reqwest"]
+
 [dependencies]
 anyhow.workspace = true
 gitana-config.workspace = true
@@ -16,7 +23,7 @@ gitana-file-store.workspace = true
 gitana-git-http.workspace = true
 gitana-object.workspace = true
 gitana-repository.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

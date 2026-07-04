@@ -27,7 +27,7 @@ gitana-identity = { path = "crates/core/gitana-identity" }
 gitana-object = { path = "crates/core/gitana-object" }
 gitana-object-store = { path = "crates/core/gitana-object-store" }
 gitana-porcelain = { path = "crates/core/gitana-porcelain" }
-gitana-remote = { path = "crates/core/gitana-remote" }
+gitana-remote = { path = "crates/core/gitana-remote", default-features = false }
 gitana-repository = { path = "crates/core/gitana-repository" }
 gitana-worktree = { path = "crates/core/gitana-worktree" }
 gta-core = { path = "crates/cli/gta-core" }

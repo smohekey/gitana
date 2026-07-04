@@ -9,6 +9,13 @@ version = "0.1.0"
 [lints]
 workspace = true
 
+[features]
+# Forward `gitana-remote`'s native reqwest transport. On by default so native consumers (gta-core)
+# are unaffected; a wasm build turns it off (`--no-default-features`) to keep `reqwest` out of the
+# wasip2 reactor and supply its own `HttpTransport`.
+default = ["reqwest-transport"]
+reqwest-transport = ["gitana-remote/reqwest-transport"]
+
 [dependencies]
 anyhow.workspace = true
 gitana-config.workspace = true

@@ -21,7 +21,7 @@ gitana-identity.workspace = true
 gitana-object.workspace = true
 gitana-object-store.workspace = true
 gitana-porcelain.workspace = true
-gitana-remote.workspace = true
+gitana-remote = { workspace = true, features = ["reqwest-transport"] }
 gitana-repository.workspace = true
 gitana-worktree.workspace = true
 sha2.workspace = true

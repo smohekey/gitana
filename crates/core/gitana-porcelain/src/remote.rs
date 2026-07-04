@@ -13,7 +13,7 @@ use gitana_git_http::{
 	build_receive_pack_request, parse_advertisement, parse_report_status,
 };
 use gitana_object::{HashAlgorithm, ObjectId};
-use gitana_remote::{Origin, RECEIVE_PACK_REQUEST, Refspec, http_post};
+use gitana_remote::{HttpTransport, Origin, RECEIVE_PACK_REQUEST, Refspec};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
 
@@ -39,6 +39,7 @@ pub struct FetchOutcome<H: HashAlgorithm> {
 /// updated here). `update_head_ok` (set by `pull`) instead *skips* that destination silently: `pull`
 /// advances the checked-out branch and work tree through its merge step.
 pub async fn fetch<F: FileStore, H: HashAlgorithm>(
+	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
 	origin: &Origin,
 	advertisement: &[u8],
@@ -46,7 +47,7 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 ) -> Result<FetchOutcome<H>> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
 	let haves = gitana_remote::local_haves(repo).await?;
-	download(repo, origin, &advertised, &haves).await?;
+	download(transport, repo, origin, &advertised, &haves).await?;
 
 	let config = repo.read_config().await?;
 	let refspecs = parse_fetch_refspecs(&config)?;
@@ -195,6 +196,7 @@ pub async fn pull_upstream<F: FileStore, H: HashAlgorithm>(
 /// a config matching `H`), download every advertised tip, recreate the refs and `HEAD`, save the
 /// origin, and check out `HEAD`. `advertisement` is the already-fetched `GET /info/refs` body.
 pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	transport: &impl HttpTransport,
 	repo: Repository<F, H>,
 	origin: &Origin,
 	advertisement: &[u8],
@@ -204,7 +206,7 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	repo.init().await?;
 
 	let advertised = parse_advertisement::<H>(advertisement)?;
-	download(&repo, origin, &advertised, &[]).await?;
+	download(transport, &repo, origin, &advertised, &[]).await?;
 
 	// Recreate the refs and HEAD locally.
 	for (name, oid) in &advertised.refs {
@@ -231,13 +233,14 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 /// Download the objects reachable from the advertised tips that `haves` do not already cover, writing
 /// them into `repo`.
 async fn download<F: FileStore, H: HashAlgorithm>(
+	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
 	origin: &Origin,
 	advertised: &Advertised<H>,
 	haves: &[ObjectId<H>],
 ) -> Result<()> {
 	let wants = gitana_remote::advertised_oids(advertised);
-	gitana_remote::fetch_pack(origin, repo, &wants, haves).await?;
+	gitana_remote::fetch_pack(transport, origin, repo, &wants, haves).await?;
 	Ok(())
 }
 
@@ -260,6 +263,7 @@ pub enum PushOutcome {
 /// certificate's pusher line — called only after confirming the server offers push-cert, so an
 /// unconfigured identity does not mask "the server does not accept signed pushes".
 pub async fn push<F: FileStore, H: HashAlgorithm>(
+	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
 	origin: &Origin,
 	advertisement: &[u8],
@@ -281,7 +285,9 @@ pub async fn push<F: FileStore, H: HashAlgorithm>(
 			name: refname.clone(),
 		};
 		let request = build_receive_pack_request(std::slice::from_ref(&update), &[]);
-		let response = http_post(&origin.receive_pack(), RECEIVE_PACK_REQUEST, request).await?;
+		let response = transport
+			.post(&origin.receive_pack(), RECEIVE_PACK_REQUEST, request)
+			.await?;
 		parse_report_status(&response)?;
 		return Ok(PushOutcome::Deleted { refname });
 	}
@@ -328,7 +334,9 @@ pub async fn push<F: FileStore, H: HashAlgorithm>(
 		build_receive_pack_request(std::slice::from_ref(&update), &pack)
 	};
 
-	let response = http_post(&origin.receive_pack(), RECEIVE_PACK_REQUEST, request).await?;
+	let response = transport
+		.post(&origin.receive_pack(), RECEIVE_PACK_REQUEST, request)
+		.await?;
 	parse_report_status(&response)?;
 	Ok(PushOutcome::Pushed {
 		branch,

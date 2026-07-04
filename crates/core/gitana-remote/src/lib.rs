@@ -2,15 +2,22 @@
 //! download/upload.
 //!
 //! The wire codec lives in `gitana-git-http` (protocol v0 client helpers); this
-//! crate pairs it with an HTTP client ([`http`]) and a local repository. Object ids are
+//! crate pairs it with an [`HttpTransport`] and a local repository. Object ids are
 //! generic over the negotiated hash algorithm `H`: a caller first reads the remote's
 //! advertised `object-format` ([`negotiated_kind`]) and then runs the rest under that
-//! `H`.
+//! `H`. The transport is a capability the caller supplies — the native `ReqwestTransport` (behind
+//! the default `reqwest-transport` feature) by default, or (on `wasm32-wasip2`) an in-guest
+//! `wasi:http` client.
 
-mod http;
+mod http_transport;
 mod refspec;
+#[cfg(feature = "reqwest-transport")]
+mod reqwest_transport;
 
+pub use http_transport::HttpTransport;
 pub use refspec::Refspec;
+#[cfg(feature = "reqwest-transport")]
+pub use reqwest_transport::ReqwestTransport;
 
 use std::path::Path;
 
@@ -22,8 +29,6 @@ use gitana_git_http::{
 };
 use gitana_object::{HashAlgorithm, HashKind, ObjectId};
 use gitana_repository::Repository;
-
-pub use http::{http_get, http_post};
 
 const UPLOAD_PACK_REQUEST: &str = "application/x-git-upload-pack-request";
 /// Content type for a `git-receive-pack` request body.
@@ -116,8 +121,12 @@ impl Origin {
 /// Fetch the raw `GET /info/refs` advertisement bytes for `service` (`git-upload-pack`
 /// or `git-receive-pack`). Hash-agnostic: the caller reads the advertised object-format
 /// from the result ([`negotiated_kind`]) before parsing oids under a concrete `H`.
-pub async fn fetch_advertisement(origin: &Origin, service: &str) -> Result<Vec<u8>> {
-	http_get(&origin.info_refs(service)).await
+pub async fn fetch_advertisement(
+	transport: &impl HttpTransport,
+	origin: &Origin,
+	service: &str,
+) -> Result<Vec<u8>> {
+	transport.get(&origin.info_refs(service)).await
 }
 
 /// The hash algorithm a remote advertises, from the `object-format` capability in its
@@ -145,6 +154,7 @@ pub fn ensure_same_format(local: HashKind, remote: HashKind) -> Result<()> {
 
 /// Download the objects reachable from `wants` but not `haves` into `repo`.
 pub async fn fetch_pack<H: HashAlgorithm>(
+	transport: &impl HttpTransport,
 	origin: &Origin,
 	repo: &Repository<impl FileStore, H>,
 	wants: &[ObjectId<H>],
@@ -154,7 +164,9 @@ pub async fn fetch_pack<H: HashAlgorithm>(
 		return Ok(());
 	}
 	let request = build_upload_pack_request(wants, haves);
-	let response = http_post(&origin.upload_pack(), UPLOAD_PACK_REQUEST, request).await?;
+	let response = transport
+		.post(&origin.upload_pack(), UPLOAD_PACK_REQUEST, request)
+		.await?;
 	let pack = parse_upload_pack_response(&response)?;
 	// Skip an empty pack (server had nothing new). The 12-byte header carries the count.
 	if pack.len() >= 12 && pack_object_count(&pack) > 0 {

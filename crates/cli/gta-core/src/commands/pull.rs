@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
-use gitana_remote::{self as transport, Origin};
+use gitana_remote::{self as transport, Origin, ReqwestTransport};
 use gitana_repository::HeadState;
 use gitana_worktree::WorkTree;
 
@@ -18,14 +18,15 @@ use crate::repo;
 pub async fn run(cwd: &Path) -> Result<()> {
 	let found = repo::discover(cwd)?;
 	let origin = Origin::load(&found.common_dir)?;
-	let body = transport::fetch_advertisement(&origin, "git-upload-pack").await?;
+	let http = ReqwestTransport::new();
+	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
 
 	let local = dispatch::detect_algorithm(&found.common_dir)?;
 	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
 
 	match local {
-		HashKind::Sha1 => pull_into::<Sha1>(&origin, &found, &body).await,
-		HashKind::Sha256 => pull_into::<Sha256>(&origin, &found, &body).await,
+		HashKind::Sha1 => pull_into::<Sha1>(&http, &origin, &found, &body).await,
+		HashKind::Sha256 => pull_into::<Sha256>(&http, &origin, &found, &body).await,
 	}
 }
 
@@ -33,6 +34,7 @@ pub async fn run(cwd: &Path) -> Result<()> {
 /// porcelain composites; this composes them, printing the "Fetched from" line *between* — so a merge
 /// that then fails (e.g. a dirty work tree) still reports the completed fetch, as git does.
 async fn pull_into<H: HashAlgorithm>(
+	http: &ReqwestTransport,
 	origin: &Origin,
 	found: &repo::Discovered,
 	body: &[u8],
@@ -50,7 +52,7 @@ async fn pull_into<H: HashAlgorithm>(
 
 	// `update_head_ok`: a fetch refspec may map straight into the checked-out branch (a mirror config
 	// like `+refs/heads/*:refs/heads/*`); the merge below advances that branch and the work tree.
-	let outcome = gitana_porcelain::fetch(worktree.repository(), origin, body, true).await?;
+	let outcome = gitana_porcelain::fetch(http, worktree.repository(), origin, body, true).await?;
 	println!("Fetched from {}", origin.url);
 	// A rejected (non-fast-forward) tracking update is a failed fetch; do not merge a stale upstream.
 	if !outcome.rejected.is_empty() {
