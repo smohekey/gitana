@@ -1,6 +1,6 @@
 //! Runtime hash-kind dispatch: one repository value per compile-time `H`.
 
-use gitana_file_store_local::LocalFileStore;
+use gitana_file_store_local::{LocalFileStore, WorktreeFileStore};
 use gitana_object::{Sha1, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::{Repository, detect_hash_kind};
@@ -28,15 +28,34 @@ macro_rules! dispatch {
 /// runtime→compile-time bridge as `gta-core`'s dispatch: match once here, and each
 /// operation body is written once, generic over `H` (see [`crate::ops`]).
 pub(crate) enum Inner {
-	Sha1(Repository<LocalFileStore, Sha1>),
-	Sha256(Repository<LocalFileStore, Sha256>),
+	Sha1(Repository<WorktreeFileStore, Sha1>),
+	Sha256(Repository<WorktreeFileStore, Sha256>),
 }
 
 impl Inner {
-	/// Build the file store over the granted descriptor, detect the object format from
-	/// `config` *through that descriptor*, and open the repository as the matching `H`.
+	/// Open the repository whose git dir *is* its common dir (an ordinary,
+	/// non-linked repository) over the single granted descriptor.
 	pub(crate) fn open(git_dir: Descriptor) -> Result<Self, RepoError> {
-		let store = LocalFileStore::from_descriptor(git_dir);
+		Self::from_store(WorktreeFileStore::single(LocalFileStore::from_descriptor(
+			git_dir,
+		)))
+	}
+
+	/// Open a linked worktree, routing per-worktree paths to `git_dir` and shared
+	/// paths (objects, refs, `packed-refs`, `config`) to `common_dir`.
+	pub(crate) fn open_worktree(
+		git_dir: Descriptor,
+		common_dir: Descriptor,
+	) -> Result<Self, RepoError> {
+		Self::from_store(WorktreeFileStore::from_stores(
+			LocalFileStore::from_descriptor(common_dir),
+			LocalFileStore::from_descriptor(git_dir),
+		))
+	}
+
+	/// Detect the object format from `config` *through the store* (which reads it from
+	/// the common dir) and open the repository as the matching `H`.
+	fn from_store(store: WorktreeFileStore) -> Result<Self, RepoError> {
 		match block_on(detect_hash_kind(&store)).map_err(ops::repo_error)? {
 			gitana_object::HashKind::Sha1 => Ok(Self::Sha1(Repository::new(ObjectStore::new(store)))),
 			gitana_object::HashKind::Sha256 => Ok(Self::Sha256(Repository::new(ObjectStore::new(store)))),
@@ -45,10 +64,12 @@ impl Inner {
 
 	/// Lay out git's directory skeleton, write the fresh-repo metadata for the
 	/// *requested* algorithm (idempotent), and open — refusing a directory that
-	/// already holds a repository of a different format.
+	/// already holds a repository of a different format. A fresh repository is never
+	/// linked, so its git dir and common dir coincide.
 	pub(crate) fn init(git_dir: Descriptor, kind: HashKind) -> Result<Self, RepoError> {
 		let store = LocalFileStore::from_descriptor(git_dir);
 		block_on(ops::init_layout(&store))?;
+		let store = WorktreeFileStore::single(store);
 		let inner = match kind {
 			HashKind::Sha1 => Self::Sha1(Repository::new(ObjectStore::new(store))),
 			HashKind::Sha256 => Self::Sha256(Repository::new(ObjectStore::new(store))),

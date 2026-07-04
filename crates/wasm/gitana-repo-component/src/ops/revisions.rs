@@ -1,6 +1,6 @@
 //! Revision resolution and history walks.
 
-use gitana_file_store_local::LocalFileStore;
+use gitana_file_store_local::WorktreeFileStore;
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::Repository;
 
@@ -10,7 +10,7 @@ use super::repo_error;
 
 /// Resolve each spec in `specs` to an id, failing on the first unresolvable one.
 async fn resolve_all<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	specs: &[String],
 ) -> Result<Vec<ObjectId<H>>, RepoError> {
 	let mut ids = Vec::with_capacity(specs.len());
@@ -21,7 +21,7 @@ async fn resolve_all<H: HashAlgorithm>(
 }
 
 pub(crate) async fn rev_parse<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	spec: &str,
 ) -> Result<String, RepoError> {
 	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
@@ -29,7 +29,7 @@ pub(crate) async fn rev_parse<H: HashAlgorithm>(
 }
 
 pub(crate) async fn rev_list<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	tips: &[String],
 	max_count: Option<u32>,
 ) -> Result<Vec<String>, RepoError> {
@@ -42,7 +42,7 @@ pub(crate) async fn rev_list<H: HashAlgorithm>(
 }
 
 pub(crate) async fn merge_base<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	commits: &[String],
 ) -> Result<Vec<String>, RepoError> {
 	let commits = resolve_all(repo, commits).await?;
@@ -51,7 +51,7 @@ pub(crate) async fn merge_base<H: HashAlgorithm>(
 }
 
 pub(crate) async fn is_ancestor<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	ancestor: &str,
 	descendant: &str,
 ) -> Result<bool, RepoError> {

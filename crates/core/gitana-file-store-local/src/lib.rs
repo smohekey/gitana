@@ -45,11 +45,11 @@ use cap_std::fs::{Dir, OpenOptions};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::Mutex as AsyncMutex;
 
-// Linked-worktree routing is a native concern (git worktree layouts); the wasm target
-// uses a single `LocalFileStore`, and cap-std's `Dir` (which this takes) is native-only.
-#[cfg(not(target_arch = "wasm32"))]
+// A `WorktreeFileStore` routes a repository's paths between its per-worktree git dir and the
+// shared common dir (git's linked-worktree layout). It is built over two `LocalFileStore`s, so it
+// serves both targets — a component can construct it from two `wasi:filesystem` descriptors; only
+// its cap-std `Dir` convenience constructor is native-only (see `worktree.rs`).
 mod worktree;
-#[cfg(not(target_arch = "wasm32"))]
 pub use worktree::WorktreeFileStore;
 
 #[cfg(target_arch = "wasm32")]

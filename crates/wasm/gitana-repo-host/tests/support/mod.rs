@@ -246,6 +246,27 @@ impl Session {
 		})
 	}
 
+	/// Instantiate the guest (no preopens), grant both `git_dir` and `common_dir` as
+	/// descriptors, and open a linked worktree that routes across the two.
+	pub async fn open_worktree(git_dir: &Path, common_dir: &Path) -> Result<Self> {
+		let engine = engine()?;
+		let mut store = store(&engine);
+		let repo = instantiate(&engine, &mut store, build_component()).await?;
+		let git = grant_dir(&mut store, git_dir)?;
+		let common = grant_dir(&mut store, common_dir)?;
+		let handle = repo
+			.gitana_repo_porcelain()
+			.repository()
+			.call_open_worktree(&mut store, git, common)
+			.await?
+			.map_err(|error| anyhow!("open-worktree: {error:?}"))?;
+		Ok(Self {
+			store,
+			repo,
+			handle,
+		})
+	}
+
 	/// Like [`Session::open`], but through the guest's `init` export; the guest's
 	/// typed error is preserved for tests asserting init failures.
 	pub async fn try_init(git_dir: &Path, kind: HashKind) -> Result<Result<Self, RepoError>> {

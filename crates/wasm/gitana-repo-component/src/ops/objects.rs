@@ -1,6 +1,6 @@
 //! Object reads and writes.
 
-use gitana_file_store_local::LocalFileStore;
+use gitana_file_store_local::WorktreeFileStore;
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_commit, parse_tag};
 use gitana_object_store::ObjectStoreError;
 use gitana_repository::{FileMode, Repository, RepositoryError, TreeBuildEntry};
@@ -16,7 +16,7 @@ use super::repo_error;
 
 /// Resolve `spec` and require the object it names to be of `kind`.
 async fn resolve_kind<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	spec: &str,
 	kind: ObjectKind,
 ) -> Result<ObjectId<H>, RepoError> {
@@ -47,7 +47,7 @@ fn wit_kind(kind: ObjectKind) -> WitObjectKind {
 }
 
 pub(crate) async fn read_object<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	spec: &str,
 ) -> Result<ObjectInfo, RepoError> {
 	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
@@ -64,7 +64,7 @@ pub(crate) async fn read_object<H: HashAlgorithm>(
 }
 
 pub(crate) async fn read_blob<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	spec: &str,
 ) -> Result<Vec<u8>, RepoError> {
 	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
@@ -72,7 +72,7 @@ pub(crate) async fn read_blob<H: HashAlgorithm>(
 }
 
 pub(crate) async fn read_tag<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	spec: &str,
 ) -> Result<TagInfo, RepoError> {
 	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
@@ -99,7 +99,7 @@ pub(crate) async fn read_tag<H: HashAlgorithm>(
 }
 
 pub(crate) async fn ls_tree<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	spec: &str,
 ) -> Result<Vec<TreeEntry>, RepoError> {
 	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
@@ -118,7 +118,7 @@ pub(crate) async fn ls_tree<H: HashAlgorithm>(
 }
 
 pub(crate) async fn read_commit<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	spec: &str,
 ) -> Result<CommitInfo, RepoError> {
 	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
@@ -150,7 +150,7 @@ pub(crate) async fn read_commit<H: HashAlgorithm>(
 }
 
 pub(crate) async fn write_blob<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	data: &[u8],
 ) -> Result<String, RepoError> {
 	let id = repo.write_blob(data).await.map_err(repo_error)?;
@@ -172,7 +172,7 @@ fn validate_tree_path(path: &str) -> Result<(), RepoError> {
 }
 
 pub(crate) async fn write_tree<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	entries: Vec<WitTreeBuildEntry>,
 ) -> Result<String, RepoError> {
 	// Validate the path *set* first: duplicates, or one path serving as both a
@@ -239,7 +239,7 @@ pub(crate) async fn write_tree<H: HashAlgorithm>(
 }
 
 pub(crate) async fn create_commit<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	tree: &str,
 	parents: &[String],
 	author: &str,

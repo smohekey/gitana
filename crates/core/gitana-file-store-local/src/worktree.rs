@@ -1,5 +1,8 @@
 //! A [`FileStore`] that understands git's *linked worktree* layout.
 
+use std::sync::Arc;
+
+#[cfg(not(target_arch = "wasm32"))]
 use cap_std::fs::Dir;
 use gitana_file_store::{ByteReader, DeleteOutcome, FileStore, Result, Version, WriteOutcome};
 
@@ -15,29 +18,55 @@ use crate::LocalFileStore;
 ///
 /// For an ordinary (non-linked) repository the two directories coincide, so the routing is a
 /// transparent no-op — every path resolves to the same place either way.
+///
+/// It is built over two already-open [`LocalFileStore`] capabilities, so it is target-agnostic:
+/// two cap-std `Dir`s natively (via `new`), or two `wasi:filesystem` descriptors on wasm (via
+/// `from_stores` / `single`).
 pub struct WorktreeFileStore {
-	common: LocalFileStore,
-	worktree: LocalFileStore,
+	common: Arc<LocalFileStore>,
+	worktree: Arc<LocalFileStore>,
 }
 
 impl WorktreeFileStore {
-	/// A store whose shared files live under the `common` capability and whose per-worktree files
-	/// live under the `worktree` capability. Pass a clone of the same `Dir` for both for an ordinary
-	/// single-directory repository.
-	pub fn new(common: Dir, worktree: Dir) -> Self {
+	/// A store whose shared files live under the `common` store and whose per-worktree files live
+	/// under the `worktree` store — git's linked-worktree split over two already-open capabilities
+	/// (each a directory descriptor on wasm, a cap-std `Dir` natively).
+	pub fn from_stores(common: LocalFileStore, worktree: LocalFileStore) -> Self {
 		Self {
-			common: LocalFileStore::from_dir(common),
-			worktree: LocalFileStore::from_dir(worktree),
+			common: Arc::new(common),
+			worktree: Arc::new(worktree),
 		}
+	}
+
+	/// A store over a single directory: an ordinary (non-linked) repository, where the per-worktree
+	/// and common files coincide. Both routes share the one store, so its temp-file counter and
+	/// per-path locks are shared — the two never contend over a `.tmp.<n>` name in the same directory.
+	pub fn single(store: LocalFileStore) -> Self {
+		let store = Arc::new(store);
+		Self {
+			common: Arc::clone(&store),
+			worktree: store,
+		}
+	}
+
+	/// A store over two cap-std directory capabilities (native). Pass a clone of the same `Dir` for
+	/// both for an ordinary single-directory repository — or prefer `single` with one store to share
+	/// its temp counter and locks.
+	#[cfg(not(target_arch = "wasm32"))]
+	pub fn new(common: Dir, worktree: Dir) -> Self {
+		Self::from_stores(
+			LocalFileStore::from_dir(common),
+			LocalFileStore::from_dir(worktree),
+		)
 	}
 
 	/// The underlying store that owns `path`: the per-worktree store for git's per-worktree files,
 	/// the common store otherwise.
 	fn store(&self, path: &str) -> &LocalFileStore {
 		if is_per_worktree(path) {
-			&self.worktree
+			&*self.worktree
 		} else {
-			&self.common
+			&*self.common
 		}
 	}
 }
@@ -141,7 +170,7 @@ impl FileStore for WorktreeFileStore {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use super::*;
 

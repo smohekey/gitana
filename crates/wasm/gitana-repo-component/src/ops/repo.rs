@@ -1,7 +1,7 @@
 //! Repository-level operations: init layout, config.
 
 use gitana_file_store::FileStore;
-use gitana_file_store_local::LocalFileStore;
+use gitana_file_store_local::{LocalFileStore, WorktreeFileStore};
 use gitana_object::HashAlgorithm;
 use gitana_repository::{Repository, RepositoryError};
 
@@ -36,7 +36,7 @@ pub(crate) async fn init_layout(store: &LocalFileStore) -> Result<(), RepoError>
 /// hood) and validate the resulting config matches the requested hash algorithm:
 /// re-initializing a repository of another format fails with `unsupported-format`.
 pub(crate) async fn init_repo<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 ) -> Result<(), RepoError> {
 	repo.init().await.map_err(repo_error)?;
 	repo.open().await.map_err(repo_error)?;
@@ -47,7 +47,7 @@ pub(crate) async fn init_repo<H: HashAlgorithm>(
 const GEOMETRIC_FACTOR: u64 = 2;
 
 pub(crate) async fn repack<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	geometric: bool,
 ) -> Result<Option<WitRepackReport>, RepoError> {
 	let max_pack_size = repo.pack_size_limit().await.map_err(repo_error)?;
@@ -70,7 +70,7 @@ pub(crate) async fn repack<H: HashAlgorithm>(
 }
 
 pub(crate) async fn read_config<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 ) -> Result<String, RepoError> {
 	let bytes = repo
 		.objects()

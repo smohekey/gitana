@@ -1,4 +1,4 @@
-package gitana:repo@0.2.0;
+package gitana:repo@0.3.0;
 
 /// Repository operations over a capability-granted git directory.
 ///
@@ -159,8 +159,20 @@ interface porcelain {
 		/// Open the repository whose git directory is `git-dir` — an owned
 		/// directory descriptor granted by the host. Reads `config` through the
 		/// descriptor to detect the object format (absent
-		/// `extensions.objectformat` means sha1, as in git).
+		/// `extensions.objectformat` means sha1, as in git). For an ordinary
+		/// repository `git-dir` is also the common directory; use
+		/// `open-worktree` for a linked worktree whose two directories differ.
 		open: static func(git-dir: descriptor) -> result<repository, repo-error>;
+
+		/// Open a *linked worktree* (created by `git worktree add`), whose files
+		/// are split across two directories: `git-dir` holds the per-worktree
+		/// state (`HEAD`, `index`, in-progress merge/rebase/cherry-pick), while
+		/// `common-dir` holds the shared objects, refs, `packed-refs`, and
+		/// `config`. Both are owned descriptors granted by the host; each path is
+		/// routed to the directory that owns it. The object format is detected
+		/// from `common-dir`'s `config`. Passing the same directory as both is
+		/// equivalent to `open`.
+		open-worktree: static func(git-dir: descriptor, common-dir: descriptor) -> result<repository, repo-error>;
 
 		/// Initialize a fresh repository in `git-dir` with the given object
 		/// format, then open it: git's empty directory skeleton, a `config`,

@@ -1,6 +1,6 @@
 //! Ref listing, resolution, HEAD state, and CAS updates.
 
-use gitana_file_store_local::LocalFileStore;
+use gitana_file_store_local::WorktreeFileStore;
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::{HeadState as EngineHeadState, Repository};
 
@@ -17,7 +17,7 @@ fn expected_id<H: HashAlgorithm>(hex: &str) -> Result<ObjectId<H>, RepoError> {
 }
 
 pub(crate) async fn list_refs<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	prefix: &str,
 ) -> Result<Vec<RefEntry>, RepoError> {
 	let refs = repo.refs().list(prefix).await.map_err(repo_error)?;
@@ -33,7 +33,7 @@ pub(crate) async fn list_refs<H: HashAlgorithm>(
 }
 
 pub(crate) async fn head<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 ) -> Result<HeadState, RepoError> {
 	match repo.refs().read_head().await.map_err(repo_error)? {
 		EngineHeadState::Symbolic(target) => {
@@ -52,7 +52,7 @@ pub(crate) async fn head<H: HashAlgorithm>(
 }
 
 pub(crate) async fn resolve_ref<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	name: &str,
 ) -> Result<Option<String>, RepoError> {
 	let id = repo.refs().resolve(name).await.map_err(repo_error)?;
@@ -60,7 +60,7 @@ pub(crate) async fn resolve_ref<H: HashAlgorithm>(
 }
 
 pub(crate) async fn update_ref<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	name: &str,
 	new: &str,
 	expected: Option<&str>,
@@ -75,7 +75,7 @@ pub(crate) async fn update_ref<H: HashAlgorithm>(
 }
 
 pub(crate) async fn delete_ref<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	name: &str,
 	expected: &str,
 ) -> Result<(), RepoError> {
@@ -88,14 +88,14 @@ pub(crate) async fn delete_ref<H: HashAlgorithm>(
 }
 
 pub(crate) async fn read_symbolic_ref<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	name: &str,
 ) -> Result<Option<String>, RepoError> {
 	repo.refs().read_symbolic(name).await.map_err(repo_error)
 }
 
 pub(crate) async fn set_symbolic_ref<H: HashAlgorithm>(
-	repo: &Repository<LocalFileStore, H>,
+	repo: &Repository<WorktreeFileStore, H>,
 	name: &str,
 	target: &str,
 ) -> Result<(), RepoError> {

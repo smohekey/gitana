@@ -26,6 +26,11 @@ impl GuestRepository for GitanaRepository {
 		Ok(Repository::new(GitanaRepository { inner }))
 	}
 
+	fn open_worktree(git_dir: Descriptor, common_dir: Descriptor) -> Result<Repository, RepoError> {
+		let inner = Inner::open_worktree(git_dir, common_dir)?;
+		Ok(Repository::new(GitanaRepository { inner }))
+	}
+
 	fn init(git_dir: Descriptor, kind: HashKind) -> Result<Repository, RepoError> {
 		let inner = Inner::init(git_dir, kind)?;
 		Ok(Repository::new(GitanaRepository { inner }))

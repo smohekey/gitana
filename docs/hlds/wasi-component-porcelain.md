@@ -222,8 +222,14 @@ Findings from this slice:
 ## Roadmap
 
 1. ~~**Full repo-level WIT surface**~~ — done, see the addendum above.
-2. **Two-descriptor `open`** (`git-dir` + `common-dir`) for linked worktrees — requires making
-   `WorktreeFileStore` buildable over any two `LocalFileStore`s rather than two cap-std `Dir`s.
+2. ~~**Two-descriptor `open`** (`git-dir` + `common-dir`) for linked worktrees~~ — done in
+   `gitana:repo@0.3.0`. `WorktreeFileStore` is now built over two `LocalFileStore`s (each an
+   `Arc`, so a single-directory repository shares one store — one temp counter, one lock set)
+   and is target-agnostic; only its cap-std `Dir` constructor stays native-only. The new
+   `open-worktree(git-dir, common-dir)` export routes per-worktree paths (`HEAD`, in-progress
+   state) to `git-dir` and shared paths (objects, refs, `packed-refs`, `config`) to `common-dir`;
+   `open`/`init` build the same store over a single descriptor (`WorktreeFileStore::single`). The
+   host e2e proves the split byte-for-byte in both hash formats (`tests/worktree.rs`).
 3. **Worktree capability threading** — the ~58 ambient `std::fs` sites in `gitana-worktree`;
    after that, `porcelain::commit`/`merge`/`status` become exportable. WASI symlink/exec-bit
    limits need validation there.
