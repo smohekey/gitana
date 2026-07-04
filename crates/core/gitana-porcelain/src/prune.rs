@@ -166,7 +166,7 @@ async fn collect_roots<F: FileStore, H: HashAlgorithm>(
 		roots.push(state.onto);
 		roots.extend(state.todo);
 	}
-	roots.extend(wt.load_index()?.entries.iter().map(|entry| entry.oid));
+	roots.extend(wt.load_index().await?.entries.iter().map(|entry| entry.oid));
 
 	Ok(roots)
 }

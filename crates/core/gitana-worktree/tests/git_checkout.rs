@@ -497,7 +497,7 @@ async fn checkout_refuses_a_traversal_index_entry() {
 	// A file just outside the work tree, and an index entry crafted to unlink it on checkout.
 	let victim = work.parent().unwrap().join("victim-checkout-traversal");
 	std::fs::write(&victim, b"do not delete\n").unwrap();
-	let mut index = wt.load_index().unwrap();
+	let mut index = wt.load_index().await.unwrap();
 	index.upsert(IndexEntry {
 		stat: Stat::default(),
 		mode: 0o100644,
@@ -506,7 +506,7 @@ async fn checkout_refuses_a_traversal_index_entry() {
 		assume_valid: false,
 		path: "../victim-checkout-traversal".to_owned(),
 	});
-	wt.save_index(&index).unwrap();
+	wt.save_index(&index).await.unwrap();
 
 	// `../victim…` is absent from the target tree, so checkout's removal loop would unlink it —
 	// but the path guard refuses, leaving the outside file untouched.
@@ -560,6 +560,54 @@ async fn checkout_aborts_before_mutating_on_a_held_index_lock() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// The counterpart to the abort-on-held-lock test: a *successful* index write through the
+/// FileStore-backed lock path (`lock_index` → `write_path_replace("index")` → release) must leave
+/// `index.lock` gone and no temp residue behind, and must let the lock be re-acquired. Runs without
+/// a git binary — it builds the repo natively — so it exercises the release half unconditionally.
+#[tokio::test]
+async fn a_successful_index_write_releases_the_lock() {
+	let work = unique_tmp("index-release");
+	let git_dir = work.join(".git");
+	std::fs::create_dir_all(&git_dir).unwrap();
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
+	repo.init().await.unwrap();
+	let wt = WorkTree::new(repo, &work, &git_dir);
+
+	std::fs::write(work.join("f.txt"), b"hi\n").unwrap();
+	wt.add(&["f.txt"], "").await.unwrap();
+
+	// The lock is released and the atomic-replace temp is cleaned up.
+	assert!(
+		!git_dir.join("index.lock").exists(),
+		"index.lock must be released after a successful write"
+	);
+	let residue: Vec<String> = std::fs::read_dir(&git_dir)
+		.unwrap()
+		.filter_map(|entry| entry.ok())
+		.map(|entry| entry.file_name().to_string_lossy().into_owned())
+		.filter(|name| name.starts_with(".tmp."))
+		.collect();
+	assert!(
+		residue.is_empty(),
+		"no temp residue in the git dir: {residue:?}"
+	);
+
+	// The write landed and the lock can be taken again (a second write succeeds).
+	assert!(
+		wt.load_index()
+			.await
+			.unwrap()
+			.entries
+			.iter()
+			.any(|entry| entry.path == "f.txt")
+	);
+	wt.add(&["f.txt"], "").await.unwrap();
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 /// A removal must not follow a symlinked ancestor out of the work tree: `link/x` is lexically safe
 /// but `link` may point outside, so the guard refuses it and the outside file survives.
 #[tokio::test]
@@ -590,7 +638,7 @@ async fn checkout_refuses_removal_through_a_symlinked_ancestor() {
 
 	// A crafted `link/victim` entry (absent from the target) would be unlinked through the symlink;
 	// the removal declines to follow the symlinked ancestor instead.
-	let mut index = wt.load_index().unwrap();
+	let mut index = wt.load_index().await.unwrap();
 	index.upsert(IndexEntry {
 		stat: Stat::default(),
 		mode: 0o100644,
@@ -599,7 +647,7 @@ async fn checkout_refuses_removal_through_a_symlinked_ancestor() {
 		assume_valid: false,
 		path: "link/victim".to_owned(),
 	});
-	wt.save_index(&index).unwrap();
+	wt.save_index(&index).await.unwrap();
 
 	// Checkout completes (dropping the crafted entry) without following the symlink, so the outside
 	// file survives.

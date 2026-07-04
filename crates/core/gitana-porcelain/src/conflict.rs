@@ -51,7 +51,7 @@ pub async fn write_conflicted_state<F: FileStore, H: HashAlgorithm>(
 	let base = tree_entry_map(repository, base_tree).await?;
 	let ours = tree_entry_map(repository, ours_tree).await?;
 	let theirs = tree_entry_map(repository, theirs_tree).await?;
-	let mut index = wt.load_index()?;
+	let mut index = wt.load_index().await?;
 	for path in conflicts {
 		index.record_conflict(
 			path,
@@ -60,7 +60,7 @@ pub async fn write_conflicted_state<F: FileStore, H: HashAlgorithm>(
 			theirs.get(path).copied(),
 		);
 	}
-	wt.save_index(&index)?;
+	wt.save_index(&index).await?;
 	Ok(())
 }
 
@@ -70,7 +70,7 @@ pub async fn write_conflicted_state<F: FileStore, H: HashAlgorithm>(
 pub async fn resolved_tree<F: FileStore, H: HashAlgorithm>(
 	wt: &WorkTree<F, H>,
 ) -> Result<ObjectId<H>> {
-	let index = wt.load_index()?;
+	let index = wt.load_index().await?;
 	if index.has_conflicts() {
 		bail!(
 			"committing is not possible because you have unmerged files; resolve them and mark resolution with `gta add`/`gta rm`"
@@ -85,7 +85,7 @@ pub async fn resolved_tree<F: FileStore, H: HashAlgorithm>(
 pub async fn index_tree<F: FileStore, H: HashAlgorithm>(
 	wt: &WorkTree<F, H>,
 ) -> Result<ObjectId<H>> {
-	let entries = wt.load_index()?.tree_entries();
+	let entries = wt.load_index().await?.tree_entries();
 	Ok(wt.repository().write_tree(&entries).await?)
 }
 

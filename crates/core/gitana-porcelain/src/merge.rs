@@ -53,7 +53,7 @@ pub async fn merge<F: FileStore, H: HashAlgorithm>(
 	if let Some(op) = conflict::operation_in_progress(repository).await? {
 		bail!("a {op} is already in progress; conclude it (`--continue`) or abort it (`--abort`)");
 	}
-	if wt.load_index()?.has_conflicts() {
+	if wt.load_index().await?.has_conflicts() {
 		bail!("merging is not possible because you have unmerged files");
 	}
 
@@ -405,6 +405,6 @@ mod tests {
 		assert_eq!(paths, vec!["f.txt".to_owned()]);
 		// The in-progress merge is recorded for the user to resolve.
 		assert_eq!(wt.repository().merge_head().await.unwrap(), Some(theirs));
-		assert!(wt.load_index().unwrap().has_conflicts());
+		assert!(wt.load_index().await.unwrap().has_conflicts());
 	}
 }

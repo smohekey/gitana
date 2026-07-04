@@ -59,7 +59,7 @@ impl Status {
 pub(crate) async fn compute<F: FileStore, H: HashAlgorithm>(
 	wt: &WorkTree<F, H>,
 ) -> Result<Status, WorktreeError> {
-	let index = wt.load_index()?;
+	let index = wt.load_index().await?;
 	let index_map: HashMap<String, (String, ObjectId<H>)> = index
 		.entries
 		.iter()

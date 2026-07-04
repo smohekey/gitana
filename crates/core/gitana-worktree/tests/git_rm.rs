@@ -41,7 +41,7 @@ async fn rm_rejects_unsafe_index_path() {
 	let _ = std::fs::remove_file(&outside);
 	std::fs::write(&outside, b"VICTIM\n").unwrap();
 
-	let mut index = wt.load_index().unwrap();
+	let mut index = wt.load_index().await.unwrap();
 	let blob = wt.repository().write_blob(b"PWN\n").await.unwrap();
 	index.upsert(IndexEntry {
 		stat: Stat::default(),
@@ -51,7 +51,7 @@ async fn rm_rejects_unsafe_index_path() {
 		assume_valid: false,
 		path: format!("../{name}"),
 	});
-	wt.save_index(&index).unwrap();
+	wt.save_index(&index).await.unwrap();
 
 	// `rm -r .` selects every tracked path; the escaping one must be rejected before any
 	// working-tree file is deleted.

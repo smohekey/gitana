@@ -18,7 +18,7 @@ pub async fn commit<F: FileStore, H: HashAlgorithm>(
 	message: &str,
 	identity: &impl Identity,
 ) -> Result<ObjectId<H>> {
-	let index = wt.load_index()?;
+	let index = wt.load_index().await?;
 	// An unmerged index would silently drop conflicted paths (they have no stage-0 entry) from the
 	// tree, so refuse — as git does — until they are resolved.
 	if index.has_conflicts() {
@@ -61,7 +61,7 @@ mod tests {
 		let blob = wt.repository().write_blob(b"hello\n").await.unwrap();
 		let mut index = Index::new();
 		stage(&mut index, "f.txt", blob);
-		wt.save_index(&index).unwrap();
+		wt.save_index(&index).await.unwrap();
 
 		let id = commit(&wt, "first", &TestIdentity::default())
 			.await
@@ -103,7 +103,7 @@ mod tests {
 		let blob = wt.repository().write_blob(b"x\n").await.unwrap();
 		let mut index = Index::<Sha256>::new();
 		index.record_conflict("f.txt", Some((0o100644, blob)), None, None); // a stage-1 entry
-		wt.save_index(&index).unwrap();
+		wt.save_index(&index).await.unwrap();
 
 		let err = commit(&wt, "x", &TestIdentity::default())
 			.await

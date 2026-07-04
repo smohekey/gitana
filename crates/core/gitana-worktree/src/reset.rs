@@ -34,5 +34,5 @@ where
 			path,
 		});
 	}
-	wt.save_index(&index)
+	wt.save_index(&index).await
 }

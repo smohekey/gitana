@@ -34,7 +34,7 @@ where
 	F: FileStore,
 	H: HashAlgorithm,
 {
-	let mut index = wt.load_index()?;
+	let mut index = wt.load_index().await?;
 
 	// The `(path, mode, oid)` content a selected path is restored from: the source tree, or the
 	// current index when there is no tree source.
@@ -92,7 +92,7 @@ where
 	// Take the index lock before mutating the working tree, so a held lock aborts before any change
 	// (as `rm`/`checkout` do) rather than after `save_index`. On a mid-apply failure the lock is
 	// released (not orphaned) and the index is left unwritten.
-	let lock = wt.lock_index()?;
+	let lock = wt.lock_index().await?;
 	let result: Result<(), WorktreeError> = async {
 		for &path in &selected {
 			match source_entries.iter().find(|(p, _, _)| p == path) {
@@ -140,9 +140,9 @@ where
 	}
 	.await;
 	match result {
-		Ok(()) => wt.commit_index(lock, &index),
+		Ok(()) => wt.commit_index(lock, &index).await,
 		Err(error) => {
-			wt.release_index_lock(lock);
+			wt.release_index_lock(lock).await;
 			Err(error)
 		}
 	}

@@ -13,6 +13,9 @@ pub enum WorktreeError {
 	/// A filesystem error.
 	#[error("io error: {0}")]
 	Io(#[from] std::io::Error),
+	/// A file-store error, e.g. reading or writing the index through the repository's store.
+	#[error("file store error: {0}")]
+	FileStore(#[from] gitana_file_store::FileStoreError),
 	/// A repository (object/ref) error.
 	#[error("repository error: {0}")]
 	Repository(#[from] gitana_repository::RepositoryError),

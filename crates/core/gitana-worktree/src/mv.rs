@@ -30,7 +30,7 @@ where
 	F: FileStore,
 	H: HashAlgorithm,
 {
-	let mut index = wt.load_index()?;
+	let mut index = wt.load_index().await?;
 	let tracked: Vec<String> = index
 		.entries
 		.iter()
@@ -111,7 +111,7 @@ where
 	}
 
 	// Lock the index before the first rename, so a held lock aborts before any file moves.
-	let lock = wt.lock_index()?;
+	let lock = wt.lock_index().await?;
 	for (src_norm, dst) in &moves {
 		let step = std::fs::rename(wt.work_dir().join(src_norm), wt.work_dir().join(dst))
 			.map_err(WorktreeError::from)
@@ -119,11 +119,11 @@ where
 		// On a mid-move failure, release the lock so it is not left stale; the moves already
 		// applied stay (git's `mv` is likewise not atomic across a rename failure).
 		if let Err(error) = step {
-			wt.release_index_lock(lock);
+			wt.release_index_lock(lock).await;
 			return Err(error);
 		}
 	}
-	wt.commit_index(lock, &index)?;
+	wt.commit_index(lock, &index).await?;
 	Ok(moves)
 }
 

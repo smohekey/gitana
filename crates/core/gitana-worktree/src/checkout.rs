@@ -30,7 +30,7 @@ where
 		.map(|(path, mode, oid)| (path.as_str(), (mode.as_str(), *oid)))
 		.collect();
 
-	let mut index = wt.load_index()?;
+	let mut index = wt.load_index().await?;
 	let current: HashMap<String, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
@@ -79,7 +79,7 @@ where
 	// filesystem change — rather than after, which would leave the tree inconsistent with the index.
 	// On a mid-materialise failure the lock is released (not orphaned) and the index is left unwritten,
 	// matching the pre-lock behaviour of not saving a partially-applied index.
-	let lock = wt.lock_index()?;
+	let lock = wt.lock_index().await?;
 	let result: Result<(), WorktreeError> = async {
 		// The paths the removal loop will prune: index entries (any stage) absent from the target.
 		// Spanning all stages lets a force checkout (e.g. `merge --abort`) discard leftover conflict
@@ -123,9 +123,9 @@ where
 	}
 	.await;
 	match result {
-		Ok(()) => wt.commit_index(lock, &index),
+		Ok(()) => wt.commit_index(lock, &index).await,
 		Err(error) => {
-			wt.release_index_lock(lock);
+			wt.release_index_lock(lock).await;
 			Err(error)
 		}
 	}
@@ -160,7 +160,7 @@ where
 		.collect();
 	changed.sort_unstable();
 
-	let mut index = wt.load_index()?;
+	let mut index = wt.load_index().await?;
 	let staged: HashMap<String, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
@@ -190,7 +190,7 @@ where
 			}
 		}
 	}
-	wt.save_index(&index)?;
+	wt.save_index(&index).await?;
 	Ok(Vec::new())
 }
 

@@ -20,7 +20,7 @@ impl WorkTreeCommand for LsFiles {
 		worktree: WorkTree<Backend, H>,
 		_prefix: String,
 	) -> Result<()> {
-		let index = worktree.load_index()?;
+		let index = worktree.load_index().await?;
 		for entry in index.entries.iter().filter(|e| e.stage == 0) {
 			println!("{}", entry.path);
 		}

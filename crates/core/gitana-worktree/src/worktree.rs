@@ -1,7 +1,6 @@
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use gitana_file_store::FileStore;
+use gitana_file_store::{FileStore, FileStoreError, WriteOutcome};
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::Repository;
 
@@ -11,15 +10,22 @@ use crate::{Index, IndexEntry, Status, WorktreeError};
 
 /// A working directory paired with its repository.
 ///
-/// Filesystem-coupled by nature: working-tree files and the index are real files,
-/// so it reads/writes them with `std::fs`, while blob objects go through the
-/// repository's object store. The index is written with git's `index.lock`
-/// create-new-then-rename protocol. `add`/`status`/`checkout` build on this.
+/// Filesystem-coupled by nature: working-tree files are real files, so it reads/writes them
+/// with `std::fs`, while blob objects and the index both go through the repository's file store
+/// (so the index lives under the same capability as the rest of the git directory). The index is
+/// written with git's lock-then-replace protocol, re-expressed on the store's compare-and-set
+/// primitives. `add`/`status`/`checkout` build on this.
 pub struct WorkTree<F, H: HashAlgorithm> {
 	repo: Repository<F, H>,
 	work_dir: PathBuf,
 	git_dir: PathBuf,
 }
+
+/// Proof that the index lock (`index.lock`) is held: minted only by [`WorkTree::lock_index`] and
+/// consumed by [`WorkTree::commit_index`] / [`WorkTree::release_index_lock`], so the index cannot be
+/// written without first taking the lock. Dropping it without releasing leaves the lock in place (a
+/// stale `index.lock`), exactly as dropping the open lock file did before.
+pub(crate) struct IndexLock(());
 
 impl<F: FileStore, H: HashAlgorithm> WorkTree<F, H> {
 	/// Build a working tree over `repo`, with the working directory at `work_dir`
@@ -53,13 +59,13 @@ impl<F: FileStore, H: HashAlgorithm> WorkTree<F, H> {
 	/// [`Repository::rev_parse`]. The path is repository-root-relative.
 	pub async fn rev_parse(&self, spec: &str) -> Result<ObjectId<H>, WorktreeError> {
 		match spec.strip_prefix(':') {
-			Some(rest) => self.resolve_index_spec(rest),
+			Some(rest) => self.resolve_index_spec(rest).await,
 			None => Ok(self.repository().rev_parse(spec).await?),
 		}
 	}
 
 	/// Resolve the part of an index spec after the leading `:` to the staged blob's id.
-	fn resolve_index_spec(&self, rest: &str) -> Result<ObjectId<H>, WorktreeError> {
+	async fn resolve_index_spec(&self, rest: &str) -> Result<ObjectId<H>, WorktreeError> {
 		// `:/text` (commit-message search) is not an index lookup.
 		if rest.starts_with('/') {
 			return Err(WorktreeError::InvalidIndexSpec(rest.to_owned()));
@@ -77,7 +83,8 @@ impl<F: FileStore, H: HashAlgorithm> WorkTree<F, H> {
 			_ => (0, rest),
 		};
 		self
-			.load_index()?
+			.load_index()
+			.await?
 			.entries
 			.iter()
 			.find(|entry| entry.path == path && entry.stage == stage)
@@ -96,62 +103,65 @@ impl<F: FileStore, H: HashAlgorithm> WorkTree<F, H> {
 		&self.work_dir
 	}
 
-	/// Read and parse `.git/index`, or an empty index if it does not exist.
-	pub fn load_index(&self) -> Result<Index<H>, WorktreeError> {
-		match std::fs::read(self.git_dir.join("index")) {
+	/// The repository's file store — the capability the index (and `index.lock`) live under, the
+	/// same one the object database and refs use. `index`/`index.lock` are per-worktree paths, so a
+	/// linked worktree's store routes them to its own git directory.
+	fn files(&self) -> &F {
+		self.repo.objects().file_store()
+	}
+
+	/// Read and parse the index (`index`), or an empty index if it does not exist.
+	pub async fn load_index(&self) -> Result<Index<H>, WorktreeError> {
+		match self.files().read_path("index").await {
 			Ok(bytes) => Ok(Index::parse(&bytes)?),
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Index::new()),
+			Err(FileStoreError::NotFound) => Ok(Index::new()),
 			Err(error) => Err(error.into()),
 		}
 	}
 
-	/// Write the index via `index.lock` create-new + rename (git's protocol).
-	pub fn save_index(&self, index: &Index<H>) -> Result<(), WorktreeError> {
-		self.commit_index(self.lock_index()?, index)
+	/// Write the index under the lock (acquire, write, release).
+	pub async fn save_index(&self, index: &Index<H>) -> Result<(), WorktreeError> {
+		let lock = self.lock_index().await?;
+		self.commit_index(lock, index).await
 	}
 
-	/// Acquire the index lock (`.git/index.lock`), returning the open lock file. Fails with
-	/// [`WorktreeError::IndexLocked`] if another process already holds it. Pair with
-	/// [`Self::commit_index`] to write through the lock (or drop the handle to release it without
-	/// writing). Taking the lock up front lets a destructive operation fail before it mutates the
-	/// working tree, rather than after.
-	pub(crate) fn lock_index(&self) -> Result<std::fs::File, WorktreeError> {
-		match std::fs::OpenOptions::new()
-			.write(true)
-			.create_new(true)
-			.open(self.git_dir.join("index.lock"))
-		{
-			Ok(file) => Ok(file),
-			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-				Err(WorktreeError::IndexLocked)
-			}
-			Err(error) => Err(error.into()),
+	/// Acquire the index lock (`index.lock`), returning a guard proving it is held. Fails with
+	/// [`WorktreeError::IndexLocked`] if another writer already holds it. Pair with
+	/// [`Self::commit_index`] to write the index and release, or [`Self::release_index_lock`] to
+	/// release without writing. Taking the lock up front lets a destructive operation fail before it
+	/// mutates the working tree, rather than after.
+	pub(crate) async fn lock_index(&self) -> Result<IndexLock, WorktreeError> {
+		match self.files().write_path_if_absent("index.lock", &[]).await? {
+			WriteOutcome::Written => Ok(IndexLock(())),
+			WriteOutcome::AlreadyExists => Err(WorktreeError::IndexLocked),
 		}
 	}
 
-	/// Write `index` through a held `lock` (from [`Self::lock_index`]) and atomically replace the
-	/// index file via rename.
-	pub(crate) fn commit_index(
+	/// Write `index` while holding `lock`, then release the lock. The index is replaced atomically
+	/// (`write_path_replace` writes to a temporary and renames), so a reader never sees a torn
+	/// index. `write_path_replace` deliberately takes no lock file of its own — the git-level
+	/// `index.lock` we already hold is the exclusion — so it does not contend for that same name the
+	/// way a compare-and-set write would. The lock is released even if the write fails, so a failure
+	/// does not strand `index.lock`.
+	pub(crate) async fn commit_index(
 		&self,
-		mut lock: std::fs::File,
+		lock: IndexLock,
 		index: &Index<H>,
 	) -> Result<(), WorktreeError> {
-		let lock_path = self.git_dir.join("index.lock");
-		if let Err(error) = lock.write_all(&index.write_v4()) {
-			let _ = std::fs::remove_file(&lock_path);
-			return Err(error.into());
-		}
-		drop(lock);
-		std::fs::rename(&lock_path, self.git_dir.join("index"))?;
-		Ok(())
+		let outcome = self
+			.files()
+			.write_path_replace("index", &index.write_v4())
+			.await;
+		self.release_index_lock(lock).await;
+		Ok(outcome?)
 	}
 
-	/// Release a held index lock (from [`Self::lock_index`]) without writing, removing
-	/// `.git/index.lock`. Use when an operation fails after locking but before
-	/// [`Self::commit_index`], so it does not leave a stale lock behind.
-	pub(crate) fn release_index_lock(&self, lock: std::fs::File) {
+	/// Release a held index lock (from [`Self::lock_index`]) without writing, removing `index.lock`.
+	/// Use when an operation fails after locking but before [`Self::commit_index`], so it does not
+	/// leave a stale lock behind.
+	pub(crate) async fn release_index_lock(&self, lock: IndexLock) {
+		let _ = self.files().delete_path("index.lock", None).await;
 		drop(lock);
-		let _ = std::fs::remove_file(self.git_dir.join("index.lock"));
 	}
 
 	/// Stage `pathspecs`, interpreted relative to `prefix` (a `/`-joined work-tree-relative
@@ -159,7 +169,7 @@ impl<F: FileStore, H: HashAlgorithm> WorkTree<F, H> {
 	/// walked, applying `.gitignore`, and its non-ignored files are staged; a path that no
 	/// longer exists is removed from the index (a staged deletion).
 	pub async fn add(&self, pathspecs: &[&str], prefix: &str) -> Result<(), WorktreeError> {
-		let mut index = self.load_index()?;
+		let mut index = self.load_index().await?;
 		let mut ignore_stack: Vec<DirIgnore> = Vec::new();
 		for &spec in pathspecs {
 			let (rel, dir_only) = crate::pathspec::normalize(spec, prefix)?;
@@ -186,7 +196,7 @@ impl<F: FileStore, H: HashAlgorithm> WorkTree<F, H> {
 				Err(error) => return Err(error.into()),
 			}
 		}
-		self.save_index(&index)
+		self.save_index(&index).await
 	}
 
 	async fn stage_file(&self, index: &mut Index<H>, path: &str) -> Result<(), WorktreeError> {

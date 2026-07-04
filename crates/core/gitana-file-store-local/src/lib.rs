@@ -192,6 +192,21 @@ impl FileStore for LocalFileStore {
 		.await
 	}
 
+	async fn write_path_replace(&self, path: &str, bytes: &[u8]) -> Result<()> {
+		let path = self.resolve(path)?.to_owned();
+		let bytes = bytes.to_vec();
+
+		// Serialise in-process writers to this path, but take no `<path>.lock` file — the caller
+		// owns cross-writer exclusion (the working tree holds `index.lock` across the whole
+		// operation), and taking `<path>.lock` here would collide with the caller's own lock.
+		#[cfg(not(target_arch = "wasm32"))]
+		let _task_guard = self.lock_for(&path).lock_owned().await;
+
+		let fs = Arc::clone(&self.backend);
+		let counter = Arc::clone(&self.temp_counter);
+		blocking(move || write_atomic(&*fs, &counter, &path, &bytes)).await
+	}
+
 	async fn delete_path(&self, path: &str, expected: Option<&Version>) -> Result<DeleteOutcome> {
 		let path = self.resolve(path)?.to_owned();
 		let expected = expected.cloned();

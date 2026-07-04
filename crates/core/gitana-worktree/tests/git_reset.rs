@@ -73,7 +73,7 @@ async fn reset_index_rejects_unsafe_tree_path() {
 	git(&["-C", w, "add", "."]);
 	commit(w, "one");
 	let wt = make_repo(&work);
-	let before = wt.load_index().unwrap();
+	let before = wt.load_index().await.unwrap();
 
 	// A crafted tree whose flattened entry escapes the work tree must not enter the index.
 	let blob = wt.repository().write_blob(b"PWN\n").await.unwrap();
@@ -91,7 +91,11 @@ async fn reset_index_rejects_unsafe_tree_path() {
 		wt.reset_index(hostile).await,
 		Err(WorktreeError::UnsafePath(_))
 	));
-	assert_eq!(wt.load_index().unwrap(), before, "the index is untouched");
+	assert_eq!(
+		wt.load_index().await.unwrap(),
+		before,
+		"the index is untouched"
+	);
 
 	std::fs::remove_dir_all(&work).ok();
 }

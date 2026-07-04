@@ -34,7 +34,7 @@ pub async fn cherry_pick<F: FileStore, H: HashAlgorithm>(
 	if let Some(op) = conflict::operation_in_progress(repository).await? {
 		bail!("a {op} is already in progress; conclude it (`--continue`) or abort it (`--abort`)");
 	}
-	if wt.load_index()?.has_conflicts() {
+	if wt.load_index().await?.has_conflicts() {
 		bail!("cherry-pick is not possible because you have unmerged files");
 	}
 
@@ -243,7 +243,7 @@ mod tests {
 			wt.repository().cherry_pick_head().await.unwrap(),
 			Some(pick)
 		);
-		assert!(wt.load_index().unwrap().has_conflicts());
+		assert!(wt.load_index().await.unwrap().has_conflicts());
 	}
 
 	#[tokio::test]

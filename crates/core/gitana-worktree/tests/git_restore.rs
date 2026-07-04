@@ -504,13 +504,13 @@ async fn staged_restore_rejects_unsafe_tree_path() {
 		.await
 		.unwrap();
 
-	let before = wt.load_index().unwrap();
+	let before = wt.load_index().await.unwrap();
 	assert!(matches!(
 		wt.restore(Some(hostile), false, true, &["."], "").await,
 		Err(WorktreeError::UnsafePath(_))
 	));
 	// The index is untouched, and nothing was written outside the work tree.
-	assert_eq!(wt.load_index().unwrap(), before);
+	assert_eq!(wt.load_index().await.unwrap(), before);
 	assert!(!escape_outside.exists());
 
 	std::fs::remove_dir_all(&work).ok();
@@ -559,7 +559,7 @@ async fn restore_rejects_unsafe_index_path() {
 
 	// Inject a hostile entry directly into the index, as a corrupt or hostile index might carry.
 	let (escape_spec, escape_outside) = escape_path(&work);
-	let mut index = wt.load_index().unwrap();
+	let mut index = wt.load_index().await.unwrap();
 	let blob = wt.repository().write_blob(b"PWN\n").await.unwrap();
 	index.upsert(IndexEntry {
 		stat: Stat::default(),
@@ -569,7 +569,7 @@ async fn restore_rejects_unsafe_index_path() {
 		assume_valid: false,
 		path: escape_spec,
 	});
-	wt.save_index(&index).unwrap();
+	wt.save_index(&index).await.unwrap();
 
 	// Selecting it via `.` must be refused before the working-tree file is written.
 	assert!(matches!(

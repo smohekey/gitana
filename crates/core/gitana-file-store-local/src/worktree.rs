@@ -73,7 +73,7 @@ impl WorktreeFileStore {
 
 /// Whether a git-relative `path` is private to one worktree (lives in the worktree's own git dir)
 /// rather than in the shared common dir. Follows git's worktree layout for the paths gitana touches:
-/// `HEAD`/`index`, the in-progress operation state (`MERGE_HEAD`/`MERGE_MSG`, `CHERRY_PICK_HEAD`,
+/// `HEAD`/`index` (and its `index.lock`), the in-progress operation state (`MERGE_HEAD`/`MERGE_MSG`, `CHERRY_PICK_HEAD`,
 /// `REVERT_HEAD`, and gitana's `REBASE_*` files), and the per-worktree ref namespaces. gitana's other
 /// refs (`refs/heads`, `refs/tags`, `refs/remotes`) are shared.
 ///
@@ -92,6 +92,7 @@ fn is_per_worktree(path: &str) -> bool {
 			| "REVERT_HEAD"
 			| "COMMIT_EDITMSG"
 			| "index"
+			| "index.lock"
 	) || path == "logs/HEAD"
 		|| path.starts_with("REBASE_")
 		|| path.starts_with("refs/worktree/")
@@ -123,6 +124,10 @@ impl FileStore for WorktreeFileStore {
 		expected: Option<&Version>,
 	) -> impl Future<Output = Result<Version>> {
 		self.store(path).write_path_cas(path, bytes, expected)
+	}
+
+	fn write_path_replace(&self, path: &str, bytes: &[u8]) -> impl Future<Output = Result<()>> {
+		self.store(path).write_path_replace(path, bytes)
 	}
 
 	fn delete_path(

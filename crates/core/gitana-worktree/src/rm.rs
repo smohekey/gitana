@@ -46,7 +46,7 @@ where
 	F: FileStore,
 	H: HashAlgorithm,
 {
-	let mut index = wt.load_index()?;
+	let mut index = wt.load_index().await?;
 	// Tracked = stage-0 entries plus unmerged paths (which have only stage 1/2/3 entries); removing
 	// an unmerged path is a valid way to resolve its conflict.
 	let mut tracked: Vec<String> = index
@@ -145,7 +145,7 @@ where
 	// Take the index lock before any destructive work, so a held lock fails the command before a
 	// file is deleted — and the index write at the end cannot fail for being locked, which would
 	// otherwise leave files removed from the working tree but still tracked.
-	let lock = wt.lock_index()?;
+	let lock = wt.lock_index().await?;
 
 	// Per-path, as git does: drop the index entry only for a path whose working-tree file was
 	// removed (or `cached`). A path whose file cannot be unlinked — a directory now occupies it,
@@ -161,6 +161,6 @@ where
 		index.remove(path);
 		removed.push(path.clone());
 	}
-	wt.commit_index(lock, &index)?;
+	wt.commit_index(lock, &index).await?;
 	Ok(RmOutcome { removed, failure })
 }

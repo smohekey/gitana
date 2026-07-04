@@ -85,6 +85,18 @@ impl FileStore for MemoryFileStore {
 		Ok(version)
 	}
 
+	async fn write_path_replace(&self, path: &str, bytes: &[u8]) -> Result<()> {
+		// The in-memory map is already an atomic overwrite under the write lock, so this is a
+		// plain unconditional insert — no version check, no lock file.
+		let version = self.mint_version();
+		self
+			.files
+			.write()
+			.expect("file store lock poisoned")
+			.insert(path.to_owned(), (bytes.to_vec(), version));
+		Ok(())
+	}
+
 	async fn delete_path(&self, path: &str, expected: Option<&Version>) -> Result<DeleteOutcome> {
 		let mut files = self.files.write().expect("file store lock poisoned");
 		let key = path.to_owned();

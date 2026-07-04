@@ -32,7 +32,7 @@ pub enum FileStoreError {
 /// Convenience result alias for file-store operations.
 pub type Result<T> = std::result::Result<T, FileStoreError>;
 
-/// Split a [`GitFileStore::list_prefix`] argument into a directory (including its
+/// Split a [`FileStore::list_prefix`] argument into a directory (including its
 /// trailing `/`, or empty) and a trailing name fragment. Defines the listing
 /// semantics shared by every backend.
 pub fn split_prefix(prefix: &str) -> (&str, &str) {
@@ -87,6 +87,16 @@ pub trait FileStore {
 		bytes: &[u8],
 		expected: Option<&Version>,
 	) -> impl Future<Output = Result<Version>>;
+
+	/// Atomically replace the value at `path` with `bytes` (creating it if absent), via a
+	/// write-to-temp-then-rename so a reader never sees a partial value.
+	///
+	/// Unlike [`Self::write_path_cas`], there is no version check and no internal `<path>.lock`
+	/// file: serialising writers is the caller's responsibility (e.g. holding an external lock).
+	/// This lets a caller that itself holds a lock named `<path>.lock` — as the working tree does
+	/// for the index — replace `path` without deadlocking against the store's own compare-and-set
+	/// lock, which would otherwise contend for that same name.
+	fn write_path_replace(&self, path: &str, bytes: &[u8]) -> impl Future<Output = Result<()>>;
 
 	/// Delete the value at `path`. `expected == Some(v)` requires a version match.
 	fn delete_path(

@@ -32,7 +32,7 @@ pub struct FileDiff {
 pub(crate) async fn unstaged<F: FileStore, H: HashAlgorithm>(
 	wt: &WorkTree<F, H>,
 ) -> Result<Vec<FileDiff>, WorktreeError> {
-	let index = wt.load_index()?;
+	let index = wt.load_index().await?;
 	let mut out = Vec::new();
 	for entry in index.entries.iter().filter(|e| e.stage == 0) {
 		let full = wt.work_dir().join(&entry.path);
@@ -77,7 +77,8 @@ pub(crate) async fn staged<F: FileStore, H: HashAlgorithm>(
 	wt: &WorkTree<F, H>,
 ) -> Result<Vec<FileDiff>, WorktreeError> {
 	let index: BTreeMap<String, (u32, ObjectId<H>)> = wt
-		.load_index()?
+		.load_index()
+		.await?
 		.entries
 		.iter()
 		.filter(|e| e.stage == 0)

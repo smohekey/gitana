@@ -34,7 +34,7 @@ pub async fn revert<F: FileStore, H: HashAlgorithm>(
 	if let Some(op) = conflict::operation_in_progress(repository).await? {
 		bail!("a {op} is already in progress; conclude it (`--continue`) or abort it (`--abort`)");
 	}
-	if wt.load_index()?.has_conflicts() {
+	if wt.load_index().await?.has_conflicts() {
 		bail!("revert is not possible because you have unmerged files");
 	}
 
@@ -216,7 +216,7 @@ mod tests {
 		};
 		assert_eq!(paths, vec!["f.txt".to_owned()]);
 		assert_eq!(wt.repository().revert_head().await.unwrap(), Some(b));
-		assert!(wt.load_index().unwrap().has_conflicts());
+		assert!(wt.load_index().await.unwrap().has_conflicts());
 	}
 
 	#[tokio::test]

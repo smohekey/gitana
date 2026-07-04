@@ -37,7 +37,7 @@ async fn mv_rejects_unsafe_index_source() {
 
 	// Inject a hostile entry naming a path inside `.git`, as a corrupt index might carry. Without
 	// source validation, `mv` would treat it as a tracked file and rename the real `.git/config`.
-	let mut index = wt.load_index().unwrap();
+	let mut index = wt.load_index().await.unwrap();
 	let blob = wt.repository().write_blob(b"PWN\n").await.unwrap();
 	index.upsert(IndexEntry {
 		stat: Stat::default(),
@@ -47,7 +47,7 @@ async fn mv_rejects_unsafe_index_source() {
 		assume_valid: false,
 		path: ".git/config".to_owned(),
 	});
-	wt.save_index(&index).unwrap();
+	wt.save_index(&index).await.unwrap();
 	let config_before = std::fs::read(work.join(".git/config")).unwrap();
 
 	assert!(matches!(
