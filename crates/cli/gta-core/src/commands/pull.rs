@@ -44,22 +44,25 @@ async fn pull_into<H: HashAlgorithm>(
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
 	let worktree = WorkTree::new(repository, work, found.git_dir.clone());
 
-	gitana_porcelain::fetch(worktree.repository(), origin, body).await?;
+	// `update_head_ok`: a fetch refspec may map straight into the checked-out branch (a mirror config
+	// like `+refs/heads/*:refs/heads/*`); the merge below advances that branch and the work tree.
+	let outcome = gitana_porcelain::fetch(worktree.repository(), origin, body, true).await?;
 	println!("Fetched from {}", origin.url);
+	// A rejected (non-fast-forward) tracking update is a failed fetch; do not merge a stale upstream.
+	if !outcome.rejected.is_empty() {
+		bail!("some remote-tracking refs were not updated (non-fast-forward)");
+	}
 
-	// The upstream tip: the current branch's `refs/remotes/origin/<branch>`, just updated by the fetch.
+	// The upstream tip is the current branch's remote branch, read straight from the advertisement —
+	// the merge source, whatever tracking ref (if any) the fetch refspecs routed it to.
 	let branch = match worktree.repository().refs().read_head().await? {
 		HeadState::Symbolic(branch) => branch,
 		HeadState::Detached(_) => bail!("cannot pull onto a detached HEAD"),
 	};
 	let short = branch.strip_prefix("refs/heads/").unwrap_or(&branch);
-	let tracking = format!("refs/remotes/origin/{short}");
-	let upstream = worktree
-		.repository()
-		.refs()
-		.resolve(&tracking)
+	let upstream = gitana_porcelain::pull_upstream(worktree.repository(), body, &branch)
 		.await?
-		.with_context(|| format!("origin has no {short}"))?;
+		.with_context(|| format!("origin has no {short} to merge (or a refspec excludes it)"))?;
 	let message = format!("Merge branch '{short}' of {}", origin.url);
 
 	let identity = CliIdentity::new(worktree.repository());

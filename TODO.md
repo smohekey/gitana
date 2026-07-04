@@ -78,7 +78,22 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   the section and the remote's `refs/remotes/<name>/*` tracking refs; `rename` moves both (tracking
   refs, reflogs, symbolic-ref targets) and repoints the fetch refspec and branch/push-default config.
   Oracle-tested against stock git (git reads what gta writes; `git remote -v`/`rename` match).
-- [ ] Add refspec parsing beyond the default `origin` fetch mapping.
+- [x] Add refspec parsing beyond the default `origin` fetch mapping. A `Refspec` type in
+  `gitana-remote` parses `[+]<src>[:<dst>]` (force `+`, a single `*` wildcard substituted src→dst,
+  exact and empty-destination forms) plus negative `^<pattern>` exclusions; `gta fetch` reads all
+  `remote.origin.fetch` refspecs and maps each advertised ref through them (first positive match wins,
+  negatives excluded), enforcing fast-forward for non-forced refspecs and erroring on an exact source
+  the remote does not advertise. `pull` honours a mirror refspec that maps into the checked-out branch
+  (update-head-ok) and fast-forwards the work tree via merge. Oracle-tested (custom tracking namespace,
+  non-fast-forward rejection, all-matching fan-out, conflicting-destination abort, checked-out-branch
+  refusal, bare mirror, pull under a mirror refspec). Deliberate divergence: a non-fast-forward into
+  the checked-out branch is refused (safe-error) rather than git's destructive force-reset. Still
+  `origin`-only (no `gta fetch <remote>` arg yet) and the object download is a safe superset of the
+  matched refs.
+- [ ] Refuse a fetch refspec that updates a branch checked out in a *linked* worktree, not only the
+  current `HEAD`. Fetch currently guards the current worktree's checked-out branch; git refuses a
+  direct-mapping refspec (e.g. `+refs/heads/dev:refs/heads/dev`) whenever `dev` is checked out in any
+  worktree, which needs enumerating `.git/worktrees/*/HEAD`. Belongs with the linked-worktree subsystem.
 - [ ] Support explicit push refspecs.
 - [ ] Support tags in fetch and push flows.
 - [ ] Add stock `git clone` interoperability tests against a small HTTP harness. (The in-process harness in `git_smart_http.rs` is gta-to-gta; these still need stock `git` as the interop peer — likewise for fetch/push below.)

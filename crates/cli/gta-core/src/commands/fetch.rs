@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_remote::{self as transport, Origin};
 
@@ -31,7 +31,17 @@ async fn fetch_into<H: HashAlgorithm>(
 	body: &[u8],
 ) -> Result<()> {
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
-	gitana_porcelain::fetch(&repository, origin, body).await?;
+	let outcome = gitana_porcelain::fetch(&repository, origin, body, false).await?;
 	println!("Fetched from {}", origin.url);
+	for (tracking, _) in &outcome.updated {
+		println!("   {tracking}");
+	}
+	for tracking in &outcome.rejected {
+		eprintln!(" ! {tracking} (non-fast-forward, not updated)");
+	}
+	// git exits non-zero when a ref update was rejected, even though the rest were applied.
+	if !outcome.rejected.is_empty() {
+		bail!("some remote-tracking refs were not updated (non-fast-forward)");
+	}
 	Ok(())
 }

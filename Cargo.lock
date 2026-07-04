@@ -1305,6 +1305,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cap-std 4.0.2",
+ "gitana-config",
  "gitana-file-store",
  "gitana-file-store-local",
  "gitana-git-http",

@@ -23,7 +23,7 @@ pub use commit::commit;
 pub use merge::{MergeOutcome, abort_merge, continue_merge, merge};
 pub use prune::{gc, prune};
 pub use rebase::{RebaseOutcome, abort_rebase, continue_rebase, rebase, skip_rebase};
-pub use remote::{FetchOutcome, PushOutcome, clone, fetch, push};
+pub use remote::{FetchOutcome, PushOutcome, clone, fetch, pull_upstream, push};
 pub use revert::{RevertOutcome, abort_revert, continue_revert, revert};
 
 /// Resolves the git identity lines (`Name <email> seconds ±hhmm`) for operations that record commits.

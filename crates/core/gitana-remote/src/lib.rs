@@ -8,6 +8,9 @@
 //! `H`.
 
 mod http;
+mod refspec;
+
+pub use refspec::Refspec;
 
 use std::path::Path;
 
@@ -26,7 +29,9 @@ const UPLOAD_PACK_REQUEST: &str = "application/x-git-upload-pack-request";
 /// Content type for a `git-receive-pack` request body.
 pub const RECEIVE_PACK_REQUEST: &str = "application/x-git-receive-pack-request";
 
-const ORIGIN_FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
+/// The default fetch refspec written for a new `origin` remote (and the fallback when a remote has no
+/// configured `fetch` line): mirror every remote branch into `refs/remotes/origin/*`, force-updated.
+pub const ORIGIN_FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
 
 /// The configured origin remote. This is the base Smart HTTP URL, e.g.
 /// `https://example.com/acme/project.git`.

@@ -111,7 +111,9 @@ Implemented command groups:
   repack), `prune` (delete unreachable loose objects), `gc` (prune, geometric repack, then
   write a multi-pack-index reachability bitmap over the ref tips).
 - Remote operations: `clone`, `fetch`, `pull`, `push`, `remote` (list/`-v`, `add`,
-  `remove`, `rename`, `set-url`).
+  `remove`, `rename`, `set-url`). `fetch` honours the configured `remote.origin.fetch` refspecs —
+  wildcard, exact, force (`+`), and negative (`^`) — mapping advertised refs to tracking refs and
+  enforcing fast-forward for non-forced refspecs.
 
 ## Crate layout
 

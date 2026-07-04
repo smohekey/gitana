@@ -253,3 +253,607 @@ async fn pull_fast_forwards_to_the_server() {
 	assert_eq!(head, tip.to_hex());
 	assert_eq!(std::fs::read(target.join("f.txt")).unwrap(), b"2\n");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_fast_forwards_under_a_mirror_refspec() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	// A mirror refspec that maps the remote branch straight onto the local (checked-out) branch. A
+	// plain fetch refuses this, but pull uses update-head-ok and reconciles the work tree via merge.
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"+refs/heads/*:refs/heads/*",
+		])
+		.await,
+		"config mirror refspec",
+	);
+
+	let tip = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
+	ok(&gta(&["-C", t, "pull"]).await, "pull mirror");
+
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "HEAD"]).await,
+			"rev-parse HEAD",
+		),
+		tip.to_hex()
+	);
+	assert_eq!(std::fs::read(target.join("f.txt")).unwrap(), b"2\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_merges_the_refspec_mapped_source_not_the_same_name() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	let base = init_server(&git_dir, "f.txt", b"1\n").await;
+	// The server has an advanced `trunk` and a *stale* `main` (rewound to the base).
+	let trunk_tip = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
+	{
+		let repo = open(&git_dir);
+		repo
+			.refs()
+			.update_ref("refs/heads/trunk", trunk_tip, None)
+			.await
+			.unwrap();
+		repo
+			.refs()
+			.update_ref("refs/heads/main", base, Some(trunk_tip))
+			.await
+			.unwrap();
+	}
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	// A rename refspec: the remote `trunk` is fetched onto the local checked-out `main`.
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"+refs/heads/trunk:refs/heads/main",
+		])
+		.await,
+		"config rename refspec",
+	);
+
+	ok(&gta(&["-C", t, "pull"]).await, "pull rename");
+
+	// Pull follows the mapped source (`trunk`), not the stale same-named `main`.
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "HEAD"]).await,
+			"rev-parse HEAD",
+		),
+		trunk_tip.to_hex()
+	);
+	assert_eq!(std::fs::read(target.join("f.txt")).unwrap(), b"2\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_declines_when_a_refspec_excludes_the_branch() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	// A negative refspec excludes the current branch's remote ref; git declines to merge it.
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"+refs/heads/*:refs/remotes/origin/*",
+		])
+		.await,
+		"config tracking",
+	);
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"--add",
+			"remote.origin.fetch",
+			"^refs/heads/main",
+		])
+		.await,
+		"config exclude",
+	);
+
+	let _tip = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
+	assert!(
+		!gta(&["-C", t, "pull"]).await.status.success(),
+		"pull must decline when the branch's remote ref is excluded"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_rejects_a_non_fast_forward_mirror_refspec() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	ok(&gta(&["-C", t, "config", "user.name", "T"]).await, "name");
+	ok(
+		&gta(&["-C", t, "config", "user.email", "t@e"]).await,
+		"email",
+	);
+	// A *non-forced* mirror refspec into the checked-out branch.
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"refs/heads/*:refs/heads/*",
+		])
+		.await,
+		"config mirror",
+	);
+
+	// Diverge: a local commit, and an independent server commit (both children of the clone base).
+	std::fs::write(target.join("f.txt"), b"local\n").unwrap();
+	ok(&gta(&["-C", t, "add", "f.txt"]).await, "add");
+	ok(&gta(&["-C", t, "commit", "-m", "local"]).await, "commit");
+	let local_tip = stdout(
+		&gta(&["-C", t, "rev-parse", "HEAD"]).await,
+		"rev-parse local",
+	);
+	let _server = commit_file(&open(&git_dir), "f.txt", b"server\n").await;
+
+	// The non-forced mirror refspec rejects the non-fast-forward onto the checked-out branch; pull
+	// fails and the local branch is untouched (git: `! [rejected] ... (non-fast-forward)`).
+	assert!(
+		!gta(&["-C", t, "pull"]).await.status.success(),
+		"pull must reject a non-fast-forward mirror refspec"
+	);
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "HEAD"]).await,
+			"rev-parse after",
+		),
+		local_tip
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_aborts_when_two_refspecs_target_the_checked_out_branch() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	let root = init_server(&git_dir, "f.txt", b"1\n").await;
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/heads/dev", root, None)
+		.await
+		.unwrap();
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	// Two different remote refs mapped onto the checked-out branch: git aborts, and pull must too
+	// (the conflict is caught even though the destination is the checked-out branch).
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"+refs/heads/main:refs/heads/main",
+		])
+		.await,
+		"config refspec 1",
+	);
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"--add",
+			"remote.origin.fetch",
+			"+refs/heads/dev:refs/heads/main",
+		])
+		.await,
+		"config refspec 2",
+	);
+
+	assert!(
+		!gta(&["-C", t, "pull"]).await.status.success(),
+		"pull must abort on conflicting refspec destinations, even for the checked-out branch"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_refuses_a_forced_mirror_that_would_discard_local_commits() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	ok(&gta(&["-C", t, "config", "user.name", "T"]).await, "name");
+	ok(
+		&gta(&["-C", t, "config", "user.email", "t@e"]).await,
+		"email",
+	);
+	// A *forced* mirror refspec: git would force-reset the checked-out branch (discarding the local
+	// commit); gta declines that destructive update and refuses instead (safe-error policy).
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"+refs/heads/*:refs/heads/*",
+		])
+		.await,
+		"config forced mirror",
+	);
+
+	std::fs::write(target.join("f.txt"), b"local\n").unwrap();
+	ok(&gta(&["-C", t, "add", "f.txt"]).await, "add");
+	ok(&gta(&["-C", t, "commit", "-m", "local"]).await, "commit");
+	let local_tip = stdout(
+		&gta(&["-C", t, "rev-parse", "HEAD"]).await,
+		"rev-parse local",
+	);
+	let _server = commit_file(&open(&git_dir), "f.txt", b"server\n").await;
+
+	assert!(
+		!gta(&["-C", t, "pull"]).await.status.success(),
+		"pull must refuse a non-fast-forward forced mirror rather than discard local commits"
+	);
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "HEAD"]).await,
+			"rev-parse after",
+		),
+		local_tip,
+		"the local commit must survive"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_honors_a_custom_tracking_namespace() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+
+	// Retarget the fetch refspec's destination to a custom namespace.
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"+refs/heads/*:refs/remotes/origin/mirror/*",
+		])
+		.await,
+		"config fetch refspec",
+	);
+
+	let tip = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
+	ok(&gta(&["-C", t, "fetch"]).await, "fetch");
+
+	// The tracking ref lands where the custom refspec maps it — not the default `origin/main`.
+	let mirror = stdout(
+		&gta(&["-C", t, "rev-parse", "refs/remotes/origin/mirror/main"]).await,
+		"rev-parse custom tracking",
+	);
+	assert_eq!(mirror, tip.to_hex());
+	assert!(
+		!gta(&["-C", t, "rev-parse", "--verify", "refs/remotes/origin/main"])
+			.await
+			.status
+			.success(),
+		"the default tracking ref must not be written under a custom refspec"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_rejects_a_non_fast_forward_without_force() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	let root = init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+
+	// A non-forced refspec (no leading `+`): tracking updates only fast-forward.
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"refs/heads/*:refs/remotes/origin/*",
+		])
+		.await,
+		"config non-force refspec",
+	);
+
+	// Server advances to a child commit; the first fetch creates the tracking ref at it.
+	let child = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
+	ok(&gta(&["-C", t, "fetch"]).await, "fetch child");
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "refs/remotes/origin/main"]).await,
+			"rev-parse tracking",
+		),
+		child.to_hex()
+	);
+
+	// Rewind the server branch to the root — a non-fast-forward from the tracking ref's point of view.
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/heads/main", root, Some(child))
+		.await
+		.unwrap();
+	// git treats the rejected update as a failed fetch (non-zero exit), even though nothing is written.
+	assert!(
+		!gta(&["-C", t, "fetch"]).await.status.success(),
+		"a non-fast-forward under a non-forced refspec must fail the fetch"
+	);
+
+	// The non-forced refspec declines the rewind: the tracking ref still points at the child.
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "refs/remotes/origin/main"]).await,
+			"rev-parse tracking after rewind",
+		),
+		child.to_hex()
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_applies_every_matching_refspec() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+
+	// Keep the default wildcard refspec and add a second, exact one for the same branch: git writes
+	// both destinations.
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"--add",
+			"remote.origin.fetch",
+			"+refs/heads/main:refs/remotes/origin/also-main",
+		])
+		.await,
+		"config extra refspec",
+	);
+
+	let tip = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
+	ok(&gta(&["-C", t, "fetch"]).await, "fetch");
+
+	for tracking in ["refs/remotes/origin/main", "refs/remotes/origin/also-main"] {
+		assert_eq!(
+			stdout(
+				&gta(&["-C", t, "rev-parse", tracking]).await,
+				"rev-parse tracking",
+			),
+			tip.to_hex(),
+			"{tracking} should be written"
+		);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_aborts_when_two_refspecs_target_one_ref() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	let root = init_server(&git_dir, "f.txt", b"1\n").await;
+	// A second server branch so both refspecs below have a source to match.
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/heads/dev", root, None)
+		.await
+		.unwrap();
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+
+	// Two refspecs mapping different branches to the same tracking ref: git aborts the whole fetch.
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"+refs/heads/main:refs/remotes/origin/same",
+		])
+		.await,
+		"config refspec 1",
+	);
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"--add",
+			"remote.origin.fetch",
+			"+refs/heads/dev:refs/remotes/origin/same",
+		])
+		.await,
+		"config refspec 2",
+	);
+
+	assert!(
+		!gta(&["-C", t, "fetch"]).await.status.success(),
+		"conflicting refspec destinations must fail the fetch"
+	);
+	// The conflict is caught before any write: the destination ref was not created.
+	assert!(
+		!gta(&["-C", t, "rev-parse", "--verify", "refs/remotes/origin/same"])
+			.await
+			.status
+			.success(),
+		"no tracking ref should be written when the config conflicts"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_fails_on_an_absent_exact_source() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	// An exact source the remote does not advertise (a typo or deleted branch): git errors.
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"+refs/heads/nonexistent:refs/remotes/origin/nope",
+		])
+		.await,
+		"config bad source",
+	);
+
+	assert!(
+		!gta(&["-C", t, "fetch"]).await.status.success(),
+		"fetch must fail when an exact source ref is not advertised"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_refuses_to_write_the_checked_out_branch() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	let before = stdout(
+		&gta(&["-C", t, "rev-parse", "refs/heads/main"]).await,
+		"rev-parse before",
+	);
+
+	// A refspec that maps the remote branch straight onto the local checked-out branch: git refuses,
+	// because a plain fetch does not update the work tree.
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"+refs/heads/*:refs/heads/*",
+		])
+		.await,
+		"config self-refspec",
+	);
+
+	let _tip = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
+	assert!(
+		!gta(&["-C", t, "fetch"]).await.status.success(),
+		"fetching into the checked-out branch must fail"
+	);
+	// The local branch tip is untouched.
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "refs/heads/main"]).await,
+			"rev-parse after",
+		),
+		before
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bare_repo_fetches_into_its_branch_namespace() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	let root = init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	// A bare client (no work tree) with a mirror refspec into `refs/heads/*`. Configure it through the
+	// repository API directly — `core.bare` must already be set for the CLI to discover the bare dir.
+	let client = srv.path().join("client.git");
+	std::fs::create_dir_all(&client).unwrap();
+	let crepo = open(&client);
+	crepo.init().await.unwrap();
+	// `discover` recognises a bare dir by `HEAD` + `objects/` + `refs/`; ensure the dirs exist.
+	std::fs::create_dir_all(client.join("objects/pack")).unwrap();
+	std::fs::create_dir_all(client.join("refs/heads")).unwrap();
+	let mut cfg = crepo.read_config().await.unwrap();
+	cfg.set("core", None, "bare", "true").unwrap();
+	cfg.set("remote", Some("origin"), "url", &url).unwrap();
+	cfg
+		.set(
+			"remote",
+			Some("origin"),
+			"fetch",
+			"+refs/heads/*:refs/heads/*",
+		)
+		.unwrap();
+	crepo.write_config(&cfg).await.unwrap();
+	let c = client.to_str().unwrap();
+
+	// git permits fetching straight into a bare repo's branch namespace; the branch is created.
+	ok(&gta(&["-C", c, "fetch"]).await, "bare fetch");
+	assert_eq!(
+		stdout(
+			&gta(&["-C", c, "rev-parse", "refs/heads/main"]).await,
+			"rev-parse bare main",
+		),
+		root.to_hex()
+	);
+}
