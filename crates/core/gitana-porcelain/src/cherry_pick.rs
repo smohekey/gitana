@@ -2,6 +2,7 @@
 
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
+use gitana_file_store_local::WorkDirFs;
 use gitana_object::{Commit, HashAlgorithm, ObjectId, parse_commit};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
@@ -23,8 +24,8 @@ pub enum PickOutcome<H: HashAlgorithm> {
 ///
 /// Re-applies the change `commit_spec` introduced — a three-way merge of its parent, `HEAD`, and the
 /// commit — as a new single-parent commit preserving the picked author.
-pub async fn cherry_pick<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	commit_spec: &str,
 	identity: &impl Identity,
 ) -> Result<PickOutcome<H>> {
@@ -116,8 +117,8 @@ pub async fn cherry_pick<F: FileStore, H: HashAlgorithm>(
 /// the picked commit's author, returning the new commit id. Shared by `cherry-pick --continue`
 /// (`message_override = None`, uses `MERGE_MSG`) and `gta commit` during a cherry-pick. Refuses while
 /// the index has unmerged stages.
-pub async fn continue_cherry_pick<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn continue_cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	message_override: Option<String>,
 	identity: &impl Identity,
 ) -> Result<ObjectId<H>> {
@@ -154,7 +155,9 @@ pub async fn continue_cherry_pick<F: FileStore, H: HashAlgorithm>(
 
 /// Abort an in-progress cherry-pick: restore the work tree and index to the (unmoved) `HEAD` and clear
 /// the cherry-pick state. Like `git cherry-pick --abort`.
-pub async fn abort_cherry_pick<F: FileStore, H: HashAlgorithm>(wt: &WorkTree<F, H>) -> Result<()> {
+pub async fn abort_cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+) -> Result<()> {
 	let repository = wt.repository();
 	if repository.cherry_pick_head().await?.is_none() {
 		bail!("there is no cherry-pick to abort (CHERRY_PICK_HEAD is missing)");

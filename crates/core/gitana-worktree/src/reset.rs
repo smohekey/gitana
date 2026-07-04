@@ -6,14 +6,19 @@
 //! the checkout CVE class before they enter the index.
 
 use gitana_file_store::FileStore;
+use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::checkout::validate_path;
 use crate::{Index, IndexEntry, Stat, WorkTree, WorktreeError};
 
-pub(crate) async fn run<F, H>(wt: &WorkTree<F, H>, tree: ObjectId<H>) -> Result<(), WorktreeError>
+pub(crate) async fn run<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	tree: ObjectId<H>,
+) -> Result<(), WorktreeError>
 where
 	F: FileStore,
+	W: WorkDirFs,
 	H: HashAlgorithm,
 {
 	let entries = wt.repository().read_tree(tree).await?;

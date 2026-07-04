@@ -9,9 +9,9 @@ use gitana_object::HashAlgorithm;
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
 
-use gitana_file_store_local::WorktreeFileStore;
+use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
 
-use crate::Backend;
+use crate::{Backend, WorkDir};
 
 /// A discovered repository: where its working tree, its (possibly per-worktree) git directory, and
 /// its shared *common* directory live.
@@ -134,6 +134,15 @@ pub fn open_generic<H: HashAlgorithm>(
 	Ok(Repository::new(ObjectStore::new(WorktreeFileStore::new(
 		common, git,
 	))))
+}
+
+/// Open the working tree at `work` as a filesystem capability. Like [`open_generic`], this is a
+/// program-edge point that mints ambient authority from a path — the working-tree counterpart to the
+/// git-directory capability the store holds.
+pub fn open_work_dir(work: &Path) -> Result<WorkDir> {
+	let dir = Dir::open_ambient_dir(work, ambient_authority())
+		.map_err(|error| anyhow!("opening work tree {}: {error}", work.display()))?;
+	Ok(CapWorkDir::from_dir(dir))
 }
 
 /// Discover the working tree containing `start` as a [`Discovered`] plus the pathspec `prefix`,

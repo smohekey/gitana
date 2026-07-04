@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use gitana_file_store_local::LocalFileStore;
+use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::Sha256;
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
@@ -53,7 +53,7 @@ async fn status_matches_git() {
 		open_dir(&git_dir),
 	)));
 	let ours = sorted(
-		&WorkTree::new(repo, &work, &git_dir)
+		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
 			.status()
 			.await
 			.unwrap()
@@ -106,7 +106,7 @@ async fn status_with_gitignore_matches_git() {
 		open_dir(&git_dir),
 	)));
 	let ours = sorted(
-		&WorkTree::new(repo, &work, &git_dir)
+		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
 			.status()
 			.await
 			.unwrap()

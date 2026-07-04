@@ -14,6 +14,7 @@
 use std::collections::BTreeSet;
 
 use gitana_file_store::FileStore;
+use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::checkout::{remove_worktree_path, validate_path, write_worktree_file};
@@ -21,8 +22,8 @@ use crate::fsmeta::stat_of;
 use crate::pathspec::normalize;
 use crate::{IndexEntry, Stat, WorkTree, WorktreeError};
 
-pub(crate) async fn run<F, H>(
-	wt: &WorkTree<F, H>,
+pub(crate) async fn run<F, W, H>(
+	wt: &WorkTree<F, W, H>,
 	source: Option<ObjectId<H>>,
 	worktree: bool,
 	staged: bool,
@@ -32,6 +33,7 @@ pub(crate) async fn run<F, H>(
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
+	W: WorkDirFs,
 	H: HashAlgorithm,
 {
 	let mut index = wt.load_index().await?;
@@ -111,7 +113,10 @@ where
 						// default stat the worktree can never match — forcing `status` to re-hash and
 						// report the entry correctly against the working tree.
 						let stat = if worktree {
-							stat_of(&std::fs::symlink_metadata(wt.work_dir().join(path))?)
+							let meta = wt.work().lstat(path)?.ok_or_else(|| {
+								std::io::Error::new(std::io::ErrorKind::NotFound, "restored entry is missing")
+							})?;
+							stat_of(&meta)
 						} else {
 							Stat::default()
 						};

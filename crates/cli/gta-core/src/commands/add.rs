@@ -19,7 +19,7 @@ struct Add<'a> {
 impl WorkTreeCommand for Add<'_> {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<Backend, H>,
+		worktree: WorkTree<Backend, crate::WorkDir, H>,
 		prefix: String,
 	) -> Result<()> {
 		let specs: Vec<&str> = self.pathspecs.iter().map(String::as_str).collect();

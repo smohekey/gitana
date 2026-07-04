@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
-use gitana_file_store_local::LocalFileStore;
+use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 
 use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
@@ -15,12 +15,12 @@ fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
 	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
 }
 
-fn make_repo(work: &std::path::Path) -> WorkTree<LocalFileStore, Sha256> {
+fn make_repo(work: &std::path::Path) -> WorkTree<LocalFileStore, CapWorkDir, Sha256> {
 	let git_dir = work.join(".git");
 	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
 		open_dir(&git_dir),
 	)));
-	WorkTree::new(repo, work, git_dir)
+	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(work)), git_dir)
 }
 
 /// Build two commits; return (work dir, first commit id).
@@ -573,7 +573,7 @@ async fn a_successful_index_write_releases_the_lock() {
 		open_dir(&git_dir),
 	)));
 	repo.init().await.unwrap();
-	let wt = WorkTree::new(repo, &work, &git_dir);
+	let wt = WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir);
 
 	std::fs::write(work.join("f.txt"), b"hi\n").unwrap();
 	wt.add(&["f.txt"], "").await.unwrap();

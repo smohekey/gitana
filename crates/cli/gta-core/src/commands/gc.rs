@@ -17,7 +17,7 @@ struct Gc;
 impl WorkTreeCommand for Gc {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<Backend, H>,
+		worktree: WorkTree<Backend, crate::WorkDir, H>,
 		_prefix: String,
 	) -> Result<()> {
 		let (prune, repack, bitmap) = gitana_porcelain::gc(&worktree).await?;

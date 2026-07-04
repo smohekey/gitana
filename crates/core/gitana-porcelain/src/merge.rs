@@ -5,6 +5,7 @@
 
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
+use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
@@ -35,8 +36,8 @@ pub enum MergeOutcome<H: HashAlgorithm> {
 /// Fast-forwards when the current tip is an ancestor of `commit_spec` (unless `no_ff`), otherwise
 /// records a true two-parent merge; `ff_only` refuses a non-fast-forward. Identity is resolved only
 /// once a commit will actually be made.
-pub async fn merge<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	commit_spec: &str,
 	message: Option<String>,
 	no_ff: bool,
@@ -196,8 +197,8 @@ pub async fn merge<F: FileStore, H: HashAlgorithm>(
 /// commit id. Shared by `merge --continue` (`message_override = None`, uses `MERGE_MSG`) and
 /// `gta commit` during a merge (`message_override = Some(..)`). Refuses while the index still has
 /// unmerged stages — checked before identity is resolved.
-pub async fn continue_merge<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn continue_merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	message_override: Option<String>,
 	identity: &impl Identity,
 ) -> Result<ObjectId<H>> {
@@ -227,7 +228,9 @@ pub async fn continue_merge<F: FileStore, H: HashAlgorithm>(
 
 /// Abort an in-progress merge: restore the work tree and index to the (unmoved) `HEAD`, discarding
 /// conflict markers and unmerged stages, and clear the merge state. Like `git merge --abort`.
-pub async fn abort_merge<F: FileStore, H: HashAlgorithm>(wt: &WorkTree<F, H>) -> Result<()> {
+pub async fn abort_merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+) -> Result<()> {
 	let repository = wt.repository();
 	if repository.merge_head().await?.is_none() {
 		bail!("there is no merge to abort (MERGE_HEAD is missing)");

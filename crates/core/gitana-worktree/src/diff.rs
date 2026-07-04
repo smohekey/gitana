@@ -4,14 +4,13 @@
 //! (gta owns its output, per docs/hlds/gta-cli.md).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::Metadata;
-use std::path::Path;
 
 use gitana_file_store::FileStore;
+use gitana_file_store_local::{Meta, WorkDirFs};
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::Repository;
 
-use crate::fsmeta::{blob_of, file_mode, path_bytes};
+use crate::fsmeta::{blob_of, file_mode};
 use crate::worktree::stat_matches;
 use crate::{WorkTree, WorktreeError};
 
@@ -29,19 +28,13 @@ pub struct FileDiff {
 
 /// Index vs working tree (the changes `git diff` shows with no args). Untracked
 /// files are not included, matching git's default.
-pub(crate) async fn unstaged<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 ) -> Result<Vec<FileDiff>, WorktreeError> {
 	let index = wt.load_index().await?;
 	let mut out = Vec::new();
 	for entry in index.entries.iter().filter(|e| e.stage == 0) {
-		let full = wt.work_dir().join(&entry.path);
-		let meta = match std::fs::symlink_metadata(&full) {
-			Ok(meta) => Some(meta),
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-			Err(error) => return Err(error.into()),
-		};
-		let Some(meta) = meta else {
+		let Some(meta) = wt.work().lstat(&entry.path)? else {
 			// Deleted in the working tree.
 			let old = wt.repository().read_blob(entry.oid).await?;
 			out.push(FileDiff {
@@ -55,11 +48,11 @@ pub(crate) async fn unstaged<F: FileStore, H: HashAlgorithm>(
 			continue;
 		}
 		// Re-hash to decide if the content really changed (mtime alone can lie).
-		match blob_of(&full, &meta)? {
+		match blob_of(wt.work(), &entry.path, &meta)? {
 			Some((oid, mode)) if oid == entry.oid && mode == entry.mode => {}
 			_ => {
 				let old = wt.repository().read_blob(entry.oid).await?;
-				let new = read_worktree(&full, &meta)?;
+				let new = read_worktree(wt.work(), &entry.path, &meta)?;
 				out.push(FileDiff {
 					path: entry.path.clone(),
 					old: Some((old, entry.mode)),
@@ -73,8 +66,8 @@ pub(crate) async fn unstaged<F: FileStore, H: HashAlgorithm>(
 }
 
 /// HEAD tree vs index (the changes `git diff --cached` shows).
-pub(crate) async fn staged<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub(crate) async fn staged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 ) -> Result<Vec<FileDiff>, WorktreeError> {
 	let index: BTreeMap<String, (u32, ObjectId<H>)> = wt
 		.load_index()
@@ -175,16 +168,16 @@ async fn side<F: FileStore, H: HashAlgorithm>(
 }
 
 /// Read a working-tree path's blob bytes: the file contents, or a symlink's target.
-fn read_worktree(full: &Path, meta: &Metadata) -> std::io::Result<Vec<u8>> {
-	if meta.is_symlink() {
-		Ok(path_bytes(&std::fs::read_link(full)?).to_vec())
+fn read_worktree<W: WorkDirFs>(work: &W, path: &str, meta: &Meta) -> std::io::Result<Vec<u8>> {
+	if meta.kind.is_symlink() {
+		work.read_link(path)
 	} else {
-		std::fs::read(full)
+		work.read(path)
 	}
 }
 
-fn working_mode(meta: &Metadata) -> u32 {
-	if meta.is_symlink() {
+fn working_mode(meta: &Meta) -> u32 {
+	if meta.kind.is_symlink() {
 		0o120000
 	} else {
 		file_mode(meta)

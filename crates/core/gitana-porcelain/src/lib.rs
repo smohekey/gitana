@@ -47,7 +47,7 @@ pub(crate) mod test_support {
 	use std::cell::Cell;
 
 	use anyhow::Result;
-	use gitana_file_store_local::LocalFileStore;
+	use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 	use gitana_object::{ObjectId, Sha256};
 	use gitana_object_store::ObjectStore;
 	use gitana_repository::{FileMode, Repository, TreeBuildEntry};
@@ -100,7 +100,10 @@ pub(crate) mod test_support {
 	}
 
 	/// A fresh repository (config + an unborn `main`) with a work tree, over a temp `LocalFileStore`.
-	pub(crate) async fn fixture() -> (tempfile::TempDir, WorkTree<LocalFileStore, Sha256>) {
+	pub(crate) async fn fixture() -> (
+		tempfile::TempDir,
+		WorkTree<LocalFileStore, CapWorkDir, Sha256>,
+	) {
 		let dir = tempfile::TempDir::new().unwrap();
 		let git_dir = dir.path().join(".git");
 		std::fs::create_dir_all(&git_dir).unwrap();
@@ -108,7 +111,11 @@ pub(crate) mod test_support {
 			open_dir(&git_dir),
 		)));
 		repo.init().await.unwrap();
-		let wt = WorkTree::new(repo, dir.path().to_path_buf(), git_dir);
+		let wt = WorkTree::new(
+			repo,
+			CapWorkDir::from_dir(open_dir(dir.path().to_path_buf())),
+			git_dir,
+		);
 		(dir, wt)
 	}
 
@@ -128,7 +135,7 @@ pub(crate) mod test_support {
 	/// tree on disk in sync (write the file, stage it, commit) so later operations see a clean tree.
 	pub(crate) async fn commit_file(
 		dir: &std::path::Path,
-		wt: &WorkTree<LocalFileStore, Sha256>,
+		wt: &WorkTree<LocalFileStore, CapWorkDir, Sha256>,
 		path: &str,
 		content: &[u8],
 		identity: &TestIdentity,

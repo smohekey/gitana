@@ -1,23 +1,24 @@
 use std::path::{Path, PathBuf};
 
 use gitana_file_store::{FileStore, FileStoreError, WriteOutcome};
+use gitana_file_store_local::{Meta, WorkDirFs};
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::Repository;
 
-use crate::fsmeta::{file_mode, mode_of, path_bytes, stat_of};
+use crate::fsmeta::{file_mode, join_rel, mode_of, push_gitignore, stat_of};
 use crate::ignore::{self, DirIgnore};
 use crate::{Index, IndexEntry, Status, WorktreeError};
 
 /// A working directory paired with its repository.
 ///
-/// Filesystem-coupled by nature: working-tree files are real files, so it reads/writes them
-/// with `std::fs`, while blob objects and the index both go through the repository's file store
-/// (so the index lives under the same capability as the rest of the git directory). The index is
-/// written with git's lock-then-replace protocol, re-expressed on the store's compare-and-set
-/// primitives. `add`/`status`/`checkout` build on this.
-pub struct WorkTree<F, H: HashAlgorithm> {
+/// Filesystem-coupled by nature, but no longer through ambient authority: working-tree files are
+/// read and written through a [`WorkDirFs`] capability (`work`), while blob objects and the index
+/// go through the repository's file store (so the index lives under the same capability as the rest
+/// of the git directory). The index is written with git's lock-then-replace protocol.
+/// `add`/`status`/`checkout` build on this.
+pub struct WorkTree<F, W, H: HashAlgorithm> {
 	repo: Repository<F, H>,
-	work_dir: PathBuf,
+	work: W,
 	git_dir: PathBuf,
 }
 
@@ -27,17 +28,13 @@ pub struct WorkTree<F, H: HashAlgorithm> {
 /// stale `index.lock`), exactly as dropping the open lock file did before.
 pub(crate) struct IndexLock(());
 
-impl<F: FileStore, H: HashAlgorithm> WorkTree<F, H> {
-	/// Build a working tree over `repo`, with the working directory at `work_dir`
+impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
+	/// Build a working tree over `repo`, with the working directory served by the capability `work`
 	/// and the git directory at `git_dir`.
-	pub fn new(
-		repo: Repository<F, H>,
-		work_dir: impl Into<PathBuf>,
-		git_dir: impl Into<PathBuf>,
-	) -> Self {
+	pub fn new(repo: Repository<F, H>, work: W, git_dir: impl Into<PathBuf>) -> Self {
 		Self {
 			repo,
-			work_dir: work_dir.into(),
+			work,
 			git_dir: git_dir.into(),
 		}
 	}
@@ -99,8 +96,9 @@ impl<F: FileStore, H: HashAlgorithm> WorkTree<F, H> {
 			})
 	}
 
-	pub(crate) fn work_dir(&self) -> &Path {
-		&self.work_dir
+	/// The working-tree filesystem capability (all working-tree paths are relative to its root).
+	pub(crate) fn work(&self) -> &W {
+		&self.work
 	}
 
 	/// The repository's file store — the capability the index (and `index.lock`) live under, the
@@ -173,50 +171,50 @@ impl<F: FileStore, H: HashAlgorithm> WorkTree<F, H> {
 		let mut ignore_stack: Vec<DirIgnore> = Vec::new();
 		for &spec in pathspecs {
 			let (rel, dir_only) = crate::pathspec::normalize(spec, prefix)?;
-			let full = if rel.is_empty() {
-				self.work_dir.clone()
-			} else {
-				self.work_dir.join(&rel)
-			};
-			match std::fs::symlink_metadata(&full) {
-				Ok(meta) if meta.is_dir() && !meta.is_symlink() => {
+			// The empty spec (`.` at the work-tree root) always names the root directory to walk.
+			if rel.is_empty() {
+				let mut files = Vec::new();
+				walk_files(self.work(), "", &mut ignore_stack, &mut files)?;
+				for file in files {
+					self.stage_file(&mut index, &file).await?;
+				}
+				continue;
+			}
+			match self.work().lstat(&rel)? {
+				Some(meta) if meta.kind.is_dir() => {
 					let mut files = Vec::new();
-					walk_files(&full, &rel, &mut ignore_stack, &mut files)?;
+					walk_files(self.work(), &rel, &mut ignore_stack, &mut files)?;
 					for file in files {
 						self.stage_file(&mut index, &file).await?;
 					}
 				}
-				// A trailing-slash spec required a directory but resolved to a file or nothing.
-				Ok(_) if dir_only => return Err(WorktreeError::PathspecMatch(spec.to_owned())),
-				Ok(_) => self.stage_file(&mut index, &rel).await?,
-				Err(error) if error.kind() == std::io::ErrorKind::NotFound && dir_only => {
-					return Err(WorktreeError::PathspecMatch(spec.to_owned()));
-				}
-				Err(error) if error.kind() == std::io::ErrorKind::NotFound => index.remove(&rel),
-				Err(error) => return Err(error.into()),
+				// A trailing-slash spec required a directory but resolved to a file.
+				Some(_) if dir_only => return Err(WorktreeError::PathspecMatch(spec.to_owned())),
+				Some(_) => self.stage_file(&mut index, &rel).await?,
+				// Absent: a trailing-slash spec is an error; otherwise stage the deletion.
+				None if dir_only => return Err(WorktreeError::PathspecMatch(spec.to_owned())),
+				None => index.remove(&rel),
 			}
 		}
 		self.save_index(&index).await
 	}
 
 	async fn stage_file(&self, index: &mut Index<H>, path: &str) -> Result<(), WorktreeError> {
-		let full = self.work_dir.join(path);
-		match std::fs::symlink_metadata(&full) {
-			Ok(meta) if meta.is_symlink() => {
-				let target = std::fs::read_link(&full)?;
-				let oid = self.repo.write_blob(path_bytes(&target)).await?;
+		match self.work().lstat(path)? {
+			Some(meta) if meta.kind.is_symlink() => {
+				let target = self.work().read_link(path)?;
+				let oid = self.repo.write_blob(&target).await?;
 				index.remove_type_conflicts(path);
 				index.upsert(entry(path, 0o120000, oid, &meta));
 			}
-			Ok(meta) if meta.is_file() => {
-				let content = std::fs::read(&full)?;
+			Some(meta) if meta.kind.is_file() => {
+				let content = self.work().read(path)?;
 				let oid = self.repo.write_blob(&content).await?;
 				index.remove_type_conflicts(path);
 				index.upsert(entry(path, file_mode(&meta), oid, &meta));
 			}
-			Ok(_) => {}
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => index.remove(path),
-			Err(error) => return Err(error.into()),
+			Some(_) => {}
+			None => index.remove(path),
 		}
 		Ok(())
 	}
@@ -327,12 +325,7 @@ impl<F: FileStore, H: HashAlgorithm> WorkTree<F, H> {
 	}
 }
 
-fn entry<H: HashAlgorithm>(
-	path: &str,
-	mode: u32,
-	oid: ObjectId<H>,
-	meta: &std::fs::Metadata,
-) -> IndexEntry<H> {
+fn entry<H: HashAlgorithm>(path: &str, mode: u32, oid: ObjectId<H>, meta: &Meta) -> IndexEntry<H> {
 	IndexEntry {
 		stat: stat_of(meta),
 		mode,
@@ -345,53 +338,34 @@ fn entry<H: HashAlgorithm>(
 
 /// Whether a working-tree file matches an index entry by its stat cache and mode
 /// (the fast path that avoids re-hashing).
-pub(crate) fn stat_matches<H: HashAlgorithm>(
-	entry: &IndexEntry<H>,
-	meta: &std::fs::Metadata,
-) -> bool {
+pub(crate) fn stat_matches<H: HashAlgorithm>(entry: &IndexEntry<H>, meta: &Meta) -> bool {
 	entry.mode == mode_of(meta) && entry.stat == stat_of(meta)
 }
 
-/// Collect all non-ignored files under `dir_path` (recursively), applying
-/// `.gitignore` and skipping `.git`. Used to expand a directory pathspec for `add`.
-fn walk_files(
-	dir_path: &Path,
+/// Collect all non-ignored files under `dir_rel` (recursively), applying `.gitignore` and skipping
+/// `.git`. Used to expand a directory pathspec for `add`.
+fn walk_files<W: WorkDirFs>(
+	work: &W,
 	dir_rel: &str,
 	stack: &mut Vec<DirIgnore>,
 	out: &mut Vec<String>,
 ) -> Result<(), WorktreeError> {
-	let pushed = match std::fs::read_to_string(dir_path.join(".gitignore")) {
-		Ok(text) => {
-			stack.push(ignore::parse(&text, dir_rel));
-			true
-		}
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-		Err(error) => return Err(error.into()),
-	};
-
-	for entry in std::fs::read_dir(dir_path)? {
-		let entry = entry?;
-		let name = entry.file_name();
-		let name = name.to_string_lossy();
-		if name == ".git" {
+	let pushed = push_gitignore(work, dir_rel, stack)?;
+	for entry in work.read_dir(dir_rel)? {
+		if entry.name == ".git" {
 			continue;
 		}
-		let rel = if dir_rel.is_empty() {
-			name.into_owned()
-		} else {
-			format!("{dir_rel}/{name}")
-		};
-		let is_dir = entry.metadata()?.is_dir();
+		let rel = join_rel(dir_rel, &entry.name);
+		let is_dir = entry.kind.is_dir();
 		if ignore::is_ignored(&rel, is_dir, stack) {
 			continue;
 		}
 		if is_dir {
-			walk_files(&entry.path(), &rel, stack, out)?;
+			walk_files(work, &rel, stack, out)?;
 		} else {
 			out.push(rel);
 		}
 	}
-
 	if pushed {
 		stack.pop();
 	}

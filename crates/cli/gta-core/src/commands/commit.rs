@@ -20,7 +20,7 @@ struct Commit<'a> {
 impl WorkTreeCommand for Commit<'_> {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<Backend, H>,
+		worktree: WorkTree<Backend, crate::WorkDir, H>,
 		_prefix: String,
 	) -> Result<()> {
 		let repo = worktree.repository();

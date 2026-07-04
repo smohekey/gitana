@@ -40,7 +40,11 @@ struct CherryPick {
 }
 
 impl WorkTreeCommand for CherryPick {
-	async fn run<H: HashAlgorithm>(self, wt: WorkTree<Backend, H>, _prefix: String) -> Result<()> {
+	async fn run<H: HashAlgorithm>(
+		self,
+		wt: WorkTree<Backend, crate::WorkDir, H>,
+		_prefix: String,
+	) -> Result<()> {
 		if self.abort {
 			return gitana_porcelain::abort_cherry_pick(&wt).await;
 		}

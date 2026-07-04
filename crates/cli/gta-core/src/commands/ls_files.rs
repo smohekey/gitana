@@ -17,7 +17,7 @@ struct LsFiles;
 impl WorkTreeCommand for LsFiles {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<Backend, H>,
+		worktree: WorkTree<Backend, crate::WorkDir, H>,
 		_prefix: String,
 	) -> Result<()> {
 		let index = worktree.load_index().await?;

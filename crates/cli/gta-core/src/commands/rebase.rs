@@ -52,7 +52,11 @@ struct Rebase {
 }
 
 impl WorkTreeCommand for Rebase {
-	async fn run<H: HashAlgorithm>(self, wt: WorkTree<Backend, H>, _prefix: String) -> Result<()> {
+	async fn run<H: HashAlgorithm>(
+		self,
+		wt: WorkTree<Backend, crate::WorkDir, H>,
+		_prefix: String,
+	) -> Result<()> {
 		let identity = CliIdentity::new(wt.repository());
 		if self.abort {
 			return gitana_porcelain::abort_rebase(&wt, &identity).await;

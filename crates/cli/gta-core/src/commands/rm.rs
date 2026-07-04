@@ -44,7 +44,7 @@ struct Rm {
 impl WorkTreeCommand for Rm {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<Backend, H>,
+		worktree: WorkTree<Backend, crate::WorkDir, H>,
 		prefix: String,
 	) -> Result<()> {
 		if self.pathspecs.is_empty() {

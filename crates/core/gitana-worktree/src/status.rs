@@ -3,12 +3,12 @@
 //! collapses fully-untracked directories the way git's default mode does.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
 
 use gitana_file_store::FileStore;
+use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
 
-use crate::fsmeta::blob_of;
+use crate::fsmeta::{blob_of, join_rel, push_gitignore};
 use crate::ignore::{self, DirIgnore};
 use crate::worktree::stat_matches;
 use crate::{Conflict, IndexEntry, WorkTree, WorktreeError};
@@ -56,8 +56,8 @@ impl Status {
 	}
 }
 
-pub(crate) async fn compute<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 ) -> Result<Status, WorktreeError> {
 	let index = wt.load_index().await?;
 	let index_map: HashMap<String, (String, ObjectId<H>)> = index
@@ -85,13 +85,7 @@ pub(crate) async fn compute<F: FileStore, H: HashAlgorithm>(
 		.collect();
 	let mut untracked = Vec::new();
 	let mut ignore_stack: Vec<DirIgnore> = Vec::new();
-	collect_untracked(
-		wt.work_dir(),
-		"",
-		&tracked,
-		&mut ignore_stack,
-		&mut untracked,
-	)?;
+	collect_untracked(wt.work(), "", &tracked, &mut ignore_stack, &mut untracked)?;
 
 	let mut merged: BTreeMap<String, StatusEntry> = BTreeMap::new();
 
@@ -115,7 +109,7 @@ pub(crate) async fn compute<F: FileStore, H: HashAlgorithm>(
 
 	// Working tree vs index (the Y column).
 	for entry in index.entries.iter().filter(|e| e.stage == 0) {
-		let code = worktree_change(entry, &wt.work_dir().join(&entry.path))?;
+		let code = worktree_change(wt.work(), entry, &entry.path)?;
 		if code != ' ' {
 			at(&mut merged, &entry.path).worktree = code;
 		}
@@ -168,8 +162,8 @@ fn at<'a>(merged: &'a mut BTreeMap<String, StatusEntry>, path: &str) -> &'a mut 
 		})
 }
 
-pub(crate) async fn head_entries<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub(crate) async fn head_entries<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 ) -> Result<HashMap<String, (String, ObjectId<H>)>, WorktreeError> {
 	let Some(commit) = wt.repository().refs().resolve_head().await? else {
 		return Ok(HashMap::new());
@@ -189,43 +183,29 @@ pub(crate) async fn head_entries<F: FileStore, H: HashAlgorithm>(
 /// directory, skip ignored entries, and collapse a fully-untracked directory to a
 /// single `dir/` entry (git's default untracked mode). Tracked files are skipped
 /// (their worktree status is handled separately).
-fn collect_untracked(
-	dir_path: &Path,
+fn collect_untracked<W: WorkDirFs>(
+	work: &W,
 	dir_rel: &str,
 	tracked: &HashSet<String>,
 	stack: &mut Vec<DirIgnore>,
 	out: &mut Vec<String>,
 ) -> Result<(), WorktreeError> {
-	let pushed = match std::fs::read_to_string(dir_path.join(".gitignore")) {
-		Ok(text) => {
-			stack.push(ignore::parse(&text, dir_rel));
-			true
-		}
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-		Err(error) => return Err(error.into()),
-	};
+	let pushed = push_gitignore(work, dir_rel, stack)?;
 
-	for entry in std::fs::read_dir(dir_path)? {
-		let entry = entry?;
-		let name = entry.file_name();
-		let name = name.to_string_lossy();
-		if name == ".git" {
+	for entry in work.read_dir(dir_rel)? {
+		if entry.name == ".git" {
 			continue;
 		}
-		let rel = if dir_rel.is_empty() {
-			name.into_owned()
-		} else {
-			format!("{dir_rel}/{name}")
-		};
-		// `DirEntry::metadata` does not traverse symlinks (like `lstat`).
-		let is_dir = entry.metadata()?.is_dir();
+		let rel = join_rel(dir_rel, &entry.name);
+		// The entry's kind is an `lstat` (a symlinked directory is a symlink, not a directory).
+		let is_dir = entry.kind.is_dir();
 		if ignore::is_ignored(&rel, is_dir, stack) {
 			continue;
 		}
 		if is_dir {
 			let prefix = format!("{rel}/");
 			if tracked.iter().any(|path| path.starts_with(&prefix)) {
-				collect_untracked(&entry.path(), &rel, tracked, stack, out)?;
+				collect_untracked(work, &rel, tracked, stack, out)?;
 			} else {
 				out.push(prefix); // fully-untracked directory → "dir/"
 			}
@@ -240,19 +220,18 @@ fn collect_untracked(
 	Ok(())
 }
 
-fn worktree_change<H: HashAlgorithm>(
+fn worktree_change<W: WorkDirFs, H: HashAlgorithm>(
+	work: &W,
 	entry: &IndexEntry<H>,
-	full: &Path,
+	path: &str,
 ) -> Result<char, WorktreeError> {
-	let meta = match std::fs::symlink_metadata(full) {
-		Ok(meta) => meta,
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok('D'),
-		Err(error) => return Err(error.into()),
+	let Some(meta) = work.lstat(path)? else {
+		return Ok('D');
 	};
 	if stat_matches(entry, &meta) {
 		return Ok(' ');
 	}
-	match blob_of(full, &meta)? {
+	match blob_of(work, path, &meta)? {
 		Some((oid, mode)) if oid == entry.oid && mode == entry.mode => Ok(' '),
 		_ => Ok('M'),
 	}

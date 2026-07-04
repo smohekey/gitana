@@ -25,7 +25,7 @@ struct Diff {
 impl WorkTreeCommand for Diff {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<Backend, H>,
+		worktree: WorkTree<Backend, crate::WorkDir, H>,
 		_prefix: String,
 	) -> Result<()> {
 		let files = if self.cached {

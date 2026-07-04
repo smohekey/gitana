@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
+use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
@@ -37,8 +38,8 @@ pub async fn operation_in_progress<F: FileStore, H: HashAlgorithm>(
 /// Write the merged result to the work tree (conflicted files carry markers) and record the conflict
 /// stages (1/2/3 from base/ours/theirs) in the index. Refuses — before any caller records operation
 /// state — if the checkout would clobber a touched local change.
-pub async fn write_conflicted_state<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	merged_tree: ObjectId<H>,
 	base_tree: ObjectId<H>,
 	ours_tree: ObjectId<H>,
@@ -67,8 +68,8 @@ pub async fn write_conflicted_state<F: FileStore, H: HashAlgorithm>(
 /// The tree captured by the resolved index, refusing while unmerged stages remain. An empty index is
 /// valid here (e.g. a delete/modify conflict resolved by deletion): `write_tree(&[])` is an empty
 /// tree, unlike an ordinary commit which rejects it.
-pub async fn resolved_tree<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn resolved_tree<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 ) -> Result<ObjectId<H>> {
 	let index = wt.load_index().await?;
 	if index.has_conflicts() {
@@ -82,8 +83,8 @@ pub async fn resolved_tree<F: FileStore, H: HashAlgorithm>(
 
 /// The tree the index currently records (stage-0 entries only), assuming no unmerged stages. Used
 /// to require a clean index before starting an operation (the index must equal `HEAD`).
-pub async fn index_tree<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn index_tree<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 ) -> Result<ObjectId<H>> {
 	let entries = wt.load_index().await?.tree_entries();
 	Ok(wt.repository().write_tree(&entries).await?)
@@ -91,7 +92,9 @@ pub async fn index_tree<F: FileStore, H: HashAlgorithm>(
 
 /// Restore the work tree and index to the (unmoved) `HEAD`, discarding conflict markers and unmerged
 /// stages — the shared core of `--abort`. The caller clears its own operation state afterwards.
-pub async fn restore_to_head<F: FileStore, H: HashAlgorithm>(wt: &WorkTree<F, H>) -> Result<()> {
+pub async fn restore_to_head<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+) -> Result<()> {
 	let repository = wt.repository();
 	let Some(head) = repository.refs().resolve_head().await? else {
 		bail!("HEAD is unborn");

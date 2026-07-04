@@ -7,6 +7,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use gitana_file_store::FileStore;
+use gitana_file_store_local::WorkDirFs;
 use gitana_git_http::{
 	Advertised, CertCommand, PushCert, RefUpdate, build_pack, build_push_cert,
 	build_receive_pack_request, parse_advertisement, parse_report_status,
@@ -193,13 +194,13 @@ pub async fn pull_upstream<F: FileStore, H: HashAlgorithm>(
 /// Clone the advertised repository into `work_dir` (whose `.git` backs `repo`): initialise it (writing
 /// a config matching `H`), download every advertised tip, recreate the refs and `HEAD`, save the
 /// origin, and check out `HEAD`. `advertisement` is the already-fetched `GET /info/refs` body.
-pub async fn clone<F: FileStore, H: HashAlgorithm>(
+pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	repo: Repository<F, H>,
 	origin: &Origin,
 	advertisement: &[u8],
-	work_dir: &Path,
+	work: W,
+	git_dir: &Path,
 ) -> Result<()> {
-	let git_dir = work_dir.join(".git");
 	repo.init().await?;
 
 	let advertised = parse_advertisement::<H>(advertisement)?;
@@ -216,12 +217,12 @@ pub async fn clone<F: FileStore, H: HashAlgorithm>(
 		.clone()
 		.unwrap_or_else(|| "refs/heads/main".to_owned());
 	repo.refs().set_head_symbolic(&head_target).await?;
-	origin.save(&git_dir)?;
+	origin.save(git_dir)?;
 
 	// Populate the working tree from HEAD (if the repo had any commits).
 	if let Some(commit) = repo.refs().resolve_head().await? {
 		let tree = repo.commit_tree(commit).await?;
-		let worktree = WorkTree::new(repo, work_dir, git_dir);
+		let worktree = WorkTree::new(repo, work, git_dir);
 		worktree.checkout(tree, true).await?;
 	}
 	Ok(())

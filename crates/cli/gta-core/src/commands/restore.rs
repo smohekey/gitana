@@ -42,7 +42,7 @@ struct Restore {
 impl WorkTreeCommand for Restore {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<Backend, H>,
+		worktree: WorkTree<Backend, crate::WorkDir, H>,
 		prefix: String,
 	) -> Result<()> {
 		if self.paths.is_empty() {

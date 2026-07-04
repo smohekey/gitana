@@ -2,6 +2,7 @@
 
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
+use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_worktree::WorkTree;
 
@@ -13,8 +14,8 @@ use crate::Identity;
 /// reports "nothing to commit" rather than an identity error. `identity` is asked for the author and
 /// committer lines only once a commit will actually be made, so the caller can resolve `GIT_*` /
 /// config lazily.
-pub async fn commit<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn commit<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	message: &str,
 	identity: &impl Identity,
 ) -> Result<ObjectId<H>> {

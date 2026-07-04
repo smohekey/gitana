@@ -46,7 +46,7 @@ struct Reset {
 impl WorkTreeCommand for Reset {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<Backend, H>,
+		worktree: WorkTree<Backend, crate::WorkDir, H>,
 		prefix: String,
 	) -> Result<()> {
 		if [self.soft, self.mixed, self.hard]

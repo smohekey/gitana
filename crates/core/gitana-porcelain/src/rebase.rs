@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
+use gitana_file_store_local::WorkDirFs;
 use gitana_object::{Commit, HashAlgorithm, ObjectId, parse_commit};
 use gitana_repository::{HeadState, RebaseState, Repository};
 use gitana_worktree::WorkTree;
@@ -36,8 +37,8 @@ pub enum RebaseOutcome<H: HashAlgorithm> {
 /// Replays the branch's commits that are not in `upstream`, oldest-first, as fresh cherry-picks. A
 /// merge commit in the range is refused (linear histories only); commits that become empty are
 /// dropped, while originally-empty commits are kept.
-pub async fn rebase<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	upstream: Option<String>,
 	onto: Option<String>,
 	identity: &impl Identity,
@@ -127,8 +128,8 @@ pub async fn rebase<F: FileStore, H: HashAlgorithm>(
 }
 
 /// Conclude the stopped step (commit the resolved index, preserving the commit's author), then resume.
-pub async fn continue_rebase<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn continue_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	identity: &impl Identity,
 ) -> Result<RebaseOutcome<H>> {
 	let repository = wt.repository();
@@ -159,8 +160,8 @@ pub async fn continue_rebase<F: FileStore, H: HashAlgorithm>(
 }
 
 /// Drop the stopped commit and resume.
-pub async fn skip_rebase<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn skip_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	identity: &impl Identity,
 ) -> Result<RebaseOutcome<H>> {
 	let repository = wt.repository();
@@ -176,8 +177,8 @@ pub async fn skip_rebase<F: FileStore, H: HashAlgorithm>(
 }
 
 /// Abort the rebase: restore the branch and work tree to the pre-rebase tip.
-pub async fn abort_rebase<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn abort_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	identity: &impl Identity,
 ) -> Result<()> {
 	let repository = wt.repository();
@@ -195,8 +196,8 @@ pub async fn abort_rebase<F: FileStore, H: HashAlgorithm>(
 }
 
 /// Replay the remaining commits from the persisted state until one conflicts or the list is empty.
-async fn replay<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	identity: &impl Identity,
 ) -> Result<RebaseOutcome<H>> {
 	let repository = wt.repository();
@@ -269,8 +270,8 @@ async fn replay<F: FileStore, H: HashAlgorithm>(
 }
 
 /// Move the current branch to `target` and update the work tree to match.
-async fn move_branch_to<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+async fn move_branch_to<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	target: ObjectId<H>,
 	committer: &str,
 	reflog: &str,
@@ -349,7 +350,10 @@ mod tests {
 	use crate::test_support::{TestIdentity, commit_file, fixture, loose_commit};
 
 	/// Point `refs/heads/upstream` at `tip`.
-	async fn set_upstream(wt: &WorkTree<impl FileStore, Sha256>, tip: ObjectId<Sha256>) {
+	async fn set_upstream(
+		wt: &WorkTree<impl FileStore, impl WorkDirFs, Sha256>,
+		tip: ObjectId<Sha256>,
+	) {
 		wt.repository()
 			.refs()
 			.update_ref("refs/heads/upstream", tip, None)

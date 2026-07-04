@@ -46,7 +46,7 @@ pub trait RepoCommand {
 pub trait WorkTreeCommand {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<Backend, H>,
+		worktree: WorkTree<Backend, crate::WorkDir, H>,
 		prefix: String,
 	) -> Result<()>;
 }
@@ -66,6 +66,7 @@ pub async fn on_repo<C: RepoCommand>(cwd: &Path, command: C) -> Result<()> {
 pub async fn on_worktree<C: WorkTreeCommand>(cwd: &Path, command: C) -> Result<()> {
 	let (found, prefix) = repo::discover_worktree_with_prefix(cwd)?;
 	let work = found.work.clone().expect("discovered work tree");
+	let work = repo::open_work_dir(&work)?;
 	match detect_algorithm(&found.common_dir)? {
 		HashKind::Sha1 => {
 			let wt = WorkTree::new(open::<Sha1>(&found)?, work, found.git_dir);
@@ -123,6 +124,7 @@ async fn resolve_object<H: HashAlgorithm>(
 			.work
 			.clone()
 			.ok_or_else(|| anyhow!("this operation must be run in a work tree"))?;
+		let work = repo::open_work_dir(&work)?;
 		WorkTree::new(open::<H>(found)?, work, found.git_dir.clone())
 			.rev_parse(spec)
 			.await?

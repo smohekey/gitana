@@ -14,6 +14,7 @@
 use std::collections::BTreeSet;
 
 use gitana_file_store::FileStore;
+use gitana_file_store_local::WorkDirFs;
 use gitana_object::HashAlgorithm;
 
 use crate::checkout::{remove_worktree_file, validate_path};
@@ -33,8 +34,8 @@ pub struct RmOutcome {
 	pub failure: Option<WorktreeError>,
 }
 
-pub(crate) async fn run<F, H>(
-	wt: &WorkTree<F, H>,
+pub(crate) async fn run<F, W, H>(
+	wt: &WorkTree<F, W, H>,
 	pathspecs: &[&str],
 	prefix: &str,
 	cached: bool,
@@ -44,6 +45,7 @@ pub(crate) async fn run<F, H>(
 ) -> Result<RmOutcome, WorktreeError>
 where
 	F: FileStore,
+	W: WorkDirFs,
 	H: HashAlgorithm,
 {
 	let mut index = wt.load_index().await?;
@@ -96,19 +98,16 @@ where
 			let Some(entry) = index.entry(path) else {
 				continue;
 			};
-			let full = wt.work_dir().join(path);
-			let meta = match std::fs::symlink_metadata(&full) {
-				Ok(meta) => meta,
-				// Already gone from the working tree — nothing to lose by dropping the index entry.
-				Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-				Err(error) => return Err(error.into()),
+			// Already gone from the working tree — nothing to lose by dropping the index entry.
+			let Some(meta) = wt.work().lstat(path)? else {
+				continue;
 			};
 
 			// `local`: the working-tree file differs from the index entry.
 			let local = if stat_matches(entry, &meta) {
 				false
 			} else {
-				match blob_of(&full, &meta)? {
+				match blob_of(wt.work(), path, &meta)? {
 					Some((oid, mode)) => oid != entry.oid || mode != entry.mode,
 					None => true,
 				}

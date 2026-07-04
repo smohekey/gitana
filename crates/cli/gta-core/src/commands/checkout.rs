@@ -37,7 +37,7 @@ struct Checkout {
 impl WorkTreeCommand for Checkout {
 	async fn run<H: HashAlgorithm>(
 		self,
-		worktree: WorkTree<Backend, H>,
+		worktree: WorkTree<Backend, crate::WorkDir, H>,
 		prefix: String,
 	) -> Result<()> {
 		let source = match self.target {

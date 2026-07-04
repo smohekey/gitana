@@ -2,6 +2,7 @@
 
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
+use gitana_file_store_local::WorkDirFs;
 use gitana_object::{Commit, HashAlgorithm, ObjectId, parse_commit};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
@@ -23,8 +24,8 @@ pub enum RevertOutcome<H: HashAlgorithm> {
 ///
 /// Records a new single-parent commit that undoes the change `commit_spec` introduced — a three-way
 /// merge of the commit, `HEAD`, and the commit's parent — authored by the current user.
-pub async fn revert<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	commit_spec: &str,
 	identity: &impl Identity,
 ) -> Result<RevertOutcome<H>> {
@@ -114,8 +115,8 @@ pub async fn revert<F: FileStore, H: HashAlgorithm>(
 /// Conclude an in-progress revert: a single-parent commit from the resolved index, authored by the
 /// current user, returning the new commit id. Shared by `revert --continue` (`message_override = None`,
 /// uses `MERGE_MSG`) and `gta commit` during a revert. Refuses while the index has unmerged stages.
-pub async fn continue_revert<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn continue_revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 	message_override: Option<String>,
 	identity: &impl Identity,
 ) -> Result<ObjectId<H>> {
@@ -149,7 +150,9 @@ pub async fn continue_revert<F: FileStore, H: HashAlgorithm>(
 
 /// Abort an in-progress revert: restore the work tree and index to the (unmoved) `HEAD` and clear the
 /// revert state. Like `git revert --abort`.
-pub async fn abort_revert<F: FileStore, H: HashAlgorithm>(wt: &WorkTree<F, H>) -> Result<()> {
+pub async fn abort_revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+) -> Result<()> {
 	let repository = wt.repository();
 	if repository.revert_head().await?.is_none() {
 		bail!("there is no revert to abort (REVERT_HEAD is missing)");

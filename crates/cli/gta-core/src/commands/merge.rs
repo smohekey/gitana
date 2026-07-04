@@ -53,7 +53,11 @@ struct Merge {
 }
 
 impl WorkTreeCommand for Merge {
-	async fn run<H: HashAlgorithm>(self, wt: WorkTree<Backend, H>, _prefix: String) -> Result<()> {
+	async fn run<H: HashAlgorithm>(
+		self,
+		wt: WorkTree<Backend, crate::WorkDir, H>,
+		_prefix: String,
+	) -> Result<()> {
 		if self.abort {
 			return gitana_porcelain::abort_merge(&wt).await;
 		}

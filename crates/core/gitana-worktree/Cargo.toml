@@ -11,12 +11,12 @@ workspace = true
 
 [dependencies]
 gitana-file-store.workspace = true
+gitana-file-store-local.workspace = true
 gitana-object.workspace = true
 gitana-repository.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-gitana-file-store-local.workspace = true
 gitana-object-store.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 

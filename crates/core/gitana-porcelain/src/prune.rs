@@ -11,6 +11,7 @@ use std::collections::HashSet;
 
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
+use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_tag, referenced_ids};
 use gitana_object_store::{BitmapReport, ObjectStoreError, PruneReport, RepackReport};
 use gitana_repository::Repository;
@@ -19,7 +20,9 @@ use gitana_worktree::WorkTree;
 /// Delete loose objects that no root can reach. Refuses while a merge, cherry-pick, revert, or
 /// rebase is in progress — those objects are protected as roots, but a half-applied tree is no
 /// time to prune.
-pub async fn prune<F: FileStore, H: HashAlgorithm>(wt: &WorkTree<F, H>) -> Result<PruneReport> {
+pub async fn prune<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+) -> Result<PruneReport> {
 	let repo = wt.repository();
 	refuse_if_linked_worktrees(repo).await?;
 	refuse_if_operation_in_progress(repo).await?;
@@ -37,8 +40,8 @@ const GEOMETRIC_FACTOR: u64 = 2;
 /// rolls only the small packs + loose into new ones, so `gc` stays cheap as history grows (use
 /// `gta repack` for a full consolidation). Finally the ref tips are bitmapped so later reachability
 /// queries (fetch negotiation, `rev-list`) can skip the history walk.
-pub async fn gc<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+pub async fn gc<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 ) -> Result<(PruneReport, Option<RepackReport>, Option<BitmapReport>)> {
 	let prune = prune(wt).await?;
 	let repo = wt.repository();
@@ -57,8 +60,8 @@ pub async fn gc<F: FileStore, H: HashAlgorithm>(
 /// Covers direct refs, symbolic-ref targets, and `HEAD` (the same roots `prune` protects), and
 /// peels an annotated tag to the commit it names (as git does), so a tag on an otherwise unselected
 /// commit still gets bitmapped. Deduplicated; the object store filters to packed commits.
-async fn ref_tip_ids<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+async fn ref_tip_ids<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 ) -> Result<Vec<ObjectId<H>>> {
 	let repo = wt.repository();
 	let refs = repo.refs();
@@ -146,8 +149,8 @@ async fn refuse_if_operation_in_progress<F: FileStore, H: HashAlgorithm>(
 /// Every root a prune must keep reachable: refs (direct *and* symbolic-ref targets), HEAD, the
 /// index (all stages, so a staged-but-uncommitted blob survives), the reflogs, and any
 /// in-progress-operation head (`ORIG_HEAD` and the merge / cherry-pick / revert / rebase heads).
-async fn collect_roots<F: FileStore, H: HashAlgorithm>(
-	wt: &WorkTree<F, H>,
+async fn collect_roots<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
 ) -> Result<Vec<ObjectId<H>>> {
 	let repo = wt.repository();
 	let refs = repo.refs();

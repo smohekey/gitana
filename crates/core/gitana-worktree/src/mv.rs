@@ -8,9 +8,9 @@
 //! filesystem change so a held lock or a bad plan never leaves a half-applied move.
 
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use gitana_file_store::FileStore;
+use gitana_file_store_local::WorkDirFs;
 use gitana_object::HashAlgorithm;
 
 use crate::checkout::validate_path;
@@ -18,8 +18,8 @@ use crate::fsmeta::{blob_of, stat_of};
 use crate::pathspec::normalize;
 use crate::{IndexEntry, Stat, WorkTree, WorktreeError};
 
-pub(crate) async fn run<F, H>(
-	wt: &WorkTree<F, H>,
+pub(crate) async fn run<F, W, H>(
+	wt: &WorkTree<F, W, H>,
 	sources: &[&str],
 	dest: &str,
 	prefix: &str,
@@ -28,6 +28,7 @@ pub(crate) async fn run<F, H>(
 ) -> Result<Vec<(String, String)>, WorktreeError>
 where
 	F: FileStore,
+	W: WorkDirFs,
 	H: HashAlgorithm,
 {
 	let mut index = wt.load_index().await?;
@@ -39,10 +40,7 @@ where
 		.collect();
 
 	let (dest_norm, dest_trailing_slash) = normalize(dest, prefix)?;
-	let dest_is_dir = matches!(
-		std::fs::symlink_metadata(wt.work_dir().join(&dest_norm)),
-		Ok(meta) if meta.is_dir() && !meta.is_symlink()
-	);
+	let dest_is_dir = matches!(wt.work().lstat(&dest_norm)?, Some(meta) if meta.kind.is_dir());
 	// A directory target: several sources, an explicit trailing slash, or an existing directory.
 	let into_dir = sources.len() > 1 || dest_trailing_slash || dest_is_dir;
 	if into_dir && !dest_is_dir {
@@ -64,7 +62,7 @@ where
 		// as `.git/config` must not be moved (`rm`/`restore` guard their selected paths the same
 		// way). The destination side is validated below, including each remapped sub-entry.
 		validate_path(&src_norm)?;
-		if std::fs::symlink_metadata(wt.work_dir().join(&src_norm)).is_err() {
+		if wt.work().lstat(&src_norm)?.is_none() {
 			return Err(WorktreeError::MvBadSource(src.to_owned()));
 		}
 
@@ -90,13 +88,11 @@ where
 		if dst == src_norm || dst.starts_with(&dir_prefix) {
 			return Err(WorktreeError::MvIntoSelf(src.to_owned()));
 		}
-		if !force && std::fs::symlink_metadata(wt.work_dir().join(&dst)).is_ok() {
+		if !force && wt.work().lstat(&dst)?.is_some() {
 			return Err(WorktreeError::MvDestinationExists(dst));
 		}
-		if let Some(parent) = Path::new(&dst)
-			.parent()
-			.filter(|p| !p.as_os_str().is_empty())
-			&& !wt.work_dir().join(parent).is_dir()
+		if let Some(parent) = dst.rfind('/').map(|i| &dst[..i])
+			&& !matches!(wt.work().lstat(parent)?, Some(meta) if meta.kind.is_dir())
 		{
 			return Err(WorktreeError::MvDestinationDirMissing(dst));
 		}
@@ -113,7 +109,9 @@ where
 	// Lock the index before the first rename, so a held lock aborts before any file moves.
 	let lock = wt.lock_index().await?;
 	for (src_norm, dst) in &moves {
-		let step = std::fs::rename(wt.work_dir().join(src_norm), wt.work_dir().join(dst))
+		let step = wt
+			.work()
+			.rename(src_norm, dst)
 			.map_err(WorktreeError::from)
 			.and_then(|()| reindex(wt, &mut index, src_norm, dst));
 		// On a mid-move failure, release the lock so it is not left stale; the moves already
@@ -130,14 +128,15 @@ where
 /// Move `src`'s index entries to `dst`: a single file entry, or every entry under `src/` with its
 /// path re-prefixed. The blob id and mode are kept (the content did not change); see [`remap`] for
 /// how the stat cache is handled.
-fn reindex<F, H>(
-	wt: &WorkTree<F, H>,
+fn reindex<F, W, H>(
+	wt: &WorkTree<F, W, H>,
 	index: &mut crate::Index<H>,
 	src: &str,
 	dst: &str,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
+	W: WorkDirFs,
 	H: HashAlgorithm,
 {
 	if let Some(entry) = index.entry(src).cloned() {
@@ -168,19 +167,22 @@ where
 /// unchanged). The stat cache is refreshed from the moved file only if its content still matches
 /// the staged blob; otherwise a default stat is left, so a moved-but-dirty file is not hidden — it
 /// cannot match the cache, forcing `status` to re-hash and report the unstaged modification.
-fn remap<F, H>(
-	wt: &WorkTree<F, H>,
+fn remap<F, W, H>(
+	wt: &WorkTree<F, W, H>,
 	mut entry: IndexEntry<H>,
 	new_path: &str,
 ) -> Result<IndexEntry<H>, WorktreeError>
 where
 	F: FileStore,
+	W: WorkDirFs,
 	H: HashAlgorithm,
 {
-	let full = wt.work_dir().join(new_path);
-	let meta = std::fs::symlink_metadata(&full)?;
+	let meta = wt
+		.work()
+		.lstat(new_path)?
+		.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "moved entry is missing"))?;
 	let clean = matches!(
-		blob_of(&full, &meta)?,
+		blob_of(wt.work(), new_path, &meta)?,
 		Some((oid, mode)) if oid == entry.oid && mode == entry.mode
 	);
 	entry.stat = if clean {

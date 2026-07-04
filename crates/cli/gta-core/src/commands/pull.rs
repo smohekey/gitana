@@ -42,7 +42,11 @@ async fn pull_into<H: HashAlgorithm>(
 		.clone()
 		.context("cannot pull in a bare repository")?;
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
-	let worktree = WorkTree::new(repository, work, found.git_dir.clone());
+	let worktree = WorkTree::new(
+		repository,
+		repo::open_work_dir(&work)?,
+		found.git_dir.clone(),
+	);
 
 	// `update_head_ok`: a fetch refspec may map straight into the checked-out branch (a mirror config
 	// like `+refs/heads/*:refs/heads/*`); the merge below advances that branch and the work tree.

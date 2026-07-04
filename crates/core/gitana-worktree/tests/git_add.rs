@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
-use gitana_file_store_local::LocalFileStore;
+use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::Sha256;
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
@@ -39,7 +39,7 @@ async fn add_stages_like_git() {
 	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
 		open_dir(&git_dir),
 	)));
-	WorkTree::new(repo, &work, &git_dir)
+	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
 		.add(&paths, "")
 		.await
 		.unwrap();
@@ -86,7 +86,7 @@ async fn add_with_prefix_is_relative_to_subdirectory() {
 	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
 		open_dir(&git_dir),
 	)));
-	WorkTree::new(repo, &work, &git_dir)
+	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
 		.add(&["a.txt"], "sub")
 		.await
 		.unwrap();
@@ -110,7 +110,7 @@ async fn add_with_prefix_is_relative_to_subdirectory() {
 	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
 		open_dir(&git_dir),
 	)));
-	WorkTree::new(repo, &work, &git_dir)
+	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
 		.add(&["../a.txt"], "sub")
 		.await
 		.unwrap();
@@ -145,7 +145,7 @@ async fn add_trailing_slash_requires_a_directory() {
 	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
 		open_dir(&git_dir),
 	)));
-	let wt = WorkTree::new(repo, &work, &git_dir);
+	let wt = WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir);
 
 	// `a.txt/` and `a.txt/.` name a file as a directory: git rejects them, and so do we.
 	for spec in ["a.txt/", "a.txt/."] {
@@ -182,7 +182,7 @@ async fn add_rewrites_index_on_file_directory_type_change() {
 	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
 		open_dir(&git_dir),
 	)));
-	let wt = WorkTree::new(repo, &work, &git_dir);
+	let wt = WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir);
 
 	// Stage `thing` as a file.
 	std::fs::write(work.join("thing"), b"FILE\n").unwrap();

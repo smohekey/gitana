@@ -52,6 +52,23 @@ use tokio::sync::Mutex as AsyncMutex;
 mod worktree;
 pub use worktree::WorktreeFileStore;
 
+// The working-tree filesystem capability: a directory-rooted `lstat`/read/readdir/write/symlink/…
+// surface richer than `FileStore`'s flat byte API, for `gitana-worktree`. The trait and its metadata
+// types are target-agnostic; the native `CapWorkDir` (over a cap-std `Dir`) is native-only, with the
+// unix-vs-other split (real mode/uid/gid and symlink bytes vs a degraded fallback) contained inside
+// it — the platform boundary. A WASI implementation follows in a later slice.
+mod file_kind;
+mod meta;
+mod work_dir_fs;
+pub use file_kind::FileKind;
+pub use meta::Meta;
+pub use work_dir_fs::{DirEntry, WorkDirFs};
+
+#[cfg(not(target_arch = "wasm32"))]
+mod cap_work_dir;
+#[cfg(not(target_arch = "wasm32"))]
+pub use cap_work_dir::CapWorkDir;
+
 #[cfg(target_arch = "wasm32")]
 mod descriptor_backend;
 #[cfg(target_arch = "wasm32")]
