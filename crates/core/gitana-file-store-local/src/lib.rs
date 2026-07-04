@@ -5,7 +5,7 @@
 //! content-hash CAS, per-path locking, streamed writes) are written once on top of it.
 //! Two backends are selected at compile time:
 //!
-//! - **native** (`CapBackend`): a [`cap_std::fs::Dir`] *capability* — the `Dir` *is*
+//! - **native** (`CapBackend`): a `cap_std::fs::Dir` *capability* — the `Dir` *is*
 //!   the sandbox, so traversal and symlink escapes are rejected structurally (no
 //!   `canonicalize` dance, no TOCTOU window).
 //! - **wasm** (`DescriptorBackend`): an open `wasi:filesystem` directory *descriptor*
