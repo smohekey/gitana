@@ -26,7 +26,7 @@ gitana-git-http = { path = "crates/core/gitana-git-http" }
 gitana-identity = { path = "crates/core/gitana-identity" }
 gitana-object = { path = "crates/core/gitana-object" }
 gitana-object-store = { path = "crates/core/gitana-object-store" }
-gitana-porcelain = { path = "crates/core/gitana-porcelain" }
+gitana-porcelain = { path = "crates/core/gitana-porcelain", default-features = false }
 gitana-remote = { path = "crates/core/gitana-remote", default-features = false }
 gitana-repository = { path = "crates/core/gitana-repository" }
 gitana-worktree = { path = "crates/core/gitana-worktree" }
@@ -43,6 +43,7 @@ tokio = "1.52.3"
 wasip2 = "1.0.4"
 wasmtime = "46"
 wasmtime-wasi = "46"
+wasmtime-wasi-http = "46"
 wit-bindgen = "0.58"
 
 [workspace.lints.rust]

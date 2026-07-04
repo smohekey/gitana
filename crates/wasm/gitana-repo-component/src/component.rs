@@ -3,8 +3,8 @@
 use wasip2::filesystem::types::Descriptor;
 
 use crate::bindings::exports::gitana::repo::porcelain::{
-	CommitInfo, Guest, GuestRepository, HashKind, HeadState, ObjectInfo, RefEntry, RepackReport,
-	RepoError, Repository, TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
+	CommitInfo, FetchOutcome, Guest, GuestRepository, HashKind, HeadState, ObjectInfo, RefEntry,
+	RepackReport, RepoError, Repository, TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
 };
 use crate::inner::Inner;
 
@@ -123,6 +123,10 @@ impl GuestRepository for GitanaRepository {
 
 	fn repack(&self, geometric: bool) -> Result<Option<RepackReport>, RepoError> {
 		self.inner.repack(geometric)
+	}
+
+	fn fetch(&self, url: String) -> Result<FetchOutcome, RepoError> {
+		self.inner.fetch(&url)
 	}
 
 	fn write_tree(&self, entries: Vec<TreeBuildEntry>) -> Result<String, RepoError> {

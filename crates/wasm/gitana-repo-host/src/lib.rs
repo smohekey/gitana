@@ -19,6 +19,8 @@ use wasmtime_wasi::filesystem::{Descriptor, Dir};
 use wasmtime_wasi::{
 	DirPerms, FilePerms, OpenMode, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
+use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 // wasmtime-wasi constructs its `Dir` from the cap-std major it was built against (3.x),
 // while the gitana workspace is on cap-std 4.x — the two must not be conflated, so the
@@ -31,14 +33,18 @@ wasmtime::component::bindgen!({
 	imports: { default: async },
 	exports: { default: async },
 	with: {
+		// `wasi:http` is satisfied by wasmtime-wasi-http's own host bindings (longest-prefix wins over
+		// the general `wasi` mapping below), so the guest's outgoing-handler import is host-mediated.
+		"wasi:http": wasmtime_wasi_http::p2::bindings::http,
 		"wasi": wasmtime_wasi::p2::bindings,
 	},
 });
 
-/// Store state: the WASI context (no preopens) plus the resource table descriptors are
-/// minted into.
+/// Store state: the WASI context (no preopens), the `wasi:http` context, and the resource
+/// table descriptors are minted into.
 pub struct State {
 	ctx: WasiCtx,
+	http_ctx: WasiHttpCtx,
 	table: ResourceTable,
 }
 
@@ -47,6 +53,16 @@ impl WasiView for State {
 		WasiCtxView {
 			ctx: &mut self.ctx,
 			table: &mut self.table,
+		}
+	}
+}
+
+impl WasiHttpView for State {
+	fn http(&mut self) -> WasiHttpCtxView<'_> {
+		WasiHttpCtxView {
+			ctx: &mut self.http_ctx,
+			table: &mut self.table,
+			hooks: Default::default(),
 		}
 	}
 }
@@ -64,6 +80,7 @@ pub fn store(engine: &Engine) -> Store<State> {
 		engine,
 		State {
 			ctx,
+			http_ctx: WasiHttpCtx::new(),
 			table: ResourceTable::new(),
 		},
 	)
@@ -79,6 +96,7 @@ pub async fn instantiate(
 		.with_context(|| format!("loading component {}", component_path.display()))?;
 	let mut linker = Linker::new(engine);
 	wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+	wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
 	Ok(Repo::instantiate_async(store, &component, &linker).await?)
 }
 

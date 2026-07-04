@@ -22,6 +22,9 @@ mod bindings {
 			"wasi:io/poll@0.2.12": wasip2::io::poll,
 			"wasi:io/streams@0.2.12": wasip2::io::streams,
 			"wasi:clocks/wall-clock@0.2.12": wasip2::clocks::wall_clock,
+			"wasi:clocks/monotonic-clock@0.2.12": wasip2::clocks::monotonic_clock,
+			"wasi:http/types@0.2.12": wasip2::http::types,
+			"wasi:http/outgoing-handler@0.2.12": wasip2::http::outgoing_handler,
 		},
 	});
 }
@@ -34,6 +37,8 @@ mod component;
 mod inner;
 #[cfg(target_arch = "wasm32")]
 mod ops;
+#[cfg(target_arch = "wasm32")]
+mod wasi_http_transport;
 
 #[cfg(target_arch = "wasm32")]
 use self::component::Component;

@@ -8,8 +8,8 @@ use gitana_worktree::WorkTree;
 use wasip2::filesystem::types::Descriptor;
 
 use crate::bindings::exports::gitana::repo::porcelain::{
-	CommitInfo, HashKind, HeadState, ObjectInfo, RefEntry, RepackReport, RepoError, TagInfo,
-	TreeBuildEntry, TreeEntry, WorktreeStatus,
+	CommitInfo, FetchOutcome, HashKind, HeadState, ObjectInfo, RefEntry, RepackReport, RepoError,
+	TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
 };
 use crate::block_on::block_on;
 use crate::ops;
@@ -229,6 +229,10 @@ impl Inner {
 
 	pub(crate) fn repack(&self, geometric: bool) -> Result<Option<RepackReport>, RepoError> {
 		dispatch!(self, held => block_on(ops::repack(held.repository(), geometric)))
+	}
+
+	pub(crate) fn fetch(&self, url: &str) -> Result<FetchOutcome, RepoError> {
+		dispatch!(self, held => block_on(ops::fetch(held.repository(), url)))
 	}
 
 	pub(crate) fn write_tree(&self, entries: Vec<TreeBuildEntry>) -> Result<String, RepoError> {

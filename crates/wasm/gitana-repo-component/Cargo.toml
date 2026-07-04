@@ -17,10 +17,18 @@ version = "0.1.0"
 crate-type = ["cdylib"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+anyhow.workspace = true
 gitana-file-store.workspace = true
 gitana-file-store-local.workspace = true
 gitana-object.workspace = true
 gitana-object-store.workspace = true
+# gitana-porcelain gives the component the remote composites (fetch/clone/push) over the injected
+# transport. Its `reqwest` forwarding is off (default-features = false at the workspace root), so no
+# HTTP stack enters the reactor — the network capability is the `wasi:http` import instead.
+gitana-porcelain.workspace = true
+# gitana-remote provides the `HttpTransport` trait the in-guest `WasiHttpTransport` implements (also
+# reqwest-free here).
+gitana-remote.workspace = true
 gitana-repository.workspace = true
 # gitana-worktree gives the component the working-tree porcelain (status/add/checkout/commit) over
 # the `DescriptorWorkDir` capability. It is deliberately the *only* worktree dep pulled in:

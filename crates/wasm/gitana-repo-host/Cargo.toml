@@ -20,11 +20,18 @@ anyhow.workspace = true
 cap-std-host = { package = "cap-std", version = "3.4" }
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
+# Satisfies the guest's `wasi:http/outgoing-handler` import so the in-component remote porcelain can
+# reach a Smart HTTP server. Outbound is host-mediated: the host mints the capability, not the guest.
+wasmtime-wasi-http.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# axum + gitana-git-http stand up a loopback Smart-HTTP server (gitana's OWN handlers) as the oracle
+# for the remote-porcelain e2e — the same pattern as gta's git_smart_http tests.
+axum.workspace = true
 cap-std.workspace = true
 gitana-file-store.workspace = true
 gitana-file-store-local.workspace = true
+gitana-git-http.workspace = true
 gitana-object.workspace = true
 gitana-object-store.workspace = true
 gitana-repository.workspace = true

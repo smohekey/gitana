@@ -160,19 +160,25 @@ open worktree item). Exact WIT surface is a per-slice decision, not settled here
 
 ## Slice plan
 
-1. **Trait + native impl, `reqwest` gated.** Introduce `HttpTransport`, move `http_get`/`http_post`
-   into `ReqwestTransport` behind a default feature, thread the parameter through `gitana-remote` and
-   `gitana-porcelain` and `gta-core`. Pure refactor — native behavior identical, full test suite
-   green, and `cargo check -p gitana-porcelain --target wasm32-wasip2 --no-default-features` (for
-   `gitana-remote`) newly passes. No component change yet. This is the bulk of the value and is
-   independently mergeable.
-2. **Vendor `wasi:http` WIT + `WasiHttpTransport`.** Add the import to the world, vendor the 0.2.12
-   WIT, implement the synchronous blocking transport (Option A), unit-proven against a local test
-   server in the host harness.
-3. **Component `clone`/`fetch`/`push` exports** + host e2e (`tests/remote.rs`) with a real in-process
-   Smart HTTP server as the oracle, both hash formats — mirroring the existing e2e style.
-
-Slices 2–3 may merge if they prove coupled (as 4+5 did for worktree threading).
+1. ~~**Trait + native impl, `reqwest` gated.**~~ **Done** (merged to main, `3739fe1`). Introduced
+   `HttpTransport`, moved `http_get`/`http_post` into `ReqwestTransport` behind a default feature,
+   threaded the parameter through `gitana-remote`/`gitana-porcelain`/`gta-core`. Pure refactor —
+   native behaviour identical; `gitana-porcelain` now `cargo check`s for wasm32-wasip2 with
+   `--no-default-features` (reqwest gone).
+2. ~~**Vendor `wasi:http` WIT + `WasiHttpTransport` + `fetch` export, proven e2e.**~~ **Done** (this
+   slice, `gitana:repo@0.5.0`). Vendored a trimmed `wasi:http@0.2.12` WIT (the `types` +
+   `outgoing-handler` interfaces only — dropping the `imports`/`proxy` worlds that reference
+   `wasi:random`/`wasi:cli`), remapped it onto the `wasip2` crate, and imported
+   `wasi:http/outgoing-handler` into the world. `WasiHttpTransport` is the synchronous blocking Option
+   A client (blocks inline on `wasi:io` pollables — `Pollable::block`, `InputStream::blocking_read`,
+   `OutputStream::blocking_write_and_flush` in ≤4 KiB chunks — so `block_on` never sees `Pending`).
+   The host gained `wasmtime-wasi-http` (`WasiHttpView` on `State`, `add_only_http_to_linker_async`).
+   The `fetch` export runs `porcelain::fetch` over the transport; host e2e `tests/remote.rs` proves a
+   real fetch from a loopback axum Smart-HTTP server in both hash formats. **Only `fetch`** landed —
+   it proves the whole architecture end to end.
+3. **Component `clone`/`push` exports** (follow-up) + e2e, over the same proven machinery. `clone`
+   adds init + hash-negotiation-from-the-wire + checkout; `push` adds the receive-pack POST (the
+   chunked-write path) and the unsigned push-cert path (signing stays out until the trust work).
 
 ## Verification gate (per slice)
 
@@ -187,12 +193,11 @@ the oracle; the guest must match byte-for-byte in both hash formats.
 1. ~~**Option A vs B** for the wasm transport~~ — **decided: Option A** (standard in-guest
    `wasi:http`, called synchronously). B stays the low-risk fallback if in-guest `wasi:http` proves
    fiddly under wasmtime 46.
-2. **Feature name / default** on `gitana-remote`: `reqwest-transport` (default on) is proposed, so
-   existing consumers are unaffected and only the wasm build opts out. Alternative: a `native` umbrella
-   feature.
-3. **Scope of the first component export set**: `fetch` only, or `clone`+`fetch`+`push` together?
-   `push` pulls in the (still unwired) signing path only for `--signed`; unsigned push is
-   self-contained.
-4. Whether to pull **all of `gitana-porcelain`** into the reactor or expose only its `remote` module's
-   functions as new exports (keeps the reactor's dependency surface smaller, as the current `commit`
-   reimplementation deliberately did).
+2. ~~**Feature name / default** on `gitana-remote`~~ — settled: `reqwest-transport`, default on;
+   `gitana-porcelain` mirrors it (`reqwest-transport = ["gitana-remote/reqwest-transport"]`). Both
+   default off at the workspace root so members opt in (gta-core explicitly; the component omits it).
+3. ~~**Scope of the first component export set**~~ — decided: `fetch` first (proves the transport,
+   smaller surface); `clone`+`push` as a follow-up. `push`'s signing path stays unwired.
+4. ~~Whether to pull **all of `gitana-porcelain`**~~ — pulled the whole crate in (reqwest gated off it
+   builds for wasip2 cleanly, and its production code was already capability-clean), reusing
+   `porcelain::fetch` unchanged rather than reimplementing it.

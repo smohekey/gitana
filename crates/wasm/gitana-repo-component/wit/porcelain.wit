@@ -1,4 +1,4 @@
-package gitana:repo@0.4.0;
+package gitana:repo@0.5.0;
 
 /// Repository operations over a capability-granted git directory.
 ///
@@ -107,6 +107,15 @@ interface porcelain {
 		name: string,
 		/// The object id the ref points at (hex).
 		id: string,
+	}
+
+	/// The outcome of a `fetch`: the tracking refs it advanced, and any it declined to.
+	record fetch-outcome {
+		/// Tracking refs advanced — name and new object id (hex).
+		updated: list<ref-entry>,
+		/// Tracking refs left unchanged because the update was not a fast-forward and the matching
+		/// refspec was not forced (no leading `+`); git rejects these too.
+		rejected: list<string>,
 	}
 
 	/// A symbolic HEAD with its resolved commit.
@@ -303,6 +312,18 @@ interface porcelain {
 		/// incremental strategy, factor 2). `none` when there was nothing to do.
 		repack: func(geometric: bool) -> result<option<repack-report>, repo-error>;
 
+		// -- Remote operations (over the host-granted `wasi:http` capability).
+
+		/// Fetch from the Smart HTTP remote at `url` (a base URL such as
+		/// `https://host/owner/repo.git`) over the host-granted `wasi:http` capability:
+		/// download the objects this repository lacks and update the tracking refs its
+		/// `remote.origin.fetch` refspecs map the advertised refs to (falling back to the
+		/// default `+refs/heads/*:refs/remotes/origin/*` when none are configured). The
+		/// working tree is not touched, so this works on a repository opened via `open` or
+		/// `open-worktree`. The remote's advertised object-format must match this
+		/// repository's, else `invalid`.
+		fetch: func(url: string) -> result<fetch-outcome, repo-error>;
+
 		// -- Working-tree operations (require a repository opened via `open-worktree`).
 
 		/// The three-way working-tree status: the `HEAD` tree vs the index (staged)
@@ -335,6 +356,9 @@ interface porcelain {
 
 world repo {
 	import wasi:filesystem/types@0.2.12;
+	// The network capability for the remote porcelain (fetch/clone/push): the host grants a
+	// `wasi:http` outgoing handler, the component's only means of reaching a Smart HTTP remote.
+	import wasi:http/outgoing-handler@0.2.12;
 
 	export porcelain;
 }
