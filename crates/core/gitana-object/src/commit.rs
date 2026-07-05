@@ -102,6 +102,50 @@ pub fn commit_signed_payload<H: HashAlgorithm>(commit: &Commit<H>) -> Vec<u8> {
 	encode_commit(&unsigned)
 }
 
+/// Split a raw commit object buffer into `(signature, signed_payload)`, working on bytes only so a
+/// commit with a non-UTF-8 message (git's `encoding` header) is handled — [`parse_commit`] would
+/// reject it. `signature` is the unfolded `gpgsig` armor (its header value with the space-prefixed
+/// continuation lines joined by `\n`), or `None` when the commit is unsigned. `signed_payload` is
+/// `raw` with the `gpgsig` header removed and every other byte — including headers the parser does
+/// not model, such as `mergetag` and `encoding` — left intact: exactly the bytes git signs. Unlike
+/// [`commit_signed_payload`], this reproduces git's signed bytes for a commit carrying extra
+/// headers (e.g. a merge of a signed tag), which the lossy parse/encode round-trip cannot.
+pub fn commit_signature_and_payload<H: HashAlgorithm>(raw: &[u8]) -> (Option<Vec<u8>>, Vec<u8>) {
+	let gpgsig_prefix = format!("{} ", H::GPGSIG_HEADER);
+	let mut signature = None;
+	let mut payload = Vec::with_capacity(raw.len());
+	// Only the header region (before the blank separator) can hold a `gpgsig` header; once into the
+	// message, copy verbatim so a message line that happens to start with `gpgsig ` is untouched.
+	let mut in_message = false;
+	let mut lines = raw.split_inclusive(|&b| b == b'\n').peekable();
+	while let Some(line) = lines.next() {
+		if !in_message && line.starts_with(gpgsig_prefix.as_bytes()) {
+			// Collect the armor (this line's value) and its continuation lines (each begins with a
+			// single space), dropping the whole block from the payload. `armor` joins them with `\n`,
+			// matching what `parse_commit` produces and what `SshSig::from_pem` expects.
+			let mut armor = trim_newline(&line[gpgsig_prefix.len()..]).to_vec();
+			while let Some(rest) = lines.peek().and_then(|next| next.strip_prefix(b" ")) {
+				armor.push(b'\n');
+				armor.extend_from_slice(trim_newline(rest));
+				lines.next();
+			}
+			signature = Some(armor);
+			continue;
+		}
+		// A bare newline (or trailing empty slice) ends the header block.
+		if line == b"\n" || line.is_empty() {
+			in_message = true;
+		}
+		payload.extend_from_slice(line);
+	}
+	(signature, payload)
+}
+
+/// Drop a single trailing `\n` (as `split_inclusive` leaves on every line but the last).
+fn trim_newline(line: &[u8]) -> &[u8] {
+	line.strip_suffix(b"\n").unwrap_or(line)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -182,5 +226,45 @@ mod tests {
 		assert_eq!(reparsed.signature, None);
 		assert_eq!(reparsed.tree, commit.tree);
 		assert_eq!(reparsed.message, commit.message);
+	}
+
+	#[test]
+	fn signature_and_payload_from_bytes_matches_the_struct_path_for_a_simple_commit() {
+		let payload: &[u8] = b"tree b5f4f26b2641070724725ca76c135b9ff2a94b3573a1cdb04223a198cfe53804\nauthor A U Thor <author@example.com> 1700000000 +1000\ncommitter C O Mitter <committer@example.com> 1700000005 -0500\ngpgsig-sha256 -----BEGIN SSH SIGNATURE-----\n U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg\n AAAABHNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA\n -----END SSH SIGNATURE-----\n\nsigned commit\n";
+		let commit = parse_commit::<Sha256>(payload).expect("parse");
+		let (signature, signed) = commit_signature_and_payload::<Sha256>(payload);
+		assert_eq!(signed, commit_signed_payload(&commit));
+		// The extracted armor matches the unfolded gpgsig value the parser recovers.
+		assert_eq!(
+			signature.map(|s| String::from_utf8(s).unwrap()),
+			commit.signature
+		);
+	}
+
+	#[test]
+	fn signature_and_payload_from_bytes_keeps_headers_the_parser_drops() {
+		// A merge commit whose `mergetag` header (multi-line) precedes `gpgsig` — git signs the
+		// mergetag too, but `parse_commit` drops it, so only the byte path reproduces the payload.
+		let payload: &[u8] = b"tree b5f4f26b2641070724725ca76c135b9ff2a94b3573a1cdb04223a198cfe53804\nparent aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nparent bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nauthor A U Thor <a@example.com> 1700000000 +0000\ncommitter C O Mitter <c@example.com> 1700000000 +0000\nmergetag object bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n type commit\n tag v1\n tagger T <t@example.com> 1700000000 +0000\n \n release\ngpgsig-sha256 -----BEGIN SSH SIGNATURE-----\n U1NIU0lH\n -----END SSH SIGNATURE-----\n\nmerge\n";
+		let (signature, signed) = commit_signature_and_payload::<Sha256>(payload);
+		assert_eq!(
+			signature.as_deref(),
+			Some(b"-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\n-----END SSH SIGNATURE-----".as_slice())
+		);
+		// The gpgsig block is gone, the mergetag block survives byte-for-byte, and the payload is
+		// exactly the input with only the gpgsig header excised.
+		assert!(!signed.windows(6).any(|w| w == b"gpgsig"), "gpgsig removed");
+		let marker = b"mergetag object";
+		assert!(
+			signed.windows(marker.len()).any(|w| w == marker),
+			"mergetag preserved"
+		);
+		let gpgsig_start = payload
+			.windows(7)
+			.position(|w| w == b"gpgsig-")
+			.expect("has gpgsig");
+		let mut expected = payload[..gpgsig_start].to_vec();
+		expected.extend_from_slice(b"\nmerge\n");
+		assert_eq!(signed, expected);
 	}
 }

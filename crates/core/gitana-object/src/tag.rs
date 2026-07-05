@@ -111,6 +111,29 @@ pub fn tag_signed_payload<H: HashAlgorithm>(tag: &Tag<H>) -> Vec<u8> {
 	encode_tag(&unsigned)
 }
 
+/// Split a raw tag object buffer into `(signature, signed_payload)`, working on bytes only so a tag
+/// with a non-UTF-8 message is handled — [`parse_tag`] would reject it. `signature` is the appended
+/// armor block (from its `-----BEGIN … SIGNATURE-----` line to the end), verbatim, or `None` when
+/// the tag is unsigned; `signed_payload` is everything before it — exactly the bytes git signs.
+pub fn tag_signature_and_payload(raw: &[u8]) -> (Option<Vec<u8>>, Vec<u8>) {
+	// The signature can only begin in the body, after the header/message blank line.
+	let Some(sep) = raw.windows(2).position(|w| w == b"\n\n") else {
+		return (None, raw.to_vec());
+	};
+	let body_start = sep + 2;
+	let mut offset = body_start;
+	for line in raw[body_start..].split_inclusive(|&b| b == b'\n') {
+		if SIGNATURE_MARKERS
+			.iter()
+			.any(|marker| line.starts_with(marker.as_bytes()))
+		{
+			return (Some(raw[offset..].to_vec()), raw[..offset].to_vec());
+		}
+		offset += line.len();
+	}
+	(None, raw.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -163,6 +186,33 @@ mod tests {
 		assert_eq!(reparsed.signature, None);
 		assert_eq!(reparsed.message, "release one\n");
 		assert_eq!(reparsed.object, tag.object);
+	}
+
+	#[test]
+	fn signature_and_payload_from_bytes_splits_at_the_appended_block() {
+		let object = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"c");
+		let payload = format!(
+			"object {object}\ntype commit\ntag v1\ntagger T <t@x> 1 +0000\n\nrelease\n\
+			 -----BEGIN SSH SIGNATURE-----\nabc\n-----END SSH SIGNATURE-----\n"
+		);
+		let (signature, signed) = tag_signature_and_payload(payload.as_bytes());
+		assert_eq!(
+			signature.as_deref(),
+			Some(b"-----BEGIN SSH SIGNATURE-----\nabc\n-----END SSH SIGNATURE-----\n".as_slice())
+		);
+		// The signed payload is byte-identical to the struct path for a well-formed tag.
+		let tag = parse_tag::<Sha256>(payload.as_bytes()).expect("parse");
+		assert_eq!(signed, tag_signed_payload(&tag));
+	}
+
+	#[test]
+	fn signature_and_payload_from_bytes_reports_an_unsigned_tag() {
+		let object = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"c");
+		let payload =
+			format!("object {object}\ntype commit\ntag v1\ntagger T <t@x> 1 +0000\n\nrelease\n");
+		let (signature, signed) = tag_signature_and_payload(payload.as_bytes());
+		assert_eq!(signature, None);
+		assert_eq!(signed, payload.as_bytes());
 	}
 
 	#[test]

@@ -1,0 +1,17 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "gitana-trust"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+gitana-object.workspace = true
+# `crypto` enables every SSH signing algorithm stock git can produce for `commit -S` / `tag -s`
+# (ed25519, rsa, and the NIST-curve ecdsa variants), so we verify all of them, not just ed25519.
+ssh-key = { workspace = true, features = ["crypto"] }
+thiserror.workspace = true

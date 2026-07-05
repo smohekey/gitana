@@ -33,7 +33,9 @@ pub use bitmap::{
 	BitmapIndex, ReachabilityBitmaps, build_reachability_bitmaps, decode_midx_bitmap,
 	encode_midx_bitmap,
 };
-pub use commit::{Commit, commit_signed_payload, encode_commit, parse_commit};
+pub use commit::{
+	Commit, commit_signature_and_payload, commit_signed_payload, encode_commit, parse_commit,
+};
 pub use delta::apply_delta;
 pub use enumerate::{enumerate_objects, referenced_ids};
 pub use ewah::{EwahBitmap, decode_ewah, encode_ewah};
@@ -59,7 +61,7 @@ pub use revindex::pack_order;
 pub use sha1::Sha1;
 pub use sha256::Sha256;
 pub use signature::{Signature, TzOffset};
-pub use tag::{Tag, encode_tag, parse_tag, tag_signed_payload};
+pub use tag::{Tag, encode_tag, parse_tag, tag_signature_and_payload, tag_signed_payload};
 pub use tree::{TreeEntry, encode_tree, parse_tree};
 
 /// Errors from decoding or parsing git objects.
