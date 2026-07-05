@@ -88,13 +88,20 @@ pub(crate) async fn read_tag<H: HashAlgorithm>(
 		)));
 	}
 	let tag = parse_tag::<H>(&payload).map_err(|error| repo_error(RepositoryError::Object(error)))?;
+	// The `tag-info` surface has no dedicated signature field yet (a later trust slice adds one),
+	// so a signed tag's appended armor block is surfaced as part of `message`, as it read before
+	// the payload split — keeping the block visible through this export.
+	let message = match tag.signature {
+		Some(signature) => tag.message + &signature,
+		None => tag.message,
+	};
 	Ok(TagInfo {
 		id: id.to_hex(),
 		target: tag.object.to_hex(),
 		target_kind: wit_kind(tag.kind),
 		name: tag.name,
 		tagger: tag.tagger,
-		message: tag.message,
+		message,
 	})
 }
 

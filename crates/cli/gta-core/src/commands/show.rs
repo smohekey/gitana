@@ -88,6 +88,12 @@ async fn show_tag<H: HashAlgorithm>(repo: &Repository<Backend, H>, payload: &[u8
 	for line in tag.message.lines() {
 		out.extend_from_slice(format!("{line}\n").as_bytes());
 	}
+	// A signed tag's armor block follows the message in git's `show` output.
+	if let Some(signature) = &tag.signature {
+		for line in signature.lines() {
+			out.extend_from_slice(format!("{line}\n").as_bytes());
+		}
+	}
 	out.push(b'\n');
 	std::io::stdout().write_all(&out)?;
 

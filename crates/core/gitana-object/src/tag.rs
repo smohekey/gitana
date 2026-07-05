@@ -12,13 +12,45 @@ pub struct Tag<H: HashAlgorithm> {
 	pub name: String,
 	/// The raw `tagger` line, if present.
 	pub tagger: Option<String>,
-	/// The tag message.
+	/// The appended armored signature block of a signed tag (`-----BEGIN {PGP,SSH} …`), if
+	/// present. Unlike a commit's `gpgsig` *header*, git appends a tag's signature after the
+	/// message, so it is stored and re-emitted verbatim (including its trailing newline) — the
+	/// message holds everything before it, and [`tag_signed_payload`] reproduces the signed bytes.
+	pub signature: Option<String>,
+	/// The tag message (up to the appended signature block, if any).
 	pub message: String,
+}
+
+/// The armored-signature-block markers git recognizes at the start of a line when separating a
+/// signed tag's message from its appended signature (mirrors git's `parse_signature`). The
+/// earliest line-start occurrence of any of these begins the signature.
+const SIGNATURE_MARKERS: [&str; 4] = [
+	"-----BEGIN PGP SIGNATURE-----",
+	"-----BEGIN PGP MESSAGE-----",
+	"-----BEGIN SIGNED MESSAGE-----",
+	"-----BEGIN SSH SIGNATURE-----",
+];
+
+/// Split a tag's body into `(message, signature)` at the first line beginning a recognized armor
+/// block; `signature` is `None` when the body carries no such block. Both parts are verbatim
+/// substrings, so concatenating them reproduces the body exactly.
+fn split_signature(body: &str) -> (&str, Option<&str>) {
+	let mut offset = 0;
+	for line in body.split_inclusive('\n') {
+		if SIGNATURE_MARKERS
+			.iter()
+			.any(|marker| line.starts_with(marker))
+		{
+			return (&body[..offset], Some(&body[offset..]));
+		}
+		offset += line.len();
+	}
+	(body, None)
 }
 
 /// Parse an annotated tag payload.
 pub fn parse_tag<H: HashAlgorithm>(payload: &[u8]) -> Result<Tag<H>, ObjectError> {
-	let (header, message) = split_message(payload)?;
+	let (header, body) = split_message(payload)?;
 
 	let mut object = None;
 	let mut kind = None;
@@ -37,17 +69,21 @@ pub fn parse_tag<H: HashAlgorithm>(payload: &[u8]) -> Result<Tag<H>, ObjectError
 		}
 	}
 
+	let (message, signature) = split_signature(body);
 	Ok(Tag {
 		object: object.ok_or(ObjectError::MalformedHeader)?,
 		kind: kind.ok_or(ObjectError::MalformedHeader)?,
 		name: name.ok_or(ObjectError::MalformedHeader)?,
 		tagger,
+		signature: signature.map(str::to_owned),
 		message: message.to_owned(),
 	})
 }
 
-/// Encode an annotated tag to its canonical git payload: `object`, `type`, `tag`,
-/// optional `tagger`, blank line, message (emitted verbatim).
+/// Encode an annotated tag to its canonical git payload: `object`, `type`, `tag`, optional
+/// `tagger`, blank line, message, then the appended signature block (all emitted verbatim). A
+/// signed tag round-trips byte-exact so its id is stable and [`tag_signed_payload`] can reproduce
+/// the signed bytes.
 pub fn encode_tag<H: HashAlgorithm>(tag: &Tag<H>) -> Vec<u8> {
 	let mut out = Vec::new();
 	out.extend_from_slice(format!("object {}\n", tag.object).as_bytes());
@@ -58,13 +94,27 @@ pub fn encode_tag<H: HashAlgorithm>(tag: &Tag<H>) -> Vec<u8> {
 	}
 	out.push(b'\n');
 	out.extend_from_slice(tag.message.as_bytes());
+	if let Some(signature) = &tag.signature {
+		out.extend_from_slice(signature.as_bytes());
+	}
 	out
+}
+
+/// The bytes a signed tag's signature is computed over: the tag re-encoded without its appended
+/// signature block. Matches what git signs/verifies.
+pub fn tag_signed_payload<H: HashAlgorithm>(tag: &Tag<H>) -> Vec<u8> {
+	if tag.signature.is_none() {
+		return encode_tag(tag);
+	}
+	let mut unsigned = tag.clone();
+	unsigned.signature = None;
+	encode_tag(&unsigned)
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::Sha256;
+	use crate::{Sha1, Sha256};
 
 	#[test]
 	fn parses_a_tag() {
@@ -85,6 +135,52 @@ mod tests {
 		let payload =
 			format!("object {object}\ntype commit\ntag v1\ntagger T <t@x> 1 +0000\n\nrelease\n");
 		let tag = parse_tag::<Sha256>(payload.as_bytes()).expect("parse");
+		assert_eq!(tag.signature, None);
+		assert_eq!(encode_tag(&tag), payload.as_bytes());
+	}
+
+	#[test]
+	fn round_trips_a_signed_tag_and_strips_the_signature() {
+		// A real `git tag -s` (SSH) object, captured byte-for-byte. The signature block is
+		// appended after the message; git verifies everything before the `-----BEGIN` line.
+		let payload: &[u8] = b"object e8dec3c943b609a5bf3d030f9a176988fcdb8cc1\ntype commit\ntag v1\ntagger T E St <tagger@example.com> 1700000000 +0000\n\nrelease one\n-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgMhCDdJ9AaIHPx+Gq+KwComelg7\nvE/AY3By/6IdEA0fIAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5\nAAAAQGjsKHgDSUI1RzUEINOZuHpz171e23pl30v85ALlcU2Kb1yWcY1DBkoSL0uujy1R81\nZ5Ba/1qf6az+khkFE8LQM=\n-----END SSH SIGNATURE-----\n";
+		let tag = parse_tag::<Sha1>(payload).expect("parse");
+
+		// The signature is split out of the message, verbatim.
+		let signature = tag.signature.clone().expect("has a signature");
+		assert!(signature.starts_with("-----BEGIN SSH SIGNATURE-----"));
+		assert!(signature.ends_with("-----END SSH SIGNATURE-----\n"));
+		assert_eq!(tag.message, "release one\n");
+
+		// Encoding is byte-exact (so the signed tag's id is stable).
+		assert_eq!(encode_tag(&tag), payload);
+
+		// The signed payload drops the appended block and equals everything git signs: the bytes
+		// up to the `-----BEGIN` marker (offset 132 in this fixture).
+		let signed = tag_signed_payload(&tag);
+		assert_eq!(signed, &payload[..132]);
+		let reparsed = parse_tag::<Sha1>(&signed).expect("reparse signed payload");
+		assert_eq!(reparsed.signature, None);
+		assert_eq!(reparsed.message, "release one\n");
+		assert_eq!(reparsed.object, tag.object);
+	}
+
+	#[test]
+	fn recognizes_a_pgp_signature_block() {
+		// The boundary logic is armor-agnostic: a PGP block splits just like an SSH one.
+		let object = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"c");
+		let payload = format!(
+			"object {object}\ntype commit\ntag v1\ntagger T <t@x> 1 +0000\n\nbody\n\
+			 -----BEGIN PGP SIGNATURE-----\n\nabc\n-----END PGP SIGNATURE-----\n"
+		);
+		let tag = parse_tag::<Sha256>(payload.as_bytes()).expect("parse");
+		assert_eq!(tag.message, "body\n");
+		assert!(
+			tag
+				.signature
+				.as_deref()
+				.is_some_and(|s| s.starts_with("-----BEGIN PGP SIGNATURE-----"))
+		);
 		assert_eq!(encode_tag(&tag), payload.as_bytes());
 	}
 }

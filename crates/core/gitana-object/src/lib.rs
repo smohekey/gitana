@@ -59,7 +59,7 @@ pub use revindex::pack_order;
 pub use sha1::Sha1;
 pub use sha256::Sha256;
 pub use signature::{Signature, TzOffset};
-pub use tag::{Tag, encode_tag, parse_tag};
+pub use tag::{Tag, encode_tag, parse_tag, tag_signed_payload};
 pub use tree::{TreeEntry, encode_tree, parse_tree};
 
 /// Errors from decoding or parsing git objects.

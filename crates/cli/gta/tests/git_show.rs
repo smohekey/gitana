@@ -2,8 +2,9 @@
 //! git), and a tag and tree. Output is gta's own porcelain form, so most assertions are
 //! structural rather than byte-for-byte against `git show`.
 
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// A repo with two commits to `a.txt`: "line1\nline2\n", then "line1\nCHANGED\nline2\n". Returns
 /// the work dir and the first commit id.
@@ -188,6 +189,41 @@ fn show_tag_displays_tag_then_target() {
 }
 
 #[test]
+fn show_signed_tag_surfaces_the_signature_block() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let (work, _c1) = two_commits("gta-show-signed-tag");
+	let w = work.to_str().unwrap();
+	let head = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+
+	// Hand-craft a signed annotated tag object: git appends the armor block after the message. A
+	// real signature is unnecessary here — we only assert the block is surfaced, not verified.
+	let payload = format!(
+		"object {head}\ntype commit\ntag v1s\ntagger T <t@e> 1700000000 +0000\n\n\
+		 signed release\n-----BEGIN SSH SIGNATURE-----\nZmFrZXNpZw==\n-----END SSH SIGNATURE-----\n"
+	);
+	let id = git_stdin(
+		w,
+		&["hash-object", "-t", "tag", "-w", "--stdin"],
+		payload.as_bytes(),
+	);
+	git(w, &["update-ref", "refs/tags/v1s", id.trim()]);
+
+	let out = gta(w, &["show", "v1s"], b"");
+	assert!(out.contains("tag v1s"), "{out}");
+	assert!(out.contains("signed release"), "{out}");
+	assert!(
+		out.contains("-----BEGIN SSH SIGNATURE-----") && out.contains("-----END SSH SIGNATURE-----"),
+		"the armor block must be surfaced, not dropped: {out}"
+	);
+	// ...still followed by the tagged commit.
+	assert!(out.contains("commit "), "{out}");
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
 fn show_and_cat_file_work_in_a_bare_repo() {
 	if !git_supports_sha256() {
 		return;
@@ -274,6 +310,31 @@ fn git(dir: &str, args: &[&str]) -> String {
 	let mut full = vec!["-C", dir];
 	full.extend_from_slice(args);
 	let out = Command::new("git").args(&full).output().expect("run git");
+	assert!(
+		out.status.success(),
+		"git {args:?} failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	String::from_utf8(out.stdout).expect("git stdout utf8")
+}
+
+fn git_stdin(dir: &str, args: &[&str], stdin: &[u8]) -> String {
+	let mut full = vec!["-C", dir];
+	full.extend_from_slice(args);
+	let mut child = Command::new("git")
+		.args(&full)
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.expect("spawn git");
+	child
+		.stdin
+		.take()
+		.expect("stdin")
+		.write_all(stdin)
+		.expect("write stdin");
+	let out = child.wait_with_output().expect("run git");
 	assert!(
 		out.status.success(),
 		"git {args:?} failed: {}",

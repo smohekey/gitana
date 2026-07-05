@@ -23,5 +23,5 @@ pub(crate) type WorkDir = CapWorkDir;
 
 /// The object-id type the CLI works with where no repository is in scope to read the hash
 /// format from (e.g. `hash-object` outside a repo). Every command that opens a repository
-/// instead routes through the runtime hash dispatch (see [`dispatch`]).
+/// instead routes through the runtime hash dispatch (see the `dispatch` module).
 pub type Oid = gitana_object::ObjectId<gitana_object::Sha256>;

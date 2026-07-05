@@ -184,6 +184,7 @@ pub async fn build_fixture<H: HashAlgorithm>() -> Result<Fixture> {
 		kind: ObjectKind::Commit,
 		name: "annot".to_owned(),
 		tagger: Some("T A Gger <tagger@example.com> 1719900100 +0000".to_owned()),
+		signature: None,
 		message: "annotated tag\n".to_owned(),
 	};
 	let annot = repo
