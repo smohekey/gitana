@@ -8,19 +8,31 @@
 //! `commit -S` / `tag -s` under `gpg.format=ssh`), with git's `git` namespace. OpenPGP is a later,
 //! additive concern.
 //!
-//! The entry points are [`verify_commit`] and [`verify_tag`], which take the **raw object bytes**
-//! and verify the signature over exactly the bytes git signs. Verifying from the raw buffer (rather
-//! than a re-encoded parsed object) is byte-accurate for commits carrying headers the object model
-//! does not preserve — e.g. a merge of a signed tag, whose `mergetag` header git also signs.
+//! The object entry points are [`verify_commit`] and [`verify_tag`], which take the **raw object
+//! bytes** and verify the signature over exactly the bytes git signs. Verifying from the raw buffer
+//! (rather than a re-encoded parsed object) is byte-accurate for commits carrying headers the object
+//! model does not preserve — e.g. a merge of a signed tag, whose `mergetag` header git also signs.
 //! [`verify_sshsig`] is the shared primitive the push-certificate path will reuse. Each returns the
 //! [`KeyId`] that verified, so callers can audit *which* trusted key signed.
+//!
+//! On top of that, [`fold_trust_root`] and [`verify_candidate_trust_update`] walk the
+//! `refs/gitana/trust` commit chain (through an [`ObjectSource`]) into the effective [`TrustRoot`],
+//! proving the whole authorization chain without touching any ref.
 
 mod error;
+mod fold;
 mod key_id;
+mod object_source;
+mod policy;
+mod trust_root;
 mod trusted_key;
 
 pub use self::error::TrustError;
+pub use self::fold::{fold_trust_root, verify_candidate_trust_update};
 pub use self::key_id::KeyId;
+pub use self::object_source::ObjectSource;
+pub use self::policy::Policy;
+pub use self::trust_root::{TRUST_DOCUMENT_PATH, TrustRoot};
 pub use self::trusted_key::TrustedKey;
 
 use gitana_object::{HashAlgorithm, commit_signature_and_payload, tag_signature_and_payload};

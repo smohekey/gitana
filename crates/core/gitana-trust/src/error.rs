@@ -19,4 +19,23 @@ pub enum TrustError {
 	/// tampered payload, or wrong namespace).
 	#[error("signature does not verify")]
 	BadSignature,
+	/// Reading a trust object through the [`crate::ObjectSource`] failed.
+	#[error("reading object {id}: {source}")]
+	ObjectSource {
+		/// The object id that could not be read.
+		id: String,
+		/// The backend read error.
+		#[source]
+		source: Box<dyn std::error::Error + Send + Sync>,
+	},
+	/// A trust document could not be parsed as JSON.
+	#[error("malformed trust document: {0}")]
+	MalformedTrustDocument(#[source] serde_json::Error),
+	/// A trust root enrols no keys (an empty-key root is never accepted).
+	#[error("trust root has no keys")]
+	EmptyTrustRoot,
+	/// The `refs/gitana/trust` chain is structurally invalid: a non-commit/-tree/-blob object, a
+	/// missing trust document, a non-linear (merge) chain, or a divergent candidate update.
+	#[error("invalid trust chain: {0}")]
+	TrustChain(String),
 }

@@ -1393,8 +1393,11 @@ name = "gitana-trust"
 version = "0.1.0"
 dependencies = [
  "gitana-object",
+ "serde",
+ "serde_json",
  "ssh-key",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

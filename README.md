@@ -140,8 +140,9 @@ Implemented command groups:
 - `crates/core/gitana-git-http`: Transport-agnostic Smart HTTP protocol helpers.
 - `crates/core/gitana-remote`: Remote operations over the `gitana-git-http` codec —
   origin config, ref discovery, the HTTP client, and pack transfer.
-- `crates/core/gitana-trust`: Pure signature-verification core for the trust
-  subsystem — verifies SSHSIG-signed commits and tags against trusted keys.
+- `crates/core/gitana-trust`: Pure trust core — verifies SSHSIG-signed commits
+  and tags against trusted keys, and folds the `refs/gitana/trust` commit chain
+  (via an `ObjectSource` capability) into the effective trust root.
 - `crates/cli/gta-core`: Shared command implementations.
 - `crates/cli/gta`: User-facing CLI.
 - `crates/cli/gta-mcp`: MCP wrapper around the same command surface.

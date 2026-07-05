@@ -11,7 +11,12 @@ workspace = true
 
 [dependencies]
 gitana-object.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 # `crypto` enables every SSH signing algorithm stock git can produce for `commit -S` / `tag -s`
 # (ed25519, rsa, and the NIST-curve ecdsa variants), so we verify all of them, not just ed25519.
 ssh-key = { workspace = true, features = ["crypto"] }
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
