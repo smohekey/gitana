@@ -2,8 +2,10 @@
 //! the ref and reports `ok`; a push whose objects are missing is rejected before any
 //! ref moves. Stock-`git push` interop belongs in higher-level HTTP integration tests.
 
+use std::sync::LazyLock;
+
 use gitana_file_store_memory::MemoryFileStore;
-use gitana_git_http::receive_pack;
+use gitana_git_http::{ReceiveOptions, TrustContext, receive_pack};
 use gitana_object::Sha256;
 use gitana_object::{
 	Commit, ObjectId, ObjectKind, PackedObject, PktLine, TreeEntry, encode_commit, encode_pack,
@@ -13,6 +15,20 @@ use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
 
 const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// These protocol tests do not configure trust, so every push runs against an empty trust context
+/// (verification short-circuits to accept on a repo with no trust root).
+static NO_TRUST: LazyLock<TrustContext> = LazyLock::new(TrustContext::none);
+
+/// Receive options with `force` and no trust configuration — the shape these protocol tests push
+/// with.
+fn opts(force: bool) -> ReceiveOptions<'static> {
+	ReceiveOptions {
+		force,
+		trust: &NO_TRUST,
+		now: 0,
+	}
+}
 
 fn repo() -> Repository<MemoryFileStore, Sha256> {
 	Repository::new(ObjectStore::<_, Sha256>::new(MemoryFileStore::new()))
@@ -94,7 +110,7 @@ async fn valid_push_moves_the_ref_and_reports_ok() {
 	let pack = encode_pack(&objects);
 	let request = push_request(ZERO, &commit.to_hex(), "refs/heads/main", &pack);
 
-	let response = receive_pack(&repo, &request, false)
+	let response = receive_pack(&repo, &request, opts(false))
 		.await
 		.expect("receive")
 		.report;
@@ -128,7 +144,7 @@ async fn push_with_missing_objects_is_rejected_without_moving_refs() {
 	let empty_pack = encode_pack::<Sha256>(&[]);
 	let request = push_request(ZERO, &commit.to_hex(), "refs/heads/main", &empty_pack);
 
-	let response = receive_pack(&repo, &request, false)
+	let response = receive_pack(&repo, &request, opts(false))
 		.await
 		.expect("receive")
 		.report;
@@ -167,7 +183,7 @@ async fn non_fast_forward_update_is_rejected() {
 		"refs/heads/main",
 		&encode_pack(&first),
 	);
-	receive_pack(&repo, &request, false)
+	receive_pack(&repo, &request, opts(false))
 		.await
 		.expect("first push");
 
@@ -179,7 +195,7 @@ async fn non_fast_forward_update_is_rejected() {
 		"refs/heads/main",
 		&encode_pack(&second),
 	);
-	let response = receive_pack(&repo, &request, false)
+	let response = receive_pack(&repo, &request, opts(false))
 		.await
 		.expect("second push")
 		.report;
@@ -214,7 +230,9 @@ async fn delete_with_force_removes_the_ref() {
 		"refs/heads/main",
 		&encode_pack(&objects),
 	);
-	receive_pack(&repo, &create, false).await.expect("create");
+	receive_pack(&repo, &create, opts(false))
+		.await
+		.expect("create");
 
 	// Delete it (new = zero) — allowed with force.
 	let delete = push_request(
@@ -223,7 +241,7 @@ async fn delete_with_force_removes_the_ref() {
 		"refs/heads/main",
 		&encode_pack::<Sha256>(&[]),
 	);
-	let report = receive_pack(&repo, &delete, true)
+	let report = receive_pack(&repo, &delete, opts(true))
 		.await
 		.expect("delete")
 		.report;
@@ -256,7 +274,9 @@ async fn delete_without_force_is_denied() {
 		"refs/heads/main",
 		&encode_pack(&objects),
 	);
-	receive_pack(&repo, &create, false).await.expect("create");
+	receive_pack(&repo, &create, opts(false))
+		.await
+		.expect("create");
 
 	let delete = push_request(
 		&commit.to_hex(),
@@ -264,7 +284,7 @@ async fn delete_without_force_is_denied() {
 		"refs/heads/main",
 		&encode_pack::<Sha256>(&[]),
 	);
-	let report = receive_pack(&repo, &delete, false)
+	let report = receive_pack(&repo, &delete, opts(false))
 		.await
 		.expect("delete attempt")
 		.report;
@@ -298,7 +318,7 @@ async fn force_push_allows_a_non_fast_forward_update() {
 		"refs/heads/main",
 		&encode_pack(&first),
 	);
-	receive_pack(&repo, &create, false)
+	receive_pack(&repo, &create, opts(false))
 		.await
 		.expect("first push");
 
@@ -310,7 +330,7 @@ async fn force_push_allows_a_non_fast_forward_update() {
 		"refs/heads/main",
 		&encode_pack(&second),
 	);
-	let report = receive_pack(&repo, &force, true)
+	let report = receive_pack(&repo, &force, opts(true))
 		.await
 		.expect("force push")
 		.report;

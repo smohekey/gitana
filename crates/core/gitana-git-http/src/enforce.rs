@@ -12,8 +12,8 @@
 //! enforced (a hard reject regardless of policy): `warn` eases in object-signature enforcement, it
 //! must not let the trust root itself be corrupted.
 //!
-//! This is the verification core only; wiring it into `receive_pack` (before objects are written or
-//! refs move) is the follow-up slice.
+//! [`receive_pack`](crate::receive_pack) runs this after unpacking and the connectivity check but
+//! before it writes objects or moves refs, and renders the [`TrustVerdict`] into its report-status.
 
 use std::collections::{HashMap, HashSet};
 
@@ -47,6 +47,23 @@ pub struct TrustContext {
 	pub pushee: String,
 	/// How far a nonce timestamp may be from `now` (seconds).
 	pub nonce_slop_secs: u64,
+}
+
+impl TrustContext {
+	/// A context carrying no server identity or secret. Its empty `nonce_secret` makes
+	/// [`verify_cert`] reject outright (a server with no secret cannot verify certificate freshness
+	/// or binding), so it is only sound where no protected push certificate is verified: a
+	/// repository with no trust root (verification short-circuits to accept) or a test harness that
+	/// never enrols trust. On a trust-configured repository it fails protected pushes closed rather
+	/// than honouring a forgeable empty-secret nonce.
+	pub fn none() -> Self {
+		Self {
+			nonce_secret: Vec::new(),
+			repo_id: String::new(),
+			pushee: String::new(),
+			nonce_slop_secs: 0,
+		}
+	}
 }
 
 /// The enforcement decision, with the trust root's policy already applied.
@@ -297,6 +314,12 @@ fn verify_cert<H: HashAlgorithm>(
 	commands: &[RefUpdate<H>],
 	now: u64,
 ) -> Result<(), String> {
+	// A server with no configured nonce secret cannot bind or freshness-check a certificate; its
+	// nonce HMAC would be computed with a publicly-known empty key. Fail closed rather than accept a
+	// forgeable nonce (this is where a `TrustContext::none()` lands on a trust-configured repo).
+	if context.nonce_secret.is_empty() {
+		return Err("server is not configured to verify push certificates".to_owned());
+	}
 	verify_sshsig(
 		&cert.payload(),
 		cert.signature.as_bytes(),

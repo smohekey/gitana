@@ -1,15 +1,19 @@
-//! Pre-receive trust enforcement (`verify_push`): a repo with a real signed trust root, pushes
-//! built from in-crate SSHSIG-signed commits and push certificates, exercised across off/warn/require.
+//! Pre-receive trust enforcement: a repo with a real signed trust root, pushes built from in-crate
+//! SSHSIG-signed commits and push certificates, exercised across off/warn/require. The first block
+//! drives the pure core (`verify_push`) directly; the `wire_*` block at the end drives the same
+//! enforcement through `receive_pack`, asserting the verdict is rendered to report-status and refs
+//! move (or don't) accordingly.
 
 use std::collections::HashMap;
 
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_git_http::{
-	CertCommand, PushCert, RefUpdate, TrustContext, TrustVerdict, make_nonce, verify_push,
+	CertCommand, PushCert, ReceiveOptions, ReceiveOutcome, RefUpdate, TrustContext, TrustVerdict,
+	build_push_cert, make_nonce, receive_pack, verify_push,
 };
 use gitana_object::{
-	Commit, ObjectId, ObjectKind, Sha256, Tag, TreeEntry, encode_commit, encode_tag, encode_tree,
-	tag_signed_payload,
+	Commit, ObjectId, ObjectKind, PackedObject, Sha256, Tag, TreeEntry, encode_commit, encode_pack,
+	encode_tag, encode_tree, tag_signed_payload,
 };
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
@@ -810,4 +814,286 @@ async fn require_rejects_protected_deletion_without_cert() {
 			..
 		}
 	));
+}
+
+// --- receive_pack wiring -----------------------------------------------------------------------
+//
+// These drive the same enforcement through the wire path (`receive_pack`) instead of `verify_push`
+// directly, so they cover what the pure core cannot: that a verdict is rendered into report-status
+// and that refs actually move (accept) or stay put (reject).
+
+/// Encode `objects` into a packfile — the pushed objects a `receive_pack` request carries.
+fn pack_of(objects: &Objects) -> Vec<u8> {
+	let packed: Vec<PackedObject<Sha256>> = objects
+		.iter()
+		.map(|(id, (kind, data))| PackedObject {
+			id: *id,
+			kind: *kind,
+			data: data.clone(),
+		})
+		.collect();
+	encode_pack(&packed)
+}
+
+/// A plain (unsigned) receive-pack request: one `<old> <new> <ref>` command line (caps on it) +
+/// flush + the pack of `objects`.
+fn plain_request(objects: &Objects, old: Option<Oid>, new: Oid, name: &str) -> Vec<u8> {
+	let old = old.map_or_else(|| ZERO.to_owned(), |o| o.to_hex());
+	let command = format!(
+		"{old} {} {name}\0report-status object-format=sha256\n",
+		new.to_hex()
+	);
+	let mut out = Vec::new();
+	out.extend_from_slice(format!("{:04x}{command}", command.len() + 4).as_bytes());
+	out.extend_from_slice(b"0000");
+	out.extend_from_slice(&pack_of(objects));
+	out
+}
+
+/// Run `receive_pack` with the test trust context at `NOW`, force off.
+async fn run_receive(repo: &Repo, request: &[u8]) -> ReceiveOutcome<Sha256> {
+	receive_pack(
+		repo,
+		request,
+		ReceiveOptions {
+			force: false,
+			trust: &context(),
+			now: NOW,
+		},
+	)
+	.await
+	.expect("receive")
+}
+
+fn report_text(outcome: &ReceiveOutcome<Sha256>) -> String {
+	String::from_utf8_lossy(&outcome.report).into_owned()
+}
+
+#[tokio::test]
+async fn wire_require_rejects_unsigned_push_and_leaves_ref_unmoved() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+
+	let (commit, raw) = commit_bytes(None, "unsigned\n");
+	let objects = one_commit(commit, raw);
+	let request = plain_request(&objects, None, commit, "refs/heads/main");
+
+	let outcome = run_receive(&repo, &request).await;
+	let text = report_text(&outcome);
+	assert!(text.contains("unpack ok"), "{text}");
+	assert!(text.contains("ng refs/heads/main"), "{text}");
+	// A whole-push (global) rejection moves nothing and writes nothing.
+	assert!(outcome.updated.is_empty());
+	assert_eq!(
+		repo
+			.refs()
+			.resolve("refs/heads/main")
+			.await
+			.expect("resolve"),
+		None
+	);
+	assert!(
+		!repo.objects().exists_object(&commit).await.expect("exists"),
+		"a globally rejected push writes no objects"
+	);
+}
+
+#[tokio::test]
+async fn wire_require_accepts_valid_signed_push_and_moves_ref() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+
+	let (commit, raw) = commit_bytes(Some(&a), "signed\n");
+	let objects = one_commit(commit, raw);
+	let cert = signed_cert(
+		&a,
+		vec![cert_command(commit, "refs/heads/main")],
+		&fresh_nonce(),
+	);
+	let request = build_push_cert(
+		&cert,
+		"report-status object-format=sha256",
+		&pack_of(&objects),
+	);
+
+	let outcome = run_receive(&repo, &request).await;
+	let text = report_text(&outcome);
+	assert!(text.contains("ok refs/heads/main"), "{text}");
+	assert_eq!(
+		outcome.updated,
+		vec![("refs/heads/main".to_owned(), commit)]
+	);
+	assert_eq!(
+		repo
+			.refs()
+			.resolve("refs/heads/main")
+			.await
+			.expect("resolve"),
+		Some(commit)
+	);
+}
+
+#[tokio::test]
+async fn wire_warn_surfaces_warnings_and_moves_ref() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "warn").await;
+
+	let (commit, raw) = commit_bytes(None, "unsigned\n");
+	let objects = one_commit(commit, raw);
+	let request = plain_request(&objects, None, commit, "refs/heads/main");
+
+	let outcome = run_receive(&repo, &request).await;
+	let text = report_text(&outcome);
+	assert!(text.contains("ok refs/heads/main"), "{text}");
+	// Under warn the failures are recorded on the outcome (for host audit) but not enforced.
+	assert!(
+		!outcome.warnings.is_empty(),
+		"warn should surface the unenforced failures"
+	);
+	assert_eq!(
+		repo
+			.refs()
+			.resolve("refs/heads/main")
+			.await
+			.expect("resolve"),
+		Some(commit)
+	);
+}
+
+#[tokio::test]
+async fn wire_require_partial_reject_applies_good_ref_and_ngs_bad() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+
+	// A valid cert covering both refs, but only one commit is signed: the signed ref lands, the
+	// unsigned ref is `ng`'d — a per-ref (non-global) rejection.
+	let (good, good_raw) = commit_bytes(Some(&a), "good\n");
+	let (bad, bad_raw) = commit_bytes(None, "bad\n");
+	let mut objects = Objects::new();
+	objects.insert(empty_tree(), (ObjectKind::Tree, encode_tree::<Sha256>(&[])));
+	objects.insert(good, (ObjectKind::Commit, good_raw));
+	objects.insert(bad, (ObjectKind::Commit, bad_raw));
+	let cert = signed_cert(
+		&a,
+		vec![
+			cert_command(good, "refs/heads/good"),
+			cert_command(bad, "refs/heads/bad"),
+		],
+		&fresh_nonce(),
+	);
+	let request = build_push_cert(
+		&cert,
+		"report-status object-format=sha256",
+		&pack_of(&objects),
+	);
+
+	let outcome = run_receive(&repo, &request).await;
+	let text = report_text(&outcome);
+	assert!(text.contains("ok refs/heads/good"), "{text}");
+	assert!(text.contains("ng refs/heads/bad"), "{text}");
+	assert_eq!(
+		repo
+			.refs()
+			.resolve("refs/heads/good")
+			.await
+			.expect("resolve"),
+		Some(good),
+		"the signed ref lands"
+	);
+	assert_eq!(
+		repo
+			.refs()
+			.resolve("refs/heads/bad")
+			.await
+			.expect("resolve"),
+		None,
+		"the unsigned ref is rejected"
+	);
+	// The rejected ref's object must not have been migrated out of quarantine…
+	assert!(
+		!repo.objects().exists_object(&bad).await.expect("exists"),
+		"a trust-rejected ref must not persist its objects"
+	);
+	// …while the accepted ref's object is stored.
+	assert!(
+		repo.objects().exists_object(&good).await.expect("exists"),
+		"the accepted ref's objects are migrated"
+	);
+}
+
+#[tokio::test]
+async fn wire_none_context_fails_closed_on_a_trust_configured_repo() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+
+	// A push validly signed by a trusted key, but received with an empty (`none`) trust context.
+	// The certificate cannot be freshness/binding-checked, so the push fails closed.
+	let (commit, raw) = commit_bytes(Some(&a), "signed\n");
+	let objects = one_commit(commit, raw);
+	let cert = signed_cert(
+		&a,
+		vec![cert_command(commit, "refs/heads/main")],
+		&fresh_nonce(),
+	);
+	let request = build_push_cert(
+		&cert,
+		"report-status object-format=sha256",
+		&pack_of(&objects),
+	);
+
+	let outcome = receive_pack(
+		&repo,
+		&request,
+		ReceiveOptions {
+			force: false,
+			trust: &TrustContext::none(),
+			now: NOW,
+		},
+	)
+	.await
+	.expect("receive");
+	let text = report_text(&outcome);
+	assert!(text.contains("ng refs/heads/main"), "{text}");
+	assert!(outcome.updated.is_empty());
+	assert_eq!(
+		repo
+			.refs()
+			.resolve("refs/heads/main")
+			.await
+			.expect("resolve"),
+		None,
+		"a none context fails a protected push closed"
+	);
+	assert!(
+		!repo.objects().exists_object(&commit).await.expect("exists"),
+		"a rejected push writes no objects"
+	);
+}
+
+#[tokio::test]
+async fn wire_bootstrap_installs_trust_root() {
+	let a = key(1);
+	let repo = new_repo().await;
+
+	// A self-signed bootstrap creating refs/gitana/trust is accepted and the ref moves.
+	let objects = trust_commit(&a, &[&a], "require", vec![]);
+	let tip = commit_id_of(&objects);
+	let request = plain_request(&objects, None, tip, "refs/gitana/trust");
+
+	let outcome = run_receive(&repo, &request).await;
+	let text = report_text(&outcome);
+	assert!(text.contains("ok refs/gitana/trust"), "{text}");
+	assert_eq!(
+		repo
+			.refs()
+			.resolve("refs/gitana/trust")
+			.await
+			.expect("resolve"),
+		Some(tip)
+	);
 }

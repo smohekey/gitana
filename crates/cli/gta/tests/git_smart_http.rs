@@ -14,7 +14,9 @@ use axum::body::Bytes;
 use axum::extract::{RawQuery, State};
 use axum::routing::{get, post};
 use gitana_file_store_local::LocalFileStore;
-use gitana_git_http::{ProtocolVersion, Service, advertise, receive_pack, upload_pack_v0};
+use gitana_git_http::{
+	ProtocolVersion, ReceiveOptions, Service, TrustContext, advertise, receive_pack, upload_pack_v0,
+};
 use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
@@ -59,11 +61,20 @@ async fn upload_pack(State(git_dir): State<PathBuf>, body: Bytes) -> Bytes {
 
 /// `POST /git-receive-pack` — push; force is on so the harness can also exercise non-ff / delete.
 async fn git_receive_pack(State(git_dir): State<PathBuf>, body: Bytes) -> Bytes {
+	// This harness exercises client push behavior, not trust; force on, no trust config.
 	Bytes::from(
-		receive_pack(&open(&git_dir), &body, true)
-			.await
-			.expect("receive-pack")
-			.report,
+		receive_pack(
+			&open(&git_dir),
+			&body,
+			ReceiveOptions {
+				force: true,
+				trust: &TrustContext::none(),
+				now: 0,
+			},
+		)
+		.await
+		.expect("receive-pack")
+		.report,
 	)
 }
 

@@ -21,7 +21,9 @@ use axum::body::Bytes;
 use axum::extract::{RawQuery, State};
 use axum::routing::{get, post};
 use gitana_file_store_local::LocalFileStore;
-use gitana_git_http::{ProtocolVersion, Service, advertise, receive_pack, upload_pack_v0};
+use gitana_git_http::{
+	ProtocolVersion, ReceiveOptions, Service, TrustContext, advertise, receive_pack, upload_pack_v0,
+};
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 use gitana_repo_host::exports::gitana::repo::porcelain::PushOutcome;
 use gitana_repo_host::{engine, grant_dir, instantiate, store};
@@ -90,15 +92,22 @@ async fn upload_pack(State(st): State<ServerState>, body: Bytes) -> Bytes {
 /// so the server would accept a non-fast-forward rewrite — which is what makes the client-side
 /// force check observable (a rejected non-ff push means the *client* declined, not the server).
 async fn receive_pack_srv(State(st): State<ServerState>, body: Bytes) -> Bytes {
+	// This harness exercises remote transport, not trust; push with force and no trust config.
+	let no_trust = TrustContext::none();
+	let options = || ReceiveOptions {
+		force: true,
+		trust: &no_trust,
+		now: 0,
+	};
 	let report = match st.kind {
 		HashKind::Sha1 => {
-			receive_pack(&open::<Sha1>(&st.git_dir), &body, true)
+			receive_pack(&open::<Sha1>(&st.git_dir), &body, options())
 				.await
 				.expect("receive-pack")
 				.report
 		}
 		HashKind::Sha256 => {
-			receive_pack(&open::<Sha256>(&st.git_dir), &body, true)
+			receive_pack(&open::<Sha256>(&st.git_dir), &body, options())
 				.await
 				.expect("receive-pack")
 				.report

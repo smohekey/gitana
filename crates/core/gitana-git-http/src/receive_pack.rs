@@ -17,8 +17,8 @@ use gitana_object::{
 };
 use gitana_repository::{Repository, RepositoryError};
 
-use crate::GitHttpError;
 use crate::push_cert::{self, PushCert};
+use crate::{GitHttpError, RefUpdate, TrustContext, TrustVerdict, verify_push};
 
 /// One ref-update command from the client.
 struct Command<H: HashAlgorithm> {
@@ -28,6 +28,34 @@ struct Command<H: HashAlgorithm> {
 	new: Option<ObjectId<H>>,
 	/// The ref name (`refs/heads/main`, …).
 	name: String,
+}
+
+impl<H: HashAlgorithm> Command<H> {
+	/// The public [`RefUpdate`] view trust enforcement consumes. (`Command` mirrors `RefUpdate`; the
+	/// duplication is a known smell noted for a later cleanup.)
+	fn to_update(&self) -> RefUpdate<H> {
+		RefUpdate {
+			old: self.old,
+			new: self.new,
+			name: self.name.clone(),
+		}
+	}
+}
+
+/// The host inputs a receive-pack needs beyond the request body: whether destructive updates are
+/// permitted, and the trust context and clock the pre-receive trust check runs against.
+pub struct ReceiveOptions<'a> {
+	/// Permits the destructive updates git withholds by default: non-fast-forward ref updates and
+	/// ref deletions. The host grants it only to a sufficiently privileged capability (the
+	/// trust/security model gates it on `admin`).
+	pub force: bool,
+	/// The server identity and nonce secret trust enforcement verifies push certificates against.
+	/// A host that has not configured trust passes [`TrustContext::none`]; a trust-configured
+	/// repository must supply real values or protected pushes fail closed.
+	pub trust: &'a TrustContext,
+	/// The current unix time, for push-certificate nonce freshness. The host supplies it so this
+	/// crate stays clock-free.
+	pub now: u64,
 }
 
 /// The result of a receive-pack: the `report-status` bytes and the refs that were
@@ -40,17 +68,21 @@ pub struct ReceiveOutcome<H: HashAlgorithm> {
 	/// The push certificate, if the client signed the push (`git push --signed`). The
 	/// wire codec only surfaces it; policy belongs to the embedding host.
 	pub push_cert: Option<PushCert>,
+	/// Trust failures observed but not enforced (only ever non-empty under `warn` policy). The wire
+	/// report does not carry them; a host records them for audit (step 7).
+	pub warnings: Vec<String>,
 }
 
 /// Handle a receive-pack request body, returning the report and the accepted updates.
 ///
-/// `force` permits the destructive updates git withholds by default: non-fast-forward
-/// ref updates and ref deletions. The host grants it only to a sufficiently privileged
-/// capability (the trust/security model gates it on `admin`).
+/// The pipeline unpacks, connectivity-checks, runs the pre-receive trust check
+/// ([`verify_push`]), and only then writes objects and moves refs — a rejection at any stage
+/// leaves the repository untouched. See [`ReceiveOptions`] for the `force` grant and the trust
+/// inputs.
 pub async fn receive_pack<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	request: &[u8],
-	force: bool,
+	options: ReceiveOptions<'_>,
 ) -> Result<ReceiveOutcome<H>, GitHttpError> {
 	let ParsedRequest {
 		commands,
@@ -74,28 +106,82 @@ pub async fn receive_pack<F: FileStore, H: HashAlgorithm>(
 				report: report_unpack_failure(out, &commands, &reason),
 				updated: Vec::new(),
 				push_cert,
+				warnings: Vec::new(),
 			});
 		}
 	};
-	let by_id: HashMap<ObjectId<H>, &(ObjectKind, Vec<u8>)> =
-		objects.iter().map(|(id, obj)| (*id, obj)).collect();
 	let new_tips: Vec<ObjectId<H>> = commands.iter().filter_map(|command| command.new).collect();
-	if let Err(reason) = check_connectivity(repo, &by_id, &new_tips).await? {
+	if let Err(reason) = check_connectivity(repo, &objects, &new_tips).await? {
 		return Ok(ReceiveOutcome {
 			report: report_unpack_failure(out, &commands, &reason),
 			updated: Vec::new(),
 			push_cert,
+			warnings: Vec::new(),
 		});
 	}
 
-	// Validated: persist the objects, then apply each ref update independently.
-	for (_, (kind, data)) in &objects {
-		repo.objects().write_object(*kind, data).await?;
+	// Pre-receive trust enforcement: verify the candidate trust root, push certificate, and newly
+	// introduced signed objects against the repository's policy — reading the pushed-but-unwritten
+	// objects through a quarantine overlay — before anything is committed.
+	let updates: Vec<RefUpdate<H>> = commands.iter().map(Command::to_update).collect();
+	let verdict = verify_push(
+		repo,
+		options.trust,
+		&updates,
+		&objects,
+		push_cert.as_ref(),
+		options.now,
+	)
+	.await?;
+	let (rejected, warnings) = match verdict {
+		TrustVerdict::Accept { warnings } => (HashMap::new(), warnings),
+		// A whole-push rejection (bad certificate, unverifiable root) `ng`s every ref and writes
+		// nothing — the repository is left exactly as it was.
+		TrustVerdict::Reject {
+			global: Some(reason),
+			..
+		} => {
+			let names: Vec<String> = commands.iter().map(|c| c.name.clone()).collect();
+			return Ok(ReceiveOutcome {
+				report: rejection_report(&names, &reason),
+				updated: Vec::new(),
+				push_cert,
+				warnings: Vec::new(),
+			});
+		}
+		// Per-ref rejections `ng` only the named refs; the rest of the push still applies.
+		TrustVerdict::Reject { global: None, refs } => (
+			refs.into_iter().collect::<HashMap<String, String>>(),
+			Vec::new(),
+		),
+	};
+
+	// Migrate only the objects reachable from accepted updates. A trust-rejected ref must not leave
+	// its (unsigned/untrusted) objects behind in the store — objects reachable from an accepted ref
+	// are the ones verify_push cleared (or the repo has no policy). The rest stay in quarantine and
+	// are discarded with this request.
+	let accepted_tips: Vec<ObjectId<H>> = commands
+		.iter()
+		.filter(|command| !rejected.contains_key(&command.name))
+		.filter_map(|command| command.new)
+		.collect();
+	let migrate = reachable_pushed(&objects, &accepted_tips)?;
+	for (id, (kind, data)) in &objects {
+		if migrate.contains(id) {
+			repo.objects().write_object(*kind, data).await?;
+		}
 	}
 	write_pkt(&mut out, b"unpack ok\n")?;
 	let mut updated = Vec::new();
 	for command in &commands {
-		match apply_command(repo, command, force).await {
+		if let Some(reason) = rejected.get(&command.name) {
+			write_pkt(
+				&mut out,
+				format!("ng {} {reason}\n", command.name).as_bytes(),
+			)?;
+			continue;
+		}
+		match apply_command(repo, command, options.force).await {
 			Ok(()) => {
 				write_pkt(&mut out, format!("ok {}\n", command.name).as_bytes())?;
 				if let Some(new) = command.new {
@@ -115,6 +201,7 @@ pub async fn receive_pack<F: FileStore, H: HashAlgorithm>(
 		report: out,
 		updated,
 		push_cert,
+		warnings,
 	})
 }
 
@@ -139,14 +226,14 @@ pub fn rejection_report(ref_names: &[String], reason: &str) -> Vec<u8> {
 	out
 }
 
-/// Unpack the pushed pack into `(id, (kind, payload))` objects, resolving thin-pack
+/// Unpack the pushed pack into an `id → (kind, payload)` map, resolving thin-pack
 /// bases from the store. An empty pack (delete-only push) yields no objects.
 async fn unpack<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	pack: &[u8],
-) -> Result<Vec<(ObjectId<H>, (ObjectKind, Vec<u8>))>, String> {
+) -> Result<HashMap<ObjectId<H>, (ObjectKind, Vec<u8>)>, String> {
 	if pack.is_empty() {
-		return Ok(Vec::new());
+		return Ok(HashMap::new());
 	}
 	let base_ids = ref_delta_base_ids::<H>(pack).map_err(|error| error.to_string())?;
 	let mut bases: HashMap<ObjectId<H>, (ObjectKind, Vec<u8>)> = HashMap::new();
@@ -169,7 +256,7 @@ async fn unpack<F: FileStore, H: HashAlgorithm>(
 /// stops at them and only descends into newly pushed objects.
 async fn check_connectivity<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
-	by_id: &HashMap<ObjectId<H>, &(ObjectKind, Vec<u8>)>,
+	by_id: &HashMap<ObjectId<H>, (ObjectKind, Vec<u8>)>,
 	tips: &[ObjectId<H>],
 ) -> Result<Result<(), String>, GitHttpError> {
 	let mut seen: HashSet<ObjectId<H>> = HashSet::new();
@@ -185,6 +272,28 @@ async fn check_connectivity<F: FileStore, H: HashAlgorithm>(
 		}
 	}
 	Ok(Ok(()))
+}
+
+/// The subset of pushed `objects` reachable from the accepted `tips` (through commits' trees and
+/// parents and tags' targets). Only these migrate to the store; anything a rejected ref introduced
+/// stays in quarantine. Ids that resolve outside the pushed set are already stored, so the walk
+/// stops at them.
+fn reachable_pushed<H: HashAlgorithm>(
+	objects: &HashMap<ObjectId<H>, (ObjectKind, Vec<u8>)>,
+	tips: &[ObjectId<H>],
+) -> Result<HashSet<ObjectId<H>>, GitHttpError> {
+	let mut migrate = HashSet::new();
+	let mut stack = tips.to_vec();
+	while let Some(id) = stack.pop() {
+		let Some((kind, data)) = objects.get(&id) else {
+			continue;
+		};
+		if !migrate.insert(id) {
+			continue;
+		}
+		stack.extend(referenced_ids::<H>(*kind, data)?);
+	}
+	Ok(migrate)
 }
 
 /// Apply one ref-update command via compare-and-set. Updates require fast-forward and

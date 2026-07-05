@@ -30,7 +30,9 @@ pub use pack::build_pack;
 pub use push_cert::{
 	CertCommand, PushCert, build as build_push_cert, make_nonce, peek as peek_push_cert, verify_nonce,
 };
-pub use receive_pack::{ReceiveOutcome, command_ref_names, receive_pack, rejection_report};
+pub use receive_pack::{
+	ReceiveOptions, ReceiveOutcome, command_ref_names, receive_pack, rejection_report,
+};
 pub use service::{ProtocolVersion, Service};
 pub use upload_pack_v0::upload_pack_v0;
 

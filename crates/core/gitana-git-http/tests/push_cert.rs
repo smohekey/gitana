@@ -4,7 +4,8 @@
 
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_git_http::{
-	CertCommand, PushCert, build_push_cert, make_nonce, receive_pack, verify_nonce,
+	CertCommand, PushCert, ReceiveOptions, TrustContext, build_push_cert, make_nonce, receive_pack,
+	verify_nonce,
 };
 use gitana_object::Sha256;
 use gitana_object::{
@@ -152,7 +153,18 @@ async fn signed_push_moves_ref_and_surfaces_cert() {
 	);
 	let request = build_push_cert(&original, "report-status object-format=sha256", &pack);
 
-	let outcome = receive_pack(&repo, &request, false).await.expect("receive");
+	// No trust root is configured here, so the certificate is surfaced but not enforced.
+	let outcome = receive_pack(
+		&repo,
+		&request,
+		ReceiveOptions {
+			force: false,
+			trust: &TrustContext::none(),
+			now: 0,
+		},
+	)
+	.await
+	.expect("receive");
 
 	// The ref moved (the cert's command was applied)…
 	assert_eq!(
