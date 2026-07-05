@@ -1,60 +1,67 @@
 //! `commit` — record a commit from the staged index on the current branch.
 
-use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_worktree::WorkTree;
 
-use crate::Identity;
+use crate::{CommitError, Identity};
 
 /// Record a commit from the staged index on the current branch, returning the new commit id.
 ///
 /// Refuses an unmerged or empty index *before* resolving identity, as git does — so a no-op commit
 /// reports "nothing to commit" rather than an identity error. `identity` is asked for the author and
 /// committer lines only once a commit will actually be made, so the caller can resolve `GIT_*` /
-/// config lazily.
+/// config lazily. The refusals and any underlying failure are distinguished through [`CommitError`].
 pub async fn commit<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
 	message: &str,
 	identity: &impl Identity,
-) -> Result<ObjectId<H>> {
-	let index = wt.load_index().await?;
+) -> Result<ObjectId<H>, CommitError> {
+	let index = wt.load_index().await.map_err(CommitError::Index)?;
 	// An unmerged index would silently drop conflicted paths (they have no stage-0 entry) from the
 	// tree, so refuse — as git does — until they are resolved.
 	if index.has_conflicts() {
-		bail!(
-			"committing is not possible because you have unmerged files; resolve them and mark resolution with `gta add`/`gta rm`"
-		);
+		return Err(CommitError::Unmerged);
 	}
 	let entries = index.tree_entries();
 	if entries.is_empty() {
-		bail!("nothing to commit (empty index)");
+		return Err(CommitError::Empty);
 	}
 
 	let repo = wt.repository();
-	let tree = repo.write_tree(&entries).await?;
+	let tree = repo
+		.write_tree(&entries)
+		.await
+		.map_err(CommitError::Repository)?;
 	// Refuse a commit that would not change the tree — git's "nothing to commit, working tree clean".
 	// The initial commit (unborn HEAD) has no parent tree to match, so it is always allowed. Checked
 	// before resolving identity, so a no-op reports "nothing to commit" rather than an identity error.
-	if let Some(head) = repo.refs().resolve_head().await?
-		&& repo.commit_tree(head).await? == tree
+	if let Some(head) = repo
+		.refs()
+		.resolve_head()
+		.await
+		.map_err(CommitError::Repository)?
+		&& repo
+			.commit_tree(head)
+			.await
+			.map_err(CommitError::Repository)?
+			== tree
 	{
-		bail!("nothing to commit, working tree clean");
+		return Err(CommitError::NothingToCommit);
 	}
 
-	let author = identity.author().await?;
-	let committer = identity.committer().await?;
+	let author = identity.author().await.map_err(CommitError::Identity)?;
+	let committer = identity.committer().await.map_err(CommitError::Identity)?;
 	let message = if message.ends_with('\n') {
 		message.to_owned()
 	} else {
 		format!("{message}\n")
 	};
-	Ok(
-		repo
-			.commit_on_head(tree, &author, &committer, &message)
-			.await?,
-	)
+	repo
+		.commit_on_head(tree, &author, &committer, &message)
+		.await
+		.map_err(CommitError::Repository)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

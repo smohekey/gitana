@@ -12,7 +12,7 @@ use crate::bindings::exports::gitana::repo::porcelain::{
 	RepoError, StatusEntry as WitStatusEntry, WorktreeStatus as WitWorktreeStatus,
 };
 
-use super::{repo_error, worktree_error};
+use super::{HostIdentity, repo_error, worktree_error};
 
 /// The working tree the worktree ops run over — the concrete `W` is the wasm descriptor capability.
 type Tree<H> = WorkTree<WorktreeFileStore, DescriptorWorkDir, H>;
@@ -59,42 +59,27 @@ pub(crate) async fn commit<H: HashAlgorithm>(
 	author: &str,
 	committer: &str,
 ) -> Result<String, RepoError> {
-	// The `gitana_porcelain::commit` orchestration, reimplemented here to take the author/committer as
-	// plain strings and map failures straight to `RepoError`. It could call `gitana_porcelain::commit`
-	// now that the crate is a dependency, but that asks for an `Identity` the component cannot supply
-	// — it has no env/config to resolve one from — so identity is passed in by the host instead.
-	let index = wt.load_index().await.map_err(worktree_error)?;
-	// An unmerged index would silently drop conflicted paths (no stage-0 entry) from the tree.
-	if index.has_conflicts() {
-		return Err(RepoError::Invalid(
-			"committing is not possible because you have unmerged files; resolve them first".to_owned(),
-		));
-	}
-	let entries = index.tree_entries();
-	if entries.is_empty() {
-		return Err(RepoError::Invalid(
-			"nothing to commit (empty index)".to_owned(),
-		));
-	}
-	let repo = wt.repository();
-	let tree = repo.write_tree(&entries).await.map_err(repo_error)?;
-	// Refuse a commit that would not change the tree — git's "nothing to commit, working tree clean"
-	// (the initial commit, with no parent tree to match, is always allowed).
-	if let Some(head) = repo.refs().resolve_head().await.map_err(repo_error)?
-		&& repo.commit_tree(head).await.map_err(repo_error)? == tree
-	{
-		return Err(RepoError::Invalid(
-			"nothing to commit, working tree clean".to_owned(),
-		));
-	}
-	let message = if message.ends_with('\n') {
-		message.to_owned()
-	} else {
-		format!("{message}\n")
-	};
-	let id = repo
-		.commit_on_head(tree, author, committer, &message)
+	// Reuse `gitana_porcelain::commit` (the unmerged/empty/unchanged guards, tree write, and commit),
+	// supplying identity as the host-passed lines. `CommitError` keeps the refusals distinct from a
+	// store failure, so they map to `invalid` vs `backend` at the boundary.
+	let identity = HostIdentity { author, committer };
+	let id = gitana_porcelain::commit(wt, message, &identity)
 		.await
-		.map_err(repo_error)?;
+		.map_err(commit_error)?;
 	Ok(id.to_hex())
+}
+
+/// Map a [`gitana_porcelain::CommitError`] to the boundary error. The three refusals are invalid
+/// input; the underlying index/repository failures defer to the shared mappings so precise variants
+/// (`corruption`, `ref-moved`, …) survive the boundary rather than collapsing to `backend`.
+fn commit_error(error: gitana_porcelain::CommitError) -> RepoError {
+	use gitana_porcelain::CommitError;
+	match error {
+		CommitError::Index(error) => worktree_error(error),
+		CommitError::Repository(error) => repo_error(error),
+		CommitError::Identity(error) => RepoError::Invalid(format!("{error:#}")),
+		refusal @ (CommitError::Unmerged | CommitError::Empty | CommitError::NothingToCommit) => {
+			RepoError::Invalid(refusal.to_string())
+		}
+	}
 }

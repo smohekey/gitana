@@ -11,6 +11,7 @@ use anyhow::Result;
 
 mod cherry_pick;
 mod commit;
+mod commit_error;
 pub mod conflict;
 mod merge;
 mod prune;
@@ -20,6 +21,7 @@ mod revert;
 
 pub use cherry_pick::{PickOutcome, abort_cherry_pick, cherry_pick, continue_cherry_pick};
 pub use commit::commit;
+pub use commit_error::CommitError;
 pub use merge::{MergeOutcome, abort_merge, continue_merge, merge};
 pub use prune::{gc, prune};
 pub use rebase::{RebaseOutcome, abort_rebase, continue_rebase, rebase, skip_rebase};

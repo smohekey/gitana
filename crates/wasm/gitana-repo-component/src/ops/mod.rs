@@ -3,6 +3,7 @@
 //! WIT types happen here, at the boundary.
 
 mod error;
+mod host_identity;
 mod objects;
 mod refs;
 mod remote;
@@ -12,6 +13,7 @@ mod worktree;
 
 pub(crate) use self::{
 	error::{repo_error, worktree_error},
+	host_identity::HostIdentity,
 	objects::{
 		create_commit, ls_tree, read_blob, read_commit, read_object, read_tag, write_blob, write_tree,
 	},
