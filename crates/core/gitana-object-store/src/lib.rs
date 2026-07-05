@@ -1,7 +1,7 @@
-//! Git object storage: read/write git objects by id over a `GitFileStore`.
+//! Git object storage: read/write git objects by id over a [`FileStore`].
 //!
 //! Composition crate: it wires [`gitana_object`]'s codecs onto a
-//! [`gitana_file_store::GitFileStore`] backend, scoped to one repository. Generic
+//! [`gitana_file_store::FileStore`] backend, scoped to one repository. Generic
 //! over the backend `F` and the hash algorithm `H` — layers are wired with
 //! compile-time generics (see docs/hlds/storage-layer.md). Reads try the loose object
 //! first, then stored packfiles: an object is located through the pack's `.idx` (id →
@@ -10,6 +10,7 @@
 //! and rejects a mismatch; objects served from a pack are content-addressed by
 //! construction (`decode_object_at` computes each id from its bytes).
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -77,6 +78,47 @@ fn ensure_within(len: u64, limit: u64) -> Result<(), ObjectStoreError> {
 fn index_path(pack_path: &str) -> String {
 	let stem = pack_path.strip_suffix(PACK_SUFFIX).unwrap_or(pack_path);
 	format!("{stem}{IDX_SUFFIX}")
+}
+
+/// Order an object id against a lowercase-hex `prefix`: `Equal` when the id's hex rendering begins
+/// with `prefix`, otherwise `Less`/`Greater` by the first differing nibble. Nibbles are compared
+/// most-significant first, matching `ObjectId`'s byte-lexicographic `Ord`, so this drives a binary
+/// search over an id-sorted slice. `prefix` must be lowercase hex (the caller validates it); a
+/// non-hex char sorts as if greater than every nibble, which merely makes the prefix match nothing.
+fn hex_prefix_cmp<H: HashAlgorithm>(id: &ObjectId<H>, prefix: &str) -> Ordering {
+	let bytes = id.as_bytes();
+	for (i, pc) in prefix.bytes().enumerate() {
+		if i / 2 >= bytes.len() {
+			// `prefix` is longer than a full id: the id is a proper prefix, so it sorts before.
+			return Ordering::Less;
+		}
+		let Some(want) = (pc as char).to_digit(16) else {
+			return Ordering::Less;
+		};
+		let byte = bytes[i / 2];
+		let nibble = u32::from(if i % 2 == 0 { byte >> 4 } else { byte & 0x0f });
+		match nibble.cmp(&want) {
+			Ordering::Equal => {}
+			other => return other,
+		}
+	}
+	Ordering::Equal
+}
+
+/// The contiguous sub-slice of `sorted` (ascending by object id) whose ids' hex renderings begin
+/// with `prefix`, located by two binary searches. `key` projects each element to its id. Both
+/// `PackIndex::entries()` and `MultiPackIndex::object_ids()` are id-sorted, so this is `O(log n)`.
+fn prefix_range<'a, H, T>(
+	sorted: &'a [T],
+	prefix: &str,
+	key: impl Fn(&T) -> &ObjectId<H>,
+) -> &'a [T]
+where
+	H: HashAlgorithm,
+{
+	let lo = sorted.partition_point(|e| hex_prefix_cmp(key(e), prefix).is_lt());
+	let hi = sorted.partition_point(|e| !hex_prefix_cmp(key(e), prefix).is_gt());
+	&sorted[lo..hi]
 }
 
 /// The order `encode_pack` writes object types in (commits, tags, trees, blobs). Used to sort
@@ -523,6 +565,76 @@ where
 			}
 		}
 		Ok(None)
+	}
+
+	/// Every stored object id whose lowercase-hex rendering begins with `prefix`, across loose and
+	/// packed objects, deduplicated and returned id-sorted. Used for abbreviated-id resolution: the
+	/// caller decides unique/absent/ambiguous from the count. `prefix` must be lowercase hex (each
+	/// char a hex digit) and is normally 4 or more chars; an object stored both loose and packed (or
+	/// in overlapping packs) is reported once. Packed ids are gathered with the same MIDX-then-per-
+	/// pack strategy `locate` uses — one binary-searched range over the multi-pack-index when it is
+	/// usable, plus each pack it does not cover — so nothing is double-counted or missed.
+	pub async fn find_by_prefix(&self, prefix: &str) -> Result<Vec<ObjectId<H>>, ObjectStoreError> {
+		let mut matches: HashSet<ObjectId<H>> = HashSet::new();
+
+		// Loose: the first two hex chars select one `objects/<aa>/` fan-out — scan just that. (A
+		// prefix shorter than the fan-out would need every directory; not a real abbreviation.)
+		if prefix.len() >= 2 {
+			let (dir, rest) = prefix.split_at(2);
+			for entry in self.files.list_prefix(&format!("objects/{dir}/")).await? {
+				let name = entry.rsplit('/').next().unwrap_or_default();
+				if name.starts_with(rest)
+					&& let Ok(id) = ObjectId::<H>::from_hex(&format!("{dir}{name}"))
+				{
+					matches.insert(id);
+				}
+			}
+		} else {
+			for id in self.loose_object_ids().await? {
+				if id.to_hex().starts_with(prefix) {
+					matches.insert(id);
+				}
+			}
+		}
+
+		let pack_paths: Vec<String> = self
+			.files
+			.list_prefix(PACK_PREFIX)
+			.await?
+			.into_iter()
+			.filter(|path| path.ends_with(PACK_SUFFIX))
+			.collect();
+
+		// Packs the MIDX covers are searched once through it; the rest scan their own `.idx`. A stale
+		// MIDX (it names a pack that no longer exists) is ignored, so every pack is scanned below.
+		let covered: HashSet<String> = match self.multi_pack_index().await? {
+			Some(midx) => {
+				let on_disk: HashSet<String> = pack_paths.iter().map(|p| midx_pack_name(p)).collect();
+				if midx.pack_names().iter().all(|name| on_disk.contains(name)) {
+					for id in prefix_range(midx.object_ids(), prefix, |id| id) {
+						matches.insert(*id);
+					}
+					midx.pack_names().iter().cloned().collect()
+				} else {
+					HashSet::new()
+				}
+			}
+			None => HashSet::new(),
+		};
+
+		for path in &pack_paths {
+			if covered.contains(&midx_pack_name(path)) {
+				continue;
+			}
+			let meta = self.pack_meta(path).await?;
+			for entry in prefix_range(meta.index.entries(), prefix, |entry| &entry.id) {
+				matches.insert(entry.id);
+			}
+		}
+
+		let mut out: Vec<ObjectId<H>> = matches.into_iter().collect();
+		out.sort_unstable();
+		Ok(out)
 	}
 
 	/// The parsed multi-pack-index, decoded on first use and cached (invalidated by `repack`).

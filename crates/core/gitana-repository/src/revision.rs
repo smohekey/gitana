@@ -2,8 +2,7 @@
 //!
 //! Resolves the everyday `git rev-parse` syntax — full/abbreviated oid, ref names
 //! (with a search order), `HEAD`/`@`, `~n`, `^n`, `^{type}` — and walks commits in
-//! committer-date order. Abbreviated-oid resolution scans loose objects only;
-//! packed-object abbreviation is a follow-up.
+//! committer-date order. Abbreviated-oid resolution spans loose and packed objects.
 
 use std::collections::{BinaryHeap, HashSet};
 
@@ -225,23 +224,7 @@ async fn resolve_abbrev<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	hex: &str,
 ) -> Result<ObjectId<H>, RepositoryError> {
-	let (dir, rest) = hex.split_at(2);
-	let entries = repo
-		.objects()
-		.file_store()
-		.list_prefix(&format!("objects/{dir}/"))
-		.await?;
-
-	let mut matches: Vec<ObjectId<H>> = Vec::new();
-	for path in entries {
-		let name = path.rsplit('/').next().unwrap_or_default();
-		if name.starts_with(rest)
-			&& let Ok(id) = ObjectId::from_hex(&format!("{dir}{name}"))
-		{
-			matches.push(id);
-		}
-	}
-	match matches.as_slice() {
+	match repo.objects().find_by_prefix(hex).await?.as_slice() {
 		[only] => Ok(*only),
 		[] => Err(RepositoryError::UnknownRevision(hex.to_owned())),
 		_ => Err(RepositoryError::AmbiguousRevision(hex.to_owned())),

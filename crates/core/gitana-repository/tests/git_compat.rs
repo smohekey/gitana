@@ -65,6 +65,47 @@ async fn init_open_and_loose_ref_cas() {
 }
 
 #[tokio::test]
+async fn abbreviations_resolve_across_loose_and_packed_objects() {
+	let repo = mem_repo();
+	repo.init().await.unwrap();
+
+	// A few commits, so several ids exist as loose objects.
+	let mut tips = Vec::new();
+	for i in 0..3u64 {
+		let blob = repo
+			.write_blob(format!("content {i}\n").as_bytes())
+			.await
+			.unwrap();
+		let tree = repo
+			.write_tree(&[TreeBuildEntry {
+				path: "f.txt".to_owned(),
+				mode: FileMode::Regular,
+				id: blob,
+			}])
+			.await
+			.unwrap();
+		let sig = format!("T E St <t@e> {} +0000", 1_700_000_000 + i as i64);
+		tips.push(
+			repo
+				.commit_on_head(tree, &sig, &sig, &format!("c{i}\n"))
+				.await
+				.unwrap(),
+		);
+	}
+	let target = tips[0];
+	let abbrev = &target.to_hex()[..12];
+
+	// Loose: the abbreviation resolves.
+	assert_eq!(repo.rev_parse(abbrev).await.unwrap(), target);
+
+	// Consolidate into a single pack, removing the loose objects.
+	repo.objects().repack(u64::MAX).await.unwrap();
+
+	// Packed: the same abbreviation still resolves (the loose-only gap this closes).
+	assert_eq!(repo.rev_parse(abbrev).await.unwrap(), target);
+}
+
+#[tokio::test]
 async fn open_refuses_non_sha256() {
 	let repo = mem_repo();
 	repo

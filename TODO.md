@@ -66,7 +66,12 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   and `git rev-list --test-bitmap` accept what gitana writes, and our reader reproduces
   `git rev-list --objects`. Not yet consumed by gitana's own reachability queries (fetch
   negotiation, `rev-list`) — that acceleration is future work.
-- [ ] Resolve abbreviated object IDs across packed objects, not only loose objects.
+- [x] Resolve abbreviated object IDs across packed objects, not only loose objects. `rev-parse`
+  of a short id now resolves loose *and* packed objects: a new `ObjectStore::find_by_prefix` unions
+  the targeted `objects/<aa>/` loose fan-out with a binary-searched range over the multi-pack-index
+  (and each pack the MIDX doesn't cover), deduplicating an object stored in more than one place, so
+  abbreviations keep resolving after a repack. `resolve_abbrev` now delegates to it and keeps the
+  unique/absent/ambiguous decision.
 
 ## Remote And Protocol Parity
 

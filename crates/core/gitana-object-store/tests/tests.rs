@@ -1150,3 +1150,172 @@ async fn write_reachability_bitmap_skips_a_loose_selected_commit() {
 		"only the packed commit is bitmapped"
 	);
 }
+
+/// The longest lowercase-hex prefix shared by any two of `ids`, and the two ids sharing it.
+/// Adjacent ids in sorted (== hex) order have the longest common prefix, so one scan suffices.
+fn longest_shared_hex_prefix(
+	ids: &[ObjectId<Sha256>],
+) -> (String, ObjectId<Sha256>, ObjectId<Sha256>) {
+	let mut sorted = ids.to_vec();
+	sorted.sort();
+	let mut best = (String::new(), sorted[0], sorted[0]);
+	for pair in sorted.windows(2) {
+		let (a, b) = (pair[0].to_hex(), pair[1].to_hex());
+		let shared: String = a
+			.chars()
+			.zip(b.chars())
+			.take_while(|(x, y)| x == y)
+			.map(|(x, _)| x)
+			.collect();
+		if shared.len() > best.0.len() {
+			best = (shared, pair[0], pair[1]);
+		}
+	}
+	best
+}
+
+#[tokio::test]
+async fn find_by_prefix_finds_loose_and_packed_objects() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let packed = sample_graph();
+	store
+		.write_pack(encode_pack(&packed))
+		.await
+		.expect("write pack");
+	let loose_a = store
+		.write_object(ObjectKind::Blob, b"loose alpha")
+		.await
+		.expect("write loose a");
+	let loose_b = store
+		.write_object(ObjectKind::Blob, b"loose beta")
+		.await
+		.expect("write loose b");
+
+	// A 12-hex-char (48-bit) prefix resolves each object uniquely, whether it is loose or packed.
+	let mut ids: Vec<ObjectId<Sha256>> = packed.iter().map(|o| o.id).collect();
+	ids.push(loose_a);
+	ids.push(loose_b);
+	for id in ids {
+		assert_eq!(
+			store
+				.find_by_prefix(&id.to_hex()[..12])
+				.await
+				.expect("find"),
+			vec![id],
+			"unique prefix of {id} must resolve to just it",
+		);
+	}
+}
+
+#[tokio::test]
+async fn find_by_prefix_dedups_an_object_that_is_both_loose_and_packed() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let data = b"stored twice".to_vec();
+	let id = ObjectId::<Sha256>::compute(ObjectKind::Blob, &data);
+
+	// Write it loose, then also inside a pack — the same id now lives in both storages.
+	store
+		.write_object(ObjectKind::Blob, &data)
+		.await
+		.expect("write loose");
+	store
+		.write_pack(encode_pack(&[PackedObject {
+			id,
+			kind: ObjectKind::Blob,
+			data,
+		}]))
+		.await
+		.expect("write pack");
+
+	assert_eq!(
+		store
+			.find_by_prefix(&id.to_hex()[..12])
+			.await
+			.expect("find"),
+		vec![id],
+		"an object stored both loose and packed is reported once, not as ambiguous",
+	);
+}
+
+#[tokio::test]
+async fn find_by_prefix_spans_a_multi_pack_index() {
+	// 1.2 MiB of incompressible blobs under a 512 KiB limit splits into several packs, which a
+	// repack covers with a multi-pack-index. Prefix resolution must consult it.
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let mut ids = Vec::new();
+	for seed in 1..=6u64 {
+		ids.push(
+			store
+				.write_object(ObjectKind::Blob, &incompressible(seed, 200 * 1024))
+				.await
+				.expect("write blob"),
+		);
+	}
+	let report = store
+		.repack(512 * 1024)
+		.await
+		.expect("repack")
+		.expect("repack did work");
+	assert!(report.packs_written > 1, "fixture must split into >1 pack");
+	assert!(
+		store
+			.file_store()
+			.exists("objects/pack/multi-pack-index")
+			.await
+			.expect("stat midx"),
+		"a multi-pack repo carries a MIDX",
+	);
+	assert!(
+		!has_loose_objects(&store).await,
+		"repack removed loose objects"
+	);
+
+	for id in ids {
+		assert_eq!(
+			store
+				.find_by_prefix(&id.to_hex()[..16])
+				.await
+				.expect("find"),
+			vec![id],
+			"packed object {id} must resolve by prefix through the MIDX",
+		);
+	}
+}
+
+#[tokio::test]
+async fn find_by_prefix_reports_every_ambiguous_match() {
+	// Pack enough blobs that two share a hex prefix, then confirm the shared prefix resolves to
+	// both (the caller reads more-than-one as ambiguous) while a longer prefix disambiguates.
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let objects: Vec<PackedObject<Sha256>> = (0..64u64)
+		.map(|seed| {
+			let data = incompressible(seed, 64);
+			let id = ObjectId::<Sha256>::compute(ObjectKind::Blob, &data);
+			PackedObject {
+				id,
+				kind: ObjectKind::Blob,
+				data,
+			}
+		})
+		.collect();
+	store
+		.write_pack(encode_pack(&objects))
+		.await
+		.expect("write pack");
+
+	let ids: Vec<ObjectId<Sha256>> = objects.iter().map(|o| o.id).collect();
+	// Pigeonhole: 64 ids over 16 first-hex-char buckets guarantees a shared prefix of length ≥ 1.
+	let (prefix, a, b) = longest_shared_hex_prefix(&ids);
+	assert!(!prefix.is_empty(), "fixture must have a shared prefix");
+
+	let matches = store.find_by_prefix(&prefix).await.expect("find");
+	assert!(
+		matches.contains(&a) && matches.contains(&b) && matches.len() >= 2,
+		"shared prefix {prefix:?} must resolve ambiguously: {matches:?}",
+	);
+
+	// One char past the divergence point, `a` still matches but `b` no longer does.
+	let longer = &a.to_hex()[..prefix.len() + 1];
+	let matches = store.find_by_prefix(longer).await.expect("find");
+	assert!(matches.contains(&a) && !matches.contains(&b));
+}
