@@ -213,9 +213,11 @@ Findings from this slice:
   `-zstack-size=8MiB` (build.rs), matching native thread stacks.
 - Post-repack reads through packs + the multi-pack-index work unchanged through the descriptor
   backend — the spike had only proven loose objects.
-- Abbreviated-id resolution scans **loose objects only** (`objects/xx/` prefix listing); after a
-  repack, abbreviations of packed objects do not resolve. Engine limitation, not a component
-  one; noted for a future engine slice.
+- Abbreviated-id resolution originally scanned **loose objects only** (`objects/xx/` prefix
+  listing), so after a repack, abbreviations of packed objects did not resolve — an engine
+  limitation, not a component one. **Resolved:** `ObjectStore::find_by_prefix` now unions the loose
+  fan-out with the packed objects (a binary-searched range over the multi-pack-index plus each pack
+  it does not cover), so post-repack abbreviations resolve in both native and component paths.
 - prune/gc remain excluded: their root collection must include the worktree *index* (staged
   objects), which is ambient-`std::fs` territory until worktree threading lands.
 
