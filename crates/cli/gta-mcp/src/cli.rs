@@ -425,6 +425,31 @@ enum Command {
 		#[command(subcommand)]
 		action: Option<RemoteAction>,
 	},
+	/// Manage the repository's trust root (the signed `refs/gitana/trust` chain).
+	Trust {
+		#[command(subcommand)]
+		action: TrustAction,
+	},
+}
+
+/// A `trust` sub-command.
+#[derive(Subcommand, clap_mcp::ClapMcp)]
+#[clap_mcp(schema_only)]
+enum TrustAction {
+	/// Bootstrap the trust root: create a self-signed root enrolling the signing key.
+	Init {
+		/// Enforcement policy for the new root.
+		#[arg(long, default_value = "warn")]
+		policy: String,
+		/// SSH private key to sign with (default: git config `user.signingkey`).
+		#[arg(long = "signing-key")]
+		signing_key: Option<PathBuf>,
+		/// Allow `--policy require` with a single enrolled key (unsafe: losing it locks the repository).
+		#[arg(long = "break-glass")]
+		break_glass: bool,
+	},
+	/// Show the current trust policy and enrolled key fingerprints.
+	List,
 }
 
 /// A `remote` sub-command. Absent means "list the remotes".
@@ -610,7 +635,25 @@ impl Cli {
 			Command::Remote { verbose, action } => {
 				commands::remote::run(&cwd, remote_action(verbose, action)).await
 			}
+			Command::Trust { action } => commands::trust::run(&cwd, trust_action(action)).await,
 		}
+	}
+}
+
+/// Map the clap `trust` sub-command to the `gta-core` action.
+fn trust_action(action: TrustAction) -> commands::trust::Action {
+	use commands::trust::Action;
+	match action {
+		TrustAction::Init {
+			policy,
+			signing_key,
+			break_glass,
+		} => Action::Init {
+			policy,
+			signing_key,
+			break_glass,
+		},
+		TrustAction::List => Action::List,
 	}
 }
 

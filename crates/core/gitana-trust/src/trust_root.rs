@@ -1,4 +1,4 @@
-use crate::{Policy, TrustError, TrustedKey};
+use crate::{Policy, TrustDocument, TrustError, TrustedKey};
 
 /// The path, within a trust commit's tree, of the canonical trust document.
 pub const TRUST_DOCUMENT_PATH: &str = "trust.json";
@@ -17,23 +17,11 @@ pub struct TrustRoot {
 	pub metadata: serde_json::Value,
 }
 
-/// The on-disk JSON shape of a trust document. Keys are OpenSSH public-key lines
-/// (`ssh-ed25519 AAAA… comment`); [`TrustRoot`] holds them parsed.
-#[derive(serde::Deserialize)]
-struct TrustDocument {
-	version: u32,
-	policy: Policy,
-	keys: Vec<String>,
-	#[serde(default)]
-	metadata: serde_json::Value,
-}
-
 impl TrustRoot {
 	/// Parse a trust root from its canonical JSON document bytes. Errors on malformed JSON, an
 	/// unparseable key, or an empty key set (an empty-key root is never accepted).
 	pub fn from_json(bytes: &[u8]) -> Result<Self, TrustError> {
-		let document: TrustDocument =
-			serde_json::from_slice(bytes).map_err(TrustError::MalformedTrustDocument)?;
+		let document = TrustDocument::from_json(bytes)?;
 		let keys = document
 			.keys
 			.iter()

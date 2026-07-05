@@ -18,6 +18,7 @@ mod prune;
 mod rebase;
 mod remote;
 mod revert;
+mod trust;
 
 pub use cherry_pick::{PickOutcome, abort_cherry_pick, cherry_pick, continue_cherry_pick};
 pub use commit::commit;
@@ -27,6 +28,7 @@ pub use prune::{gc, prune};
 pub use rebase::{RebaseOutcome, abort_rebase, continue_rebase, rebase, skip_rebase};
 pub use remote::{FetchOutcome, PushOutcome, clone, fetch, pull_upstream, push};
 pub use revert::{RevertOutcome, abort_revert, continue_revert, revert};
+pub use trust::{TRUST_REF, trust_init, trust_list};
 
 /// Resolves the git identity lines (`Name <email> seconds ±hhmm`) for operations that record commits.
 /// The engine never reads process env / config directly; the CLI adapter implements this over its
@@ -42,6 +44,18 @@ pub trait Identity {
 	async fn committer_or_default(&self) -> String;
 }
 
+/// Produces a git-format SSH signature (an `SSHSIG` armor block, git's `git` namespace) over given
+/// bytes. Like [`Identity`], the engine holds this capability rather than loading keys or invoking
+/// tools itself: the CLI adapter implements it (over `ssh-keygen`), and an operation asks for a
+/// signature only once it is certain to record a signed object.
+pub trait Signer {
+	/// Sign `payload`, returning the armored `-----BEGIN SSH SIGNATURE-----` block with no trailing
+	/// newline — the value goes straight into a commit's `gpgsig` header, which
+	/// [`gitana_object::encode_commit`] folds (a trailing newline would emit a stray blank
+	/// continuation line and corrupt the signed object).
+	async fn sign(&self, payload: &[u8]) -> Result<String>;
+}
+
 // The fixtures build a native cap-std `LocalFileStore` (`from_dir`), so the test module is
 // native-only — keeping `--target wasm32-wasip2 --all-targets` clean.
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -54,10 +68,46 @@ pub(crate) mod test_support {
 	use gitana_object_store::ObjectStore;
 	use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 	use gitana_worktree::{Index, IndexEntry, Stat, WorkTree};
+	use ssh_key::private::Ed25519Keypair;
+	use ssh_key::{HashAlg, LineEnding, PrivateKey};
 
-	use crate::Identity;
+	use crate::{Identity, Signer};
 
 	pub(crate) const WHO: &str = "A U Thor <a@example.com> 0 +0000";
+
+	/// A test [`Signer`] over a deterministic ed25519 key: signs with the same SSHSIG recipe git uses
+	/// (namespace `git`, SHA-512, LF-armored, trailing newline trimmed) so the signed objects it
+	/// produces verify through the real `gitana-trust` core.
+	pub(crate) struct TestSigner {
+		key: PrivateKey,
+	}
+
+	impl TestSigner {
+		/// A signer whose key is seeded by `seed` — distinct seeds give distinct keys.
+		pub(crate) fn new(seed: u8) -> Self {
+			Self {
+				key: PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32])),
+			}
+		}
+
+		/// This signer's public key as an OpenSSH line, to enrol in a trust document.
+		pub(crate) fn public_line(&self) -> String {
+			self.key.public_key().to_openssh().expect("openssh line")
+		}
+	}
+
+	impl Signer for TestSigner {
+		async fn sign(&self, payload: &[u8]) -> Result<String> {
+			Ok(
+				self
+					.key
+					.sign("git", HashAlg::Sha512, payload)?
+					.to_pem(LineEnding::LF)?
+					.trim_end()
+					.to_owned(),
+			)
+		}
+	}
 
 	/// A test [`Identity`] that yields a fixed signature and records whether it was ever asked to
 	/// resolve — so a test can assert the engine did not resolve identity on a no-op path.

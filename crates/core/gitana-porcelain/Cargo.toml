@@ -26,6 +26,7 @@ gitana-object.workspace = true
 gitana-object-store.workspace = true
 gitana-remote.workspace = true
 gitana-repository.workspace = true
+gitana-trust.workspace = true
 gitana-worktree.workspace = true
 
 [dev-dependencies]
@@ -35,5 +36,7 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 
 # cap-std (used only to build a native `LocalFileStore` in tests) pulls WASI deps that don't
 # build on stable; keep it native-only so `--target wasm32-wasip2 --all-targets` stays clean.
+# ssh-key (the test `Signer`, which produces real SSHSIG signatures) is native-only for the same reason.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 cap-std.workspace = true
+ssh-key = { workspace = true, features = ["crypto"] }

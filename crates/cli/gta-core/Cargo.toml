@@ -23,8 +23,10 @@ gitana-object-store.workspace = true
 gitana-porcelain = { workspace = true, features = ["reqwest-transport"] }
 gitana-remote = { workspace = true, features = ["reqwest-transport"] }
 gitana-repository.workspace = true
+gitana-trust.workspace = true
 gitana-worktree.workspace = true
 sha2.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "process"] }
 
 [dev-dependencies]
 gitana-file-store-memory.workspace = true

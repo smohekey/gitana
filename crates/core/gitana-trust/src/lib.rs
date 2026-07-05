@@ -24,6 +24,7 @@ mod fold;
 mod key_id;
 mod object_source;
 mod policy;
+mod trust_document;
 mod trust_root;
 mod trusted_key;
 
@@ -32,6 +33,7 @@ pub use self::fold::{fold_trust_root, verify_candidate_trust_update};
 pub use self::key_id::KeyId;
 pub use self::object_source::ObjectSource;
 pub use self::policy::Policy;
+pub use self::trust_document::TrustDocument;
 pub use self::trust_root::{TRUST_DOCUMENT_PATH, TrustRoot};
 pub use self::trusted_key::TrustedKey;
 

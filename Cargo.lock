@@ -1316,7 +1316,9 @@ dependencies = [
  "gitana-object-store",
  "gitana-remote",
  "gitana-repository",
+ "gitana-trust",
  "gitana-worktree",
+ "ssh-key",
  "tempfile",
  "tokio",
 ]
@@ -1467,6 +1469,7 @@ dependencies = [
  "gitana-porcelain",
  "gitana-remote",
  "gitana-repository",
+ "gitana-trust",
  "gitana-worktree",
  "sha2",
  "ssh-key",

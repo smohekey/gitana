@@ -8,6 +8,7 @@ mod dispatch;
 mod error;
 mod identity;
 mod repo;
+mod signer;
 
 pub use error::{MergeConflict, SilentExit};
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
