@@ -1,0 +1,813 @@
+//! Pre-receive trust enforcement (`verify_push`): a repo with a real signed trust root, pushes
+//! built from in-crate SSHSIG-signed commits and push certificates, exercised across off/warn/require.
+
+use std::collections::HashMap;
+
+use gitana_file_store_memory::MemoryFileStore;
+use gitana_git_http::{
+	CertCommand, PushCert, RefUpdate, TrustContext, TrustVerdict, make_nonce, verify_push,
+};
+use gitana_object::{
+	Commit, ObjectId, ObjectKind, Sha256, Tag, TreeEntry, encode_commit, encode_tag, encode_tree,
+	tag_signed_payload,
+};
+use gitana_object_store::ObjectStore;
+use gitana_repository::Repository;
+use ssh_key::private::Ed25519Keypair;
+use ssh_key::{HashAlg, LineEnding, PrivateKey};
+
+type Repo = Repository<MemoryFileStore, Sha256>;
+type Oid = ObjectId<Sha256>;
+type Objects = HashMap<Oid, (ObjectKind, Vec<u8>)>;
+
+const NOW: u64 = 1_700_000_000;
+const SECRET: &[u8] = b"server-secret";
+const REPO_ID: &str = "acme/app";
+const PUSHEE: &str = "http://host/acme/app";
+const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn key(seed: u8) -> PrivateKey {
+	PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32]))
+}
+
+async fn new_repo() -> Repo {
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(MemoryFileStore::new()));
+	repo.init().await.expect("init");
+	repo
+}
+
+fn context() -> TrustContext {
+	TrustContext {
+		nonce_secret: SECRET.to_vec(),
+		repo_id: REPO_ID.to_owned(),
+		pushee: PUSHEE.to_owned(),
+		nonce_slop_secs: 900,
+	}
+}
+
+/// A trust document enrolling `keys` under `policy`.
+fn trust_json(keys: &[&PrivateKey], policy: &str) -> Vec<u8> {
+	let lines: Vec<String> = keys
+		.iter()
+		.map(|k| k.public_key().to_openssh().expect("openssh"))
+		.collect();
+	serde_json::to_vec(&serde_json::json!({ "version": 1, "policy": policy, "keys": lines }))
+		.expect("json")
+}
+
+/// The armored SSHSIG over `payload` in git's `git` namespace.
+fn sign(signer: &PrivateKey, payload: &[u8]) -> String {
+	signer
+		.sign("git", HashAlg::Sha512, payload)
+		.expect("sign")
+		.to_pem(LineEnding::LF)
+		.expect("pem")
+		.trim_end()
+		.to_owned()
+}
+
+fn empty_tree() -> Oid {
+	ObjectId::compute(ObjectKind::Tree, &encode_tree::<Sha256>(&[]))
+}
+
+fn commit_bytes(signer: Option<&PrivateKey>, message: &str) -> (Oid, Vec<u8>) {
+	let mut commit = Commit {
+		tree: empty_tree(),
+		parents: vec![],
+		author: "Dev <dev@x> 1700000000 +0000".to_owned(),
+		committer: "Dev <dev@x> 1700000000 +0000".to_owned(),
+		signature: None,
+		extra_headers: Vec::new(),
+		message: message.to_owned(),
+	};
+	if let Some(signer) = signer {
+		commit.signature = Some(sign(signer, &encode_commit(&commit)));
+	}
+	let raw = encode_commit(&commit);
+	(ObjectId::compute(ObjectKind::Commit, &raw), raw)
+}
+
+/// Write a bootstrap trust commit (self-signed by `signer`, enrolling `keys` under `policy`) into
+/// the store and point `refs/gitana/trust` at it. Returns the tip.
+async fn install_root(repo: &Repo, signer: &PrivateKey, keys: &[&PrivateKey], policy: &str) -> Oid {
+	let objects = trust_commit(signer, keys, policy, vec![]);
+	let mut tip = None;
+	for (kind, raw) in objects.values() {
+		let id = repo
+			.objects()
+			.write_object(*kind, raw)
+			.await
+			.expect("write");
+		if *kind == ObjectKind::Commit {
+			tip = Some(id);
+		}
+	}
+	let tip = tip.expect("commit");
+	repo
+		.refs()
+		.update_ref("refs/gitana/trust", tip, None)
+		.await
+		.expect("set trust ref");
+	tip
+}
+
+/// The blob+tree+commit objects of a trust commit (keyed by id), the commit signed by `signer`.
+fn trust_commit(
+	signer: &PrivateKey,
+	keys: &[&PrivateKey],
+	policy: &str,
+	parents: Vec<Oid>,
+) -> Objects {
+	let mut objects = Objects::new();
+	let blob = trust_json(keys, policy);
+	let blob_id = ObjectId::compute(ObjectKind::Blob, &blob);
+	objects.insert(blob_id, (ObjectKind::Blob, blob));
+	let tree = encode_tree(&[TreeEntry {
+		mode: "100644".to_owned(),
+		name: "trust.json".to_owned(),
+		id: blob_id,
+	}]);
+	let tree_id = ObjectId::compute(ObjectKind::Tree, &tree);
+	objects.insert(tree_id, (ObjectKind::Tree, tree));
+	let mut commit = Commit {
+		tree: tree_id,
+		parents,
+		author: "Trust <t@x> 1700000000 +0000".to_owned(),
+		committer: "Trust <t@x> 1700000000 +0000".to_owned(),
+		signature: None,
+		extra_headers: Vec::new(),
+		message: "trust\n".to_owned(),
+	};
+	commit.signature = Some(sign(signer, &encode_commit(&commit)));
+	let raw = encode_commit(&commit);
+	objects.insert(
+		ObjectId::compute(ObjectKind::Commit, &raw),
+		(ObjectKind::Commit, raw),
+	);
+	objects
+}
+
+fn ref_update(name: &str, old: Option<Oid>, new: Oid) -> RefUpdate<Sha256> {
+	RefUpdate {
+		old,
+		new: Some(new),
+		name: name.to_owned(),
+	}
+}
+
+fn ref_delete(name: &str, old: Oid) -> RefUpdate<Sha256> {
+	RefUpdate {
+		old: Some(old),
+		new: None,
+		name: name.to_owned(),
+	}
+}
+
+/// A pushed-objects map for a single commit, including its (empty) tree — a real push carries every
+/// reachable object, and the signing walk resolves the commit's reachability through the quarantine.
+fn one_commit(commit: Oid, raw: Vec<u8>) -> Objects {
+	let mut objects = Objects::new();
+	objects.insert(empty_tree(), (ObjectKind::Tree, encode_tree::<Sha256>(&[])));
+	objects.insert(commit, (ObjectKind::Commit, raw));
+	objects
+}
+
+/// A signed annotated tag pointing at `target`; returns `(id, raw bytes)`.
+fn signed_tag(signer: &PrivateKey, target: Oid, name: &str) -> (Oid, Vec<u8>) {
+	let mut tag = Tag {
+		object: target,
+		kind: ObjectKind::Commit,
+		name: name.to_owned(),
+		tagger: Some("Dev <dev@x> 1700000000 +0000".to_owned()),
+		signature: None,
+		message: format!("{name}\n"),
+	};
+	tag.signature = Some(format!("{}\n", sign(signer, &tag_signed_payload(&tag))));
+	let raw = encode_tag(&tag);
+	(ObjectId::compute(ObjectKind::Tag, &raw), raw)
+}
+
+fn commit_id_of(objects: &Objects) -> Oid {
+	objects
+		.iter()
+		.find(|(_, (kind, _))| *kind == ObjectKind::Commit)
+		.map(|(id, _)| *id)
+		.expect("commit")
+}
+
+/// A push certificate signed by `signer` for `commands`, with a fresh valid nonce by default.
+fn signed_cert(signer: &PrivateKey, commands: Vec<CertCommand>, nonce: &str) -> PushCert {
+	let mut cert = PushCert {
+		version: "0.1".to_owned(),
+		pusher: "Dev <dev@x> 1700000000 +0000".to_owned(),
+		pushee: PUSHEE.to_owned(),
+		nonce: nonce.to_owned(),
+		push_options: Vec::new(),
+		commands,
+		signature: String::new(),
+	};
+	cert.signature = sign(signer, &cert.payload());
+	cert
+}
+
+fn cert_command(new: Oid, name: &str) -> CertCommand {
+	CertCommand {
+		old: ZERO.to_owned(),
+		new: new.to_hex(),
+		refname: name.to_owned(),
+	}
+}
+
+fn fresh_nonce() -> String {
+	make_nonce(SECRET, REPO_ID, NOW, b"\x01\x02\x03\x04")
+}
+
+#[tokio::test]
+async fn accepts_when_no_trust_root() {
+	let repo = new_repo().await;
+	let (commit, raw) = commit_bytes(None, "unsigned\n");
+	let objects = one_commit(commit, raw);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/heads/main", None, commit)],
+		&objects,
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	assert_eq!(verdict, TrustVerdict::Accept { warnings: vec![] });
+}
+
+#[tokio::test]
+async fn accepts_when_policy_off() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "off").await;
+	let (commit, raw) = commit_bytes(None, "unsigned\n");
+	let objects = one_commit(commit, raw);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/heads/main", None, commit)],
+		&objects,
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	assert_eq!(verdict, TrustVerdict::Accept { warnings: vec![] });
+}
+
+#[tokio::test]
+async fn require_rejects_unsigned_commit_and_missing_cert() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	let (commit, raw) = commit_bytes(None, "unsigned\n");
+	let objects = one_commit(commit, raw);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/heads/main", None, commit)],
+		&objects,
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	match verdict {
+		TrustVerdict::Reject { global, refs } => {
+			assert!(global.is_some(), "certificate required globally");
+			assert!(
+				refs.iter().any(|(name, _)| name == "refs/heads/main"),
+				"unsigned commit rejected per-ref: {refs:?}"
+			);
+		}
+		other => panic!("expected reject, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn require_accepts_signed_commit_with_valid_cert() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	let (commit, raw) = commit_bytes(Some(&a), "signed\n");
+	let objects = one_commit(commit, raw);
+	let cert = signed_cert(
+		&a,
+		vec![cert_command(commit, "refs/heads/main")],
+		&fresh_nonce(),
+	);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/heads/main", None, commit)],
+		&objects,
+		Some(&cert),
+		NOW,
+	)
+	.await
+	.expect("verify");
+	assert_eq!(verdict, TrustVerdict::Accept { warnings: vec![] });
+}
+
+#[tokio::test]
+async fn require_rejects_stale_nonce() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	let (commit, raw) = commit_bytes(Some(&a), "signed\n");
+	let objects = one_commit(commit, raw);
+	let cert = signed_cert(
+		&a,
+		vec![cert_command(commit, "refs/heads/main")],
+		&fresh_nonce(),
+	);
+	// `now` well outside the slop window makes the nonce stale.
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/heads/main", None, commit)],
+		&objects,
+		Some(&cert),
+		NOW + 10_000,
+	)
+	.await
+	.expect("verify");
+	assert!(matches!(
+		verdict,
+		TrustVerdict::Reject {
+			global: Some(_),
+			..
+		}
+	));
+}
+
+#[tokio::test]
+async fn require_rejects_cert_command_mismatch() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	let (commit, raw) = commit_bytes(Some(&a), "signed\n");
+	let objects = one_commit(commit, raw);
+	// The certificate signs a different ref than the push updates.
+	let cert = signed_cert(
+		&a,
+		vec![cert_command(commit, "refs/heads/other")],
+		&fresh_nonce(),
+	);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/heads/main", None, commit)],
+		&objects,
+		Some(&cert),
+		NOW,
+	)
+	.await
+	.expect("verify");
+	assert!(matches!(
+		verdict,
+		TrustVerdict::Reject {
+			global: Some(_),
+			..
+		}
+	));
+}
+
+#[tokio::test]
+async fn require_rejects_commit_by_untrusted_key() {
+	let (a, b) = (key(1), key(2));
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	// The commit is signed, but by `b`, who is not in the trust root.
+	let (commit, raw) = commit_bytes(Some(&b), "signed by untrusted\n");
+	let objects = one_commit(commit, raw);
+	let cert = signed_cert(
+		&a,
+		vec![cert_command(commit, "refs/heads/main")],
+		&fresh_nonce(),
+	);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/heads/main", None, commit)],
+		&objects,
+		Some(&cert),
+		NOW,
+	)
+	.await
+	.expect("verify");
+	match verdict {
+		TrustVerdict::Reject { refs, .. } => {
+			assert!(
+				refs.iter().any(|(name, _)| name == "refs/heads/main"),
+				"{refs:?}"
+			);
+		}
+		other => panic!("expected reject, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn warn_records_warnings_but_accepts() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "warn").await;
+	let (commit, raw) = commit_bytes(None, "unsigned\n");
+	let objects = one_commit(commit, raw);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/heads/main", None, commit)],
+		&objects,
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	match verdict {
+		TrustVerdict::Accept { warnings } => assert!(!warnings.is_empty(), "warnings recorded"),
+		other => panic!("expected accept-with-warnings, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn accepts_a_valid_candidate_trust_update() {
+	let (a, b) = (key(1), key(2));
+	let repo = new_repo().await;
+	let bootstrap = install_root(&repo, &a, &[&a], "require").await;
+	// A new trust commit (signed by the trusted `a`) enrolling `b`, pushed but not yet stored.
+	let objects = trust_commit(&a, &[&a, &b], "require", vec![bootstrap]);
+	let new_tip = commit_id_of(&objects);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/gitana/trust", Some(bootstrap), new_tip)],
+		&objects,
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	assert_eq!(verdict, TrustVerdict::Accept { warnings: vec![] });
+}
+
+#[tokio::test]
+async fn off_still_hard_rejects_trust_ref_deletion() {
+	let a = key(1);
+	let repo = new_repo().await;
+	// Even under `off`, the trust root's own integrity is enforced: it cannot be deleted.
+	let tip = install_root(&repo, &a, &[&a], "off").await;
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_delete("refs/gitana/trust", tip)],
+		&Objects::new(),
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	match verdict {
+		TrustVerdict::Reject { refs, .. } => {
+			assert!(
+				refs.iter().any(|(name, _)| name == "refs/gitana/trust"),
+				"{refs:?}"
+			);
+		}
+		other => panic!("expected reject, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn warn_still_hard_rejects_an_invalid_trust_update() {
+	let (a, b) = (key(1), key(2));
+	let repo = new_repo().await;
+	// Current root is `warn`, enrolling only `a`.
+	let bootstrap = install_root(&repo, &a, &[&a], "warn").await;
+	// A trust update signed by the untrusted `b`: warn must NOT let it poison the trust root.
+	let objects = trust_commit(&b, &[&a, &b], "warn", vec![bootstrap]);
+	let new_tip = commit_id_of(&objects);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/gitana/trust", Some(bootstrap), new_tip)],
+		&objects,
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	match verdict {
+		TrustVerdict::Reject { refs, .. } => {
+			assert!(
+				refs.iter().any(|(name, _)| name == "refs/gitana/trust"),
+				"{refs:?}"
+			);
+		}
+		other => panic!("expected hard reject under warn, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn accepts_a_valid_bootstrap_creation() {
+	let a = key(1);
+	let repo = new_repo().await; // no trust ref yet
+	// A self-signed bootstrap (signed by `a`, which the doc enrols), pushed to create the trust ref.
+	let objects = trust_commit(&a, &[&a], "require", vec![]);
+	let tip = commit_id_of(&objects);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/gitana/trust", None, tip)],
+		&objects,
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	assert_eq!(verdict, TrustVerdict::Accept { warnings: vec![] });
+}
+
+#[tokio::test]
+async fn rejects_a_bootstrap_not_self_signed() {
+	let (a, b) = (key(1), key(2));
+	let repo = new_repo().await;
+	// The bootstrap doc enrols `a` but the commit is signed by `b`: not self-signed.
+	let objects = trust_commit(&b, &[&a], "require", vec![]);
+	let tip = commit_id_of(&objects);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/gitana/trust", None, tip)],
+		&objects,
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	match verdict {
+		TrustVerdict::Reject { refs, .. } => {
+			assert!(
+				refs.iter().any(|(name, _)| name == "refs/gitana/trust"),
+				"{refs:?}"
+			);
+		}
+		other => panic!("expected reject, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn rejects_trust_ref_deletion() {
+	let a = key(1);
+	let repo = new_repo().await;
+	let tip = install_root(&repo, &a, &[&a], "require").await;
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_delete("refs/gitana/trust", tip)],
+		&HashMap::new(),
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	match verdict {
+		TrustVerdict::Reject { refs, .. } => {
+			assert!(
+				refs.iter().any(|(name, _)| name == "refs/gitana/trust"),
+				"{refs:?}"
+			);
+		}
+		other => panic!("expected reject, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn require_rejects_moving_a_protected_ref_to_an_unsigned_stored_commit() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	// An unsigned commit already in the store (as if first pushed to an unprotected ref). It is not
+	// reachable from any protected ref, so it is NOT grandfathered.
+	let (stored, raw) = commit_bytes(None, "unsigned but stored\n");
+	repo
+		.objects()
+		.write_object(ObjectKind::Commit, &raw)
+		.await
+		.expect("store");
+	// A signed push moving a protected branch onto it (empty pack — the object is already stored).
+	let cert = signed_cert(
+		&a,
+		vec![cert_command(stored, "refs/heads/main")],
+		&fresh_nonce(),
+	);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/heads/main", None, stored)],
+		&Objects::new(),
+		Some(&cert),
+		NOW,
+	)
+	.await
+	.expect("verify");
+	match verdict {
+		TrustVerdict::Reject { refs, .. } => {
+			assert!(
+				refs.iter().any(|(name, _)| name == "refs/heads/main"),
+				"{refs:?}"
+			);
+		}
+		other => panic!("expected reject, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn rejects_a_mixed_bootstrap_and_protected_push() {
+	let a = key(1);
+	let repo = new_repo().await; // no trust ref
+	// The push both creates the trust ref and updates a protected branch — refused; bootstrap alone.
+	let boot = trust_commit(&a, &[&a], "require", vec![]);
+	let boot_tip = commit_id_of(&boot);
+	let (commit, raw) = commit_bytes(Some(&a), "signed\n");
+	let mut objects = boot;
+	objects.insert(commit, (ObjectKind::Commit, raw));
+	objects.insert(empty_tree(), (ObjectKind::Tree, encode_tree::<Sha256>(&[])));
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[
+			ref_update("refs/gitana/trust", None, boot_tip),
+			ref_update("refs/heads/main", None, commit),
+		],
+		&objects,
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	assert!(matches!(
+		verdict,
+		TrustVerdict::Reject {
+			global: Some(_),
+			..
+		}
+	));
+}
+
+#[tokio::test]
+async fn rejects_a_trust_policy_change_mixed_with_protected_refs() {
+	let a = key(1);
+	let repo = new_repo().await;
+	// Current root is lenient (warn); the push flips it to require AND moves a protected ref, which
+	// would otherwise be judged under the old warn policy but land under the new require root.
+	let bootstrap = install_root(&repo, &a, &[&a], "warn").await;
+	let trust = trust_commit(&a, &[&a], "require", vec![bootstrap]);
+	let trust_tip = commit_id_of(&trust);
+	let (commit, raw) = commit_bytes(None, "unsigned\n");
+	let mut objects = trust;
+	objects.insert(commit, (ObjectKind::Commit, raw));
+	objects.insert(empty_tree(), (ObjectKind::Tree, encode_tree::<Sha256>(&[])));
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[
+			ref_update("refs/gitana/trust", Some(bootstrap), trust_tip),
+			ref_update("refs/heads/main", None, commit),
+		],
+		&objects,
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	assert!(matches!(
+		verdict,
+		TrustVerdict::Reject {
+			global: Some(_),
+			..
+		}
+	));
+}
+
+#[tokio::test]
+async fn require_rejects_a_protected_branch_pointing_at_a_non_commit() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	// Point a protected branch straight at a tree object.
+	let tree = empty_tree();
+	let objects: Objects = [(tree, (ObjectKind::Tree, encode_tree::<Sha256>(&[])))].into();
+	let cert = signed_cert(
+		&a,
+		vec![cert_command(tree, "refs/heads/main")],
+		&fresh_nonce(),
+	);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/heads/main", None, tree)],
+		&objects,
+		Some(&cert),
+		NOW,
+	)
+	.await
+	.expect("verify");
+	match verdict {
+		TrustVerdict::Reject { refs, .. } => {
+			assert!(
+				refs.iter().any(|(name, _)| name == "refs/heads/main"),
+				"{refs:?}"
+			);
+		}
+		other => panic!("expected reject, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn require_rejects_a_lightweight_protected_tag() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	// The commit is signed, but a tag ref pointing straight at it is a lightweight tag.
+	let (commit, raw) = commit_bytes(Some(&a), "signed\n");
+	let objects = one_commit(commit, raw);
+	let cert = signed_cert(
+		&a,
+		vec![cert_command(commit, "refs/tags/v1")],
+		&fresh_nonce(),
+	);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/tags/v1", None, commit)],
+		&objects,
+		Some(&cert),
+		NOW,
+	)
+	.await
+	.expect("verify");
+	match verdict {
+		TrustVerdict::Reject { refs, .. } => {
+			assert!(
+				refs.iter().any(|(name, _)| name == "refs/tags/v1"),
+				"{refs:?}"
+			);
+		}
+		other => panic!("expected reject, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn require_accepts_a_signed_annotated_protected_tag() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	let (commit, craw) = commit_bytes(Some(&a), "signed\n");
+	let (tag, traw) = signed_tag(&a, commit, "v1");
+	let mut objects = one_commit(commit, craw);
+	objects.insert(tag, (ObjectKind::Tag, traw));
+	let cert = signed_cert(&a, vec![cert_command(tag, "refs/tags/v1")], &fresh_nonce());
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/tags/v1", None, tag)],
+		&objects,
+		Some(&cert),
+		NOW,
+	)
+	.await
+	.expect("verify");
+	assert_eq!(verdict, TrustVerdict::Accept { warnings: vec![] });
+}
+
+#[tokio::test]
+async fn require_rejects_protected_deletion_without_cert() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	// Deleting a protected branch needs a trusted push certificate, just like an update.
+	let old = commit_bytes(Some(&a), "x\n").0;
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_delete("refs/heads/main", old)],
+		&HashMap::new(),
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	assert!(matches!(
+		verdict,
+		TrustVerdict::Reject {
+			global: Some(_),
+			..
+		}
+	));
+}

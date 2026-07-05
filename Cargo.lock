@@ -1261,8 +1261,11 @@ dependencies = [
  "gitana-object",
  "gitana-object-store",
  "gitana-repository",
+ "gitana-trust",
  "hmac",
+ "serde_json",
  "sha2",
+ "ssh-key",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -1384,6 +1387,7 @@ dependencies = [
  "gitana-file-store-memory",
  "gitana-object",
  "gitana-object-store",
+ "gitana-trust",
  "thiserror 2.0.18",
  "tokio",
 ]

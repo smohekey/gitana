@@ -7,6 +7,7 @@
 
 mod advertise;
 mod client;
+mod enforce;
 mod fetch;
 mod ls_refs;
 mod pack;
@@ -22,6 +23,7 @@ pub use client::{
 	Advertised, RefUpdate, build_receive_pack_request, build_upload_pack_request,
 	parse_advertisement, parse_report_status, parse_upload_pack_response, peek_object_format,
 };
+pub use enforce::{TrustContext, TrustVerdict, verify_push};
 pub use fetch::fetch;
 pub use ls_refs::ls_refs;
 pub use pack::build_pack;

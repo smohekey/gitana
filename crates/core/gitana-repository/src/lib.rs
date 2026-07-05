@@ -15,6 +15,7 @@ mod merge;
 mod merge_base;
 mod merge_state;
 mod mode;
+mod object_source;
 mod rebase_state;
 mod refs;
 mod repository;
