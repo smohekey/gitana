@@ -176,9 +176,20 @@ open worktree item). Exact WIT surface is a per-slice decision, not settled here
    The `fetch` export runs `porcelain::fetch` over the transport; host e2e `tests/remote.rs` proves a
    real fetch from a loopback axum Smart-HTTP server in both hash formats. **Only `fetch`** landed —
    it proves the whole architecture end to end.
-3. **Component `clone`/`push` exports** (follow-up) + e2e, over the same proven machinery. `clone`
-   adds init + hash-negotiation-from-the-wire + checkout; `push` adds the receive-pack POST (the
-   chunked-write path) and the unsigned push-cert path (signing stays out until the trust work).
+3. ~~**Component `clone`/`push` exports** + e2e~~ **Done** (`gitana:repo@0.6.0`). Both reuse
+   `gitana-porcelain`'s composites unchanged over the in-guest `WasiHttpTransport`. To make
+   `porcelain::clone` capability-clean, `Origin::save` moved off `std::fs`/`&Path` onto
+   `&impl FileStore` (async; writes `config` through the store) — the last ambient-fs call on the
+   remote path, mirroring the worktree-threading precedent; `clone` then drops its `git_dir: &Path`
+   parameter and persists the origin through `repo`'s file store. `clone` is a **static func**
+   (`git-dir`, `work-dir`, `url`): it negotiates the object format from the wire advertisement (there
+   is no local config to detect one from yet), lays the git skeleton, runs the clone, and — because a
+   clone populates directories rather than opening one — consumes both descriptors and returns unit
+   (reopen with `open-worktree` to operate on the result). `push(url, force, delete)` is a method that
+   reuses `porcelain::push` with `signed = false`; the pusher-identity resolver (only reached for a
+   signed push) unconditionally errors, so the **unsigned** receive-pack POST is wired and signing
+   stays out until the trust work. Host e2e `tests/remote.rs` gains a `git-receive-pack` route over
+   gitana's own `receive_pack` handler and proves clone + push round-trips in both hash formats.
 
 ## Verification gate (per slice)
 

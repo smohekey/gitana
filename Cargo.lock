@@ -1325,6 +1325,7 @@ dependencies = [
  "anyhow",
  "gitana-config",
  "gitana-file-store",
+ "gitana-file-store-memory",
  "gitana-git-http",
  "gitana-object",
  "gitana-repository",

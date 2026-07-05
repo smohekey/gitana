@@ -39,11 +39,13 @@ What works today:
   exporting the repo-level plumbing set — object reads/writes, revisions, refs
   (CAS updates), `repack`, and `init` — plus the working-tree porcelain
   (`status`, `add`, `checkout`, `commit`) over a repository opened with its
-  working tree (`open-worktree`, which grants a third `work-dir` descriptor). The
+  working tree (`open-worktree`, which grants a third `work-dir` descriptor), and
+  the Smart HTTP remote operations (`fetch`, `push`, and `clone`) over a
+  host-granted `wasi:http` capability — no `reqwest`, no ambient network. The
   component's only filesystem authority is the `wasi:filesystem` directory
   descriptors passed in by the host (no preopens, no ambient access).
   `crates/wasm/gitana-repo-host` embeds it under wasmtime; see
-  `docs/hlds/wasi-component-porcelain.md`.
+  `docs/hlds/wasi-component-porcelain.md` and `docs/hlds/wasi-http-transport.md`.
 
 Major gaps:
 

@@ -1,15 +1,19 @@
-//! Remote operations — `fetch` over the in-guest `wasi:http` transport.
+//! Remote operations — `fetch`, `push`, and `clone` over the in-guest `wasi:http` transport.
 //!
 //! These reuse `gitana-porcelain`'s remote composites unchanged, injecting the component's
 //! [`WasiHttpTransport`] as the `HttpTransport` capability. The advertisement GET and the pack POST
 //! both flow through `wasi:http`; nothing here reaches for `reqwest`.
 
-use gitana_file_store_local::WorktreeFileStore;
+use gitana_file_store_local::{DescriptorWorkDir, WorktreeFileStore};
 use gitana_object::HashAlgorithm;
+use gitana_object_store::ObjectStore;
+use gitana_porcelain::PushOutcome;
 use gitana_remote::Origin;
 use gitana_repository::Repository;
 
-use crate::bindings::exports::gitana::repo::porcelain::{FetchOutcome, RefEntry, RepoError};
+use crate::bindings::exports::gitana::repo::porcelain::{
+	FetchOutcome, HashKind, PushOutcome as WitPushOutcome, PushSummary, RefEntry, RepoError,
+};
 use crate::wasi_http_transport::WasiHttpTransport;
 
 /// Fetch from the remote at `url` into `repo`, returning the tracking-ref outcome. The advertised
@@ -47,6 +51,85 @@ pub(crate) async fn fetch<H: HashAlgorithm>(
 			.collect(),
 		rejected: outcome.rejected,
 	})
+}
+
+/// Push `HEAD`'s branch to the remote at `url` (or, with `delete`, remove a remote branch),
+/// returning the outcome. The advertised object-format is checked against `repo`'s first. Signed
+/// pushes are not supported here — signing is deferred to the trust work — so the pusher-identity
+/// resolver (only reached for a signed push) unconditionally errors.
+pub(crate) async fn push<H: HashAlgorithm>(
+	repo: &Repository<WorktreeFileStore, H>,
+	url: &str,
+	force: bool,
+	delete: Option<String>,
+) -> Result<WitPushOutcome, RepoError> {
+	let origin = Origin::parse(url).map_err(|e| RepoError::Invalid(e.to_string()))?;
+	let transport = WasiHttpTransport;
+
+	let advertisement = gitana_remote::fetch_advertisement(&transport, &origin, "git-receive-pack")
+		.await
+		.map_err(remote_error)?;
+	let remote = gitana_remote::negotiated_kind(&advertisement).map_err(remote_error)?;
+	if H::NAME != remote.name() {
+		return Err(RepoError::Invalid(format!(
+			"remote object-format is {}, but the local repository is {}",
+			remote.name(),
+			H::NAME
+		)));
+	}
+
+	let outcome = gitana_porcelain::push(
+		&transport,
+		repo,
+		&origin,
+		&advertisement,
+		force,
+		delete,
+		false,
+		async || anyhow::bail!("signed push is not supported in the component"),
+	)
+	.await
+	.map_err(remote_error)?;
+
+	Ok(match outcome {
+		PushOutcome::Pushed { branch, forced, .. } => {
+			WitPushOutcome::Pushed(PushSummary { branch, forced })
+		}
+		PushOutcome::Deleted { refname } => WitPushOutcome::Deleted(refname),
+		PushOutcome::UpToDate => WitPushOutcome::UpToDate,
+	})
+}
+
+/// Fetch the remote's ref advertisement and read the object format it advertises — the pre-dispatch
+/// step of `clone`, run before any local repository exists to detect a format from. The caller then
+/// creates the repository as `HashKind` and hands the advertisement to [`clone`] (no second GET).
+pub(crate) async fn clone_negotiate(origin: &Origin) -> Result<(Vec<u8>, HashKind), RepoError> {
+	let transport = WasiHttpTransport;
+	let advertisement = gitana_remote::fetch_advertisement(&transport, origin, "git-upload-pack")
+		.await
+		.map_err(remote_error)?;
+	let kind = match gitana_remote::negotiated_kind(&advertisement).map_err(remote_error)? {
+		gitana_object::HashKind::Sha1 => HashKind::Sha1,
+		gitana_object::HashKind::Sha256 => HashKind::Sha256,
+	};
+	Ok((advertisement, kind))
+}
+
+/// Clone the remote at `origin` into a fresh checkout backed by `store` (the git directory) and
+/// `work` (the working tree), as hash `H`. The caller has already fetched `advertisement` — to
+/// negotiate `H` — and laid the git skeleton into `store`; here we run `gitana-porcelain`'s clone
+/// (init, download, recreate refs/HEAD, save origin, check out `HEAD`) unchanged.
+pub(crate) async fn clone<H: HashAlgorithm>(
+	store: WorktreeFileStore,
+	work: DescriptorWorkDir,
+	origin: &Origin,
+	advertisement: &[u8],
+) -> Result<(), RepoError> {
+	let transport = WasiHttpTransport;
+	let repo: Repository<WorktreeFileStore, H> = Repository::new(ObjectStore::new(store));
+	gitana_porcelain::clone(&transport, repo, origin, advertisement, work)
+		.await
+		.map_err(remote_error)
 }
 
 /// The remote composites surface `anyhow::Error` (network, protocol, and storage failures all

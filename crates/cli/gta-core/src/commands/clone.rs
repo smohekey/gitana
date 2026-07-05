@@ -47,27 +47,11 @@ pub async fn run(url: String, dir: Option<PathBuf>) -> Result<()> {
 	match kind {
 		HashKind::Sha1 => {
 			let repo = repo::open_generic::<Sha1>(&git_dir, &git_dir)?;
-			gitana_porcelain::clone(
-				&http,
-				repo,
-				&origin,
-				&body,
-				repo::open_work_dir(&target)?,
-				&git_dir,
-			)
-			.await?;
+			gitana_porcelain::clone(&http, repo, &origin, &body, repo::open_work_dir(&target)?).await?;
 		}
 		HashKind::Sha256 => {
 			let repo = repo::open_generic::<Sha256>(&git_dir, &git_dir)?;
-			gitana_porcelain::clone(
-				&http,
-				repo,
-				&origin,
-				&body,
-				repo::open_work_dir(&target)?,
-				&git_dir,
-			)
-			.await?;
+			gitana_porcelain::clone(&http, repo, &origin, &body, repo::open_work_dir(&target)?).await?;
 		}
 	}
 

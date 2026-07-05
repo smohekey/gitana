@@ -1,4 +1,4 @@
-package gitana:repo@0.5.0;
+package gitana:repo@0.6.0;
 
 /// Repository operations over a capability-granted git directory.
 ///
@@ -118,6 +118,24 @@ interface porcelain {
 		rejected: list<string>,
 	}
 
+	/// The branch a successful `push` sent, with its render hint.
+	record push-summary {
+		/// The branch pushed (e.g. `refs/heads/main`).
+		branch: string,
+		/// Whether the update was a forced (non-fast-forward) push.
+		forced: bool,
+	}
+
+	/// The outcome of a `push`.
+	variant push-outcome {
+		/// `HEAD`'s branch was sent to the remote.
+		pushed(push-summary),
+		/// A remote branch was deleted (the payload is the full ref name).
+		deleted(string),
+		/// The remote already had the branch tip; nothing was sent.
+		up-to-date,
+	}
+
 	/// A symbolic HEAD with its resolved commit.
 	record symbolic-head {
 		/// The ref HEAD points at (e.g. `refs/heads/main`).
@@ -228,6 +246,15 @@ interface porcelain {
 		/// *different* format fails with `unsupported-format`.
 		init: static func(git-dir: descriptor, kind: hash-kind) -> result<repository, repo-error>;
 
+		/// Clone the Smart HTTP remote at `url` into a freshly-granted, empty checkout
+		/// over the host-granted `wasi:http` capability. `git-dir` receives the git
+		/// directory (skeleton, `config`, refs, objects) and `work-dir` the checked-out
+		/// working tree; both must be empty owned directory descriptors. The local
+		/// object format is whatever the remote advertises. Consumes both descriptors —
+		/// it does not return a repository resource (a clone populates directories rather
+		/// than opening one); reopen the result with `open-worktree` to operate on it.
+		clone: static func(git-dir: descriptor, work-dir: descriptor, url: string) -> result<_, repo-error>;
+
 		/// The object-hash algorithm detected at `open`.
 		hash-kind: func() -> hash-kind;
 
@@ -323,6 +350,14 @@ interface porcelain {
 		/// `open-worktree`. The remote's advertised object-format must match this
 		/// repository's, else `invalid`.
 		fetch: func(url: string) -> result<fetch-outcome, repo-error>;
+
+		/// Push `HEAD`'s branch to the Smart HTTP remote at `url` over the host-granted
+		/// `wasi:http` capability, or — with `delete` set to a branch name — remove that
+		/// branch on the remote. `force` permits a non-fast-forward update. Reads refs and
+		/// packs objects, so this works on a repository opened via `open` or `open-worktree`.
+		/// The remote's advertised object-format must match this repository's, else `invalid`.
+		/// Signed pushes are not yet supported (signing is deferred to the trust work).
+		push: func(url: string, force: bool, delete: option<string>) -> result<push-outcome, repo-error>;
 
 		// -- Working-tree operations (require a repository opened via `open-worktree`).
 

@@ -3,8 +3,6 @@
 //! hash algorithm, then calls these generic over the file store. (`pull` composes `fetch` + `merge` in
 //! the adapter.)
 
-use std::path::Path;
-
 use anyhow::{Context, Result, bail};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
@@ -192,16 +190,17 @@ pub async fn pull_upstream<F: FileStore, H: HashAlgorithm>(
 	Ok(advertised.oid_of(branch))
 }
 
-/// Clone the advertised repository into `work_dir` (whose `.git` backs `repo`): initialise it (writing
+/// Clone the advertised repository into `work` (whose `.git` backs `repo`): initialise it (writing
 /// a config matching `H`), download every advertised tip, recreate the refs and `HEAD`, save the
-/// origin, and check out `HEAD`. `advertisement` is the already-fetched `GET /info/refs` body.
+/// origin, and check out `HEAD`. `advertisement` is the already-fetched `GET /info/refs` body. The
+/// origin is persisted through `repo`'s file store (no ambient filesystem access), so this runs over
+/// any [`FileStore`] — a local checkout or the wasm descriptor backend.
 pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	repo: Repository<F, H>,
 	origin: &Origin,
 	advertisement: &[u8],
 	work: W,
-	git_dir: &Path,
 ) -> Result<()> {
 	repo.init().await?;
 
@@ -219,12 +218,14 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		.clone()
 		.unwrap_or_else(|| "refs/heads/main".to_owned());
 	repo.refs().set_head_symbolic(&head_target).await?;
-	origin.save(git_dir)?;
+	origin.save(repo.objects().file_store()).await?;
 
 	// Populate the working tree from HEAD (if the repo had any commits).
 	if let Some(commit) = repo.refs().resolve_head().await? {
 		let tree = repo.commit_tree(commit).await?;
-		let worktree = WorkTree::new(repo, work, git_dir);
+		// The `git_dir` a `WorkTree` carries is inert — the index and all git-dir files route through
+		// the `FileStore` — so a placeholder path suffices, as elsewhere in the worktree layer.
+		let worktree = WorkTree::new(repo, work, "");
 		worktree.checkout(tree, true).await?;
 	}
 	Ok(())
@@ -305,6 +306,20 @@ pub async fn push<F: FileStore, H: HashAlgorithm>(
 	let remote_old = advertised.oid_of(&branch);
 	if remote_old == Some(local_tip) {
 		return Ok(PushOutcome::UpToDate);
+	}
+
+	// Without `--force`, refuse a non-fast-forward before sending anything: the remote tip must be an
+	// ancestor of the local tip (git's client-side check). A create (no remote tip) is always a
+	// fast-forward. Relying on the server to reject is not enough — a server configured to permit
+	// rewrites would otherwise silently overwrite the remote branch.
+	if !force
+		&& let Some(remote_old) = remote_old
+		&& !repo.is_ancestor(remote_old, local_tip).await?
+	{
+		bail!(
+			"updates were rejected because the remote contains work that you do not have locally; \
+			 integrate the remote changes (e.g. fetch) before pushing again, or use --force"
+		);
 	}
 
 	// Pack the objects the remote lacks (reachable from the tip, minus its refs).

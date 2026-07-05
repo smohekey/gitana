@@ -3,13 +3,14 @@
 use gitana_file_store_local::{DescriptorWorkDir, LocalFileStore, WorktreeFileStore};
 use gitana_object::{HashAlgorithm, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
+use gitana_remote::Origin;
 use gitana_repository::{Repository, detect_hash_kind};
 use gitana_worktree::WorkTree;
 use wasip2::filesystem::types::Descriptor;
 
 use crate::bindings::exports::gitana::repo::porcelain::{
-	CommitInfo, FetchOutcome, HashKind, HeadState, ObjectInfo, RefEntry, RepackReport, RepoError,
-	TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
+	CommitInfo, FetchOutcome, HashKind, HeadState, ObjectInfo, PushOutcome, RefEntry, RepackReport,
+	RepoError, TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
 };
 use crate::block_on::block_on;
 use crate::ops;
@@ -139,6 +140,31 @@ impl Inner {
 		Ok(inner)
 	}
 
+	/// Clone the Smart HTTP remote at `url` into the freshly-granted `git_dir`/`work_dir`
+	/// descriptors. The object format is negotiated from the remote's advertisement (there is
+	/// no local config to detect one from yet), then the git skeleton is laid and the clone runs
+	/// under the matching `H`. Consumes both descriptors — a clone populates directories rather
+	/// than opening a resource, so this returns unit; reopen with `open-worktree` to operate on
+	/// the result.
+	pub(crate) fn clone(
+		git_dir: Descriptor,
+		work_dir: Descriptor,
+		url: &str,
+	) -> Result<(), RepoError> {
+		let origin = Origin::parse(url).map_err(|e| RepoError::Invalid(e.to_string()))?;
+		let (advertisement, kind) = block_on(ops::clone_negotiate(&origin))?;
+
+		let git = LocalFileStore::from_descriptor(git_dir);
+		block_on(ops::init_layout(&git))?;
+		let store = WorktreeFileStore::single(git);
+		let work = DescriptorWorkDir::from_descriptor(work_dir);
+
+		match kind {
+			HashKind::Sha1 => block_on(ops::clone::<Sha1>(store, work, &origin, &advertisement)),
+			HashKind::Sha256 => block_on(ops::clone::<Sha256>(store, work, &origin, &advertisement)),
+		}
+	}
+
 	pub(crate) fn hash_kind(&self) -> HashKind {
 		match self {
 			Self::Sha1(_) => HashKind::Sha1,
@@ -233,6 +259,15 @@ impl Inner {
 
 	pub(crate) fn fetch(&self, url: &str) -> Result<FetchOutcome, RepoError> {
 		dispatch!(self, held => block_on(ops::fetch(held.repository(), url)))
+	}
+
+	pub(crate) fn push(
+		&self,
+		url: &str,
+		force: bool,
+		delete: Option<String>,
+	) -> Result<PushOutcome, RepoError> {
+		dispatch!(self, held => block_on(ops::push(held.repository(), url, force, delete)))
 	}
 
 	pub(crate) fn write_tree(&self, entries: Vec<TreeBuildEntry>) -> Result<String, RepoError> {

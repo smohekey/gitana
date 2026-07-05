@@ -18,7 +18,7 @@ pub(crate) use self::{
 	refs::{
 		delete_ref, head, list_refs, read_symbolic_ref, resolve_ref, set_symbolic_ref, update_ref,
 	},
-	remote::fetch,
+	remote::{clone, clone_negotiate, fetch, push},
 	repo::{init_layout, init_repo, read_config, repack},
 	revisions::{is_ancestor, merge_base, rev_list, rev_parse},
 	worktree::{add, checkout, commit, status},

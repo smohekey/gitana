@@ -3,8 +3,9 @@
 use wasip2::filesystem::types::Descriptor;
 
 use crate::bindings::exports::gitana::repo::porcelain::{
-	CommitInfo, FetchOutcome, Guest, GuestRepository, HashKind, HeadState, ObjectInfo, RefEntry,
-	RepackReport, RepoError, Repository, TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
+	CommitInfo, FetchOutcome, Guest, GuestRepository, HashKind, HeadState, ObjectInfo, PushOutcome,
+	RefEntry, RepackReport, RepoError, Repository, TagInfo, TreeBuildEntry, TreeEntry,
+	WorktreeStatus,
 };
 use crate::inner::Inner;
 
@@ -38,6 +39,10 @@ impl GuestRepository for GitanaRepository {
 	fn init(git_dir: Descriptor, kind: HashKind) -> Result<Repository, RepoError> {
 		let inner = Inner::init(git_dir, kind)?;
 		Ok(Repository::new(GitanaRepository { inner }))
+	}
+
+	fn clone(git_dir: Descriptor, work_dir: Descriptor, url: String) -> Result<(), RepoError> {
+		Inner::clone(git_dir, work_dir, &url)
 	}
 
 	fn hash_kind(&self) -> HashKind {
@@ -127,6 +132,15 @@ impl GuestRepository for GitanaRepository {
 
 	fn fetch(&self, url: String) -> Result<FetchOutcome, RepoError> {
 		self.inner.fetch(&url)
+	}
+
+	fn push(
+		&self,
+		url: String,
+		force: bool,
+		delete: Option<String>,
+	) -> Result<PushOutcome, RepoError> {
+		self.inner.push(&url, force, delete)
 	}
 
 	fn write_tree(&self, entries: Vec<TreeBuildEntry>) -> Result<String, RepoError> {

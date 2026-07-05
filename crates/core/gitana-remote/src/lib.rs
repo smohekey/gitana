@@ -77,17 +77,19 @@ impl Origin {
 		}
 	}
 
-	/// Persist the origin as a standard git remote in `.git/config`.
-	pub fn save(&self, git_dir: &Path) -> Result<()> {
-		let path = git_dir.join("config");
-		let text =
-			std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-		let mut config =
-			GitConfig::parse(&text).with_context(|| format!("parsing {}", path.display()))?;
+	/// Persist the origin as a standard git remote in the repository's `config`, written
+	/// through the `store` capability — so this works over any [`FileStore`] (a local
+	/// checkout or the wasm descriptor backend) with no ambient filesystem access.
+	pub async fn save(&self, store: &impl FileStore) -> Result<()> {
+		let bytes = store.read_path("config").await.context("reading config")?;
+		let text = String::from_utf8(bytes).context("config is not UTF-8")?;
+		let mut config = GitConfig::parse(&text).context("parsing config")?;
 		config.set("remote", Some("origin"), "url", &self.url)?;
 		config.set("remote", Some("origin"), "fetch", ORIGIN_FETCH_REFSPEC)?;
-		std::fs::write(&path, config.render())
-			.with_context(|| format!("writing {}", path.display()))?;
+		store
+			.write_path_replace("config", config.render().as_bytes())
+			.await
+			.context("writing config")?;
 		Ok(())
 	}
 
@@ -211,9 +213,7 @@ pub async fn local_haves<H: HashAlgorithm>(
 
 #[cfg(test)]
 mod tests {
-	use std::fs;
-
-	use tempfile::TempDir;
+	use gitana_file_store_memory::MemoryFileStore;
 
 	use super::*;
 
@@ -233,24 +233,29 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn origin_round_trips_through_git_config() {
-		let dir = TempDir::new().unwrap();
-		let git_dir = dir.path().join(".git");
-		fs::create_dir_all(&git_dir).unwrap();
-		fs::write(
-			git_dir.join("config"),
-			"[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha256\n",
-		)
-		.unwrap();
+	#[tokio::test]
+	async fn origin_saves_through_the_file_store() {
+		let store = MemoryFileStore::new();
+		store
+			.write_path_replace(
+				"config",
+				b"[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha256\n",
+			)
+			.await
+			.unwrap();
 
 		let origin = Origin::parse("https://example.com/acme/app.git").unwrap();
-		origin.save(&git_dir).unwrap();
+		origin.save(&store).await.unwrap();
 
-		assert_eq!(Origin::load(&git_dir).unwrap(), origin);
-		let config = fs::read_to_string(git_dir.join("config")).unwrap();
+		let config = String::from_utf8(store.read_path("config").await.unwrap()).unwrap();
 		assert!(config.contains("[remote \"origin\"]"));
 		assert!(config.contains("url = https://example.com/acme/app.git"));
 		assert!(config.contains("fetch = +refs/heads/*:refs/remotes/origin/*"));
+		// The saved config parses back to the same origin (what `Origin::load` reads).
+		let parsed = GitConfig::parse(&config).unwrap();
+		assert_eq!(
+			parsed.get_string("remote", Some("origin"), "url"),
+			Some(origin.url.as_str())
+		);
 	}
 }

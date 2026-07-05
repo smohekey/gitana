@@ -26,5 +26,6 @@ gitana-repository.workspace = true
 reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
+gitana-file-store-memory.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
