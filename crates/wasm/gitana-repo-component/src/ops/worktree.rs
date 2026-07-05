@@ -59,9 +59,10 @@ pub(crate) async fn commit<H: HashAlgorithm>(
 	author: &str,
 	committer: &str,
 ) -> Result<String, RepoError> {
-	// The `gitana_porcelain::commit` orchestration, reimplemented here so the component need not
-	// depend on gitana-porcelain (which would pull gitana-remote → reqwest into the wasip2 reactor).
-	// Identity is passed in, not resolved from env/config, since the component has neither.
+	// The `gitana_porcelain::commit` orchestration, reimplemented here to take the author/committer as
+	// plain strings and map failures straight to `RepoError`. It could call `gitana_porcelain::commit`
+	// now that the crate is a dependency, but that asks for an `Identity` the component cannot supply
+	// — it has no env/config to resolve one from — so identity is passed in by the host instead.
 	let index = wt.load_index().await.map_err(worktree_error)?;
 	// An unmerged index would silently drop conflicted paths (no stage-0 entry) from the tree.
 	if index.has_conflicts() {

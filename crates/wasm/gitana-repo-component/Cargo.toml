@@ -31,10 +31,11 @@ gitana-porcelain.workspace = true
 gitana-remote.workspace = true
 gitana-repository.workspace = true
 # gitana-worktree gives the component the working-tree porcelain (status/add/checkout/commit) over
-# the `DescriptorWorkDir` capability. It is deliberately the *only* worktree dep pulled in:
-# gitana-porcelain would drag gitana-remote → reqwest (a browser wasm-bindgen HTTP stack) into this
-# wasip2 reactor, so the trivial `commit` orchestration is reimplemented here over
-# `WorkTree` + `Repository::commit_on_head` instead.
+# the `DescriptorWorkDir` capability. It is a *direct* dep because the component names its types
+# (`WorkTree`, `DescriptorWorkDir`) itself; gitana-porcelain (above) also depends on it. `commit` is
+# reimplemented here over `WorkTree` + `Repository::commit_on_head` rather than calling
+# `gitana_porcelain::commit` only to take the author/committer as plain strings — the component has no
+# env/config to resolve porcelain's `Identity` trait from (a possible future cleanup: adapt one).
 gitana-worktree.workspace = true
 wasip2.workspace = true
 wit-bindgen.workspace = true
