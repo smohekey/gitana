@@ -136,7 +136,7 @@ impl Signer for CliSigner {
 /// If `contents` is an OpenSSH public key (its first non-blank line begins with a public key-type
 /// token, as in `authorized_keys`), return that line. A private key file (`-----BEGIN … PRIVATE
 /// KEY-----`) yields `None`.
-fn public_key_line(contents: &str) -> Option<String> {
+pub(crate) fn public_key_line(contents: &str) -> Option<String> {
 	const KEY_TYPE_PREFIXES: [&str; 3] = ["ssh-", "ecdsa-", "sk-"];
 	let first = contents
 		.lines()

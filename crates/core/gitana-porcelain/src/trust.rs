@@ -5,12 +5,12 @@
 //! `gitana-trust` core the server enforces with **before** moving the local ref, so a local edit can
 //! never install a root the server would reject.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use gitana_file_store::FileStore;
 use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit};
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 use gitana_trust::{
-	Policy, TRUST_DOCUMENT_PATH, TrustDocument, TrustRoot, fold_trust_root,
+	Policy, TRUST_DOCUMENT_PATH, TrustDocument, TrustRoot, TrustedKey, fold_trust_root,
 	verify_candidate_trust_update,
 };
 
@@ -85,6 +85,109 @@ pub async fn trust_list<F: FileStore, H: HashAlgorithm>(
 	}
 }
 
+/// Enrol `key_line` (an OpenSSH public-key line) in the trust root, signing the update with `signer`
+/// — which must be a key the *current* root already trusts. Refuses a malformed key or one already
+/// enrolled (matched by fingerprint, so a re-paste with a different comment is still a duplicate).
+/// Extends the chain and moves `refs/gitana/trust` only after the new root re-verifies.
+pub async fn trust_add_key<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	key_line: &str,
+	identity: &impl Identity,
+	signer: &impl Signer,
+) -> Result<ObjectId<H>> {
+	let tip = current_tip(repo).await?;
+	let mut document = read_current_document(repo, tip).await?;
+
+	let new_id = TrustedKey::from_openssh(key_line.trim())
+		.context("parsing the public key to add")?
+		.id();
+	for line in &document.keys {
+		let existing = TrustedKey::from_openssh(line)
+			.with_context(|| format!("parsing an already-enrolled key ({line})"))?;
+		if existing.id() == new_id {
+			bail!("key {new_id} is already enrolled");
+		}
+	}
+	document.keys.push(key_line.trim().to_owned());
+	trust_update(repo, &document, tip, "add key", identity, signer).await
+}
+
+/// Remove the key named by `selector` — a `SHA256:…` fingerprint (as `trust list` prints) or an
+/// OpenSSH public-key line — from the trust root, signing the update with `signer`. Refuses when no
+/// enrolled key matches, or when it would remove the last key (a root must keep at least one). Under
+/// [`Policy::Require`], dropping below two keys is unsafe (the same invariant `init`/`set-policy`
+/// hold) and is refused unless `break_glass` is set.
+pub async fn trust_remove_key<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	selector: &str,
+	break_glass: bool,
+	identity: &impl Identity,
+	signer: &impl Signer,
+) -> Result<ObjectId<H>> {
+	let tip = current_tip(repo).await?;
+	let mut document = read_current_document(repo, tip).await?;
+
+	let target = selector_fingerprint(selector)?;
+	let mut kept = Vec::with_capacity(document.keys.len());
+	for line in &document.keys {
+		let id = TrustedKey::from_openssh(line)
+			.with_context(|| format!("parsing an enrolled key ({line})"))?
+			.id();
+		if id.as_str() != target {
+			kept.push(line.clone());
+		}
+	}
+	if kept.len() == document.keys.len() {
+		bail!("no enrolled key matches `{selector}`");
+	}
+	if kept.is_empty() {
+		bail!("cannot remove the last trusted key; a trust root must keep at least one");
+	}
+	if document.policy == Policy::Require && kept.len() < 2 && !break_glass {
+		bail!(
+			"removing this key would leave a `require` root with a single key, which is unsafe: \
+			 losing it locks the repository. Pass `--break-glass` to override, or lower the policy \
+			 with `set-policy` first."
+		);
+	}
+	document.keys = kept;
+	trust_update(repo, &document, tip, "remove key", identity, signer).await
+}
+
+/// Change the trust policy to `policy`, signing the update with `signer`. Under [`Policy::Require`] a
+/// root with fewer than two keys is unsafe — losing the sole key locks the repository — so it is
+/// refused unless `break_glass` is set. A no-op change (already `policy`) is refused.
+pub async fn trust_set_policy<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	policy: Policy,
+	break_glass: bool,
+	identity: &impl Identity,
+	signer: &impl Signer,
+) -> Result<ObjectId<H>> {
+	let tip = current_tip(repo).await?;
+	let mut document = read_current_document(repo, tip).await?;
+
+	if document.policy == policy {
+		bail!("policy is already `{policy}`");
+	}
+	if policy == Policy::Require && !break_glass && document.keys.len() < 2 {
+		bail!(
+			"`require` with fewer than two enrolled keys is unsafe: losing the key locks the \
+			 repository. Enrol another key with `add-key`, or pass `--break-glass` to override."
+		);
+	}
+	document.policy = policy;
+	trust_update(
+		repo,
+		&document,
+		tip,
+		&format!("set policy {policy}"),
+		identity,
+		signer,
+	)
+	.await
+}
+
 /// Write a signed trust commit: store `document` as `trust.json` in a fresh tree, then build a
 /// commit over it (with `parents`), sign the exact bytes git signs, and write the signed object.
 /// Does not move any ref — the caller verifies the candidate first.
@@ -128,8 +231,96 @@ async fn write_trust_commit<F: FileStore, H: HashAlgorithm>(
 	)
 }
 
+/// Extend the trust chain with a new signed commit carrying `document` (parent `old_tip`), re-verify
+/// the candidate update through the trust core, then fast-forward `refs/gitana/trust` via CAS.
+/// `label` names the operation in the commit subject (`gitana trust: <label>`) and reflog
+/// (`trust: <label>`).
+async fn trust_update<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	document: &TrustDocument,
+	old_tip: ObjectId<H>,
+	label: &str,
+	identity: &impl Identity,
+	signer: &impl Signer,
+) -> Result<ObjectId<H>> {
+	let new_tip = write_trust_commit(
+		repo,
+		document,
+		vec![old_tip],
+		&format!("gitana trust: {label}"),
+		identity,
+		signer,
+	)
+	.await?;
+	// Prove the new chain (signed by a key the *previous* root trusts, and a fast-forward of it)
+	// before the ref moves — the same check receive-pack makes.
+	verify_candidate_trust_update(repo, Some(old_tip), new_tip).await?;
+	repo
+		.refs()
+		.update_ref(TRUST_REF, new_tip, Some(old_tip))
+		.await?;
+	let committer = identity.committer_or_default().await;
+	repo
+		.refs()
+		.append_reflog(
+			TRUST_REF,
+			Some(old_tip),
+			new_tip,
+			&committer,
+			&format!("trust: {label}"),
+		)
+		.await?;
+	Ok(new_tip)
+}
+
+/// The current trust tip, or an error when trust is not initialised (there is nothing to update).
+async fn current_tip<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+) -> Result<ObjectId<H>> {
+	repo
+		.refs()
+		.resolve(TRUST_REF)
+		.await?
+		.ok_or_else(|| anyhow!("trust is not initialised; run `gta trust init` first"))
+}
+
+/// Read the current trust document — raw, preserving each key's exact line and any metadata — from
+/// the trust commit `tip`'s tree, so an edit changes only what it means to.
+async fn read_current_document<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	tip: ObjectId<H>,
+) -> Result<TrustDocument> {
+	let tree = repo.commit_tree(tip).await?;
+	let entries = repo.read_tree(tree).await?;
+	let (_, _, blob) = entries
+		.iter()
+		.find(|(path, _, _)| path == TRUST_DOCUMENT_PATH)
+		.ok_or_else(|| anyhow!("trust commit {tip} has no {TRUST_DOCUMENT_PATH}"))?;
+	let bytes = repo.read_blob(*blob).await?;
+	TrustDocument::from_json(&bytes).map_err(Into::into)
+}
+
+/// Resolve a key selector to a fingerprint: a `SHA256:…` value is used as-is; anything else is parsed
+/// as an OpenSSH public-key line and fingerprinted.
+fn selector_fingerprint(selector: &str) -> Result<String> {
+	let selector = selector.trim();
+	if selector.starts_with("SHA256:") {
+		Ok(selector.to_owned())
+	} else {
+		Ok(
+			TrustedKey::from_openssh(selector)
+				.context("parsing the key selector as an OpenSSH public key")?
+				.id()
+				.as_str()
+				.to_owned(),
+		)
+	}
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+	use gitana_file_store_local::LocalFileStore;
+	use gitana_object::Sha256;
 	use gitana_trust::TrustedKey;
 
 	use super::*;
@@ -229,5 +420,273 @@ mod tests {
 		.unwrap();
 		let root = trust_list(repo).await.unwrap().unwrap();
 		assert_eq!(root.policy, Policy::Require);
+	}
+
+	/// Bootstrap `signer`'s self-signed root under `policy` (break-glass, so tests can start at
+	/// `require`), returning the repository's tip.
+	async fn bootstrap(
+		repo: &Repository<LocalFileStore, Sha256>,
+		signer: &TestSigner,
+		policy: Policy,
+	) -> ObjectId<Sha256> {
+		trust_init(
+			repo,
+			policy,
+			&signer.public_line(),
+			true,
+			&TestIdentity::default(),
+			signer,
+		)
+		.await
+		.unwrap()
+	}
+
+	fn fingerprint(signer: &TestSigner) -> String {
+		TrustedKey::from_openssh(&signer.public_line())
+			.unwrap()
+			.id()
+			.as_str()
+			.to_owned()
+	}
+
+	#[tokio::test]
+	async fn add_key_enrols_a_second_key() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let (admin, colleague) = (TestSigner::new(1), TestSigner::new(2));
+		bootstrap(repo, &admin, Policy::Warn).await;
+
+		trust_add_key(
+			repo,
+			&colleague.public_line(),
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+
+		let root = trust_list(repo).await.unwrap().unwrap();
+		let ids: Vec<String> = root
+			.keys
+			.iter()
+			.map(|k| k.id().as_str().to_owned())
+			.collect();
+		assert!(ids.contains(&fingerprint(&admin)) && ids.contains(&fingerprint(&colleague)));
+	}
+
+	#[tokio::test]
+	async fn add_key_refuses_a_duplicate() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let admin = TestSigner::new(1);
+		bootstrap(repo, &admin, Policy::Warn).await;
+
+		let err = trust_add_key(repo, &admin.public_line(), &TestIdentity::default(), &admin)
+			.await
+			.unwrap_err();
+		assert!(err.to_string().contains("already enrolled"), "{err}");
+	}
+
+	#[tokio::test]
+	async fn add_key_signed_by_an_untrusted_key_is_refused_and_leaves_the_ref() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let (admin, colleague, outsider) = (TestSigner::new(1), TestSigner::new(2), TestSigner::new(3));
+		let tip = bootstrap(repo, &admin, Policy::Warn).await;
+
+		// `outsider` is not in the current root, so the update cannot verify.
+		let err = trust_add_key(
+			repo,
+			&colleague.public_line(),
+			&TestIdentity::default(),
+			&outsider,
+		)
+		.await
+		.unwrap_err();
+		assert!(!err.to_string().is_empty());
+		// The ref must not have moved.
+		assert_eq!(repo.refs().resolve(TRUST_REF).await.unwrap(), Some(tip));
+	}
+
+	#[tokio::test]
+	async fn remove_key_by_fingerprint() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let (admin, colleague) = (TestSigner::new(1), TestSigner::new(2));
+		bootstrap(repo, &admin, Policy::Warn).await;
+		trust_add_key(
+			repo,
+			&colleague.public_line(),
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+
+		// Remove the original admin, signing with the still-trusted colleague.
+		trust_remove_key(
+			repo,
+			&fingerprint(&admin),
+			false,
+			&TestIdentity::default(),
+			&colleague,
+		)
+		.await
+		.unwrap();
+
+		let root = trust_list(repo).await.unwrap().unwrap();
+		assert_eq!(root.keys.len(), 1);
+		assert_eq!(root.keys[0].id().as_str(), fingerprint(&colleague));
+	}
+
+	#[tokio::test]
+	async fn remove_key_refuses_unknown_and_last() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let admin = TestSigner::new(1);
+		bootstrap(repo, &admin, Policy::Warn).await;
+
+		let unknown = trust_remove_key(
+			repo,
+			"SHA256:AAAAdoesnotexist",
+			false,
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap_err();
+		assert!(
+			unknown.to_string().contains("no enrolled key matches"),
+			"{unknown}"
+		);
+
+		let last = trust_remove_key(
+			repo,
+			&fingerprint(&admin),
+			false,
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap_err();
+		assert!(last.to_string().contains("last trusted key"), "{last}");
+	}
+
+	#[tokio::test]
+	async fn remove_key_refuses_dropping_require_below_two_keys_without_break_glass() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let (admin, colleague) = (TestSigner::new(1), TestSigner::new(2));
+		bootstrap(repo, &admin, Policy::Warn).await;
+		trust_add_key(
+			repo,
+			&colleague.public_line(),
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+		trust_set_policy(
+			repo,
+			Policy::Require,
+			false,
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+
+		// Removing one key would leave a single-key `require` root: refused without break-glass.
+		let err = trust_remove_key(
+			repo,
+			&fingerprint(&colleague),
+			false,
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap_err();
+		assert!(err.to_string().contains("break-glass"), "{err}");
+		assert_eq!(trust_list(repo).await.unwrap().unwrap().keys.len(), 2);
+
+		// With break-glass it proceeds.
+		trust_remove_key(
+			repo,
+			&fingerprint(&colleague),
+			true,
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+		assert_eq!(trust_list(repo).await.unwrap().unwrap().keys.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn set_policy_require_needs_two_keys() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let (admin, colleague) = (TestSigner::new(1), TestSigner::new(2));
+		bootstrap(repo, &admin, Policy::Warn).await;
+
+		// One key: refused without break-glass.
+		let err = trust_set_policy(
+			repo,
+			Policy::Require,
+			false,
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap_err();
+		assert!(err.to_string().contains("fewer than two"), "{err}");
+
+		// Enrol a second key, then the flip succeeds.
+		trust_add_key(
+			repo,
+			&colleague.public_line(),
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+		trust_set_policy(
+			repo,
+			Policy::Require,
+			false,
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+		assert_eq!(
+			trust_list(repo).await.unwrap().unwrap().policy,
+			Policy::Require
+		);
+	}
+
+	#[tokio::test]
+	async fn set_policy_refuses_a_noop() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let admin = TestSigner::new(1);
+		bootstrap(repo, &admin, Policy::Warn).await;
+
+		let err = trust_set_policy(repo, Policy::Warn, false, &TestIdentity::default(), &admin)
+			.await
+			.unwrap_err();
+		assert!(err.to_string().contains("already"), "{err}");
+	}
+
+	#[tokio::test]
+	async fn updates_require_an_initialised_root() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let admin = TestSigner::new(1);
+
+		let err = trust_add_key(repo, &admin.public_line(), &TestIdentity::default(), &admin)
+			.await
+			.unwrap_err();
+		assert!(err.to_string().contains("not initialised"), "{err}");
 	}
 }

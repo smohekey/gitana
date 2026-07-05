@@ -450,6 +450,39 @@ enum TrustAction {
 	},
 	/// Show the current trust policy and enrolled key fingerprints.
 	List,
+	/// Enrol a public key in the trust root.
+	AddKey {
+		/// Public key to enrol: a `.pub` file path or a literal OpenSSH key line.
+		#[arg(long)]
+		key: String,
+		/// SSH private key to sign the update with (default: git config `user.signingkey`).
+		#[arg(long = "signing-key")]
+		signing_key: Option<PathBuf>,
+	},
+	/// Remove a key from the trust root.
+	RemoveKey {
+		/// Key to remove: a `SHA256:…` fingerprint, or a public-key file path / OpenSSH line.
+		#[arg(long)]
+		key: String,
+		/// SSH private key to sign the update with (default: git config `user.signingkey`).
+		#[arg(long = "signing-key")]
+		signing_key: Option<PathBuf>,
+		/// Allow leaving a `require` root with a single key (unsafe: losing it locks the repository).
+		#[arg(long = "break-glass")]
+		break_glass: bool,
+	},
+	/// Change the enforcement policy.
+	SetPolicy {
+		/// New policy (off, warn, or require).
+		#[arg(long)]
+		policy: String,
+		/// SSH private key to sign the update with (default: git config `user.signingkey`).
+		#[arg(long = "signing-key")]
+		signing_key: Option<PathBuf>,
+		/// Allow `require` with fewer than two enrolled keys (unsafe: losing a key locks the repository).
+		#[arg(long = "break-glass")]
+		break_glass: bool,
+	},
 }
 
 /// A `remote` sub-command. Absent means "list the remotes".
@@ -654,6 +687,25 @@ fn trust_action(action: TrustAction) -> commands::trust::Action {
 			break_glass,
 		},
 		TrustAction::List => Action::List,
+		TrustAction::AddKey { key, signing_key } => Action::AddKey { key, signing_key },
+		TrustAction::RemoveKey {
+			key,
+			signing_key,
+			break_glass,
+		} => Action::RemoveKey {
+			key,
+			signing_key,
+			break_glass,
+		},
+		TrustAction::SetPolicy {
+			policy,
+			signing_key,
+			break_glass,
+		} => Action::SetPolicy {
+			policy,
+			signing_key,
+			break_glass,
+		},
 	}
 }
 

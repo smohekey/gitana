@@ -28,7 +28,9 @@ pub use prune::{gc, prune};
 pub use rebase::{RebaseOutcome, abort_rebase, continue_rebase, rebase, skip_rebase};
 pub use remote::{FetchOutcome, PushOutcome, clone, fetch, pull_upstream, push};
 pub use revert::{RevertOutcome, abort_revert, continue_revert, revert};
-pub use trust::{TRUST_REF, trust_init, trust_list};
+pub use trust::{
+	TRUST_REF, trust_add_key, trust_init, trust_list, trust_remove_key, trust_set_policy,
+};
 
 /// Resolves the git identity lines (`Name <email> seconds ±hhmm`) for operations that record commits.
 /// The engine never reads process env / config directly; the CLI adapter implements this over its
