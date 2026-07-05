@@ -15,6 +15,12 @@ pub struct Commit<H: HashAlgorithm> {
 	/// The `gpgsig` signature block (an `SSHSIG`/PGP armored signature), if signed. The
 	/// value with git's multi-line continuation spaces stripped (lines joined by `\n`).
 	pub signature: Option<String>,
+	/// Header lines other than `tree`/`parent`/`author`/`committer`/`gpgsig`, in order — e.g.
+	/// `encoding` and `mergetag` (a merge of a signed tag embeds the tag here). Each is `(name,
+	/// value)` with the value unfolded (git's space-prefixed continuation lines joined by `\n`) and
+	/// held as raw bytes, since a `mergetag`'s embedded tag can carry a non-UTF-8 message. Preserved
+	/// so [`encode_commit`] reproduces the commit byte-for-byte (and its id is stable).
+	pub extra_headers: Vec<(String, Vec<u8>)>,
 	/// The commit message (everything after the header's blank line).
 	pub message: String,
 }
@@ -28,6 +34,7 @@ pub fn parse_commit<H: HashAlgorithm>(payload: &[u8]) -> Result<Commit<H>, Objec
 	let mut author = None;
 	let mut committer = None;
 	let mut signature = None;
+	let mut extra_headers = Vec::new();
 
 	let gpgsig_prefix = format!("{} ", H::GPGSIG_HEADER);
 	let mut lines = header.split(|&b| b == b'\n').peekable();
@@ -41,17 +48,14 @@ pub fn parse_commit<H: HashAlgorithm>(payload: &[u8]) -> Result<Commit<H>, Objec
 		} else if let Some(rest) = line.strip_prefix(b"committer ") {
 			committer = Some(as_str(rest)?.to_owned());
 		} else if let Some(rest) = line.strip_prefix(gpgsig_prefix.as_bytes()) {
-			// A multi-line header: the value continues on lines starting with a space.
-			let mut value = as_str(rest)?.to_owned();
-			while let Some(next) = lines.peek() {
-				let Some(continuation) = next.strip_prefix(b" ") else {
-					break;
-				};
-				value.push('\n');
-				value.push_str(as_str(continuation)?);
-				lines.next();
-			}
-			signature = Some(value);
+			signature = Some(as_str(&unfold(rest, &mut lines))?.to_owned());
+		} else if !line.is_empty() {
+			// Any other header (e.g. `encoding`, `mergetag`), preserved verbatim so re-encoding is
+			// byte-exact. Split `name value`; the value keeps its raw bytes (a `mergetag` embeds a
+			// tag whose message may not be UTF-8).
+			let split = line.iter().position(|&b| b == b' ');
+			let (name, first) = split.map_or((line, &b""[..]), |i| (&line[..i], &line[i + 1..]));
+			extra_headers.push((as_str(name)?.to_owned(), unfold(first, &mut lines)));
 		}
 	}
 
@@ -61,13 +65,31 @@ pub fn parse_commit<H: HashAlgorithm>(payload: &[u8]) -> Result<Commit<H>, Objec
 		author: author.ok_or(ObjectError::MalformedHeader)?,
 		committer: committer.ok_or(ObjectError::MalformedHeader)?,
 		signature,
+		extra_headers,
 		message: message.to_owned(),
 	})
 }
 
-/// Encode a commit to its canonical git payload: `tree`, `parent`*, `author`,
-/// `committer`, optional `gpgsig`, blank line, message. Byte-exact with git, so a
-/// signed commit round-trips and [`commit_signed_payload`] reproduces the signed bytes.
+/// Unfold a multi-line header value: `first` (the bytes after `name `) plus each following
+/// space-prefixed continuation line (its leading space removed), joined by `\n`. Consumes the
+/// continuation lines from `lines`. Mirrors [`encode_commit`]'s folding, so the round-trip is exact.
+fn unfold<'a>(
+	first: &[u8],
+	lines: &mut std::iter::Peekable<impl Iterator<Item = &'a [u8]>>,
+) -> Vec<u8> {
+	let mut value = first.to_vec();
+	while let Some(continuation) = lines.peek().and_then(|next| next.strip_prefix(b" ")) {
+		value.push(b'\n');
+		value.extend_from_slice(continuation);
+		lines.next();
+	}
+	value
+}
+
+/// Encode a commit to its canonical git payload: `tree`, `parent`*, `author`, `committer`, any
+/// [`Commit::extra_headers`] (e.g. `encoding`, `mergetag`), optional `gpgsig`, blank line, message.
+/// Byte-exact with git, so any commit round-trips (its id is stable) and [`commit_signed_payload`]
+/// reproduces the signed bytes.
 pub fn encode_commit<H: HashAlgorithm>(commit: &Commit<H>) -> Vec<u8> {
 	let mut out = Vec::new();
 	out.extend_from_slice(format!("tree {}\n", commit.tree).as_bytes());
@@ -76,6 +98,20 @@ pub fn encode_commit<H: HashAlgorithm>(commit: &Commit<H>) -> Vec<u8> {
 	}
 	out.extend_from_slice(format!("author {}\n", commit.author).as_bytes());
 	out.extend_from_slice(format!("committer {}\n", commit.committer).as_bytes());
+	for (name, value) in &commit.extra_headers {
+		// `name <first line>`, then each unfolded continuation re-folded with a leading space. git
+		// writes these (e.g. `encoding`, `mergetag`) between `committer` and `gpgsig`.
+		let mut segments = value.split(|&b| b == b'\n');
+		out.extend_from_slice(name.as_bytes());
+		out.push(b' ');
+		out.extend_from_slice(segments.next().unwrap_or_default());
+		out.push(b'\n');
+		for segment in segments {
+			out.push(b' ');
+			out.extend_from_slice(segment);
+			out.push(b'\n');
+		}
+	}
 	if let Some(signature) = &commit.signature {
 		// First line trails `<gpgsig header> `; continuations a single space (git's format).
 		let mut signature_lines = signature.split('\n');
@@ -181,6 +217,7 @@ mod tests {
 			author: "A U Thor <author@example.com> 1700000000 +1000".to_owned(),
 			committer: "C O Mitter <committer@example.com> 1700000005 -0500".to_owned(),
 			signature: None,
+			extra_headers: Vec::new(),
 			message: "first commit\n".to_owned(),
 		};
 		let id = ObjectId::<Sha256>::compute(ObjectKind::Commit, &encode_commit(&commit));
@@ -226,6 +263,29 @@ mod tests {
 		assert_eq!(reparsed.signature, None);
 		assert_eq!(reparsed.tree, commit.tree);
 		assert_eq!(reparsed.message, commit.message);
+	}
+
+	#[test]
+	fn round_trips_encoding_and_mergetag_headers_byte_exact() {
+		// A signed merge of a signed tag: `encoding`, a multi-line `mergetag` (whose embedded tag
+		// message carries a non-UTF-8 byte, `\xe9`), then `gpgsig` — git's header order. The parser
+		// dropped these headers before, so re-encoding changed the id; now it must round-trip.
+		let payload: &[u8] = b"tree b5f4f26b2641070724725ca76c135b9ff2a94b3573a1cdb04223a198cfe53804\nparent aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nparent bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nauthor A <a@x> 1 +0000\ncommitter C <c@x> 2 +0000\nencoding ISO-8859-1\nmergetag object bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n type commit\n tag v1\n tagger T <t@x> 1 +0000\n \n rel\xe9ase\ngpgsig-sha256 -----BEGIN SSH SIGNATURE-----\n U1NIU0lH\n -----END SSH SIGNATURE-----\n\nmerge\n";
+		let commit = parse_commit::<Sha256>(payload).expect("parse");
+
+		// Both headers preserved, in order, with raw (non-UTF-8-safe) values.
+		assert_eq!(commit.extra_headers.len(), 2);
+		assert_eq!(commit.extra_headers[0].0, "encoding");
+		assert_eq!(commit.extra_headers[0].1, b"ISO-8859-1");
+		assert_eq!(commit.extra_headers[1].0, "mergetag");
+		assert!(
+			commit.extra_headers[1].1.contains(&0xe9),
+			"non-UTF-8 mergetag byte preserved"
+		);
+		assert!(commit.signature.is_some(), "gpgsig still parsed");
+
+		// The whole commit round-trips byte-for-byte, so its id is stable.
+		assert_eq!(encode_commit(&commit), payload);
 	}
 
 	#[test]

@@ -129,6 +129,7 @@ mod tests {
 			author: "A <a@x> 1 +0000".to_owned(),
 			committer: "A <a@x> 1 +0000".to_owned(),
 			signature: None,
+			extra_headers: Vec::new(),
 			message: msg.to_owned(),
 		})
 	}

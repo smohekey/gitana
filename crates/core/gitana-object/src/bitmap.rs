@@ -477,6 +477,7 @@ mod tests {
 				author: sig.clone(),
 				committer: sig.clone(),
 				signature: None,
+				extra_headers: Vec::new(),
 				message: "one\n".to_owned(),
 			}),
 		);
@@ -488,6 +489,7 @@ mod tests {
 				author: sig.clone(),
 				committer: sig,
 				signature: None,
+				extra_headers: Vec::new(),
 				message: "two\n".to_owned(),
 			}),
 		);
@@ -593,6 +595,7 @@ mod tests {
 				author: sig.clone(),
 				committer: sig,
 				signature: None,
+				extra_headers: Vec::new(),
 				message: "sub\n".to_owned(),
 			}),
 		);

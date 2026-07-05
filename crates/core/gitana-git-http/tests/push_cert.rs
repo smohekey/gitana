@@ -95,6 +95,7 @@ fn commit_objects(content: &[u8]) -> (Vec<PackedObject<Sha256>>, ObjectId<Sha256
 		author: "A <a@x> 1 +0000".to_owned(),
 		committer: "A <a@x> 1 +0000".to_owned(),
 		signature: None,
+		extra_headers: Vec::new(),
 		message: "root\n".to_owned(),
 	});
 	let commit_id = ObjectId::<Sha256>::compute(ObjectKind::Commit, &commit);

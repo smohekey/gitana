@@ -58,6 +58,7 @@ fn sample_graph() -> Vec<PackedObject<Sha256>> {
 			author: "A U Thor <a@x> 1700000000 +0000".to_owned(),
 			committer: "A U Thor <a@x> 1700000000 +0000".to_owned(),
 			signature: None,
+			extra_headers: Vec::new(),
 			message: "root\n".to_owned(),
 		}),
 	);
@@ -69,6 +70,7 @@ fn sample_graph() -> Vec<PackedObject<Sha256>> {
 			author: "A U Thor <a@x> 1700000100 +0000".to_owned(),
 			committer: "A U Thor <a@x> 1700000100 +0000".to_owned(),
 			signature: None,
+			extra_headers: Vec::new(),
 			message: "second\n".to_owned(),
 		}),
 	);

@@ -44,6 +44,7 @@ fn sample_graph() -> Vec<PackedObject<Sha256>> {
 			author: "A U Thor <a@x> 1700000000 +0000".to_owned(),
 			committer: "A U Thor <a@x> 1700000000 +0000".to_owned(),
 			signature: None,
+			extra_headers: Vec::new(),
 			message: "root\n".to_owned(),
 		}),
 	);
@@ -987,6 +988,7 @@ async fn write_reachability_bitmap_is_read_back_by_our_reader() {
 				author: sig.clone(),
 				committer: sig.clone(),
 				signature: None,
+				extra_headers: Vec::new(),
 				message: "one\n".to_owned(),
 			}),
 		)
@@ -1001,6 +1003,7 @@ async fn write_reachability_bitmap_is_read_back_by_our_reader() {
 				author: sig.clone(),
 				committer: sig,
 				signature: None,
+				extra_headers: Vec::new(),
 				message: "two\n".to_owned(),
 			}),
 		)
@@ -1117,6 +1120,7 @@ async fn write_reachability_bitmap_skips_a_loose_selected_commit() {
 				author: sig.clone(),
 				committer: sig.clone(),
 				signature: None,
+				extra_headers: Vec::new(),
 				message: "one\n".to_owned(),
 			}),
 		)
@@ -1134,6 +1138,7 @@ async fn write_reachability_bitmap_skips_a_loose_selected_commit() {
 				author: sig.clone(),
 				committer: sig,
 				signature: None,
+				extra_headers: Vec::new(),
 				message: "two\n".to_owned(),
 			}),
 		)

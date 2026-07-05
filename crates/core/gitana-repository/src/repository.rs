@@ -164,6 +164,7 @@ where
 			author: author.to_owned(),
 			committer: committer.to_owned(),
 			signature: None,
+			extra_headers: Vec::new(),
 			message: message.to_owned(),
 		};
 		Ok(
