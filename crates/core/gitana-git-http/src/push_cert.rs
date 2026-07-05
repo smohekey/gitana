@@ -22,7 +22,8 @@
 //! The **signed payload** is the certificate body — every line from `certificate version`
 //! through the last command (including the blank separator line), exactly as below — and
 //! the signature is computed over those bytes. `gitana-trust` verifies the signature; this
-//! module owns the wire format and the nonce HMAC. See `docs/hlds/trust.md` (Phase 3).
+//! module owns the wire format and the repo-bound nonce HMAC. See
+//! `docs/hlds/secure-git-trust-signing.md` (step 3).
 
 use gitana_object::{PktLine, parse_pkt, write_flush, write_pkt};
 use hmac::{Hmac, Mac};
@@ -257,20 +258,28 @@ pub fn build(cert: &PushCert, capabilities: &str, pack: &[u8]) -> Vec<u8> {
 	out
 }
 
-/// Issue a stateless push nonce: `<timestamp>-<hex(HMAC-SHA256(secret, timestamp))>`.
+/// Issue a stateless, repo-bound push nonce:
+/// `<timestamp>-<random_hex>-<hex(HMAC-SHA256(secret, "<timestamp>-<random_hex>-<repo_id>"))>`.
 ///
-/// Stateless so any server replica can mint and verify without shared state; the HMAC
-/// binds the timestamp so a client cannot forge a fresh-looking nonce.
-pub fn make_nonce(secret: &[u8], timestamp: u64) -> String {
-	let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
-	mac.update(timestamp.to_string().as_bytes());
-	format!("{timestamp}-{}", hex(&mac.finalize().into_bytes()))
+/// Stateless, so any server replica can mint and verify without shared state. Binding `repo_id` (a
+/// canonical, service-scoped repository identifier) into the HMAC stops a nonce — and thus a whole
+/// push certificate — minted for one repository from being replayed against another. The caller
+/// supplies `random` bytes (reading the clock and RNG is a frontend concern, kept out of the codec)
+/// so each nonce is unique and unpredictable within a timestamp; the HMAC over all three prevents
+/// forgery of a fresh-looking nonce.
+pub fn make_nonce(secret: &[u8], repo_id: &str, timestamp: u64, random: &[u8]) -> String {
+	let random_hex = hex(random);
+	let tag = nonce_tag(secret, timestamp, &random_hex, repo_id);
+	format!("{timestamp}-{random_hex}-{}", hex(&tag))
 }
 
-/// Verify a nonce minted by [`make_nonce`]: the HMAC must match (constant-time) and the
-/// timestamp must be within `slop_secs` of `now` (replay/clock-skew window).
-pub fn verify_nonce(secret: &[u8], nonce: &str, now: u64, slop_secs: u64) -> bool {
-	let Some((ts_str, tag_hex)) = nonce.split_once('-') else {
+/// Verify a nonce minted by [`make_nonce`] for `repo_id`: the HMAC must match (constant-time) and
+/// the timestamp must be within `slop_secs` of `now` (replay/clock-skew window). A nonce minted for
+/// a different repository (or secret, or timestamp) fails the HMAC.
+pub fn verify_nonce(secret: &[u8], repo_id: &str, nonce: &str, now: u64, slop_secs: u64) -> bool {
+	let mut parts = nonce.splitn(3, '-');
+	let (Some(ts_str), Some(random_hex), Some(tag_hex)) = (parts.next(), parts.next(), parts.next())
+	else {
 		return false;
 	};
 	let Ok(timestamp) = ts_str.parse::<u64>() else {
@@ -279,9 +288,22 @@ pub fn verify_nonce(secret: &[u8], nonce: &str, now: u64, slop_secs: u64) -> boo
 	let Some(tag) = unhex(tag_hex) else {
 		return false;
 	};
+	// `verify_slice` compares in constant time.
 	let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
-	mac.update(ts_str.as_bytes());
+	mac.update(nonce_message(timestamp, random_hex, repo_id).as_bytes());
 	mac.verify_slice(&tag).is_ok() && now.abs_diff(timestamp) <= slop_secs
+}
+
+/// The HMAC tag binding `timestamp`, `random_hex`, and `repo_id`.
+fn nonce_tag(secret: &[u8], timestamp: u64, random_hex: &str, repo_id: &str) -> Vec<u8> {
+	let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+	mac.update(nonce_message(timestamp, random_hex, repo_id).as_bytes());
+	mac.finalize().into_bytes().to_vec()
+}
+
+/// The message the nonce HMAC is computed over.
+fn nonce_message(timestamp: u64, random_hex: &str, repo_id: &str) -> String {
+	format!("{timestamp}-{random_hex}-{repo_id}")
 }
 
 /// Lowercase-hex encode.

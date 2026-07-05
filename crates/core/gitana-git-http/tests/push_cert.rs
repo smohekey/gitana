@@ -57,20 +57,35 @@ fn payload_matches_the_git_certificate_format() {
 #[test]
 fn nonce_accepts_fresh_untampered_and_rejects_otherwise() {
 	let secret = b"server-secret";
+	let repo = "acme/app";
 	let now = 1_700_000_000;
-	let nonce = make_nonce(secret, now);
+	let nonce = make_nonce(secret, repo, now, b"\x01\x02\x03\x04");
 
-	// Fresh and within the slop window: accepted.
-	assert!(verify_nonce(secret, &nonce, now + 60, 900));
+	// Fresh, right repo, within the slop window: accepted.
+	assert!(verify_nonce(secret, repo, &nonce, now + 60, 900));
 	// Outside the slop window: rejected (replay protection).
-	assert!(!verify_nonce(secret, &nonce, now + 5_000, 900));
+	assert!(!verify_nonce(secret, repo, &nonce, now + 5_000, 900));
+	// A different repository: rejected — a cert for repo A cannot be replayed to repo B.
+	assert!(!verify_nonce(secret, "acme/other", &nonce, now + 60, 900));
 	// Tampered HMAC: rejected.
-	let tampered = format!("{now}-deadbeef");
-	assert!(!verify_nonce(secret, &tampered, now, 900));
+	let tampered = format!("{now}-01020304-deadbeef");
+	assert!(!verify_nonce(secret, repo, &tampered, now, 900));
 	// Wrong secret: rejected.
-	assert!(!verify_nonce(b"other-secret", &nonce, now, 900));
+	assert!(!verify_nonce(b"other-secret", repo, &nonce, now, 900));
 	// Garbage: rejected, no panic.
-	assert!(!verify_nonce(secret, "not-a-nonce", now, 900));
+	assert!(!verify_nonce(secret, repo, "not-a-nonce", now, 900));
+}
+
+#[test]
+fn nonce_is_unique_per_random() {
+	let secret = b"server-secret";
+	let repo = "acme/app";
+	let now = 1_700_000_000;
+	let a = make_nonce(secret, repo, now, b"\x00\x00\x00\x01");
+	let b = make_nonce(secret, repo, now, b"\x00\x00\x00\x02");
+	assert_ne!(a, b, "different random bytes yield different nonces");
+	assert!(verify_nonce(secret, repo, &a, now, 900));
+	assert!(verify_nonce(secret, repo, &b, now, 900));
 }
 
 // --- integration: a signed push through receive_pack ------------------------------
@@ -126,7 +141,7 @@ async fn signed_push_moves_ref_and_surfaces_cert() {
 
 	let (objects, commit) = commit_objects(b"hello\n");
 	let pack = encode_pack(&objects);
-	let nonce = make_nonce(b"secret", 1_700_000_000);
+	let nonce = make_nonce(b"secret", "acme/app", 1_700_000_000, b"\x01\x02\x03\x04");
 	let original = cert(
 		&nonce,
 		vec![CertCommand {
@@ -151,5 +166,11 @@ async fn signed_push_moves_ref_and_surfaces_cert() {
 	// …and the certificate is surfaced intact for the host to verify.
 	let surfaced = outcome.push_cert.expect("cert surfaced");
 	assert_eq!(surfaced, original);
-	assert!(verify_nonce(b"secret", &surfaced.nonce, 1_700_000_000, 900));
+	assert!(verify_nonce(
+		b"secret",
+		"acme/app",
+		&surfaced.nonce,
+		1_700_000_000,
+		900
+	));
 }
