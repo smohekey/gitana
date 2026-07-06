@@ -126,9 +126,12 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   prints the event to stderr on an adoption or fast-forward — completing the client-side audit
   vocabulary (descoped from step 7b). Scoped in
   `docs/hlds/trust-followups.md#5-trustrootadopted-audit-event-for-trust-sync`.
-- [ ] Add a one-time-nonce replay cache. Close the replay-within-freshness-window gap (accepted by
-  design in v1's stateless HMAC nonce) with a host-supplied TTL nonce ledger threaded through
-  `verify_push`, keeping the core pure. Scoped in `docs/hlds/trust-followups.md#2-one-time-nonce-replay-cache`.
+- [x] Add a one-time-nonce replay cache. Added a host-supplied `NonceLedger` capability (with a
+  `NoReplayCheck` no-op default) threaded through the new `verify_push_with_ledger` / `ReceiveOptions`;
+  after a certificate verifies, its nonce is recorded and a still-fresh replay is a certificate failure
+  (rejected under `require`, warned under `warn`). The pure core stays stateless — the ledger is the
+  host's state. `verify_push` delegates with `NoReplayCheck`, so its callers are unchanged. Covered by
+  in-memory-ledger replay tests. Scoped in `docs/hlds/trust-followups.md#2-one-time-nonce-replay-cache`.
 - [ ] Add a persisted require-time baseline. Snapshot the grandfather set at the `require` cutover into a
   stored artifact so object-signature enforcement is incremental and stable, instead of the live
   `protected_baseline` walk. Scoped in `docs/hlds/trust-followups.md#4-persisted-require-time-baseline`.

@@ -8,8 +8,9 @@ use std::collections::HashMap;
 
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_git_http::{
-	AuditEvent, CertCommand, PushCert, ReceiveOptions, ReceiveOutcome, RefUpdate, TrustContext,
-	TrustVerdict, build_push_cert, make_nonce, receive_pack, verify_push,
+	AuditEvent, CertCommand, NoReplayCheck, NonceLedger, PushCert, ReceiveOptions, ReceiveOutcome,
+	RefUpdate, TrustContext, TrustVerdict, build_push_cert, make_nonce, receive_pack, verify_push,
+	verify_push_with_ledger,
 };
 use gitana_object::{
 	Commit, ObjectId, ObjectKind, PackedObject, Sha256, Tag, TreeEntry, encode_commit, encode_pack,
@@ -363,6 +364,127 @@ async fn require_rejects_stale_nonce() {
 			..
 		}
 	));
+}
+
+/// An in-memory [`NonceLedger`]: records nonces in a set and reports a replay when one is seen twice.
+#[derive(Default)]
+struct MemLedger {
+	seen: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl NonceLedger for MemLedger {
+	type Error = std::convert::Infallible;
+
+	async fn check_and_record(
+		&self,
+		nonce: &str,
+		_expires_at: u64,
+	) -> Result<bool, std::convert::Infallible> {
+		// `insert` returns `true` when the nonce is new; a replay is a nonce already present.
+		Ok(!self.seen.lock().unwrap().insert(nonce.to_owned()))
+	}
+}
+
+#[tokio::test]
+async fn require_rejects_a_replayed_nonce() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	let (commit, raw) = commit_bytes(Some(&a), "signed\n");
+	let objects = one_commit(commit, raw);
+	let cert = signed_cert(
+		&a,
+		vec![cert_command(commit, "refs/heads/main")],
+		&fresh_nonce(),
+	);
+	let commands = [ref_update("refs/heads/main", None, commit)];
+	let ledger = MemLedger::default();
+
+	// First use of this (fresh, valid) nonce is accepted and recorded.
+	let first = verify_push_with_ledger(
+		&repo,
+		&context(),
+		&commands,
+		&objects,
+		Some(&cert),
+		NOW,
+		&ledger,
+	)
+	.await
+	.expect("verify");
+	assert_eq!(first, TrustVerdict::Accept { warnings: vec![] });
+
+	// Replaying the same still-fresh nonce is rejected, even though the certificate itself is valid.
+	let second = verify_push_with_ledger(
+		&repo,
+		&context(),
+		&commands,
+		&objects,
+		Some(&cert),
+		NOW,
+		&ledger,
+	)
+	.await
+	.expect("verify");
+	assert!(
+		matches!(
+			second,
+			TrustVerdict::Reject {
+				global: Some(_),
+				..
+			}
+		),
+		"{second:?}"
+	);
+}
+
+#[tokio::test]
+async fn warn_records_a_replayed_nonce_as_a_warning() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "warn").await;
+	let (commit, raw) = commit_bytes(Some(&a), "signed\n");
+	let objects = one_commit(commit, raw);
+	let cert = signed_cert(
+		&a,
+		vec![cert_command(commit, "refs/heads/main")],
+		&fresh_nonce(),
+	);
+	let commands = [ref_update("refs/heads/main", None, commit)];
+	let ledger = MemLedger::default();
+
+	verify_push_with_ledger(
+		&repo,
+		&context(),
+		&commands,
+		&objects,
+		Some(&cert),
+		NOW,
+		&ledger,
+	)
+	.await
+	.expect("verify");
+	// Under `warn` the replay is recorded but not enforced — surfaced as a warning, not a rejection.
+	let second = verify_push_with_ledger(
+		&repo,
+		&context(),
+		&commands,
+		&objects,
+		Some(&cert),
+		NOW,
+		&ledger,
+	)
+	.await
+	.expect("verify");
+	match second {
+		TrustVerdict::Accept { warnings } => {
+			assert!(
+				warnings.iter().any(|w| w.contains("replay")),
+				"{warnings:?}"
+			);
+		}
+		other => panic!("expected accept-with-warning, got {other:?}"),
+	}
 }
 
 #[tokio::test]
@@ -1022,6 +1144,7 @@ async fn run_receive(repo: &Repo, request: &[u8]) -> ReceiveOutcome<Sha256> {
 			force: false,
 			trust: &context(),
 			now: NOW,
+			nonce_ledger: &NoReplayCheck,
 		},
 	)
 	.await
@@ -1169,6 +1292,7 @@ async fn wire_require_applies_a_signed_delete_when_the_host_grants_deletes() {
 			force: true,
 			trust: &context(),
 			now: NOW,
+			nonce_ledger: &NoReplayCheck,
 		},
 	)
 	.await
@@ -1379,6 +1503,7 @@ async fn wire_none_context_fails_closed_on_a_trust_configured_repo() {
 			force: false,
 			trust: &TrustContext::none(),
 			now: NOW,
+			nonce_ledger: &NoReplayCheck,
 		},
 	)
 	.await

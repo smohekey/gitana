@@ -9,7 +9,7 @@ Suggested order (cheapest / highest-leverage first):
 
 1. ~~[Signed `--signed --delete`](#1-signed-push---signed---delete)~~ — **done.**
 2. ~~[`trust sync` audit event](#5-trustrootadopted-audit-event-for-trust-sync)~~ — **done.**
-3. [One-time-nonce replay cache](#2-one-time-nonce-replay-cache) — security hardening; medium.
+3. ~~[One-time-nonce replay cache](#2-one-time-nonce-replay-cache)~~ — **done.**
 4. [Persisted require-time baseline](#4-persisted-require-time-baseline) — enforcement perf/stability;
    medium.
 5. [OpenPGP signatures](#3-openpgp-signatures) — GPG interop; large, new dependency.
@@ -47,6 +47,13 @@ reference.
   (`real_git_push_signed.rs`) with a signed delete.
 
 ## 2. One-time-nonce replay cache
+
+**✅ Done.** A host-supplied `NonceLedger` trait (with a `NoReplayCheck` no-op default) is threaded
+through `verify_push_with_ledger` and `ReceiveOptions`; after a certificate verifies, its nonce is
+recorded and a still-fresh replay is a certificate failure (rejected under `require`, warned under
+`warn`). The pure core stays stateless — the ledger holds the host's state; `verify_push` delegates with
+`NoReplayCheck`. Only the seam ships (no production ledger yet, matching the no-server-binary reality).
+The scoped plan below is kept for reference.
 
 - **Goal.** Reject a push certificate whose fresh, valid nonce has already been used — closing the
   replay-*within*-the-freshness-window gap (matrix row 6, ⚠️ by design).

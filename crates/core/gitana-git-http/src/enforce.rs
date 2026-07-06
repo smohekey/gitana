@@ -26,7 +26,7 @@ use gitana_trust::{
 };
 
 use crate::push_cert::{PushCert, verify_nonce};
-use crate::{GitHttpError, RefUpdate};
+use crate::{GitHttpError, NoReplayCheck, NonceLedger, RefUpdate};
 
 /// The signed trust-state ref. Its updates are verified as a candidate chain and are exempt from the
 /// push-certificate and object-signature requirements (the chain is self-authorising).
@@ -141,6 +141,10 @@ impl Failure {
 /// `commands` are the push's ref updates, `objects` the pushed objects (id → kind + raw bytes) that
 /// unpacking produced but that are not yet written, and `push_cert` the certificate if the push was
 /// signed. `now` is the current unix time (for nonce freshness); the caller supplies it.
+///
+/// This does no one-time-nonce replay check (v1's stateless nonce accepts replay within the freshness
+/// window). A host that wants to reject a replayed nonce calls [`verify_push_with_ledger`] with a
+/// [`NonceLedger`] instead.
 pub async fn verify_push<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	context: &TrustContext,
@@ -148,6 +152,31 @@ pub async fn verify_push<F: FileStore, H: HashAlgorithm>(
 	objects: &HashMap<ObjectId<H>, (ObjectKind, Vec<u8>)>,
 	push_cert: Option<&PushCert>,
 	now: u64,
+) -> Result<TrustVerdict, GitHttpError> {
+	verify_push_with_ledger(
+		repo,
+		context,
+		commands,
+		objects,
+		push_cert,
+		now,
+		&NoReplayCheck,
+	)
+	.await
+}
+
+/// [`verify_push`] plus a one-time-nonce replay check: after a certificate verifies (signature, fresh
+/// nonce, pushee, commands), its nonce is recorded in `nonce_ledger` and a replay — a still-fresh
+/// nonce already seen — is treated as a certificate failure (rejected under `require`, warned under
+/// `warn`). The ledger is the host's state; the pure verification is otherwise identical.
+pub async fn verify_push_with_ledger<F: FileStore, H: HashAlgorithm, L: NonceLedger>(
+	repo: &Repository<F, H>,
+	context: &TrustContext,
+	commands: &[RefUpdate<H>],
+	objects: &HashMap<ObjectId<H>, (ObjectKind, Vec<u8>)>,
+	push_cert: Option<&PushCert>,
+	now: u64,
+	nonce_ledger: &L,
 ) -> Result<TrustVerdict, GitHttpError> {
 	let current_tip = repo.refs().resolve(TRUST_REF).await?;
 
@@ -242,6 +271,10 @@ pub async fn verify_push<F: FileStore, H: HashAlgorithm>(
 				Some(cert) => {
 					if let Err(reason) = verify_cert(cert, &root.keys, context, commands, now) {
 						failures.push(Failure::global(reason));
+					} else if replayed_nonce(nonce_ledger, cert, context, now).await? {
+						failures.push(Failure::global(
+							"push certificate nonce has already been used (replay)",
+						));
 					}
 				}
 			}
@@ -346,6 +379,22 @@ fn verify_cert<H: HashAlgorithm>(
 		return Err("push certificate commands do not match the pushed updates".to_owned());
 	}
 	Ok(())
+}
+
+/// Record the certificate's (already-verified, fresh) nonce in `ledger` and report whether it was a
+/// replay — a still-fresh nonce already seen. The entry only needs to outlive the freshness window;
+/// `now + 2 * slop` bounds when the nonce can no longer be fresh, so the ledger may evict past it.
+async fn replayed_nonce<L: NonceLedger>(
+	ledger: &L,
+	cert: &PushCert,
+	context: &TrustContext,
+	now: u64,
+) -> Result<bool, GitHttpError> {
+	let expires_at = now.saturating_add(context.nonce_slop_secs.saturating_mul(2));
+	ledger
+		.check_and_record(&cert.nonce, expires_at)
+		.await
+		.map_err(|error| GitHttpError::NonceLedger(error.to_string()))
 }
 
 /// Whether the certificate's signed commands exactly match the push's commands (as a set of

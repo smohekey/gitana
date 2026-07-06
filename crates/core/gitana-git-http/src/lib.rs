@@ -10,6 +10,8 @@ mod client;
 mod enforce;
 mod fetch;
 mod ls_refs;
+mod no_replay_check;
+mod nonce_ledger;
 mod pack;
 mod push_cert;
 mod receive_pack;
@@ -23,10 +25,12 @@ pub use client::{
 	Advertised, RefUpdate, build_receive_pack_request, build_upload_pack_request,
 	parse_advertisement, parse_report_status, parse_upload_pack_response, peek_object_format,
 };
-pub use enforce::{TrustContext, TrustVerdict, verify_push};
+pub use enforce::{TrustContext, TrustVerdict, verify_push, verify_push_with_ledger};
 pub use fetch::fetch;
 pub use gitana_trust::AuditEvent;
 pub use ls_refs::ls_refs;
+pub use no_replay_check::NoReplayCheck;
+pub use nonce_ledger::NonceLedger;
 pub use pack::build_pack;
 pub use push_cert::{
 	CertCommand, PushCert, build as build_push_cert, make_nonce, peek as peek_push_cert, verify_nonce,
@@ -59,4 +63,7 @@ pub enum GitHttpError {
 	/// Encoding or decoding wire bytes failed.
 	#[error("codec error: {0}")]
 	Codec(#[from] ObjectError),
+	/// A host push-nonce ledger lookup failed (see [`NonceLedger`]).
+	#[error("nonce ledger error: {0}")]
+	NonceLedger(String),
 }

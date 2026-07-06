@@ -19,7 +19,9 @@ use gitana_repository::{Repository, RepositoryError};
 use gitana_trust::AuditEvent;
 
 use crate::push_cert::{self, PushCert};
-use crate::{GitHttpError, RefUpdate, TrustContext, TrustVerdict, verify_push};
+use crate::{
+	GitHttpError, NonceLedger, RefUpdate, TrustContext, TrustVerdict, verify_push_with_ledger,
+};
 
 /// One ref-update command from the client.
 struct Command<H: HashAlgorithm> {
@@ -44,8 +46,10 @@ impl<H: HashAlgorithm> Command<H> {
 }
 
 /// The host inputs a receive-pack needs beyond the request body: whether destructive updates are
-/// permitted, and the trust context and clock the pre-receive trust check runs against.
-pub struct ReceiveOptions<'a> {
+/// permitted, the trust context and clock the pre-receive trust check runs against, and the push-nonce
+/// ledger. A host that does not enforce one-time nonces passes
+/// [`&NoReplayCheck`](crate::NoReplayCheck).
+pub struct ReceiveOptions<'a, L: NonceLedger> {
 	/// Permits the destructive updates git withholds by default: non-fast-forward ref updates and
 	/// ref deletions. The host grants it only to a sufficiently privileged capability (the
 	/// trust/security model gates it on `admin`).
@@ -57,6 +61,9 @@ pub struct ReceiveOptions<'a> {
 	/// The current unix time, for push-certificate nonce freshness. The host supplies it so this
 	/// crate stays clock-free.
 	pub now: u64,
+	/// Records used push-cert nonces so a replayed one is rejected. [`NoReplayCheck`](crate::NoReplayCheck)
+	/// disables the check (v1's default — replay within the freshness window is accepted).
+	pub nonce_ledger: &'a L,
 }
 
 /// The result of a receive-pack: the `report-status` bytes and the refs that were
@@ -82,10 +89,10 @@ pub struct ReceiveOutcome<H: HashAlgorithm> {
 /// ([`verify_push`]), and only then writes objects and moves refs — a rejection at any stage
 /// leaves the repository untouched. See [`ReceiveOptions`] for the `force` grant and the trust
 /// inputs.
-pub async fn receive_pack<F: FileStore, H: HashAlgorithm>(
+pub async fn receive_pack<F: FileStore, H: HashAlgorithm, L: NonceLedger>(
 	repo: &Repository<F, H>,
 	request: &[u8],
-	options: ReceiveOptions<'_>,
+	options: ReceiveOptions<'_, L>,
 ) -> Result<ReceiveOutcome<H>, GitHttpError> {
 	let ParsedRequest {
 		commands,
@@ -127,13 +134,14 @@ pub async fn receive_pack<F: FileStore, H: HashAlgorithm>(
 	// introduced signed objects against the repository's policy — reading the pushed-but-unwritten
 	// objects through a quarantine overlay — before anything is committed.
 	let updates: Vec<RefUpdate<H>> = commands.iter().map(Command::to_update).collect();
-	let verdict = verify_push(
+	let verdict = verify_push_with_ledger(
 		repo,
 		options.trust,
 		&updates,
 		&objects,
 		push_cert.as_ref(),
 		options.now,
+		options.nonce_ledger,
 	)
 	.await?;
 	// Split the verdict into the refs trust rejects (denied before they reach `apply_command`), the

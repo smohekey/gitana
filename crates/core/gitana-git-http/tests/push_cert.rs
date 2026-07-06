@@ -5,8 +5,8 @@
 
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_git_http::{
-	CertCommand, PushCert, ReceiveOptions, TrustContext, build_push_cert, make_nonce, receive_pack,
-	verify_nonce,
+	CertCommand, NoReplayCheck, PushCert, ReceiveOptions, TrustContext, build_push_cert, make_nonce,
+	receive_pack, verify_nonce,
 };
 use gitana_object::Sha256;
 use gitana_object::{
@@ -248,6 +248,7 @@ async fn signed_push_moves_ref_and_surfaces_cert() {
 			force: false,
 			trust: &TrustContext::none(),
 			now: 0,
+			nonce_ledger: &NoReplayCheck,
 		},
 	)
 	.await

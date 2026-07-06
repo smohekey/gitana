@@ -21,7 +21,8 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use gitana_file_store_local::LocalFileStore;
 use gitana_git_http::{
-	ProtocolVersion, ReceiveOptions, Service, TrustContext, advertise, make_nonce, receive_pack,
+	NoReplayCheck, ProtocolVersion, ReceiveOptions, Service, TrustContext, advertise, make_nonce,
+	receive_pack,
 };
 use gitana_object::{Commit, ObjectId, ObjectKind, Sha1, TreeEntry, encode_commit, encode_tree};
 use gitana_object_store::ObjectStore;
@@ -96,6 +97,7 @@ async fn git_receive_pack(State(state): State<AppState>, body: Bytes) -> impl In
 			force: false,
 			trust: &trust,
 			now: NOW,
+			nonce_ledger: &NoReplayCheck,
 		},
 	)
 	.await

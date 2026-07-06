@@ -15,7 +15,8 @@ use axum::extract::{RawQuery, State};
 use axum::routing::{get, post};
 use gitana_file_store_local::LocalFileStore;
 use gitana_git_http::{
-	ProtocolVersion, ReceiveOptions, Service, TrustContext, advertise, receive_pack, upload_pack_v0,
+	NoReplayCheck, ProtocolVersion, ReceiveOptions, Service, TrustContext, advertise, receive_pack,
+	upload_pack_v0,
 };
 use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
@@ -76,6 +77,7 @@ async fn git_receive_pack(State(git_dir): State<PathBuf>, body: Bytes) -> Bytes 
 				force: true,
 				trust: &TrustContext::none(),
 				now: 0,
+				nonce_ledger: &NoReplayCheck,
 			},
 		)
 		.await

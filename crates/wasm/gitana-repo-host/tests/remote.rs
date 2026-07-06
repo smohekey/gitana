@@ -22,7 +22,8 @@ use axum::extract::{RawQuery, State};
 use axum::routing::{get, post};
 use gitana_file_store_local::LocalFileStore;
 use gitana_git_http::{
-	ProtocolVersion, ReceiveOptions, Service, TrustContext, advertise, receive_pack, upload_pack_v0,
+	NoReplayCheck, ProtocolVersion, ReceiveOptions, Service, TrustContext, advertise, receive_pack,
+	upload_pack_v0,
 };
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 use gitana_repo_host::exports::gitana::repo::porcelain::PushOutcome;
@@ -98,6 +99,7 @@ async fn receive_pack_srv(State(st): State<ServerState>, body: Bytes) -> Bytes {
 		force: true,
 		trust: &no_trust,
 		now: 0,
+		nonce_ledger: &NoReplayCheck,
 	};
 	let report = match st.kind {
 		HashKind::Sha1 => {

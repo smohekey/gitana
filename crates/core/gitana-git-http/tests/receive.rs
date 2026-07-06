@@ -5,7 +5,7 @@
 use std::sync::LazyLock;
 
 use gitana_file_store_memory::MemoryFileStore;
-use gitana_git_http::{ReceiveOptions, TrustContext, receive_pack};
+use gitana_git_http::{NoReplayCheck, ReceiveOptions, TrustContext, receive_pack};
 use gitana_object::Sha256;
 use gitana_object::{
 	Commit, ObjectId, ObjectKind, PackedObject, PktLine, TreeEntry, encode_commit, encode_pack,
@@ -22,11 +22,12 @@ static NO_TRUST: LazyLock<TrustContext> = LazyLock::new(TrustContext::none);
 
 /// Receive options with `force` and no trust configuration — the shape these protocol tests push
 /// with.
-fn opts(force: bool) -> ReceiveOptions<'static> {
+fn opts(force: bool) -> ReceiveOptions<'static, NoReplayCheck> {
 	ReceiveOptions {
 		force,
 		trust: &NO_TRUST,
 		now: 0,
+		nonce_ledger: &NoReplayCheck,
 	}
 }
 
