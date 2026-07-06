@@ -191,6 +191,21 @@ fn signed_tag(signer: &PrivateKey, target: Oid, name: &str) -> (Oid, Vec<u8>) {
 	(ObjectId::compute(ObjectKind::Tag, &raw), raw)
 }
 
+/// An *unsigned* annotated tag object pointing at `target`; returns `(id, raw bytes)`. A real tag
+/// object (unlike a lightweight tag, which is a bare commit), but with no signature.
+fn unsigned_tag(target: Oid, name: &str) -> (Oid, Vec<u8>) {
+	let tag = Tag {
+		object: target,
+		kind: ObjectKind::Commit,
+		name: name.to_owned(),
+		tagger: Some("Dev <dev@x> 1700000000 +0000".to_owned()),
+		signature: None,
+		message: format!("{name}\n"),
+	};
+	let raw = encode_tag(&tag);
+	(ObjectId::compute(ObjectKind::Tag, &raw), raw)
+}
+
 fn commit_id_of(objects: &Objects) -> Oid {
 	objects
 		.iter()
@@ -814,6 +829,124 @@ async fn require_rejects_protected_deletion_without_cert() {
 			..
 		}
 	));
+}
+
+#[tokio::test]
+async fn require_rejects_a_cert_signed_by_an_untrusted_key() {
+	let (a, b) = (key(1), key(2));
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	// The commit is signed by the trusted `a`, but the push certificate is signed by `b`, who is not
+	// enrolled in the root. The object signatures pass; the certificate signature does not — so the
+	// whole push is rejected globally (a bad cert fails every ref).
+	let (commit, raw) = commit_bytes(Some(&a), "signed\n");
+	let objects = one_commit(commit, raw);
+	let cert = signed_cert(
+		&b,
+		vec![cert_command(commit, "refs/heads/main")],
+		&fresh_nonce(),
+	);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/heads/main", None, commit)],
+		&objects,
+		Some(&cert),
+		NOW,
+	)
+	.await
+	.expect("verify");
+	assert!(
+		matches!(
+			verdict,
+			TrustVerdict::Reject {
+				global: Some(_),
+				..
+			}
+		),
+		"{verdict:?}"
+	);
+}
+
+#[tokio::test]
+async fn require_rejects_an_unsigned_annotated_protected_tag() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	// A real annotated tag object (so it clears the "must be a tag object" check that a lightweight
+	// tag fails) pointing at a signed commit — but the tag itself carries no signature.
+	let (commit, craw) = commit_bytes(Some(&a), "signed\n");
+	let (tag, traw) = unsigned_tag(commit, "v1");
+	let mut objects = one_commit(commit, craw);
+	objects.insert(tag, (ObjectKind::Tag, traw));
+	let cert = signed_cert(&a, vec![cert_command(tag, "refs/tags/v1")], &fresh_nonce());
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/tags/v1", None, tag)],
+		&objects,
+		Some(&cert),
+		NOW,
+	)
+	.await
+	.expect("verify");
+	match verdict {
+		TrustVerdict::Reject { refs, .. } => {
+			assert!(
+				refs.iter().any(|(name, _)| name == "refs/tags/v1"),
+				"{refs:?}"
+			);
+		}
+		other => panic!("expected reject, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn fails_closed_when_the_current_trust_root_is_unverifiable() {
+	let a = key(1);
+	let repo = new_repo().await;
+	// Point `refs/gitana/trust` at an ordinary commit (empty tree, no `trust.json`): a root that
+	// exists but cannot be folded. Protected writes must fail *closed* — a corrupt trust anchor must
+	// never silently disable enforcement.
+	let (bad, raw) = commit_bytes(Some(&a), "not a trust commit\n");
+	repo
+		.objects()
+		.write_object(ObjectKind::Tree, &encode_tree::<Sha256>(&[]))
+		.await
+		.expect("write tree");
+	repo
+		.objects()
+		.write_object(ObjectKind::Commit, &raw)
+		.await
+		.expect("write commit");
+	repo
+		.refs()
+		.update_ref("refs/gitana/trust", bad, None)
+		.await
+		.expect("set trust ref");
+
+	// Any protected push is refused before policy even runs; the fold failure is a whole-push reject.
+	let (commit, craw) = commit_bytes(Some(&a), "signed\n");
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_update("refs/heads/main", None, commit)],
+		&one_commit(commit, craw),
+		None,
+		NOW,
+	)
+	.await
+	.expect("verify");
+	assert!(
+		matches!(
+			verdict,
+			TrustVerdict::Reject {
+				global: Some(_),
+				..
+			}
+		),
+		"{verdict:?}"
+	);
 }
 
 // --- receive_pack wiring -----------------------------------------------------------------------
