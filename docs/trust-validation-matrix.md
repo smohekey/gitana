@@ -14,7 +14,7 @@ remains.
 |---|---|---|---|
 | 1 | Stock Git SSH-signed commits verify | ✅ | `gitana-trust` `verifies_a_stock_git_signed_commit`, `verifies_stock_git_signatures_from_rsa_and_ecdsa_keys`, `verifies_a_merge_of_a_signed_tag_with_a_mergetag_header`, `verifies_signatures_over_non_utf8_messages` |
 | 2 | Stock Git GPG-signed commits verify (if OpenPGP included) | ⛔ | OpenPGP is out of v1 scope (SSHSIG only); additive later |
-| 3 | Stock `git push --signed` verifies | 🟡 → 8c | `gitana-git-http` `push_cert::verifies_a_real_git_push_certificate` proves a real captured cert verifies against the trust core. The full real-client → `receive_pack` loop is still pending slice 8c |
+| 3 | Stock `git push --signed` verifies | ✅ | Full real-client loop: `gta` `tests/real_git_push_signed.rs::stock_git_push_signed_into_gitana_receive_pack` — stock `git push --signed` into gitana's `receive_pack` over gitana's own HMAC nonce (nonce advertise/echo + pushee + commands + cert signature + object signatures), plus `..._unsigned_push_is_rejected_under_require`. Unit-level: `push_cert::verifies_a_real_git_push_certificate` (captured fixture) |
 | 4 | Unsigned push is rejected under `require` | ✅ | `gitana-git-http` `enforce::require_rejects_unsigned_commit_and_missing_cert`, `enforce::wire_require_rejects_unsigned_push_and_leaves_ref_unmoved` |
 | 5 | Signed push by an untrusted key is rejected | ✅ | commit by untrusted key: `enforce::require_rejects_commit_by_untrusted_key`; certificate by untrusted key: `enforce::require_rejects_a_cert_signed_by_an_untrusted_key` |
 | 6 | Signed push with a stale or replayed nonce is rejected | ✅ stale / ⚠️ replay | Stale rejected: `enforce::require_rejects_stale_nonce`, `push_cert::nonce_accepts_fresh_untampered_and_rejects_otherwise`. Replay *within* the freshness window is accepted **by design** — a stateless HMAC nonce has no replay cache (the HLD's documented trade-off; a one-time-nonce cache is future work, not a v1 gate) |
@@ -32,9 +32,12 @@ trust anchor): `enforce::off_still_hard_rejects_trust_ref_deletion`,
 `enforce::rejects_a_trust_policy_change_mixed_with_protected_refs`,
 `enforce::require_rejects_a_protected_branch_pointing_at_a_non_commit`.
 
+Every matrix row is now ✅, ⚠️ (documented deviation), or ⛔ (out of v1 scope): the validation gate is
+green.
+
 ## Remaining before `require` is declared production-ready
 
 - ~~**8b** — parser fuzzing (row 13).~~ ✅ done.
-- **8c** — full real-`git push --signed` → gitana `receive_pack` e2e (row 3, full loop).
+- ~~**8c** — full real-`git push --signed` → gitana `receive_pack` e2e (row 3).~~ ✅ done (SHA-1).
 - **8d** — migration preflight + docs for moving an existing repo to `require`.
-- **8e** — flip the README/HLD status to production-ready once 8a–8c are green.
+- **8e** — flip the README/HLD status to production-ready (the matrix gate is now green).
