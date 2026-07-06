@@ -46,6 +46,19 @@ What works today:
   descriptors passed in by the host (no preopens, no ambient access).
   `crates/wasm/gitana-repo-host` embeds it under wasmtime; see
   `docs/hlds/wasi-component-porcelain.md` and `docs/hlds/wasi-http-transport.md`.
+- A trust and signing subsystem (`docs/hlds/secure-git-trust-signing.md`) that makes
+  protected-ref writes tamper-evident. Repository trust lives on a signed `refs/gitana/trust`
+  commit chain carrying a policy (`off` / `warn` / `require`) and the trusted SSH keys;
+  `gta trust init/list/add-key/remove-key/set-policy/sync` manage it — each update is re-verified
+  before the ref moves, and `sync` adopts a remote root forward-only (pinning the bootstrap signer
+  on first use). Clients sign with `ssh-keygen`: `gta commit -S`, `gta tag -s`, and
+  `gta push --signed` produce SSHSIG signatures in git's `git` namespace, interoperable with stock
+  git. Receive-pack enforces the policy before any ref moves — verifying the candidate trust-root
+  update, the push certificate (repo-bound nonce, pushee, exact commands), and a trusted signature
+  on every newly introduced commit and annotated tag — failing closed on a malformed root and
+  emitting typed audit events. `require` is validated end to end against stock `git push --signed`
+  (`docs/trust-validation-matrix.md`); migrate an existing repo onto it with the `--dry-run`
+  preflight (`docs/trust-migration.md`).
 
 Major gaps:
 
@@ -66,10 +79,8 @@ Major gaps:
   sparse-checkout support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
-- `gta push --signed` attaches a Git push certificate signed with `ssh-keygen`
-  (`--signing-key`, or git config `user.signingkey`, under `gpg.format=ssh`) — the
-  same SSHSIG format stock `git push --signed` sends and receive-pack verifies. A
-  signed delete (`--signed --delete`) still sends an unsigned delete.
+- Trust signing is SSHSIG-only (no OpenPGP yet), and a signed delete
+  (`gta push --signed --delete`) still sends an unsigned delete.
 - Remote transport currently supports HTTP(S) Smart HTTP remotes. Other Git URL
   schemes, such as SSH remotes, are not implemented.
 - Object storage now uses pack `.idx` and a multi-pack-index for lookup. `gta repack`
@@ -121,6 +132,11 @@ Implemented command groups:
   `remove`, `rename`, `set-url`). `fetch` honours the configured `remote.origin.fetch` refspecs —
   wildcard, exact, force (`+`), and negative (`^`) — mapping advertised refs to tracking refs and
   enforcing fast-forward for non-forced refspecs.
+- Trust and signing: `trust` (`init`, `list`, `add-key`, `remove-key`, `set-policy`, `sync`;
+  `init`/`set-policy` take `--dry-run` to preview a policy change). Commits and tags are signed with
+  `commit -S` / `tag -s`, or automatically via git config `commit.gpgsign` / `tag.gpgSign` (with
+  `user.signingkey` under `gpg.format=ssh`); a push is signed only when `push --signed` is passed —
+  no config signs pushes automatically.
 
 ## Crate layout
 

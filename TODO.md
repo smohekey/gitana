@@ -131,10 +131,15 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   with `warn`-mode warnings), and the `gta trust` porcelain ops return `(tip, AuditEvent)` for
   bootstrap/key add-remove/policy change, which the CLI prints to stderr (kept off gta-mcp's captured
   stdout result). No persistence in v1; a host records the events however it wishes.
-- [ ] Decide how much signature verification belongs in core crates versus host policy. (Provisionally:
-  `gitana-trust` owns pure verification; `gitana-git-http` orchestrates the receive-pack boundary;
-  `warn` mode + audit output landed in step 7; enabling `require` after the validation matrix is
-  step 8.)
+- [x] Decide how much signature verification belongs in core crates versus host policy, and enable
+  `require`. Settled: `gitana-trust` owns pure verification; `gitana-git-http` orchestrates the
+  receive-pack boundary; the host supplies the `TrustContext`. The full 8-step subsystem
+  (`docs/hlds/secure-git-trust-signing.md`) is implemented and `require` is production-ready — the
+  validation matrix is green (`docs/trust-validation-matrix.md`, including a real stock
+  `git push --signed` verified end to end), with a migration preflight + guide
+  (`docs/trust-migration.md`). Trust is opt-in per repository via the signed `refs/gitana/trust`
+  root. Additive follow-ups: OpenPGP, a one-time-nonce replay cache, a signed `--signed --delete`,
+  and a persisted require-time baseline.
 
 ## Working Tree Details
 

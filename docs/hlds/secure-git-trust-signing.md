@@ -1,5 +1,16 @@
 # Secure Git Trust And Signing Plan
 
+## Status
+
+**Implemented and production-ready.** All eight steps of the implementation order below have landed.
+`require` is enabled as a supported policy: the validation matrix is green (see
+`docs/trust-validation-matrix.md`), including a real stock `git push --signed` verified end to end
+through receive-pack. Trust is opt-in per repository via the signed `refs/gitana/trust` root — there
+is no global default to flip — so `gta trust init`/`set-policy` choose the policy, and
+`docs/trust-migration.md` covers moving an existing repository onto `require`. Remaining work is
+additive and out of the v1 scope below: OpenPGP signatures, a one-time-nonce replay cache, a signed
+`--signed --delete`, and a persisted require-time baseline.
+
 ## Context
 
 Gitana already has a SHA-256-native Git implementation with object codecs, refs, working-tree support,

@@ -33,12 +33,13 @@ trust anchor): `enforce::off_still_hard_rejects_trust_ref_deletion`,
 `enforce::require_rejects_a_protected_branch_pointing_at_a_non_commit`.
 
 Every matrix row is now ✅, ⚠️ (documented deviation), or ⛔ (out of v1 scope): the validation gate is
-green.
+green, and `require` is a supported, production-ready policy (see the HLD's Status section).
 
-## Remaining before `require` is declared production-ready
+## Step 8 completion
 
+- ~~**8a** — validation matrix gap-fill + this checklist.~~ ✅ done.
 - ~~**8b** — parser fuzzing (row 13).~~ ✅ done.
 - ~~**8c** — full real-`git push --signed` → gitana `receive_pack` e2e (row 3).~~ ✅ done (SHA-1).
 - ~~**8d** — migration preflight + docs for moving an existing repo to `require`.~~ ✅ done (`gta trust
   init/set-policy --dry-run`; `docs/trust-migration.md`).
-- **8e** — flip the README/HLD status to production-ready (the matrix gate is now green).
+- ~~**8e** — README/HLD status flipped to production-ready.~~ ✅ done.

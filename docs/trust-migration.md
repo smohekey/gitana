@@ -36,9 +36,11 @@ will demand of future pushes — so you can confirm the right keys are trusted b
 
 3. **Flip:** `gta trust set-policy require --signing-key <your-key>`.
 
-4. **Sign your work from now on:** `gta commit -S`, `gta tag -s`, and `gta push --signed` — or set the
-   git config conventions `user.signingkey` and `gpg.format=ssh` with `commit.gpgsign` / `tag.gpgSign`
-   so signing happens automatically.
+4. **Sign your work from now on.** Commits and tags are signed with `gta commit -S` / `gta tag -s`, or
+   automatically via the git config `commit.gpgsign` / `tag.gpgSign` (with `user.signingkey` under
+   `gpg.format=ssh`). A push is signed only when you pass `gta push --signed` — there is no config that
+   signs pushes automatically, so a plain `gta push` to a protected ref will be rejected under
+   `require`.
 
 ## Ease in with `warn` first
 
