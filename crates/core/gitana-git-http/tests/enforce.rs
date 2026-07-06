@@ -832,6 +832,36 @@ async fn require_rejects_protected_deletion_without_cert() {
 }
 
 #[tokio::test]
+async fn require_accepts_a_signed_protected_deletion() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	// A protected deletion carrying a valid certificate is authorised (the positive counterpart of the
+	// no-cert rejection above). A delete sends no objects, so there is no signed-object walk.
+	let old = commit_bytes(Some(&a), "x\n").0;
+	let cert = signed_cert(
+		&a,
+		vec![CertCommand {
+			old: old.to_hex(),
+			new: ZERO.to_owned(),
+			refname: "refs/heads/main".to_owned(),
+		}],
+		&fresh_nonce(),
+	);
+	let verdict = verify_push(
+		&repo,
+		&context(),
+		&[ref_delete("refs/heads/main", old)],
+		&HashMap::new(),
+		Some(&cert),
+		NOW,
+	)
+	.await
+	.expect("verify");
+	assert_eq!(verdict, TrustVerdict::Accept { warnings: vec![] });
+}
+
+#[tokio::test]
 async fn require_rejects_a_cert_signed_by_an_untrusted_key() {
 	let (a, b) = (key(1), key(2));
 	let repo = new_repo().await;
@@ -1092,6 +1122,67 @@ async fn wire_require_accepts_valid_signed_push_and_moves_ref() {
 			refs: vec!["refs/heads/main".to_owned()],
 			warnings: Vec::new(),
 		}]
+	);
+}
+
+#[tokio::test]
+async fn wire_require_applies_a_signed_delete_when_the_host_grants_deletes() {
+	let a = key(1);
+	let repo = new_repo().await;
+	install_root(&repo, &a, &[&a], "require").await;
+	// A protected branch exists (a signed commit).
+	let (commit, raw) = commit_bytes(Some(&a), "signed\n");
+	repo
+		.objects()
+		.write_object(ObjectKind::Commit, &raw)
+		.await
+		.expect("write commit");
+	repo
+		.objects()
+		.write_object(ObjectKind::Tree, &encode_tree::<Sha256>(&[]))
+		.await
+		.expect("write tree");
+	repo
+		.refs()
+		.update_ref("refs/heads/main", commit, None)
+		.await
+		.expect("set ref");
+
+	// A signed delete certificate for it (new value zeroed), carrying no pack.
+	let cert = signed_cert(
+		&a,
+		vec![CertCommand {
+			old: commit.to_hex(),
+			new: ZERO.to_owned(),
+			refname: "refs/heads/main".to_owned(),
+		}],
+		&fresh_nonce(),
+	);
+	let request = build_push_cert(&cert, "report-status object-format=sha256", &[]);
+
+	// Trust authorises *who* deletes; the host's delete grant (`force`, git's delete-refs capability)
+	// authorises deletes *at all* — orthogonal axes. With the grant, the signed, trusted delete lands.
+	let outcome = receive_pack(
+		&repo,
+		&request,
+		ReceiveOptions {
+			force: true,
+			trust: &context(),
+			now: NOW,
+		},
+	)
+	.await
+	.expect("receive");
+	let text = report_text(&outcome);
+	assert!(text.contains("ok refs/heads/main"), "{text}");
+	assert_eq!(
+		repo
+			.refs()
+			.resolve("refs/heads/main")
+			.await
+			.expect("resolve"),
+		None,
+		"the protected ref was deleted"
 	);
 }
 

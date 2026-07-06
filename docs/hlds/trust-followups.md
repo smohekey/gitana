@@ -7,7 +7,7 @@ without re-deriving the design.
 
 Suggested order (cheapest / highest-leverage first):
 
-1. [Signed `--signed --delete`](#1-signed-push---signed---delete) — closes a real `require` gap; small.
+1. ~~[Signed `--signed --delete`](#1-signed-push---signed---delete)~~ — **done.**
 2. [`trust sync` audit event](#5-trustrootadopted-audit-event-for-trust-sync) — completes the client
    audit vocabulary; small.
 3. [One-time-nonce replay cache](#2-one-time-nonce-replay-cache) — security hardening; medium.
@@ -22,7 +22,14 @@ the `gta`/`gta-mcp` surface-parity lock where a CLI surface changes.
 
 ## 1. Signed `push --signed --delete`
 
-**Also tracked as a checkbox in `TODO.md` (Signing And Integrity).**
+**✅ Done.** `push_signed` takes a `delete` target and sends a signed delete certificate via
+`delete_signed`; `build_cert` is now `old`/`new`-optional; the CLI routes `--signed --delete` through
+`push_signed`. Covered by a porcelain cert round-trip, an `enforce.rs` verify_push acceptance test, and
+a `receive_pack` wire test that applies the delete end to end. Note the two orthogonal authorization
+axes: signing authorises *who* deletes (trust), while the host's delete-refs grant (receive-pack's
+`force`) authorises deletes *at all* — a signed delete still needs the host to permit deletes, exactly
+as stock git's `receive.denyDeletes` is independent of signing. The scoped plan below is kept for
+reference.
 
 - **Goal.** A signed deletion of a protected ref. Today `--signed --delete` sends an *unsigned* delete
   (the delete path returns before the certificate is built), so under `require` a protected-ref deletion

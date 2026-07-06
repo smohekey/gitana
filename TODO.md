@@ -115,11 +115,12 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   `LazyCliSigner` (explicit-ssh policy, like `commit -S`), both invoked only after the server advertises
   push-cert. Covered by a porcelain round-trip (cert verifies via the real trust core) and a CLI e2e
   over the loopback smart-HTTP harness.
-- [ ] Sign delete commands in `gta push --signed --delete`. A signed delete currently sends an
-  *unsigned* delete (the delete path returns before certificate building), so under a `require` policy a
-  protected-ref deletion could not be authorised. Fold the delete command into a `push_signed`
-  certificate (one cert command, `<old> <zero> <ref>`) so a signed delete is possible. Scoped in
-  `docs/hlds/trust-followups.md#1-signed-push---signed---delete`.
+- [x] Sign delete commands in `gta push --signed --delete`. `push_signed` now takes a `delete` target
+  and, when set, sends a signed delete certificate (one command `<old> <zero> <ref>`) via the new
+  `delete_signed`, so a `require` server verifies and authorises the deletion instead of receiving an
+  unsigned delete. `build_cert` was generalised to `old`/`new` options (a `None` becomes the zero id);
+  the CLI routes `--signed --delete` through `push_signed`. Covered by a porcelain cert round-trip and
+  an `enforce.rs` verify_push acceptance test (complementing the no-cert rejection).
 - [ ] Emit a `trust sync` audit event. Add `AuditEvent::TrustRootAdopted { anchor }` and surface it from
   `trust_sync`, completing the client-side audit vocabulary (descoped from step 7b). Scoped in
   `docs/hlds/trust-followups.md#5-trustrootadopted-audit-event-for-trust-sync`.

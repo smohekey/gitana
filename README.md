@@ -79,8 +79,7 @@ Major gaps:
   sparse-checkout support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
-- Trust signing is SSHSIG-only (no OpenPGP yet), and a signed delete
-  (`gta push --signed --delete`) still sends an unsigned delete.
+- Trust signing is SSHSIG-only (no OpenPGP yet).
 - Remote transport currently supports HTTP(S) Smart HTTP remotes. Other Git URL
   schemes, such as SSH remotes, are not implemented.
 - Object storage now uses pack `.idx` and a multi-pack-index for lookup. `gta repack`

@@ -295,20 +295,27 @@ pub async fn push<F: FileStore, H: HashAlgorithm>(
 	})
 }
 
-/// Push `HEAD`'s branch to `origin` with a signed push certificate (`gta push --signed`). Otherwise
-/// like [`push`]. `pusher` resolves the certificate's pusher line and `signer` signs the certificate
-/// body — both invoked only after confirming the server offers push-cert, so an unconfigured identity
-/// or an unresolvable signing key does not mask "the server does not accept signed pushes".
+/// Push `HEAD`'s branch to `origin` with a signed push certificate (`gta push --signed`), or — with
+/// `delete` — remove a remote branch with a *signed* delete certificate (so a `require` server can
+/// authorise the deletion). Otherwise like [`push`]. `pusher` resolves the certificate's pusher line
+/// and `signer` signs the certificate body — both invoked only after confirming the server offers
+/// push-cert, so an unconfigured identity or an unresolvable signing key does not mask "the server
+/// does not accept signed pushes".
 pub async fn push_signed<F: FileStore, H: HashAlgorithm, S: Signer>(
 	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
 	origin: &Origin,
 	advertisement: &[u8],
 	force: bool,
+	delete: Option<String>,
 	pusher: impl AsyncFnOnce() -> Result<String>,
 	signer: &S,
 ) -> Result<PushOutcome> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
+
+	if let Some(target) = delete {
+		return delete_signed(transport, origin, &advertised, &target, pusher, signer).await;
+	}
 
 	let Some(plan) = prepare_branch_push(repo, &advertised, force).await? else {
 		return Ok(PushOutcome::UpToDate);
@@ -322,7 +329,7 @@ pub async fn push_signed<F: FileStore, H: HashAlgorithm, S: Signer>(
 		pusher().await?,
 		nonce,
 		plan.remote_old,
-		plan.local_tip,
+		Some(plan.local_tip),
 		&plan.branch,
 	);
 	// The signer emits an SSHSIG armor (git's `git` namespace) over the certificate body — exactly what
@@ -335,6 +342,35 @@ pub async fn push_signed<F: FileStore, H: HashAlgorithm, S: Signer>(
 		signed: true,
 		forced: force,
 	})
+}
+
+/// Send a *signed* delete-ref command for `target`: a push certificate whose single command zeroes
+/// the ref's new value, so a `require` server verifies *who* is deleting and authorises it (unlike the
+/// unsigned [`delete_ref`]). The server must additionally permit deletes at all — its delete-refs grant
+/// (receive-pack's `force`), an orthogonal axis to signing — for the command to apply. Like
+/// [`push_signed`], the nonce is required before the pusher or signer is touched, so a "server does not
+/// accept signed pushes" error is not masked.
+async fn delete_signed<H: HashAlgorithm, S: Signer>(
+	transport: &impl HttpTransport,
+	origin: &Origin,
+	advertised: &Advertised<H>,
+	target: &str,
+	pusher: impl AsyncFnOnce() -> Result<String>,
+	signer: &S,
+) -> Result<PushOutcome> {
+	let refname = normalize_branch(target);
+	let remote = advertised
+		.oid_of(&refname)
+		.with_context(|| format!("the remote has no {refname}"))?;
+	let nonce = advertised
+		.push_cert_nonce
+		.clone()
+		.context("the server does not accept signed pushes")?;
+	let mut cert = build_cert(origin, pusher().await?, nonce, Some(remote), None, &refname);
+	cert.signature = signer.sign(&cert.payload()).await?;
+	let request = build_push_cert(&cert, &push_caps::<H>(), &[]);
+	send_receive_pack(transport, origin, request).await?;
+	Ok(PushOutcome::Deleted { refname })
 }
 
 /// A planned branch push: the ref-update coordinates and the pack the remote lacks, shared by [`push`]
@@ -428,18 +464,20 @@ async fn send_receive_pack(
 	Ok(())
 }
 
-/// Build a push certificate for a single-branch update, with an empty `signature`: the caller signs
-/// [`PushCert::payload`] and fills it in. The payload (pusher, pushee, nonce, and command) is complete.
+/// Build a push certificate for a single ref command, with an empty `signature`: the caller signs
+/// [`PushCert::payload`] and fills it in. The payload (pusher, pushee, nonce, and command) is
+/// complete. `old`/`new` are the ref's before/after values — a `None` becomes the all-zero id, so a
+/// create is `old: None` and a delete is `new: None`.
 fn build_cert<H: HashAlgorithm>(
 	origin: &Origin,
 	pusher: String,
 	nonce: String,
-	remote_old: Option<ObjectId<H>>,
-	local_tip: ObjectId<H>,
-	branch: &str,
+	old: Option<ObjectId<H>>,
+	new: Option<ObjectId<H>>,
+	refname: &str,
 ) -> PushCert {
-	// The "no previous value" oid for a create is the all-zero id at the hash's width.
 	let zero = "0".repeat(H::RAW_LEN * 2);
+	let hex = |id: Option<ObjectId<H>>| id.map_or_else(|| zero.clone(), |oid| oid.to_hex());
 	PushCert {
 		version: "0.1".to_owned(),
 		pusher,
@@ -447,9 +485,9 @@ fn build_cert<H: HashAlgorithm>(
 		nonce,
 		push_options: Vec::new(),
 		commands: vec![CertCommand {
-			old: remote_old.map_or(zero, |oid| oid.to_hex()),
-			new: local_tip.to_hex(),
-			refname: branch.to_owned(),
+			old: hex(old),
+			new: hex(new),
+			refname: refname.to_owned(),
 		}],
 		signature: String::new(),
 	}
@@ -542,6 +580,7 @@ mod tests {
 			&origin,
 			&advertisement,
 			false,
+			None,
 			async || Ok("Dev <dev@x.test> 1700000000 +0000".to_owned()),
 			&signer,
 		)
@@ -570,6 +609,77 @@ mod tests {
 		)
 		.unwrap();
 		assert_eq!(signer_id, key.id());
+	}
+
+	/// A signed delete attaches a certificate whose single command zeroes the ref's new value and whose
+	/// signature the trust core accepts — so a `require` server can authorise the deletion. This is the
+	/// client half of `gta push --signed --delete`.
+	#[tokio::test]
+	async fn push_signed_delete_attaches_a_verifiable_certificate() {
+		// A server that offers push-cert and has `refs/heads/main` to delete.
+		let (_server_dir, server) = fixture().await;
+		let blob = server.repository().write_blob(b"srv\n").await.unwrap();
+		let mut index = Index::new();
+		stage(&mut index, "f.txt", blob);
+		server.save_index(&index).await.unwrap();
+		let server_tip = crate::commit(&server, "srv", &TestIdentity::default())
+			.await
+			.unwrap();
+		let nonce = make_nonce(b"secret", "acme/app", 1_700_000_000, b"\x01\x02\x03\x04");
+		let advertisement = advertise(
+			server.repository(),
+			Service::ReceivePack,
+			ProtocolVersion::V0,
+			Some(&nonce),
+		)
+		.await
+		.unwrap();
+
+		// The client repo is irrelevant to a delete (no objects are sent); any repo satisfies the type.
+		let (_dir, wt) = fixture().await;
+		let origin = Origin::parse("http://host/acme/app").unwrap();
+		let signer = TestSigner::new(7);
+		let public_line = signer.public_line();
+		let transport = CapturingTransport {
+			posted: RefCell::new(None),
+		};
+
+		let outcome = push_signed(
+			&transport,
+			wt.repository(),
+			&origin,
+			&advertisement,
+			false,
+			Some("main".to_owned()),
+			async || Ok("Dev <dev@x.test> 1700000000 +0000".to_owned()),
+			&signer,
+		)
+		.await
+		.unwrap();
+		let PushOutcome::Deleted { refname } = outcome else {
+			panic!("expected a signed delete outcome");
+		};
+		assert_eq!(refname, "refs/heads/main");
+
+		// The posted request is a push certificate whose command deletes the ref (new = zero, old = tip).
+		let request = transport.posted.into_inner().expect("a request was POSTed");
+		let cert = peek_push_cert(&request).expect("a signed push-cert request");
+		assert_eq!(cert.nonce, nonce);
+		assert_eq!(cert.commands.len(), 1);
+		assert_eq!(cert.commands[0].refname, "refs/heads/main");
+		assert_eq!(cert.commands[0].old, server_tip.to_hex());
+		assert_eq!(cert.commands[0].new, "0".repeat(64));
+
+		// Its signature verifies over the exact payload in git's `git` namespace under the signing key —
+		// so a receive-pack server that trusts this key authorises the deletion.
+		let key = TrustedKey::from_openssh(&public_line).unwrap();
+		verify_sshsig(
+			&cert.payload(),
+			cert.signature.as_bytes(),
+			std::slice::from_ref(&key),
+			"git",
+		)
+		.unwrap();
 	}
 
 	/// When the server does not advertise a nonce (push-cert unsupported), a signed push fails before
@@ -606,6 +716,7 @@ mod tests {
 			&origin,
 			&advertisement,
 			false,
+			None,
 			async || panic!("pusher resolved despite no push-cert support"),
 			&crate::test_support::FailingSigner,
 		)

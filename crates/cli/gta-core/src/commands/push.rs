@@ -81,9 +81,9 @@ async fn push_into<H: HashAlgorithm>(
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
 	// A signed push certificate is signed like an explicit `commit -S`: an unset `gpg.format` is
 	// assumed `ssh` (rather than rejected as config-driven signing is), and the key is resolved lazily
-	// so a "server does not accept signed pushes" error is not masked by a missing signing key. A
-	// signed delete is not distinct on the wire here, so `--signed --delete` sends an unsigned delete.
-	let outcome = if signed && delete.is_none() {
+	// so a "server does not accept signed pushes" error is not masked by a missing signing key.
+	// `--signed --delete` attaches a signed delete certificate, so a `require` server can authorise it.
+	let outcome = if signed {
 		let signer = LazyCliSigner::new(&repository, signing_key, cwd.to_path_buf(), false);
 		gitana_porcelain::push_signed(
 			http,
@@ -91,6 +91,7 @@ async fn push_into<H: HashAlgorithm>(
 			origin,
 			body,
 			force,
+			delete,
 			async || pusher_ident(&repository).await,
 			&signer,
 		)
