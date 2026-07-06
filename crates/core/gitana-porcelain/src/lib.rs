@@ -29,7 +29,8 @@ pub use rebase::{RebaseOutcome, abort_rebase, continue_rebase, rebase, skip_reba
 pub use remote::{FetchOutcome, PushOutcome, clone, fetch, pull_upstream, push};
 pub use revert::{RevertOutcome, abort_revert, continue_revert, revert};
 pub use trust::{
-	TRUST_REF, trust_add_key, trust_init, trust_list, trust_remove_key, trust_set_policy,
+	TRUST_REF, TrustSyncOutcome, trust_add_key, trust_init, trust_list, trust_remove_key,
+	trust_set_policy, trust_sync,
 };
 
 /// Resolves the git identity lines (`Name <email> seconds ±hhmm`) for operations that record commits.

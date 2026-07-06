@@ -423,6 +423,8 @@ enum TrustAction {
 		#[arg(long = "break-glass")]
 		break_glass: bool,
 	},
+	/// Adopt the origin's trust root into the local `refs/gitana/trust` (forward-only, verified).
+	Sync,
 }
 
 /// A `remote` sub-command. Absent means "list the remotes".
@@ -627,6 +629,7 @@ fn trust_action(action: TrustAction) -> commands::trust::Action {
 			signing_key,
 			break_glass,
 		},
+		TrustAction::Sync => Action::Sync,
 	}
 }
 

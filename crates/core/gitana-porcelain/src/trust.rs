@@ -7,7 +7,9 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use gitana_file_store::FileStore;
+use gitana_git_http::parse_advertisement;
 use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit};
+use gitana_remote::{HttpTransport, Origin};
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 use gitana_trust::{
 	Policy, TRUST_DOCUMENT_PATH, TrustDocument, TrustRoot, TrustedKey, fold_trust_root,
@@ -83,6 +85,81 @@ pub async fn trust_list<F: FileStore, H: HashAlgorithm>(
 		None => Ok(None),
 		Some(tip) => Ok(Some(fold_trust_root(repo, tip).await?)),
 	}
+}
+
+/// The outcome of a [`trust_sync`].
+#[derive(Debug)]
+pub enum TrustSyncOutcome<H: HashAlgorithm> {
+	/// The remote does not publish `refs/gitana/trust`; there was nothing to sync.
+	RemoteUnset,
+	/// Local trust already contains the remote tip — the refs are equal, or the local chain is ahead
+	/// of the remote. Nothing moved.
+	UpToDate,
+	/// Adopted the remote root: the local `refs/gitana/trust` moved `old` → `new` (a bootstrap when
+	/// `old` is `None`).
+	Updated {
+		old: Option<ObjectId<H>>,
+		new: ObjectId<H>,
+	},
+}
+
+/// Adopt the remote's `refs/gitana/trust` into the local ref, **forward-only and only if it
+/// verifies**. `advertisement` is the already-fetched `git-upload-pack` `GET /info/refs` body (the
+/// CLI adapter does the HTTP, keeping this network-free like the other remote composites).
+///
+/// The remote tip is verified as a candidate update over the *local* tip through the same
+/// [`verify_candidate_trust_update`] the server enforces with: the remote chain must fold cleanly
+/// (self-signed bootstrap, every link signed by the prior root) and, when local trust already
+/// exists, must fast-forward it (the local tip is an ancestor of the remote tip). An invalid or
+/// divergent remote root is refused and the local ref never moves. A remote tip the local chain
+/// already contains (equal, or local-ahead) is a no-op. Only the remote trust chain's objects are
+/// downloaded, not the whole advertisement.
+pub async fn trust_sync<F: FileStore, H: HashAlgorithm>(
+	transport: &impl HttpTransport,
+	repo: &Repository<F, H>,
+	origin: &Origin,
+	advertisement: &[u8],
+	identity: &impl Identity,
+) -> Result<TrustSyncOutcome<H>> {
+	let advertised = parse_advertisement::<H>(advertisement)?;
+	let Some(remote_tip) = advertised.oid_of(TRUST_REF) else {
+		return Ok(TrustSyncOutcome::RemoteUnset);
+	};
+	let local_tip = repo.refs().resolve(TRUST_REF).await?;
+	if local_tip == Some(remote_tip) {
+		return Ok(TrustSyncOutcome::UpToDate);
+	}
+
+	// Download only the remote trust chain's objects (the tip and its ancestors we lack) so the
+	// candidate can be folded and verified locally.
+	let haves = gitana_remote::local_haves(repo).await?;
+	gitana_remote::fetch_pack(transport, origin, repo, &[remote_tip], &haves).await?;
+
+	// If the local chain already contains the remote tip, we are ahead of the remote: keep the richer
+	// local root rather than "rewinding" to it. (`verify_candidate_trust_update` only proves the
+	// other direction — local fast-forwards to remote — so this case is handled first.)
+	if let Some(local) = local_tip
+		&& repo.is_ancestor(remote_tip, local).await?
+	{
+		return Ok(TrustSyncOutcome::UpToDate);
+	}
+
+	// Prove the remote root before adopting it: it must fold cleanly and (when local trust exists)
+	// fast-forward the local tip. A divergent chain fails here and the ref stays put.
+	verify_candidate_trust_update(repo, local_tip, remote_tip).await?;
+	repo
+		.refs()
+		.update_ref(TRUST_REF, remote_tip, local_tip)
+		.await?;
+	let committer = identity.committer_or_default().await;
+	repo
+		.refs()
+		.append_reflog(TRUST_REF, local_tip, remote_tip, &committer, "trust: sync")
+		.await?;
+	Ok(TrustSyncOutcome::Updated {
+		old: local_tip,
+		new: remote_tip,
+	})
 }
 
 /// Enrol `key_line` (an OpenSSH public-key line) in the trust root, signing the update with `signer`
@@ -319,12 +396,285 @@ fn selector_fingerprint(selector: &str) -> Result<String> {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+	use std::path::{Path, PathBuf};
+
 	use gitana_file_store_local::LocalFileStore;
+	use gitana_git_http::{ProtocolVersion, Service, advertise, upload_pack_v0};
 	use gitana_object::Sha256;
+	use gitana_object_store::ObjectStore;
 	use gitana_trust::TrustedKey;
 
 	use super::*;
-	use crate::test_support::{TestIdentity, TestSigner, fixture};
+	use crate::test_support::{TestIdentity, TestSigner, fixture, open_dir};
+
+	/// An [`HttpTransport`] that serves a "server" repository's own `git-upload-pack` handlers
+	/// in-process (advertisement + pack), so `trust_sync` can be exercised end to end without a socket.
+	/// It reopens the repo per call (like the real server), so trust updates made between calls show up.
+	struct ServerTransport {
+		git_dir: PathBuf,
+	}
+
+	impl ServerTransport {
+		fn open(&self) -> Repository<LocalFileStore, Sha256> {
+			Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+				open_dir(&self.git_dir),
+			)))
+		}
+	}
+
+	impl HttpTransport for ServerTransport {
+		async fn get(&self, _url: &str) -> Result<Vec<u8>> {
+			Ok(advertise(&self.open(), Service::UploadPack, ProtocolVersion::V0, None).await?)
+		}
+
+		async fn post(&self, _url: &str, _content_type: &str, body: Vec<u8>) -> Result<Vec<u8>> {
+			Ok(upload_pack_v0(&self.open(), &body).await?)
+		}
+	}
+
+	/// A bare-ish server repo (initialised, no work tree) at a fresh temp dir, returning its git dir so
+	/// a [`ServerTransport`] can reopen it, plus the repo handle to author trust commits through.
+	async fn server() -> (
+		tempfile::TempDir,
+		PathBuf,
+		Repository<LocalFileStore, Sha256>,
+	) {
+		let dir = tempfile::TempDir::new().unwrap();
+		let git_dir = dir.path().join("srv.git");
+		std::fs::create_dir_all(&git_dir).unwrap();
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			open_dir(&git_dir),
+		)));
+		repo.init().await.unwrap();
+		(dir, git_dir, repo)
+	}
+
+	/// The advertisement a [`ServerTransport`] would serve for `git_dir`.
+	async fn advertisement(git_dir: &Path) -> Vec<u8> {
+		let transport = ServerTransport {
+			git_dir: git_dir.to_path_buf(),
+		};
+		transport.get("").await.unwrap()
+	}
+
+	/// A dummy origin — the [`ServerTransport`] ignores the URL and routes by handler.
+	fn origin() -> Origin {
+		Origin::parse("http://test.invalid/repo.git").unwrap()
+	}
+
+	#[tokio::test]
+	async fn sync_adopts_a_verifying_remote_root_when_local_has_none() {
+		let (_srv_dir, git_dir, server_repo) = server().await;
+		let (_dir, wt) = fixture().await;
+		let client = wt.repository();
+		let signer = TestSigner::new(1);
+
+		// The server bootstraps a signed trust root; the client has none.
+		let server_tip = trust_init(
+			&server_repo,
+			Policy::Warn,
+			&signer.public_line(),
+			false,
+			&TestIdentity::default(),
+			&signer,
+		)
+		.await
+		.unwrap();
+
+		let transport = ServerTransport {
+			git_dir: git_dir.clone(),
+		};
+		let outcome = trust_sync(
+			&transport,
+			client,
+			&origin(),
+			&advertisement(&git_dir).await,
+			&TestIdentity::default(),
+		)
+		.await
+		.unwrap();
+
+		match outcome {
+			TrustSyncOutcome::Updated { old: None, new } => assert_eq!(new, server_tip),
+			_ => panic!("expected a bootstrap adoption"),
+		}
+		// The local ref now points at the server tip and folds back to the enrolled root.
+		assert_eq!(
+			client.refs().resolve(TRUST_REF).await.unwrap(),
+			Some(server_tip)
+		);
+		let root = trust_list(client).await.unwrap().unwrap();
+		assert_eq!(root.policy, Policy::Warn);
+		assert_eq!(root.keys.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn sync_fast_forwards_local_trust() {
+		let (_srv_dir, git_dir, server_repo) = server().await;
+		let (_dir, wt) = fixture().await;
+		let client = wt.repository();
+		let (admin, colleague) = (TestSigner::new(1), TestSigner::new(2));
+
+		trust_init(
+			&server_repo,
+			Policy::Warn,
+			&admin.public_line(),
+			false,
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+
+		let transport = ServerTransport {
+			git_dir: git_dir.clone(),
+		};
+		// First sync: adopt the bootstrap.
+		trust_sync(
+			&transport,
+			client,
+			&origin(),
+			&advertisement(&git_dir).await,
+			&TestIdentity::default(),
+		)
+		.await
+		.unwrap();
+
+		// The server enrols a second key (extending the chain), then the client syncs again.
+		let server_tip = trust_add_key(
+			&server_repo,
+			&colleague.public_line(),
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+		let outcome = trust_sync(
+			&transport,
+			client,
+			&origin(),
+			&advertisement(&git_dir).await,
+			&TestIdentity::default(),
+		)
+		.await
+		.unwrap();
+
+		match outcome {
+			TrustSyncOutcome::Updated { old: Some(_), new } => assert_eq!(new, server_tip),
+			_ => panic!("expected a fast-forward update"),
+		}
+		assert_eq!(trust_list(client).await.unwrap().unwrap().keys.len(), 2);
+	}
+
+	#[tokio::test]
+	async fn sync_refuses_a_divergent_remote_root_and_leaves_the_local_ref() {
+		let (_srv_dir, git_dir, server_repo) = server().await;
+		let (_dir, wt) = fixture().await;
+		let client = wt.repository();
+		let (mine, theirs) = (TestSigner::new(1), TestSigner::new(2));
+
+		// The client and server bootstrap *independent* roots (no shared history).
+		let local_tip = trust_init(
+			client,
+			Policy::Warn,
+			&mine.public_line(),
+			false,
+			&TestIdentity::default(),
+			&mine,
+		)
+		.await
+		.unwrap();
+		trust_init(
+			&server_repo,
+			Policy::Warn,
+			&theirs.public_line(),
+			false,
+			&TestIdentity::default(),
+			&theirs,
+		)
+		.await
+		.unwrap();
+
+		let transport = ServerTransport {
+			git_dir: git_dir.clone(),
+		};
+		let err = trust_sync(
+			&transport,
+			client,
+			&origin(),
+			&advertisement(&git_dir).await,
+			&TestIdentity::default(),
+		)
+		.await
+		.unwrap_err();
+		assert!(err.to_string().contains("does not descend"), "{err}");
+		// The divergent remote root was refused: the local ref never moved.
+		assert_eq!(
+			client.refs().resolve(TRUST_REF).await.unwrap(),
+			Some(local_tip)
+		);
+	}
+
+	#[tokio::test]
+	async fn sync_is_a_noop_when_already_up_to_date() {
+		let (_srv_dir, git_dir, server_repo) = server().await;
+		let (_dir, wt) = fixture().await;
+		let client = wt.repository();
+		let signer = TestSigner::new(1);
+		trust_init(
+			&server_repo,
+			Policy::Warn,
+			&signer.public_line(),
+			false,
+			&TestIdentity::default(),
+			&signer,
+		)
+		.await
+		.unwrap();
+
+		let transport = ServerTransport {
+			git_dir: git_dir.clone(),
+		};
+		trust_sync(
+			&transport,
+			client,
+			&origin(),
+			&advertisement(&git_dir).await,
+			&TestIdentity::default(),
+		)
+		.await
+		.unwrap();
+		// A second sync with no server movement is a no-op.
+		let outcome = trust_sync(
+			&transport,
+			client,
+			&origin(),
+			&advertisement(&git_dir).await,
+			&TestIdentity::default(),
+		)
+		.await
+		.unwrap();
+		assert!(matches!(outcome, TrustSyncOutcome::UpToDate));
+	}
+
+	#[tokio::test]
+	async fn sync_reports_a_remote_without_a_trust_root() {
+		let (_srv_dir, git_dir, _server_repo) = server().await;
+		let (_dir, wt) = fixture().await;
+		let transport = ServerTransport {
+			git_dir: git_dir.clone(),
+		};
+		let outcome = trust_sync(
+			&transport,
+			wt.repository(),
+			&origin(),
+			&advertisement(&git_dir).await,
+			&TestIdentity::default(),
+		)
+		.await
+		.unwrap();
+		assert!(matches!(outcome, TrustSyncOutcome::RemoteUnset));
+	}
 
 	#[tokio::test]
 	async fn list_is_none_before_init() {
