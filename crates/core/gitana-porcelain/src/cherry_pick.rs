@@ -7,8 +7,8 @@ use gitana_object::{Commit, HashAlgorithm, ObjectId, parse_commit};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
 
-use crate::Identity;
 use crate::conflict;
+use crate::{Identity, Signer, signing};
 
 /// The result of starting a [`cherry_pick`].
 #[derive(Debug)]
@@ -24,10 +24,11 @@ pub enum PickOutcome<H: HashAlgorithm> {
 ///
 /// Re-applies the change `commit_spec` introduced — a three-way merge of its parent, `HEAD`, and the
 /// commit — as a new single-parent commit preserving the picked author.
-pub async fn cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+pub async fn cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	wt: &WorkTree<F, W, H>,
 	commit_spec: &str,
 	identity: &impl Identity,
+	signer: Option<&S>,
 ) -> Result<PickOutcome<H>> {
 	let repository = wt.repository();
 
@@ -49,16 +50,16 @@ pub async fn cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		);
 	}
 
-	// The current tip is the new commit's single parent. Detached HEAD is rejected up front (the
-	// completing `commit_on_head` is symbolic-only, like `gta commit`) so a clean pick cannot mutate
-	// the work tree and then fail; an unborn branch has no parent to pick onto.
-	let head = match repository.refs().read_head().await? {
-		HeadState::Symbolic(branch) => repository.refs().resolve(&branch).await?,
+	// The current tip is the new commit's single parent. Detached HEAD is rejected up front (recording
+	// the commit is symbolic-only, like `gta commit`) so a clean pick cannot mutate the work tree and
+	// then fail; an unborn branch has no parent to pick onto.
+	let branch = match repository.refs().read_head().await? {
+		HeadState::Symbolic(branch) => branch,
 		HeadState::Detached(_) => {
 			bail!("cannot cherry-pick onto a detached HEAD (not yet supported)")
 		}
 	};
-	let Some(head) = head else {
+	let Some(head) = repository.refs().resolve(&branch).await? else {
 		bail!("cannot cherry-pick onto an unborn branch");
 	};
 	let head_tree = repository.commit_tree(head).await?;
@@ -103,12 +104,23 @@ pub async fn cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	}
 
 	// A clean pick: resolve identity only now — a conflict above materialises without it, as git does.
-	// Then materialise the tree first: a checkout that would clobber a touched local change fails before
-	// any commit.
+	// Build (and, when configured, sign) the commit *before* the checkout: signing can fail, and the
+	// object write is inert until a ref names it, so a failure leaves the work tree untouched. Then
+	// materialise (a clobbering checkout fails here, before the ref moves) and advance the branch.
 	let committer = identity.committer().await?;
+	let new_commit = signing::seal_commit(
+		repository,
+		merge.tree,
+		vec![head],
+		&picked.author,
+		&committer,
+		&message,
+		signer,
+	)
+	.await?;
 	wt.checkout(merge.tree, false).await?;
-	let new_commit = repository
-		.commit_on_head(merge.tree, &picked.author, &committer, &message)
+	repository
+		.record_commit(&branch, Some(head), new_commit, &committer, &message)
 		.await?;
 	Ok(PickOutcome::Picked { commit: new_commit })
 }
@@ -117,10 +129,11 @@ pub async fn cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 /// the picked commit's author, returning the new commit id. Shared by `cherry-pick --continue`
 /// (`message_override = None`, uses `MERGE_MSG`) and `gta commit` during a cherry-pick. Refuses while
 /// the index has unmerged stages.
-pub async fn continue_cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+pub async fn continue_cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	wt: &WorkTree<F, W, H>,
 	message_override: Option<String>,
 	identity: &impl Identity,
+	signer: Option<&S>,
 ) -> Result<ObjectId<H>> {
 	let repository = wt.repository();
 	let Some(pick) = repository.cherry_pick_head().await? else {
@@ -146,9 +159,15 @@ pub async fn continue_cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	};
 	let message = conflict::ensure_trailing_newline(message);
 
-	let new_commit = repository
-		.commit_on_head(tree, &picked.author, &committer, &message)
-		.await?;
+	let new_commit = signing::commit_on_head(
+		repository,
+		tree,
+		&picked.author,
+		&committer,
+		&message,
+		signer,
+	)
+	.await?;
 	repository.clear_cherry_pick().await?;
 	Ok(new_commit)
 }
@@ -182,7 +201,9 @@ mod tests {
 	use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 
 	use super::*;
-	use crate::test_support::{FailingIdentity, TestIdentity, commit_file, fixture, loose_commit};
+	use crate::test_support::{
+		FailingIdentity, TestIdentity, TestSigner, commit_file, fixture, loose_commit,
+	};
 
 	/// The author line recorded on `commit`.
 	async fn author_of(
@@ -215,7 +236,9 @@ mod tests {
 			.await
 			.unwrap();
 
-		let outcome = cherry_pick(&wt, &pick.to_hex(), &id).await.unwrap();
+		let outcome = cherry_pick(&wt, &pick.to_hex(), &id, None::<&TestSigner>)
+			.await
+			.unwrap();
 		let PickOutcome::Picked { commit } = outcome else {
 			panic!("expected a clean pick");
 		};
@@ -237,7 +260,9 @@ mod tests {
 		let _ours = commit_file(dir.path(), &wt, "f.txt", b"ours\n", &id).await;
 		let pick = loose_commit(wt.repository(), vec![a], "f.txt", b"theirs\n").await;
 
-		let outcome = cherry_pick(&wt, &pick.to_hex(), &id).await.unwrap();
+		let outcome = cherry_pick(&wt, &pick.to_hex(), &id, None::<&TestSigner>)
+			.await
+			.unwrap();
 		let PickOutcome::Conflict { paths } = outcome else {
 			panic!("expected a conflict");
 		};
@@ -259,7 +284,7 @@ mod tests {
 
 		// A conflict records CHERRY_PICK_HEAD without recording a commit, so it must not require a
 		// configured identity — git materialises the conflict regardless.
-		let outcome = cherry_pick(&wt, &pick.to_hex(), &FailingIdentity)
+		let outcome = cherry_pick(&wt, &pick.to_hex(), &FailingIdentity, None::<&TestSigner>)
 			.await
 			.unwrap();
 		assert!(matches!(outcome, PickOutcome::Conflict { .. }));
@@ -277,7 +302,9 @@ mod tests {
 		// A no-op commit relative to its parent: picking it changes nothing.
 		let pick = loose_commit(wt.repository(), vec![a], "f.txt", b"v1\n").await;
 
-		let err = cherry_pick(&wt, &pick.to_hex(), &id).await.unwrap_err();
+		let err = cherry_pick(&wt, &pick.to_hex(), &id, None::<&TestSigner>)
+			.await
+			.unwrap_err();
 		assert!(err.to_string().contains("empty"), "{err}");
 	}
 }

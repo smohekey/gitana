@@ -113,6 +113,15 @@ enum Command {
 		/// Commit message.
 		#[arg(short = 'm', long = "message")]
 		message: String,
+		/// Sign the commit with SSH (default: git config `commit.gpgsign`).
+		#[arg(short = 'S', long = "gpg-sign")]
+		sign: bool,
+		/// Do not sign, overriding `commit.gpgsign`.
+		#[arg(long = "no-gpg-sign", conflicts_with = "sign")]
+		no_sign: bool,
+		/// SSH key to sign with (default: git config `user.signingkey`).
+		#[arg(long = "signing-key", value_name = "path")]
+		signing_key: Option<PathBuf>,
 	},
 	/// Merge a commit into the current branch (fast-forward or a true merge commit).
 	Merge {
@@ -487,7 +496,12 @@ impl Cli {
 			}
 			Command::Add { pathspecs } => commands::add::run(&cwd, &pathspecs).await,
 			Command::Status => commands::status::run(&cwd).await,
-			Command::Commit { message } => commands::commit::run(&cwd, &message).await,
+			Command::Commit {
+				message,
+				sign,
+				no_sign,
+				signing_key,
+			} => commands::commit::run(&cwd, &message, sign, no_sign, signing_key).await,
 			Command::Merge {
 				commit,
 				message,

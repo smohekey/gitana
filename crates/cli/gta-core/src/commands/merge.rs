@@ -9,6 +9,7 @@ use gitana_worktree::WorkTree;
 use crate::commands::conflict;
 use crate::dispatch::{self, WorkTreeCommand};
 use crate::identity::CliIdentity;
+use crate::signer;
 
 /// Merge `commit` into the current branch, or carry an in-progress merge to its end.
 ///
@@ -38,6 +39,7 @@ pub async fn run(
 			ff_only,
 			abort,
 			continue_,
+			cwd: cwd.to_path_buf(),
 		},
 	)
 	.await
@@ -50,6 +52,8 @@ struct Merge {
 	ff_only: bool,
 	abort: bool,
 	continue_: bool,
+	/// The effective working directory, for resolving a relative `user.signingkey` (`-C`).
+	cwd: std::path::PathBuf,
 }
 
 impl WorkTreeCommand for Merge {
@@ -62,8 +66,10 @@ impl WorkTreeCommand for Merge {
 			return gitana_porcelain::abort_merge(&wt).await;
 		}
 		let identity = CliIdentity::new(wt.repository());
+		// The merge commit is signed when git config requests it (`commit.gpgsign` + `gpg.format=ssh`).
+		let signer = signer::config_signer(wt.repository(), &self.cwd).await?;
 		if self.continue_ {
-			let commit = gitana_porcelain::continue_merge(&wt, None, &identity).await?;
+			let commit = gitana_porcelain::continue_merge(&wt, None, &identity, signer.as_ref()).await?;
 			println!("{commit}");
 			return Ok(());
 		}
@@ -78,6 +84,7 @@ impl WorkTreeCommand for Merge {
 			self.no_ff,
 			self.ff_only,
 			&identity,
+			signer.as_ref(),
 		)
 		.await?;
 		render(outcome)

@@ -175,6 +175,54 @@ where
 		)
 	}
 
+	/// The branch `HEAD` points at and its current tip (`None` on an unborn branch) — the starting
+	/// point for recording a commit on `HEAD`. Errors on a detached `HEAD` (not yet supported), so a
+	/// caller need not repeat that guard. Used by [`Self::commit_on_head`] and by the signed-commit
+	/// path, which must resolve the parent to build the object before its id is known.
+	pub async fn head_branch_tip(&self) -> Result<(String, Option<ObjectId<H>>), RepositoryError> {
+		let refs = self.refs();
+		let target = match refs.read_head().await? {
+			HeadState::Symbolic(target) => target,
+			HeadState::Detached(_) => {
+				return Err(RepositoryError::Unsupported(
+					"commit on detached HEAD".to_owned(),
+				));
+			}
+		};
+		let parent = refs.resolve(&target).await?;
+		Ok((target, parent))
+	}
+
+	/// Record an already-written `commit` (built on `parent`, from [`Self::head_branch_tip`]) as the
+	/// new tip of branch `target`: advance it via CAS and append `commit`/`commit (initial)` reflog
+	/// entries to the branch and `HEAD`. The ref half of [`Self::commit_on_head`], split out so the
+	/// signed-commit path — which builds and signs the object first — reuses the identical logic.
+	pub async fn record_commit(
+		&self,
+		target: &str,
+		parent: Option<ObjectId<H>>,
+		commit: ObjectId<H>,
+		committer: &str,
+		message: &str,
+	) -> Result<(), RepositoryError> {
+		let refs = self.refs();
+		refs.update_ref(target, commit, parent).await?;
+
+		let subject = message.lines().next().unwrap_or("");
+		let reflog = if parent.is_none() {
+			format!("commit (initial): {subject}")
+		} else {
+			format!("commit: {subject}")
+		};
+		refs
+			.append_reflog(target, parent, commit, committer, &reflog)
+			.await?;
+		refs
+			.append_reflog("HEAD", parent, commit, committer, &reflog)
+			.await?;
+		Ok(())
+	}
+
 	/// Create a commit on the branch `HEAD` points at, advancing the branch via CAS
 	/// and appending reflog entries to the branch and `HEAD`. Returns the commit id.
 	/// Detached HEAD is not yet supported.
@@ -185,79 +233,40 @@ where
 		committer: &str,
 		message: &str,
 	) -> Result<ObjectId<H>, RepositoryError> {
-		let refs = self.refs();
-		let target = match refs.read_head().await? {
-			HeadState::Symbolic(target) => target,
-			HeadState::Detached(_) => {
-				return Err(RepositoryError::Unsupported(
-					"commit on detached HEAD".to_owned(),
-				));
-			}
-		};
-
-		let parent = refs.resolve(&target).await?;
+		let (target, parent) = self.head_branch_tip().await?;
 		let parents = parent.map(|p| vec![p]).unwrap_or_default();
 		let commit = self
 			.create_commit(tree, parents, author, committer, message)
 			.await?;
-		refs.update_ref(&target, commit, parent).await?;
-
-		let subject = message.lines().next().unwrap_or("");
-		let reflog = if parent.is_none() {
-			format!("commit (initial): {subject}")
-		} else {
-			format!("commit: {subject}")
-		};
-		refs
-			.append_reflog(&target, parent, commit, committer, &reflog)
-			.await?;
-		refs
-			.append_reflog("HEAD", parent, commit, committer, &reflog)
+		self
+			.record_commit(&target, parent, commit, committer, message)
 			.await?;
 		Ok(commit)
 	}
 
-	/// Create a two-parent merge commit on the branch `HEAD` points at — first parent the current
-	/// tip, second `merge_head` — advancing the branch via CAS with `commit (merge):` reflog
-	/// entries. Like [`Self::commit_on_head`] but for concluding a merge; detached HEAD and an
-	/// unborn branch are not supported.
-	pub async fn commit_merge(
+	/// Record an already-written two-parent merge `commit` (built on `parent`, from
+	/// [`Self::head_branch_tip`]) as the new tip of branch `target`: advance it via CAS and append
+	/// `commit (merge):` reflog entries to the branch and `HEAD`. Like [`Self::record_commit`] but for
+	/// concluding a merge — the porcelain builds the (optionally signed) merge commit, then calls this.
+	pub async fn record_merge_commit(
 		&self,
-		tree: ObjectId<H>,
-		merge_head: ObjectId<H>,
-		author: &str,
+		target: &str,
+		parent: ObjectId<H>,
+		commit: ObjectId<H>,
 		committer: &str,
 		message: &str,
-	) -> Result<ObjectId<H>, RepositoryError> {
+	) -> Result<(), RepositoryError> {
 		let refs = self.refs();
-		let target = match refs.read_head().await? {
-			HeadState::Symbolic(target) => target,
-			HeadState::Detached(_) => {
-				return Err(RepositoryError::Unsupported(
-					"merge commit on detached HEAD".to_owned(),
-				));
-			}
-		};
-		let Some(parent) = refs.resolve(&target).await? else {
-			return Err(RepositoryError::Unsupported(
-				"merge commit on an unborn branch".to_owned(),
-			));
-		};
-
-		let commit = self
-			.create_commit(tree, vec![parent, merge_head], author, committer, message)
-			.await?;
-		refs.update_ref(&target, commit, Some(parent)).await?;
-
+		refs.update_ref(target, commit, Some(parent)).await?;
 		let subject = message.lines().next().unwrap_or("");
 		let reflog = format!("commit (merge): {subject}");
 		refs
-			.append_reflog(&target, Some(parent), commit, committer, &reflog)
+			.append_reflog(target, Some(parent), commit, committer, &reflog)
 			.await?;
 		refs
 			.append_reflog("HEAD", Some(parent), commit, committer, &reflog)
 			.await?;
-		Ok(commit)
+		Ok(())
 	}
 
 	/// Move the current branch (or detached `HEAD`) to `commit` via CAS, recording the previous

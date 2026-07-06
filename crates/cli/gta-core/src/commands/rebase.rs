@@ -10,6 +10,7 @@ use gitana_worktree::WorkTree;
 
 use crate::dispatch::{self, WorkTreeCommand};
 use crate::identity::CliIdentity;
+use crate::signer;
 
 /// Rebase the current branch onto `upstream` (or `--onto <newbase>`), or carry an in-progress rebase
 /// to its end.
@@ -38,6 +39,7 @@ pub async fn run(
 			abort,
 			continue_,
 			skip,
+			cwd: cwd.to_path_buf(),
 		},
 	)
 	.await
@@ -49,6 +51,8 @@ struct Rebase {
 	abort: bool,
 	continue_: bool,
 	skip: bool,
+	/// The effective working directory, for resolving a relative `user.signingkey` (`-C`).
+	cwd: std::path::PathBuf,
 }
 
 impl WorkTreeCommand for Rebase {
@@ -61,12 +65,14 @@ impl WorkTreeCommand for Rebase {
 		if self.abort {
 			return gitana_porcelain::abort_rebase(&wt, &identity).await;
 		}
+		// Each replayed commit is signed when git config requests it (`commit.gpgsign` + `gpg.format=ssh`).
+		let signer = signer::config_signer(wt.repository(), &self.cwd).await?;
 		let outcome = if self.continue_ {
-			gitana_porcelain::continue_rebase(&wt, &identity).await?
+			gitana_porcelain::continue_rebase(&wt, &identity, signer.as_ref()).await?
 		} else if self.skip {
-			gitana_porcelain::skip_rebase(&wt, &identity).await?
+			gitana_porcelain::skip_rebase(&wt, &identity, signer.as_ref()).await?
 		} else {
-			gitana_porcelain::rebase(&wt, self.upstream, self.onto, &identity).await?
+			gitana_porcelain::rebase(&wt, self.upstream, self.onto, &identity, signer.as_ref()).await?
 		};
 		render(outcome)
 	}

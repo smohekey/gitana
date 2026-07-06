@@ -25,6 +25,8 @@ pub enum CommitError {
 	NothingToCommit,
 	/// Resolving the author/committer identity failed.
 	Identity(anyhow::Error),
+	/// Signing the commit failed (`gta commit -S`) — the signer (e.g. `ssh-keygen`) errored.
+	Signing(anyhow::Error),
 	/// Reading the index failed.
 	Index(WorktreeError),
 	/// A repository operation failed — writing the tree, reading `HEAD`, or writing the commit.
@@ -41,6 +43,7 @@ impl fmt::Display for CommitError {
 			CommitError::Empty => f.write_str("nothing to commit (empty index)"),
 			CommitError::NothingToCommit => f.write_str("nothing to commit, working tree clean"),
 			CommitError::Identity(error) => write!(f, "{error:#}"),
+			CommitError::Signing(error) => write!(f, "{error:#}"),
 			CommitError::Index(error) => write!(f, "{error}"),
 			CommitError::Repository(error) => write!(f, "{error}"),
 		}

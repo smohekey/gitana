@@ -18,10 +18,11 @@ mod prune;
 mod rebase;
 mod remote;
 mod revert;
+mod signing;
 mod trust;
 
 pub use cherry_pick::{PickOutcome, abort_cherry_pick, cherry_pick, continue_cherry_pick};
-pub use commit::commit;
+pub use commit::{commit, commit_signed};
 pub use commit_error::CommitError;
 pub use merge::{MergeOutcome, abort_merge, continue_merge, merge};
 pub use prune::{gc, prune};
@@ -109,6 +110,16 @@ pub(crate) mod test_support {
 					.trim_end()
 					.to_owned(),
 			)
+		}
+	}
+
+	/// A [`Signer`] whose `sign` always fails — models a signing failure (bad `gpg.format`, missing
+	/// key, `ssh-keygen` error) for asserting a history operation leaves recoverable state.
+	pub(crate) struct FailingSigner;
+
+	impl Signer for FailingSigner {
+		async fn sign(&self, _payload: &[u8]) -> Result<String> {
+			anyhow::bail!("signing failed")
 		}
 	}
 

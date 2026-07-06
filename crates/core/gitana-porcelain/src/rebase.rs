@@ -9,8 +9,8 @@ use gitana_object::{Commit, HashAlgorithm, ObjectId, parse_commit};
 use gitana_repository::{HeadState, RebaseState, Repository};
 use gitana_worktree::WorkTree;
 
-use crate::Identity;
 use crate::conflict;
+use crate::{Identity, Signer, signing};
 
 /// The result of starting a [`rebase`] or resuming one ([`continue_rebase`] / [`skip_rebase`]). In
 /// each variant `branch` is the full ref name (`refs/heads/<name>`); the adapter shortens it.
@@ -37,11 +37,12 @@ pub enum RebaseOutcome<H: HashAlgorithm> {
 /// Replays the branch's commits that are not in `upstream`, oldest-first, as fresh cherry-picks. A
 /// merge commit in the range is refused (linear histories only); commits that become empty are
 /// dropped, while originally-empty commits are kept.
-pub async fn rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+pub async fn rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	wt: &WorkTree<F, W, H>,
 	upstream: Option<String>,
 	onto: Option<String>,
 	identity: &impl Identity,
+	signer: Option<&S>,
 ) -> Result<RebaseOutcome<H>> {
 	let repository = wt.repository();
 	if let Some(op) = conflict::operation_in_progress(repository).await? {
@@ -124,20 +125,21 @@ pub async fn rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		repository.clear_rebase().await.ok();
 		return Err(error);
 	}
-	replay(wt, identity).await
+	replay(wt, identity, signer).await
 }
 
 /// Conclude the stopped step (commit the resolved index, preserving the commit's author), then resume.
-pub async fn continue_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+pub async fn continue_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	wt: &WorkTree<F, W, H>,
 	identity: &impl Identity,
+	signer: Option<&S>,
 ) -> Result<RebaseOutcome<H>> {
 	let repository = wt.repository();
 	let Some(state) = repository.rebase_state().await? else {
 		bail!("no rebase in progress");
 	};
 	let Some(&current) = state.todo.first() else {
-		return replay(wt, identity).await; // nothing pending; let replay finish/clean up
+		return replay(wt, identity, signer).await; // nothing pending; let replay finish/clean up
 	};
 
 	let tree = conflict::resolved_tree(wt).await?; // refuses while the index has conflicts
@@ -152,28 +154,35 @@ pub async fn continue_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	let commit = read_commit(repository, current).await?;
 	let committer = identity.committer().await?;
 	let message = conflict::ensure_trailing_newline(commit.message.clone());
-	repository
-		.commit_on_head(tree, &commit.author, &committer, &message)
-		.await?;
+	signing::commit_on_head(
+		repository,
+		tree,
+		&commit.author,
+		&committer,
+		&message,
+		signer,
+	)
+	.await?;
 	advance_todo(repository, state.todo).await?;
-	replay(wt, identity).await
+	replay(wt, identity, signer).await
 }
 
 /// Drop the stopped commit and resume.
-pub async fn skip_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+pub async fn skip_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	wt: &WorkTree<F, W, H>,
 	identity: &impl Identity,
+	signer: Option<&S>,
 ) -> Result<RebaseOutcome<H>> {
 	let repository = wt.repository();
 	let Some(state) = repository.rebase_state().await? else {
 		bail!("no rebase in progress");
 	};
 	if state.todo.is_empty() {
-		return replay(wt, identity).await;
+		return replay(wt, identity, signer).await;
 	}
 	conflict::restore_to_head(wt).await?; // discard the conflicted work tree / index
 	advance_todo(repository, state.todo).await?;
-	replay(wt, identity).await
+	replay(wt, identity, signer).await
 }
 
 /// Abort the rebase: restore the branch and work tree to the pre-rebase tip.
@@ -196,9 +205,10 @@ pub async fn abort_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 }
 
 /// Replay the remaining commits from the persisted state until one conflicts or the list is empty.
-async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	wt: &WorkTree<F, W, H>,
 	identity: &impl Identity,
+	signer: Option<&S>,
 ) -> Result<RebaseOutcome<H>> {
 	let repository = wt.repository();
 	let Some(state) = repository.rebase_state().await? else {
@@ -225,9 +235,15 @@ async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			if base_tree == commit.tree {
 				let committer = identity.committer().await?;
 				let message = conflict::ensure_trailing_newline(commit.message.clone());
-				repository
-					.commit_on_head(head_tree, &commit.author, &committer, &message)
-					.await?;
+				signing::commit_on_head(
+					repository,
+					head_tree,
+					&commit.author,
+					&committer,
+					&message,
+					signer,
+				)
+				.await?;
 			}
 			todo.remove(0);
 			repository.set_rebase_todo(&todo).await?;
@@ -256,9 +272,15 @@ async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		wt.checkout(merge.tree, false).await?;
 		let committer = identity.committer().await?;
 		let message = conflict::ensure_trailing_newline(commit.message.clone());
-		repository
-			.commit_on_head(merge.tree, &commit.author, &committer, &message)
-			.await?;
+		signing::commit_on_head(
+			repository,
+			merge.tree,
+			&commit.author,
+			&committer,
+			&message,
+			signer,
+		)
+		.await?;
 		todo.remove(0);
 		repository.set_rebase_todo(&todo).await?;
 	}
@@ -347,7 +369,7 @@ mod tests {
 	use gitana_object::{ObjectId, Sha256};
 
 	use super::*;
-	use crate::test_support::{TestIdentity, commit_file, fixture, loose_commit};
+	use crate::test_support::{TestIdentity, TestSigner, commit_file, fixture, loose_commit};
 
 	/// Point `refs/heads/upstream` at `tip`.
 	async fn set_upstream(
@@ -368,9 +390,15 @@ mod tests {
 		let a = commit_file(dir.path(), &wt, "f.txt", b"a\n", &id).await;
 		set_upstream(&wt, a).await; // upstream == the branch tip
 
-		let outcome = rebase(&wt, Some("upstream".to_owned()), None, &id)
-			.await
-			.unwrap();
+		let outcome = rebase(
+			&wt,
+			Some("upstream".to_owned()),
+			None,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap();
 		assert!(matches!(outcome, RebaseOutcome::UpToDate { .. }));
 	}
 
@@ -383,9 +411,15 @@ mod tests {
 		let u = loose_commit(wt.repository(), vec![a], "u.txt", b"u\n").await;
 		set_upstream(&wt, u).await;
 
-		let outcome = rebase(&wt, Some("upstream".to_owned()), None, &id)
-			.await
-			.unwrap();
+		let outcome = rebase(
+			&wt,
+			Some("upstream".to_owned()),
+			None,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap();
 		assert!(matches!(outcome, RebaseOutcome::FastForwarded { onto, .. } if onto == u));
 		assert_eq!(
 			wt.repository()
@@ -407,9 +441,15 @@ mod tests {
 		// A commit of the branch's own, diverging from `a` on a different path (clean to replay).
 		let b = commit_file(dir.path(), &wt, "g.txt", b"b\n", &id).await;
 
-		let outcome = rebase(&wt, Some("upstream".to_owned()), None, &id)
-			.await
-			.unwrap();
+		let outcome = rebase(
+			&wt,
+			Some("upstream".to_owned()),
+			None,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap();
 		assert!(matches!(outcome, RebaseOutcome::Rebased { .. }));
 		let repo = wt.repository();
 		let tip = repo
@@ -433,9 +473,15 @@ mod tests {
 		set_upstream(&wt, u).await;
 		let b = commit_file(dir.path(), &wt, "f.txt", b"mine\n", &id).await;
 
-		let outcome = rebase(&wt, Some("upstream".to_owned()), None, &id)
-			.await
-			.unwrap();
+		let outcome = rebase(
+			&wt,
+			Some("upstream".to_owned()),
+			None,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap();
 		let RebaseOutcome::Conflict {
 			commit,
 			subject,

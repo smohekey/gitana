@@ -77,7 +77,11 @@ fn commit_error(error: gitana_porcelain::CommitError) -> RepoError {
 	match error {
 		CommitError::Index(error) => worktree_error(error),
 		CommitError::Repository(error) => repo_error(error),
-		CommitError::Identity(error) => RepoError::Invalid(format!("{error:#}")),
+		// The component's `commit` op never signs, so `Signing` cannot arise here; map it like
+		// `Identity` (an opaque signer failure) to keep the match total.
+		CommitError::Identity(error) | CommitError::Signing(error) => {
+			RepoError::Invalid(format!("{error:#}"))
+		}
 		refusal @ (CommitError::Unmerged | CommitError::Empty | CommitError::NothingToCommit) => {
 			RepoError::Invalid(refusal.to_string())
 		}

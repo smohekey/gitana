@@ -7,8 +7,8 @@ use gitana_object::{Commit, HashAlgorithm, ObjectId, parse_commit};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
 
-use crate::Identity;
 use crate::conflict;
+use crate::{Identity, Signer, signing};
 
 /// The result of starting a [`revert`].
 #[derive(Debug)]
@@ -24,10 +24,11 @@ pub enum RevertOutcome<H: HashAlgorithm> {
 ///
 /// Records a new single-parent commit that undoes the change `commit_spec` introduced — a three-way
 /// merge of the commit, `HEAD`, and the commit's parent — authored by the current user.
-pub async fn revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+pub async fn revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	wt: &WorkTree<F, W, H>,
 	commit_spec: &str,
 	identity: &impl Identity,
+	signer: Option<&S>,
 ) -> Result<RevertOutcome<H>> {
 	let repository = wt.repository();
 
@@ -49,13 +50,13 @@ pub async fn revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		);
 	}
 
-	// Detached HEAD is rejected up front (the completing `commit_on_head` is symbolic-only) so a clean
-	// revert cannot mutate the work tree and then fail; an unborn branch has nothing to revert.
-	let head = match repository.refs().read_head().await? {
-		HeadState::Symbolic(branch) => repository.refs().resolve(&branch).await?,
+	// Detached HEAD is rejected up front (recording the commit is symbolic-only) so a clean revert
+	// cannot mutate the work tree and then fail; an unborn branch has nothing to revert.
+	let branch = match repository.refs().read_head().await? {
+		HeadState::Symbolic(branch) => branch,
 		HeadState::Detached(_) => bail!("cannot revert onto a detached HEAD (not yet supported)"),
 	};
-	let Some(head) = head else {
+	let Some(head) = repository.refs().resolve(&branch).await? else {
 		bail!("cannot revert onto an unborn branch");
 	};
 	let head_tree = repository.commit_tree(head).await?;
@@ -101,13 +102,24 @@ pub async fn revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	}
 
 	// A clean revert: resolve identity only now — a conflict above materialises without it, as git does.
-	// Then materialise the tree first: a checkout that would clobber a touched local change fails before
-	// any commit.
+	// Build (and, when configured, sign) the commit *before* the checkout: signing can fail, and the
+	// object write is inert until a ref names it, so a failure leaves the work tree untouched. Then
+	// materialise (a clobbering checkout fails here, before the ref moves) and advance the branch.
 	let author = identity.author().await?;
 	let committer = identity.committer().await?;
+	let new_commit = signing::seal_commit(
+		repository,
+		merge.tree,
+		vec![head],
+		&author,
+		&committer,
+		&message,
+		signer,
+	)
+	.await?;
 	wt.checkout(merge.tree, false).await?;
-	let new_commit = repository
-		.commit_on_head(merge.tree, &author, &committer, &message)
+	repository
+		.record_commit(&branch, Some(head), new_commit, &committer, &message)
 		.await?;
 	Ok(RevertOutcome::Reverted { commit: new_commit })
 }
@@ -115,10 +127,11 @@ pub async fn revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 /// Conclude an in-progress revert: a single-parent commit from the resolved index, authored by the
 /// current user, returning the new commit id. Shared by `revert --continue` (`message_override = None`,
 /// uses `MERGE_MSG`) and `gta commit` during a revert. Refuses while the index has unmerged stages.
-pub async fn continue_revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+pub async fn continue_revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	wt: &WorkTree<F, W, H>,
 	message_override: Option<String>,
 	identity: &impl Identity,
+	signer: Option<&S>,
 ) -> Result<ObjectId<H>> {
 	let repository = wt.repository();
 	if repository.revert_head().await?.is_none() {
@@ -141,9 +154,8 @@ pub async fn continue_revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	};
 	let message = conflict::ensure_trailing_newline(message);
 
-	let new_commit = repository
-		.commit_on_head(tree, &author, &committer, &message)
-		.await?;
+	let new_commit =
+		signing::commit_on_head(repository, tree, &author, &committer, &message, signer).await?;
 	repository.clear_revert().await?;
 	Ok(new_commit)
 }
@@ -180,7 +192,7 @@ async fn read_commit<F: FileStore, H: HashAlgorithm>(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use super::*;
-	use crate::test_support::{FailingIdentity, TestIdentity, commit_file, fixture};
+	use crate::test_support::{FailingIdentity, TestIdentity, TestSigner, commit_file, fixture};
 
 	#[tokio::test]
 	async fn reverts_the_head_commit() {
@@ -189,7 +201,9 @@ mod tests {
 		commit_file(dir.path(), &wt, "f.txt", b"v1\n", &id).await;
 		let b = commit_file(dir.path(), &wt, "f.txt", b"v2\n", &id).await;
 
-		let outcome = revert(&wt, &b.to_hex(), &id).await.unwrap();
+		let outcome = revert(&wt, &b.to_hex(), &id, None::<&TestSigner>)
+			.await
+			.unwrap();
 		let RevertOutcome::Reverted { commit } = outcome else {
 			panic!("expected a clean revert");
 		};
@@ -213,7 +227,9 @@ mod tests {
 		// HEAD moves on past `b`, touching the same path → reverting `b` cannot apply cleanly.
 		commit_file(dir.path(), &wt, "f.txt", b"current\n", &id).await;
 
-		let outcome = revert(&wt, &b.to_hex(), &id).await.unwrap();
+		let outcome = revert(&wt, &b.to_hex(), &id, None::<&TestSigner>)
+			.await
+			.unwrap();
 		let RevertOutcome::Conflict { paths } = outcome else {
 			panic!("expected a conflict");
 		};
@@ -232,7 +248,9 @@ mod tests {
 
 		// A conflict records REVERT_HEAD without recording a commit, so it must not require a configured
 		// identity — git materialises the conflict regardless.
-		let outcome = revert(&wt, &b.to_hex(), &FailingIdentity).await.unwrap();
+		let outcome = revert(&wt, &b.to_hex(), &FailingIdentity, None::<&TestSigner>)
+			.await
+			.unwrap();
 		assert!(matches!(outcome, RevertOutcome::Conflict { .. }));
 		assert_eq!(wt.repository().revert_head().await.unwrap(), Some(b));
 	}

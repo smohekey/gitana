@@ -13,6 +13,7 @@ use crate::commands::merge;
 use crate::dispatch;
 use crate::identity::CliIdentity;
 use crate::repo;
+use crate::signer;
 
 /// Pull `HEAD`'s branch from the origin.
 pub async fn run(cwd: &Path) -> Result<()> {
@@ -25,8 +26,8 @@ pub async fn run(cwd: &Path) -> Result<()> {
 	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
 
 	match local {
-		HashKind::Sha1 => pull_into::<Sha1>(&http, &origin, &found, &body).await,
-		HashKind::Sha256 => pull_into::<Sha256>(&http, &origin, &found, &body).await,
+		HashKind::Sha1 => pull_into::<Sha1>(&http, &origin, &found, &body, cwd).await,
+		HashKind::Sha256 => pull_into::<Sha256>(&http, &origin, &found, &body, cwd).await,
 	}
 }
 
@@ -38,6 +39,7 @@ async fn pull_into<H: HashAlgorithm>(
 	origin: &Origin,
 	found: &repo::Discovered,
 	body: &[u8],
+	cwd: &Path,
 ) -> Result<()> {
 	let work = found
 		.work
@@ -72,6 +74,8 @@ async fn pull_into<H: HashAlgorithm>(
 	let message = format!("Merge branch '{short}' of {}", origin.url);
 
 	let identity = CliIdentity::new(worktree.repository());
+	// A pull's merge commit is signed when git config requests it, like a plain `gta merge`.
+	let signer = signer::config_signer(worktree.repository(), cwd).await?;
 	let outcome = gitana_porcelain::merge(
 		&worktree,
 		&upstream.to_hex(),
@@ -79,6 +83,7 @@ async fn pull_into<H: HashAlgorithm>(
 		false,
 		false,
 		&identity,
+		signer.as_ref(),
 	)
 	.await?;
 	merge::render(outcome)

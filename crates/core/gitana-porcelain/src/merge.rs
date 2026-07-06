@@ -3,15 +3,15 @@
 //! CLI adapter renders; a conflict materialises in-progress state and reports its paths as data
 //! rather than printing.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
 
-use crate::Identity;
 use crate::conflict;
+use crate::{Identity, Signer, signing};
 
 /// The result of starting a [`merge`].
 #[derive(Debug)]
@@ -36,13 +36,14 @@ pub enum MergeOutcome<H: HashAlgorithm> {
 /// Fast-forwards when the current tip is an ancestor of `commit_spec` (unless `no_ff`), otherwise
 /// records a true two-parent merge; `ff_only` refuses a non-fast-forward. Identity is resolved only
 /// once a commit will actually be made.
-pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	wt: &WorkTree<F, W, H>,
 	commit_spec: &str,
 	message: Option<String>,
 	no_ff: bool,
 	ff_only: bool,
 	identity: &impl Identity,
+	signer: Option<&S>,
 ) -> Result<MergeOutcome<H>> {
 	if no_ff && ff_only {
 		bail!("--no-ff and --ff-only are incompatible");
@@ -169,18 +170,22 @@ pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	let author = identity.author().await?;
 	let committer = identity.committer().await?;
 
-	// Materialise the result first: a checkout that would clobber a touched local change fails here,
-	// before any commit is created or the ref is moved.
+	// Build (and, when configured, sign) the merge commit *before* touching the work tree: signing can
+	// fail (bad `gpg.format`, missing key, `ssh-keygen` error), and writing the object has no
+	// observable effect until a ref points at it — so a failure here leaves the work tree untouched
+	// rather than materialised-but-uncommitted. Then materialise the result (a checkout that would
+	// clobber a touched local change fails here, before the ref moves) and advance the branch.
+	let merge_commit = signing::seal_commit(
+		repository,
+		merged_tree,
+		vec![head, theirs],
+		&author,
+		&committer,
+		&message,
+		signer,
+	)
+	.await?;
 	wt.checkout(merged_tree, false).await?;
-	let merge_commit = repository
-		.create_commit(
-			merged_tree,
-			vec![head, theirs],
-			&author,
-			&committer,
-			&message,
-		)
-		.await?;
 	repository
 		.reset_head(
 			merge_commit,
@@ -197,10 +202,11 @@ pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 /// commit id. Shared by `merge --continue` (`message_override = None`, uses `MERGE_MSG`) and
 /// `gta commit` during a merge (`message_override = Some(..)`). Refuses while the index still has
 /// unmerged stages — checked before identity is resolved.
-pub async fn continue_merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+pub async fn continue_merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	wt: &WorkTree<F, W, H>,
 	message_override: Option<String>,
 	identity: &impl Identity,
+	signer: Option<&S>,
 ) -> Result<ObjectId<H>> {
 	let repository = wt.repository();
 	let Some(merge_head) = repository.merge_head().await? else {
@@ -219,8 +225,22 @@ pub async fn continue_merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	};
 	let message = conflict::ensure_trailing_newline(message);
 
-	let commit = repository
-		.commit_merge(tree, merge_head, &author, &committer, &message)
+	// Build the (optionally signed) two-parent commit, then move the ref with the `commit (merge):`
+	// reflog. A merge in progress implies the branch has a tip.
+	let (target, parent) = repository.head_branch_tip().await?;
+	let parent = parent.context("a merge is in progress but the branch is unborn")?;
+	let commit = signing::seal_commit(
+		repository,
+		tree,
+		vec![parent, merge_head],
+		&author,
+		&committer,
+		&message,
+		signer,
+	)
+	.await?;
+	repository
+		.record_merge_commit(&target, parent, commit, &committer, &message)
 		.await?;
 	repository.clear_merge().await?;
 	Ok(commit)
@@ -327,7 +347,44 @@ async fn virtual_base_tree<F: FileStore, H: HashAlgorithm>(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use super::*;
-	use crate::test_support::{TestIdentity, commit_file, fixture, loose_commit};
+	use crate::test_support::{
+		FailingSigner, TestIdentity, TestSigner, commit_file, fixture, loose_commit,
+	};
+
+	#[tokio::test]
+	async fn a_failed_signature_leaves_a_clean_merge_recoverable() {
+		let (dir, wt) = fixture().await;
+		let id = TestIdentity::default();
+		let a = commit_file(dir.path(), &wt, "f.txt", b"base\n", &id).await;
+		let ours = commit_file(dir.path(), &wt, "ours.txt", b"ours\n", &id).await;
+		let theirs = loose_commit(wt.repository(), vec![a], "theirs.txt", b"theirs\n").await;
+
+		// A true merge that would succeed, but signing fails: the object write happens before the
+		// checkout, so the branch stays at `ours` and the work tree/index are untouched — not left
+		// materialised-but-uncommitted with no way to continue or abort.
+		let err = merge(
+			&wt,
+			&theirs.to_hex(),
+			None,
+			false,
+			false,
+			&id,
+			Some(&FailingSigner),
+		)
+		.await
+		.unwrap_err();
+		assert!(err.to_string().contains("signing failed"), "{err}");
+		let repo = wt.repository();
+		assert_eq!(
+			repo.refs().resolve("refs/heads/main").await.unwrap(),
+			Some(ours),
+			"the branch must not move on a failed signed merge"
+		);
+		assert_eq!(repo.merge_head().await.unwrap(), None);
+		// The index still matches HEAD (the clean pre-merge state), so the tree was not materialised.
+		let head_tree = repo.commit_tree(ours).await.unwrap();
+		assert_eq!(conflict::index_tree(&wt).await.unwrap(), head_tree);
+	}
 
 	#[tokio::test]
 	async fn already_up_to_date_when_target_is_reachable() {
@@ -335,9 +392,17 @@ mod tests {
 		let id = TestIdentity::default();
 		let a = commit_file(dir.path(), &wt, "f.txt", b"a\n", &id).await;
 
-		let outcome = merge(&wt, &a.to_hex(), None, false, false, &id)
-			.await
-			.unwrap();
+		let outcome = merge(
+			&wt,
+			&a.to_hex(),
+			None,
+			false,
+			false,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap();
 		assert!(matches!(outcome, MergeOutcome::AlreadyUpToDate));
 	}
 
@@ -349,9 +414,17 @@ mod tests {
 		// A descendant of the current tip, off-branch: merging it fast-forwards.
 		let b = loose_commit(wt.repository(), vec![a], "f.txt", b"b\n").await;
 
-		let outcome = merge(&wt, &b.to_hex(), None, false, false, &id)
-			.await
-			.unwrap();
+		let outcome = merge(
+			&wt,
+			&b.to_hex(),
+			None,
+			false,
+			false,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap();
 		assert!(
 			matches!(outcome, MergeOutcome::FastForward { from, to } if from == Some(a) && to == b)
 		);
@@ -374,9 +447,17 @@ mod tests {
 		let ours = commit_file(dir.path(), &wt, "ours.txt", b"ours\n", &id).await;
 		let theirs = loose_commit(wt.repository(), vec![a], "theirs.txt", b"theirs\n").await;
 
-		let outcome = merge(&wt, &theirs.to_hex(), None, false, false, &id)
-			.await
-			.unwrap();
+		let outcome = merge(
+			&wt,
+			&theirs.to_hex(),
+			None,
+			false,
+			false,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap();
 		let MergeOutcome::Made { commit } = outcome else {
 			panic!("expected a merge commit");
 		};
@@ -399,9 +480,17 @@ mod tests {
 		let _ours = commit_file(dir.path(), &wt, "f.txt", b"ours\n", &id).await;
 		let theirs = loose_commit(wt.repository(), vec![a], "f.txt", b"theirs\n").await;
 
-		let outcome = merge(&wt, &theirs.to_hex(), None, false, false, &id)
-			.await
-			.unwrap();
+		let outcome = merge(
+			&wt,
+			&theirs.to_hex(),
+			None,
+			false,
+			false,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap();
 		let MergeOutcome::Conflict { paths } = outcome else {
 			panic!("expected a conflict");
 		};
