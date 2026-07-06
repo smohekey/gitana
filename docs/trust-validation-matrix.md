@@ -24,7 +24,7 @@ remains.
 | 10 | Unsigned commit inside a signed push is rejected under `require` | ✅ | `enforce::require_rejects_unsigned_commit_and_missing_cert`, `enforce::require_rejects_moving_a_protected_ref_to_an_unsigned_stored_commit`, `enforce::wire_require_partial_reject_applies_good_ref_and_ngs_bad` |
 | 11 | Unsigned annotated tag inside a signed push is rejected under `require` | ✅ | `enforce::require_rejects_an_unsigned_annotated_protected_tag` (annotated tag object, no signature); `enforce::require_rejects_a_lightweight_protected_tag` (lightweight); `enforce::require_accepts_a_signed_annotated_protected_tag` (positive) |
 | 12 | Local `trust sync` does not adopt invalid remote roots | ✅ | `gitana-porcelain` `trust::sync_refuses_a_divergent_remote_root_and_leaves_the_local_ref`, `trust::sync_bootstrap_confirm_error_propagates_and_leaves_the_ref_unset`, `trust::sync_declining_a_bootstrap_leaves_the_ref_unset` |
-| 13 | Fuzz pkt-line, push-cert, commit/tag signature, and trust-root JSON parsing | 🔜 | slice 8b (`proptest` in-tree: no-panic on arbitrary bytes + round-trip stability) |
+| 13 | Fuzz pkt-line, push-cert, commit/tag signature, and trust-root JSON parsing | ✅ | `proptest` in-tree (no-panic on arbitrary bytes + round-trip on the valid subset): `gitana-object` `tests/parser_fuzz.rs` (pkt-line, commit/tag parse + signature split), `gitana-trust` `tests/json_fuzz.rs` (trust root + document JSON), `gitana-git-http` `push_cert::fuzz` (cert parse + mutation fuzz) |
 
 Supporting hard-invariant coverage (enforced regardless of policy, so `warn`/`off` cannot poison the
 trust anchor): `enforce::off_still_hard_rejects_trust_ref_deletion`,
@@ -34,7 +34,7 @@ trust anchor): `enforce::off_still_hard_rejects_trust_ref_deletion`,
 
 ## Remaining before `require` is declared production-ready
 
-- **8b** — parser fuzzing (row 13).
+- ~~**8b** — parser fuzzing (row 13).~~ ✅ done.
 - **8c** — full real-`git push --signed` → gitana `receive_pack` e2e (row 3, full loop).
 - **8d** — migration preflight + docs for moving an existing repo to `require`.
 - **8e** — flip the README/HLD status to production-ready once 8a–8c are green.

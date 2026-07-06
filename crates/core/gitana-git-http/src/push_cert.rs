@@ -335,3 +335,54 @@ fn trim_lf(data: &[u8]) -> &[u8] {
 fn malformed(message: &str) -> GitHttpError {
 	GitHttpError::MalformedRequest(message.to_owned())
 }
+
+/// Fuzz tests for the push-certificate parser (`docs/hlds/secure-git-trust-signing.md`, step 8
+/// validation plan): a hostile client controls these bytes, so parsing must never panic — only
+/// `Err`. `parse`/`is_push_cert` are crate-internal, so this lives here rather than in `tests/`. A
+/// real build→parse round-trip is covered by `tests/push_cert.rs`.
+#[cfg(test)]
+mod fuzz {
+	use proptest::prelude::*;
+
+	use super::{CertCommand, PushCert, build, is_push_cert, parse};
+
+	/// A minimal well-formed push-cert request, for mutation fuzzing.
+	fn base_request() -> Vec<u8> {
+		let cert = PushCert {
+			version: "0.1".to_owned(),
+			pusher: "A U Thor <a@example.com> 0 +0000".to_owned(),
+			pushee: "http://host/repo".to_owned(),
+			nonce: "1700000000-abcd".to_owned(),
+			push_options: Vec::new(),
+			commands: vec![CertCommand {
+				old: "0".repeat(64),
+				new: "1".repeat(64),
+				refname: "refs/heads/main".to_owned(),
+			}],
+			signature: "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----".to_owned(),
+		};
+		build(&cert, "report-status", b"PACK\x00\x00\x00\x02")
+	}
+
+	proptest! {
+		/// Neither the push-cert detector nor the parser may panic on arbitrary bytes.
+		#[test]
+		fn parse_and_detect_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..800)) {
+			let _ = is_push_cert(&bytes);
+			let _ = parse(&bytes);
+		}
+
+		/// Splicing random bytes into a real request drives corrupted input through the body and
+		/// command parser (not just the shallow reject); it must still only ever `Err`.
+		#[test]
+		fn parse_never_panics_on_a_mutated_cert(
+			splice in proptest::collection::vec(any::<u8>(), 0..64),
+			at in any::<proptest::sample::Index>(),
+		) {
+			let mut request = base_request();
+			let index = at.index(request.len() + 1);
+			request.splice(index..index, splice);
+			let _ = parse(&request);
+		}
+	}
+}

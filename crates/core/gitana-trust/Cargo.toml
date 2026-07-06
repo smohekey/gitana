@@ -19,4 +19,5 @@ ssh-key = { workspace = true, features = ["crypto"] }
 thiserror.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
