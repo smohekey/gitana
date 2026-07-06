@@ -195,16 +195,19 @@ impl RepoCommand for Trust {
 				let policy = parse_policy(&policy)?;
 				let signer = CliSigner::resolve(&repo, signing_key, &self.cwd).await?;
 				let pubkey = signer.public_line().await?;
-				let tip = trust_init(&repo, policy, &pubkey, break_glass, &identity, &signer).await?;
+				let (tip, event) =
+					trust_init(&repo, policy, &pubkey, break_glass, &identity, &signer).await?;
 				println!("Initialised trust root at {tip}");
+				eprintln!("{event}");
 				print_root(&repo).await
 			}
 			Action::List => print_root(&repo).await,
 			Action::AddKey { key, signing_key } => {
 				let signer = CliSigner::resolve(&repo, signing_key, &self.cwd).await?;
 				let key_line = read_key_arg(&key, &self.cwd).await?;
-				let tip = trust_add_key(&repo, &key_line, &identity, &signer).await?;
+				let (tip, event) = trust_add_key(&repo, &key_line, &identity, &signer).await?;
 				println!("Enrolled key; {TRUST_REF} now at {tip}");
+				eprintln!("{event}");
 				print_root(&repo).await
 			}
 			Action::RemoveKey {
@@ -214,8 +217,10 @@ impl RepoCommand for Trust {
 			} => {
 				let signer = CliSigner::resolve(&repo, signing_key, &self.cwd).await?;
 				let selector = read_key_arg(&key, &self.cwd).await?;
-				let tip = trust_remove_key(&repo, &selector, break_glass, &identity, &signer).await?;
+				let (tip, event) =
+					trust_remove_key(&repo, &selector, break_glass, &identity, &signer).await?;
 				println!("Removed key; {TRUST_REF} now at {tip}");
+				eprintln!("{event}");
 				print_root(&repo).await
 			}
 			Action::SetPolicy {
@@ -225,8 +230,9 @@ impl RepoCommand for Trust {
 			} => {
 				let policy = parse_policy(&policy)?;
 				let signer = CliSigner::resolve(&repo, signing_key, &self.cwd).await?;
-				let tip = trust_set_policy(&repo, policy, break_glass, &identity, &signer).await?;
+				let (tip, event) = trust_set_policy(&repo, policy, break_glass, &identity, &signer).await?;
 				println!("Policy set to {policy}; {TRUST_REF} now at {tip}");
+				eprintln!("{event}");
 				print_root(&repo).await
 			}
 			// `sync` is handled in `run` before dispatch (it needs the origin + network), never here.

@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::{KeyId, Policy};
+
 /// An audit record of a trust-policy decision.
 ///
 /// These form the trust subsystem's audit stream (`docs/hlds/secure-git-trust-signing.md`, step 7).
@@ -36,6 +38,28 @@ pub enum AuditEvent {
 		/// Why it was rejected.
 		reason: String,
 	},
+	/// The trust root was bootstrapped (`gta trust init`): a self-signed root under `policy`.
+	TrustRootBootstrapped {
+		/// The key that signed the bootstrap commit (the chain's anchor).
+		anchor: KeyId,
+		/// The enforcement policy the root was created with.
+		policy: Policy,
+	},
+	/// A key was enrolled in the trust root (`gta trust add-key`).
+	KeyAdded {
+		/// The enrolled key's fingerprint.
+		key: KeyId,
+	},
+	/// A key was removed from the trust root (`gta trust remove-key`).
+	KeyRemoved {
+		/// The removed key's fingerprint.
+		key: KeyId,
+	},
+	/// The enforcement policy was changed (`gta trust set-policy`).
+	PolicyChanged {
+		/// The new policy.
+		policy: Policy,
+	},
 }
 
 impl fmt::Display for AuditEvent {
@@ -50,6 +74,15 @@ impl fmt::Display for AuditEvent {
 			}
 			Self::PushRejected { reason } => write!(f, "push rejected: {reason}"),
 			Self::RefRejected { name, reason } => write!(f, "ref rejected {name}: {reason}"),
+			Self::TrustRootBootstrapped { anchor, policy } => {
+				write!(
+					f,
+					"trust root bootstrapped: policy {policy}, anchored by {anchor}"
+				)
+			}
+			Self::KeyAdded { key } => write!(f, "trusted key added: {key}"),
+			Self::KeyRemoved { key } => write!(f, "trusted key removed: {key}"),
+			Self::PolicyChanged { policy } => write!(f, "trust policy changed to {policy}"),
 		}
 	}
 }

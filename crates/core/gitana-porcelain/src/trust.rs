@@ -12,8 +12,8 @@ use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit};
 use gitana_remote::{HttpTransport, Origin};
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 use gitana_trust::{
-	KeyId, Policy, TRUST_DOCUMENT_PATH, TrustDocument, TrustRoot, TrustedKey, fold_trust_root,
-	verify_candidate_trust_update, verify_candidate_trust_update_anchored,
+	AuditEvent, KeyId, Policy, TRUST_DOCUMENT_PATH, TrustDocument, TrustRoot, TrustedKey,
+	fold_trust_root, verify_candidate_trust_update, verify_candidate_trust_update_anchored,
 };
 
 use crate::{Identity, Signer};
@@ -30,6 +30,9 @@ pub const TRUST_REF: &str = "refs/gitana/trust";
 /// `break_glass` is set (the design's explicit override); enrol a second key first instead. The
 /// built commit is re-folded through [`verify_candidate_trust_update`] before the ref moves, so the
 /// bootstrap is only adopted if it genuinely self-verifies.
+///
+/// Returns the new tip and an [`AuditEvent::TrustRootBootstrapped`] carrying the chain's anchor (the
+/// key that actually signed the bootstrap) and the policy.
 pub async fn trust_init<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	policy: Policy,
@@ -37,7 +40,7 @@ pub async fn trust_init<F: FileStore, H: HashAlgorithm>(
 	break_glass: bool,
 	identity: &impl Identity,
 	signer: &impl Signer,
-) -> Result<ObjectId<H>> {
+) -> Result<(ObjectId<H>, AuditEvent)> {
 	if repo.refs().resolve(TRUST_REF).await?.is_some() {
 		bail!(
 			"trust is already initialised ({TRUST_REF} exists); use `add-key`/`remove-key` to change it"
@@ -63,8 +66,9 @@ pub async fn trust_init<F: FileStore, H: HashAlgorithm>(
 	.await?;
 
 	// Prove the chain before moving the ref: the bootstrap must be self-signed by a key in its own
-	// root. If the signing key is not the one we enrolled, this refuses and the ref stays unset.
-	verify_candidate_trust_update(repo, None, tip).await?;
+	// root. If the signing key is not the one we enrolled, this refuses and the ref stays unset. The
+	// anchored fold also surfaces the key that actually signed, for the audit event.
+	let folded = verify_candidate_trust_update_anchored(repo, None, tip).await?;
 
 	repo.refs().update_ref(TRUST_REF, tip, None).await?;
 	let committer = identity.committer_or_default().await;
@@ -72,7 +76,13 @@ pub async fn trust_init<F: FileStore, H: HashAlgorithm>(
 		.refs()
 		.append_reflog(TRUST_REF, None, tip, &committer, "trust: bootstrap")
 		.await?;
-	Ok(tip)
+	Ok((
+		tip,
+		AuditEvent::TrustRootBootstrapped {
+			anchor: folded.anchor,
+			policy,
+		},
+	))
 }
 
 /// The current effective trust root: fold the `refs/gitana/trust` chain into its [`TrustRoot`], or
@@ -186,13 +196,14 @@ pub async fn trust_sync<F: FileStore, H: HashAlgorithm>(
 /// Enrol `key_line` (an OpenSSH public-key line) in the trust root, signing the update with `signer`
 /// — which must be a key the *current* root already trusts. Refuses a malformed key or one already
 /// enrolled (matched by fingerprint, so a re-paste with a different comment is still a duplicate).
-/// Extends the chain and moves `refs/gitana/trust` only after the new root re-verifies.
+/// Extends the chain and moves `refs/gitana/trust` only after the new root re-verifies. Returns the
+/// new tip and an [`AuditEvent::KeyAdded`] naming the enrolled key.
 pub async fn trust_add_key<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	key_line: &str,
 	identity: &impl Identity,
 	signer: &impl Signer,
-) -> Result<ObjectId<H>> {
+) -> Result<(ObjectId<H>, AuditEvent)> {
 	let tip = current_tip(repo).await?;
 	let mut document = read_current_document(repo, tip).await?;
 
@@ -207,7 +218,8 @@ pub async fn trust_add_key<F: FileStore, H: HashAlgorithm>(
 		}
 	}
 	document.keys.push(key_line.trim().to_owned());
-	trust_update(repo, &document, tip, "add key", identity, signer).await
+	let tip = trust_update(repo, &document, tip, "add key", identity, signer).await?;
+	Ok((tip, AuditEvent::KeyAdded { key: new_id }))
 }
 
 /// Remove the key named by `selector` — a `SHA256:…` fingerprint (as `trust list` prints) or an
@@ -221,17 +233,20 @@ pub async fn trust_remove_key<F: FileStore, H: HashAlgorithm>(
 	break_glass: bool,
 	identity: &impl Identity,
 	signer: &impl Signer,
-) -> Result<ObjectId<H>> {
+) -> Result<(ObjectId<H>, AuditEvent)> {
 	let tip = current_tip(repo).await?;
 	let mut document = read_current_document(repo, tip).await?;
 
 	let target = selector_fingerprint(selector)?;
 	let mut kept = Vec::with_capacity(document.keys.len());
+	let mut removed = None;
 	for line in &document.keys {
 		let id = TrustedKey::from_openssh(line)
 			.with_context(|| format!("parsing an enrolled key ({line})"))?
 			.id();
-		if id.as_str() != target {
+		if id.as_str() == target {
+			removed = Some(id);
+		} else {
 			kept.push(line.clone());
 		}
 	}
@@ -249,7 +264,10 @@ pub async fn trust_remove_key<F: FileStore, H: HashAlgorithm>(
 		);
 	}
 	document.keys = kept;
-	trust_update(repo, &document, tip, "remove key", identity, signer).await
+	// `removed` is `Some` whenever `kept` shrank, which the no-match guard above has confirmed.
+	let key = removed.expect("a removed key once a match is confirmed");
+	let tip = trust_update(repo, &document, tip, "remove key", identity, signer).await?;
+	Ok((tip, AuditEvent::KeyRemoved { key }))
 }
 
 /// Change the trust policy to `policy`, signing the update with `signer`. Under [`Policy::Require`] a
@@ -261,7 +279,7 @@ pub async fn trust_set_policy<F: FileStore, H: HashAlgorithm>(
 	break_glass: bool,
 	identity: &impl Identity,
 	signer: &impl Signer,
-) -> Result<ObjectId<H>> {
+) -> Result<(ObjectId<H>, AuditEvent)> {
 	let tip = current_tip(repo).await?;
 	let mut document = read_current_document(repo, tip).await?;
 
@@ -275,7 +293,7 @@ pub async fn trust_set_policy<F: FileStore, H: HashAlgorithm>(
 		);
 	}
 	document.policy = policy;
-	trust_update(
+	let tip = trust_update(
 		repo,
 		&document,
 		tip,
@@ -283,7 +301,8 @@ pub async fn trust_set_policy<F: FileStore, H: HashAlgorithm>(
 		identity,
 		signer,
 	)
-	.await
+	.await?;
+	Ok((tip, AuditEvent::PolicyChanged { policy }))
 }
 
 /// Write a signed trust commit: store `document` as `trust.json` in a fresh tree, then build a
@@ -491,7 +510,7 @@ mod tests {
 		let signer = TestSigner::new(1);
 
 		// The server bootstraps a signed trust root; the client has none.
-		let server_tip = trust_init(
+		let (server_tip, _) = trust_init(
 			&server_repo,
 			Policy::Warn,
 			&signer.public_line(),
@@ -564,7 +583,7 @@ mod tests {
 		.unwrap();
 
 		// The server enrols a second key (extending the chain), then the client syncs again.
-		let server_tip = trust_add_key(
+		let (server_tip, _) = trust_add_key(
 			&server_repo,
 			&colleague.public_line(),
 			&TestIdentity::default(),
@@ -598,7 +617,7 @@ mod tests {
 		let (mine, theirs) = (TestSigner::new(1), TestSigner::new(2));
 
 		// The client and server bootstrap *independent* roots (no shared history).
-		let local_tip = trust_init(
+		let (local_tip, _) = trust_init(
 			client,
 			Policy::Warn,
 			&mine.public_line(),
@@ -710,7 +729,7 @@ mod tests {
 		let (_dir, wt) = fixture().await;
 		let client = wt.repository();
 		let signer = TestSigner::new(1);
-		let server_tip = trust_init(
+		let (server_tip, _) = trust_init(
 			&server_repo,
 			Policy::Warn,
 			&signer.public_line(),
@@ -893,7 +912,7 @@ mod tests {
 		let repo = wt.repository();
 		let signer = TestSigner::new(1);
 
-		let tip = trust_init(
+		let (tip, event) = trust_init(
 			repo,
 			Policy::Warn,
 			&signer.public_line(),
@@ -912,6 +931,14 @@ mod tests {
 		assert_eq!(root.keys.len(), 1);
 		let enrolled = TrustedKey::from_openssh(&signer.public_line()).unwrap();
 		assert_eq!(root.keys[0].id(), enrolled.id());
+		// The audit event carries the policy and the bootstrap anchor (the key that signed it).
+		assert_eq!(
+			event,
+			AuditEvent::TrustRootBootstrapped {
+				anchor: enrolled.id(),
+				policy: Policy::Warn,
+			}
+		);
 	}
 
 	#[tokio::test]
@@ -994,6 +1021,7 @@ mod tests {
 		)
 		.await
 		.unwrap()
+		.0
 	}
 
 	fn fingerprint(signer: &TestSigner) -> String {
@@ -1011,7 +1039,7 @@ mod tests {
 		let (admin, colleague) = (TestSigner::new(1), TestSigner::new(2));
 		bootstrap(repo, &admin, Policy::Warn).await;
 
-		trust_add_key(
+		let (_, event) = trust_add_key(
 			repo,
 			&colleague.public_line(),
 			&TestIdentity::default(),
@@ -1019,6 +1047,8 @@ mod tests {
 		)
 		.await
 		.unwrap();
+		let enrolled = TrustedKey::from_openssh(&colleague.public_line()).unwrap();
+		assert_eq!(event, AuditEvent::KeyAdded { key: enrolled.id() });
 
 		let root = trust_list(repo).await.unwrap().unwrap();
 		let ids: Vec<String> = root
@@ -1079,7 +1109,7 @@ mod tests {
 		.unwrap();
 
 		// Remove the original admin, signing with the still-trusted colleague.
-		trust_remove_key(
+		let (_, event) = trust_remove_key(
 			repo,
 			&fingerprint(&admin),
 			false,
@@ -1088,6 +1118,8 @@ mod tests {
 		)
 		.await
 		.unwrap();
+		let removed = TrustedKey::from_openssh(&admin.public_line()).unwrap();
+		assert_eq!(event, AuditEvent::KeyRemoved { key: removed.id() });
 
 		let root = trust_list(repo).await.unwrap().unwrap();
 		assert_eq!(root.keys.len(), 1);
@@ -1205,7 +1237,7 @@ mod tests {
 		)
 		.await
 		.unwrap();
-		trust_set_policy(
+		let (_, event) = trust_set_policy(
 			repo,
 			Policy::Require,
 			false,
@@ -1214,6 +1246,12 @@ mod tests {
 		)
 		.await
 		.unwrap();
+		assert_eq!(
+			event,
+			AuditEvent::PolicyChanged {
+				policy: Policy::Require
+			}
+		);
 		assert_eq!(
 			trust_list(repo).await.unwrap().unwrap().policy,
 			Policy::Require
