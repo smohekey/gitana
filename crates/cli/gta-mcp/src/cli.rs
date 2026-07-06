@@ -471,6 +471,9 @@ enum TrustAction {
 		/// Allow `--policy require` with a single enrolled key (unsafe: losing it locks the repository).
 		#[arg(long = "break-glass")]
 		break_glass: bool,
+		/// Report what bootstrapping would do, without writing anything.
+		#[arg(long = "dry-run")]
+		dry_run: bool,
 	},
 	/// Show the current trust policy and enrolled key fingerprints.
 	List,
@@ -506,6 +509,9 @@ enum TrustAction {
 		/// Allow `require` with fewer than two enrolled keys (unsafe: losing a key locks the repository).
 		#[arg(long = "break-glass")]
 		break_glass: bool,
+		/// Report the cutover impact, without writing anything.
+		#[arg(long = "dry-run")]
+		dry_run: bool,
 	},
 	/// Adopt the origin's trust root into the local `refs/gitana/trust` (forward-only, verified).
 	Sync {
@@ -738,10 +744,12 @@ fn trust_action(action: TrustAction) -> commands::trust::Action {
 			policy,
 			signing_key,
 			break_glass,
+			dry_run,
 		} => Action::Init {
 			policy,
 			signing_key,
 			break_glass,
+			dry_run,
 		},
 		TrustAction::List => Action::List,
 		TrustAction::AddKey { key, signing_key } => Action::AddKey { key, signing_key },
@@ -758,10 +766,12 @@ fn trust_action(action: TrustAction) -> commands::trust::Action {
 			policy,
 			signing_key,
 			break_glass,
+			dry_run,
 		} => Action::SetPolicy {
 			policy,
 			signing_key,
 			break_glass,
+			dry_run,
 		},
 		TrustAction::Sync { expect } => Action::Sync { expect },
 	}

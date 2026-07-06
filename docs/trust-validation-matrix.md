@@ -39,5 +39,6 @@ green.
 
 - ~~**8b** — parser fuzzing (row 13).~~ ✅ done.
 - ~~**8c** — full real-`git push --signed` → gitana `receive_pack` e2e (row 3).~~ ✅ done (SHA-1).
-- **8d** — migration preflight + docs for moving an existing repo to `require`.
+- ~~**8d** — migration preflight + docs for moving an existing repo to `require`.~~ ✅ done (`gta trust
+  init/set-policy --dry-run`; `docs/trust-migration.md`).
 - **8e** — flip the README/HLD status to production-ready (the matrix gate is now green).

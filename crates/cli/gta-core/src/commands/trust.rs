@@ -14,7 +14,7 @@ use gitana_porcelain::{
 };
 use gitana_remote::{self as transport, Origin, ReqwestTransport};
 use gitana_repository::Repository;
-use gitana_trust::{KeyId, Policy, TrustRoot};
+use gitana_trust::{KeyId, Policy, TrustRoot, TrustedKey};
 
 use crate::Backend;
 use crate::dispatch::{self, RepoCommand};
@@ -29,6 +29,8 @@ pub enum Action {
 		policy: String,
 		signing_key: Option<PathBuf>,
 		break_glass: bool,
+		/// Report what bootstrapping would do, without writing anything.
+		dry_run: bool,
 	},
 	/// Show the current policy and enrolled key fingerprints.
 	List,
@@ -48,6 +50,8 @@ pub enum Action {
 		policy: String,
 		signing_key: Option<PathBuf>,
 		break_glass: bool,
+		/// Report the cutover impact, without writing anything.
+		dry_run: bool,
 	},
 	/// Safely adopt the origin's trust root into the local `refs/gitana/trust`. On a first-use
 	/// bootstrap (local trust unset), `expect` pins the fingerprint of the key that must have signed
@@ -191,10 +195,14 @@ impl RepoCommand for Trust {
 				policy,
 				signing_key,
 				break_glass,
+				dry_run,
 			} => {
 				let policy = parse_policy(&policy)?;
 				let signer = CliSigner::resolve(&repo, signing_key, &self.cwd).await?;
 				let pubkey = signer.public_line().await?;
+				if dry_run {
+					return init_preflight(&repo, policy, break_glass, &pubkey).await;
+				}
 				let (tip, event) =
 					trust_init(&repo, policy, &pubkey, break_glass, &identity, &signer).await?;
 				println!("Initialised trust root at {tip}");
@@ -227,8 +235,12 @@ impl RepoCommand for Trust {
 				policy,
 				signing_key,
 				break_glass,
+				dry_run,
 			} => {
 				let policy = parse_policy(&policy)?;
+				if dry_run {
+					return set_policy_preflight(&repo, policy, break_glass).await;
+				}
 				let signer = CliSigner::resolve(&repo, signing_key, &self.cwd).await?;
 				let (tip, event) = trust_set_policy(&repo, policy, break_glass, &identity, &signer).await?;
 				println!("Policy set to {policy}; {TRUST_REF} now at {tip}");
@@ -239,6 +251,92 @@ impl RepoCommand for Trust {
 			Action::Sync { .. } => unreachable!("trust sync is dispatched before on_repo"),
 		}
 	}
+}
+
+/// Preflight for `trust init --dry-run`: report what bootstrapping would do, writing nothing.
+async fn init_preflight<H: HashAlgorithm>(
+	repo: &Repository<Backend, H>,
+	policy: Policy,
+	break_glass: bool,
+	pubkey: &str,
+) -> Result<()> {
+	println!("Dry run: `gta trust init` would bootstrap a trust root ({TRUST_REF}).");
+	if repo.refs().resolve(TRUST_REF).await?.is_some() {
+		println!(
+			"  ! trust is already initialised; the real command would fail — use add-key/remove-key/set-policy."
+		);
+	}
+	let id = TrustedKey::from_openssh(pubkey.trim())
+		.context("parsing the signing public key")?
+		.id();
+	println!("  policy: {policy}");
+	println!("  enrolling signing key: {id}");
+	if policy == Policy::Require {
+		print_single_key_warning(break_glass);
+		print_require_implications();
+	}
+	println!("No changes made.");
+	Ok(())
+}
+
+/// Preflight for `trust set-policy <policy> --dry-run`: report the cutover impact, writing nothing.
+async fn set_policy_preflight<H: HashAlgorithm>(
+	repo: &Repository<Backend, H>,
+	target: Policy,
+	break_glass: bool,
+) -> Result<()> {
+	match trust_list(repo).await? {
+		None => {
+			println!("No trust root configured ({TRUST_REF} is unset); run `gta trust init` first.")
+		}
+		Some(root) => {
+			println!(
+				"Dry run: `gta trust set-policy` would change policy `{}` -> `{target}`.",
+				root.policy
+			);
+			if root.policy == target {
+				println!("  ! no change: policy is already `{target}` (the real command refuses a no-op).");
+			}
+			println!("  enrolled keys ({}):", root.keys.len());
+			for key in &root.keys {
+				println!("    {}", key.id());
+			}
+			if target == Policy::Require {
+				if root.keys.len() < 2 {
+					print_single_key_warning(break_glass);
+				}
+				print_require_implications();
+			}
+		}
+	}
+	println!("No changes made.");
+	Ok(())
+}
+
+/// The single-key `require` warning, worded for whether `--break-glass` was supplied — so the
+/// preview matches what the real command would do.
+fn print_single_key_warning(break_glass: bool) {
+	if break_glass {
+		println!(
+			"  ! `require` with fewer than two enrolled keys is unsafe (losing a key locks the repository); proceeding under `--break-glass`."
+		);
+	} else {
+		println!(
+			"  ! `require` with fewer than two enrolled keys is unsafe; the real command needs `--break-glass`."
+		);
+	}
+}
+
+/// The enforcement `require` turns on: what future pushes must carry, and what is grandfathered.
+fn print_require_implications() {
+	println!(
+		"Under `require`, pushes to protected refs (refs/heads/*, refs/tags/*, refs/gitana/*) will require:"
+	);
+	println!("  - a push certificate signed by a trusted key (`gta push --signed`), and");
+	println!("  - a trusted signature on every newly introduced commit and annotated tag.");
+	println!(
+		"Existing history reachable from the current protected refs is grandfathered (no re-signing needed)."
+	);
 }
 
 /// Print the current trust policy and enrolled key fingerprints, or a notice when trust is unset.
