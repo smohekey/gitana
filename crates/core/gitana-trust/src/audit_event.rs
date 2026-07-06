@@ -60,6 +60,12 @@ pub enum AuditEvent {
 		/// The new policy.
 		policy: Policy,
 	},
+	/// The local trust root was moved to a remote's by `gta trust sync` — a first-use adoption or a
+	/// fast-forward. `anchor` is the key that signed the adopted chain's bootstrap.
+	TrustRootAdopted {
+		/// The bootstrap signer of the adopted chain.
+		anchor: KeyId,
+	},
 }
 
 impl fmt::Display for AuditEvent {
@@ -83,6 +89,9 @@ impl fmt::Display for AuditEvent {
 			Self::KeyAdded { key } => write!(f, "trusted key added: {key}"),
 			Self::KeyRemoved { key } => write!(f, "trusted key removed: {key}"),
 			Self::PolicyChanged { policy } => write!(f, "trust policy changed to {policy}"),
+			Self::TrustRootAdopted { anchor } => {
+				write!(f, "trust root adopted from remote, anchored by {anchor}")
+			}
 		}
 	}
 }

@@ -121,8 +121,10 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   unsigned delete. `build_cert` was generalised to `old`/`new` options (a `None` becomes the zero id);
   the CLI routes `--signed --delete` through `push_signed`. Covered by a porcelain cert round-trip and
   an `enforce.rs` verify_push acceptance test (complementing the no-cert rejection).
-- [ ] Emit a `trust sync` audit event. Add `AuditEvent::TrustRootAdopted { anchor }` and surface it from
-  `trust_sync`, completing the client-side audit vocabulary (descoped from step 7b). Scoped in
+- [x] Emit a `trust sync` audit event. Added `AuditEvent::TrustRootAdopted { anchor }`;
+  `TrustSyncOutcome::Updated` now carries the chain's bootstrap `anchor`, and the CLI sync handler
+  prints the event to stderr on an adoption or fast-forward — completing the client-side audit
+  vocabulary (descoped from step 7b). Scoped in
   `docs/hlds/trust-followups.md#5-trustrootadopted-audit-event-for-trust-sync`.
 - [ ] Add a one-time-nonce replay cache. Close the replay-within-freshness-window gap (accepted by
   design in v1's stateless HMAC nonce) with a host-supplied TTL nonce ledger threaded through

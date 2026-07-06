@@ -106,10 +106,11 @@ pub enum TrustSyncOutcome<H: HashAlgorithm> {
 	/// of the remote. Nothing moved.
 	UpToDate,
 	/// Adopted the remote root: the local `refs/gitana/trust` moved `old` → `new` (a bootstrap when
-	/// `old` is `None`).
+	/// `old` is `None`). `anchor` is the key that signed the chain's bootstrap commit — for audit.
 	Updated {
 		old: Option<ObjectId<H>>,
 		new: ObjectId<H>,
+		anchor: KeyId,
 	},
 	/// A bootstrap adoption (local trust was unset) that the caller's `confirm` declined; the remote
 	/// tip `new` verified but was not adopted, and the local ref stays unset.
@@ -190,6 +191,7 @@ pub async fn trust_sync<F: FileStore, H: HashAlgorithm>(
 	Ok(TrustSyncOutcome::Updated {
 		old: local_tip,
 		new: remote_tip,
+		anchor: folded.anchor,
 	})
 }
 
@@ -536,7 +538,16 @@ mod tests {
 		.unwrap();
 
 		match outcome {
-			TrustSyncOutcome::Updated { old: None, new } => assert_eq!(new, server_tip),
+			TrustSyncOutcome::Updated {
+				old: None,
+				new,
+				anchor,
+			} => {
+				assert_eq!(new, server_tip);
+				// The audit anchor is the key that signed the adopted chain's bootstrap.
+				let signer_key = TrustedKey::from_openssh(&signer.public_line()).unwrap();
+				assert_eq!(anchor, signer_key.id());
+			}
 			_ => panic!("expected a bootstrap adoption"),
 		}
 		// The local ref now points at the server tip and folds back to the enrolled root.
@@ -603,7 +614,9 @@ mod tests {
 		.unwrap();
 
 		match outcome {
-			TrustSyncOutcome::Updated { old: Some(_), new } => assert_eq!(new, server_tip),
+			TrustSyncOutcome::Updated {
+				old: Some(_), new, ..
+			} => assert_eq!(new, server_tip),
 			_ => panic!("expected a fast-forward update"),
 		}
 		assert_eq!(trust_list(client).await.unwrap().unwrap().keys.len(), 2);

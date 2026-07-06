@@ -8,8 +8,7 @@ without re-deriving the design.
 Suggested order (cheapest / highest-leverage first):
 
 1. ~~[Signed `--signed --delete`](#1-signed-push---signed---delete)~~ — **done.**
-2. [`trust sync` audit event](#5-trustrootadopted-audit-event-for-trust-sync) — completes the client
-   audit vocabulary; small.
+2. ~~[`trust sync` audit event](#5-trustrootadopted-audit-event-for-trust-sync)~~ — **done.**
 3. [One-time-nonce replay cache](#2-one-time-nonce-replay-cache) — security hardening; medium.
 4. [Persisted require-time baseline](#4-persisted-require-time-baseline) — enforcement perf/stability;
    medium.
@@ -103,6 +102,10 @@ reference.
 - **Effort.** Medium.
 
 ## 5. `TrustRootAdopted` audit event for `trust sync`
+
+**✅ Done.** `AuditEvent::TrustRootAdopted { anchor }` added; `TrustSyncOutcome::Updated` carries the
+chain's bootstrap `anchor` (`folded.anchor`), and the CLI sync handler prints the event to stderr on an
+adoption or fast-forward. The scoped plan below is kept for reference.
 
 - **Goal.** Emit a typed `AuditEvent` when `gta trust sync` adopts (bootstrap) or fast-forwards the local
   trust root, completing the client-side audit vocabulary started in 7b.

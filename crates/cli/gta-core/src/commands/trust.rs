@@ -14,7 +14,7 @@ use gitana_porcelain::{
 };
 use gitana_remote::{self as transport, Origin, ReqwestTransport};
 use gitana_repository::Repository;
-use gitana_trust::{KeyId, Policy, TrustRoot, TrustedKey};
+use gitana_trust::{AuditEvent, KeyId, Policy, TrustRoot, TrustedKey};
 
 use crate::Backend;
 use crate::dispatch::{self, RepoCommand};
@@ -115,7 +115,7 @@ async fn sync_into<H: HashAlgorithm>(
 			println!("Trust root is already up to date.");
 			print_root(&repository).await?;
 		}
-		TrustSyncOutcome::Updated { old, new } => {
+		TrustSyncOutcome::Updated { old, new, anchor } => {
 			match old {
 				None => println!(
 					"Adopted trust root from {}; {TRUST_REF} set to {new}",
@@ -128,6 +128,7 @@ async fn sync_into<H: HashAlgorithm>(
 					)
 				}
 			}
+			eprintln!("{}", AuditEvent::TrustRootAdopted { anchor });
 			print_root(&repository).await?;
 		}
 		TrustSyncOutcome::Declined { .. } => {
