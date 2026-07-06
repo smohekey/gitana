@@ -126,9 +126,15 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   commit via the `signing` seam; verifiable by stock git and the trust core.
 - [x] Add signed tag creation. `gta tag -a/-s` writes annotated tag objects, signed when `-s` (or
   `tag.gpgSign`), with the signature block preserved byte-for-byte.
+- [x] Add trust audit output (step 7). A typed `gitana_trust::AuditEvent` vocabulary is emitted on both
+  boundaries: `receive_pack` returns `audit: Vec<AuditEvent>` (push accepted/rejected, per-ref rejected,
+  with `warn`-mode warnings), and the `gta trust` porcelain ops return `(tip, AuditEvent)` for
+  bootstrap/key add-remove/policy change, which the CLI prints to stderr (kept off gta-mcp's captured
+  stdout result). No persistence in v1; a host records the events however it wishes.
 - [ ] Decide how much signature verification belongs in core crates versus host policy. (Provisionally:
   `gitana-trust` owns pure verification; `gitana-git-http` orchestrates the receive-pack boundary;
-  `warn`/`require` enforcement + audit output is the remaining step 7–8 work.)
+  `warn` mode + audit output landed in step 7; enabling `require` after the validation matrix is
+  step 8.)
 
 ## Working Tree Details
 
