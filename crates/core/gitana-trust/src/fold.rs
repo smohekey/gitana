@@ -1,6 +1,6 @@
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_commit, parse_tree};
 
-use crate::{ObjectSource, TRUST_DOCUMENT_PATH, TrustError, TrustRoot, verify_commit};
+use crate::{FoldedTrust, ObjectSource, TRUST_DOCUMENT_PATH, TrustError, TrustRoot, verify_commit};
 
 /// Fold the `refs/gitana/trust` chain ending at `tip` into its effective [`TrustRoot`], verifying
 /// the whole authorization chain: the bootstrap (root) commit must be self-signed by a key in its
@@ -11,6 +11,21 @@ use crate::{ObjectSource, TRUST_DOCUMENT_PATH, TrustError, TrustRoot, verify_com
 /// An absent trust ref means "no trust configured" — that is the caller's check (don't call this),
 /// not an outcome here.
 pub async fn fold_trust_root<H, S>(source: &S, tip: ObjectId<H>) -> Result<TrustRoot, TrustError>
+where
+	H: HashAlgorithm,
+	S: ObjectSource<H>,
+{
+	Ok(fold_trust_root_anchored(source, tip).await?.root)
+}
+
+/// Like [`fold_trust_root`], but additionally surfaces the [`KeyId`](crate::KeyId) that signed the
+/// chain's bootstrap commit as the [`FoldedTrust::anchor`]. Use this when adopting a never-before-seen
+/// root and you need to pin *who* the chain's authority rests on — a key listed in the root is not
+/// enough (see [`FoldedTrust`]).
+pub async fn fold_trust_root_anchored<H, S>(
+	source: &S,
+	tip: ObjectId<H>,
+) -> Result<FoldedTrust, TrustError>
 where
 	H: HashAlgorithm,
 	S: ObjectSource<H>,
@@ -28,16 +43,16 @@ where
 
 	let mut iter = chain.into_iter();
 	let (bootstrap_raw, bootstrap_tree) = iter.next().expect("chain has at least the tip commit");
-	// Bootstrap: self-signed by a key in its own root.
+	// Bootstrap: self-signed by a key in its own root. The signer is the chain's anchor.
 	let mut root = load_trust_root(source, bootstrap_tree).await?;
-	verify_commit::<H>(&bootstrap_raw, &root.keys)?;
+	let anchor = verify_commit::<H>(&bootstrap_raw, &root.keys)?;
 
 	// Each later commit is authorized by the previous root, then installs its own.
 	for (raw, tree) in iter {
 		verify_commit::<H>(&raw, &root.keys)?;
 		root = load_trust_root(source, tree).await?;
 	}
-	Ok(root)
+	Ok(FoldedTrust { root, anchor })
 }
 
 /// Verify a candidate trust-root update from `old_tip` (the current ref, `None` at bootstrap) to
@@ -54,7 +69,26 @@ where
 	H: HashAlgorithm,
 	S: ObjectSource<H>,
 {
-	let new_root = fold_trust_root(source, new_tip).await?;
+	Ok(
+		verify_candidate_trust_update_anchored(source, old_tip, new_tip)
+			.await?
+			.root,
+	)
+}
+
+/// Like [`verify_candidate_trust_update`], but additionally surfaces the chain's bootstrap
+/// [`FoldedTrust::anchor`]. Use this on the bootstrap-adoption path (`old_tip` is `None`) to pin the
+/// anchor before adopting an unseen root.
+pub async fn verify_candidate_trust_update_anchored<H, S>(
+	source: &S,
+	old_tip: Option<ObjectId<H>>,
+	new_tip: ObjectId<H>,
+) -> Result<FoldedTrust, TrustError>
+where
+	H: HashAlgorithm,
+	S: ObjectSource<H>,
+{
+	let folded = fold_trust_root_anchored(source, new_tip).await?;
 	if let Some(old_tip) = old_tip
 		&& !is_ancestor(source, &old_tip, new_tip).await?
 	{
@@ -62,7 +96,7 @@ where
 			"candidate trust update {new_tip} does not descend from current {old_tip}"
 		)));
 	}
-	Ok(new_root)
+	Ok(folded)
 }
 
 /// Read a trust-chain commit: its raw bytes (for signature verification), its parents, and its tree

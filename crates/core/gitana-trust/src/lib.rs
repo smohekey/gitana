@@ -21,6 +21,7 @@
 
 mod error;
 mod fold;
+mod folded_trust;
 mod key_id;
 mod object_source;
 mod policy;
@@ -29,7 +30,11 @@ mod trust_root;
 mod trusted_key;
 
 pub use self::error::TrustError;
-pub use self::fold::{fold_trust_root, verify_candidate_trust_update};
+pub use self::fold::{
+	fold_trust_root, fold_trust_root_anchored, verify_candidate_trust_update,
+	verify_candidate_trust_update_anchored,
+};
+pub use self::folded_trust::FoldedTrust;
 pub use self::key_id::KeyId;
 pub use self::object_source::ObjectSource;
 pub use self::policy::Policy;

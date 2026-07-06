@@ -484,7 +484,13 @@ enum TrustAction {
 		break_glass: bool,
 	},
 	/// Adopt the origin's trust root into the local `refs/gitana/trust` (forward-only, verified).
-	Sync,
+	Sync {
+		/// On a first-use bootstrap (no local trust yet), only adopt if the incoming root's bootstrap
+		/// was signed by this `SHA256:…` fingerprint (the chain's anchor). Required here: without a
+		/// terminal to prompt, an unpinned adoption is refused.
+		#[arg(long = "expect")]
+		expect: Option<String>,
+	},
 }
 
 /// A `remote` sub-command. Absent means "list the remotes".
@@ -708,7 +714,7 @@ fn trust_action(action: TrustAction) -> commands::trust::Action {
 			signing_key,
 			break_glass,
 		},
-		TrustAction::Sync => Action::Sync,
+		TrustAction::Sync { expect } => Action::Sync { expect },
 	}
 }
 

@@ -3,6 +3,7 @@
 //! signed updates; `list` shows the current policy and enrolled key fingerprints; `sync` safely
 //! adopts the origin's trust root (forward-only, only if it verifies).
 
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -13,7 +14,7 @@ use gitana_porcelain::{
 };
 use gitana_remote::{self as transport, Origin, ReqwestTransport};
 use gitana_repository::Repository;
-use gitana_trust::{Policy, TrustRoot};
+use gitana_trust::{KeyId, Policy, TrustRoot};
 
 use crate::Backend;
 use crate::dispatch::{self, RepoCommand};
@@ -48,16 +49,18 @@ pub enum Action {
 		signing_key: Option<PathBuf>,
 		break_glass: bool,
 	},
-	/// Safely adopt the origin's trust root into the local `refs/gitana/trust`.
-	Sync,
+	/// Safely adopt the origin's trust root into the local `refs/gitana/trust`. On a first-use
+	/// bootstrap (local trust unset), `expect` pins the fingerprint of the key that must have signed
+	/// the incoming root's bootstrap.
+	Sync { expect: Option<String> },
 }
 
 /// Run a `trust` sub-command in the repository containing `cwd`.
 pub async fn run(cwd: &Path, action: Action) -> Result<()> {
 	// `sync` transacts with the origin, so it does its own discovery + HTTP + hash dispatch (like
 	// `fetch`), rather than the offline `on_repo` path the other sub-commands share.
-	if let Action::Sync = action {
-		return sync(cwd).await;
+	if let Action::Sync { expect } = action {
+		return sync(cwd, expect).await;
 	}
 	dispatch::on_repo(
 		cwd,
@@ -71,7 +74,7 @@ pub async fn run(cwd: &Path, action: Action) -> Result<()> {
 
 /// Fetch the origin's `git-upload-pack` advertisement and adopt its `refs/gitana/trust` — after
 /// verifying it as a forward-only candidate over the local root — then print the resulting root.
-async fn sync(cwd: &Path) -> Result<()> {
+async fn sync(cwd: &Path, expect: Option<String>) -> Result<()> {
 	let found = repo::discover(cwd)?;
 	let origin = Origin::load(&found.common_dir)?;
 	let http = ReqwestTransport::new();
@@ -81,8 +84,8 @@ async fn sync(cwd: &Path) -> Result<()> {
 	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
 
 	match local {
-		HashKind::Sha1 => sync_into::<Sha1>(&http, &origin, &found, &body).await,
-		HashKind::Sha256 => sync_into::<Sha256>(&http, &origin, &found, &body).await,
+		HashKind::Sha1 => sync_into::<Sha1>(&http, &origin, &found, &body, expect).await,
+		HashKind::Sha256 => sync_into::<Sha256>(&http, &origin, &found, &body, expect).await,
 	}
 }
 
@@ -91,10 +94,16 @@ async fn sync_into<H: HashAlgorithm>(
 	origin: &Origin,
 	found: &repo::Discovered,
 	body: &[u8],
+	expect: Option<String>,
 ) -> Result<()> {
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
 	let identity = CliIdentity::new(&repository);
-	match trust_sync(http, &repository, origin, body, &identity).await? {
+	// On a first-use bootstrap, `trust_sync` asks whether to adopt the unseen root; the fast-forward
+	// path never calls this. `--expect` pins the anchor for a non-interactive decision; otherwise a
+	// terminal is prompted, and a non-terminal (gta-mcp, piped stdin) fails closed.
+	let confirm =
+		async move |root: &TrustRoot, anchor: &KeyId| confirm_adoption(&expect, root, anchor);
+	match trust_sync(http, &repository, origin, body, &identity, confirm).await? {
 		TrustSyncOutcome::RemoteUnset => {
 			println!("{} has no trust root; nothing to sync.", origin.url);
 		}
@@ -117,8 +126,55 @@ async fn sync_into<H: HashAlgorithm>(
 			}
 			print_root(&repository).await?;
 		}
+		TrustSyncOutcome::Declined { .. } => {
+			println!(
+				"Declined the trust root from {}; {TRUST_REF} left unset.",
+				origin.url
+			);
+		}
 	}
 	Ok(())
+}
+
+/// Decide whether to adopt an unseen trust root during a first-use `sync` bootstrap. With `--expect`,
+/// adopt iff the chain's bootstrap `anchor` matches the pinned fingerprint (a mismatch is a hard
+/// error). Otherwise, on a terminal, print the incoming root and prompt; off a terminal (gta-mcp, or
+/// piped stdin) refuse — adopting an unverified root non-interactively is unsafe.
+fn confirm_adoption(expect: &Option<String>, root: &TrustRoot, anchor: &KeyId) -> Result<bool> {
+	if let Some(expected) = expect {
+		let expected = expected.trim();
+		if anchor.as_str() == expected {
+			return Ok(true);
+		}
+		bail!(
+			"the origin's trust root is anchored by {anchor}, not the expected {expected}; \
+			 refusing to adopt it"
+		);
+	}
+	if std::io::stdin().is_terminal() {
+		return prompt_adoption(root, anchor);
+	}
+	bail!(
+		"refusing to adopt an unverified trust root non-interactively; re-run with \
+		 `--expect <fingerprint>` to pin the key that signed it (its anchor)"
+	)
+}
+
+/// Print the incoming trust root and its anchor, then read a yes/no answer from the terminal.
+fn prompt_adoption(root: &TrustRoot, anchor: &KeyId) -> Result<bool> {
+	println!("The origin published a trust root this repository has not seen before:");
+	println!("  policy: {}", root.policy);
+	println!("  keys ({}):", root.keys.len());
+	for key in &root.keys {
+		println!("    {}", key.id());
+	}
+	println!("  anchored by (the key that signed the bootstrap): {anchor}");
+	print!("Adopt this trust root? [y/N] ");
+	std::io::stdout().flush().ok();
+	let mut answer = String::new();
+	std::io::stdin().read_line(&mut answer)?;
+	let answer = answer.trim();
+	Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
 struct Trust {
@@ -174,7 +230,7 @@ impl RepoCommand for Trust {
 				print_root(&repo).await
 			}
 			// `sync` is handled in `run` before dispatch (it needs the origin + network), never here.
-			Action::Sync => unreachable!("trust sync is dispatched before on_repo"),
+			Action::Sync { .. } => unreachable!("trust sync is dispatched before on_repo"),
 		}
 	}
 }

@@ -8,7 +8,8 @@ use gitana_object::{
 	Commit, HashAlgorithm, ObjectId, ObjectKind, Sha256, TreeEntry, encode_commit, encode_tree,
 };
 use gitana_trust::{
-	ObjectSource, Policy, TrustError, fold_trust_root, verify_candidate_trust_update,
+	ObjectSource, Policy, TrustError, fold_trust_root, fold_trust_root_anchored,
+	verify_candidate_trust_update,
 };
 use ssh_key::private::Ed25519Keypair;
 use ssh_key::{HashAlg, LineEnding, PrivateKey};
@@ -127,6 +128,31 @@ async fn folds_a_valid_chain_to_the_tip_root() {
 	let root = fold_trust_root(&source, tip).await.expect("fold");
 	assert_eq!(root.policy, Policy::Require);
 	assert_eq!(root.keys.len(), 2);
+}
+
+#[tokio::test]
+async fn anchor_is_the_bootstrap_signer_not_a_merely_listed_key() {
+	// The bootstrap enrols BOTH `a` and `b`, but is signed by `a`. A caller pinning the anchor must
+	// see `a`'s fingerprint — pinning `b` (a listed but non-signing key) would be forgeable, since an
+	// attacker could list `b`'s public key in a chain signed by their own key.
+	let (a, b) = (key(1), key(2));
+	let a_fingerprint = a
+		.public_key()
+		.key_data()
+		.fingerprint(HashAlg::Sha256)
+		.to_string();
+	let b_fingerprint = b
+		.public_key()
+		.key_data()
+		.fingerprint(HashAlg::Sha256)
+		.to_string();
+	let mut build = Builder::<Sha256>::new();
+	let boot = build.commit(&a, &trust_json(&[&a, &b], "warn"), vec![]);
+	let source = build.source();
+
+	let folded = fold_trust_root_anchored(&source, boot).await.expect("fold");
+	assert_eq!(folded.anchor.as_str(), a_fingerprint);
+	assert_ne!(folded.anchor.as_str(), b_fingerprint);
 }
 
 #[tokio::test]

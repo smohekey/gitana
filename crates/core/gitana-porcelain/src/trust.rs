@@ -12,8 +12,8 @@ use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit};
 use gitana_remote::{HttpTransport, Origin};
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 use gitana_trust::{
-	Policy, TRUST_DOCUMENT_PATH, TrustDocument, TrustRoot, TrustedKey, fold_trust_root,
-	verify_candidate_trust_update,
+	KeyId, Policy, TRUST_DOCUMENT_PATH, TrustDocument, TrustRoot, TrustedKey, fold_trust_root,
+	verify_candidate_trust_update, verify_candidate_trust_update_anchored,
 };
 
 use crate::{Identity, Signer};
@@ -101,6 +101,9 @@ pub enum TrustSyncOutcome<H: HashAlgorithm> {
 		old: Option<ObjectId<H>>,
 		new: ObjectId<H>,
 	},
+	/// A bootstrap adoption (local trust was unset) that the caller's `confirm` declined; the remote
+	/// tip `new` verified but was not adopted, and the local ref stays unset.
+	Declined { new: ObjectId<H> },
 }
 
 /// Adopt the remote's `refs/gitana/trust` into the local ref, **forward-only and only if it
@@ -114,12 +117,21 @@ pub enum TrustSyncOutcome<H: HashAlgorithm> {
 /// divergent remote root is refused and the local ref never moves. A remote tip the local chain
 /// already contains (equal, or local-ahead) is a no-op. Only the remote trust chain's objects are
 /// downloaded, not the whole advertisement.
+///
+/// When local trust is **unset** this is a trust-on-first-use bootstrap: folding proves the chain is
+/// internally consistent but cannot prove its bootstrap key is the *right* one, so `confirm` is
+/// consulted before adopting. It receives the incoming [`TrustRoot`] and the chain's anchor (the
+/// [`KeyId`] that signed the bootstrap — the thing worth pinning; see the crate's `FoldedTrust`):
+/// `Ok(true)` adopts, `Ok(false)` yields [`TrustSyncOutcome::Declined`] and leaves the ref unset, and
+/// an `Err` propagates. On a fast-forward (local trust already exists and anchors the update)
+/// `confirm` is **not** called — the update is already anchored to the trusted local root.
 pub async fn trust_sync<F: FileStore, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
 	origin: &Origin,
 	advertisement: &[u8],
 	identity: &impl Identity,
+	confirm: impl AsyncFnOnce(&TrustRoot, &KeyId) -> Result<bool>,
 ) -> Result<TrustSyncOutcome<H>> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
 	let Some(remote_tip) = advertised.oid_of(TRUST_REF) else {
@@ -145,8 +157,17 @@ pub async fn trust_sync<F: FileStore, H: HashAlgorithm>(
 	}
 
 	// Prove the remote root before adopting it: it must fold cleanly and (when local trust exists)
-	// fast-forward the local tip. A divergent chain fails here and the ref stays put.
-	verify_candidate_trust_update(repo, local_tip, remote_tip).await?;
+	// fast-forward the local tip. A divergent chain fails here and the ref stays put. Surface the
+	// chain's anchor so a bootstrap adoption can pin it.
+	let folded = verify_candidate_trust_update_anchored(repo, local_tip, remote_tip).await?;
+
+	// A first-use bootstrap (no local trust) is faith-based: folding proves internal consistency but
+	// not that the anchor is the right key. Defer to `confirm` before adopting. A fast-forward is
+	// already anchored to the trusted local root, so it skips the prompt.
+	if local_tip.is_none() && !confirm(&folded.root, &folded.anchor).await? {
+		return Ok(TrustSyncOutcome::Declined { new: remote_tip });
+	}
+
 	repo
 		.refs()
 		.update_ref(TRUST_REF, remote_tip, local_tip)
@@ -490,6 +511,7 @@ mod tests {
 			&origin(),
 			&advertisement(&git_dir).await,
 			&TestIdentity::default(),
+			async |_, _| Ok(true),
 		)
 		.await
 		.unwrap();
@@ -536,6 +558,7 @@ mod tests {
 			&origin(),
 			&advertisement(&git_dir).await,
 			&TestIdentity::default(),
+			async |_, _| Ok(true),
 		)
 		.await
 		.unwrap();
@@ -555,6 +578,7 @@ mod tests {
 			&origin(),
 			&advertisement(&git_dir).await,
 			&TestIdentity::default(),
+			async |_, _| Ok(true),
 		)
 		.await
 		.unwrap();
@@ -604,6 +628,7 @@ mod tests {
 			&origin(),
 			&advertisement(&git_dir).await,
 			&TestIdentity::default(),
+			async |_, _| Ok(true),
 		)
 		.await
 		.unwrap_err();
@@ -641,6 +666,7 @@ mod tests {
 			&origin(),
 			&advertisement(&git_dir).await,
 			&TestIdentity::default(),
+			async |_, _| Ok(true),
 		)
 		.await
 		.unwrap();
@@ -651,6 +677,7 @@ mod tests {
 			&origin(),
 			&advertisement(&git_dir).await,
 			&TestIdentity::default(),
+			async |_, _| Ok(true),
 		)
 		.await
 		.unwrap();
@@ -670,10 +697,188 @@ mod tests {
 			&origin(),
 			&advertisement(&git_dir).await,
 			&TestIdentity::default(),
+			async |_, _| Ok(true),
 		)
 		.await
 		.unwrap();
 		assert!(matches!(outcome, TrustSyncOutcome::RemoteUnset));
+	}
+
+	#[tokio::test]
+	async fn sync_declining_a_bootstrap_leaves_the_ref_unset() {
+		let (_srv_dir, git_dir, server_repo) = server().await;
+		let (_dir, wt) = fixture().await;
+		let client = wt.repository();
+		let signer = TestSigner::new(1);
+		let server_tip = trust_init(
+			&server_repo,
+			Policy::Warn,
+			&signer.public_line(),
+			false,
+			&TestIdentity::default(),
+			&signer,
+		)
+		.await
+		.unwrap();
+
+		let transport = ServerTransport {
+			git_dir: git_dir.clone(),
+		};
+		// The confirm callback declines the (verifying but unseen) bootstrap root.
+		let outcome = trust_sync(
+			&transport,
+			client,
+			&origin(),
+			&advertisement(&git_dir).await,
+			&TestIdentity::default(),
+			async |_, _| Ok(false),
+		)
+		.await
+		.unwrap();
+
+		match outcome {
+			TrustSyncOutcome::Declined { new } => assert_eq!(new, server_tip),
+			_ => panic!("expected a declined bootstrap"),
+		}
+		// Declined: the local ref must stay unset.
+		assert!(client.refs().resolve(TRUST_REF).await.unwrap().is_none());
+	}
+
+	#[tokio::test]
+	async fn sync_bootstrap_confirm_sees_the_signing_anchor_and_can_adopt() {
+		let (_srv_dir, git_dir, server_repo) = server().await;
+		let (_dir, wt) = fixture().await;
+		let client = wt.repository();
+		let signer = TestSigner::new(1);
+		trust_init(
+			&server_repo,
+			Policy::Warn,
+			&signer.public_line(),
+			false,
+			&TestIdentity::default(),
+			&signer,
+		)
+		.await
+		.unwrap();
+
+		let transport = ServerTransport {
+			git_dir: git_dir.clone(),
+		};
+		// The confirm callback is handed the chain's anchor: the key that *signed* the bootstrap. A
+		// caller pinning `--expect` compares against exactly this.
+		let expected = fingerprint(&signer);
+		let outcome = trust_sync(
+			&transport,
+			client,
+			&origin(),
+			&advertisement(&git_dir).await,
+			&TestIdentity::default(),
+			async move |root: &TrustRoot, anchor: &KeyId| {
+				assert_eq!(anchor.as_str(), expected);
+				assert_eq!(root.keys.len(), 1);
+				Ok(true)
+			},
+		)
+		.await
+		.unwrap();
+		assert!(matches!(
+			outcome,
+			TrustSyncOutcome::Updated { old: None, .. }
+		));
+	}
+
+	#[tokio::test]
+	async fn sync_bootstrap_confirm_error_propagates_and_leaves_the_ref_unset() {
+		let (_srv_dir, git_dir, server_repo) = server().await;
+		let (_dir, wt) = fixture().await;
+		let client = wt.repository();
+		let signer = TestSigner::new(1);
+		trust_init(
+			&server_repo,
+			Policy::Warn,
+			&signer.public_line(),
+			false,
+			&TestIdentity::default(),
+			&signer,
+		)
+		.await
+		.unwrap();
+
+		let transport = ServerTransport {
+			git_dir: git_dir.clone(),
+		};
+		// A confirm that errors (e.g. a `--expect` fingerprint that does not match the anchor) aborts
+		// the sync — the error propagates and the ref never moves.
+		let err = trust_sync(
+			&transport,
+			client,
+			&origin(),
+			&advertisement(&git_dir).await,
+			&TestIdentity::default(),
+			async |_, _| anyhow::bail!("anchor does not match --expect"),
+		)
+		.await
+		.unwrap_err();
+		assert!(err.to_string().contains("--expect"), "{err}");
+		assert!(client.refs().resolve(TRUST_REF).await.unwrap().is_none());
+	}
+
+	#[tokio::test]
+	async fn sync_fast_forward_never_invokes_confirm() {
+		let (_srv_dir, git_dir, server_repo) = server().await;
+		let (_dir, wt) = fixture().await;
+		let client = wt.repository();
+		let (admin, colleague) = (TestSigner::new(1), TestSigner::new(2));
+		trust_init(
+			&server_repo,
+			Policy::Warn,
+			&admin.public_line(),
+			false,
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+
+		let transport = ServerTransport {
+			git_dir: git_dir.clone(),
+		};
+		// First sync adopts the bootstrap (confirmed).
+		trust_sync(
+			&transport,
+			client,
+			&origin(),
+			&advertisement(&git_dir).await,
+			&TestIdentity::default(),
+			async |_, _| Ok(true),
+		)
+		.await
+		.unwrap();
+
+		// The server extends the chain; the client's second sync is a fast-forward anchored to the
+		// already-trusted local root, so confirm must never be consulted.
+		trust_add_key(
+			&server_repo,
+			&colleague.public_line(),
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+		let outcome = trust_sync(
+			&transport,
+			client,
+			&origin(),
+			&advertisement(&git_dir).await,
+			&TestIdentity::default(),
+			async |_, _| panic!("confirm must not be called on a fast-forward"),
+		)
+		.await
+		.unwrap();
+		assert!(matches!(
+			outcome,
+			TrustSyncOutcome::Updated { old: Some(_), .. }
+		));
 	}
 
 	#[tokio::test]
