@@ -214,14 +214,30 @@ pub(crate) async fn config_signer<'a, H: HashAlgorithm>(
 	)
 }
 
-/// Whether git config `commit.gpgsign` requests commit signing. Fails *closed*: a config read/parse
-/// error propagates rather than silently dropping to unsigned. `gpg.format` is **not** checked here —
-/// that is deferred to [`LazyCliSigner`], so an operation that records no commit never fails on it.
+/// Whether git config `commit.gpgSign` requests commit signing (see [`config_requests_gpgsign`]).
 pub(crate) async fn config_requests_signing<H: HashAlgorithm>(
 	repo: &Repository<Backend, H>,
 ) -> Result<bool> {
+	config_requests_gpgsign(repo, "commit").await
+}
+
+/// Whether git config `tag.gpgSign` requests signing of annotated tags (`gta tag -a` with no explicit
+/// `-s`). The tag analog of [`config_requests_signing`], and equally fails *closed*.
+pub(crate) async fn config_requests_tag_signing<H: HashAlgorithm>(
+	repo: &Repository<Backend, H>,
+) -> Result<bool> {
+	config_requests_gpgsign(repo, "tag").await
+}
+
+/// Read `<section>.gpgSign` (git's boolean signing switch), defaulting to `false`. A config read/parse
+/// error propagates rather than silently dropping to unsigned. `gpg.format` is deferred to
+/// [`LazyCliSigner`], so an operation that records nothing never fails on it.
+async fn config_requests_gpgsign<H: HashAlgorithm>(
+	repo: &Repository<Backend, H>,
+	section: &str,
+) -> Result<bool> {
 	let config = repo.read_config().await?;
-	Ok(config.get_bool("commit", None, "gpgsign")?.unwrap_or(false))
+	Ok(config.get_bool(section, None, "gpgsign")?.unwrap_or(false))
 }
 
 /// Expand a leading `~` (`~` or `~/…`) against `$HOME`, as git and ssh do for `user.signingkey` —

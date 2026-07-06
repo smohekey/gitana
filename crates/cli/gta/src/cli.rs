@@ -239,12 +239,27 @@ enum Command {
 		/// Revision the new branch points at (default: `HEAD`).
 		start: Option<String>,
 	},
-	/// List tags, or create a lightweight one.
+	/// List tags, or create a lightweight, annotated, or signed one.
 	Tag {
 		/// Tag to create. With none, list tags.
 		name: Option<String>,
 		/// Revision the new tag points at (default: `HEAD`).
 		target: Option<String>,
+		/// Create an annotated tag object (implied by -m/-s).
+		#[arg(short = 'a', long = "annotate")]
+		annotate: bool,
+		/// Sign the annotated tag with SSH (implies -a; default: git config `tag.gpgSign`).
+		#[arg(short = 's', long = "sign")]
+		sign: bool,
+		/// Do not sign, overriding `tag.gpgSign`.
+		#[arg(long = "no-sign", conflicts_with = "sign")]
+		no_sign: bool,
+		/// Tag message (implies -a).
+		#[arg(short = 'm', long = "message")]
+		message: Option<String>,
+		/// SSH key to sign with (default: git config `user.signingkey`).
+		#[arg(long = "signing-key", value_name = "path")]
+		signing_key: Option<PathBuf>,
 	},
 	/// Switch branches, updating the working tree and HEAD.
 	Switch {
@@ -560,7 +575,27 @@ impl Cli {
 				.await
 			}
 			Command::Branch { name, start } => commands::branch::run(&cwd, name, start).await,
-			Command::Tag { name, target } => commands::tag::run(&cwd, name, target).await,
+			Command::Tag {
+				name,
+				target,
+				annotate,
+				sign,
+				no_sign,
+				message,
+				signing_key,
+			} => {
+				commands::tag::run(
+					&cwd,
+					name,
+					target,
+					annotate,
+					sign,
+					no_sign,
+					message,
+					signing_key,
+				)
+				.await
+			}
 			Command::Switch {
 				create,
 				force,
