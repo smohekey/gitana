@@ -8,8 +8,9 @@
 through receive-pack. Trust is opt-in per repository via the signed `refs/gitana/trust` root — there
 is no global default to flip — so `gta trust init`/`set-policy` choose the policy, and
 `docs/trust-migration.md` covers moving an existing repository onto `require`. Remaining work is
-additive and out of the v1 scope below: OpenPGP signatures, a one-time-nonce replay cache, a signed
-`--signed --delete`, and a persisted require-time baseline.
+additive and out of the v1 scope below — OpenPGP signatures, a one-time-nonce replay cache, a signed
+`--signed --delete`, a persisted require-time baseline, and a `trust sync` audit event — each scoped in
+`trust-followups.md`.
 
 ## Context
 

@@ -118,7 +118,20 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [ ] Sign delete commands in `gta push --signed --delete`. A signed delete currently sends an
   *unsigned* delete (the delete path returns before certificate building), so under a `require` policy a
   protected-ref deletion could not be authorised. Fold the delete command into a `push_signed`
-  certificate (one cert command, `<old> <zero> <ref>`) so a signed delete is possible.
+  certificate (one cert command, `<old> <zero> <ref>`) so a signed delete is possible. Scoped in
+  `docs/hlds/trust-followups.md#1-signed-push---signed---delete`.
+- [ ] Emit a `trust sync` audit event. Add `AuditEvent::TrustRootAdopted { anchor }` and surface it from
+  `trust_sync`, completing the client-side audit vocabulary (descoped from step 7b). Scoped in
+  `docs/hlds/trust-followups.md#5-trustrootadopted-audit-event-for-trust-sync`.
+- [ ] Add a one-time-nonce replay cache. Close the replay-within-freshness-window gap (accepted by
+  design in v1's stateless HMAC nonce) with a host-supplied TTL nonce ledger threaded through
+  `verify_push`, keeping the core pure. Scoped in `docs/hlds/trust-followups.md#2-one-time-nonce-replay-cache`.
+- [ ] Add a persisted require-time baseline. Snapshot the grandfather set at the `require` cutover into a
+  stored artifact so object-signature enforcement is incremental and stable, instead of the live
+  `protected_baseline` walk. Scoped in `docs/hlds/trust-followups.md#4-persisted-require-time-baseline`.
+- [ ] Add OpenPGP signature support. Verify (and optionally produce) OpenPGP-signed commits/tags/push
+  certs alongside SSHSIG, dispatching on the armor marker in the trust core and extending `TrustedKey`.
+  Large (new dependency). Scoped in `docs/hlds/trust-followups.md#3-openpgp-signatures`.
 - [x] Add verification helpers for received push certificates. `gitana-git-http`'s `verify_push`
   (`enforce.rs`) verifies a certificate's SSHSIG against the folded trust root, checks the repo-bound
   nonce freshness, matches the pushee, and confirms the signed commands equal what receive-pack applies.
@@ -138,8 +151,9 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   validation matrix is green (`docs/trust-validation-matrix.md`, including a real stock
   `git push --signed` verified end to end), with a migration preflight + guide
   (`docs/trust-migration.md`). Trust is opt-in per repository via the signed `refs/gitana/trust`
-  root. Additive follow-ups: OpenPGP, a one-time-nonce replay cache, a signed `--signed --delete`,
-  and a persisted require-time baseline.
+  root. Additive follow-ups (OpenPGP, a one-time-nonce replay cache, a signed `--signed --delete`, a
+  persisted require-time baseline, and a `trust sync` audit event) are scoped in
+  `docs/hlds/trust-followups.md` and tracked as their own items above.
 
 ## Working Tree Details
 
