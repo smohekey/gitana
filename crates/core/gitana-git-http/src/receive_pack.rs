@@ -16,6 +16,7 @@ use gitana_object::{
 	ref_delta_base_ids, referenced_ids, write_flush, write_pkt,
 };
 use gitana_repository::{Repository, RepositoryError};
+use gitana_trust::AuditEvent;
 
 use crate::push_cert::{self, PushCert};
 use crate::{GitHttpError, RefUpdate, TrustContext, TrustVerdict, verify_push};
@@ -68,9 +69,11 @@ pub struct ReceiveOutcome<H: HashAlgorithm> {
 	/// The push certificate, if the client signed the push (`git push --signed`). The
 	/// wire codec only surfaces it; policy belongs to the embedding host.
 	pub push_cert: Option<PushCert>,
-	/// Trust failures observed but not enforced (only ever non-empty under `warn` policy). The wire
-	/// report does not carry them; a host records them for audit (step 7).
-	pub warnings: Vec<String>,
+	/// The trust-policy audit trail for this push (`docs/hlds/secure-git-trust-signing.md`, step 7):
+	/// whether it was accepted (with any `warn`-mode warnings), rejected outright, or had specific
+	/// refs rejected. The wire report does not carry these; a host records them for audit. Empty when
+	/// the push failed before trust ran (a bad pack or a connectivity gap).
+	pub audit: Vec<AuditEvent>,
 }
 
 /// Handle a receive-pack request body, returning the report and the accepted updates.
@@ -106,7 +109,7 @@ pub async fn receive_pack<F: FileStore, H: HashAlgorithm>(
 				report: report_unpack_failure(out, &commands, &reason),
 				updated: Vec::new(),
 				push_cert,
-				warnings: Vec::new(),
+				audit: Vec::new(),
 			});
 		}
 	};
@@ -116,7 +119,7 @@ pub async fn receive_pack<F: FileStore, H: HashAlgorithm>(
 			report: report_unpack_failure(out, &commands, &reason),
 			updated: Vec::new(),
 			push_cert,
-			warnings: Vec::new(),
+			audit: Vec::new(),
 		});
 	}
 
@@ -133,28 +136,48 @@ pub async fn receive_pack<F: FileStore, H: HashAlgorithm>(
 		options.now,
 	)
 	.await?;
-	let (rejected, warnings) = match verdict {
-		TrustVerdict::Accept { warnings } => (HashMap::new(), warnings),
-		// A whole-push rejection (bad certificate, unverifiable root) `ng`s every ref and writes
-		// nothing — the repository is left exactly as it was.
-		TrustVerdict::Reject {
-			global: Some(reason),
-			..
-		} => {
-			let names: Vec<String> = commands.iter().map(|c| c.name.clone()).collect();
-			return Ok(ReceiveOutcome {
-				report: rejection_report(&names, &reason),
-				updated: Vec::new(),
-				push_cert,
-				warnings: Vec::new(),
-			});
-		}
-		// Per-ref rejections `ng` only the named refs; the rest of the push still applies.
-		TrustVerdict::Reject { global: None, refs } => (
-			refs.into_iter().collect::<HashMap<String, String>>(),
-			Vec::new(),
-		),
-	};
+	// Split the verdict into the refs trust rejects (denied before they reach `apply_command`), the
+	// `warn`-mode warnings, and the audit events for the rejections. The acceptance event is built
+	// *after* the apply loop from the refs that actually landed — trust clearing a ref does not mean
+	// it moves (a non-fast-forward, denied deletion, or stale old id still `ng`s it on the wire).
+	let (rejected, warnings, mut audit): (HashMap<String, String>, Vec<String>, Vec<AuditEvent>) =
+		match verdict {
+			TrustVerdict::Accept { warnings } => (HashMap::new(), warnings, Vec::new()),
+			// A whole-push rejection (bad certificate, unverifiable root) `ng`s every ref and writes
+			// nothing — the repository is left exactly as it was. The verdict may also carry per-ref
+			// failures (a `require` push both missing a certificate and introducing an unsigned
+			// object): the wire report is a blanket rejection, but the audit trail keeps every reason.
+			TrustVerdict::Reject {
+				global: Some(reason),
+				refs,
+			} => {
+				let names: Vec<String> = commands.iter().map(|c| c.name.clone()).collect();
+				let report = rejection_report(&names, &reason);
+				let mut audit = vec![AuditEvent::PushRejected { reason }];
+				audit.extend(
+					refs
+						.into_iter()
+						.map(|(name, reason)| AuditEvent::RefRejected { name, reason }),
+				);
+				return Ok(ReceiveOutcome {
+					report,
+					updated: Vec::new(),
+					push_cert,
+					audit,
+				});
+			}
+			// Per-ref rejections `ng` only the named refs; the rest of the push still applies.
+			TrustVerdict::Reject { global: None, refs } => {
+				let audit = refs
+					.iter()
+					.map(|(name, reason)| AuditEvent::RefRejected {
+						name: name.clone(),
+						reason: reason.clone(),
+					})
+					.collect();
+				(refs.into_iter().collect(), Vec::new(), audit)
+			}
+		};
 
 	// Migrate only the objects reachable from accepted updates. A trust-rejected ref must not leave
 	// its (unsigned/untrusted) objects behind in the store — objects reachable from an accepted ref
@@ -173,6 +196,7 @@ pub async fn receive_pack<F: FileStore, H: HashAlgorithm>(
 	}
 	write_pkt(&mut out, b"unpack ok\n")?;
 	let mut updated = Vec::new();
+	let mut applied = Vec::new();
 	for command in &commands {
 		if let Some(reason) = rejected.get(&command.name) {
 			write_pkt(
@@ -184,6 +208,7 @@ pub async fn receive_pack<F: FileStore, H: HashAlgorithm>(
 		match apply_command(repo, command, options.force).await {
 			Ok(()) => {
 				write_pkt(&mut out, format!("ok {}\n", command.name).as_bytes())?;
+				applied.push(command.name.clone());
 				if let Some(new) = command.new {
 					updated.push((command.name.clone(), new));
 				}
@@ -197,11 +222,19 @@ pub async fn receive_pack<F: FileStore, H: HashAlgorithm>(
 		}
 	}
 	write_flush(&mut out);
+	// Record the acceptance for the refs that actually moved (and any `warn`-mode warnings). If
+	// nothing landed and there is nothing to warn about, there is no acceptance to audit.
+	if !applied.is_empty() || !warnings.is_empty() {
+		audit.push(AuditEvent::PushAccepted {
+			refs: applied,
+			warnings,
+		});
+	}
 	Ok(ReceiveOutcome {
 		report: out,
 		updated,
 		push_cert,
-		warnings,
+		audit,
 	})
 }
 

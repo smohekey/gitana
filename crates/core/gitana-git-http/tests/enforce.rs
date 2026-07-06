@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_git_http::{
-	CertCommand, PushCert, ReceiveOptions, ReceiveOutcome, RefUpdate, TrustContext, TrustVerdict,
-	build_push_cert, make_nonce, receive_pack, verify_push,
+	AuditEvent, CertCommand, PushCert, ReceiveOptions, ReceiveOutcome, RefUpdate, TrustContext,
+	TrustVerdict, build_push_cert, make_nonce, receive_pack, verify_push,
 };
 use gitana_object::{
 	Commit, ObjectId, ObjectKind, PackedObject, Sha256, Tag, TreeEntry, encode_commit, encode_pack,
@@ -897,6 +897,25 @@ async fn wire_require_rejects_unsigned_push_and_leaves_ref_unmoved() {
 		!repo.objects().exists_object(&commit).await.expect("exists"),
 		"a globally rejected push writes no objects"
 	);
+	// This push is rejected on two counts at once — no push certificate (whole-push) and an unsigned
+	// commit under a protected ref (per-ref) — and the audit trail keeps both, even though the wire
+	// report is a blanket rejection.
+	assert!(
+		outcome
+			.audit
+			.iter()
+			.any(|event| matches!(event, AuditEvent::PushRejected { .. })),
+		"{:?}",
+		outcome.audit
+	);
+	assert!(
+		outcome.audit.iter().any(|event| matches!(
+			event,
+			AuditEvent::RefRejected { name, .. } if name == "refs/heads/main"
+		)),
+		"{:?}",
+		outcome.audit
+	);
 }
 
 #[tokio::test]
@@ -933,6 +952,14 @@ async fn wire_require_accepts_valid_signed_push_and_moves_ref() {
 			.expect("resolve"),
 		Some(commit)
 	);
+	// The audit trail records an acceptance with no warnings.
+	assert_eq!(
+		outcome.audit,
+		vec![AuditEvent::PushAccepted {
+			refs: vec!["refs/heads/main".to_owned()],
+			warnings: Vec::new(),
+		}]
+	);
 }
 
 #[tokio::test]
@@ -948,11 +975,15 @@ async fn wire_warn_surfaces_warnings_and_moves_ref() {
 	let outcome = run_receive(&repo, &request).await;
 	let text = report_text(&outcome);
 	assert!(text.contains("ok refs/heads/main"), "{text}");
-	// Under warn the failures are recorded on the outcome (for host audit) but not enforced.
-	assert!(
-		!outcome.warnings.is_empty(),
-		"warn should surface the unenforced failures"
-	);
+	// Under warn the failures are recorded on the audit trail (for a host to log) but not enforced:
+	// the push is accepted, carrying the unenforced failures as warnings.
+	match outcome.audit.as_slice() {
+		[AuditEvent::PushAccepted { refs, warnings }] => {
+			assert_eq!(refs, &["refs/heads/main".to_owned()]);
+			assert!(!warnings.is_empty(), "warn should record the failures");
+		}
+		other => panic!("expected accept-with-warnings, got {other:?}"),
+	}
 	assert_eq!(
 		repo
 			.refs()
@@ -1022,6 +1053,77 @@ async fn wire_require_partial_reject_applies_good_ref_and_ngs_bad() {
 	assert!(
 		repo.objects().exists_object(&good).await.expect("exists"),
 		"the accepted ref's objects are migrated"
+	);
+	// The audit trail records the per-ref rejection and, separately, the accepted ref.
+	assert!(
+		outcome.audit.iter().any(|event| matches!(
+			event,
+			AuditEvent::RefRejected { name, .. } if name == "refs/heads/bad"
+		)),
+		"{:?}",
+		outcome.audit
+	);
+	assert!(
+		outcome.audit.contains(&AuditEvent::PushAccepted {
+			refs: vec!["refs/heads/good".to_owned()],
+			warnings: Vec::new(),
+		}),
+		"{:?}",
+		outcome.audit
+	);
+}
+
+#[tokio::test]
+async fn wire_trust_cleared_but_non_fast_forward_ref_is_not_audited_as_accepted() {
+	// A repo with no trust root: verify_push accepts everything, so acceptance is decided entirely
+	// by the receive path. The audit must reflect what actually moved, not what trust cleared.
+	let repo = new_repo().await;
+
+	let (first, first_raw) = commit_bytes(None, "one\n");
+	let create = plain_request(
+		&one_commit(first, first_raw),
+		None,
+		first,
+		"refs/heads/main",
+	);
+	let created = run_receive(&repo, &create).await;
+	assert_eq!(
+		created.audit,
+		vec![AuditEvent::PushAccepted {
+			refs: vec!["refs/heads/main".to_owned()],
+			warnings: Vec::new(),
+		}]
+	);
+
+	// An unrelated commit is not a fast-forward of the first; with force off the receive path `ng`s
+	// it even though trust raised no objection.
+	let (second, second_raw) = commit_bytes(None, "two\n");
+	let update = plain_request(
+		&one_commit(second, second_raw),
+		Some(first),
+		second,
+		"refs/heads/main",
+	);
+	let outcome = run_receive(&repo, &update).await;
+	let text = report_text(&outcome);
+	assert!(
+		text.contains("ng refs/heads/main non-fast-forward"),
+		"{text}"
+	);
+	assert_eq!(
+		repo
+			.refs()
+			.resolve("refs/heads/main")
+			.await
+			.expect("resolve"),
+		Some(first),
+		"the ref did not move"
+	);
+	// The audit records no acceptance — nothing landed and there was nothing to warn about.
+	assert!(
+		outcome.audit.is_empty(),
+		"a non-fast-forward ref must not be audited as accepted: {:?}",
+		outcome.audit
 	);
 }
 

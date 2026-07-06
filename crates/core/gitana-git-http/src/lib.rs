@@ -25,6 +25,7 @@ pub use client::{
 };
 pub use enforce::{TrustContext, TrustVerdict, verify_push};
 pub use fetch::fetch;
+pub use gitana_trust::AuditEvent;
 pub use ls_refs::ls_refs;
 pub use pack::build_pack;
 pub use push_cert::{

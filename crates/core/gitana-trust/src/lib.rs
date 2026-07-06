@@ -19,6 +19,7 @@
 //! `refs/gitana/trust` commit chain (through an [`ObjectSource`]) into the effective [`TrustRoot`],
 //! proving the whole authorization chain without touching any ref.
 
+mod audit_event;
 mod error;
 mod fold;
 mod folded_trust;
@@ -29,6 +30,7 @@ mod trust_document;
 mod trust_root;
 mod trusted_key;
 
+pub use self::audit_event::AuditEvent;
 pub use self::error::TrustError;
 pub use self::fold::{
 	fold_trust_root, fold_trust_root_anchored, verify_candidate_trust_update,
