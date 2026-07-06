@@ -54,9 +54,9 @@ pub(crate) async fn fetch<H: HashAlgorithm>(
 }
 
 /// Push `HEAD`'s branch to the remote at `url` (or, with `delete`, remove a remote branch),
-/// returning the outcome. The advertised object-format is checked against `repo`'s first. Signed
-/// pushes are not supported here — signing is deferred to the trust work — so the pusher-identity
-/// resolver (only reached for a signed push) unconditionally errors.
+/// returning the outcome. The advertised object-format is checked against `repo`'s first. This is an
+/// unsigned push: certificate signing shells out to `ssh-keygen`, which the component has no authority
+/// to do, so `gta push --signed` stays on the CLI.
 pub(crate) async fn push<H: HashAlgorithm>(
 	repo: &Repository<WorktreeFileStore, H>,
 	url: &str,
@@ -78,18 +78,9 @@ pub(crate) async fn push<H: HashAlgorithm>(
 		)));
 	}
 
-	let outcome = gitana_porcelain::push(
-		&transport,
-		repo,
-		&origin,
-		&advertisement,
-		force,
-		delete,
-		false,
-		async || anyhow::bail!("signed push is not supported in the component"),
-	)
-	.await
-	.map_err(remote_error)?;
+	let outcome = gitana_porcelain::push(&transport, repo, &origin, &advertisement, force, delete)
+		.await
+		.map_err(remote_error)?;
 
 	Ok(match outcome {
 		PushOutcome::Pushed { branch, forced, .. } => {

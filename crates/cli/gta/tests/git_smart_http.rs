@@ -44,11 +44,17 @@ fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
 async fn info_refs(State(git_dir): State<PathBuf>, RawQuery(query): RawQuery) -> Bytes {
 	let raw = query.unwrap_or_default();
 	let service = Service::parse(raw.strip_prefix("service=").unwrap_or(&raw)).expect("service");
-	let body = advertise(&open(&git_dir), service, ProtocolVersion::V0, None)
+	// Offer push-cert on receive-pack (advertise a nonce) so `gta push --signed` has something to sign.
+	// Trust is not enforced here (`TrustContext::none()`), so the nonce is only echoed, not verified.
+	let nonce = matches!(service, Service::ReceivePack).then_some(PUSH_CERT_NONCE);
+	let body = advertise(&open(&git_dir), service, ProtocolVersion::V0, nonce)
 		.await
 		.expect("advertise");
 	Bytes::from(body)
 }
+
+/// The push-cert nonce this test server advertises for receive-pack.
+const PUSH_CERT_NONCE: &str = "1700000000-testnonce";
 
 /// `POST /git-upload-pack` — v0 fetch/clone negotiation, responds with the packfile.
 async fn upload_pack(State(git_dir): State<PathBuf>, body: Bytes) -> Bytes {
@@ -239,6 +245,107 @@ async fn push_moves_the_server_ref() {
 		.unwrap()
 		.unwrap();
 	assert_eq!(server_tip.to_hex(), local_tip);
+}
+
+/// `gta push --signed` drives the real `ssh-keygen` signer end to end: it attaches a push certificate
+/// (the server advertises a nonce), the signed path is taken (`(signed)` reported), and the ref moves.
+/// The cryptographic correctness of the certificate — that its signature verifies under the signing
+/// key in git's `git` namespace — is asserted at the porcelain level; here the value is the CLI wiring
+/// (`--signed`/`--signing-key`, config resolution, the `ssh-keygen` subprocess) over a live server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_signed_moves_the_server_ref() {
+	if !have_ssh_keygen() {
+		eprintln!("skipping: ssh-keygen not available");
+		return;
+	}
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	ok(&gta(&["-C", t, "config", "user.name", "T"]).await, "name");
+	ok(
+		&gta(&["-C", t, "config", "user.email", "t@e"]).await,
+		"email",
+	);
+
+	// An ephemeral ed25519 key; `gta push --signed` signs with `ssh-keygen -Y sign` under this key.
+	let key = target.join("key");
+	ssh_keygen(&[
+		"-q",
+		"-t",
+		"ed25519",
+		"-N",
+		"",
+		"-C",
+		"t@e",
+		"-f",
+		key.to_str().unwrap(),
+	]);
+	ok(
+		&gta(&["-C", t, "config", "gpg.format", "ssh"]).await,
+		"gpg.format",
+	);
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"user.signingkey",
+			key.with_extension("pub").to_str().unwrap(),
+		])
+		.await,
+		"signingkey",
+	);
+
+	std::fs::write(target.join("f.txt"), b"2\n").unwrap();
+	ok(&gta(&["-C", t, "add", "f.txt"]).await, "add");
+	ok(
+		&gta(&["-C", t, "commit", "-m", "local change"]).await,
+		"commit",
+	);
+	let local_tip = stdout(&gta(&["-C", t, "rev-parse", "HEAD"]).await, "rev-parse");
+
+	// The signed push takes the certificate path and reports it.
+	let out = stdout(&gta(&["-C", t, "push", "--signed"]).await, "push --signed");
+	assert!(
+		out.contains("(signed)"),
+		"push did not report a signed push: {out}"
+	);
+
+	// The server's branch advanced to the pushed commit.
+	let server_tip = open(&git_dir)
+		.refs()
+		.resolve("refs/heads/main")
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(server_tip.to_hex(), local_tip);
+}
+
+/// Whether `ssh-keygen` is on `PATH` (SSH signing shells out to it); the signed-push test skips if not.
+fn have_ssh_keygen() -> bool {
+	std::process::Command::new("ssh-keygen")
+		.arg("-?")
+		.output()
+		.is_ok()
+}
+
+/// Run `ssh-keygen` with `args`, asserting success (used to mint an ephemeral signing key).
+fn ssh_keygen(args: &[&str]) {
+	let out = std::process::Command::new("ssh-keygen")
+		.args(args)
+		.output()
+		.expect("run ssh-keygen");
+	assert!(
+		out.status.success(),
+		"ssh-keygen {args:?} failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

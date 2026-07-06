@@ -107,11 +107,28 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 
 ## Signing And Integrity
 
-- [ ] Wire `gta push --signed` to load signing keys and produce real signatures.
-- [ ] Add verification helpers for received push certificates.
-- [ ] Add signed commit creation.
-- [ ] Add signed tag creation.
-- [ ] Decide how much signature verification belongs in core crates versus host policy.
+- [x] Wire `gta push --signed` to load signing keys and produce real signatures. `gta push --signed`
+  attaches a push certificate signed with `ssh-keygen -Y sign` (git's `git` SSHSIG namespace) over the
+  certificate body — the bytes stock `git push --signed` signs and receive-pack verifies. The porcelain
+  `push` split into an unsigned `push` (wasm component, no signer authority) and a `push_signed` taking
+  a pusher-identity resolver + `Signer`; the CLI resolves `--signing-key`/`user.signingkey` into a
+  `LazyCliSigner` (explicit-ssh policy, like `commit -S`), both invoked only after the server advertises
+  push-cert. Covered by a porcelain round-trip (cert verifies via the real trust core) and a CLI e2e
+  over the loopback smart-HTTP harness.
+- [ ] Sign delete commands in `gta push --signed --delete`. A signed delete currently sends an
+  *unsigned* delete (the delete path returns before certificate building), so under a `require` policy a
+  protected-ref deletion could not be authorised. Fold the delete command into a `push_signed`
+  certificate (one cert command, `<old> <zero> <ref>`) so a signed delete is possible.
+- [x] Add verification helpers for received push certificates. `gitana-git-http`'s `verify_push`
+  (`enforce.rs`) verifies a certificate's SSHSIG against the folded trust root, checks the repo-bound
+  nonce freshness, matches the pushee, and confirms the signed commands equal what receive-pack applies.
+- [x] Add signed commit creation. `gta commit -S` (and every history op) records a `gpgsig`-armored
+  commit via the `signing` seam; verifiable by stock git and the trust core.
+- [x] Add signed tag creation. `gta tag -a/-s` writes annotated tag objects, signed when `-s` (or
+  `tag.gpgSign`), with the signature block preserved byte-for-byte.
+- [ ] Decide how much signature verification belongs in core crates versus host policy. (Provisionally:
+  `gitana-trust` owns pure verification; `gitana-git-http` orchestrates the receive-pack boundary;
+  `warn`/`require` enforcement + audit output is the remaining step 7–8 work.)
 
 ## Working Tree Details
 

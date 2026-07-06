@@ -15,6 +15,8 @@ use gitana_remote::{HttpTransport, Origin, RECEIVE_PACK_REQUEST, Refspec};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
 
+use crate::Signer;
+
 /// The outcome of a [`fetch`]: the tracking refs it advanced, and any it declined to.
 pub struct FetchOutcome<H: HashAlgorithm> {
 	/// Tracking refs advanced (`(ref name, new oid)`).
@@ -259,10 +261,9 @@ pub enum PushOutcome {
 	UpToDate,
 }
 
-/// Push `HEAD`'s branch to `origin` (or, with `delete`, remove a remote branch). `advertisement` is the
-/// already-fetched `git-receive-pack` `GET /info/refs` body. For a signed push, `pusher` resolves the
-/// certificate's pusher line — called only after confirming the server offers push-cert, so an
-/// unconfigured identity does not mask "the server does not accept signed pushes".
+/// Push `HEAD`'s branch to `origin` over an unsigned receive-pack request (or, with `delete`, remove a
+/// remote branch). `advertisement` is the already-fetched `git-receive-pack` `GET /info/refs` body.
+/// For a signed push (`gta push --signed`), see [`push_signed`].
 pub async fn push<F: FileStore, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
@@ -270,29 +271,89 @@ pub async fn push<F: FileStore, H: HashAlgorithm>(
 	advertisement: &[u8],
 	force: bool,
 	delete: Option<String>,
-	signed: bool,
-	pusher: impl AsyncFnOnce() -> Result<String>,
 ) -> Result<PushOutcome> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
 
 	if let Some(target) = delete {
-		let refname = normalize_branch(&target);
-		let remote = advertised
-			.oid_of(&refname)
-			.with_context(|| format!("the remote has no {refname}"))?;
-		let update = RefUpdate {
-			old: Some(remote),
-			new: None,
-			name: refname.clone(),
-		};
-		let request = build_receive_pack_request(std::slice::from_ref(&update), &[]);
-		let response = transport
-			.post(&origin.receive_pack(), RECEIVE_PACK_REQUEST, request)
-			.await?;
-		parse_report_status(&response)?;
-		return Ok(PushOutcome::Deleted { refname });
+		return delete_ref(transport, origin, &advertised, &target).await;
 	}
 
+	let Some(plan) = prepare_branch_push(repo, &advertised, force).await? else {
+		return Ok(PushOutcome::UpToDate);
+	};
+	let update = RefUpdate {
+		old: plan.remote_old,
+		new: Some(plan.local_tip),
+		name: plan.branch.clone(),
+	};
+	let request = build_receive_pack_request(std::slice::from_ref(&update), &plan.pack);
+	send_receive_pack(transport, origin, request).await?;
+	Ok(PushOutcome::Pushed {
+		branch: plan.branch,
+		signed: false,
+		forced: force,
+	})
+}
+
+/// Push `HEAD`'s branch to `origin` with a signed push certificate (`gta push --signed`). Otherwise
+/// like [`push`]. `pusher` resolves the certificate's pusher line and `signer` signs the certificate
+/// body — both invoked only after confirming the server offers push-cert, so an unconfigured identity
+/// or an unresolvable signing key does not mask "the server does not accept signed pushes".
+pub async fn push_signed<F: FileStore, H: HashAlgorithm, S: Signer>(
+	transport: &impl HttpTransport,
+	repo: &Repository<F, H>,
+	origin: &Origin,
+	advertisement: &[u8],
+	force: bool,
+	pusher: impl AsyncFnOnce() -> Result<String>,
+	signer: &S,
+) -> Result<PushOutcome> {
+	let advertised = parse_advertisement::<H>(advertisement)?;
+
+	let Some(plan) = prepare_branch_push(repo, &advertised, force).await? else {
+		return Ok(PushOutcome::UpToDate);
+	};
+	let nonce = advertised
+		.push_cert_nonce
+		.clone()
+		.context("the server does not accept signed pushes")?;
+	let mut cert = build_cert(
+		origin,
+		pusher().await?,
+		nonce,
+		plan.remote_old,
+		plan.local_tip,
+		&plan.branch,
+	);
+	// The signer emits an SSHSIG armor (git's `git` namespace) over the certificate body — exactly what
+	// receive-pack verifies via `verify_sshsig(cert.payload(), cert.signature, keys, "git")`.
+	cert.signature = signer.sign(&cert.payload()).await?;
+	let request = build_push_cert(&cert, &push_caps::<H>(), &plan.pack);
+	send_receive_pack(transport, origin, request).await?;
+	Ok(PushOutcome::Pushed {
+		branch: plan.branch,
+		signed: true,
+		forced: force,
+	})
+}
+
+/// A planned branch push: the ref-update coordinates and the pack the remote lacks, shared by [`push`]
+/// and [`push_signed`]. `prepare_branch_push` returns `None` when the remote already has the tip.
+struct BranchPush<H: HashAlgorithm> {
+	branch: String,
+	remote_old: Option<ObjectId<H>>,
+	local_tip: ObjectId<H>,
+	pack: Vec<u8>,
+}
+
+/// Resolve `HEAD`'s branch and tip against the advertised refs, enforce the fast-forward rule (unless
+/// `force`), and pack the objects the remote lacks. Returns `None` when the remote already has the tip
+/// (nothing to send). Shared preamble of the signed and unsigned pushes so both apply the same guards.
+async fn prepare_branch_push<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	advertised: &Advertised<H>,
+	force: bool,
+) -> Result<Option<BranchPush<H>>> {
 	let branch = match repo.refs().read_head().await? {
 		HeadState::Symbolic(branch) => branch,
 		HeadState::Detached(_) => bail!("cannot push a detached HEAD"),
@@ -305,7 +366,7 @@ pub async fn push<F: FileStore, H: HashAlgorithm>(
 
 	let remote_old = advertised.oid_of(&branch);
 	if remote_old == Some(local_tip) {
-		return Ok(PushOutcome::UpToDate);
+		return Ok(None);
 	}
 
 	// Without `--force`, refuse a non-fast-forward before sending anything: the remote tip must be an
@@ -323,45 +384,52 @@ pub async fn push<F: FileStore, H: HashAlgorithm>(
 	}
 
 	// Pack the objects the remote lacks (reachable from the tip, minus its refs).
-	let haves = gitana_remote::advertised_oids(&advertised);
+	let haves = gitana_remote::advertised_oids(advertised);
 	let pack = build_pack(repo, &[local_tip], &haves).await?;
+	Ok(Some(BranchPush {
+		branch,
+		remote_old,
+		local_tip,
+		pack,
+	}))
+}
 
-	let request = if signed {
-		let nonce = advertised
-			.push_cert_nonce
-			.clone()
-			.context("the server does not accept signed pushes")?;
-		let cert = build_cert(
-			origin,
-			pusher().await?,
-			nonce,
-			remote_old,
-			local_tip,
-			&branch,
-		);
-		build_push_cert(&cert, &push_caps::<H>(), &pack)
-	} else {
-		let update = RefUpdate {
-			old: remote_old,
-			new: Some(local_tip),
-			name: branch.clone(),
-		};
-		build_receive_pack_request(std::slice::from_ref(&update), &pack)
+/// Send a delete-ref command for `target` (a branch name or full ref) to the remote.
+async fn delete_ref<H: HashAlgorithm>(
+	transport: &impl HttpTransport,
+	origin: &Origin,
+	advertised: &Advertised<H>,
+	target: &str,
+) -> Result<PushOutcome> {
+	let refname = normalize_branch(target);
+	let remote = advertised
+		.oid_of(&refname)
+		.with_context(|| format!("the remote has no {refname}"))?;
+	let update = RefUpdate {
+		old: Some(remote),
+		new: None,
+		name: refname.clone(),
 	};
+	let request = build_receive_pack_request(std::slice::from_ref(&update), &[]);
+	send_receive_pack(transport, origin, request).await?;
+	Ok(PushOutcome::Deleted { refname })
+}
 
+/// POST a receive-pack request to `origin` and check the report-status it returns.
+async fn send_receive_pack(
+	transport: &impl HttpTransport,
+	origin: &Origin,
+	request: Vec<u8>,
+) -> Result<()> {
 	let response = transport
 		.post(&origin.receive_pack(), RECEIVE_PACK_REQUEST, request)
 		.await?;
 	parse_report_status(&response)?;
-	Ok(PushOutcome::Pushed {
-		branch,
-		signed,
-		forced: force,
-	})
+	Ok(())
 }
 
-/// Build a push certificate for a single-branch update. Signing itself is not yet wired, so the
-/// `signature` is left empty; the payload is otherwise complete.
+/// Build a push certificate for a single-branch update, with an empty `signature`: the caller signs
+/// [`PushCert::payload`] and fills it in. The payload (pusher, pushee, nonce, and command) is complete.
 fn build_cert<H: HashAlgorithm>(
 	origin: &Origin,
 	pusher: String,
@@ -398,5 +466,160 @@ fn normalize_branch(name: &str) -> String {
 		name.to_owned()
 	} else {
 		format!("refs/heads/{name}")
+	}
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+	use std::cell::RefCell;
+
+	use gitana_git_http::{ProtocolVersion, Service, advertise, make_nonce, peek_push_cert};
+	use gitana_object::{write_flush, write_pkt};
+	use gitana_trust::{TrustedKey, verify_sshsig};
+	use gitana_worktree::Index;
+
+	use super::*;
+	use crate::test_support::{TestIdentity, TestSigner, fixture, stage};
+
+	/// A [`HttpTransport`] double that records the single POSTed request and answers with a success
+	/// `report-status` (`unpack ok`), so a push completes without a real server.
+	struct CapturingTransport {
+		posted: RefCell<Option<Vec<u8>>>,
+	}
+
+	impl HttpTransport for CapturingTransport {
+		async fn get(&self, _url: &str) -> Result<Vec<u8>> {
+			unreachable!("push does not GET the advertisement (the caller passes it in)")
+		}
+
+		async fn post(&self, _url: &str, _content_type: &str, body: Vec<u8>) -> Result<Vec<u8>> {
+			*self.posted.borrow_mut() = Some(body);
+			let mut report = Vec::new();
+			write_pkt(&mut report, b"unpack ok\n").unwrap();
+			write_flush(&mut report);
+			Ok(report)
+		}
+	}
+
+	/// A signed push attaches a certificate whose signature the trust core accepts — the same check
+	/// receive-pack runs — over the exact payload, carrying the server's nonce, the pushee URL, and the
+	/// create command. This is the client half of `gta push --signed`.
+	#[tokio::test]
+	async fn push_signed_attaches_a_verifiable_certificate() {
+		// A client repo with one commit on `refs/heads/main`.
+		let (_dir, wt) = fixture().await;
+		let blob = wt.repository().write_blob(b"hello\n").await.unwrap();
+		let mut index = Index::new();
+		stage(&mut index, "f.txt", blob);
+		wt.save_index(&index).await.unwrap();
+		let tip = crate::commit(&wt, "root", &TestIdentity::default())
+			.await
+			.unwrap();
+
+		// A server advertisement that offers push-cert (a nonce) and has no `refs/heads/main` yet, so
+		// the push is a create — always a fast-forward, no objects to reconcile.
+		let (_server_dir, server) = fixture().await;
+		let nonce = make_nonce(b"secret", "acme/app", 1_700_000_000, b"\x01\x02\x03\x04");
+		let advertisement = advertise(
+			server.repository(),
+			Service::ReceivePack,
+			ProtocolVersion::V0,
+			Some(&nonce),
+		)
+		.await
+		.unwrap();
+
+		let origin = Origin::parse("http://host/acme/app").unwrap();
+		let signer = TestSigner::new(7);
+		let public_line = signer.public_line();
+		let transport = CapturingTransport {
+			posted: RefCell::new(None),
+		};
+
+		let outcome = push_signed(
+			&transport,
+			wt.repository(),
+			&origin,
+			&advertisement,
+			false,
+			async || Ok("Dev <dev@x.test> 1700000000 +0000".to_owned()),
+			&signer,
+		)
+		.await
+		.unwrap();
+		assert!(matches!(outcome, PushOutcome::Pushed { signed: true, .. }));
+
+		// The posted request is a push certificate binding this create to the server's nonce.
+		let request = transport.posted.into_inner().expect("a request was POSTed");
+		let cert = peek_push_cert(&request).expect("a signed push-cert request");
+		assert_eq!(cert.nonce, nonce);
+		assert_eq!(cert.pushee, origin.url);
+		assert_eq!(cert.commands.len(), 1);
+		assert_eq!(cert.commands[0].refname, "refs/heads/main");
+		assert_eq!(cert.commands[0].new, tip.to_hex());
+		assert_eq!(cert.commands[0].old, "0".repeat(64));
+
+		// Its signature verifies over the exact payload in git's `git` namespace, under the signing key
+		// — so a real server (receive-pack) that trusts this key accepts the push.
+		let key = TrustedKey::from_openssh(&public_line).unwrap();
+		let signer_id = verify_sshsig(
+			&cert.payload(),
+			cert.signature.as_bytes(),
+			std::slice::from_ref(&key),
+			"git",
+		)
+		.unwrap();
+		assert_eq!(signer_id, key.id());
+	}
+
+	/// When the server does not advertise a nonce (push-cert unsupported), a signed push fails before
+	/// resolving the pusher or touching the signer — so the error names the real cause, not a missing
+	/// identity or key.
+	#[tokio::test]
+	async fn push_signed_without_server_support_fails_before_signing() {
+		let (_dir, wt) = fixture().await;
+		let blob = wt.repository().write_blob(b"hi\n").await.unwrap();
+		let mut index = Index::new();
+		stage(&mut index, "f.txt", blob);
+		wt.save_index(&index).await.unwrap();
+		crate::commit(&wt, "root", &TestIdentity::default())
+			.await
+			.unwrap();
+
+		let (_server_dir, server) = fixture().await;
+		let advertisement = advertise(
+			server.repository(),
+			Service::ReceivePack,
+			ProtocolVersion::V0,
+			None,
+		)
+		.await
+		.unwrap();
+
+		let origin = Origin::parse("http://host/acme/app").unwrap();
+		let transport = CapturingTransport {
+			posted: RefCell::new(None),
+		};
+		let result = push_signed(
+			&transport,
+			wt.repository(),
+			&origin,
+			&advertisement,
+			false,
+			async || panic!("pusher resolved despite no push-cert support"),
+			&crate::test_support::FailingSigner,
+		)
+		.await;
+		let Err(err) = result else {
+			panic!("a signed push to a server without push-cert support must fail");
+		};
+		assert!(
+			err.to_string().contains("does not accept signed pushes"),
+			"{err}"
+		);
+		assert!(
+			transport.posted.into_inner().is_none(),
+			"nothing was POSTed"
+		);
 	}
 }

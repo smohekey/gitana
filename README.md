@@ -66,8 +66,10 @@ Major gaps:
   sparse-checkout support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
-- Push signing is still incomplete: the CLI has `--signed`, but key loading and
-  signature generation are not wired through yet.
+- `gta push --signed` attaches a Git push certificate signed with `ssh-keygen`
+  (`--signing-key`, or git config `user.signingkey`, under `gpg.format=ssh`) — the
+  same SSHSIG format stock `git push --signed` sends and receive-pack verifies. A
+  signed delete (`--signed --delete`) still sends an unsigned delete.
 - Remote transport currently supports HTTP(S) Smart HTTP remotes. Other Git URL
   schemes, such as SSH remotes, are not implemented.
 - Object storage now uses pack `.idx` and a multi-pack-index for lookup. `gta repack`

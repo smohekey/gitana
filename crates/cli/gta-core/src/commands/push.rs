@@ -14,14 +14,15 @@ use gitana_repository::Repository;
 
 use crate::dispatch;
 use crate::repo;
+use crate::signer::LazyCliSigner;
 
-/// Push `HEAD`'s branch to the origin. `signed` attaches a push certificate; `force`
-/// permits a non-fast-forward update; `delete` removes a remote branch instead of
-/// pushing.
+/// Push `HEAD`'s branch to the origin. `signed` attaches a push certificate (signed with
+/// `--signing-key`, or git config `user.signingkey`); `force` permits a non-fast-forward update;
+/// `delete` removes a remote branch instead of pushing.
 pub async fn run(
 	cwd: &Path,
 	signed: bool,
-	_signing_key: Option<PathBuf>,
+	signing_key: Option<PathBuf>,
 	force: bool,
 	delete: Option<String>,
 ) -> Result<()> {
@@ -34,34 +35,69 @@ pub async fn run(
 	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
 
 	match local {
-		HashKind::Sha1 => push_into::<Sha1>(&http, &origin, &found, &body, signed, force, delete).await,
+		HashKind::Sha1 => {
+			push_into::<Sha1>(
+				&http,
+				&origin,
+				&found,
+				&body,
+				signed,
+				signing_key,
+				force,
+				delete,
+				cwd,
+			)
+			.await
+		}
 		HashKind::Sha256 => {
-			push_into::<Sha256>(&http, &origin, &found, &body, signed, force, delete).await
+			push_into::<Sha256>(
+				&http,
+				&origin,
+				&found,
+				&body,
+				signed,
+				signing_key,
+				force,
+				delete,
+				cwd,
+			)
+			.await
 		}
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn push_into<H: HashAlgorithm>(
 	http: &ReqwestTransport,
 	origin: &Origin,
 	found: &repo::Discovered,
 	body: &[u8],
 	signed: bool,
+	signing_key: Option<PathBuf>,
 	force: bool,
 	delete: Option<String>,
+	cwd: &Path,
 ) -> Result<()> {
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
-	let outcome = gitana_porcelain::push(
-		http,
-		&repository,
-		origin,
-		body,
-		force,
-		delete,
-		signed,
-		async || pusher_ident(&repository).await,
-	)
-	.await?;
+	// A signed push certificate is signed like an explicit `commit -S`: an unset `gpg.format` is
+	// assumed `ssh` (rather than rejected as config-driven signing is), and the key is resolved lazily
+	// so a "server does not accept signed pushes" error is not masked by a missing signing key. A
+	// signed delete is not distinct on the wire here, so `--signed --delete` sends an unsigned delete.
+	let outcome = if signed && delete.is_none() {
+		let signer = LazyCliSigner::new(&repository, signing_key, cwd.to_path_buf(), false);
+		gitana_porcelain::push_signed(
+			http,
+			&repository,
+			origin,
+			body,
+			force,
+			async || pusher_ident(&repository).await,
+			&signer,
+		)
+		.await?
+	} else {
+		gitana_porcelain::push(http, &repository, origin, body, force, delete).await?
+	};
 
 	match outcome {
 		PushOutcome::Deleted { refname } => println!("Deleted {refname} on {}", origin.url),
