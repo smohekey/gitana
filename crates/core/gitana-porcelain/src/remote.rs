@@ -511,8 +511,9 @@ async fn plan_push<F: FileStore, H: HashAlgorithm>(
 	let mut seen_dsts = std::collections::HashSet::new();
 	for spec in refspecs {
 		let forced = force || spec.force;
-		// A `HEAD` destination (git's `push origin HEAD` shorthand) means the current branch's ref.
-		let dst = resolve_destination(repo, &spec.dst).await?;
+		// A `HEAD` destination (git's `push origin HEAD` shorthand) means the current branch's ref; a
+		// bare deletion target (`:v1`) resolves against the remote's advertised refs (branch vs tag).
+		let dst = resolve_destination(repo, advertised, &spec).await?;
 		// Two refspecs targeting one destination would be applied sequentially by receive-pack — the
 		// second stale after the first moved the ref — leaving a partial push. Refuse before sending.
 		if !seen_dsts.insert(dst.clone()) {
@@ -585,7 +586,7 @@ async fn tag_refspecs<F: FileStore, H: HashAlgorithm>(
 	// Destinations the base already pushes, so a tag is not planned twice (git de-dups these).
 	let mut base_dsts = std::collections::HashSet::new();
 	for spec in base {
-		base_dsts.insert(resolve_destination(repo, &spec.dst).await?);
+		base_dsts.insert(resolve_destination(repo, advertised, spec).await?);
 	}
 	// For `--follow-tags`: the object closure of the commits being pushed (the base sources' tips),
 	// against which each candidate annotated tag's target commit is tested for reachability.
@@ -626,6 +627,7 @@ async fn tag_refspecs<F: FileStore, H: HashAlgorithm>(
 				force: false,
 				src: Some(name.clone()),
 				dst: name,
+				dst_bare: false,
 			});
 		}
 	}
@@ -654,13 +656,14 @@ async fn follow_tag_commit<F: FileStore, H: HashAlgorithm>(
 	}
 }
 
-/// Resolve a push destination: the literal `HEAD` becomes the current branch's ref; any other name is
-/// already a full ref.
+/// Resolve a push destination: the literal `HEAD` becomes the current branch's ref; a bare deletion
+/// target is DWIM'd against the remote's advertised refs; any other name is already a full ref.
 async fn resolve_destination<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
-	dst: &str,
+	advertised: &Advertised<H>,
+	spec: &PushRefspec,
 ) -> Result<String> {
-	if dst == "HEAD" {
+	if spec.dst == "HEAD" {
 		return match repo.refs().read_head().await? {
 			HeadState::Symbolic(branch) => Ok(branch),
 			HeadState::Detached(_) => {
@@ -668,7 +671,28 @@ async fn resolve_destination<F: FileStore, H: HashAlgorithm>(
 			}
 		};
 	}
-	Ok(dst.to_owned())
+	// A deletion of a bare name (`:v1`) resolves against the remote's refs: git deletes an existing
+	// `refs/tags/v1` rather than a nonexistent `refs/heads/v1`. The branch default (`spec.dst`) stands
+	// unless the remote has only the tag; having both is ambiguous.
+	if spec.src.is_none() && spec.dst_bare {
+		let name = spec
+			.dst
+			.strip_prefix("refs/heads/")
+			.expect("a bare destination is branch-qualified");
+		let as_tag = format!("refs/tags/{name}");
+		let has_branch = advertised.oid_of(&spec.dst).is_some();
+		let has_tag = advertised.oid_of(&as_tag).is_some();
+		return match (has_branch, has_tag) {
+			(true, true) => bail!(
+				"{name} is ambiguous on the remote (both {} and {as_tag}); delete with a full ref name",
+				spec.dst
+			),
+			(false, true) => Ok(as_tag),
+			// Branch present, or neither (the deletion below then reports the missing ref).
+			_ => Ok(spec.dst.clone()),
+		};
+	}
+	Ok(spec.dst.clone())
 }
 
 /// The refspecs to push: `refspecs` when non-empty, else `remote.origin.push`, else `HEAD`'s branch to
@@ -696,6 +720,7 @@ async fn default_refspecs<F: FileStore, H: HashAlgorithm>(
 		force: false,
 		src: Some(branch.clone()),
 		dst: branch,
+		dst_bare: false,
 	}])
 }
 

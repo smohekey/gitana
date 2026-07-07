@@ -371,6 +371,106 @@ async fn push_follow_tags_sends_only_reachable_annotated_tags() {
 	);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_delete_dwims_a_bare_tag_name() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	// The server has a tag `v1` but no branch `v1`.
+	let tip = open(&git_dir)
+		.refs()
+		.resolve("refs/heads/main")
+		.await
+		.unwrap()
+		.unwrap();
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/tags/v1", tip, None)
+		.await
+		.unwrap();
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+
+	// `--delete v1` (a bare name) resolves against the remote's refs: it removes `refs/tags/v1`, not a
+	// nonexistent `refs/heads/v1`.
+	ok(
+		&gta(&["-C", t, "push", "--delete", "v1"]).await,
+		"push --delete v1",
+	);
+	let server = open(&git_dir);
+	assert_eq!(
+		server.refs().resolve("refs/tags/v1").await.unwrap(),
+		None,
+		"the tag was deleted"
+	);
+	assert_eq!(
+		server.refs().resolve("refs/heads/main").await.unwrap(),
+		Some(tip),
+		"the branch is untouched"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_delete_bare_name_is_ambiguous_when_branch_and_tag_both_exist() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	// The server has BOTH a branch and a tag named `dup`.
+	let tip = open(&git_dir)
+		.refs()
+		.resolve("refs/heads/main")
+		.await
+		.unwrap()
+		.unwrap();
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/heads/dup", tip, None)
+		.await
+		.unwrap();
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/tags/dup", tip, None)
+		.await
+		.unwrap();
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+
+	// A bare `--delete dup` is ambiguous — the remote has both `refs/heads/dup` and `refs/tags/dup`.
+	let out = gta(&["-C", t, "push", "--delete", "dup"]).await;
+	assert!(!out.status.success(), "an ambiguous bare delete must fail");
+	assert!(
+		String::from_utf8_lossy(&out.stderr).contains("ambiguous"),
+		"error names the ambiguity: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	let server = open(&git_dir);
+	assert!(
+		server
+			.refs()
+			.resolve("refs/heads/dup")
+			.await
+			.unwrap()
+			.is_some()
+			&& server
+				.refs()
+				.resolve("refs/tags/dup")
+				.await
+				.unwrap()
+				.is_some(),
+		"nothing is deleted on ambiguity"
+	);
+}
+
 /// `gta push --signed` drives the real `ssh-keygen` signer end to end: it attaches a push certificate
 /// (the server advertises a nonce), the signed path is taken (`(signed)` reported), and the ref moves.
 /// The cryptographic correctness of the certificate — that its signature verifies under the signing

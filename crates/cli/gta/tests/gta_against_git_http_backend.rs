@@ -364,3 +364,40 @@ async fn gta_pushes_follow_tags_to_a_real_git_repo() {
 		"a lightweight tag must not be followed"
 	);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gta_deletes_a_remote_tag_by_bare_name() {
+	if skip() {
+		return;
+	}
+	let root = tmp("client-delete-tag");
+	build_bare(&root);
+	let url = serve_git_http_backend(root.clone()).await;
+	let bare = root.join("repo.git");
+
+	let checkout = root.join("c");
+	let c = checkout.to_str().unwrap();
+	gta_ok(
+		&gta(&["clone", &format!("{url}/repo.git"), c]).await,
+		"clone",
+	);
+
+	// The bare repo has the annotated tag `v1` (and no branch `v1`). Deleting the bare name resolves
+	// against the remote's refs, so it removes `refs/tags/v1` rather than a nonexistent branch.
+	assert!(
+		git_try(&bare, &["rev-parse", "--verify", "refs/tags/v1"])
+			.status
+			.success(),
+		"precondition: the remote has the tag"
+	);
+	gta_ok(
+		&gta(&["-C", c, "push", "origin", "--delete", "v1"]).await,
+		"push --delete v1",
+	);
+	assert!(
+		!git_try(&bare, &["rev-parse", "--verify", "refs/tags/v1"])
+			.status
+			.success(),
+		"the remote tag was deleted"
+	);
+}
