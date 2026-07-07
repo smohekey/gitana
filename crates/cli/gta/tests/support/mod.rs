@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{RawQuery, State};
-use axum::http::HeaderMap;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use gitana_file_store_local::LocalFileStore;
@@ -28,6 +28,7 @@ use gitana_git_http::{
 use gitana_object::{HashAlgorithm, PktLine, Sha1, Sha256, parse_pkt};
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
 // --- repo open ----------------------------------------------------------------------------------
@@ -186,6 +187,113 @@ pub async fn serve_gitana(git_dir: PathBuf, hash: ServerHash) -> String {
 	format!("http://{addr}")
 }
 
+// --- Direction B: serve a real git repo via `git http-backend` (CGI) ----------------------------
+
+/// Serve `project_root` (holding one or more bare repos) over Smart-HTTP by bridging `git
+/// http-backend` (a CGI program) behind axum. Returns the base URL; a repo at `<root>/repo.git` is
+/// reached at `<url>/repo.git`. Lets the gitana `gta` client talk to a real git server.
+pub async fn serve_git_http_backend(project_root: PathBuf) -> String {
+	let app = Router::new()
+		.fallback(git_http_backend_cgi)
+		.with_state(project_root);
+	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+	let addr = listener.local_addr().expect("addr");
+	tokio::spawn(async move {
+		axum::serve(listener, app).await.expect("serve");
+	});
+	format!("http://{addr}")
+}
+
+/// Bridge one HTTP request to `git http-backend`: set the CGI environment from the request, pipe the
+/// body to its stdin, and translate its CGI response (headers, blank line, body) back to HTTP.
+async fn git_http_backend_cgi(
+	State(root): State<PathBuf>,
+	method: Method,
+	uri: Uri,
+	headers: HeaderMap,
+	body: Bytes,
+) -> Response {
+	let content_type = headers
+		.get(CONTENT_TYPE)
+		.and_then(|v| v.to_str().ok())
+		.unwrap_or("")
+		.to_owned();
+	let mut child = tokio::process::Command::new("git")
+		.arg("http-backend")
+		.env_clear()
+		// `git` still needs PATH (to find its subcommands) after env_clear.
+		.env("PATH", std::env::var("PATH").unwrap_or_default())
+		.env("GIT_PROJECT_ROOT", &root)
+		.env("GIT_HTTP_EXPORT_ALL", "1")
+		.env("PATH_INFO", uri.path())
+		.env("QUERY_STRING", uri.query().unwrap_or(""))
+		.env("REQUEST_METHOD", method.as_str())
+		.env("CONTENT_TYPE", &content_type)
+		.env("CONTENT_LENGTH", body.len().to_string())
+		.env("REMOTE_ADDR", "127.0.0.1")
+		.stdin(std::process::Stdio::piped())
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped())
+		.spawn()
+		.expect("spawn git http-backend");
+	child
+		.stdin
+		.take()
+		.unwrap()
+		.write_all(&body)
+		.await
+		.expect("write cgi body");
+	let out = child.wait_with_output().await.expect("git http-backend");
+	assert!(
+		out.status.success(),
+		"git http-backend failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	parse_cgi(&out.stdout)
+}
+
+/// Split a CGI response (`Header: value` lines, a blank line, then the body) into an HTTP response,
+/// honouring the `Status:` (default 200) and `Content-Type:` headers git http-backend emits.
+fn parse_cgi(raw: &[u8]) -> Response {
+	let split = raw
+		.windows(4)
+		.position(|w| w == b"\r\n\r\n")
+		.map(|i| (i, i + 4))
+		.or_else(|| {
+			raw
+				.windows(2)
+				.position(|w| w == b"\n\n")
+				.map(|i| (i, i + 2))
+		})
+		.expect("cgi header/body separator");
+	let (head, body) = (&raw[..split.0], &raw[split.1..]);
+	let head = String::from_utf8_lossy(head);
+
+	let mut status = StatusCode::OK;
+	let mut content_type: Option<String> = None;
+	for line in head.lines() {
+		if let Some(value) = line.strip_prefix("Status:") {
+			if let Some(code) = value
+				.trim()
+				.split(' ')
+				.next()
+				.and_then(|c| c.parse::<u16>().ok())
+			{
+				status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+			}
+		} else if let Some(value) = line.strip_prefix("Content-Type:") {
+			content_type = Some(value.trim().to_owned());
+		}
+	}
+	let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_owned());
+	(
+		status,
+		[(CONTENT_TYPE, content_type)],
+		Bytes::copy_from_slice(body),
+	)
+		.into_response()
+}
+
 // --- external-command runners -------------------------------------------------------------------
 
 /// Run `git -C dir <args>`, returning the raw output (no success assertion).
@@ -269,16 +377,22 @@ pub fn git_supports_sha256() -> bool {
 }
 
 /// Whether `git http-backend` is present (absent on some minimal installs). Cached. Used by
-/// Direction B. `--help` exits non-zero but prints usage, so we check it spawned and mentioned itself.
+/// Direction B. Checked by looking for the actual `git-http-backend` binary in git's exec-path —
+/// running `git http-backend --help` is no good, because a missing subcommand still prints a message
+/// containing "http-backend" ("git: 'http-backend' is not a git command").
 pub fn git_http_backend_available() -> bool {
 	static AVAILABLE: OnceLock<bool> = OnceLock::new();
 	*AVAILABLE.get_or_init(|| {
 		Command::new("git")
-			.args(["http-backend", "--help"])
+			.arg("--exec-path")
 			.output()
-			.map(|o| {
-				let text = String::from_utf8_lossy(&o.stderr) + String::from_utf8_lossy(&o.stdout);
-				text.contains("http-backend")
+			.ok()
+			.filter(|o| o.status.success())
+			.and_then(|o| String::from_utf8(o.stdout).ok())
+			.map(|exec_path| {
+				Path::new(exec_path.trim())
+					.join(format!("git-http-backend{}", std::env::consts::EXE_SUFFIX))
+					.exists()
 			})
 			.unwrap_or(false)
 	})
