@@ -17,16 +17,18 @@ use gitana_worktree::WorkTree;
 
 use crate::Signer;
 
-/// How a [`fetch`] treats the remote's tags (git's `--tags` / default).
+/// How a [`fetch`] treats the remote's tags (git's default / `--tags` / `--no-tags`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TagFetch {
-	/// Default fetch behavior: no tag refs are written beyond what the configured refspecs name.
-	/// (Git's tag auto-follow — writing a tag ref for each advertised tag reachable from the fetched
-	/// branches — lands in a later slice; this variant will gain that behavior then.)
+	/// Default: auto-follow. Beyond the configured refspecs, write `refs/tags/<name>` for each
+	/// advertised tag that is not already present locally and whose target is reachable from a branch
+	/// this fetch is following — matching git, which follows tags pointing into the fetched history.
 	#[default]
 	Auto,
 	/// `--tags`: fetch every advertised `refs/tags/*` into the same-named local `refs/tags/*`.
 	All,
+	/// `--no-tags`: write no tag refs beyond what the configured refspecs name (disables auto-follow).
+	None,
 }
 
 /// The outcome of a [`fetch`]: the tracking refs it advanced, and any it declined to.
@@ -63,6 +65,17 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	download(transport, repo, origin, &advertised, &haves).await?;
 
 	let config = repo.read_config().await?;
+	// Resolve the effective tag mode: an explicit CLI `--tags` / `--no-tags` (`All` / `None`) wins;
+	// otherwise the default (`Auto`) honors git's `remote.origin.tagOpt` config (`--tags` / `--no-tags`,
+	// set e.g. by `git clone --no-tags`), and only then falls back to auto-follow.
+	let tags = match tags {
+		TagFetch::Auto => match config.get_string("remote", Some("origin"), "tagopt") {
+			Some("--tags") => TagFetch::All,
+			Some("--no-tags") => TagFetch::None,
+			_ => TagFetch::Auto,
+		},
+		explicit => explicit,
+	};
 	let mut refspecs = parse_fetch_refspecs(&config)?;
 	// `--tags` mirrors every advertised tag into the same-named local ref, in addition to the
 	// configured refspecs. It is not forced (git does not clobber an existing tag pointing elsewhere
@@ -164,7 +177,88 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 		repo.refs().update_ref(&tracking, oid, current).await?;
 		updated.push((tracking, oid));
 	}
+
+	// Auto-follow (git's default): create a local `refs/tags/<name>` for each advertised tag that is
+	// not already present and whose target is reachable from a branch this fetch is following. `--tags`
+	// mirrors tags through a refspec above (so it skips this); `--no-tags` disables it.
+	if tags == TagFetch::Auto {
+		auto_follow_tags(repo, &advertised, &positive, &negative, &mut updated).await?;
+	}
 	Ok(FetchOutcome { updated, rejected })
+}
+
+/// Write a local `refs/tags/<name>` for each advertised tag whose target is reachable from a branch
+/// this fetch is following (git's tag auto-follow), skipping tags already present locally (git leaves
+/// existing tags alone in auto mode — it never clobbers or reports them here). "Reachable" means the
+/// tag's target — the commit, tree, or blob it ultimately points at — is in the object closure of the
+/// fetched branch tips: git follows a tag pointing at any object the branch fetch downloads, including
+/// a tree or blob, but not one on history this fetch did not pull.
+///
+/// gitana already downloads the whole advertised closure (not just the branches), so the objects are
+/// present and peeling / the closure walk run locally. The walk is bounded by the branch closure and
+/// only runs when there is a candidate tag; a future refspec-scoped download (protocol slice) could
+/// reduce this to an O(1) presence check per tag, as git does.
+async fn auto_follow_tags<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	advertised: &Advertised<H>,
+	positive: &[&Refspec],
+	negative: &[&Refspec],
+	updated: &mut Vec<(String, ObjectId<H>)>,
+) -> Result<()> {
+	// Candidate tags: advertised `refs/tags/*` not already present locally (git leaves existing tags
+	// alone in auto mode). If none, skip the reachability walk entirely.
+	let mut candidates = Vec::new();
+	for (name, oid) in &advertised.refs {
+		if name.starts_with("refs/tags/") && repo.refs().resolve(name).await?.is_none() {
+			candidates.push((name.clone(), *oid));
+		}
+	}
+	if candidates.is_empty() {
+		return Ok(());
+	}
+
+	// Reachability roots: the tips of the non-tag refs this fetch follows (its branch tips). A tag is
+	// auto-followed only when its target lies in the object closure of these — so a tag on history this
+	// fetch did not pull (e.g. an unfetched branch, or a standalone object) is left alone, as git does.
+	let roots: Vec<ObjectId<H>> = advertised
+		.refs
+		.iter()
+		.filter(|(name, _)| !name.starts_with("refs/tags/"))
+		.filter(|(name, _)| !negative.iter().any(|spec| spec.excludes(name)))
+		.filter(|(name, _)| positive.iter().any(|spec| spec.destination(name).is_some()))
+		.map(|(_, oid)| *oid)
+		.collect();
+	let closure = crate::prune::reachable_from(repo, roots).await?;
+
+	for (name, oid) in candidates {
+		// Peel through any tag chain to the object the tag ultimately names (commit / tree / blob).
+		let target = peel_tag_target(repo, oid).await?;
+		if closure.contains(&target) {
+			repo.refs().update_ref(&name, oid, None).await?;
+			updated.push((name, oid));
+		}
+	}
+	Ok(())
+}
+
+/// Follow an annotated-tag chain from `oid` to the object it ultimately points at (a commit, tree, or
+/// blob). A lightweight tag's `oid` is already that object. A read error propagates: the fetch just
+/// downloaded the advertised closure, so an unreadable tag object indicates a corrupt pack / store,
+/// not a benign miss. (Mirrors gitana-git-http's private best-effort `peel_tag` on the client side —
+/// a candidate to share, though the error handling differs by context.)
+async fn peel_tag_target<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	oid: ObjectId<H>,
+) -> Result<ObjectId<H>> {
+	let mut current = oid;
+	loop {
+		let (kind, data) = repo.objects().read_object(&current).await?;
+		if kind == gitana_object::ObjectKind::Tag {
+			current = gitana_object::parse_tag::<H>(&data)?.object;
+		} else {
+			return Ok(current);
+		}
+	}
 }
 
 /// The parsed `remote.origin.fetch` refspecs, or the default when the remote has no `fetch` line.

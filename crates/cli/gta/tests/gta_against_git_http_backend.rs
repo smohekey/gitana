@@ -180,19 +180,10 @@ async fn gta_fetches_tags_from_a_real_git_repo() {
 		&["push", "-q", root.join("repo.git").to_str().unwrap(), "v2"],
 	);
 
-	// A plain fetch does not create the new tag ref (auto-follow lands in a later slice)...
+	// A plain fetch auto-follows the new tag: its target is reachable from the fetched `main`, so gta
+	// lands `refs/tags/v2` at the tag object id (not the peeled commit — the advertisement's
+	// `refs/tags/v2^{}` peel line is dropped, not written as a junk ref).
 	gta_ok(&gta(&["-C", c, "fetch"]).await, "fetch");
-	assert!(
-		!gta(&["-C", c, "rev-parse", "--verify", "refs/tags/v2"])
-			.await
-			.status
-			.success(),
-		"a plain fetch must not create tag refs in this slice"
-	);
-
-	// ...but `--tags` mirrors every remote tag into the local ref (the tag object id, not the peeled
-	// commit — the advertisement's `refs/tags/v2^{}` peel line is dropped, not written as a junk ref).
-	gta_ok(&gta(&["-C", c, "fetch", "--tags"]).await, "fetch --tags");
 	assert_eq!(
 		gta_stdout(
 			&gta(&["-C", c, "rev-parse", "refs/tags/v2"]).await,

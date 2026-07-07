@@ -176,8 +176,9 @@ async fn collect_roots<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 
 /// The transitive closure of `roots` over the object graph — each object's [`referenced_ids`],
 /// read loose or packed. A root that does not exist is skipped (an empty repo has none), matching
-/// the async walk used to build a fetch pack.
-async fn reachable_from<F: FileStore, H: HashAlgorithm>(
+/// the async walk used to build a fetch pack. Shared with `fetch`'s tag auto-follow, which tests
+/// whether a tag's target is reachable from the fetched branch tips.
+pub(crate) async fn reachable_from<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	roots: Vec<ObjectId<H>>,
 ) -> Result<HashSet<ObjectId<H>>> {

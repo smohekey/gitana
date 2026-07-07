@@ -11,9 +11,10 @@ use gitana_remote::{self as transport, Origin, ReqwestTransport};
 use crate::dispatch;
 use crate::repo;
 
-/// Fetch all branches from the origin into `refs/remotes/origin/*`. With `all_tags` (`--tags`), also
-/// mirror every advertised `refs/tags/*` into the same-named local ref.
-pub async fn run(cwd: &Path, all_tags: bool) -> Result<()> {
+/// Fetch all branches from the origin into `refs/remotes/origin/*`. By default git's tag auto-follow
+/// also lands tags reachable from the fetched branches; `all_tags` (`--tags`) mirrors every advertised
+/// `refs/tags/*`, and `no_tags` (`--no-tags`) disables tag fetching entirely. The two are exclusive.
+pub async fn run(cwd: &Path, all_tags: bool, no_tags: bool) -> Result<()> {
 	let found = repo::discover(cwd)?;
 	let origin = Origin::load(&found.common_dir)?;
 	let http = ReqwestTransport::new();
@@ -22,10 +23,10 @@ pub async fn run(cwd: &Path, all_tags: bool) -> Result<()> {
 	let local = dispatch::detect_algorithm(&found.common_dir)?;
 	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
 
-	let tags = if all_tags {
-		TagFetch::All
-	} else {
-		TagFetch::Auto
+	let tags = match (all_tags, no_tags) {
+		(true, _) => TagFetch::All,
+		(_, true) => TagFetch::None,
+		_ => TagFetch::Auto,
 	};
 	match local {
 		HashKind::Sha1 => fetch_into::<Sha1>(&http, &origin, &found, &body, tags).await,

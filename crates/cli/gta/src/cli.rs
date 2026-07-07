@@ -368,6 +368,9 @@ enum Command {
 		/// Fetch all tags from the origin (mirror every `refs/tags/*`), in addition to branches.
 		#[arg(short = 't', long)]
 		tags: bool,
+		/// Disable tag auto-follow: fetch no tags beyond what the configured refspecs name.
+		#[arg(short = 'n', long = "no-tags", conflicts_with = "tags")]
+		no_tags: bool,
 	},
 	/// Fetch the current branch from the origin and fast-forward the working tree.
 	Pull,
@@ -652,7 +655,9 @@ impl Cli {
 			} => commands::mv::run(&cwd, force, dry_run, verbose, paths).await,
 			Command::Diff { cached } => commands::diff::run(&cwd, cached).await,
 			Command::Clone { url, path } => commands::clone::run(url, path).await,
-			Command::Fetch { tags } => commands::fetch::run(&cwd, tags).await.map(|_| ()),
+			Command::Fetch { tags, no_tags } => {
+				commands::fetch::run(&cwd, tags, no_tags).await.map(|_| ())
+			}
 			Command::Pull => commands::pull::run(&cwd).await,
 			Command::Push {
 				repository,

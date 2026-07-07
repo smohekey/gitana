@@ -706,7 +706,66 @@ async fn fetch_honors_a_custom_tracking_namespace() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fetch_tags_mirrors_remote_tags() {
+async fn fetch_auto_follows_only_reachable_tags() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	let root = init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+
+	// Build two tags on the server: `reach` on `main`'s tip (root), and `unreach` on a commit that is
+	// NOT reachable from `main` — advance `main` to a child, tag it, then rewind `main` back to root.
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/tags/reach", root, None)
+		.await
+		.unwrap();
+	let child = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/tags/unreach", child, None)
+		.await
+		.unwrap();
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/heads/main", root, Some(child))
+		.await
+		.unwrap();
+
+	// A plain fetch auto-follows the tag reachable from `main`, but not the one on unfetched history.
+	ok(&gta(&["-C", t, "fetch"]).await, "fetch");
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "refs/tags/reach"]).await,
+			"rev-parse reach",
+		),
+		root.to_hex()
+	);
+	assert!(
+		!gta(&["-C", t, "rev-parse", "--verify", "refs/tags/unreach"])
+			.await
+			.status
+			.success(),
+		"a tag on history this fetch did not pull must not be auto-followed"
+	);
+
+	// `--tags` mirrors every advertised tag regardless of reachability.
+	ok(&gta(&["-C", t, "fetch", "--tags"]).await, "fetch --tags");
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "refs/tags/unreach"]).await,
+			"rev-parse unreach",
+		),
+		child.to_hex()
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_auto_follows_a_reachable_blob_tag() {
 	let srv = TempDir::new().unwrap();
 	let git_dir = srv.path().join("srv.git");
 	init_server(&git_dir, "f.txt", b"1\n").await;
@@ -717,7 +776,43 @@ async fn fetch_tags_mirrors_remote_tags() {
 	let t = target.to_str().unwrap();
 	ok(&gta(&["clone", &url, t]).await, "clone");
 
-	// The server advances and tags the new tip.
+	// Tag the blob that is part of `main`'s tree (content-addressed, so re-writing it yields the same
+	// id). Git auto-follows a tag pointing at ANY object reachable from the fetched branch — not only
+	// commits — so a plain fetch must land this blob tag.
+	let blob = open(&git_dir).write_blob(b"1\n").await.unwrap();
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/tags/blobtag", blob, None)
+		.await
+		.unwrap();
+
+	ok(&gta(&["-C", t, "fetch"]).await, "fetch");
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "refs/tags/blobtag"]).await,
+			"rev-parse blobtag",
+		),
+		blob.to_hex()
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_honors_tagopt_no_tags_config() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	// `git clone --no-tags` records this; a plain fetch must then skip auto-follow.
+	ok(
+		&gta(&["-C", t, "config", "remote.origin.tagOpt", "--", "--no-tags"]).await,
+		"config tagOpt",
+	);
+
 	let tip = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
 	open(&git_dir)
 		.refs()
@@ -725,22 +820,66 @@ async fn fetch_tags_mirrors_remote_tags() {
 		.await
 		.unwrap();
 
-	// A plain fetch does not write tag refs (auto-follow lands in a later slice)...
+	// Plain fetch respects `tagOpt=--no-tags`: the reachable tag is not auto-followed.
 	ok(&gta(&["-C", t, "fetch"]).await, "fetch");
 	assert!(
 		!gta(&["-C", t, "rev-parse", "--verify", "refs/tags/v1"])
 			.await
 			.status
 			.success(),
-		"a plain fetch must not create tag refs in this slice"
+		"tagOpt=--no-tags must disable auto-follow"
 	);
 
-	// ...but `--tags` mirrors every advertised tag into the same-named local ref.
+	// An explicit `--tags` on the command line overrides the config.
 	ok(&gta(&["-C", t, "fetch", "--tags"]).await, "fetch --tags");
 	assert_eq!(
 		stdout(
 			&gta(&["-C", t, "rev-parse", "refs/tags/v1"]).await,
-			"rev-parse tag",
+			"rev-parse v1",
+		),
+		tip.to_hex()
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_no_tags_disables_auto_follow() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+
+	// The server advances `main` and tags the new tip — a tag that auto-follow would otherwise land.
+	let tip = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/tags/v1", tip, None)
+		.await
+		.unwrap();
+
+	// `--no-tags` disables auto-follow: the tag is not written even though it is reachable.
+	ok(
+		&gta(&["-C", t, "fetch", "--no-tags"]).await,
+		"fetch --no-tags",
+	);
+	assert!(
+		!gta(&["-C", t, "rev-parse", "--verify", "refs/tags/v1"])
+			.await
+			.status
+			.success(),
+		"--no-tags must not auto-follow a reachable tag"
+	);
+
+	// A plain fetch then auto-follows it, confirming the tag was fetchable all along.
+	ok(&gta(&["-C", t, "fetch"]).await, "fetch");
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "refs/tags/v1"]).await,
+			"rev-parse v1",
 		),
 		tip.to_hex()
 	);
