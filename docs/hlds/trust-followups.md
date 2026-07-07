@@ -12,9 +12,9 @@ re-deriving the design.
 | Signed `push --signed --delete` | ✅ done (`19c056f`) | — |
 | `trust sync` audit event (`TrustRootAdopted`) | ✅ done (`6e3d909`) | — |
 | One-time-nonce replay cache | ✅ done (`91b05df6`) | — |
-| OpenPGP signature *verification* | ✅ done (this branch) | — |
+| OpenPGP signature *verification* | ✅ done | — |
+| OpenPGP signature *production* | ✅ done (this branch) | — |
 | Persisted require-time baseline | deferred (premature: no server binary; live-walk fallback is correct) | medium |
-| OpenPGP signature *production* | pending | medium (a GPG `Signer` beside the ssh-keygen one) |
 
 Each remaining item is gated by the project's usual flow: its own worktree/branch, Codex-clean before
 merge, and the `gta`/`gta-mcp` surface-parity lock where a CLI surface changes. See **Completed** at the
@@ -74,26 +74,22 @@ bottom for what the three done items shipped.
   cutover set while a post-cutover unsigned commit is rejected; a `trust_set_policy` test that the
   baseline ref is written on the `require` cutover.
 
-### OpenPGP signature production
-
-Verification landed (see **Completed**); this remaining slice is *producing* OpenPGP signatures.
-
-- **Goal.** Optionally produce OpenPGP-signed commits, annotated tags, and push certificates, so a
-  GPG-native operator can sign with `gta` (not just verify others' GPG signatures).
-- **Approach.** Add a GPG `Signer` beside the `ssh-keygen` `CliSigner` — either shelling to `gpg
-  --detach-sign --armor` or signing in-process with rpgp (already a dependency) given an unlocked
-  secret key. The object layer needs no change (it already round-trips a `gpgsig` PGP header). Select
-  the format from git config (`gpg.format` = `openpgp` + `user.signingkey`).
-- **Touch points.** `gitana-porcelain`/`gta-core` (a GPG signer + config plumbing); no `gitana-trust`
-  change (the verify side is done).
-- **Open decisions.** Shell to `gpg` (matches how the SSH signer shells to `ssh-keygen`, honours the
-  user's agent/keyring) vs sign in-process with rpgp (no external binary, but gitana must then locate
-  and unlock the secret key). Do not hand-roll crypto.
-- **Effort.** Medium.
-
 ## Completed
 
-- **OpenPGP signature verification + enrolment** (this branch). `gitana-trust` now verifies
+- **OpenPGP signature production** (this branch). `gta commit -S` / `tag -s` / `push --signed` sign in
+  either format, chosen by `gpg.format` (`ssh` → `ssh-keygen`; `openpgp` or **unset** → `gpg
+  --detach-sign --armor`, matching git's default). The signing seam was already pluggable (`Signer`),
+  so this added a `GpgSigner` beside the ssh `CliSigner` and made `LazyCliSigner` dispatch on
+  `gpg.format`; both programs are overridable via git's own config (`gpg.ssh.program` / `gpg.program`)
+  — the ssh path previously hardcoded `ssh-keygen`, a pre-existing gap closed here. `user.signingkey` /
+  `--signing-key` is a key file for ssh, an OpenPGP key id for gpg. Server-side, `verify_cert` now
+  dispatches the push-certificate signature on its armor (SSHSIG or OpenPGP), so a `gpg.format=openpgp`
+  client's signed push verifies end to end. No object-layer or trust-core change (verification already
+  did PGP; the object codec round-trips a `gpgsig` PGP header). Trust-chain commits stay SSHSIG-only.
+  Tests: reverse oracles (`git verify-commit` / `git tag -v` accept `gta`'s gpg-signed objects) and a
+  real `git push --signed` under `gpg.format=openpgp` into gitana's `receive_pack`. Passphrase handling
+  is gpg-agent's, as with stock `git commit -S`.
+- **OpenPGP signature verification + enrolment** (`6e3e24c1`, `300cb96c`). `gitana-trust` now verifies
   OpenPGP-signed commits and annotated tags alongside SSHSIG, using the pure-Rust `pgp` (rpgp) crate
   (chosen over `sequoia-openpgp` because it builds for `wasm32-wasip2` — the trust core is in the
   component's graph via `gitana-porcelain` — and pulls no C libs, fitting the clean-room/unsafe-forbidding

@@ -1,7 +1,11 @@
-//! The CLI side of SSH signing: resolve a signing key and shell out to `ssh-keygen -Y sign` — the
-//! same mechanism stock git drives through `gpg.ssh.program`, so the signatures interoperate with
-//! git and the key can be in any format `ssh-keygen` reads. The subprocess is awaited through
-//! `tokio::process` so it never blocks the runtime (see `docs/conventions.md`).
+//! The CLI side of commit/tag/push signing: resolve a signing key and shell out to the signing
+//! program, returning the bare armor block the [`Signer`] contract asks for. Two formats, chosen by
+//! git config `gpg.format` (`ssh` → [`CliSigner`] over `ssh-keygen -Y sign`; `openpgp` or unset →
+//! [`GpgSigner`] over `gpg --detach-sign`, matching git's default). Each program is overridable via the
+//! same config git uses — `gpg.ssh.program` for SSH and `gpg.openpgp.program` (or the legacy
+//! `gpg.program`) for OpenPGP — so gitana runs whatever binary the repo is already configured for.
+//! Subprocesses are awaited through `tokio::process` so they never block the runtime (see
+//! `docs/conventions.md`).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -15,15 +19,58 @@ use tokio::process::Command;
 
 use crate::Backend;
 
-/// A [`Signer`] backed by a local SSH private key, signing via `ssh-keygen -Y sign` in git's `git`
-/// namespace.
+/// The default program for each signing format, overridable by the matching git config key.
+const DEFAULT_SSH_PROGRAM: &str = "ssh-keygen";
+const DEFAULT_GPG_PROGRAM: &str = "gpg";
+
+/// Feed `payload` to `command` on stdin and return its stdout, trimmed of the trailing newline
+/// signing programs print (the [`Signer`] contract is a bare armor block, which the object encoder
+/// folds into the `gpgsig` header). `what` names the program for error context.
+async fn run_signer(mut command: Command, payload: &[u8], what: &str) -> Result<String> {
+	let mut child = command
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.with_context(|| format!("spawning `{what}` (is it installed?)"))?;
+
+	// Feed the payload on stdin; closing it (drop) signals EOF so the program finishes.
+	let mut stdin = child.stdin.take().expect("stdin was piped");
+	stdin
+		.write_all(payload)
+		.await
+		.with_context(|| format!("writing payload to `{what}`"))?;
+	drop(stdin);
+
+	let output = child
+		.wait_with_output()
+		.await
+		.with_context(|| format!("waiting for `{what}`"))?;
+	if !output.status.success() {
+		bail!(
+			"`{what}` failed: {}",
+			String::from_utf8_lossy(&output.stderr).trim()
+		);
+	}
+	Ok(
+		String::from_utf8(output.stdout)
+			.with_context(|| format!("`{what}` signature output was not UTF-8"))?
+			.trim_end()
+			.to_owned(),
+	)
+}
+
+/// A [`Signer`] backed by a local SSH private key, signing via `ssh-keygen -Y sign` (program
+/// overridable by `gpg.ssh.program`) in git's `git` namespace.
 pub(crate) struct CliSigner {
+	program: String,
 	key_path: PathBuf,
 }
 
 impl CliSigner {
-	/// Resolve the signing key from `--signing-key <path>`, or git config `user.signingkey` when the
-	/// flag is absent, and confirm the file exists. Errors when neither is set — signing needs a key.
+	/// Resolve the signing program (`gpg.ssh.program`, default `ssh-keygen`) and key from
+	/// `--signing-key <path>`, or git config `user.signingkey` when the flag is absent, and confirm the
+	/// file exists. Errors when neither key is set — signing needs a key.
 	///
 	/// A leading `~`/`~/` is expanded against `$HOME` (as git and ssh do — SSH signing keys commonly
 	/// live at `~/.ssh/...`). An otherwise-relative key path (from either source) resolves against
@@ -34,10 +81,15 @@ impl CliSigner {
 		signing_key: Option<PathBuf>,
 		cwd: &Path,
 	) -> Result<Self> {
+		let config = repo.read_config().await.ok();
+		let program = config
+			.as_ref()
+			.and_then(|config| config.get_string("gpg", Some("ssh"), "program"))
+			.unwrap_or(DEFAULT_SSH_PROGRAM)
+			.to_owned();
 		let configured = match signing_key {
 			Some(path) => path,
 			None => {
-				let config = repo.read_config().await.ok();
 				let configured = config
 					.as_ref()
 					.and_then(|config| config.get_string("user", None, "signingkey"))
@@ -53,7 +105,7 @@ impl CliSigner {
 		if !key_path.exists() {
 			bail!("signing key not found: {}", key_path.display());
 		}
-		Ok(Self { key_path })
+		Ok(Self { program, key_path })
 	}
 
 	/// The OpenSSH public-key line for this signing key — what a trust document enrols so the key can
@@ -70,16 +122,17 @@ impl CliSigner {
 			return Ok(line);
 		}
 
-		let output = Command::new("ssh-keygen")
+		let output = Command::new(&self.program)
 			.arg("-y")
 			.arg("-f")
 			.arg(&self.key_path)
 			.output()
 			.await
-			.context("running `ssh-keygen -y` (is ssh-keygen installed?)")?;
+			.with_context(|| format!("running `{} -y` (is it installed?)", self.program))?;
 		if !output.status.success() {
 			bail!(
-				"`ssh-keygen -y` failed: {}",
+				"`{} -y` failed: {}",
+				self.program,
 				String::from_utf8_lossy(&output.stderr).trim()
 			);
 		}
@@ -94,50 +147,89 @@ impl CliSigner {
 
 impl Signer for CliSigner {
 	async fn sign(&self, payload: &[u8]) -> Result<String> {
-		let mut child = Command::new("ssh-keygen")
+		let mut command = Command::new(&self.program);
+		command
 			.arg("-Y")
 			.arg("sign")
 			.arg("-n")
 			.arg("git")
 			.arg("-f")
-			.arg(&self.key_path)
-			.stdin(Stdio::piped())
-			.stdout(Stdio::piped())
-			.stderr(Stdio::piped())
-			.spawn()
-			.context("spawning `ssh-keygen -Y sign` (is ssh-keygen installed?)")?;
-
-		// Feed the payload on stdin; closing it (drop) signals EOF so ssh-keygen finishes.
-		let mut stdin = child.stdin.take().expect("stdin was piped");
-		stdin
-			.write_all(payload)
-			.await
-			.context("writing payload to ssh-keygen")?;
-		drop(stdin);
-
-		let output = child
-			.wait_with_output()
-			.await
-			.context("waiting for ssh-keygen")?;
-		if !output.status.success() {
-			bail!(
-				"`ssh-keygen -Y sign` failed: {}",
-				String::from_utf8_lossy(&output.stderr).trim()
-			);
-		}
-		// Trim the trailing newline ssh-keygen prints: the `Signer` contract is a bare armor block,
-		// which the commit encoder folds into the `gpgsig` header.
-		Ok(
-			String::from_utf8(output.stdout)
-				.context("ssh-keygen signature output was not UTF-8")?
-				.trim_end()
-				.to_owned(),
-		)
+			.arg(&self.key_path);
+		run_signer(command, payload, &format!("{} -Y sign", self.program)).await
 	}
 }
 
-/// A lazily-resolved [`CliSigner`]: it validates `gpg.format`, loads the signing key, and runs
-/// `ssh-keygen` only on the first `sign` call. So an operation that records **no** commit — a no-op
+/// A [`Signer`] backed by GnuPG, signing via `gpg --detach-sign --armor` (program overridable by
+/// `gpg.program`) — a binary detached OpenPGP signature over the object bytes, exactly what git's
+/// `gpgsig` carries and what gitana's trust core verifies. Passphrase handling is gpg-agent's, as with
+/// stock `git commit -S`.
+pub(crate) struct GpgSigner {
+	program: String,
+	/// The signing key selector (`--signing-key <keyid>` or `user.signingkey`), passed to gpg's
+	/// `--local-user`; `None` lets gpg pick its default signing key.
+	key: Option<String>,
+}
+
+impl GpgSigner {
+	/// Resolve the signing program (`gpg.program`, default `gpg`) and key selector. Unlike the SSH
+	/// path, `user.signingkey`/`--signing-key` is an OpenPGP key id or fingerprint (not a file path),
+	/// and is optional — gpg falls back to its own default signing key.
+	async fn resolve<H: HashAlgorithm>(
+		repo: &Repository<Backend, H>,
+		signing_key: Option<PathBuf>,
+	) -> Result<Self> {
+		let config = repo.read_config().await.ok();
+		// git prefers the per-format `gpg.openpgp.program`, falling back to the legacy `gpg.program`.
+		let program = config
+			.as_ref()
+			.and_then(|config| {
+				config
+					.get_string("gpg", Some("openpgp"), "program")
+					.or_else(|| config.get_string("gpg", None, "program"))
+			})
+			.unwrap_or(DEFAULT_GPG_PROGRAM)
+			.to_owned();
+		let key = match signing_key {
+			Some(key) => Some(key.into_os_string().into_string().map_err(|_| {
+				anyhow!("--signing-key is not valid UTF-8 (an OpenPGP key id is expected)")
+			})?),
+			None => config
+				.as_ref()
+				.and_then(|config| config.get_string("user", None, "signingkey"))
+				.map(str::to_owned),
+		};
+		Ok(Self { program, key })
+	}
+}
+
+impl Signer for GpgSigner {
+	async fn sign(&self, payload: &[u8]) -> Result<String> {
+		let mut command = Command::new(&self.program);
+		command.arg("--detach-sign").arg("--armor");
+		if let Some(key) = &self.key {
+			command.arg("--local-user").arg(key);
+		}
+		run_signer(command, payload, &format!("{} --detach-sign", self.program)).await
+	}
+}
+
+/// The signer a [`LazyCliSigner`] resolves to, per `gpg.format`.
+enum ResolvedSigner {
+	Ssh(CliSigner),
+	Gpg(GpgSigner),
+}
+
+impl Signer for ResolvedSigner {
+	async fn sign(&self, payload: &[u8]) -> Result<String> {
+		match self {
+			Self::Ssh(signer) => signer.sign(payload).await,
+			Self::Gpg(signer) => signer.sign(payload).await,
+		}
+	}
+}
+
+/// A lazily-resolved signer: it reads `gpg.format`, loads the signing key, and runs the signing
+/// program only on the first `sign` call. So an operation that records **no** commit — a no-op
 /// `gta commit`, a fast-forward `merge`/`pull`, an up-to-date `rebase` — never touches signing config
 /// at all (it must not fail on an unsupported `gpg.format` or a missing key when nothing is signed),
 /// while one that records several (a rebase replay) resolves once and reuses. Every history operation
@@ -146,49 +238,42 @@ pub(crate) struct LazyCliSigner<'a, H: HashAlgorithm> {
 	repo: &'a Repository<Backend, H>,
 	signing_key: Option<PathBuf>,
 	cwd: PathBuf,
-	/// Whether an unset `gpg.format` is rejected (config-driven signing) or assumed `ssh` (explicit
-	/// `-S`). Either way an explicit non-`ssh` format is always rejected — gitana signs only with SSH.
-	require_explicit_ssh: bool,
-	resolved: tokio::sync::OnceCell<CliSigner>,
+	resolved: tokio::sync::OnceCell<ResolvedSigner>,
 }
 
 impl<'a, H: HashAlgorithm> LazyCliSigner<'a, H> {
-	/// A signer that will resolve `signing_key` (or git config `user.signingkey`) against `cwd`, and
-	/// enforce `gpg.format`, when first asked to sign. `require_explicit_ssh` distinguishes the
-	/// config-driven policy (unset `gpg.format` is an error — git's default is OpenPGP) from the
-	/// explicit `-S` policy (unset is assumed `ssh`).
+	/// A signer that will pick its format from `gpg.format` and resolve `signing_key` (or git config
+	/// `user.signingkey`) against `cwd` when first asked to sign.
 	pub(crate) fn new(
 		repo: &'a Repository<Backend, H>,
 		signing_key: Option<PathBuf>,
 		cwd: PathBuf,
-		require_explicit_ssh: bool,
 	) -> Self {
 		Self {
 			repo,
 			signing_key,
 			cwd,
-			require_explicit_ssh,
 			resolved: tokio::sync::OnceCell::new(),
 		}
 	}
 
-	/// Validate `gpg.format` and resolve the underlying [`CliSigner`]. Called once, the first time a
-	/// commit is actually signed — deferring both checks off the no-commit paths.
-	async fn resolve(&self) -> Result<CliSigner> {
+	/// Resolve the signer per `gpg.format`, matching git: `ssh` → SSHSIG; `openpgp` or **unset** →
+	/// OpenPGP (git's default). Any other format is refused. Called once, the first time a commit is
+	/// actually signed — deferring the config read and key load off the no-commit paths.
+	async fn resolve(&self) -> Result<ResolvedSigner> {
 		let config = self.repo.read_config().await?;
-		match config.get_string("gpg", None, "format") {
-			Some("ssh") => {}
+		let format = config.get_string("gpg", None, "format").map(str::to_owned);
+		match format.as_deref() {
+			Some("ssh") => Ok(ResolvedSigner::Ssh(
+				CliSigner::resolve(self.repo, self.signing_key.clone(), &self.cwd).await?,
+			)),
+			Some("openpgp") | None => Ok(ResolvedSigner::Gpg(
+				GpgSigner::resolve(self.repo, self.signing_key.clone()).await?,
+			)),
 			Some(other) => bail!(
-				"cannot sign: gitana produces only SSH signatures, but git config `gpg.format` is \
-				 `{other}`; set `gpg.format ssh` to sign with gitana"
+				"cannot sign: git config `gpg.format` is `{other}`; gitana signs with `ssh` or `openpgp`"
 			),
-			None if self.require_explicit_ssh => bail!(
-				"cannot sign: git config `commit.gpgsign` is set but `gpg.format` is unset (git's default \
-				 is OpenPGP); gitana signs only with SSH — set `gpg.format ssh`"
-			),
-			None => {} // explicit `-S`: assume ssh, the only format gitana signs
 		}
-		CliSigner::resolve(self.repo, self.signing_key.clone(), &self.cwd).await
 	}
 }
 
@@ -202,7 +287,7 @@ impl<H: HashAlgorithm> Signer for LazyCliSigner<'_, H> {
 /// The signer for git config-driven signing on the history operations (merge/cherry-pick/revert/
 /// rebase/pull, and `gta commit` with no explicit flag): a [`LazyCliSigner`] over `user.signingkey`
 /// when [`config_requests_signing`] is true, else `None`. The op passes it as `Option<&LazyCliSigner>`.
-/// `gpg.format` is validated lazily by the signer, so a signing-configured repo can still fast-forward.
+/// `gpg.format` is read lazily by the signer, so a signing-configured repo can still fast-forward.
 pub(crate) async fn config_signer<'a, H: HashAlgorithm>(
 	repo: &'a Repository<Backend, H>,
 	cwd: &Path,
@@ -210,7 +295,7 @@ pub(crate) async fn config_signer<'a, H: HashAlgorithm>(
 	Ok(
 		config_requests_signing(repo)
 			.await?
-			.then(|| LazyCliSigner::new(repo, None, cwd.to_path_buf(), true)),
+			.then(|| LazyCliSigner::new(repo, None, cwd.to_path_buf())),
 	)
 }
 

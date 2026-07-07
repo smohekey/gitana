@@ -128,9 +128,21 @@ async fn serve(git_dir: PathBuf) -> String {
 
 // --- trust-root install (a signed bootstrap enrolling `publine`, policy require) -----------------
 
-async fn install_trust_root(git_dir: &Path, publine: &str, keyfile: &Path) {
+async fn install_trust_root(git_dir: &Path, keys: &[String], sign_keyfile: &Path) {
 	let repo = open(git_dir);
-	let trust_json = format!("{{\"version\":1,\"policy\":\"require\",\"keys\":[\"{publine}\"]}}");
+	// A trust document may enrol OpenSSH lines and armored OpenPGP certs; each JSON string escapes its
+	// backslashes and newlines (a PGP block is multi-line). The bootstrap commit is always SSH-signed.
+	let keys_json = keys
+		.iter()
+		.map(|key| {
+			format!(
+				"\"{}\"",
+				key.trim().replace('\\', "\\\\").replace('\n', "\\n")
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(",");
+	let trust_json = format!("{{\"version\":1,\"policy\":\"require\",\"keys\":[{keys_json}]}}");
 	let blob = repo
 		.objects()
 		.write_object(ObjectKind::Blob, trust_json.as_bytes())
@@ -156,7 +168,7 @@ async fn install_trust_root(git_dir: &Path, publine: &str, keyfile: &Path) {
 		message: "gitana trust: bootstrap\n".to_owned(),
 	};
 	// Sign exactly the bytes git signs (the object with no gpgsig header), then fold the armor back in.
-	commit.signature = Some(ssh_sign(keyfile, &encode_commit(&commit)));
+	commit.signature = Some(ssh_sign(sign_keyfile, &encode_commit(&commit)));
 	let commit_id = repo
 		.objects()
 		.write_object(ObjectKind::Commit, &encode_commit(&commit))
@@ -257,7 +269,7 @@ async fn stock_git_push_signed_into_gitana_receive_pack() {
 	let server_dir = tmp.path().join("srv.git");
 	std::fs::create_dir_all(&server_dir).unwrap();
 	open(&server_dir).init().await.unwrap();
-	install_trust_root(&server_dir, &publine, &keyfile).await;
+	install_trust_root(&server_dir, std::slice::from_ref(&publine), &keyfile).await;
 	let url = serve(server_dir.clone()).await;
 
 	// A stock-git client with one SSH-signed commit; push it signed.
@@ -306,7 +318,7 @@ async fn stock_git_unsigned_push_is_rejected_under_require() {
 	let server_dir = tmp.path().join("srv.git");
 	std::fs::create_dir_all(&server_dir).unwrap();
 	open(&server_dir).init().await.unwrap();
-	install_trust_root(&server_dir, &publine, &keyfile).await;
+	install_trust_root(&server_dir, std::slice::from_ref(&publine), &keyfile).await;
 	let url = serve(server_dir.clone()).await;
 
 	let client = signed_client(tmp.path(), &keyfile);
@@ -332,6 +344,195 @@ async fn stock_git_unsigned_push_is_rejected_under_require() {
 		.await
 		.unwrap();
 	assert_eq!(landed, None, "the protected ref must not have moved");
+}
+
+/// The OpenPGP analog of the SSH capstone: a real `git push --signed` under `gpg.format=openpgp`
+/// (gpg-signed certificate *and* commit) into gitana's `receive_pack`. Proves the server verifies an
+/// OpenPGP push certificate (the `verify_cert` armor dispatch) and OpenPGP-signed objects, against a
+/// trust root that enrols the gpg certificate. The bootstrap trust commit is still SSHSIG (trust
+/// updates are SSH-only), so the root enrols both the admin SSH key and the pusher's gpg cert.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stock_git_gpg_push_signed_into_gitana_receive_pack() {
+	if gpg_skip() {
+		return;
+	}
+	let tmp = TempDir::new().unwrap();
+	// An SSH admin key signs the trust bootstrap; a gpg key signs the pushed commit + certificate.
+	let admin = tmp.path().join("admin");
+	generate_key(&admin);
+	let admin_pub = std::fs::read_to_string(admin.with_extension("pub"))
+		.unwrap()
+		.trim()
+		.to_owned();
+	let gpg = generate_gpg(tmp.path());
+
+	let server_dir = tmp.path().join("srv.git");
+	std::fs::create_dir_all(&server_dir).unwrap();
+	open(&server_dir).init().await.unwrap();
+	install_trust_root(&server_dir, &[admin_pub, gpg.cert.clone()], &admin).await;
+	let url = serve(server_dir.clone()).await;
+
+	// A stock-git client that signs with gpg (via the isolated-home wrapper), one gpg-signed commit.
+	let client = tmp.path().join("client");
+	std::fs::create_dir_all(&client).unwrap();
+	assert!(
+		Command::new("git")
+			.args(["init", "--object-format=sha1", "-q"])
+			.arg(&client)
+			.status()
+			.unwrap()
+			.success()
+	);
+	git(&client, &["config", "user.name", "A U Thor"]);
+	git(&client, &["config", "user.email", "a@example.com"]);
+	git(&client, &["config", "gpg.format", "openpgp"]);
+	git(
+		&client,
+		&["config", "gpg.program", gpg.wrapper.to_str().unwrap()],
+	);
+	git(&client, &["config", "user.signingkey", &gpg.fpr]);
+	std::fs::write(client.join("hello.txt"), b"world\n").unwrap();
+	git(&client, &["add", "hello.txt"]);
+	git(&client, &["commit", "-S", "-m", "gpg signed"]);
+	git(&client, &["remote", "add", "origin", &url]);
+	let head = git(&client, &["rev-parse", "HEAD"]);
+
+	let push = git_try(
+		&client,
+		&[
+			"-c",
+			"protocol.version=0",
+			"push",
+			"--signed",
+			"origin",
+			"HEAD:refs/heads/main",
+		],
+	);
+	assert!(
+		push.status.success(),
+		"gpg-signed push rejected: {}",
+		String::from_utf8_lossy(&push.stderr)
+	);
+	let landed = open(&server_dir)
+		.refs()
+		.resolve("refs/heads/main")
+		.await
+		.unwrap();
+	assert_eq!(landed, Some(ObjectId::<Sha1>::from_hex(&head).unwrap()));
+}
+
+/// An isolated GnuPG home with an ed25519 signing key, plus a `gpg.program` wrapper pinning that home
+/// (so `git` signs non-interactively against it), the key fingerprint, and its armored certificate.
+#[cfg(unix)]
+struct GpgKey {
+	wrapper: PathBuf,
+	fpr: String,
+	cert: String,
+}
+
+#[cfg(unix)]
+fn generate_gpg(root: &Path) -> GpgKey {
+	use std::os::unix::fs::PermissionsExt;
+	let home = root.join("gnupg");
+	std::fs::create_dir_all(&home).unwrap();
+	std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+	std::fs::write(home.join("gpg-agent.conf"), "allow-loopback-pinentry\n").unwrap();
+	std::fs::write(home.join("gpg.conf"), "pinentry-mode loopback\n").unwrap();
+	let gpg = |args: &[&str]| {
+		let out = Command::new("gpg")
+			.arg("--homedir")
+			.arg(&home)
+			.args(args)
+			.output()
+			.expect("run gpg");
+		assert!(
+			out.status.success(),
+			"gpg {args:?} failed: {}",
+			String::from_utf8_lossy(&out.stderr)
+		);
+		String::from_utf8_lossy(&out.stdout).into_owned()
+	};
+	gpg(&[
+		"--batch",
+		"--pinentry-mode",
+		"loopback",
+		"--passphrase",
+		"",
+		"--quick-generate-key",
+		"A U Thor <a@example.com>",
+		"ed25519",
+		"sign",
+		"0",
+	]);
+	let fpr = gpg(&["--list-keys", "--with-colons"])
+		.lines()
+		.find_map(|line| line.strip_prefix("fpr:"))
+		.map(|rest| rest.trim_matches(':').to_owned())
+		.expect("a key fingerprint");
+	let cert = gpg(&["--export", "--armor", &fpr]);
+	let wrapper = root.join("gpg-wrap.sh");
+	std::fs::write(
+		&wrapper,
+		format!(
+			"#!/usr/bin/env bash\nexport GNUPGHOME={home}\nexec gpg --batch --pinentry-mode loopback --passphrase '' \"$@\"\n",
+			home = home.to_str().unwrap()
+		),
+	)
+	.unwrap();
+	std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+	GpgKey { wrapper, fpr, cert }
+}
+
+#[cfg(unix)]
+fn gpg_skip() -> bool {
+	if !git_supports_ssh_signing() {
+		eprintln!("skipping: git without ssh signing (needed for the trust bootstrap)");
+		return true;
+	}
+	if !gpg_can_sign() {
+		eprintln!("skipping: gpg cannot generate a key here (missing binary or gpg-agent)");
+		return true;
+	}
+	false
+}
+
+/// Whether gpg can actually generate a signing key — some sandboxes ship the binary but no working
+/// `gpg-agent`, so key generation fails; the test then skips rather than fails. Cached.
+#[cfg(unix)]
+fn gpg_can_sign() -> bool {
+	use std::os::unix::fs::PermissionsExt;
+	static USABLE: OnceLock<bool> = OnceLock::new();
+	*USABLE.get_or_init(|| {
+		let Ok(probe) = TempDir::new() else {
+			return false;
+		};
+		let home = probe.path().join("gnupg");
+		if std::fs::create_dir_all(&home).is_err() {
+			return false;
+		}
+		let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+		let _ = std::fs::write(home.join("gpg-agent.conf"), "allow-loopback-pinentry\n");
+		let _ = std::fs::write(home.join("gpg.conf"), "pinentry-mode loopback\n");
+		Command::new("gpg")
+			.arg("--homedir")
+			.arg(&home)
+			.args([
+				"--batch",
+				"--pinentry-mode",
+				"loopback",
+				"--passphrase",
+				"",
+				"--quick-generate-key",
+				"probe <p@x>",
+				"ed25519",
+				"sign",
+				"0",
+			])
+			.output()
+			.map(|out| out.status.success())
+			.unwrap_or(false)
+	})
 }
 
 // --- skip probes --------------------------------------------------------------------------------

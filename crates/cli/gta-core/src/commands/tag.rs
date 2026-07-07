@@ -111,56 +111,24 @@ impl Tag {
 		// git records the *committer* identity as the tagger.
 		let tagger = CliIdentity::new(repo).committer().await?;
 
-		match self.signing_mode(repo).await? {
-			SigningMode::Off => gitana_porcelain::tag(repo, oid, name, &tagger, message).await,
-			mode => {
-				let signer = LazyCliSigner::new(
-					repo,
-					self.signing_key,
-					self.cwd,
-					mode.require_explicit_ssh(),
-				);
-				gitana_porcelain::tag_signed(repo, oid, name, &tagger, message, &signer).await
-			}
+		if self.should_sign(repo).await? {
+			let signer = LazyCliSigner::new(repo, self.signing_key, self.cwd);
+			gitana_porcelain::tag_signed(repo, oid, name, &tagger, message, &signer).await
+		} else {
+			gitana_porcelain::tag(repo, oid, name, &tagger, message).await
 		}
 	}
 
-	/// Resolve how the annotated tag should sign: `--no-sign` wins (off), then `-s` (explicit — assumes
-	/// ssh on an unset `gpg.format`), then git config `tag.gpgSign` (config — requires an explicit
-	/// `gpg.format=ssh`). Fails *closed*: a config read/parse error propagates rather than dropping to
-	/// unsigned.
-	async fn signing_mode<H: HashAlgorithm>(
-		&self,
-		repo: &Repository<Backend, H>,
-	) -> Result<SigningMode> {
+	/// Whether the annotated tag should be signed: `--no-sign` wins (off), then `-s`/`--sign`, then git
+	/// config `tag.gpgSign`. Fails *closed*: a config read/parse error propagates rather than dropping
+	/// to unsigned. The signing format (`gpg.format`) and key are resolved by the signer, lazily.
+	async fn should_sign<H: HashAlgorithm>(&self, repo: &Repository<Backend, H>) -> Result<bool> {
 		if self.no_sign {
-			return Ok(SigningMode::Off);
+			return Ok(false);
 		}
 		if self.sign {
-			return Ok(SigningMode::Explicit);
+			return Ok(true);
 		}
-		Ok(if signer::config_requests_tag_signing(repo).await? {
-			SigningMode::Config
-		} else {
-			SigningMode::Off
-		})
-	}
-}
-
-/// How `gta tag` should sign an annotated tag — mirrors `gta commit`'s modes.
-enum SigningMode {
-	/// Do not sign.
-	Off,
-	/// `-s`/`--sign`: sign, assuming `gpg.format=ssh` when unset.
-	Explicit,
-	/// `tag.gpgSign`: sign, requiring an explicit `gpg.format=ssh`.
-	Config,
-}
-
-impl SigningMode {
-	/// Whether an unset `gpg.format` is rejected (config-driven) rather than assumed `ssh` (explicit
-	/// `-s`). Only meaningful for the signing modes.
-	fn require_explicit_ssh(&self) -> bool {
-		matches!(self, SigningMode::Config)
+		signer::config_requests_tag_signing(repo).await
 	}
 }

@@ -51,16 +51,17 @@ What works today:
   commit chain carrying a policy (`off` / `warn` / `require`) and the trusted SSH keys;
   `gta trust init/list/add-key/remove-key/set-policy/sync` manage it — each update is re-verified
   before the ref moves, and `sync` adopts a remote root forward-only (pinning the bootstrap signer
-  on first use). Clients sign with `ssh-keygen`: `gta commit -S`, `gta tag -s`, and
-  `gta push --signed` produce SSHSIG signatures in git's `git` namespace, interoperable with stock
-  git. Receive-pack enforces the policy before any ref moves — verifying the candidate trust-root
-  update, the push certificate (repo-bound nonce, pushee, exact commands), and a trusted signature
-  on every newly introduced commit and annotated tag — failing closed on a malformed root and
-  emitting typed audit events. Signature *verification* accepts both SSHSIG and OpenPGP signatures
-  (dispatched on the armor), so a trust root may enrol OpenSSH keys, armored OpenPGP certificates, or
-  both; signature *production* is still SSHSIG-only. `require` is validated end to end against stock `git push --signed`
-  (`docs/trust-validation-matrix.md`); migrate an existing repo onto it with the `--dry-run`
-  preflight (`docs/trust-migration.md`).
+  on first use). `gta commit -S`, `gta tag -s`, and `gta push --signed` sign with either format,
+  chosen by git config `gpg.format` (`ssh` → `ssh-keygen`, `openpgp`/unset → `gpg`, matching git's
+  default; programs overridable via `gpg.ssh.program` / `gpg.program`), interoperable with stock git
+  in both directions. Receive-pack enforces the policy before any ref moves — verifying the candidate
+  trust-root update, the push certificate (repo-bound nonce, pushee, exact commands), and a trusted
+  signature on every newly introduced commit and annotated tag — failing closed on a malformed root
+  and emitting typed audit events. Signatures (objects and push certificates) are verified in both
+  SSHSIG and OpenPGP, dispatched on the armor, so a trust root may enrol OpenSSH keys, armored OpenPGP
+  certificates, or both; trust-chain commits themselves remain SSHSIG-only. `require` is validated end
+  to end against stock `git push --signed` (`docs/trust-validation-matrix.md`); migrate an existing
+  repo onto it with the `--dry-run` preflight (`docs/trust-migration.md`).
 
 Major gaps:
 
@@ -81,9 +82,8 @@ Major gaps:
   sparse-checkout support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
-- Trust *verification* accepts both SSHSIG and OpenPGP signatures, but signature *production*
-  (`commit -S`, `tag -s`, `push --signed`) is SSHSIG-only — gitana does not yet produce OpenPGP
-  signatures.
+- Trust signing produces and verifies both SSHSIG and OpenPGP signatures (git's `gpg.format`), but
+  not yet OpenPGP's other forms (e.g. X.509/`gpgsm`). Trust-root updates are SSHSIG-only.
 - Remote transport currently supports HTTP(S) Smart HTTP remotes. Other Git URL
   schemes, such as SSH remotes, are not implemented.
 - Object storage now uses pack `.idx` and a multi-pack-index for lookup. `gta repack`

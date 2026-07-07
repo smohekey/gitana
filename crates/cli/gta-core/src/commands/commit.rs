@@ -50,16 +50,13 @@ impl WorkTreeCommand for Commit<'_> {
 	) -> Result<()> {
 		let repo = worktree.repository();
 		let identity = CliIdentity::new(repo);
-		// Whether this commit should be signed, and under which `gpg.format` policy: `-S` forces on and
-		// assumes ssh when `gpg.format` is unset; `--no-gpg-sign` forces off; otherwise git config
-		// `commit.gpgsign` decides (and an unset `gpg.format` is an error). The signer resolves its key
-		// and validates `gpg.format` lazily, only once a commit is certain — so a no-op reports "nothing
-		// to commit" first.
-		let signer = match self.signing_mode(repo).await? {
-			SigningMode::Off => None,
-			SigningMode::Explicit => Some(LazyCliSigner::new(repo, self.signing_key, self.cwd, false)),
-			SigningMode::Config => Some(LazyCliSigner::new(repo, self.signing_key, self.cwd, true)),
-		};
+		// Whether this commit should be signed (`-S` / `--no-gpg-sign` / `commit.gpgsign`). The signer
+		// picks its format from `gpg.format` and resolves its key lazily, only once a commit is certain —
+		// so a no-op reports "nothing to commit" first, never a signing-config error.
+		let signer = self
+			.should_sign(repo)
+			.await?
+			.then(|| LazyCliSigner::new(repo, self.signing_key, self.cwd));
 		let signer = signer.as_ref();
 
 		// A rebase replays commits itself; a plain `gta commit` would create a stray commit the
@@ -121,34 +118,17 @@ impl WorkTreeCommand for Commit<'_> {
 }
 
 impl Commit<'_> {
-	/// Resolve the signing mode: `--no-gpg-sign` wins (off), then `-S` (explicit — assumes ssh on an
-	/// unset `gpg.format`), then git config `commit.gpgsign` (config — requires an explicit
-	/// `gpg.format=ssh`). Fails *closed*: a config read/parse error propagates rather than silently
-	/// dropping to unsigned. The `gpg.format` check itself is deferred to the signer (lazy).
-	async fn signing_mode<H: HashAlgorithm>(
-		&self,
-		repo: &Repository<Backend, H>,
-	) -> Result<SigningMode> {
+	/// Whether this commit should be signed: `--no-gpg-sign` wins (off), then `-S`/`--gpg-sign`, then
+	/// git config `commit.gpgsign`. Fails *closed*: a config read/parse error propagates rather than
+	/// silently dropping to unsigned. The signing format (`gpg.format`) and key are resolved by the
+	/// signer, lazily — only once a commit is certain.
+	async fn should_sign<H: HashAlgorithm>(&self, repo: &Repository<Backend, H>) -> Result<bool> {
 		if self.no_sign {
-			return Ok(SigningMode::Off);
+			return Ok(false);
 		}
 		if self.sign {
-			return Ok(SigningMode::Explicit);
+			return Ok(true);
 		}
-		Ok(if signer::config_requests_signing(repo).await? {
-			SigningMode::Config
-		} else {
-			SigningMode::Off
-		})
+		signer::config_requests_signing(repo).await
 	}
-}
-
-/// How `gta commit` should sign — see [`Commit::signing_mode`].
-enum SigningMode {
-	/// Do not sign.
-	Off,
-	/// `-S`/`--gpg-sign`: sign, assuming `gpg.format=ssh` when unset.
-	Explicit,
-	/// `commit.gpgsign`: sign, requiring an explicit `gpg.format=ssh`.
-	Config,
 }

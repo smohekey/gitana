@@ -22,7 +22,7 @@ use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, referenced_ids};
 use gitana_repository::{Repository, RepositoryError};
 use gitana_trust::{
 	ObjectSource, Policy, TrustedKey, fold_trust_root, verify_candidate_trust_update, verify_commit,
-	verify_sshsig, verify_tag,
+	verify_pgpsig, verify_sshsig, verify_tag,
 };
 
 use crate::push_cert::{PushCert, verify_nonce};
@@ -337,9 +337,10 @@ fn apply_policy(policy: Policy, failures: Vec<Failure>) -> TrustVerdict {
 	TrustVerdict::Reject { global, refs }
 }
 
-/// Verify a push certificate against the trusted `keys`: its SSHSIG over the certificate payload,
-/// a fresh repo-bound nonce, the expected `pushee`, and that its signed commands exactly match the
-/// push. Returns the rejection reason on the first failure.
+/// Verify a push certificate against the trusted `keys`: its signature (SSHSIG or OpenPGP, matching
+/// the `gpg.format` the client signed with) over the certificate payload, a fresh repo-bound nonce,
+/// the expected `pushee`, and that its signed commands exactly match the push. Returns the rejection
+/// reason on the first failure.
 fn verify_cert<H: HashAlgorithm>(
 	cert: &PushCert,
 	keys: &[TrustedKey],
@@ -353,13 +354,16 @@ fn verify_cert<H: HashAlgorithm>(
 	if context.nonce_secret.is_empty() {
 		return Err("server is not configured to verify push certificates".to_owned());
 	}
-	verify_sshsig(
-		&cert.payload(),
-		cert.signature.as_bytes(),
-		keys,
-		GIT_NAMESPACE,
-	)
-	.map_err(|error| format!("push certificate signature: {error}"))?;
+	// Dispatch on the certificate signature's armor, as commit/tag verification does: git signs a push
+	// certificate with the configured `gpg.format`, so an OpenPGP-signed cert (from a `gpg.format=openpgp`
+	// client) must verify via the OpenPGP path, an SSHSIG cert in git's `git` namespace.
+	let signature = cert.signature.as_bytes();
+	let verified = if signature.starts_with(b"-----BEGIN PGP SIGNATURE-----") {
+		verify_pgpsig(&cert.payload(), signature, keys)
+	} else {
+		verify_sshsig(&cert.payload(), signature, keys, GIT_NAMESPACE)
+	};
+	verified.map_err(|error| format!("push certificate signature: {error}"))?;
 	if !verify_nonce(
 		&context.nonce_secret,
 		&context.repo_id,
