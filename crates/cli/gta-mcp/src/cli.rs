@@ -454,6 +454,12 @@ enum Command {
 		/// Delete a remote ref instead of pushing (sugar for a `:<ref>` refspec).
 		#[arg(long, value_name = "ref")]
 		delete: Option<String>,
+		/// Push all local tags (`refs/tags/*`); with no refspec, pushes tags only.
+		#[arg(short = 't', long)]
+		tags: bool,
+		/// Also push annotated tags reachable from the pushed commits that the remote lacks.
+		#[arg(long = "follow-tags", conflicts_with = "tags")]
+		follow_tags: bool,
 	},
 	/// List, add, remove, or retarget the configured remotes.
 	Remote {
@@ -745,6 +751,8 @@ impl Cli {
 				signing_key,
 				force,
 				delete,
+				tags,
+				follow_tags,
 			} => {
 				// `--repository` is an explicit remote (not git's ambiguous positional), so a non-`origin`
 				// value is a mistake, not a refspec shorthand — reject it before it reaches the pusher.
@@ -761,6 +769,8 @@ impl Cli {
 					signing_key,
 					force,
 					delete,
+					tags,
+					follow_tags,
 				)
 				.await
 			}

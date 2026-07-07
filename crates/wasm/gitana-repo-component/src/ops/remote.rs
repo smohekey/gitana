@@ -97,9 +97,17 @@ pub(crate) async fn push<H: HashAlgorithm>(
 			gitana_remote::PushRefspec::parse("HEAD").map_err(|e| RepoError::Invalid(e.to_string()))?,
 		],
 	};
-	let outcome = gitana_porcelain::push(&transport, repo, &origin, &advertisement, force, refspecs)
-		.await
-		.map_err(remote_error)?;
+	let outcome = gitana_porcelain::push(
+		&transport,
+		repo,
+		&origin,
+		&advertisement,
+		force,
+		refspecs,
+		gitana_porcelain::PushTags::None,
+	)
+	.await
+	.map_err(remote_error)?;
 
 	// Exactly one result in the component case (a branch push or a single delete), or none when the
 	// remote was already up to date.

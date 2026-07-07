@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::Backend;
 use anyhow::Result;
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
+use gitana_porcelain::PushTags;
 use gitana_remote::{self as transport, Origin, PushRefspec, ReqwestTransport};
 use gitana_repository::Repository;
 
@@ -18,8 +19,9 @@ use crate::repo;
 use crate::signer::LazyCliSigner;
 
 /// Push to the origin. `repository` (if given) must name the `origin` remote; `refspecs` and `delete`
-/// select what to push; `signed` attaches a push certificate (signed with `--signing-key`, or git
-/// config `user.signingkey`); `force` permits a non-fast-forward update.
+/// select what to push; `all_tags` (`--tags`) / `follow_tags` (`--follow-tags`) add tags; `signed`
+/// attaches a push certificate (signed with `--signing-key`, or git config `user.signingkey`); `force`
+/// permits a non-fast-forward update.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
 	cwd: &Path,
@@ -29,7 +31,16 @@ pub async fn run(
 	signing_key: Option<PathBuf>,
 	force: bool,
 	delete: Option<String>,
+	all_tags: bool,
+	follow_tags: bool,
 ) -> Result<()> {
+	let tags = if all_tags {
+		PushTags::All
+	} else if follow_tags {
+		PushTags::Follow
+	} else {
+		PushTags::None
+	};
 	// git puts the remote first (`push [<remote>] [<refspec>...]`); gitana has exactly one remote
 	// (`origin`), so a leading positional is the remote only when it *is* `origin` — otherwise it is a
 	// refspec, and `gta push HEAD:refs/heads/x` works without redundantly naming origin.
@@ -69,6 +80,7 @@ pub async fn run(
 				signed,
 				signing_key,
 				force,
+				tags,
 				cwd,
 			)
 			.await
@@ -83,6 +95,7 @@ pub async fn run(
 				signed,
 				signing_key,
 				force,
+				tags,
 				cwd,
 			)
 			.await
@@ -100,6 +113,7 @@ async fn push_into<H: HashAlgorithm>(
 	signed: bool,
 	signing_key: Option<PathBuf>,
 	force: bool,
+	tags: PushTags,
 	cwd: &Path,
 ) -> Result<()> {
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
@@ -115,12 +129,13 @@ async fn push_into<H: HashAlgorithm>(
 			body,
 			force,
 			refspecs,
+			tags,
 			async || pusher_ident(&repository).await,
 			&signer,
 		)
 		.await?
 	} else {
-		gitana_porcelain::push(http, &repository, origin, body, force, refspecs).await?
+		gitana_porcelain::push(http, &repository, origin, body, force, refspecs, tags).await?
 	};
 
 	if outcome.is_up_to_date() {

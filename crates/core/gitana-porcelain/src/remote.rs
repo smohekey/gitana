@@ -396,11 +396,26 @@ struct Planned<H: HashAlgorithm> {
 	forced: bool,
 }
 
+/// Which tags a [`push`] sends beyond its refspecs (git's `--tags` / `--follow-tags`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PushTags {
+	/// No tags beyond those the refspecs name explicitly.
+	#[default]
+	None,
+	/// `--tags`: push every local `refs/tags/*`. With no explicit refspec this pushes tags *only* —
+	/// git suppresses the default branch push when `--tags` supplies the refs.
+	All,
+	/// `--follow-tags`: in addition to the base push, send annotated tags reachable from the pushed
+	/// commits that the remote does not already have.
+	Follow,
+}
+
 /// Push `refspecs` to `origin` over an unsigned receive-pack request. Each `[+]<src>:<dst>` maps a
 /// local ref to a remote ref (an empty `<src>` deletes it); an empty `refspecs` list pushes what
-/// `remote.origin.push` configures, else `HEAD`'s branch to the same-name remote branch.
-/// `advertisement` is the already-fetched `git-receive-pack` `GET /info/refs` body. For a signed push
-/// (`gta push --signed`), see [`push_signed`].
+/// `remote.origin.push` configures, else `HEAD`'s branch to the same-name remote branch. `tags` adds
+/// tags per git's `--tags` / `--follow-tags`. `advertisement` is the already-fetched
+/// `git-receive-pack` `GET /info/refs` body. For a signed push (`gta push --signed`), see
+/// [`push_signed`].
 pub async fn push<F: FileStore, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
@@ -408,9 +423,10 @@ pub async fn push<F: FileStore, H: HashAlgorithm>(
 	advertisement: &[u8],
 	force: bool,
 	refspecs: Vec<PushRefspec>,
+	tags: PushTags,
 ) -> Result<PushOutcome> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
-	let planned = plan_push(repo, &advertised, refspecs, force).await?;
+	let planned = plan_push(repo, &advertised, refspecs, force, tags).await?;
 	if planned.is_empty() {
 		return Ok(PushOutcome {
 			results: Vec::new(),
@@ -440,11 +456,12 @@ pub async fn push_signed<F: FileStore, H: HashAlgorithm, S: Signer>(
 	advertisement: &[u8],
 	force: bool,
 	refspecs: Vec<PushRefspec>,
+	tags: PushTags,
 	pusher: impl AsyncFnOnce() -> Result<String>,
 	signer: &S,
 ) -> Result<PushOutcome> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
-	let planned = plan_push(repo, &advertised, refspecs, force).await?;
+	let planned = plan_push(repo, &advertised, refspecs, force, tags).await?;
 	if planned.is_empty() {
 		return Ok(PushOutcome {
 			results: Vec::new(),
@@ -478,8 +495,18 @@ async fn plan_push<F: FileStore, H: HashAlgorithm>(
 	advertised: &Advertised<H>,
 	refspecs: Vec<PushRefspec>,
 	force: bool,
+	tags: PushTags,
 ) -> Result<Vec<Planned<H>>> {
-	let refspecs = default_refspecs(repo, refspecs).await?;
+	// The base refspecs: explicit ones, else the config/HEAD default — except `--tags` with no explicit
+	// refspec pushes tags *only* (git suppresses the branch default when `--tags` supplies the refs).
+	let base = if refspecs.is_empty() && tags == PushTags::All {
+		Vec::new()
+	} else {
+		default_refspecs(repo, refspecs).await?
+	};
+	// Expand `--tags` / `--follow-tags` into additional `refs/tags/*` refspecs (see `tag_refspecs`).
+	let tag_specs = tag_refspecs(repo, advertised, &base, tags).await?;
+	let refspecs: Vec<PushRefspec> = base.into_iter().chain(tag_specs).collect();
 	let mut planned = Vec::new();
 	let mut seen_dsts = std::collections::HashSet::new();
 	for spec in refspecs {
@@ -539,6 +566,92 @@ async fn plan_push<F: FileStore, H: HashAlgorithm>(
 		planned.push(Planned { update, forced });
 	}
 	Ok(planned)
+}
+
+/// The extra `refs/tags/<name>:refs/tags/<name>` refspecs `--tags` / `--follow-tags` add to the base
+/// push. `--tags` sends every local tag; `--follow-tags` sends only annotated tags whose target commit
+/// is reachable from the commits being pushed (`base`) and that the remote does not already have. A tag
+/// whose destination a base refspec already targets is skipped, so it is planned once. The planner then
+/// applies the usual create / immutability / fast-forward rules to each.
+async fn tag_refspecs<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	advertised: &Advertised<H>,
+	base: &[PushRefspec],
+	tags: PushTags,
+) -> Result<Vec<PushRefspec>> {
+	if tags == PushTags::None {
+		return Ok(Vec::new());
+	}
+	// Destinations the base already pushes, so a tag is not planned twice (git de-dups these).
+	let mut base_dsts = std::collections::HashSet::new();
+	for spec in base {
+		base_dsts.insert(resolve_destination(repo, &spec.dst).await?);
+	}
+	// For `--follow-tags`: the object closure of the commits being pushed (the base sources' tips),
+	// against which each candidate annotated tag's target commit is tested for reachability.
+	let reachable = if tags == PushTags::Follow {
+		let mut tips = Vec::new();
+		for spec in base {
+			if let Some(src) = &spec.src
+				&& let Some(tip) = resolve_source(repo, src).await?
+			{
+				tips.push(tip);
+			}
+		}
+		Some(crate::prune::reachable_from(repo, tips).await?)
+	} else {
+		None
+	};
+
+	let mut out = Vec::new();
+	for (name, oid) in repo.refs().list("refs/tags/").await? {
+		if base_dsts.contains(&name) {
+			continue;
+		}
+		let include = match tags {
+			PushTags::All => true,
+			// A follow candidate is an annotated tag, missing from the remote, whose target commit is
+			// reachable from a pushed commit. Lightweight tags and tags of non-commits are not followed.
+			PushTags::Follow => {
+				advertised.oid_of(&name).is_none()
+					&& match follow_tag_commit(repo, oid).await? {
+						Some(commit) => reachable.as_ref().is_some_and(|set| set.contains(&commit)),
+						None => false,
+					}
+			}
+			PushTags::None => unreachable!("returned early above"),
+		};
+		if include {
+			out.push(PushRefspec {
+				force: false,
+				src: Some(name.clone()),
+				dst: name,
+			});
+		}
+	}
+	Ok(out)
+}
+
+/// The commit an annotated tag ultimately points at (peeling nested tags), or `None` if `oid` is a
+/// lightweight tag (not a tag object) or the tag does not resolve to a commit — neither is a
+/// `--follow-tags` candidate. A read error propagates (the tag is a local ref we expect to resolve).
+async fn follow_tag_commit<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	oid: ObjectId<H>,
+) -> Result<Option<ObjectId<H>>> {
+	let (kind, data) = repo.objects().read_object(&oid).await?;
+	if kind != gitana_object::ObjectKind::Tag {
+		return Ok(None);
+	}
+	let mut target = gitana_object::parse_tag::<H>(&data)?.object;
+	loop {
+		let (kind, data) = repo.objects().read_object(&target).await?;
+		match kind {
+			gitana_object::ObjectKind::Commit => return Ok(Some(target)),
+			gitana_object::ObjectKind::Tag => target = gitana_object::parse_tag::<H>(&data)?.object,
+			_ => return Ok(None),
+		}
+	}
 }
 
 /// Resolve a push destination: the literal `HEAD` becomes the current branch's ref; any other name is
@@ -749,6 +862,7 @@ mod tests {
 			&advertisement,
 			false,
 			vec![],
+			PushTags::None,
 			async || Ok("Dev <dev@x.test> 1700000000 +0000".to_owned()),
 			&signer,
 		)
@@ -819,6 +933,7 @@ mod tests {
 			&advertisement,
 			false,
 			vec![PushRefspec::parse(":main").unwrap()],
+			PushTags::None,
 			async || Ok("Dev <dev@x.test> 1700000000 +0000".to_owned()),
 			&signer,
 		)
@@ -884,6 +999,7 @@ mod tests {
 			&advertisement,
 			false,
 			vec![],
+			PushTags::None,
 			async || panic!("pusher resolved despite no push-cert support"),
 			&crate::test_support::FailingSigner,
 		)
@@ -950,6 +1066,7 @@ mod tests {
 				PushRefspec::parse("main:dup").unwrap(),
 				PushRefspec::parse("dev:dup").unwrap(),
 			],
+			PushTags::None,
 		)
 		.await;
 		let Err(err) = result else {

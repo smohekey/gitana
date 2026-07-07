@@ -249,6 +249,128 @@ async fn push_moves_the_server_ref() {
 	assert_eq!(server_tip.to_hex(), local_tip);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_tags_sends_all_local_tags() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	ok(&gta(&["-C", t, "config", "user.name", "T"]).await, "name");
+	ok(
+		&gta(&["-C", t, "config", "user.email", "t@e"]).await,
+		"email",
+	);
+
+	// A lightweight and an annotated tag on the current tip.
+	ok(&gta(&["-C", t, "tag", "lw"]).await, "tag lw");
+	ok(
+		&gta(&["-C", t, "tag", "-a", "anno", "-m", "release"]).await,
+		"tag anno",
+	);
+	let anno = stdout(
+		&gta(&["-C", t, "rev-parse", "anno"]).await,
+		"rev-parse anno",
+	);
+
+	// `--tags` pushes every local tag, lightweight and annotated alike.
+	ok(&gta(&["-C", t, "push", "--tags"]).await, "push --tags");
+	let server = open(&git_dir);
+	let head = server
+		.refs()
+		.resolve("refs/heads/main")
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		server.refs().resolve("refs/tags/lw").await.unwrap(),
+		Some(head),
+		"lightweight tag pushed"
+	);
+	assert_eq!(
+		server
+			.refs()
+			.resolve("refs/tags/anno")
+			.await
+			.unwrap()
+			.map(|o| o.to_hex()),
+		Some(anno),
+		"annotated tag object pushed"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_follow_tags_sends_only_reachable_annotated_tags() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	ok(&gta(&["-C", t, "config", "user.name", "T"]).await, "name");
+	ok(
+		&gta(&["-C", t, "config", "user.email", "t@e"]).await,
+		"email",
+	);
+
+	// Advance the branch locally, then tag the new tip both ways.
+	std::fs::write(target.join("f.txt"), b"2\n").unwrap();
+	ok(&gta(&["-C", t, "add", "f.txt"]).await, "add");
+	ok(&gta(&["-C", t, "commit", "-m", "local"]).await, "commit");
+	let head = stdout(
+		&gta(&["-C", t, "rev-parse", "HEAD"]).await,
+		"rev-parse HEAD",
+	);
+	ok(&gta(&["-C", t, "tag", "lw"]).await, "tag lw");
+	ok(
+		&gta(&["-C", t, "tag", "-a", "anno", "-m", "release"]).await,
+		"tag anno",
+	);
+	let anno = stdout(
+		&gta(&["-C", t, "rev-parse", "anno"]).await,
+		"rev-parse anno",
+	);
+
+	// `--follow-tags` pushes the branch plus the reachable *annotated* tag — not the lightweight one.
+	ok(
+		&gta(&["-C", t, "push", "--follow-tags"]).await,
+		"push --follow-tags",
+	);
+	let server = open(&git_dir);
+	assert_eq!(
+		server
+			.refs()
+			.resolve("refs/heads/main")
+			.await
+			.unwrap()
+			.map(|o| o.to_hex()),
+		Some(head),
+		"the branch advanced"
+	);
+	assert_eq!(
+		server
+			.refs()
+			.resolve("refs/tags/anno")
+			.await
+			.unwrap()
+			.map(|o| o.to_hex()),
+		Some(anno),
+		"the annotated tag was followed"
+	);
+	assert_eq!(
+		server.refs().resolve("refs/tags/lw").await.unwrap(),
+		None,
+		"a lightweight tag is not followed"
+	);
+}
+
 /// `gta push --signed` drives the real `ssh-keygen` signer end to end: it attaches a push certificate
 /// (the server advertises a nonce), the signed path is taken (`(signed)` reported), and the ref moves.
 /// The cryptographic correctness of the certificate — that its signature verifies under the signing

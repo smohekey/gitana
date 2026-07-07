@@ -305,3 +305,62 @@ async fn gta_pushes_explicit_refspecs_to_a_real_git_repo() {
 			.success()
 	);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gta_pushes_follow_tags_to_a_real_git_repo() {
+	if skip() {
+		return;
+	}
+	let root = tmp("client-follow-tags");
+	build_bare(&root);
+	let url = serve_git_http_backend(root.clone()).await;
+	let bare = root.join("repo.git");
+
+	let checkout = root.join("c");
+	let c = checkout.to_str().unwrap();
+	gta_ok(
+		&gta(&["clone", &format!("{url}/repo.git"), c]).await,
+		"clone",
+	);
+	gta_ok(
+		&gta(&["-C", c, "config", "user.name", "C"]).await,
+		"config name",
+	);
+	gta_ok(
+		&gta(&["-C", c, "config", "user.email", "c@e"]).await,
+		"config email",
+	);
+
+	// Advance `main` locally, then tag the new tip both ways.
+	std::fs::write(checkout.join("a.txt"), b"changed\n").unwrap();
+	gta_ok(&gta(&["-C", c, "add", "."]).await, "add");
+	gta_ok(
+		&gta(&["-C", c, "commit", "-m", "client change"]).await,
+		"commit",
+	);
+	let head = gta_stdout(
+		&gta(&["-C", c, "rev-parse", "HEAD"]).await,
+		"rev-parse HEAD",
+	);
+	gta_ok(
+		&gta(&["-C", c, "tag", "-a", "v2", "-m", "release"]).await,
+		"tag v2",
+	);
+	gta_ok(&gta(&["-C", c, "tag", "v2lw"]).await, "tag v2lw");
+	let v2 = gta_stdout(&gta(&["-C", c, "rev-parse", "v2"]).await, "rev-parse v2");
+
+	// `--follow-tags` pushes `main` plus the reachable annotated tag `v2`, into the real git repo — but
+	// not the lightweight `v2lw`. Real git accepts the pack (the tag's commit rides along).
+	gta_ok(
+		&gta(&["-C", c, "push", "--follow-tags"]).await,
+		"push --follow-tags",
+	);
+	assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), head);
+	assert_eq!(git(&bare, &["rev-parse", "v2"]), v2);
+	assert!(
+		!git_try(&bare, &["rev-parse", "--verify", "refs/tags/v2lw"])
+			.status
+			.success(),
+		"a lightweight tag must not be followed"
+	);
+}
