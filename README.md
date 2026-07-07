@@ -135,6 +135,13 @@ Implemented command groups:
   `remove`, `rename`, `set-url`). `fetch` honours the configured `remote.origin.fetch` refspecs —
   wildcard, exact, force (`+`), and negative (`^`) — mapping advertised refs to tracking refs and
   enforcing fast-forward for non-forced refspecs.
+- Tags over the wire, matching git: `fetch` auto-follows tags (writing `refs/tags/*` for advertised
+  tags reachable from the fetched branches), with `--tags` to mirror every tag, `--no-tags` to opt
+  out, and `remote.origin.tagOpt` honoured; `push --tags` sends all local tags and `push
+  --follow-tags` sends the annotated tags reachable from the pushed commits that the remote lacks.
+  Existing tags are immutable (a non-forced update to one is rejected on both fetch and push), and a
+  bare-name deletion (`push --delete v1`) resolves against the remote's refs, so it removes an
+  existing `refs/tags/v1` rather than a nonexistent branch.
 - Trust and signing: `trust` (`init`, `list`, `add-key`, `remove-key`, `set-policy`, `sync`;
   `init`/`set-policy` take `--dry-run` to preview a policy change). Commits and tags are signed with
   `commit -S` / `tag -s`, or automatically via git config `commit.gpgsign` / `tag.gpgSign` (with
