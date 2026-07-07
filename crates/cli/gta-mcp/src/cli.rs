@@ -428,6 +428,13 @@ enum Command {
 	Pull,
 	/// Push the current branch to the origin.
 	Push {
+		/// The remote to push to (must be `origin`); defaults to `origin`.
+		#[arg(long)]
+		repository: Option<String>,
+		/// Refspecs to push: `[+]<src>:<dst>`, `<name>` (same-name), or `:<dst>` (delete). None pushes
+		/// `HEAD`'s branch (or `remote.origin.push`).
+		#[arg(long = "refspec")]
+		refspecs: Vec<String>,
 		/// Attach a push certificate.
 		#[arg(long)]
 		signed: bool,
@@ -437,8 +444,8 @@ enum Command {
 		/// Allow a non-fast-forward update.
 		#[arg(short = 'f', long)]
 		force: bool,
-		/// Delete a remote branch instead of pushing.
-		#[arg(long, value_name = "branch")]
+		/// Delete a remote ref instead of pushing (sugar for a `:<ref>` refspec).
+		#[arg(long, value_name = "ref")]
 		delete: Option<String>,
 	},
 	/// List, add, remove, or retarget the configured remotes.
@@ -723,11 +730,31 @@ impl Cli {
 			Command::Fetch => commands::fetch::run(&cwd).await.map(|_| ()),
 			Command::Pull => commands::pull::run(&cwd).await,
 			Command::Push {
+				repository,
+				refspecs,
 				signed,
 				signing_key,
 				force,
 				delete,
-			} => commands::push::run(&cwd, signed, signing_key, force, delete).await,
+			} => {
+				// `--repository` is an explicit remote (not git's ambiguous positional), so a non-`origin`
+				// value is a mistake, not a refspec shorthand — reject it before it reaches the pusher.
+				if let Some(remote) = &repository
+					&& remote != "origin"
+				{
+					anyhow::bail!("gitana has a single remote; --repository must be `origin`");
+				}
+				commands::push::run(
+					&cwd,
+					repository,
+					refspecs,
+					signed,
+					signing_key,
+					force,
+					delete,
+				)
+				.await
+			}
 			Command::Remote { verbose, action } => {
 				commands::remote::run(&cwd, remote_action(verbose, action)).await
 			}

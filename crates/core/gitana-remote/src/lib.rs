@@ -10,11 +10,13 @@
 //! `wasi:http` client.
 
 mod http_transport;
+mod push_refspec;
 mod refspec;
 #[cfg(feature = "reqwest-transport")]
 mod reqwest_transport;
 
 pub use http_transport::HttpTransport;
+pub use push_refspec::PushRefspec;
 pub use refspec::Refspec;
 #[cfg(feature = "reqwest-transport")]
 pub use reqwest_transport::ReqwestTransport;

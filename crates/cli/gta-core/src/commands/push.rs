@@ -1,6 +1,8 @@
-//! `gta push` — send the current branch to the configured origin over Git Smart
-//! HTTP. With `--signed`, attach a push certificate. `--force` permits a
-//! non-fast-forward update, and `--delete <branch>` sends a delete ref command.
+//! `gta push` — send refs to the configured origin over Git Smart HTTP. Positional refspecs
+//! (`[+]<src>:<dst>`, `<name>`, or `:<dst>` to delete) select what to push; with none, `HEAD`'s branch
+//! (or `remote.origin.push`) is pushed to the same-name remote branch. `--signed` attaches a push
+//! certificate, `--force` permits a non-fast-forward, and `--delete <ref>` is sugar for a `:<ref>`
+//! deletion.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,24 +10,46 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::Backend;
 use anyhow::Result;
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
-use gitana_porcelain::PushOutcome;
-use gitana_remote::{self as transport, Origin, ReqwestTransport};
+use gitana_remote::{self as transport, Origin, PushRefspec, ReqwestTransport};
 use gitana_repository::Repository;
 
 use crate::dispatch;
 use crate::repo;
 use crate::signer::LazyCliSigner;
 
-/// Push `HEAD`'s branch to the origin. `signed` attaches a push certificate (signed with
-/// `--signing-key`, or git config `user.signingkey`); `force` permits a non-fast-forward update;
-/// `delete` removes a remote branch instead of pushing.
+/// Push to the origin. `repository` (if given) must name the `origin` remote; `refspecs` and `delete`
+/// select what to push; `signed` attaches a push certificate (signed with `--signing-key`, or git
+/// config `user.signingkey`); `force` permits a non-fast-forward update.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
 	cwd: &Path,
+	repository: Option<String>,
+	refspecs: Vec<String>,
 	signed: bool,
 	signing_key: Option<PathBuf>,
 	force: bool,
 	delete: Option<String>,
 ) -> Result<()> {
+	// git puts the remote first (`push [<remote>] [<refspec>...]`); gitana has exactly one remote
+	// (`origin`), so a leading positional is the remote only when it *is* `origin` — otherwise it is a
+	// refspec, and `gta push HEAD:refs/heads/x` works without redundantly naming origin.
+	let mut spec_texts = Vec::new();
+	match repository {
+		Some(remote) if remote == "origin" => {}
+		Some(refspec) => spec_texts.push(refspec),
+		None => {}
+	}
+	spec_texts.extend(refspecs);
+	// Parse the refspecs, plus `--delete <ref>` as a `:<ref>` deletion. An empty list lets the
+	// porcelain default to `remote.origin.push` or `HEAD`'s branch.
+	let mut specs = spec_texts
+		.iter()
+		.map(|s| PushRefspec::parse(s))
+		.collect::<Result<Vec<_>>>()?;
+	if let Some(target) = delete {
+		specs.push(PushRefspec::parse(&format!(":{target}"))?);
+	}
+
 	let found = repo::discover(cwd)?;
 	let origin = Origin::load(&found.common_dir)?;
 	let http = ReqwestTransport::new();
@@ -41,10 +65,10 @@ pub async fn run(
 				&origin,
 				&found,
 				&body,
+				specs,
 				signed,
 				signing_key,
 				force,
-				delete,
 				cwd,
 			)
 			.await
@@ -55,10 +79,10 @@ pub async fn run(
 				&origin,
 				&found,
 				&body,
+				specs,
 				signed,
 				signing_key,
 				force,
-				delete,
 				cwd,
 			)
 			.await
@@ -72,17 +96,16 @@ async fn push_into<H: HashAlgorithm>(
 	origin: &Origin,
 	found: &repo::Discovered,
 	body: &[u8],
+	refspecs: Vec<PushRefspec>,
 	signed: bool,
 	signing_key: Option<PathBuf>,
 	force: bool,
-	delete: Option<String>,
 	cwd: &Path,
 ) -> Result<()> {
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
 	// A signed push certificate is signed like `commit -S`: the format follows `gpg.format` (unset →
 	// OpenPGP, git's default), and the key is resolved lazily so a "server does not accept signed
-	// pushes" error is not masked by a missing signing key. `--signed --delete` attaches a signed
-	// delete certificate, so a `require` server can authorise it.
+	// pushes" error is not masked by a missing signing key.
 	let outcome = if signed {
 		let signer = LazyCliSigner::new(&repository, signing_key, cwd.to_path_buf());
 		gitana_porcelain::push_signed(
@@ -91,29 +114,31 @@ async fn push_into<H: HashAlgorithm>(
 			origin,
 			body,
 			force,
-			delete,
+			refspecs,
 			async || pusher_ident(&repository).await,
 			&signer,
 		)
 		.await?
 	} else {
-		gitana_porcelain::push(http, &repository, origin, body, force, delete).await?
+		gitana_porcelain::push(http, &repository, origin, body, force, refspecs).await?
 	};
 
-	match outcome {
-		PushOutcome::Deleted { refname } => println!("Deleted {refname} on {}", origin.url),
-		PushOutcome::UpToDate => println!("Everything up-to-date"),
-		PushOutcome::Pushed {
-			branch,
-			signed,
-			forced,
-		} => {
-			let how = match (signed, forced) {
-				(true, _) => " (signed)",
-				(false, true) => " (forced)",
-				_ => "",
+	if outcome.is_up_to_date() {
+		println!("Everything up-to-date");
+		return Ok(());
+	}
+	for result in &outcome.results {
+		if result.deleted {
+			println!("Deleted {} on {}", result.refname, origin.url);
+		} else {
+			let how = if outcome.signed {
+				" (signed)"
+			} else if result.forced {
+				" (forced)"
+			} else {
+				""
 			};
-			println!("Pushed {branch} -> {}{how}", origin.url);
+			println!("Pushed {} -> {}{how}", result.refname, origin.url);
 		}
 	}
 	Ok(())

@@ -11,7 +11,7 @@ use gitana_git_http::{
 	build_receive_pack_request, parse_advertisement, parse_report_status,
 };
 use gitana_object::{HashAlgorithm, ObjectId};
-use gitana_remote::{HttpTransport, Origin, RECEIVE_PACK_REQUEST, Refspec};
+use gitana_remote::{HttpTransport, Origin, PushRefspec, RECEIVE_PACK_REQUEST, Refspec};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
 
@@ -247,208 +247,268 @@ async fn download<F: FileStore, H: HashAlgorithm>(
 	Ok(())
 }
 
-/// The result of a [`push`]; `signed`/`forced` are render hints.
-pub enum PushOutcome {
-	/// `HEAD`'s branch was pushed to the remote.
-	Pushed {
-		branch: String,
-		signed: bool,
-		forced: bool,
-	},
-	/// A remote branch was deleted.
-	Deleted { refname: String },
-	/// The remote already had the branch tip; nothing was sent.
-	UpToDate,
+/// The result of a [`push`]. `results` is empty when everything was already up to date; `signed` is a
+/// render hint.
+pub struct PushOutcome {
+	/// One entry per destination ref actually updated or deleted.
+	pub results: Vec<PushResult>,
+	/// Whether the push was sent as a signed certificate.
+	pub signed: bool,
 }
 
-/// Push `HEAD`'s branch to `origin` over an unsigned receive-pack request (or, with `delete`, remove a
-/// remote branch). `advertisement` is the already-fetched `git-receive-pack` `GET /info/refs` body.
-/// For a signed push (`gta push --signed`), see [`push_signed`].
+/// One destination ref's outcome within a [`PushOutcome`].
+pub struct PushResult {
+	/// The remote ref updated or deleted.
+	pub refname: String,
+	/// Whether this was a deletion.
+	pub deleted: bool,
+	/// Whether the update was forced (a non-fast-forward permitted).
+	pub forced: bool,
+}
+
+impl PushOutcome {
+	/// Whether nothing was sent because every ref was already up to date.
+	pub fn is_up_to_date(&self) -> bool {
+		self.results.is_empty()
+	}
+}
+
+/// A planned ref update (already fast-forward-checked and resolved) plus its render metadata.
+struct Planned<H: HashAlgorithm> {
+	update: RefUpdate<H>,
+	forced: bool,
+}
+
+/// Push `refspecs` to `origin` over an unsigned receive-pack request. Each `[+]<src>:<dst>` maps a
+/// local ref to a remote ref (an empty `<src>` deletes it); an empty `refspecs` list pushes what
+/// `remote.origin.push` configures, else `HEAD`'s branch to the same-name remote branch.
+/// `advertisement` is the already-fetched `git-receive-pack` `GET /info/refs` body. For a signed push
+/// (`gta push --signed`), see [`push_signed`].
 pub async fn push<F: FileStore, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
 	origin: &Origin,
 	advertisement: &[u8],
 	force: bool,
-	delete: Option<String>,
+	refspecs: Vec<PushRefspec>,
 ) -> Result<PushOutcome> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
-
-	if let Some(target) = delete {
-		return delete_ref(transport, origin, &advertised, &target).await;
+	let planned = plan_push(repo, &advertised, refspecs, force).await?;
+	if planned.is_empty() {
+		return Ok(PushOutcome {
+			results: Vec::new(),
+			signed: false,
+		});
 	}
-
-	let Some(plan) = prepare_branch_push(repo, &advertised, force).await? else {
-		return Ok(PushOutcome::UpToDate);
-	};
-	let update = RefUpdate {
-		old: plan.remote_old,
-		new: Some(plan.local_tip),
-		name: plan.branch.clone(),
-	};
-	let request = build_receive_pack_request(std::slice::from_ref(&update), &plan.pack);
+	let updates: Vec<RefUpdate<H>> = planned.iter().map(|p| p.update.clone()).collect();
+	let pack = pack_for(repo, &advertised, &planned).await?;
+	let request = build_receive_pack_request(&updates, &pack);
 	send_receive_pack(transport, origin, request).await?;
-	Ok(PushOutcome::Pushed {
-		branch: plan.branch,
+	Ok(PushOutcome {
+		results: results_of(&planned),
 		signed: false,
-		forced: force,
 	})
 }
 
-/// Push `HEAD`'s branch to `origin` with a signed push certificate (`gta push --signed`), or — with
-/// `delete` — remove a remote branch with a *signed* delete certificate (so a `require` server can
-/// authorise the deletion). Otherwise like [`push`]. `pusher` resolves the certificate's pusher line
-/// and `signer` signs the certificate body — both invoked only after confirming the server offers
-/// push-cert, so an unconfigured identity or an unresolvable signing key does not mask "the server
-/// does not accept signed pushes".
+/// Push `refspecs` to `origin` with a signed push certificate (`gta push --signed`) — a single cert
+/// carrying one command per ref, so a `require` server can authorise every update (and any deletion).
+/// Otherwise like [`push`]. `pusher` resolves the certificate's pusher line and `signer` signs the
+/// certificate body — both invoked only after confirming the server offers push-cert, so an
+/// unconfigured identity or an unresolvable signing key does not mask "the server does not accept
+/// signed pushes".
 pub async fn push_signed<F: FileStore, H: HashAlgorithm, S: Signer>(
 	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
 	origin: &Origin,
 	advertisement: &[u8],
 	force: bool,
-	delete: Option<String>,
+	refspecs: Vec<PushRefspec>,
 	pusher: impl AsyncFnOnce() -> Result<String>,
 	signer: &S,
 ) -> Result<PushOutcome> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
-
-	if let Some(target) = delete {
-		return delete_signed(transport, origin, &advertised, &target, pusher, signer).await;
+	let planned = plan_push(repo, &advertised, refspecs, force).await?;
+	if planned.is_empty() {
+		return Ok(PushOutcome {
+			results: Vec::new(),
+			signed: true,
+		});
 	}
-
-	let Some(plan) = prepare_branch_push(repo, &advertised, force).await? else {
-		return Ok(PushOutcome::UpToDate);
-	};
 	let nonce = advertised
 		.push_cert_nonce
 		.clone()
 		.context("the server does not accept signed pushes")?;
-	let mut cert = build_cert(
-		origin,
-		pusher().await?,
-		nonce,
-		plan.remote_old,
-		Some(plan.local_tip),
-		&plan.branch,
-	);
+	let updates: Vec<RefUpdate<H>> = planned.iter().map(|p| p.update.clone()).collect();
+	let mut cert = build_cert(origin, pusher().await?, nonce, &updates);
 	// The signer emits an SSHSIG armor (git's `git` namespace) over the certificate body — exactly what
 	// receive-pack verifies via `verify_sshsig(cert.payload(), cert.signature, keys, "git")`.
 	cert.signature = signer.sign(&cert.payload()).await?;
-	let request = build_push_cert(&cert, &push_caps::<H>(), &plan.pack);
+	let pack = pack_for(repo, &advertised, &planned).await?;
+	let request = build_push_cert(&cert, &push_caps::<H>(), &pack);
 	send_receive_pack(transport, origin, request).await?;
-	Ok(PushOutcome::Pushed {
-		branch: plan.branch,
+	Ok(PushOutcome {
+		results: results_of(&planned),
 		signed: true,
-		forced: force,
 	})
 }
 
-/// Send a *signed* delete-ref command for `target`: a push certificate whose single command zeroes
-/// the ref's new value, so a `require` server verifies *who* is deleting and authorises it (unlike the
-/// unsigned [`delete_ref`]). The server must additionally permit deletes at all — its delete-refs grant
-/// (receive-pack's `force`), an orthogonal axis to signing — for the command to apply. Like
-/// [`push_signed`], the nonce is required before the pusher or signer is touched, so a "server does not
-/// accept signed pushes" error is not masked.
-async fn delete_signed<H: HashAlgorithm, S: Signer>(
-	transport: &impl HttpTransport,
-	origin: &Origin,
-	advertised: &Advertised<H>,
-	target: &str,
-	pusher: impl AsyncFnOnce() -> Result<String>,
-	signer: &S,
-) -> Result<PushOutcome> {
-	let refname = normalize_branch(target);
-	let remote = advertised
-		.oid_of(&refname)
-		.with_context(|| format!("the remote has no {refname}"))?;
-	let nonce = advertised
-		.push_cert_nonce
-		.clone()
-		.context("the server does not accept signed pushes")?;
-	let mut cert = build_cert(origin, pusher().await?, nonce, Some(remote), None, &refname);
-	cert.signature = signer.sign(&cert.payload()).await?;
-	let request = build_push_cert(&cert, &push_caps::<H>(), &[]);
-	send_receive_pack(transport, origin, request).await?;
-	Ok(PushOutcome::Deleted { refname })
-}
-
-/// A planned branch push: the ref-update coordinates and the pack the remote lacks, shared by [`push`]
-/// and [`push_signed`]. `prepare_branch_push` returns `None` when the remote already has the tip.
-struct BranchPush<H: HashAlgorithm> {
-	branch: String,
-	remote_old: Option<ObjectId<H>>,
-	local_tip: ObjectId<H>,
-	pack: Vec<u8>,
-}
-
-/// Resolve `HEAD`'s branch and tip against the advertised refs, enforce the fast-forward rule (unless
-/// `force`), and pack the objects the remote lacks. Returns `None` when the remote already has the tip
-/// (nothing to send). Shared preamble of the signed and unsigned pushes so both apply the same guards.
-async fn prepare_branch_push<F: FileStore, H: HashAlgorithm>(
+/// Resolve `refspecs` to concrete, fast-forward-checked ref updates against the advertised refs. An
+/// empty `refspecs` defaults to `remote.origin.push`, else `HEAD`'s branch pushed to the same name. A
+/// ref already at its destination tip is dropped (nothing to send for it). A non-fast-forward update
+/// without `force` (global) or a `+` on the refspec is refused before anything is sent.
+async fn plan_push<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	advertised: &Advertised<H>,
+	refspecs: Vec<PushRefspec>,
 	force: bool,
-) -> Result<Option<BranchPush<H>>> {
-	let branch = match repo.refs().read_head().await? {
-		HeadState::Symbolic(branch) => branch,
-		HeadState::Detached(_) => bail!("cannot push a detached HEAD"),
-	};
-	let local_tip = repo
-		.refs()
-		.resolve(&branch)
-		.await?
-		.context("nothing to push (the branch is unborn)")?;
-
-	let remote_old = advertised.oid_of(&branch);
-	if remote_old == Some(local_tip) {
-		return Ok(None);
+) -> Result<Vec<Planned<H>>> {
+	let refspecs = default_refspecs(repo, refspecs).await?;
+	let mut planned = Vec::new();
+	let mut seen_dsts = std::collections::HashSet::new();
+	for spec in refspecs {
+		let forced = force || spec.force;
+		// A `HEAD` destination (git's `push origin HEAD` shorthand) means the current branch's ref.
+		let dst = resolve_destination(repo, &spec.dst).await?;
+		// Two refspecs targeting one destination would be applied sequentially by receive-pack — the
+		// second stale after the first moved the ref — leaving a partial push. Refuse before sending.
+		if !seen_dsts.insert(dst.clone()) {
+			bail!("refspec destination {dst} is updated by more than one refspec");
+		}
+		let remote_old = advertised.oid_of(&dst);
+		let update = match &spec.src {
+			// Deletion: the remote ref must exist.
+			None => {
+				let old = remote_old.with_context(|| format!("the remote has no {dst}"))?;
+				RefUpdate {
+					old: Some(old),
+					new: None,
+					name: dst,
+				}
+			}
+			Some(src) => {
+				let local_tip = resolve_source(repo, src)
+					.await?
+					.with_context(|| format!("{src} does not resolve to a ref to push"))?;
+				if remote_old == Some(local_tip) {
+					continue; // already up to date
+				}
+				// Existing tags are immutable in git: any change to an existing `refs/tags/*` needs a
+				// force, even a fast-forward — a tag is a fixed name, not a moving branch tip. (Bare-name
+				// tag DWIM — `push origin v1` where v1 is a local tag — is deferred to the tags slice.)
+				if !forced && dst.starts_with("refs/tags/") && remote_old.is_some() {
+					bail!(
+						"updates to {dst} were rejected: the tag already exists on the remote at a different \
+							 object; force with `+{src}:{dst}` / --force to overwrite it"
+					);
+				}
+				// Otherwise, without a force, refuse a non-fast-forward before sending anything (git's client-side
+				// check): the remote tip must be an ancestor of the local tip. A create is a fast-forward.
+				if !forced
+					&& let Some(old) = remote_old
+					&& !repo.is_ancestor(old, local_tip).await?
+				{
+					bail!(
+						"updates to {dst} were rejected: the remote has work you do not have locally; fetch \
+						 and integrate first, or force with `+{src}:{dst}` / --force"
+					);
+				}
+				RefUpdate {
+					old: remote_old,
+					new: Some(local_tip),
+					name: dst,
+				}
+			}
+		};
+		planned.push(Planned { update, forced });
 	}
-
-	// Without `--force`, refuse a non-fast-forward before sending anything: the remote tip must be an
-	// ancestor of the local tip (git's client-side check). A create (no remote tip) is always a
-	// fast-forward. Relying on the server to reject is not enough — a server configured to permit
-	// rewrites would otherwise silently overwrite the remote branch.
-	if !force
-		&& let Some(remote_old) = remote_old
-		&& !repo.is_ancestor(remote_old, local_tip).await?
-	{
-		bail!(
-			"updates were rejected because the remote contains work that you do not have locally; \
-			 integrate the remote changes (e.g. fetch) before pushing again, or use --force"
-		);
-	}
-
-	// Pack the objects the remote lacks (reachable from the tip, minus its refs).
-	let haves = gitana_remote::advertised_oids(advertised);
-	let pack = build_pack(repo, &[local_tip], &haves).await?;
-	Ok(Some(BranchPush {
-		branch,
-		remote_old,
-		local_tip,
-		pack,
-	}))
+	Ok(planned)
 }
 
-/// Send a delete-ref command for `target` (a branch name or full ref) to the remote.
-async fn delete_ref<H: HashAlgorithm>(
-	transport: &impl HttpTransport,
-	origin: &Origin,
-	advertised: &Advertised<H>,
-	target: &str,
-) -> Result<PushOutcome> {
-	let refname = normalize_branch(target);
-	let remote = advertised
-		.oid_of(&refname)
-		.with_context(|| format!("the remote has no {refname}"))?;
-	let update = RefUpdate {
-		old: Some(remote),
-		new: None,
-		name: refname.clone(),
+/// Resolve a push destination: the literal `HEAD` becomes the current branch's ref; any other name is
+/// already a full ref.
+async fn resolve_destination<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	dst: &str,
+) -> Result<String> {
+	if dst == "HEAD" {
+		return match repo.refs().read_head().await? {
+			HeadState::Symbolic(branch) => Ok(branch),
+			HeadState::Detached(_) => {
+				bail!("cannot push to `HEAD` from a detached HEAD; use an explicit destination ref")
+			}
+		};
+	}
+	Ok(dst.to_owned())
+}
+
+/// The refspecs to push: `refspecs` when non-empty, else `remote.origin.push`, else `HEAD`'s branch to
+/// the same-name remote branch (git's default when nothing is configured).
+async fn default_refspecs<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	refspecs: Vec<PushRefspec>,
+) -> Result<Vec<PushRefspec>> {
+	if !refspecs.is_empty() {
+		return Ok(refspecs);
+	}
+	if let Ok(config) = repo.read_config().await {
+		let configured = config.get_all("remote", Some("origin"), "push");
+		if !configured.is_empty() {
+			return configured.iter().map(|s| PushRefspec::parse(s)).collect();
+		}
+	}
+	let branch = match repo.refs().read_head().await? {
+		HeadState::Symbolic(branch) => branch,
+		HeadState::Detached(_) => {
+			bail!("cannot push a detached HEAD without a refspec (e.g. `HEAD:refs/heads/<name>`)")
+		}
 	};
-	let request = build_receive_pack_request(std::slice::from_ref(&update), &[]);
-	send_receive_pack(transport, origin, request).await?;
-	Ok(PushOutcome::Deleted { refname })
+	Ok(vec![PushRefspec {
+		force: false,
+		src: Some(branch.clone()),
+		dst: branch,
+	}])
+}
+
+/// Resolve a push source ref to a tip: `HEAD` follows the symbolic ref (or is the detached commit); any
+/// other name resolves directly.
+async fn resolve_source<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	src: &str,
+) -> Result<Option<ObjectId<H>>> {
+	if src == "HEAD" {
+		return Ok(match repo.refs().read_head().await? {
+			HeadState::Symbolic(branch) => repo.refs().resolve(&branch).await?,
+			HeadState::Detached(oid) => Some(oid),
+		});
+	}
+	Ok(repo.refs().resolve(src).await?)
+}
+
+/// Build the pack the remote lacks for the planned updates (objects reachable from the new tips, minus
+/// the advertised refs). A pure-deletion push sends no pack.
+async fn pack_for<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	advertised: &Advertised<H>,
+	planned: &[Planned<H>],
+) -> Result<Vec<u8>> {
+	let wants: Vec<ObjectId<H>> = planned.iter().filter_map(|p| p.update.new).collect();
+	if wants.is_empty() {
+		return Ok(Vec::new());
+	}
+	let haves = gitana_remote::advertised_oids(advertised);
+	Ok(build_pack(repo, &wants, &haves).await?)
+}
+
+/// Render metadata for each planned update.
+fn results_of<H: HashAlgorithm>(planned: &[Planned<H>]) -> Vec<PushResult> {
+	planned
+		.iter()
+		.map(|p| PushResult {
+			refname: p.update.name.clone(),
+			deleted: p.update.new.is_none(),
+			forced: p.forced,
+		})
+		.collect()
 }
 
 /// POST a receive-pack request to `origin` and check the report-status it returns.
@@ -464,17 +524,14 @@ async fn send_receive_pack(
 	Ok(())
 }
 
-/// Build a push certificate for a single ref command, with an empty `signature`: the caller signs
-/// [`PushCert::payload`] and fills it in. The payload (pusher, pushee, nonce, and command) is
-/// complete. `old`/`new` are the ref's before/after values — a `None` becomes the all-zero id, so a
-/// create is `old: None` and a delete is `new: None`.
+/// Build a push certificate carrying one command per `update`, with an empty `signature`: the caller
+/// signs [`PushCert::payload`] and fills it in. Each command's `old`/`new` are the ref's before/after
+/// values — a `None` becomes the all-zero id, so a create is `old: None` and a delete is `new: None`.
 fn build_cert<H: HashAlgorithm>(
 	origin: &Origin,
 	pusher: String,
 	nonce: String,
-	old: Option<ObjectId<H>>,
-	new: Option<ObjectId<H>>,
-	refname: &str,
+	updates: &[RefUpdate<H>],
 ) -> PushCert {
 	let zero = "0".repeat(H::RAW_LEN * 2);
 	let hex = |id: Option<ObjectId<H>>| id.map_or_else(|| zero.clone(), |oid| oid.to_hex());
@@ -484,11 +541,14 @@ fn build_cert<H: HashAlgorithm>(
 		pushee: origin.url.clone(),
 		nonce,
 		push_options: Vec::new(),
-		commands: vec![CertCommand {
-			old: hex(old),
-			new: hex(new),
-			refname: refname.to_owned(),
-		}],
+		commands: updates
+			.iter()
+			.map(|u| CertCommand {
+				old: hex(u.old),
+				new: hex(u.new),
+				refname: u.name.clone(),
+			})
+			.collect(),
 		signature: String::new(),
 	}
 }
@@ -496,15 +556,6 @@ fn build_cert<H: HashAlgorithm>(
 /// Capabilities echoed on the push request's first line / cert marker, for hash `H`.
 fn push_caps<H: HashAlgorithm>() -> String {
 	format!("report-status object-format={}", H::NAME)
-}
-
-/// Expand a branch name to a full ref (`main` → `refs/heads/main`); pass full refs through.
-fn normalize_branch(name: &str) -> String {
-	if name.starts_with("refs/") {
-		name.to_owned()
-	} else {
-		format!("refs/heads/{name}")
-	}
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -580,13 +631,13 @@ mod tests {
 			&origin,
 			&advertisement,
 			false,
-			None,
+			vec![],
 			async || Ok("Dev <dev@x.test> 1700000000 +0000".to_owned()),
 			&signer,
 		)
 		.await
 		.unwrap();
-		assert!(matches!(outcome, PushOutcome::Pushed { signed: true, .. }));
+		assert!(outcome.signed && outcome.results.len() == 1 && !outcome.results[0].deleted);
 
 		// The posted request is a push certificate binding this create to the server's nonce.
 		let request = transport.posted.into_inner().expect("a request was POSTed");
@@ -650,16 +701,15 @@ mod tests {
 			&origin,
 			&advertisement,
 			false,
-			Some("main".to_owned()),
+			vec![PushRefspec::parse(":main").unwrap()],
 			async || Ok("Dev <dev@x.test> 1700000000 +0000".to_owned()),
 			&signer,
 		)
 		.await
 		.unwrap();
-		let PushOutcome::Deleted { refname } = outcome else {
-			panic!("expected a signed delete outcome");
-		};
-		assert_eq!(refname, "refs/heads/main");
+		assert_eq!(outcome.results.len(), 1);
+		assert!(outcome.results[0].deleted);
+		assert_eq!(outcome.results[0].refname, "refs/heads/main");
 
 		// The posted request is a push certificate whose command deletes the ref (new = zero, old = tip).
 		let request = transport.posted.into_inner().expect("a request was POSTed");
@@ -716,7 +766,7 @@ mod tests {
 			&origin,
 			&advertisement,
 			false,
-			None,
+			vec![],
 			async || panic!("pusher resolved despite no push-cert support"),
 			&crate::test_support::FailingSigner,
 		)
@@ -728,6 +778,67 @@ mod tests {
 			err.to_string().contains("does not accept signed pushes"),
 			"{err}"
 		);
+		assert!(
+			transport.posted.into_inner().is_none(),
+			"nothing was POSTed"
+		);
+	}
+
+	#[tokio::test]
+	async fn push_rejects_two_refspecs_targeting_one_destination() {
+		// `push a:x b:x` would be applied sequentially by receive-pack: the second command is stale
+		// after the first moved `x`, leaving a partial push. The plan must refuse before POSTing.
+		let (_dir, wt) = fixture().await;
+		let blob = wt.repository().write_blob(b"hi\n").await.unwrap();
+		let mut index = Index::new();
+		stage(&mut index, "f.txt", blob);
+		wt.save_index(&index).await.unwrap();
+		crate::commit(&wt, "root", &TestIdentity::default())
+			.await
+			.unwrap();
+		let tip = wt
+			.repository()
+			.refs()
+			.resolve_head()
+			.await
+			.unwrap()
+			.unwrap();
+		wt.repository()
+			.refs()
+			.update_ref("refs/heads/dev", tip, None)
+			.await
+			.unwrap();
+
+		let (_server_dir, server) = fixture().await;
+		let advertisement = advertise(
+			server.repository(),
+			Service::ReceivePack,
+			ProtocolVersion::V0,
+			None,
+		)
+		.await
+		.unwrap();
+
+		let origin = Origin::parse("http://host/acme/app").unwrap();
+		let transport = CapturingTransport {
+			posted: RefCell::new(None),
+		};
+		let result = push(
+			&transport,
+			wt.repository(),
+			&origin,
+			&advertisement,
+			false,
+			vec![
+				PushRefspec::parse("main:dup").unwrap(),
+				PushRefspec::parse("dev:dup").unwrap(),
+			],
+		)
+		.await;
+		let Err(err) = result else {
+			panic!("two refspecs to one destination must be rejected");
+		};
+		assert!(err.to_string().contains("more than one refspec"), "{err}");
 		assert!(
 			transport.posted.into_inner().is_none(),
 			"nothing was POSTed"

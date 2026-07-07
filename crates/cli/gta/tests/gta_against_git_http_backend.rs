@@ -192,3 +192,79 @@ async fn gta_pushes_to_a_real_git_repo() {
 	let bare = root.join("repo.git");
 	assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), head);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gta_pushes_explicit_refspecs_to_a_real_git_repo() {
+	if skip() {
+		return;
+	}
+	let root = tmp("client-refspec");
+	let (head, _) = build_bare(&root);
+	let url = serve_git_http_backend(root.clone()).await;
+	let bare = root.join("repo.git");
+
+	let checkout = root.join("c");
+	let c = checkout.to_str().unwrap();
+	gta_ok(
+		&gta(&["clone", &format!("{url}/repo.git"), c]).await,
+		"clone",
+	);
+
+	// Create a new remote branch from HEAD via an explicit `HEAD:refs/heads/x` refspec — with no
+	// `origin` argument (gitana's only remote is origin, so a refspec-only push must work).
+	gta_ok(
+		&gta(&["-C", c, "push", "HEAD:refs/heads/feature"]).await,
+		"push HEAD refspec",
+	);
+	assert_eq!(git(&bare, &["rev-parse", "refs/heads/feature"]), head);
+
+	// A `<src>:<dst>` rename push — the local `dev` (recreated by clone) to a new remote `release`.
+	gta_ok(
+		&gta(&["-C", c, "push", "origin", "dev:release"]).await,
+		"push rename",
+	);
+	assert_eq!(git(&bare, &["rev-parse", "refs/heads/release"]), head);
+
+	// Bare `HEAD` (git's `push origin HEAD` shorthand) pushes the current branch (`main`), not a
+	// literal `refs/heads/HEAD`.
+	gta_ok(&gta(&["-C", c, "config", "user.name", "C"]).await, "config");
+	gta_ok(
+		&gta(&["-C", c, "config", "user.email", "c@e"]).await,
+		"config",
+	);
+	std::fs::write(checkout.join("a.txt"), b"advance\n").unwrap();
+	gta_ok(&gta(&["-C", c, "add", "."]).await, "add");
+	gta_ok(&gta(&["-C", c, "commit", "-m", "advance"]).await, "commit");
+	let advanced = gta_stdout(&gta(&["-C", c, "rev-parse", "HEAD"]).await, "rev-parse");
+	gta_ok(
+		&gta(&["-C", c, "push", "origin", "HEAD"]).await,
+		"push bare HEAD",
+	);
+	assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), advanced);
+	assert!(
+		!git_try(&bare, &["rev-parse", "--verify", "refs/heads/HEAD"])
+			.status
+			.success(),
+		"a literal refs/heads/HEAD must not be created"
+	);
+
+	// Delete a remote ref two ways: a `:<dst>` refspec, and the `--delete` flag.
+	gta_ok(
+		&gta(&["-C", c, "push", "origin", ":feature"]).await,
+		"push delete refspec",
+	);
+	assert!(
+		!git_try(&bare, &["rev-parse", "--verify", "refs/heads/feature"])
+			.status
+			.success()
+	);
+	gta_ok(
+		&gta(&["-C", c, "push", "origin", "--delete", "release"]).await,
+		"push delete flag",
+	);
+	assert!(
+		!git_try(&bare, &["rev-parse", "--verify", "refs/heads/release"])
+			.status
+			.success()
+	);
+}

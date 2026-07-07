@@ -28,7 +28,9 @@ pub use commit_error::CommitError;
 pub use merge::{MergeOutcome, abort_merge, continue_merge, merge};
 pub use prune::{gc, prune};
 pub use rebase::{RebaseOutcome, abort_rebase, continue_rebase, rebase, skip_rebase};
-pub use remote::{FetchOutcome, PushOutcome, clone, fetch, pull_upstream, push, push_signed};
+pub use remote::{
+	FetchOutcome, PushOutcome, PushResult, clone, fetch, pull_upstream, push, push_signed,
+};
 pub use revert::{RevertOutcome, abort_revert, continue_revert, revert};
 pub use tag::{tag, tag_signed};
 pub use trust::{

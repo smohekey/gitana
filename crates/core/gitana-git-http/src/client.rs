@@ -190,10 +190,11 @@ pub fn parse_upload_pack_response(body: &[u8]) -> Result<Vec<u8>, GitHttpError> 
 }
 
 /// A ref-update to push: the expected remote value, the new value, and the ref name.
+#[derive(Clone)]
 pub struct RefUpdate<H: HashAlgorithm> {
 	/// Expected current remote value (`None` to create).
 	pub old: Option<ObjectId<H>>,
-	/// New value (`None` to delete — not supported by the server yet).
+	/// New value (`None` to delete).
 	pub new: Option<ObjectId<H>>,
 	/// The ref name.
 	pub name: String,

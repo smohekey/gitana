@@ -7,7 +7,6 @@
 use gitana_file_store_local::{DescriptorWorkDir, WorktreeFileStore};
 use gitana_object::HashAlgorithm;
 use gitana_object_store::ObjectStore;
-use gitana_porcelain::PushOutcome;
 use gitana_remote::Origin;
 use gitana_repository::Repository;
 
@@ -78,16 +77,32 @@ pub(crate) async fn push<H: HashAlgorithm>(
 		)));
 	}
 
-	let outcome = gitana_porcelain::push(&transport, repo, &origin, &advertisement, force, delete)
+	// The component surface pushes `HEAD`'s branch or deletes one ref — expressed as push refspecs.
+	// The push case is an explicit `HEAD` refspec (not an empty list): the porcelain default would
+	// honour `remote.origin.push`, which could push a different or multiple refs and break this WIT
+	// contract of "push HEAD's branch" (and the single-result mapping below).
+	let refspecs = match delete {
+		Some(target) => vec![
+			gitana_remote::PushRefspec::parse(&format!(":{target}"))
+				.map_err(|e| RepoError::Invalid(e.to_string()))?,
+		],
+		None => vec![
+			gitana_remote::PushRefspec::parse("HEAD").map_err(|e| RepoError::Invalid(e.to_string()))?,
+		],
+	};
+	let outcome = gitana_porcelain::push(&transport, repo, &origin, &advertisement, force, refspecs)
 		.await
 		.map_err(remote_error)?;
 
-	Ok(match outcome {
-		PushOutcome::Pushed { branch, forced, .. } => {
-			WitPushOutcome::Pushed(PushSummary { branch, forced })
-		}
-		PushOutcome::Deleted { refname } => WitPushOutcome::Deleted(refname),
-		PushOutcome::UpToDate => WitPushOutcome::UpToDate,
+	// Exactly one result in the component case (a branch push or a single delete), or none when the
+	// remote was already up to date.
+	Ok(match outcome.results.first() {
+		None => WitPushOutcome::UpToDate,
+		Some(result) if result.deleted => WitPushOutcome::Deleted(result.refname.clone()),
+		Some(result) => WitPushOutcome::Pushed(PushSummary {
+			branch: result.refname.clone(),
+			forced: result.forced,
+		}),
 	})
 }
 
