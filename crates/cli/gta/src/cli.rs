@@ -364,7 +364,11 @@ enum Command {
 		path: Option<PathBuf>,
 	},
 	/// Download new objects from the origin and update remote-tracking refs.
-	Fetch,
+	Fetch {
+		/// Fetch all tags from the origin (mirror every `refs/tags/*`), in addition to branches.
+		#[arg(short = 't', long)]
+		tags: bool,
+	},
 	/// Fetch the current branch from the origin and fast-forward the working tree.
 	Pull,
 	/// Push the current branch to the origin.
@@ -648,7 +652,7 @@ impl Cli {
 			} => commands::mv::run(&cwd, force, dry_run, verbose, paths).await,
 			Command::Diff { cached } => commands::diff::run(&cwd, cached).await,
 			Command::Clone { url, path } => commands::clone::run(url, path).await,
-			Command::Fetch => commands::fetch::run(&cwd).await.map(|_| ()),
+			Command::Fetch { tags } => commands::fetch::run(&cwd, tags).await.map(|_| ()),
 			Command::Pull => commands::pull::run(&cwd).await,
 			Command::Push {
 				repository,

@@ -157,6 +157,52 @@ async fn gta_fetches_from_a_real_git_repo() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gta_fetches_tags_from_a_real_git_repo() {
+	if skip() {
+		return;
+	}
+	let root = tmp("client-fetch-tags");
+	build_bare(&root);
+	let url = serve_git_http_backend(root.clone()).await;
+
+	let checkout = root.join("c");
+	let repo_url = format!("{url}/repo.git");
+	let c = checkout.to_str().unwrap();
+	gta_ok(&gta(&["clone", &repo_url, c]).await, "clone");
+
+	// The real server gains a NEW annotated tag after the clone (its advertisement carries a
+	// `refs/tags/v2^{}` peel line — gta must fetch the tag ref, not a junk `^{}` ref).
+	let work = root.join("work");
+	git(&work, &["tag", "-a", "v2", "-m", "another"]);
+	let v2 = git(&work, &["rev-parse", "v2"]);
+	git(
+		&work,
+		&["push", "-q", root.join("repo.git").to_str().unwrap(), "v2"],
+	);
+
+	// A plain fetch does not create the new tag ref (auto-follow lands in a later slice)...
+	gta_ok(&gta(&["-C", c, "fetch"]).await, "fetch");
+	assert!(
+		!gta(&["-C", c, "rev-parse", "--verify", "refs/tags/v2"])
+			.await
+			.status
+			.success(),
+		"a plain fetch must not create tag refs in this slice"
+	);
+
+	// ...but `--tags` mirrors every remote tag into the local ref (the tag object id, not the peeled
+	// commit — the advertisement's `refs/tags/v2^{}` peel line is dropped, not written as a junk ref).
+	gta_ok(&gta(&["-C", c, "fetch", "--tags"]).await, "fetch --tags");
+	assert_eq!(
+		gta_stdout(
+			&gta(&["-C", c, "rev-parse", "refs/tags/v2"]).await,
+			"rev-parse v2"
+		),
+		v2
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gta_pushes_to_a_real_git_repo() {
 	if skip() {
 		return;

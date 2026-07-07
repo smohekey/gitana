@@ -110,8 +110,12 @@ pub fn parse_advertisement<H: HashAlgorithm>(body: &[u8]) -> Result<Advertised<H
 		let Some((oid, name)) = text.split_once(' ') else {
 			continue;
 		};
-		// The `capabilities^{}` placeholder of an empty repo names no real ref.
-		if name == "capabilities^{}" {
+		// A `^{}` line is git's peel annotation, not a real ref: the empty-repo `capabilities^{}`
+		// placeholder, or an annotated tag's peeled target trailing its `refs/tags/<name>` line.
+		// Neither is a fetchable/writable ref (fetching a tag object pulls in its peeled target
+		// anyway), so drop them — leaving them in would let a `refs/tags/*` refspec, or clone's
+		// ref recreation, write a junk `refs/tags/<name>^{}` ref.
+		if name.ends_with("^{}") {
 			continue;
 		}
 		result
@@ -332,6 +336,32 @@ mod tests {
 		assert_eq!(adv.head_target.as_deref(), Some("refs/heads/main"));
 		assert_eq!(adv.branches().count(), 1);
 		assert!(adv.oid_of("refs/heads/main").is_some());
+	}
+
+	#[test]
+	fn drops_peeled_tag_pseudo_refs() {
+		// An annotated tag advertises `refs/tags/v1` (the tag object) then a `refs/tags/v1^{}` peel
+		// line naming the commit. The peel line is not a real ref and must not appear in `.refs` —
+		// else a `refs/tags/*` refspec, or clone's ref recreation, would write a junk `^{}` ref.
+		let tag = ObjectId::<Sha256>::compute(gitana_object::ObjectKind::Tag, b"t").to_hex();
+		let commit = ObjectId::<Sha256>::compute(gitana_object::ObjectKind::Commit, b"c").to_hex();
+		let mut body = Vec::new();
+		write_pkt(
+			&mut body,
+			format!("{tag} refs/tags/v1\0object-format=sha256\n").as_bytes(),
+		)
+		.unwrap();
+		write_pkt(
+			&mut body,
+			format!("{commit} refs/tags/v1^{{}}\n").as_bytes(),
+		)
+		.unwrap();
+		write_flush(&mut body);
+
+		let adv = parse_advertisement::<Sha256>(&body).expect("parse");
+		assert_eq!(adv.refs.len(), 1);
+		assert_eq!(adv.oid_of("refs/tags/v1").unwrap().to_hex(), tag);
+		assert!(adv.oid_of("refs/tags/v1^{}").is_none());
 	}
 
 	#[test]

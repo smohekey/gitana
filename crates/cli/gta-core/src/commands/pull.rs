@@ -54,7 +54,15 @@ async fn pull_into<H: HashAlgorithm>(
 
 	// `update_head_ok`: a fetch refspec may map straight into the checked-out branch (a mirror config
 	// like `+refs/heads/*:refs/heads/*`); the merge below advances that branch and the work tree.
-	let outcome = gitana_porcelain::fetch(http, worktree.repository(), origin, body, true).await?;
+	let outcome = gitana_porcelain::fetch(
+		http,
+		worktree.repository(),
+		origin,
+		body,
+		true,
+		gitana_porcelain::TagFetch::Auto,
+	)
+	.await?;
 	println!("Fetched from {}", origin.url);
 	// A rejected (non-fast-forward) tracking update is a failed fetch; do not merge a stale upstream.
 	if !outcome.rejected.is_empty() {

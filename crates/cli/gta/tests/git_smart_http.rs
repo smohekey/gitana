@@ -706,6 +706,102 @@ async fn fetch_honors_a_custom_tracking_namespace() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_tags_mirrors_remote_tags() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+
+	// The server advances and tags the new tip.
+	let tip = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/tags/v1", tip, None)
+		.await
+		.unwrap();
+
+	// A plain fetch does not write tag refs (auto-follow lands in a later slice)...
+	ok(&gta(&["-C", t, "fetch"]).await, "fetch");
+	assert!(
+		!gta(&["-C", t, "rev-parse", "--verify", "refs/tags/v1"])
+			.await
+			.status
+			.success(),
+		"a plain fetch must not create tag refs in this slice"
+	);
+
+	// ...but `--tags` mirrors every advertised tag into the same-named local ref.
+	ok(&gta(&["-C", t, "fetch", "--tags"]).await, "fetch --tags");
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "refs/tags/v1"]).await,
+			"rev-parse tag",
+		),
+		tip.to_hex()
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_tags_refuses_to_clobber_a_moved_tag() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+
+	// The server tags its root commit; the client mirrors the tag.
+	let root = open(&git_dir)
+		.refs()
+		.resolve("refs/heads/main")
+		.await
+		.unwrap()
+		.unwrap();
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/tags/v1", root, None)
+		.await
+		.unwrap();
+	ok(&gta(&["-C", t, "fetch", "--tags"]).await, "fetch --tags");
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "refs/tags/v1"]).await,
+			"tag first",
+		),
+		root.to_hex()
+	);
+
+	// The server repoints v1 to a descendant commit — a fast-forward for a branch, but tags are
+	// immutable: a non-forced `--tags` fetch must reject it and leave the local tag at the root.
+	let child = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/tags/v1", child, Some(root))
+		.await
+		.unwrap();
+	assert!(
+		!gta(&["-C", t, "fetch", "--tags"]).await.status.success(),
+		"repointing an existing tag without a force must fail the fetch"
+	);
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "refs/tags/v1"]).await,
+			"tag after",
+		),
+		root.to_hex(),
+		"the local tag must stay at its original target"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_rejects_a_non_fast_forward_without_force() {
 	let srv = TempDir::new().unwrap();
 	let git_dir = srv.path().join("srv.git");

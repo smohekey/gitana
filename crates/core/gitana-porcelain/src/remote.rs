@@ -17,6 +17,18 @@ use gitana_worktree::WorkTree;
 
 use crate::Signer;
 
+/// How a [`fetch`] treats the remote's tags (git's `--tags` / default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TagFetch {
+	/// Default fetch behavior: no tag refs are written beyond what the configured refspecs name.
+	/// (Git's tag auto-follow — writing a tag ref for each advertised tag reachable from the fetched
+	/// branches — lands in a later slice; this variant will gain that behavior then.)
+	#[default]
+	Auto,
+	/// `--tags`: fetch every advertised `refs/tags/*` into the same-named local `refs/tags/*`.
+	All,
+}
+
 /// The outcome of a [`fetch`]: the tracking refs it advanced, and any it declined to.
 pub struct FetchOutcome<H: HashAlgorithm> {
 	/// Tracking refs advanced (`(ref name, new oid)`).
@@ -44,13 +56,20 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	origin: &Origin,
 	advertisement: &[u8],
 	update_head_ok: bool,
+	tags: TagFetch,
 ) -> Result<FetchOutcome<H>> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
 	let haves = gitana_remote::local_haves(repo).await?;
 	download(transport, repo, origin, &advertised, &haves).await?;
 
 	let config = repo.read_config().await?;
-	let refspecs = parse_fetch_refspecs(&config)?;
+	let mut refspecs = parse_fetch_refspecs(&config)?;
+	// `--tags` mirrors every advertised tag into the same-named local ref, in addition to the
+	// configured refspecs. It is not forced (git does not clobber an existing tag pointing elsewhere
+	// without `--force`), so a tag that would move to an unrelated object is reported as rejected.
+	if tags == TagFetch::All {
+		refspecs.push(Refspec::parse("refs/tags/*:refs/tags/*")?);
+	}
 	let (positive, negative): (Vec<&Refspec>, Vec<&Refspec>) =
 		refspecs.iter().partition(|spec| !spec.negative);
 
@@ -130,13 +149,17 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 		if current == Some(oid) {
 			continue;
 		}
-		// Without `+`, only a fast-forward is allowed (a fresh tracking ref always is).
-		if !force
-			&& let Some(current) = current
-			&& !repo.is_ancestor(current, oid).await?
-		{
-			rejected.push(tracking);
-			continue;
+		// Without `+`, a non-forced update to an existing ref is refused unless allowed. A branch may
+		// advance on a fast-forward; but an existing tag is immutable — git rejects repointing a
+		// `refs/tags/*` that already exists to a different object even on a fast-forward (a tag is a
+		// fixed name, not a moving branch tip). A fresh tracking ref (`current` is `None`) always
+		// applies. (The push side enforces the same tag immutability in `plan_push`.)
+		if !force && let Some(existing) = current {
+			let allowed = !tracking.starts_with("refs/tags/") && repo.is_ancestor(existing, oid).await?;
+			if !allowed {
+				rejected.push(tracking);
+				continue;
+			}
 		}
 		repo.refs().update_ref(&tracking, oid, current).await?;
 		updated.push((tracking, oid));

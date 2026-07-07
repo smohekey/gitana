@@ -36,9 +36,16 @@ pub(crate) async fn fetch<H: HashAlgorithm>(
 		)));
 	}
 
-	let outcome = gitana_porcelain::fetch(&transport, repo, &origin, &advertisement, false)
-		.await
-		.map_err(remote_error)?;
+	let outcome = gitana_porcelain::fetch(
+		&transport,
+		repo,
+		&origin,
+		&advertisement,
+		false,
+		gitana_porcelain::TagFetch::Auto,
+	)
+	.await
+	.map_err(remote_error)?;
 	Ok(FetchOutcome {
 		updated: outcome
 			.updated
