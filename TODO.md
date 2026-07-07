@@ -125,19 +125,19 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   `TrustSyncOutcome::Updated` now carries the chain's bootstrap `anchor`, and the CLI sync handler
   prints the event to stderr on an adoption or fast-forward — completing the client-side audit
   vocabulary (descoped from step 7b). Scoped in
-  `docs/hlds/trust-followups.md#5-trustrootadopted-audit-event-for-trust-sync`.
+  `docs/hlds/trust-followups.md#completed`.
 - [x] Add a one-time-nonce replay cache. Added a host-supplied `NonceLedger` capability (with a
   `NoReplayCheck` no-op default) threaded through the new `verify_push_with_ledger` / `ReceiveOptions`;
   after a certificate verifies, its nonce is recorded and a still-fresh replay is a certificate failure
   (rejected under `require`, warned under `warn`). The pure core stays stateless — the ledger is the
   host's state. `verify_push` delegates with `NoReplayCheck`, so its callers are unchanged. Covered by
-  in-memory-ledger replay tests. Scoped in `docs/hlds/trust-followups.md#2-one-time-nonce-replay-cache`.
+  in-memory-ledger replay tests. Scoped in `docs/hlds/trust-followups.md#completed`.
 - [ ] Add a persisted require-time baseline. Snapshot the grandfather set at the `require` cutover into a
   stored artifact so object-signature enforcement is incremental and stable, instead of the live
-  `protected_baseline` walk. Scoped in `docs/hlds/trust-followups.md#4-persisted-require-time-baseline`.
+  `protected_baseline` walk. Scoped in `docs/hlds/trust-followups.md#persisted-require-time-baseline`.
 - [ ] Add OpenPGP signature support. Verify (and optionally produce) OpenPGP-signed commits/tags/push
   certs alongside SSHSIG, dispatching on the armor marker in the trust core and extending `TrustedKey`.
-  Large (new dependency). Scoped in `docs/hlds/trust-followups.md#3-openpgp-signatures`.
+  Large (new dependency). Scoped in `docs/hlds/trust-followups.md#openpgp-signatures`.
 - [x] Add verification helpers for received push certificates. `gitana-git-http`'s `verify_push`
   (`enforce.rs`) verifies a certificate's SSHSIG against the folded trust root, checks the repo-bound
   nonce freshness, matches the pushee, and confirms the signed commands equal what receive-pack applies.

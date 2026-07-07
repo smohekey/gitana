@@ -1,77 +1,79 @@
 # Trust & Signing — Post-v1 Follow-ups
 
 The 8-step trust & signing subsystem (`secure-git-trust-signing.md`) is complete and `require` is
-production-ready. The items below are **additive** and were deliberately left out of v1 — none of them
-weakens the current boundary, and each is independent. This doc scopes each one so it can be picked up
-without re-deriving the design.
+production-ready. The items here are **additive** and were deliberately left out of v1 — none weakens
+the current boundary, and each is independent. This doc scopes each so it can be picked up without
+re-deriving the design.
 
-Suggested order (cheapest / highest-leverage first):
+## Status
 
-1. ~~[Signed `--signed --delete`](#1-signed-push---signed---delete)~~ — **done.**
-2. ~~[`trust sync` audit event](#5-trustrootadopted-audit-event-for-trust-sync)~~ — **done.**
-3. ~~[One-time-nonce replay cache](#2-one-time-nonce-replay-cache)~~ — **done.**
-4. [Persisted require-time baseline](#4-persisted-require-time-baseline) — enforcement perf/stability;
-   medium.
-5. [OpenPGP signatures](#3-openpgp-signatures) — GPG interop; large, new dependency.
+| Item | Status | Effort |
+|---|---|---|
+| Signed `push --signed --delete` | ✅ done (`19c056f`) | — |
+| `trust sync` audit event (`TrustRootAdopted`) | ✅ done (`6e3d909`) | — |
+| One-time-nonce replay cache | ✅ done (`91b05df6`) | — |
+| **Persisted require-time baseline** | **⏭ next up** | medium |
+| OpenPGP signatures | pending | large (new dependency) |
 
-Each remains gated by the project's usual flow: its own worktree/branch, Codex-clean before merge, and
-the `gta`/`gta-mcp` surface-parity lock where a CLI surface changes.
+Each remaining item is gated by the project's usual flow: its own worktree/branch, Codex-clean before
+merge, and the `gta`/`gta-mcp` surface-parity lock where a CLI surface changes. See **Completed** at the
+bottom for what the three done items shipped.
 
----
+## Outstanding
 
-## 1. Signed `push --signed --delete`
+### Persisted require-time baseline
 
-**✅ Done.** `push_signed` takes a `delete` target and sends a signed delete certificate via
-`delete_signed`; `build_cert` is now `old`/`new`-optional; the CLI routes `--signed --delete` through
-`push_signed`. Covered by a porcelain cert round-trip, an `enforce.rs` verify_push acceptance test, and
-a `receive_pack` wire test that applies the delete end to end. Note the two orthogonal authorization
-axes: signing authorises *who* deletes (trust), while the host's delete-refs grant (receive-pack's
-`force`) authorises deletes *at all* — a signed delete still needs the host to permit deletes, exactly
-as stock git's `receive.denyDeletes` is independent of signing. The scoped plan below is kept for
-reference.
+**⏭ Next up.**
 
-- **Goal.** A signed deletion of a protected ref. Today `--signed --delete` sends an *unsigned* delete
-  (the delete path returns before the certificate is built), so under `require` a protected-ref deletion
-  cannot be authorised — receive-pack already refuses it (`enforce.rs::require_rejects_protected_deletion_without_cert`).
-- **Why deferred.** Noted as a known gap when `gta push --signed` landed (step 6c); the delete branch
-  predates `push_signed`.
-- **Approach.** Fold the deletion into a `push_signed` certificate as one cert command `<old> <zero>
-  <ref>` (git's delete form). Route a signed delete through `push_signed` instead of the early-return
-  unsigned path. Nothing new is needed server-side — `verify_push` already verifies certificates for
-  deletions.
-- **Touch points.** `gitana-porcelain/src/remote.rs` (accept a delete command in `push_signed` /
-  `prepare_branch_push`), `gta-core` `commands/push.rs` (dispatch `--signed --delete`).
-- **Open decisions.** Minimal — mostly mechanical. Confirm the empty pack is acceptable for a
-  delete-only signed push (it is: `receive_pack` handles an empty pack).
-- **Effort.** Small–medium. Add a porcelain round-trip and extend the real-git e2e
-  (`real_git_push_signed.rs`) with a signed delete.
+- **Goal.** An explicit, stored grandfather set captured when policy moves to `require`, consulted by
+  object-signature enforcement instead of re-deriving it live on every push.
+- **Why deferred.** v1 uses `protected_baseline` (`gitana-git-http/src/enforce.rs`): a live walk from
+  the *current* protected-ref tips on every push, grandfathering everything reachable from them. The 8d
+  decision kept it deliberately — it is correct and needs no stored state — but it is O(history) per push
+  and its boundary shifts as tips move. This item makes the cutover explicit and enforcement
+  incremental. Only worth doing once histories are large enough for the walk to matter.
+- **Approach.** At the `require` cutover, snapshot the cutover state and store it; `verify_protected_tip`
+  (also in `enforce.rs`) then treats that stored set as the grandfather boundary instead of calling
+  `protected_baseline`. Everything a protected ref *newly* introduces past the snapshot must be signed,
+  exactly as today — only the boundary's source changes.
+- **Touch points.**
+  - `gitana-git-http/src/enforce.rs` — `protected_baseline` / `verify_protected_tip` read the stored
+    baseline (falling back to the live walk when absent).
+  - `gitana-porcelain/src/trust.rs` — `trust_set_policy` writes the baseline when moving to `require`
+    (or a new `trust_baseline` composite for an explicit command).
+  - Storage — a new ref plus the object it names (see below).
+  - `gta-core` / both CLI surfaces if an explicit `gta trust baseline` command is added (surface-parity).
+- **Open decisions — with recommended defaults (still confirm before building):**
+  - *Capture timing:* **auto in `trust_set_policy` when the target is `require`** (the natural cutover),
+    with an explicit `gta trust baseline` command as an optional later nicety for re-baselining. The 8d
+    slice deferred the explicit command; do not add it unless a need appears.
+  - *Storage shape:* a **`refs/gitana/baseline` ref naming one object that encodes the whole cutover
+    state** — a ref can name only a single object, so the multiple protected tips (and/or the
+    grandfathered id-set) must be packed into it. Two representable encodings:
+    1. **A synthetic commit whose parents are all the protected tips at cutover** (git-native; `verify_
+       protected_tip` walks from that commit's parents as a fixed boundary — stable, but still a walk).
+    2. **A manifest blob listing the grandfathered object ids** (or just the cutover tips) — O(1)
+       membership (the real incrementality win), at the cost of a new, versioned serialisation and a
+       larger object for big histories.
+    Recommend starting with **(1)** — it reuses the existing tip-walk logic verbatim and needs no new
+    format; move to **(2)** only if profiling shows the walk is the bottleneck. Do **not** try to point
+    the ref straight at "the tips" — that is not representable for more than one tip.
+  - *Absent baseline:* **fall back to the live `protected_baseline` walk** — so a repo that enabled
+    `require` before this landed keeps working unchanged, and the persisted baseline is a pure
+    optimisation, never a correctness dependency.
+  - *Under `off`/`warn`:* only write the baseline when actually moving to `require`; lowering the policy
+    later can leave it (harmless, unused) or clear it — clearing is tidier.
+- **Correctness note.** The only objects a baseline grandfathers are *unsigned* ones (signed
+  commits/tags pass `verify_commit`/`verify_tag` regardless of the baseline). So the persisted set is
+  exactly "the unsigned history that existed at cutover", fixed — which is what an operator expects when
+  they flip to `require`. Because it never grandfathers anything a signature check wouldn't already
+  clear, an absent or stale baseline can only ever be *stricter* (more re-verification), never a bypass —
+  which is why the live-walk fallback is safe.
+- **Effort.** Medium. Tests: a `verify_protected_tip` test that a stored baseline grandfathers the
+  cutover set while a post-cutover unsigned commit is rejected; a `trust_set_policy` test that the
+  baseline ref is written on the `require` cutover.
 
-## 2. One-time-nonce replay cache
-
-**✅ Done.** A host-supplied `NonceLedger` trait (with a `NoReplayCheck` no-op default) is threaded
-through `verify_push_with_ledger` and `ReceiveOptions`; after a certificate verifies, its nonce is
-recorded and a still-fresh replay is a certificate failure (rejected under `require`, warned under
-`warn`). The pure core stays stateless — the ledger holds the host's state; `verify_push` delegates with
-`NoReplayCheck`. Only the seam ships (no production ledger yet, matching the no-server-binary reality).
-The scoped plan below is kept for reference.
-
-- **Goal.** Reject a push certificate whose fresh, valid nonce has already been used — closing the
-  replay-*within*-the-freshness-window gap (matrix row 6, ⚠️ by design).
-- **Why deferred.** v1's nonce is a stateless HMAC (`timestamp || random || HMAC(secret, …||repo_id)`),
-  so it needs no server state; replay-in-window is accepted and documented. Closing it requires
-  short-lived server state.
-- **Approach.** After `verify_cert` passes, consult and record the nonce in a TTL store (TTL = the
-  freshness window). Keep the core pure: add a host-supplied capability (a small trait, e.g.
-  `NonceLedger { async fn seen_and_record(&self, nonce: &str) -> bool }`) threaded through
-  `TrustContext` (or a new param on `verify_push`). Single-instance → in-memory map; multi-instance →
-  a shared cache (the HLD's "shared cache or bounded replay" note).
-- **Touch points.** `gitana-git-http` (`TrustContext` / `verify_push` / `enforce.rs::verify_cert`), the
-  embedding host (test harness + any future server) provides the ledger.
-- **Open decisions.** The ledger trait shape; whether to key on the full nonce or its hash;
-  single- vs multi-instance semantics. Must not make the core stateful — state lives in the host.
-- **Effort.** Medium.
-
-## 3. OpenPGP signatures
+### OpenPGP signatures
 
 - **Goal.** Verify (and optionally produce) OpenPGP-signed commits, annotated tags, and push
   certificates alongside SSHSIG, for GPG interoperability.
@@ -85,44 +87,29 @@ The scoped plan below is kept for reference.
   signing would add a GPG `Signer` (shelling to `gpg`, parallel to the `ssh-keygen` `CliSigner`).
 - **Touch points.** `gitana-trust` (verify path, `TrustedKey`, `KeyId`, `TrustDocument` key parsing),
   `gitana-porcelain`/`gta-core` (a GPG signer, if producing), a vetted OpenPGP crate.
-- **Open decisions.** Which library (`sequoia-openpgp` vs `pgp`); verify-only first vs also sign; how to
-  represent OpenPGP keys in `trust.json` (armored public key vs fingerprint + keyring). Do not hand-roll
-  crypto — a vetted lib owns parsing/verification.
-- **Effort.** Large (new dependency + key model).
+- **Open decisions.** Which library (`sequoia-openpgp` vs the pure-Rust `pgp` crate — the choice has real
+  weight for a clean-room, unsafe-forbidding workspace); verify-only first vs also sign; how to represent
+  OpenPGP keys in `trust.json` (armored public key vs fingerprint + keyring). Do not hand-roll crypto — a
+  vetted lib owns parsing/verification.
+- **Effort.** Large (new dependency + key model). Best split verify-only first (a new crate + the
+  dispatch + fixtures), then signing as a separate slice.
 
-## 4. Persisted require-time baseline
+## Completed
 
-- **Goal.** An explicit, stored grandfather set captured when policy moves to `require`, consulted by
-  object-signature enforcement — instead of re-deriving it live on every push.
-- **Why deferred.** v1 uses `protected_baseline` (a live walk from the *current* protected-ref tips at
-  each push). That already grandfathers existing history correctly (the 8d decision kept it), but it is
-  O(history) per push and shifts if tips move.
-- **Approach.** At the require cutover (auto in `trust_set_policy`, or an explicit `gta trust baseline`),
-  snapshot the objects reachable from the current protected tips into a stored artifact — e.g. a ref
-  `refs/gitana/baseline` pointing at those tips, or a serialised id set. `verify_protected_tip` then uses
-  the stored baseline instead of the live walk, making enforcement incremental and stable.
-- **Touch points.** `gitana-git-http/enforce.rs` (`protected_baseline` reads the stored set), a writer at
-  require-time (`gitana-porcelain` `trust_set_policy` or a new command), ref/blob storage.
-- **Open decisions.** Storage shape (a ref to the tips vs a persisted id set); captured automatically at
-  `set-policy require` vs an explicit command (8d deferred the explicit command); fallback to the live
-  walk when absent.
-- **Effort.** Medium.
-
-## 5. `TrustRootAdopted` audit event for `trust sync`
-
-**✅ Done.** `AuditEvent::TrustRootAdopted { anchor }` added; `TrustSyncOutcome::Updated` carries the
-chain's bootstrap `anchor` (`folded.anchor`), and the CLI sync handler prints the event to stderr on an
-adoption or fast-forward. The scoped plan below is kept for reference.
-
-- **Goal.** Emit a typed `AuditEvent` when `gta trust sync` adopts (bootstrap) or fast-forwards the local
-  trust root, completing the client-side audit vocabulary started in 7b.
-- **Why deferred.** Descoped from 7b: `trust sync` already prints its anchor prominently, and threading
-  the anchor out to an event would have churned `TrustSyncOutcome` and its tests.
-- **Approach.** Add `AuditEvent::TrustRootAdopted { anchor }` (and/or an updated/synced variant). Either
-  extend `TrustSyncOutcome::Updated` with the anchor (`Some` on bootstrap adoption) or have `trust_sync`
-  return the event; the `gta-core` sync handler `eprintln!`s it like the other trust ops.
-- **Touch points.** `gitana-trust` (`AuditEvent` variant), `gitana-porcelain/src/trust.rs`
-  (`TrustSyncOutcome` / `trust_sync`), `gta-core` `commands/trust.rs` (sync handler).
-- **Open decisions.** Whether `Updated` gains an `anchor` field (churns ~5 sync tests) vs a returned
-  event; whether to also audit fast-forward syncs (not just bootstrap adoption).
-- **Effort.** Small.
+- **Signed `push --signed --delete`** (`19c056f`). `push_signed` gained a `delete` target →
+  `delete_signed` sends a signed delete certificate (`<old> <zero> <ref>`); `build_cert` generalised to
+  optional `old`/`new`; the CLI routes `--signed --delete` through `push_signed`. Two orthogonal
+  authorization axes were documented: signing authorises *who* deletes (trust), the host's delete-refs
+  grant (`force`) authorises deletes *at all* — a signed delete still needs the host to permit deletes,
+  like stock git's `receive.denyDeletes`. Porcelain round-trip + `enforce.rs` accept + `receive_pack`
+  wire-apply tests.
+- **`trust sync` audit event** (`6e3d909`). Added `AuditEvent::TrustRootAdopted { anchor }`;
+  `TrustSyncOutcome::Updated` carries the chain's bootstrap `anchor`; the `gta-core` sync handler prints
+  the event to stderr on an adoption or fast-forward — completing the client-side audit vocabulary from
+  step 7b.
+- **One-time-nonce replay cache** (`91b05df6`). A host-supplied `NonceLedger` trait (with a
+  `NoReplayCheck` no-op default) threaded through `verify_push_with_ledger` and `ReceiveOptions`; after a
+  certificate verifies, its nonce is recorded and a still-fresh replay is a certificate failure (rejected
+  under `require`, warned under `warn`). The pure core stays stateless — the ledger is the host's state;
+  `verify_push` delegates with `NoReplayCheck`, so its call sites are unchanged. The seam only — no
+  production ledger yet (no server binary), matching the step-7 "typed events, no sink" decision.
