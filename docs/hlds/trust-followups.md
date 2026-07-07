@@ -16,15 +16,22 @@ re-deriving the design.
 | OpenPGP signature *production* | ✅ done (this branch) | — |
 | Persisted require-time baseline | deferred (premature: no server binary; live-walk fallback is correct) | medium |
 
-Each remaining item is gated by the project's usual flow: its own worktree/branch, Codex-clean before
-merge, and the `gta`/`gta-mcp` surface-parity lock where a CLI surface changes. See **Completed** at the
-bottom for what the three done items shipped.
+Every item here is done except the persisted baseline, which is **deferred** (see below). With that,
+the trust & signing initiative is effectively closed — the remaining gitana gaps are in other areas
+(see `TODO.md`). Each shipped item followed the project's usual flow: its own worktree/branch,
+Codex-clean before merge, and the `gta`/`gta-mcp` surface-parity lock where a CLI surface changed. See
+**Completed** at the bottom for what each shipped.
 
 ## Outstanding
 
 ### Persisted require-time baseline
 
-**⏭ Next up.**
+**⏭ Deferred** — premature: `enforce.rs` has no production server binary to benefit, the live-walk
+`protected_baseline` fallback is correct, and the capture location is under-specified (client-side
+`trust_set_policy` would write it, but enforcement is server-side and `refs/gitana/baseline` would
+itself sit in the protected `refs/gitana/*` namespace). Revisit only if a server binary + large
+histories make the walk a measured cost; server-side capture at the `require` cutover is the cleaner
+design then.
 
 - **Goal.** An explicit, stored grandfather set captured when policy moves to `require`, consulted by
   object-signature enforcement instead of re-deriving it live on every push.

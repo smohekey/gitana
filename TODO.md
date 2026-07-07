@@ -135,9 +135,13 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [ ] Add a persisted require-time baseline. Snapshot the grandfather set at the `require` cutover into a
   stored artifact so object-signature enforcement is incremental and stable, instead of the live
   `protected_baseline` walk. Scoped in `docs/hlds/trust-followups.md#persisted-require-time-baseline`.
-- [ ] Add OpenPGP signature support. Verify (and optionally produce) OpenPGP-signed commits/tags/push
-  certs alongside SSHSIG, dispatching on the armor marker in the trust core and extending `TrustedKey`.
-  Large (new dependency). Scoped in `docs/hlds/trust-followups.md#openpgp-signatures`.
+- [x] Add OpenPGP signature support. Verify, enrol, and produce OpenPGP-signed commits/tags/push certs
+  alongside SSHSIG, dispatching on the armor marker. `gitana-trust` verifies OpenPGP with a full
+  certificate-validity engine (bindings, back-sig, key flags, expiry, reason-aware revocation) via the
+  pure-Rust `pgp` (rpgp) crate; `gta trust add-key/remove-key` enrol armored PGP certs; `gta commit -S`/
+  `tag -s`/`push --signed` sign via `gpg` when `gpg.format=openpgp` (or unset — git's default), with
+  `gpg.openpgp.program`/`gpg.program` overrides. Interop-locked against stock git+GnuPG both directions.
+  Trust-chain commits stay SSHSIG-only. Scoped in `docs/hlds/trust-followups.md#completed`.
 - [x] Add verification helpers for received push certificates. `gitana-git-http`'s `verify_push`
   (`enforce.rs`) verifies a certificate's SSHSIG against the folded trust root, checks the repo-bound
   nonce freshness, matches the pushee, and confirms the signed commands equal what receive-pack applies.
