@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 gitana-object.workspace = true
+pgp.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 # `crypto` enables every SSH signing algorithm stock git can produce for `commit -S` / `tag -s`

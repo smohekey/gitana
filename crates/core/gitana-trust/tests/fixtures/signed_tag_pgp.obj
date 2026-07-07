@@ -1,0 +1,13 @@
+object cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+type commit
+tag v1
+tagger A U Thor <author@example.com> 1700000000 +0000
+
+openpgp signed tag
+-----BEGIN PGP SIGNATURE-----
+
+wnEEABsIAB0WIQQVxL0OIutiP/ro05uXSR+qb7j42wUCakyelQAKCRCXSR+qb7j4
+23x3pQVJOV0G+lC+8HwLa3p5IjQnM9nyJXtouekdAYj8g+Crdk0lpo6keG0Pdv9n
+pPytvkhEXPAJu4JPz09UCToSBA==
+=5vHi
+-----END PGP SIGNATURE-----

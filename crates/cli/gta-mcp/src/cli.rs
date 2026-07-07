@@ -479,7 +479,7 @@ enum TrustAction {
 	List,
 	/// Enrol a public key in the trust root.
 	AddKey {
-		/// Public key to enrol: a `.pub` file path or a literal OpenSSH key line.
+		/// Public key to enrol: a file path or a literal OpenSSH key line / armored OpenPGP certificate.
 		#[arg(long)]
 		key: String,
 		/// SSH private key to sign the update with (default: git config `user.signingkey`).
@@ -488,7 +488,7 @@ enum TrustAction {
 	},
 	/// Remove a key from the trust root.
 	RemoveKey {
-		/// Key to remove: a `SHA256:…` fingerprint, or a public-key file path / OpenSSH line.
+		/// Key to remove: a `SHA256:…` or OpenPGP hex fingerprint, or a public-key file / OpenSSH line.
 		#[arg(long)]
 		key: String,
 		/// SSH private key to sign the update with (default: git config `user.signingkey`).

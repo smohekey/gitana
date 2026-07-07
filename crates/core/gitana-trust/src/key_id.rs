@@ -1,9 +1,11 @@
 use std::fmt;
 
+use pgp::types::Fingerprint;
 use ssh_key::{HashAlg, public::KeyData};
 
-/// The stable identity of a trusted key: its OpenSSH SHA-256 fingerprint (`SHA256:…`), the same
-/// string `ssh-keygen -lf` and `git`'s signature output print. Used to name the key that produced
+/// The stable identity of a trusted key: an OpenSSH SHA-256 fingerprint (`SHA256:…`, the same string
+/// `ssh-keygen -lf` and `git`'s SSH signature output print) for an SSH key, or an OpenPGP
+/// fingerprint (uppercase hex, as `gpg` prints) for a PGP key. Used to name the key that produced
 /// (or failed to produce) a trusted signature, for audit and error reporting.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KeyId(String);
@@ -12,6 +14,12 @@ impl KeyId {
 	/// The SHA-256 fingerprint of an SSH public key.
 	pub(crate) fn of(key: &KeyData) -> Self {
 		Self(key.fingerprint(HashAlg::Sha256).to_string())
+	}
+
+	/// The OpenPGP fingerprint of a PGP key, as uppercase hex (the form `gpg` prints, without the
+	/// spaced grouping).
+	pub(crate) fn of_pgp(fingerprint: &Fingerprint) -> Self {
+		Self(format!("{fingerprint:X}"))
 	}
 
 	/// The fingerprint string (`SHA256:…`).

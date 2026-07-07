@@ -12,8 +12,9 @@ re-deriving the design.
 | Signed `push --signed --delete` | ✅ done (`19c056f`) | — |
 | `trust sync` audit event (`TrustRootAdopted`) | ✅ done (`6e3d909`) | — |
 | One-time-nonce replay cache | ✅ done (`91b05df6`) | — |
-| **Persisted require-time baseline** | **⏭ next up** | medium |
-| OpenPGP signatures | pending | large (new dependency) |
+| OpenPGP signature *verification* | ✅ done (this branch) | — |
+| Persisted require-time baseline | deferred (premature: no server binary; live-walk fallback is correct) | medium |
+| OpenPGP signature *production* | pending | medium (a GPG `Signer` beside the ssh-keygen one) |
 
 Each remaining item is gated by the project's usual flow: its own worktree/branch, Codex-clean before
 merge, and the `gta`/`gta-mcp` surface-parity lock where a CLI surface changes. See **Completed** at the
@@ -73,29 +74,47 @@ bottom for what the three done items shipped.
   cutover set while a post-cutover unsigned commit is rejected; a `trust_set_policy` test that the
   baseline ref is written on the `require` cutover.
 
-### OpenPGP signatures
+### OpenPGP signature production
 
-- **Goal.** Verify (and optionally produce) OpenPGP-signed commits, annotated tags, and push
-  certificates alongside SSHSIG, for GPG interoperability.
-- **Why deferred.** v1 is SSHSIG-only by explicit choice (dependency cost). Verification is purely
-  additive — a second branch in the trust core selected by the armor marker.
-- **Approach.** `gitana-object` already preserves the `gpgsig` header byte-exactly (and `gpgsig-sha256`
-  for SHA-256 repos) via generic extra-headers, so the object layer likely needs no change. In
-  `gitana-trust`, dispatch on the signature armor (`-----BEGIN PGP SIGNATURE-----` vs
-  `-----BEGIN SSH SIGNATURE-----`) inside `verify_commit`/`verify_tag`, add an OpenPGP verify path beside
-  `verify_sshsig`, and extend `TrustedKey`/`KeyId` (today OpenSSH-only) to carry an OpenPGP key. Client
-  signing would add a GPG `Signer` (shelling to `gpg`, parallel to the `ssh-keygen` `CliSigner`).
-- **Touch points.** `gitana-trust` (verify path, `TrustedKey`, `KeyId`, `TrustDocument` key parsing),
-  `gitana-porcelain`/`gta-core` (a GPG signer, if producing), a vetted OpenPGP crate.
-- **Open decisions.** Which library (`sequoia-openpgp` vs the pure-Rust `pgp` crate — the choice has real
-  weight for a clean-room, unsafe-forbidding workspace); verify-only first vs also sign; how to represent
-  OpenPGP keys in `trust.json` (armored public key vs fingerprint + keyring). Do not hand-roll crypto — a
-  vetted lib owns parsing/verification.
-- **Effort.** Large (new dependency + key model). Best split verify-only first (a new crate + the
-  dispatch + fixtures), then signing as a separate slice.
+Verification landed (see **Completed**); this remaining slice is *producing* OpenPGP signatures.
+
+- **Goal.** Optionally produce OpenPGP-signed commits, annotated tags, and push certificates, so a
+  GPG-native operator can sign with `gta` (not just verify others' GPG signatures).
+- **Approach.** Add a GPG `Signer` beside the `ssh-keygen` `CliSigner` — either shelling to `gpg
+  --detach-sign --armor` or signing in-process with rpgp (already a dependency) given an unlocked
+  secret key. The object layer needs no change (it already round-trips a `gpgsig` PGP header). Select
+  the format from git config (`gpg.format` = `openpgp` + `user.signingkey`).
+- **Touch points.** `gitana-porcelain`/`gta-core` (a GPG signer + config plumbing); no `gitana-trust`
+  change (the verify side is done).
+- **Open decisions.** Shell to `gpg` (matches how the SSH signer shells to `ssh-keygen`, honours the
+  user's agent/keyring) vs sign in-process with rpgp (no external binary, but gitana must then locate
+  and unlock the secret key). Do not hand-roll crypto.
+- **Effort.** Medium.
 
 ## Completed
 
+- **OpenPGP signature verification + enrolment** (this branch). `gitana-trust` now verifies
+  OpenPGP-signed commits and annotated tags alongside SSHSIG, using the pure-Rust `pgp` (rpgp) crate
+  (chosen over `sequoia-openpgp` because it builds for `wasm32-wasip2` — the trust core is in the
+  component's graph via `gitana-porcelain` — and pulls no C libs, fitting the clean-room/unsafe-forbidding
+  workspace). `TrustedKey` became an enum (`Ssh` | `Pgp`); `KeyId` carries an OpenPGP fingerprint
+  (uppercase hex); `TrustRoot::from_json` dispatches each trust-document entry on its armor, so a root
+  may enrol OpenSSH keys, armored OpenPGP certificates, or both. `verify_commit`/`verify_tag` dispatch
+  on the signature armor; `verify_pgpsig` matches the signature's issuer against a trusted certificate's
+  primary key and subkeys and verifies with the matched component key (returning the certificate's
+  fingerprint). The matched component is validated as a *valid signer as of the signature's own creation
+  timestamp* (clock-free — no wall clock threaded through the trust core): a verified self-signature
+  (primary) or subkey binding — including the signing subkey's back-signature — grants the signing key
+  flag, that grant has not expired at signing time, and the component is not revoked. An unbound attacker
+  subkey can't borrow a victim's fingerprint (its binding won't verify); an encryption/auth-only subkey is
+  refused; and validation is scoped to the *used* component, so a normally `gpg --export`ed key carrying
+  third-party certifications still enrols and verifies. No `enforce.rs`/`receive_pack` change was needed
+  — they route through `verify_commit`/`verify_tag`, so policy enforcement accepts trusted OpenPGP
+  signatures automatically. End-to-end enrolment landed too: `gta trust add-key`/`remove-key` accept an
+  armored OpenPGP certificate (file or literal) and an OpenPGP hex fingerprint selector, across both the
+  `gta` and `gta-mcp` surfaces. Signature *production* stays SSHSIG-only (the remaining follow-up above).
+  **Follow-up:** the PGP fixtures are rpgp-produced (no `gpg` in the build env); add a captured real-`gpg`
+  object to regression-lock cross-implementation interop, as the SSHSIG path does with stock-git fixtures.
 - **Signed `push --signed --delete`** (`19c056f`). `push_signed` gained a `delete` target →
   `delete_signed` sends a signed delete certificate (`<old> <zero> <ref>`); `build_cert` generalised to
   optional `old`/`new`; the CLI routes `--signed --delete` through `push_signed`. Two orthogonal

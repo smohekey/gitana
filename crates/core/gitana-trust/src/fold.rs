@@ -1,10 +1,14 @@
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_commit, parse_tree};
 
-use crate::{FoldedTrust, ObjectSource, TRUST_DOCUMENT_PATH, TrustError, TrustRoot, verify_commit};
+use crate::{
+	FoldedTrust, ObjectSource, TRUST_DOCUMENT_PATH, TrustError, TrustRoot, verify_trust_commit,
+};
 
 /// Fold the `refs/gitana/trust` chain ending at `tip` into its effective [`TrustRoot`], verifying
-/// the whole authorization chain: the bootstrap (root) commit must be self-signed by a key in its
-/// own document, and every later commit must be signed by a key trusted in the *previous* root.
+/// the whole authorization chain: the bootstrap (root) commit must be self-signed (SSHSIG) by an SSH
+/// key in its own document, and every later commit must be SSHSIG-signed by an SSH key trusted in the
+/// *previous* root. Trust updates are SSH-only — an enrolled OpenPGP certificate is a verification-only
+/// anchor and cannot authorize a trust update (see [`verify_trust_commit`](crate::verify_trust_commit)).
 /// Returns the tip's root. The chain must be linear (a merge in it is refused) and every root
 /// non-empty.
 ///
@@ -45,11 +49,11 @@ where
 	let (bootstrap_raw, bootstrap_tree) = iter.next().expect("chain has at least the tip commit");
 	// Bootstrap: self-signed by a key in its own root. The signer is the chain's anchor.
 	let mut root = load_trust_root(source, bootstrap_tree).await?;
-	let anchor = verify_commit::<H>(&bootstrap_raw, &root.keys)?;
+	let anchor = verify_trust_commit::<H>(&bootstrap_raw, &root.keys)?;
 
 	// Each later commit is authorized by the previous root, then installs its own.
 	for (raw, tree) in iter {
-		verify_commit::<H>(&raw, &root.keys)?;
+		verify_trust_commit::<H>(&raw, &root.keys)?;
 		root = load_trust_root(source, tree).await?;
 	}
 	Ok(FoldedTrust { root, anchor })

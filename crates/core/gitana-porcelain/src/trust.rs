@@ -195,9 +195,12 @@ pub async fn trust_sync<F: FileStore, H: HashAlgorithm>(
 	})
 }
 
-/// Enrol `key_line` (an OpenSSH public-key line) in the trust root, signing the update with `signer`
-/// — which must be a key the *current* root already trusts. Refuses a malformed key or one already
-/// enrolled (matched by fingerprint, so a re-paste with a different comment is still a duplicate).
+/// Enrol `key_line` (an OpenSSH public-key line or an armored OpenPGP public-key certificate) in the
+/// trust root, signing the update with `signer` — which must be a key the *current* root already
+/// trusts. The enrolled key is a *verification* key; it need not match the SSHSIG `signer`, so a
+/// repo can trust OpenPGP signers while its admins still sign trust updates with SSH. Refuses a
+/// malformed key or one already enrolled (matched by fingerprint, so a re-paste with a different
+/// comment is still a duplicate).
 /// Extends the chain and moves `refs/gitana/trust` only after the new root re-verifies. Returns the
 /// new tip and an [`AuditEvent::KeyAdded`] naming the enrolled key.
 pub async fn trust_add_key<F: FileStore, H: HashAlgorithm>(
@@ -209,11 +212,11 @@ pub async fn trust_add_key<F: FileStore, H: HashAlgorithm>(
 	let tip = current_tip(repo).await?;
 	let mut document = read_current_document(repo, tip).await?;
 
-	let new_id = TrustedKey::from_openssh(key_line.trim())
+	let new_id = TrustedKey::parse(key_line)
 		.context("parsing the public key to add")?
 		.id();
 	for line in &document.keys {
-		let existing = TrustedKey::from_openssh(line)
+		let existing = TrustedKey::parse(line)
 			.with_context(|| format!("parsing an already-enrolled key ({line})"))?;
 		if existing.id() == new_id {
 			bail!("key {new_id} is already enrolled");
@@ -224,9 +227,10 @@ pub async fn trust_add_key<F: FileStore, H: HashAlgorithm>(
 	Ok((tip, AuditEvent::KeyAdded { key: new_id }))
 }
 
-/// Remove the key named by `selector` — a `SHA256:…` fingerprint (as `trust list` prints) or an
-/// OpenSSH public-key line — from the trust root, signing the update with `signer`. Refuses when no
-/// enrolled key matches, or when it would remove the last key (a root must keep at least one). Under
+/// Remove the key named by `selector` — a `SHA256:…` or OpenPGP hex fingerprint (as `trust list`
+/// prints), or a full OpenSSH public-key line / armored OpenPGP certificate — from the trust root,
+/// signing the update with `signer`. Refuses when no enrolled key matches, or when it would remove
+/// the last key (a root must keep at least one). Under
 /// [`Policy::Require`], dropping below two keys is unsafe (the same invariant `init`/`set-policy`
 /// hold) and is refused unless `break_glass` is set.
 pub async fn trust_remove_key<F: FileStore, H: HashAlgorithm>(
@@ -243,7 +247,7 @@ pub async fn trust_remove_key<F: FileStore, H: HashAlgorithm>(
 	let mut kept = Vec::with_capacity(document.keys.len());
 	let mut removed = None;
 	for line in &document.keys {
-		let id = TrustedKey::from_openssh(line)
+		let id = TrustedKey::parse(line)
 			.with_context(|| format!("parsing an enrolled key ({line})"))?
 			.id();
 		if id.as_str() == target {
@@ -258,12 +262,26 @@ pub async fn trust_remove_key<F: FileStore, H: HashAlgorithm>(
 	if kept.is_empty() {
 		bail!("cannot remove the last trusted key; a trust root must keep at least one");
 	}
-	if document.policy == Policy::Require && kept.len() < 2 && !break_glass {
-		bail!(
-			"removing this key would leave a `require` root with a single key, which is unsafe: \
-			 losing it locks the repository. Pass `--break-glass` to override, or lower the policy \
-			 with `set-policy` first."
-		);
+	let remaining_ssh = push_capable_key_count(&kept);
+	if !break_glass {
+		if document.policy == Policy::Require && remaining_ssh < 2 {
+			bail!(
+				"removing this key would leave a `require` root with fewer than two SSH keys, which is \
+				 unsafe: losing the remaining key locks the repository (OpenPGP certs are verification-only \
+				 and cannot sign a push). Pass `--break-glass` to override, or lower the policy with \
+				 `set-policy` first."
+			);
+		}
+		// Regardless of policy, a root with no SSH key is unmanageable: every trust update is SSH-signed,
+		// so a PGP-only root can never sign a valid next update (nor add an SSH key back). OpenPGP certs
+		// are verification-only.
+		if remaining_ssh == 0 {
+			bail!(
+				"removing this key would leave a trust root with no SSH keys — only verification-only \
+				 OpenPGP certs — which can never sign a future trust update, leaving the root \
+				 unmanageable. Enrol another SSH key first, or pass `--break-glass` to override."
+			);
+		}
 	}
 	document.keys = kept;
 	// `removed` is `Some` whenever `kept` shrank, which the no-match guard above has confirmed.
@@ -288,10 +306,11 @@ pub async fn trust_set_policy<F: FileStore, H: HashAlgorithm>(
 	if document.policy == policy {
 		bail!("policy is already `{policy}`");
 	}
-	if policy == Policy::Require && !break_glass && document.keys.len() < 2 {
+	if policy == Policy::Require && !break_glass && push_capable_key_count(&document.keys) < 2 {
 		bail!(
-			"`require` with fewer than two enrolled keys is unsafe: losing the key locks the \
-			 repository. Enrol another key with `add-key`, or pass `--break-glass` to override."
+			"`require` with fewer than two SSH keys is unsafe: losing the key locks the repository \
+			 (OpenPGP certs are verification-only and cannot sign a push). Enrol another SSH key with \
+			 `add-key`, or pass `--break-glass` to override."
 		);
 	}
 	document.policy = policy;
@@ -419,21 +438,40 @@ async fn read_current_document<F: FileStore, H: HashAlgorithm>(
 	TrustDocument::from_json(&bytes).map_err(Into::into)
 }
 
-/// Resolve a key selector to a fingerprint: a `SHA256:…` value is used as-is; anything else is parsed
-/// as an OpenSSH public-key line and fingerprinted.
+/// The number of enrolled keys that can actually *sign* in gitana — OpenSSH keys. OpenPGP
+/// certificates are verification-only trust anchors: gitana produces SSHSIG signatures, signs trust
+/// updates with SSH, and its push certificates are SSH-signed, so a PGP cert can never authenticate a
+/// commit, a trust update, or a required push. The `require` lock-out safety margin (keeping two keys
+/// so losing one does not brick the repository) must therefore count only these push-capable keys —
+/// a PGP cert beside a single SSH key does not make the SSH key safe to lose.
+fn push_capable_key_count(keys: &[String]) -> usize {
+	keys
+		.iter()
+		.filter(|entry| matches!(TrustedKey::parse(entry), Ok(TrustedKey::Ssh(_))))
+		.count()
+}
+
+/// Resolve a key selector to the fingerprint string [`TrustedKey::id`] produces. A `SHA256:…` value
+/// (an SSH fingerprint) is used as-is; a bare hex string (an OpenPGP fingerprint, as `trust list`
+/// prints it — accepted with or without `gpg`'s spaced grouping, any case) is normalised to
+/// uppercase; anything else is parsed as a full key (OpenSSH line or armored OpenPGP certificate) and
+/// fingerprinted.
 fn selector_fingerprint(selector: &str) -> Result<String> {
 	let selector = selector.trim();
 	if selector.starts_with("SHA256:") {
-		Ok(selector.to_owned())
-	} else {
-		Ok(
-			TrustedKey::from_openssh(selector)
-				.context("parsing the key selector as an OpenSSH public key")?
-				.id()
-				.as_str()
-				.to_owned(),
-		)
+		return Ok(selector.to_owned());
 	}
+	let compact: String = selector.chars().filter(|c| !c.is_whitespace()).collect();
+	if !compact.is_empty() && compact.chars().all(|c| c.is_ascii_hexdigit()) {
+		return Ok(compact.to_ascii_uppercase());
+	}
+	Ok(
+		TrustedKey::parse(selector)
+			.context("parsing the key selector as an OpenSSH or OpenPGP public key")?
+			.id()
+			.as_str()
+			.to_owned(),
+	)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -1294,5 +1332,164 @@ mod tests {
 			.await
 			.unwrap_err();
 		assert!(err.to_string().contains("not initialised"), "{err}");
+	}
+
+	/// A valid armored OpenPGP public-key certificate — a *verification* key, distinct from the SSH
+	/// keys the test admins sign with. Its primary fingerprint (uppercase hex) is
+	/// [`PGP_CERT_FINGERPRINT`].
+	const PGP_CERT: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
+		xiYEX14QABtN2GL9e7kIulFy6ACJ0RZAwwJC5BwdFsoBP2a0BppE/s0hR2l0YW5h\n\
+		IFRlc3QgPHRlc3RAZ2l0YW5hLmludmFsaWQ+woIEExsIAC4FAmpMl9cWIQQVxL0O\n\
+		IutiP/ro05uXSR+qb7j42wIbAwIeAQELARUBFgEnAhkBAAoJEJdJH6pvuPjb+Y1f\n\
+		Norc9vYtfqI/rw9o42LwVQ1udkFWf3M7+mc8hexmgCo/lePB0uqD3+Ul881d3kBV\n\
+		TAfPdo24tOiQCWR9dUUB\n\
+		=/X56\n\
+		-----END PGP PUBLIC KEY BLOCK-----\n";
+	const PGP_CERT_FINGERPRINT: &str = "15C4BD0E22EB623FFAE8D39B97491FAA6FB8F8DB";
+
+	#[tokio::test]
+	async fn add_key_enrols_an_openpgp_certificate_signed_by_an_ssh_admin() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let admin = TestSigner::new(1);
+		bootstrap(repo, &admin, Policy::Warn).await;
+
+		// The signer is an SSH admin; the enrolled key is an OpenPGP verification certificate.
+		let (_, event) = trust_add_key(repo, PGP_CERT, &TestIdentity::default(), &admin)
+			.await
+			.unwrap();
+		let pgp_id = TrustedKey::parse(PGP_CERT).unwrap().id();
+		assert_eq!(pgp_id.as_str(), PGP_CERT_FINGERPRINT);
+		assert_eq!(event, AuditEvent::KeyAdded { key: pgp_id });
+
+		let root = trust_list(repo).await.unwrap().unwrap();
+		assert_eq!(root.keys.len(), 2);
+		let ids: Vec<String> = root
+			.keys
+			.iter()
+			.map(|k| k.id().as_str().to_owned())
+			.collect();
+		assert!(ids.contains(&PGP_CERT_FINGERPRINT.to_owned()));
+	}
+
+	#[tokio::test]
+	async fn add_key_refuses_a_duplicate_openpgp_certificate() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let admin = TestSigner::new(1);
+		bootstrap(repo, &admin, Policy::Warn).await;
+		trust_add_key(repo, PGP_CERT, &TestIdentity::default(), &admin)
+			.await
+			.unwrap();
+
+		let err = trust_add_key(repo, PGP_CERT, &TestIdentity::default(), &admin)
+			.await
+			.unwrap_err();
+		assert!(err.to_string().contains("already enrolled"), "{err}");
+	}
+
+	#[tokio::test]
+	async fn require_needs_two_ssh_keys_a_pgp_cert_does_not_count() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let admin = TestSigner::new(1);
+		bootstrap(repo, &admin, Policy::Warn).await;
+		// Enrol a PGP verification cert: now two document keys, but only one can sign a push.
+		trust_add_key(repo, PGP_CERT, &TestIdentity::default(), &admin)
+			.await
+			.unwrap();
+
+		// `require` is still refused — a PGP cert cannot authenticate a push, so losing the sole SSH
+		// key would lock the repository.
+		let err = trust_set_policy(
+			repo,
+			Policy::Require,
+			false,
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap_err();
+		assert!(err.to_string().contains("two SSH keys"), "{err}");
+
+		// A second SSH key satisfies it.
+		trust_add_key(
+			repo,
+			&TestSigner::new(2).public_line(),
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+		trust_set_policy(
+			repo,
+			Policy::Require,
+			false,
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+		assert_eq!(
+			trust_list(repo).await.unwrap().unwrap().policy,
+			Policy::Require
+		);
+	}
+
+	#[tokio::test]
+	async fn remove_key_refuses_leaving_a_pgp_only_root() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let admin = TestSigner::new(1);
+		bootstrap(repo, &admin, Policy::Warn).await;
+		trust_add_key(repo, PGP_CERT, &TestIdentity::default(), &admin)
+			.await
+			.unwrap();
+
+		// Removing the sole SSH key would leave a PGP-only root that can never sign a trust update —
+		// refused even under `warn`, without break-glass.
+		let err = trust_remove_key(
+			repo,
+			&fingerprint(&admin),
+			false,
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap_err();
+		assert!(err.to_string().contains("no SSH keys"), "{err}");
+		// Both keys are still enrolled.
+		assert_eq!(trust_list(repo).await.unwrap().unwrap().keys.len(), 2);
+	}
+
+	#[tokio::test]
+	async fn remove_key_by_openpgp_fingerprint() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+		let admin = TestSigner::new(1);
+		bootstrap(repo, &admin, Policy::Warn).await;
+		trust_add_key(repo, PGP_CERT, &TestIdentity::default(), &admin)
+			.await
+			.unwrap();
+
+		// Removing the PGP key by its hex fingerprint (accepted lowercase) leaves the SSH admin.
+		let (_, event) = trust_remove_key(
+			repo,
+			&PGP_CERT_FINGERPRINT.to_ascii_lowercase(),
+			false,
+			&TestIdentity::default(),
+			&admin,
+		)
+		.await
+		.unwrap();
+		assert_eq!(
+			event,
+			AuditEvent::KeyRemoved {
+				key: TrustedKey::parse(PGP_CERT).unwrap().id()
+			}
+		);
+		let root = trust_list(repo).await.unwrap().unwrap();
+		assert_eq!(root.keys.len(), 1);
+		assert_eq!(root.keys[0].id().as_str(), fingerprint(&admin));
 	}
 }

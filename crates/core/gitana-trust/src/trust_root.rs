@@ -25,7 +25,7 @@ impl TrustRoot {
 		let keys = document
 			.keys
 			.iter()
-			.map(|line| TrustedKey::from_openssh(line))
+			.map(|entry| TrustedKey::parse(entry))
 			.collect::<Result<Vec<_>, _>>()?;
 		if keys.is_empty() {
 			return Err(TrustError::EmptyTrustRoot);

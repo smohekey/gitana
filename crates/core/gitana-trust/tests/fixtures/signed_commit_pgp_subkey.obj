@@ -1,0 +1,12 @@
+tree efefefefefefefefefefefefefefefefefefefef
+author A U Thor <author@example.com> 1700000000 +0000
+committer A U Thor <author@example.com> 1700000000 +0000
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ wnEEABsIAB0WIQTiLAp+Xmgo24dT7Be/aeU/BB5rvgUCakyelQAKCRC/aeU/BB5r
+ vs4cgpKlRD3qtIclesVubiv2OqT4w6lWBbM0IyEwbopQ1JCNrZqCgIOxnwnmscaG
+ VQj2AHb8ejRw6sWi0naJr7AxCA==
+ =bvZF
+ -----END PGP SIGNATURE-----
+
+openpgp subkey-signed commit

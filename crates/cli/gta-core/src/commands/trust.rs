@@ -34,12 +34,12 @@ pub enum Action {
 	},
 	/// Show the current policy and enrolled key fingerprints.
 	List,
-	/// Enrol a public key (a `.pub` file path or a literal OpenSSH line).
+	/// Enrol a public key (a file path or a literal OpenSSH line / armored OpenPGP certificate).
 	AddKey {
 		key: String,
 		signing_key: Option<PathBuf>,
 	},
-	/// Remove a key by fingerprint (`SHA256:…`) or public-key line/file.
+	/// Remove a key by fingerprint (`SHA256:…` or OpenPGP hex) or public-key line/file.
 	RemoveKey {
 		key: String,
 		signing_key: Option<PathBuf>,
@@ -303,7 +303,14 @@ async fn set_policy_preflight<H: HashAlgorithm>(
 				println!("    {}", key.id());
 			}
 			if target == Policy::Require {
-				if root.keys.len() < 2 {
+				// The `require` safety margin counts only push-capable (SSH) keys — OpenPGP certs are
+				// verification-only and cannot sign a push — mirroring `trust_set_policy`.
+				let ssh_keys = root
+					.keys
+					.iter()
+					.filter(|key| matches!(key, TrustedKey::Ssh(_)))
+					.count();
+				if ssh_keys < 2 {
 					print_single_key_warning(break_glass);
 				}
 				print_require_implications();
@@ -319,11 +326,11 @@ async fn set_policy_preflight<H: HashAlgorithm>(
 fn print_single_key_warning(break_glass: bool) {
 	if break_glass {
 		println!(
-			"  ! `require` with fewer than two enrolled keys is unsafe (losing a key locks the repository); proceeding under `--break-glass`."
+			"  ! `require` with fewer than two SSH keys is unsafe (losing a key locks the repository; OpenPGP certs are verification-only); proceeding under `--break-glass`."
 		);
 	} else {
 		println!(
-			"  ! `require` with fewer than two enrolled keys is unsafe; the real command needs `--break-glass`."
+			"  ! `require` with fewer than two SSH keys is unsafe (OpenPGP certs are verification-only); the real command needs `--break-glass`."
 		);
 	}
 }
@@ -357,17 +364,27 @@ fn print_trust_root(root: &TrustRoot) {
 	}
 }
 
-/// Resolve a key argument to the value the porcelain expects: if it names a file, read the OpenSSH
-/// public-key line out of it; otherwise pass it through verbatim (a literal key line, or — for
-/// `remove-key` — a `SHA256:…` fingerprint). A relative file path honors `-C` via `cwd`.
+/// Resolve a key argument to the value the porcelain expects: if it names a file, read the public key
+/// out of it — an armored OpenPGP certificate verbatim, otherwise the OpenSSH public-key line;
+/// if it does not name a file, pass it through verbatim (a literal OpenSSH/OpenPGP key, or — for
+/// `remove-key` — a `SHA256:…`/OpenPGP fingerprint). A relative file path honors `-C` via `cwd`.
 async fn read_key_arg(arg: &str, cwd: &Path) -> Result<String> {
 	let path = cwd.join(arg);
 	if path.is_file() {
 		let contents = tokio::fs::read_to_string(&path)
 			.await
 			.with_context(|| format!("reading public key {}", path.display()))?;
-		return signer::public_key_line(&contents)
-			.ok_or_else(|| anyhow!("{} does not contain an OpenSSH public key", path.display()));
+		// An armored OpenPGP public key spans multiple lines and is used verbatim; an OpenSSH key is a
+		// single line extracted from the file (e.g. a `.pub` or a private-key file's comment).
+		if contents.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----") {
+			return Ok(contents.trim().to_owned());
+		}
+		return signer::public_key_line(&contents).ok_or_else(|| {
+			anyhow!(
+				"{} does not contain an OpenSSH or OpenPGP public key",
+				path.display()
+			)
+		});
 	}
 	Ok(arg.trim().to_owned())
 }

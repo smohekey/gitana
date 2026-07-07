@@ -12,6 +12,12 @@ pub enum TrustError {
 	/// A trusted-key entry could not be parsed as an OpenSSH public key.
 	#[error("malformed public key: {0}")]
 	MalformedKey(#[source] ssh_key::Error),
+	/// The armored signature block could not be parsed as an OpenPGP signature.
+	#[error("malformed OpenPGP signature: {0}")]
+	MalformedPgpSignature(#[source] pgp::errors::Error),
+	/// A trusted-key entry could not be parsed as an OpenPGP public-key certificate.
+	#[error("malformed OpenPGP public key: {0}")]
+	MalformedPgpKey(#[source] pgp::errors::Error),
 	/// The signature is cryptographically valid but its signer is not in the trusted set.
 	#[error("signature by untrusted key {0}")]
 	UntrustedKey(KeyId),

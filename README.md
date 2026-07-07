@@ -56,7 +56,9 @@ What works today:
   git. Receive-pack enforces the policy before any ref moves — verifying the candidate trust-root
   update, the push certificate (repo-bound nonce, pushee, exact commands), and a trusted signature
   on every newly introduced commit and annotated tag — failing closed on a malformed root and
-  emitting typed audit events. `require` is validated end to end against stock `git push --signed`
+  emitting typed audit events. Signature *verification* accepts both SSHSIG and OpenPGP signatures
+  (dispatched on the armor), so a trust root may enrol OpenSSH keys, armored OpenPGP certificates, or
+  both; signature *production* is still SSHSIG-only. `require` is validated end to end against stock `git push --signed`
   (`docs/trust-validation-matrix.md`); migrate an existing repo onto it with the `--dry-run`
   preflight (`docs/trust-migration.md`).
 
@@ -79,7 +81,9 @@ Major gaps:
   sparse-checkout support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
-- Trust signing is SSHSIG-only (no OpenPGP yet).
+- Trust *verification* accepts both SSHSIG and OpenPGP signatures, but signature *production*
+  (`commit -S`, `tag -s`, `push --signed`) is SSHSIG-only — gitana does not yet produce OpenPGP
+  signatures.
 - Remote transport currently supports HTTP(S) Smart HTTP remotes. Other Git URL
   schemes, such as SSH remotes, are not implemented.
 - Object storage now uses pack `.idx` and a multi-pack-index for lookup. `gta repack`
@@ -157,8 +161,8 @@ Implemented command groups:
 - `crates/core/gitana-git-http`: Transport-agnostic Smart HTTP protocol helpers.
 - `crates/core/gitana-remote`: Remote operations over the `gitana-git-http` codec —
   origin config, ref discovery, the HTTP client, and pack transfer.
-- `crates/core/gitana-trust`: Pure trust core — verifies SSHSIG-signed commits
-  and tags against trusted keys, and folds the `refs/gitana/trust` commit chain
+- `crates/core/gitana-trust`: Pure trust core — verifies SSHSIG- and OpenPGP-signed
+  commits and tags against trusted keys, and folds the `refs/gitana/trust` commit chain
   (via an `ObjectSource` capability) into the effective trust root.
 - `crates/cli/gta-core`: Shared command implementations.
 - `crates/cli/gta`: User-facing CLI.
