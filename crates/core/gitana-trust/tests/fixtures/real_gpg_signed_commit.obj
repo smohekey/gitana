@@ -1,0 +1,13 @@
+tree aaa96ced2d9a1c8e72c56b253a0e2fe78393feb7
+author Gitana GPG Fixture <fixture@gitana.invalid> 1700000000 +0000
+committer Gitana GPG Fixture <fixture@gitana.invalid> 1700000000 +0000
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ iJEEABYKADkWIQSFLpp6ypjsP2RTDE7rM50mWhksKQUCakyxfBsUgAAAAAAEAA5t
+ YW51MiwyLjUrMS4xMiwwLDMACgkQ6zOdJloZLClVlwD/aDpl0fzlvipvu/pjQnUj
+ QEux5dtTF57n6cT0EB0OPCIBAOjuSW5ofulkJR3xy0HxM0RBKEL4R7c7eBUSRRhh
+ E88P
+ =nBIB
+ -----END PGP SIGNATURE-----
+
+openpgp signed commit

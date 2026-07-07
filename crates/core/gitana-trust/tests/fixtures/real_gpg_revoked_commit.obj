@@ -1,0 +1,13 @@
+tree ba856f78f34fcefae5d72ef4aec60e70a52ea4a0
+author Gitana Revoked Fixture <revoked@gitana.invalid> 1700000000 +0000
+committer Gitana Revoked Fixture <revoked@gitana.invalid> 1700000000 +0000
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ iJEEABYKADkWIQRPUTdY+kkXI8B3/HDlZFMZjIAgIgUCakyy3xsUgAAAAAAEAA5t
+ YW51MiwyLjUrMS4xMiwwLDMACgkQ5WRTGYyAICI/ogD/eokWXhdTT4aFkJ7Xqc3Q
+ xrRj+LPGNiIZmwji7v+dsXcBANQjfvB8pBKxo5si9RIVk2l1/erv+LnAo80COgLo
+ QpEL
+ =x3c6
+ -----END PGP SIGNATURE-----
+
+signed before revocation

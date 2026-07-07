@@ -1,20 +1,20 @@
 //! Verify OpenPGP-signed git commit/tag objects. The fixtures are byte-exact `git`-format objects
 //! (a `gpgsig` header for commits, an appended armor block for tags) whose detached OpenPGP
-//! signatures were produced over exactly the bytes git signs (see `tests/fixtures/*_pgp.*`).
+//! signatures were produced over exactly the bytes git signs.
 //!
-//! NOTE: these fixtures are produced by the same OpenPGP library gitana verifies with (rpgp), not by
-//! stock `gpg`, because no `gpg` was available in the build environment. They lock in gitana's
-//! integration — armor dispatch, git payload extraction, issuer matching, and the verify call —
-//! but a captured real-`gpg` object should be added to regression-lock cross-implementation interop
-//! (parity with the stock-git SSHSIG fixtures in `verify.rs`).
+//! Two provenances: `*_pgp.*` / `pgp_*` fixtures are produced by the same library gitana verifies
+//! with (rpgp), exercising component shapes rpgp can build (a signing subkey, a third-party
+//! certification); `real_gpg_*` fixtures are captured from **stock `git commit -S` / `git tag -s`
+//! under GnuPG** (`gpg (GnuPG) 2.5`, ed25519), regression-locking cross-implementation interop — the
+//! real question, "does gitana verify what other people's `gpg` actually produces" (parity with the
+//! stock-git SSHSIG fixtures in `verify.rs`).
 //!
-//! Coverage gap: the *revocation*, *key-expiry*, *grant-not-yet-valid*, and *non-Binary signature
-//! type* rejection paths (see `verify_pgpsig`) are not exercised by integration fixtures here,
-//! because rpgp 0.20 refuses to *produce* the malformed/adversarial inputs they guard against — it
-//! cannot generate a key-revocation, set a key-expiration at generation, or sign a non-`Binary`/`Text`
-//! data signature ("incompatible signature type"). The expiry arithmetic is unit-tested (`expired_at`,
-//! in the crate); those guards otherwise rest on review. A hand-crafted-packet or real-`gpg` fixture
-//! would close this.
+//! Coverage note: the *key-expiry*, *grant-not-yet-valid*, and *non-Binary signature type* rejection
+//! paths (see `verify_pgpsig`) have no integration fixture — they cannot arise from honest signing (a
+//! key valid *when it signs* is never expired by the clock-free model; `gpg`/rpgp refuse to sign with
+//! an expired key or to emit a non-data signature), so they guard hand-crafted packets and rest on the
+//! `expired_at` unit test + review. The *revocation* path IS exercised: `real_gpg_revoked_*` below is a
+//! real `gpg`-revoked certificate.
 
 use gitana_object::{Sha1, encode_commit, parse_commit};
 use gitana_trust::{
@@ -36,6 +36,16 @@ const SUBKEY_SIGNED_COMMIT: &[u8] = include_bytes!("fixtures/signed_commit_pgp_s
 /// The signer certificate augmented with a third-party certification (by `other`) on its User ID —
 /// as `gpg --export` includes once someone signs your key. It must still enrol and verify.
 const THIRDPARTY_PUB: &str = include_str!("fixtures/pgp_signer_thirdparty.pub.asc");
+/// A certificate captured from stock GnuPG, with the `git commit -S` / `git tag -s` objects it signed.
+const REAL_GPG_PUB: &str = include_str!("fixtures/real_gpg_signer.pub.asc");
+const REAL_GPG_COMMIT: &[u8] = include_bytes!("fixtures/real_gpg_signed_commit.obj");
+const REAL_GPG_TAG: &[u8] = include_bytes!("fixtures/real_gpg_signed_tag.obj");
+/// The stock-gpg signer's fingerprint (uppercase hex, as gitana's `KeyId` renders it).
+const REAL_GPG_FINGERPRINT: &str = "852E9A7ACA98EC3F64530C4EEB339D265A192C29";
+/// A stock-gpg certificate that was **revoked** (reason unspecified → retroactive), with a commit it
+/// signed *before* the revocation. gitana must refuse the signature.
+const REAL_GPG_REVOKED_PUB: &str = include_str!("fixtures/real_gpg_revoked_signer.pub.asc");
+const REAL_GPG_REVOKED_COMMIT: &[u8] = include_bytes!("fixtures/real_gpg_revoked_commit.obj");
 /// The signer certificate's OpenPGP fingerprint, uppercase hex (as `gpg` prints, ungrouped).
 const SIGNER_FINGERPRINT: &str = "15C4BD0E22EB623FFAE8D39B97491FAA6FB8F8DB";
 /// The subkey-signer certificate's *primary* fingerprint — verification attributes a subkey
@@ -62,6 +72,32 @@ fn parse_dispatches_on_armor() {
 #[test]
 fn pgp_key_id_is_its_fingerprint() {
 	assert_eq!(signer().id().as_str(), SIGNER_FINGERPRINT);
+}
+
+#[test]
+fn verifies_a_stock_gpg_signed_commit() {
+	// The real interop check: a `git commit -S` object produced by stock GnuPG (not rpgp) verifies.
+	let cert = TrustedKey::from_armored_pgp(REAL_GPG_PUB).expect("parse gpg certificate");
+	let key = verify_commit::<Sha1>(REAL_GPG_COMMIT, &[cert]).expect("verify");
+	assert_eq!(key.as_str(), REAL_GPG_FINGERPRINT);
+}
+
+#[test]
+fn verifies_a_stock_gpg_signed_tag() {
+	let cert = TrustedKey::from_armored_pgp(REAL_GPG_PUB).expect("parse gpg certificate");
+	let key = verify_tag(REAL_GPG_TAG, &[cert]).expect("verify");
+	assert_eq!(key.as_str(), REAL_GPG_FINGERPRINT);
+}
+
+#[test]
+fn rejects_a_signature_by_a_stock_gpg_revoked_key() {
+	// A real gpg-revoked certificate (reason unspecified, which is retroactive). Even though this
+	// commit was signed before the revocation, gitana must refuse it — a revoked key is not trusted.
+	let cert = TrustedKey::from_armored_pgp(REAL_GPG_REVOKED_PUB).expect("parse revoked certificate");
+	assert!(matches!(
+		verify_commit::<Sha1>(REAL_GPG_REVOKED_COMMIT, &[cert]),
+		Err(TrustError::BadSignature)
+	));
 }
 
 #[test]

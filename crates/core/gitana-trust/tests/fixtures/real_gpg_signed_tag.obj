@@ -1,0 +1,14 @@
+object c5c7ba28801f29d252b711f668ae329e2dba154c
+type commit
+tag v1
+tagger Gitana GPG Fixture <fixture@gitana.invalid> 1700000000 +0000
+
+openpgp signed tag
+-----BEGIN PGP SIGNATURE-----
+
+iJEEABYKADkWIQSFLpp6ypjsP2RTDE7rM50mWhksKQUCakyxfBsUgAAAAAAEAA5t
+YW51MiwyLjUrMS4xMiwwLDMACgkQ6zOdJloZLCnamQD8DdiGun8B/SYZZLfAP+X9
+r+7KcoS7lo7J73flKYw+fJ8BAOuDIZqmhAJSFaN4Ihd+vcgaQz6JuQbiRg9M6Q1h
+rQAB
+=92ZI
+-----END PGP SIGNATURE-----
