@@ -108,6 +108,23 @@ impl BitmapIndex {
 			.collect()
 	}
 
+	/// The raw reachability EWAH (in bitmap object order) for `commit`, without resolving its set bits
+	/// to ids — so a caller can OR several commits' bitmaps together and resolve the union *once*,
+	/// rather than materializing (and re-hashing) each commit's closure separately. `None` unless
+	/// `midx` is the very index this bitmap was built over (checksums match) and `commit` is bitmapped.
+	/// The bits are in bitmap object order; resolve them via [`MultiPackIndex::object_at_bitmap_position`].
+	pub fn commit_reachability_ewah<H: HashAlgorithm>(
+		&self,
+		commit: &ObjectId<H>,
+		midx: &MultiPackIndex<H>,
+	) -> Option<&EwahBitmap> {
+		if self.midx_checksum != midx.checksum() {
+			return None;
+		}
+		let position = midx.object_position(commit)? as u32;
+		self.commit_reachability(position)
+	}
+
 	/// The object ids reachable from `commit` — the ergonomic query: resolve the commit's lexical
 	/// position in `midx`, then its reachability. `None` if `commit` is absent or not bitmapped.
 	pub fn reachable_from<H: HashAlgorithm>(
@@ -735,6 +752,31 @@ mod tests {
 
 		assert!(index.commit_reachability(0).is_some());
 		assert!(index.reachable_object_ids(0, &midx).is_none());
+	}
+
+	#[test]
+	fn commit_reachability_ewah_returns_the_raw_bitmap_and_honours_the_binding() {
+		let midx = sample_midx(true);
+		let commit = midx.object_ids()[0];
+		let lexical = midx.object_position(&commit).unwrap() as u32;
+		let empty = EwahBitmap::from_set_bits([]);
+		let reach = EwahBitmap::from_set_bits([0, 1, 2]);
+		let bytes = build(
+			midx.checksum().try_into().unwrap(),
+			[&empty, &empty, &empty, &empty],
+			&[(lexical, 0, reach.clone())],
+		);
+		let index = decode_midx_bitmap::<Sha1>(&bytes).expect("decode");
+
+		// The raw EWAH is returned unresolved (same bits, no id materialization).
+		assert_eq!(index.commit_reachability_ewah(&commit, &midx), Some(&reach));
+		// A commit absent from the MIDX has no entry.
+		let absent = ObjectId::<Sha1>::compute(ObjectKind::Blob, &[99]);
+		assert!(index.commit_reachability_ewah(&absent, &midx).is_none());
+		// A MIDX this bitmap was not built over fails the checksum binding (even for a present commit).
+		let foreign = sample_midx(false);
+		assert_ne!(index.midx_checksum(), foreign.checksum());
+		assert!(index.commit_reachability_ewah(&commit, &foreign).is_none());
 	}
 
 	#[test]

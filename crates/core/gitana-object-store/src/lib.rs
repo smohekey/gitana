@@ -18,10 +18,10 @@ use std::sync::Arc;
 use gitana_file_store::{FileStore, FileStoreError, WriteOutcome};
 
 use gitana_object::{
-	BitmapIndex, HashAlgorithm, MAX_OBJECT_SIZE, MidxEntry, MultiPackIndex, ObjectError, ObjectId,
-	ObjectKind, PackEntry, PackIndex, PackedObject, apply_delta, build_reachability_bitmaps,
-	decode_loose, decode_midx_bitmap, decode_multi_pack_index, decode_object_at, decode_pack_entry,
-	decode_pack_index, encode_loose, encode_multi_pack_index,
+	BitmapIndex, EwahBitmap, HashAlgorithm, MAX_OBJECT_SIZE, MidxEntry, MultiPackIndex, ObjectError,
+	ObjectId, ObjectKind, PackEntry, PackIndex, PackedObject, apply_delta,
+	build_reachability_bitmaps, decode_loose, decode_midx_bitmap, decode_multi_pack_index,
+	decode_object_at, decode_pack_entry, decode_pack_index, encode_loose, encode_multi_pack_index,
 	encode_multi_pack_index_with_reverse_index, encode_pack, encode_pack_index, loose_object_path,
 	pack_index_entries, parse_commit, referenced_ids,
 };
@@ -776,22 +776,101 @@ where
 		tips: &[ObjectId<H>],
 		strict: bool,
 	) -> Result<HashSet<ObjectId<H>>, ObjectStoreError> {
-		let bitmap = self.bitmap_and_midx().await?;
+		// Resolving the accumulated result bitmap back to ids needs the MIDX reverse index; a
+		// foreign/corrupt `.bitmap` over a MIDX that carries no RIDX can never be turned back into ids,
+		// so treat such a bitmap as absent and walk (the resolve-to-id path did this per-object before —
+		// see follow-up A's identical gate in `commit_reaches_any`).
+		let bitmap = self
+			.bitmap_and_midx()
+			.await?
+			.filter(|(_, midx)| midx.reverse_index().is_some());
+		match &bitmap {
+			Some((bitmap, midx)) => match self
+				.bitmap_reachable_closure(tips, strict, bitmap, midx)
+				.await?
+			{
+				Some(closure) => Ok(closure),
+				// A set bit failed to resolve — the `.bitmap` disagrees with its MIDX (corruption past the
+				// checksum-header check). Fall back to a full walk rather than return a silently short set.
+				None => self.walk_reachable_closure(tips, strict).await,
+			},
+			None => self.walk_reachable_closure(tips, strict).await,
+		}
+	}
+
+	/// The bitmap-accelerated [`Self::reachable_object_closure`]: each bitmapped commit contributes its
+	/// whole closure by OR-ing its reachability bitmap into one result bitmap (in bitmap-position space,
+	/// so a closure shared by many tips is unioned once, never re-materialized per tip), while loose or
+	/// otherwise un-bitmapped objects reached by the frontier walk collect in a `HashSet`. The result
+	/// bitmap's set bits are resolved to ids once at the end and unioned with the frontier.
+	///
+	/// Returns `Ok(None)` if a result bit cannot be resolved against `midx` — a corrupt `.bitmap` that
+	/// still carried the right MIDX checksum — so the caller can fall back to a plain walk. `midx` must
+	/// carry a reverse index (the caller gates on it).
+	async fn bitmap_reachable_closure(
+		&self,
+		tips: &[ObjectId<H>],
+		strict: bool,
+		bitmap: &BitmapIndex,
+		midx: &MultiPackIndex<H>,
+	) -> Result<Option<HashSet<ObjectId<H>>>, ObjectStoreError> {
+		let mut result = EwahBitmap::default();
+		let mut frontier: HashSet<ObjectId<H>> = HashSet::new();
+		let mut stack: Vec<ObjectId<H>> = tips.to_vec();
+		while let Some(id) = stack.pop() {
+			if frontier.contains(&id) {
+				continue;
+			}
+			// Already covered by a previously OR'd closure — nothing more to add or walk.
+			if let Some(position) = midx.bitmap_position(&id) {
+				if result.get(position) {
+					continue;
+				}
+			}
+			// A bitmapped commit's entire reachable closure is its reachability bitmap — OR it in and do
+			// not descend (it already accounts for its trees, blobs, and ancestors).
+			if let Some(reachability) = bitmap.commit_reachability_ewah(&id, midx) {
+				result.union_in_place(reachability);
+				continue;
+			}
+			// Otherwise read and walk it. A missing object is fatal only on the strict (want) side.
+			let (kind, data) = match self.read_object(&id).await {
+				Ok(object) => object,
+				Err(ObjectStoreError::NotFound) if !strict => continue,
+				Err(other) => return Err(other),
+			};
+			frontier.insert(id);
+			stack.extend(referenced_ids::<H>(kind, &data)?);
+		}
+		// Resolve the accumulated positions once and union the walked frontier. A bit that fails to
+		// resolve signals a bitmap/MIDX mismatch: bail so the caller walks instead of returning short.
+		let mut closure = frontier;
+		for position in result.set_bits() {
+			match midx.object_at_bitmap_position(position as usize) {
+				Some(id) => {
+					closure.insert(*id);
+				}
+				None => return Ok(None),
+			}
+		}
+		Ok(Some(closure))
+	}
+
+	/// The plain graph-walk [`Self::reachable_object_closure`], used when there is no usable bitmap (or
+	/// as the fallback when one proves inconsistent). Identical in result to the bitmap path for every
+	/// supported (non-submodule) history.
+	async fn walk_reachable_closure(
+		&self,
+		tips: &[ObjectId<H>],
+		strict: bool,
+	) -> Result<HashSet<ObjectId<H>>, ObjectStoreError> {
 		let mut closure: HashSet<ObjectId<H>> = HashSet::new();
 		let mut stack: Vec<ObjectId<H>> = tips.to_vec();
 		while let Some(id) = stack.pop() {
 			if closure.contains(&id) {
 				continue;
 			}
-			// A bitmapped commit's entire reachable closure is known — add it in bulk and do not
-			// descend (the bitmap already accounts for its trees, blobs, and ancestors).
-			if let Some((bitmap, midx)) = &bitmap {
-				if let Some(ids) = bitmap.reachable_from(&id, midx) {
-					closure.extend(ids);
-					continue;
-				}
-			}
-			// Otherwise read and walk it. A missing object is fatal only on the strict (want) side.
+			// A missing object is fatal only on the strict (want) side.
 			let (kind, data) = match self.read_object(&id).await {
 				Ok(object) => object,
 				Err(ObjectStoreError::NotFound) if !strict => continue,

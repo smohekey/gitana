@@ -85,6 +85,18 @@ impl EwahBitmap {
 		self.words.iter().map(|w| w.count_ones() as u64).sum()
 	}
 
+	/// OR `other` into this bitmap in place, word-wise (growing to hold the longer of the two, so the
+	/// shorter is effectively zero-extended). Lets a caller union several bitmaps in bitmap-position
+	/// space — O(words) per OR regardless of overlap — before resolving the set bits back to ids once.
+	pub fn union_in_place(&mut self, other: &EwahBitmap) {
+		if other.words.len() > self.words.len() {
+			self.words.resize(other.words.len(), 0);
+		}
+		for (into, from) in self.words.iter_mut().zip(&other.words) {
+			*into |= from;
+		}
+	}
+
 	/// The set-bit positions, ascending.
 	pub fn set_bits(&self) -> impl Iterator<Item = u32> + '_ {
 		self.words.iter().enumerate().flat_map(|(index, &word)| {
@@ -262,6 +274,23 @@ mod tests {
 		let bytes = encode_ewah(&bitmap);
 		let (decoded, _) = decode_ewah(&bytes).expect("decode");
 		assert_eq!(decoded.set_bits().collect::<Vec<_>>(), positions);
+	}
+
+	#[test]
+	fn union_in_place_ors_word_wise_and_zero_extends() {
+		// A shorter accumulator grows to hold a longer operand; the union is the set-bit union.
+		let mut acc = EwahBitmap::from_set_bits([1, 64]);
+		acc.union_in_place(&EwahBitmap::from_set_bits([1, 2, 130]));
+		assert_eq!(acc.set_bits().collect::<Vec<_>>(), [1, 2, 64, 130]);
+
+		// OR-ing an empty bitmap (no words) leaves the accumulator unchanged.
+		acc.union_in_place(&EwahBitmap::default());
+		assert_eq!(acc.set_bits().collect::<Vec<_>>(), [1, 2, 64, 130]);
+
+		// OR is commutative in result: starting from the longer side gives the same set.
+		let mut other = EwahBitmap::from_set_bits([1, 2, 130]);
+		other.union_in_place(&EwahBitmap::from_set_bits([1, 64]));
+		assert_eq!(other.set_bits().collect::<Vec<_>>(), [1, 2, 64, 130]);
 	}
 
 	#[test]

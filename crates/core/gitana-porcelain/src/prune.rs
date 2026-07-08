@@ -343,6 +343,48 @@ mod tests {
 		}
 	}
 
+	/// Two bitmapped tips that share ancestry: the accelerated closure ORs each tip's reachability
+	/// bitmap in place — so the shared closure (c0, c1 and their trees/blobs) is unioned once rather
+	/// than re-materialized per tip — then resolves the result to ids once. The set must still equal the
+	/// graph walk (this exercises the OR / already-covered path, distinct from the frontier walk-fill).
+	#[tokio::test]
+	async fn reachable_from_with_overlapping_bitmapped_tips_matches_the_walk() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+
+		// c0 <- c1 <- c2 and c1 <- c3: c2 and c3 both descend from the shared c0/c1.
+		let c0 = loose_commit(repo, Vec::new(), "f.txt", b"0").await;
+		let c1 = loose_commit(repo, vec![c0], "f.txt", b"1").await;
+		let c2 = loose_commit(repo, vec![c1], "f.txt", b"2").await;
+		let c3 = loose_commit(repo, vec![c1], "f.txt", b"3").await;
+		let roots = vec![c2, c3];
+
+		// Baseline graph walk before any bitmap exists.
+		let from_walk = reachable_from(repo, roots.clone()).await.unwrap();
+
+		// Bitmap *both* tips, so both roots hit the OR path (their shared ancestry overlaps).
+		repo.objects().repack(u64::MAX).await.unwrap();
+		repo
+			.objects()
+			.write_reachability_bitmap(&[c2, c3])
+			.await
+			.unwrap();
+		assert!(
+			repo.objects().has_reachability_bitmap().await.unwrap(),
+			"the repo should now have a reachability bitmap",
+		);
+
+		let from_bitmap = reachable_from(repo, roots).await.unwrap();
+
+		assert_eq!(
+			from_walk, from_bitmap,
+			"OR-ing overlapping bitmapped tips must equal the graph walk",
+		);
+		for id in [c0, c1, c2, c3] {
+			assert!(from_bitmap.contains(&id), "commit {id} reachable");
+		}
+	}
+
 	/// `prune` must never delete a commit listed in `.git/shallow` — even a *stale* entry sitting behind
 	/// the current boundary (a repo re-shortened after a deepen) — because the client re-sends it as a
 	/// `shallow` line on a later `--unshallow`. Protecting shallow entries as roots keeps them while the
