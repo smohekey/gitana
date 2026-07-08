@@ -99,11 +99,22 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   current `HEAD`. Fetch currently guards the current worktree's checked-out branch; git refuses a
   direct-mapping refspec (e.g. `+refs/heads/dev:refs/heads/dev`) whenever `dev` is checked out in any
   worktree, which needs enumerating `.git/worktrees/*/HEAD`. Belongs with the linked-worktree subsystem.
-- [ ] Support explicit push refspecs.
-- [ ] Support tags in fetch and push flows.
-- [ ] Add stock `git clone` interoperability tests against a small HTTP harness. (The in-process harness in `git_smart_http.rs` is gta-to-gta; these still need stock `git` as the interop peer — likewise for fetch/push below.)
-- [ ] Add stock `git fetch` interoperability tests against a small HTTP harness.
-- [ ] Add stock `git push` interoperability tests against a small HTTP harness.
+- [x] Support explicit push refspecs. `gta push [<remote>] [<refspec>...]` sends `[+]<src>[:<dst>]`
+  (force `+`, delete `:<dst>`, exact and DWIM-src forms), enforcing fast-forward for non-forced specs
+  (`d40ce107`).
+- [x] Support tags in fetch and push flows. `fetch` auto-follows tags (`--tags`/`--no-tags`,
+  `remote.origin.tagOpt`); `push --tags`/`--follow-tags`; tag immutability and bare-name tag deletion
+  against the remote's refs (`0736d8df`, `0d121cc4`, `a17b1bf5`, `5c8d0581`, `660c5bcd`).
+- [x] Add stock `git clone` interoperability tests against a small HTTP harness. `real_git_interop.rs`
+  (stock-git ↔ gitana Smart-HTTP, v0 + v2, `adcfe27b`) and `gta_against_git_http_backend.rs` (gta ↔ real
+  git http-backend, `49b83cd7`) exercise clone against a stock-`git` peer in both directions — superseding
+  the gta-to-gta `git_smart_http.rs` harness. Hardened across the remote-interop initiative (thin-packs,
+  shallow/`--depth`, multi-round negotiation).
+- [x] Add stock `git fetch` interoperability tests against a small HTTP harness. Covered by the same
+  `real_git_interop.rs` / `gta_against_git_http_backend.rs` harnesses (fetch/negotiation, both directions).
+- [x] Add stock `git push` interoperability tests against a small HTTP harness. Covered by the same
+  harnesses (push/receive-pack, both directions); `real_git_push_signed.rs` adds a real
+  `git push --signed` oracle.
 
 ## Signing And Integrity
 
