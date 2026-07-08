@@ -471,6 +471,123 @@ async fn push_delete_bare_name_is_ambiguous_when_branch_and_tag_both_exist() {
 	);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_dwims_a_bare_tag_source_name() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+
+	// The clone has a local tag `v1` but no branch `v1`.
+	ok(&gta(&["-C", t, "tag", "v1"]).await, "tag v1");
+
+	// A bare `push origin v1` resolves against the local refs: it pushes `refs/tags/v1`, not a
+	// nonexistent `refs/heads/v1`.
+	ok(
+		&gta(&["-C", t, "push", "origin", "v1"]).await,
+		"push origin v1",
+	);
+	let server = open(&git_dir);
+	let tip = server
+		.refs()
+		.resolve("refs/heads/main")
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		server.refs().resolve("refs/tags/v1").await.unwrap(),
+		Some(tip),
+		"the bare name pushed to refs/tags/v1"
+	);
+	assert_eq!(
+		server.refs().resolve("refs/heads/v1").await.unwrap(),
+		None,
+		"no branch was created"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_tags_with_a_bare_tag_source_is_not_a_duplicate() {
+	// `--tags` expands to a `refs/tags/v1` refspec; the bare `v1` base refspec must be DWIM'd to the
+	// same tag *before* that expansion, so the two coincide instead of colliding as two refspecs
+	// targeting one destination.
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	ok(&gta(&["-C", t, "tag", "v1"]).await, "tag v1");
+
+	ok(
+		&gta(&["-C", t, "push", "--tags", "origin", "v1"]).await,
+		"push --tags origin v1",
+	);
+	let server = open(&git_dir);
+	let tip = server
+		.refs()
+		.resolve("refs/heads/main")
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		server.refs().resolve("refs/tags/v1").await.unwrap(),
+		Some(tip),
+		"the tag was pushed once, not rejected as a duplicate"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_bare_source_is_ambiguous_when_branch_and_tag_both_exist() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+
+	// The clone has BOTH a branch and a tag named `dup`.
+	ok(&gta(&["-C", t, "branch", "dup"]).await, "branch dup");
+	ok(&gta(&["-C", t, "tag", "dup"]).await, "tag dup");
+
+	// A bare `push origin dup` is ambiguous — the local repo has both `refs/heads/dup` and
+	// `refs/tags/dup`.
+	let out = gta(&["-C", t, "push", "origin", "dup"]).await;
+	assert!(!out.status.success(), "an ambiguous bare push must fail");
+	assert!(
+		String::from_utf8_lossy(&out.stderr).contains("ambiguous"),
+		"error names the ambiguity: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	let server = open(&git_dir);
+	assert!(
+		server
+			.refs()
+			.resolve("refs/heads/dup")
+			.await
+			.unwrap()
+			.is_none()
+			&& server
+				.refs()
+				.resolve("refs/tags/dup")
+				.await
+				.unwrap()
+				.is_none(),
+		"nothing is pushed on ambiguity"
+	);
+}
+
 /// `gta push --signed` drives the real `ssh-keygen` signer end to end: it attaches a push certificate
 /// (the server advertises a nonce), the signed path is taken (`(signed)` reported), and the ref moves.
 /// The cryptographic correctness of the certificate — that its signature verifies under the signing

@@ -504,6 +504,14 @@ async fn plan_push<F: FileStore, H: HashAlgorithm>(
 	} else {
 		default_refspecs(repo, refspecs).await?
 	};
+	// Resolve bare-name sources (`push origin v1`) against the local refs first — rewriting a tag-only
+	// name to `refs/tags/v1:refs/tags/v1` — so tag expansion below sees the real destinations (its dedup
+	// and follow-tag reachability would otherwise key off the branch-defaulted `refs/heads/v1`).
+	let mut dwimmed = Vec::with_capacity(base.len());
+	for spec in base {
+		dwimmed.push(dwim_bare_source(repo, spec).await?);
+	}
+	let base = dwimmed;
 	// Expand `--tags` / `--follow-tags` into additional `refs/tags/*` refspecs (see `tag_refspecs`).
 	let tag_specs = tag_refspecs(repo, advertised, &base, tags).await?;
 	let refspecs: Vec<PushRefspec> = base.into_iter().chain(tag_specs).collect();
@@ -538,8 +546,7 @@ async fn plan_push<F: FileStore, H: HashAlgorithm>(
 					continue; // already up to date
 				}
 				// Existing tags are immutable in git: any change to an existing `refs/tags/*` needs a
-				// force, even a fast-forward — a tag is a fixed name, not a moving branch tip. (Bare-name
-				// tag DWIM — `push origin v1` where v1 is a local tag — is deferred to the tags slice.)
+				// force, even a fast-forward — a tag is a fixed name, not a moving branch tip.
 				if !forced && dst.starts_with("refs/tags/") && remote_old.is_some() {
 					bail!(
 						"updates to {dst} were rejected: the tag already exists on the remote at a different \
@@ -628,6 +635,7 @@ async fn tag_refspecs<F: FileStore, H: HashAlgorithm>(
 				src: Some(name.clone()),
 				dst: name,
 				dst_bare: false,
+				src_bare: false,
 			});
 		}
 	}
@@ -721,7 +729,46 @@ async fn default_refspecs<F: FileStore, H: HashAlgorithm>(
 		src: Some(branch.clone()),
 		dst: branch,
 		dst_bare: false,
+		src_bare: false,
 	}])
+}
+
+/// DWIM a bare-name push source against the *local* refs: `push origin v1` pushes an existing local
+/// `refs/tags/v1` (into `refs/tags/v1`) rather than a nonexistent `refs/heads/v1`. Only a bare `<name>`
+/// push (`src_bare`) is rewritten — an explicit source is literal. The branch default stands unless the
+/// local repo has only the tag; having both a branch and a tag by that name is ambiguous (as in git).
+async fn dwim_bare_source<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	spec: PushRefspec,
+) -> Result<PushRefspec> {
+	if !spec.src_bare {
+		return Ok(spec);
+	}
+	let src = spec
+		.src
+		.as_deref()
+		.expect("a bare source push has a source");
+	let name = src
+		.strip_prefix("refs/heads/")
+		.expect("a bare source is branch-qualified");
+	let as_tag = format!("refs/tags/{name}");
+	let has_branch = repo.refs().resolve(src).await?.is_some();
+	let has_tag = repo.refs().resolve(&as_tag).await?.is_some();
+	match (has_branch, has_tag) {
+		(true, true) => {
+			bail!("{name} is ambiguous locally (both {src} and {as_tag}); push with a full ref name")
+		}
+		// Only the tag exists: push it into the same-named remote tag. `src_bare` is cleared — the name
+		// is now resolved to a full ref, so this is idempotent if ever re-applied.
+		(false, true) => Ok(PushRefspec {
+			src: Some(as_tag.clone()),
+			dst: as_tag,
+			src_bare: false,
+			..spec
+		}),
+		// Branch present, or neither (resolve_source then reports the missing ref).
+		_ => Ok(spec),
+	}
 }
 
 /// Resolve a push source ref to a tip: `HEAD` follows the symbolic ref (or is the detached commit); any

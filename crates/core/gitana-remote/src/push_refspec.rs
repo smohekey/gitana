@@ -5,12 +5,16 @@
 //! update (permits a non-fast-forward). An empty source (`:<dst>`) deletes the remote ref. With no
 //! colon, `<name>` pushes to the same-name remote ref (git's DWIM). Wildcards are not supported yet.
 //!
-//! Qualification is **static** (parse-time), so an unqualified name resolves to a **branch** unless
-//! its own refspec makes the namespace clear (`refs/tags/v1:v2` → `refs/tags/v2`). Pushing a bare name
-//! to a tag therefore still needs its full `refs/tags/<name>`. The one exception is a **deletion**: a
-//! bare `:v1` / `--delete v1` records [`PushRefspec::dst_bare`], and the pusher resolves it against the
-//! remote's *advertised* refs at plan time — so it deletes an existing `refs/tags/v1` (erroring only if
-//! the remote has both a branch and a tag by that name).
+//! Qualification is **static** (parse-time), so an unqualified name in an explicit `<src>:<dst>`
+//! refspec resolves to a **branch** unless the refspec makes the namespace clear (`refs/tags/v1:v2` →
+//! `refs/tags/v2`). Two bare-name forms are DWIM'd against real refs at plan time instead:
+//! - A **bare push** (`push origin v1`) records [`PushRefspec::src_bare`]; the pusher resolves it
+//!   against the *local* refs, pushing an existing `refs/tags/v1` (into `refs/tags/v1`) rather than a
+//!   nonexistent `refs/heads/v1`.
+//! - A **deletion** (`:v1` / `--delete v1`) records [`PushRefspec::dst_bare`]; the pusher resolves it
+//!   against the remote's *advertised* refs, deleting an existing `refs/tags/v1`.
+//!
+//! Both error if a branch and a tag share the name.
 
 use anyhow::{Result, bail};
 
@@ -31,6 +35,12 @@ pub struct PushRefspec {
 	/// bare name against the remote's advertised refs — so `:v1` / `--delete v1` deletes an existing
 	/// `refs/tags/v1` rather than a nonexistent `refs/heads/v1`. `false` for `HEAD` and `refs/*`.
 	pub dst_bare: bool,
+	/// Whether the source was a bare `<name>` push (`push origin v1`, so both `src` and `dst` were
+	/// branch-defaulted to `refs/heads/<name>`). Lets the pusher resolve the bare name against the
+	/// *local* refs — so `push origin v1` pushes an existing `refs/tags/v1` rather than a nonexistent
+	/// `refs/heads/v1`, updating both `src` and `dst` to the discovered namespace. `false` for an
+	/// explicit `<src>:<dst>`, `HEAD`, `refs/*`, and a deletion (which has no source).
+	pub src_bare: bool,
 }
 
 impl PushRefspec {
@@ -52,15 +62,15 @@ impl PushRefspec {
 		// A destination written without a `refs/` prefix (and not the `HEAD` sentinel) was branch-
 		// defaulted; for a deletion this lets the pusher DWIM the bare name against the remote's refs.
 		let is_bare = |name: &str| !name.starts_with("refs/") && name != "HEAD";
-		let (src, dst, dst_bare) = match body.split_once(':') {
+		let (src, dst, dst_bare, src_bare) = match body.split_once(':') {
 			// `:<dst>` — delete the remote ref.
-			Some(("", dst)) if !dst.is_empty() => (None, qualify_dst(dst), is_bare(dst)),
+			Some(("", dst)) if !dst.is_empty() => (None, qualify_dst(dst), is_bare(dst), false),
 			Some(("", _)) => bail!("refspec has an empty source and destination: '{text}'"),
 			// `<src>:<dst>`. An unqualified destination inherits the source's namespace, so
 			// `refs/tags/v1:v2` targets `refs/tags/v2` rather than a `refs/heads/v2` branch.
 			Some((src, dst)) if !dst.is_empty() => {
 				let src = qualify_src(src);
-				(Some(src.clone()), qualify_dst_like(dst, &src), false)
+				(Some(src.clone()), qualify_dst_like(dst, &src), false, false)
 			}
 			// `<src>:` — no destination.
 			Some((_, _)) => bail!("refspec has an empty destination: '{text}'"),
@@ -68,15 +78,22 @@ impl PushRefspec {
 			// remote branch. The `HEAD` destination is a sentinel the pusher resolves to the current
 			// branch. This shorthand applies *only* to a bare `HEAD`; an explicit `HEAD` destination
 			// (`main:HEAD`, `:HEAD`) is the literal `refs/heads/HEAD` via `qualify_dst` above.
-			None if body == "HEAD" => (Some("HEAD".to_owned()), "HEAD".to_owned(), false),
-			// `<name>` — push to the same-name remote ref (git DWIM).
-			None => (Some(qualify_src(body)), qualify_dst(body), false),
+			None if body == "HEAD" => (Some("HEAD".to_owned()), "HEAD".to_owned(), false, false),
+			// `<name>` — push to the same-name remote ref (git DWIM). `src_bare` lets the pusher resolve
+			// the bare name against local refs (branch vs tag) at plan time.
+			None => (
+				Some(qualify_src(body)),
+				qualify_dst(body),
+				false,
+				is_bare(body),
+			),
 		};
 		Ok(Self {
 			force,
 			src,
 			dst,
 			dst_bare,
+			src_bare,
 		})
 	}
 }
@@ -127,6 +144,7 @@ mod tests {
 				src: Some("refs/heads/main".to_owned()),
 				dst: "refs/heads/main".to_owned(),
 				dst_bare: false,
+				src_bare: true,
 			}
 		);
 		assert_eq!(
@@ -136,6 +154,7 @@ mod tests {
 				src: Some("HEAD".to_owned()),
 				dst: "refs/heads/x".to_owned(),
 				dst_bare: false,
+				src_bare: false,
 			}
 		);
 		assert_eq!(
@@ -145,6 +164,7 @@ mod tests {
 				src: Some("refs/heads/dev".to_owned()),
 				dst: "refs/heads/release".to_owned(),
 				dst_bare: false,
+				src_bare: false,
 			}
 		);
 		assert_eq!(
@@ -205,6 +225,18 @@ mod tests {
 		// `dst_bare` is a deletion concept: an update refspec never sets it.
 		assert!(!PushRefspec::parse("main").unwrap().dst_bare);
 		assert!(!PushRefspec::parse("refs/tags/v1:v2").unwrap().dst_bare);
+	}
+
+	#[test]
+	fn bare_source_is_marked_for_local_dwim() {
+		// A bare `push origin v1` records `src_bare` so the pusher can resolve it against the local
+		// refs (pushing an existing `refs/tags/v1` rather than a nonexistent `refs/heads/v1`).
+		assert!(PushRefspec::parse("v1").unwrap().src_bare);
+		// An explicit source, `refs/*`, `HEAD`, and a deletion are never DWIM'd.
+		assert!(!PushRefspec::parse("v1:v1").unwrap().src_bare);
+		assert!(!PushRefspec::parse("refs/tags/v1").unwrap().src_bare);
+		assert!(!PushRefspec::parse("HEAD").unwrap().src_bare);
+		assert!(!PushRefspec::parse(":v1").unwrap().src_bare);
 	}
 
 	#[test]
