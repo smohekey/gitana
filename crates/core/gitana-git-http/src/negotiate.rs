@@ -67,6 +67,12 @@ async fn want_reaches_common<H: HashAlgorithm>(
 		// A non-commit want (a tree/blob want, or an absent one) has no commit ancestry to cut at.
 		return Ok(false);
 	};
+	// A reachability bitmap answers this without a full walk: is any `common` among the commits
+	// reachable from the want? A common a step away short-circuits at once. (A shallow server has no
+	// bitmap, so it keeps the walk below.)
+	if repo.objects().has_reachability_bitmap().await? {
+		return Ok(repo.objects().commit_reaches_any(start, common).await?);
+	}
 	let mut stack = vec![start];
 	let mut seen: HashSet<ObjectId<H>> = HashSet::new();
 	while let Some(id) = stack.pop() {
@@ -145,6 +151,44 @@ mod tests {
 			!ok_to_give_up(&repo, &[tracked, disjoint], &commons)
 				.await
 				.unwrap()
+		);
+	}
+
+	#[tokio::test]
+	async fn ok_to_give_up_matches_with_and_without_a_bitmap() {
+		// The bitmap-accelerated negotiation must reach the same verdict as the walk: a want whose
+		// history meets a common is ready; a disjoint want keeps the server negotiating.
+		let repo = new_repo().await;
+		let base = commit(&repo, &[], "base\n").await;
+		let tip = commit(&repo, &[base], "tip\n").await;
+		let disjoint = commit(&repo, &[], "disjoint\n").await;
+
+		let commons = common_haves(&repo, &[base]).await.unwrap();
+		assert!(!repo.objects().has_reachability_bitmap().await.unwrap());
+		let walk_tip = ok_to_give_up(&repo, &[tip], &commons).await.unwrap();
+		let walk_two = ok_to_give_up(&repo, &[tip, disjoint], &commons)
+			.await
+			.unwrap();
+		assert!(walk_tip);
+		assert!(!walk_two);
+
+		repo.objects().repack(u64::MAX).await.unwrap();
+		repo
+			.objects()
+			.write_reachability_bitmap(&[tip, disjoint])
+			.await
+			.unwrap()
+			.unwrap();
+		assert!(repo.objects().has_reachability_bitmap().await.unwrap());
+		assert_eq!(
+			ok_to_give_up(&repo, &[tip], &commons).await.unwrap(),
+			walk_tip
+		);
+		assert_eq!(
+			ok_to_give_up(&repo, &[tip, disjoint], &commons)
+				.await
+				.unwrap(),
+			walk_two,
 		);
 	}
 

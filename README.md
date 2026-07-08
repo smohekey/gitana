@@ -95,8 +95,10 @@ Major gaps:
   push enumerates objects as `closure(wants) \ closure(haves)` over the bitmap (git's
   fill-in — a bitmapped commit contributes its whole closure at once, and only an
   un-bitmapped frontier is walked), so the have side is never read for a non-shallow fetch.
-  Fetch negotiation (`ok_to_give_up`) and `rev-list` still walk the graph — they do not yet
-  consume bitmaps.
+  Ancestry queries consume it too: fetch negotiation (`ok_to_give_up`) and `is_ancestor`
+  (behind `merge`/`rebase`/`merge-base`) answer from a commit-only reachability set over the
+  bitmap on a non-shallow repo. `rev-list`/`log` still walk the graph — they need ordered
+  output, which bitmaps do not provide.
 
 ## `gta` CLI
 

@@ -58,6 +58,19 @@ pub(crate) async fn is_ancestor<H: HashAlgorithm>(
 	let descendant = peel_to_commit(repo, descendant).await?;
 
 	let shallow = shallow_set(repo).await?;
+	// With no shallow boundary to honour, a reachability bitmap answers this without a walk: is the
+	// ancestor among the commits reachable from the descendant? A shallow repo has no bitmap, and its
+	// boundary must stop the walk, so it keeps the graph traversal below.
+	if shallow.is_empty() && repo.objects().has_reachability_bitmap().await? {
+		let target = HashSet::from([ancestor]);
+		return Ok(
+			repo
+				.objects()
+				.commit_reaches_any(descendant, &target)
+				.await?,
+		);
+	}
+
 	let mut seen = HashSet::from([descendant]);
 	let mut stack = vec![descendant];
 	while let Some(id) = stack.pop() {
@@ -261,6 +274,51 @@ mod tests {
 			sorted(merge_base(&repo, &[m1, m2]).await.unwrap()),
 			sorted(vec![a, b])
 		);
+	}
+
+	#[tokio::test]
+	async fn is_ancestor_matches_with_and_without_a_bitmap() {
+		// The bitmap path must agree with the walk on the same graph: record the walk's answers, then
+		// bitmap the repo (only the tip) and re-run — a bitmapped descendant answers from its bitmap, an
+		// unbitmapped one walks down to bitmapped ancestors (fill-in).
+		let (repo, tree) = new_repo().await;
+		let root = commit(&repo, tree, &[], 1).await;
+		let x = commit(&repo, tree, &[root], 2).await;
+		let y = commit(&repo, tree, &[root], 3).await;
+		let m = commit(&repo, tree, &[x, y], 4).await;
+
+		let queries = [
+			(root, m, true),
+			(x, m, true),
+			(y, m, true),
+			(m, x, false),
+			(x, y, false),
+			(root, root, true),
+		];
+
+		assert!(!repo.objects().has_reachability_bitmap().await.unwrap());
+		let mut walked = Vec::new();
+		for (a, d, expect) in queries {
+			let got = is_ancestor(&repo, a, d).await.unwrap();
+			assert_eq!(got, expect, "walk: is_ancestor({a}, {d})");
+			walked.push(got);
+		}
+
+		repo.objects().repack(u64::MAX).await.unwrap();
+		repo
+			.objects()
+			.write_reachability_bitmap(&[m])
+			.await
+			.unwrap()
+			.unwrap();
+		assert!(repo.objects().has_reachability_bitmap().await.unwrap());
+		for (i, (a, d, _)) in queries.iter().enumerate() {
+			assert_eq!(
+				is_ancestor(&repo, *a, *d).await.unwrap(),
+				walked[i],
+				"bitmap: is_ancestor({a}, {d}) must match the walk",
+			);
+		}
 	}
 
 	#[tokio::test]

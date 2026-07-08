@@ -23,7 +23,7 @@ use gitana_object::{
 	decode_loose, decode_midx_bitmap, decode_multi_pack_index, decode_object_at, decode_pack_entry,
 	decode_pack_index, encode_loose, encode_multi_pack_index,
 	encode_multi_pack_index_with_reverse_index, encode_pack, encode_pack_index, loose_object_path,
-	pack_index_entries, referenced_ids,
+	pack_index_entries, parse_commit, referenced_ids,
 };
 use tokio::sync::Mutex;
 
@@ -801,6 +801,67 @@ where
 			stack.extend(referenced_ids::<H>(kind, &data)?);
 		}
 		Ok(closure)
+	}
+
+	/// Whether any commit in `targets` is reachable from `source` (a commit), following commit→parent
+	/// edges only — never reading a tree or blob. Each commit's *direct parents* are tested against
+	/// `targets` before anything deeper, so a target a step or two away short-circuits at once (the
+	/// common incremental-fetch case, where the client already has the tip's parent — even when the tip
+	/// itself is bitmapped). A parent that is itself bitmapped is tested against `targets` for its whole
+	/// ancestry in one step and then pruned, so deep history is never walked commit-by-commit. A missing
+	/// or non-commit frontier node contributes nothing.
+	///
+	/// Follows every parent to the root, so it is only correct where there is no shallow boundary to
+	/// stop at — callers restrict it to a non-shallow repo (which is also the only kind that has a
+	/// bitmap). With no bitmap this degrades to a plain early-exit commit walk.
+	///
+	/// Follow-up: a bitmapped parent still materializes its commit-ancestry to test membership; a
+	/// single-bit test (mapping each target to its bitmap position) would avoid even that.
+	pub async fn commit_reaches_any(
+		&self,
+		source: ObjectId<H>,
+		targets: &HashSet<ObjectId<H>>,
+	) -> Result<bool, ObjectStoreError> {
+		if targets.contains(&source) {
+			return Ok(true);
+		}
+		let bitmap = self.bitmap_and_midx().await?;
+		let mut seen: HashSet<ObjectId<H>> = HashSet::from([source]);
+		let mut stack: Vec<ObjectId<H>> = vec![source];
+		while let Some(id) = stack.pop() {
+			// Read this commit for its parent edges. A missing commit (a peer may name one the store
+			// lacks) or a non-commit contributes nothing.
+			let parents = match self.read_object(&id).await {
+				Ok((ObjectKind::Commit, data)) => parse_commit::<H>(&data)?.parents,
+				Ok(_) | Err(ObjectStoreError::NotFound) => continue,
+				Err(other) => return Err(other),
+			};
+			for parent in parents {
+				// A parent that is a target ends it in one edge — the near-tip case, regardless of whether
+				// `id` was bitmapped.
+				if targets.contains(&parent) {
+					return Ok(true);
+				}
+				if !seen.insert(parent) {
+					continue;
+				}
+				// A bitmapped parent answers for its whole ancestry at once: test the targets against it,
+				// then prune (every commit above it is within its reachability). Otherwise keep walking.
+				let reachable = match &bitmap {
+					Some((bitmap, midx)) => bitmap.reachable_commits(&parent, midx),
+					None => None,
+				};
+				match reachable {
+					Some(commits) => {
+						if commits.iter().any(|commit| targets.contains(commit)) {
+							return Ok(true);
+						}
+					}
+					None => stack.push(parent),
+				}
+			}
+		}
+		Ok(false)
 	}
 
 	/// The cached metadata for one pack, built and cached on first use: its `.idx` (from the

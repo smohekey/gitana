@@ -1467,3 +1467,86 @@ async fn a_bitmap_over_a_stale_midx_is_not_trusted() {
 		"a bitmap over a MIDX naming a deleted pack must not be trusted",
 	);
 }
+
+#[tokio::test]
+async fn commit_reaches_any_is_commit_only() {
+	// The commit-only query resolves ancestry among commits and never reports a reachable tree or blob
+	// as a target (they are reachable objects, but not commits).
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let (blob, tree, c1, c2) = packed_history(&store).await;
+	store
+		.write_reachability_bitmap(&[c2])
+		.await
+		.expect("bitmap")
+		.expect("packs");
+	assert!(
+		store
+			.commit_reaches_any(c2, &HashSet::from([c1]))
+			.await
+			.unwrap()
+	);
+	assert!(
+		!store
+			.commit_reaches_any(c1, &HashSet::from([c2]))
+			.await
+			.unwrap()
+	);
+	// The tree and blob are reachable from c2 as objects, but are not commits, so ancestry ignores them.
+	assert!(
+		!store
+			.commit_reaches_any(c2, &HashSet::from([tree, blob]))
+			.await
+			.unwrap()
+	);
+}
+
+#[tokio::test]
+async fn commit_reaches_any_walks_down_to_a_bitmapped_ancestor() {
+	// Bitmap only c1; c2 is packed but unbitmapped, so the query walks c2's parents to the bitmapped c1
+	// and tests it — the fill-in path.
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let (_blob, tree, c1, c2) = packed_history(&store).await;
+	store
+		.write_reachability_bitmap(&[c1])
+		.await
+		.expect("bitmap")
+		.expect("packs");
+	assert!(
+		store
+			.commit_reaches_any(c2, &HashSet::from([c1]))
+			.await
+			.unwrap()
+	);
+	assert!(
+		!store
+			.commit_reaches_any(c2, &HashSet::from([tree]))
+			.await
+			.unwrap()
+	);
+}
+
+#[tokio::test]
+async fn commit_reaches_any_without_a_bitmap_walks() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let (_blob, _tree, c1, c2) = packed_history(&store).await;
+	assert!(!store.has_reachability_bitmap().await.unwrap());
+	assert!(
+		store
+			.commit_reaches_any(c2, &HashSet::from([c1]))
+			.await
+			.unwrap()
+	);
+	assert!(
+		!store
+			.commit_reaches_any(c1, &HashSet::from([c2]))
+			.await
+			.unwrap()
+	);
+	// A commit trivially reaches itself.
+	assert!(
+		store
+			.commit_reaches_any(c2, &HashSet::from([c2]))
+			.await
+			.unwrap()
+	);
+}
