@@ -156,6 +156,26 @@ async fn gta_fetches_from_a_real_git_repo() {
 	);
 }
 
+/// Fetching when already up to date still succeeds: git sends a valid empty (0-object) packfile, which
+/// must not be mistaken for the empty-body server-error case (which `fetch_pack` now rejects).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gta_fetch_when_up_to_date_succeeds() {
+	if skip() {
+		return;
+	}
+	let root = tmp("client-uptodate");
+	build_bare(&root);
+	let url = serve_git_http_backend(root.clone()).await;
+	let checkout = root.join("c");
+	let c = checkout.to_str().unwrap();
+	gta_ok(
+		&gta(&["clone", &format!("{url}/repo.git"), c]).await,
+		"clone",
+	);
+	// No server change: a second fetch downloads a valid 0-object pack and must still succeed.
+	gta_ok(&gta(&["-C", c, "fetch"]).await, "up-to-date fetch");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gta_fetches_tags_from_a_real_git_repo() {
 	if skip() {
@@ -479,6 +499,234 @@ async fn gta_pushes_a_thin_pack_to_a_real_git_repo() {
 	assert_eq!(
 		git(&bare, &["cat-file", "-p", &format!("{head}:big.txt")]),
 		String::from_utf8(big(b'B')).unwrap()
+	);
+}
+
+/// Build `<root>/repo.git`: a bare git repo with a linear history of `n` commits on `main`
+/// (`a.txt` = `v0`, `v1`, …), HTTP push enabled. Returns the commit ids oldest→newest; the source
+/// work tree stays at `<root>/work`.
+fn build_linear_bare(root: &Path, n: usize) -> Vec<String> {
+	let work = root.join("work");
+	std::fs::create_dir_all(&work).unwrap();
+	git(&work, &["init", "-q", "-b", "main", "."]);
+	git(&work, &["config", "user.name", "S"]);
+	git(&work, &["config", "user.email", "s@e"]);
+	let mut ids = Vec::new();
+	for i in 0..n {
+		std::fs::write(work.join("a.txt"), format!("v{i}\n")).unwrap();
+		git(&work, &["add", "."]);
+		git(&work, &["commit", "-qm", &format!("c{i}")]);
+		ids.push(git(&work, &["rev-parse", "HEAD"]));
+	}
+	let bare = root.join("repo.git");
+	let out = git_try(
+		Path::new("."),
+		&[
+			"clone",
+			"--bare",
+			"-q",
+			work.to_str().unwrap(),
+			bare.to_str().unwrap(),
+		],
+	);
+	assert!(
+		out.status.success(),
+		"bare clone failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	ids
+}
+
+/// The sorted commit ids in a checkout's `.git/shallow` (empty when the file is absent).
+fn shallow_set(checkout: &Path) -> Vec<String> {
+	match std::fs::read_to_string(checkout.join(".git/shallow")) {
+		Ok(text) => {
+			let mut ids: Vec<String> = text
+				.lines()
+				.map(|line| line.trim().to_owned())
+				.filter(|line| !line.is_empty())
+				.collect();
+			ids.sort();
+			ids
+		}
+		Err(_) => Vec::new(),
+	}
+}
+
+/// `gta clone --depth N` against a real `git http-backend` truncates history exactly as stock git's own
+/// `--depth N` clone does: the same `.git/shallow` boundary, and the objects past it genuinely absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gta_shallow_clones_a_real_git_repo() {
+	if skip() {
+		return;
+	}
+	let root = tmp("client-shallow");
+	let ids = build_linear_bare(&root, 3); // c0 (root) <- c1 <- c2 (tip)
+	let url = serve_git_http_backend(root.clone()).await;
+	let repo_url = format!("{url}/repo.git");
+	let tip = ids[2].clone();
+	let parent = ids[1].clone();
+	let grandparent = ids[0].clone();
+
+	// --depth 1: only the tip commit; its parent is the boundary's cut point.
+	let gta1 = root.join("gta1");
+	let g1 = gta1.to_str().unwrap();
+	gta_ok(
+		&gta(&["clone", "--depth", "1", &repo_url, g1]).await,
+		"shallow clone",
+	);
+	// HEAD is the server tip, checked out.
+	assert_eq!(
+		gta_stdout(&gta(&["-C", g1, "rev-parse", "HEAD"]).await, "rev-parse"),
+		tip
+	);
+	// The boundary matches git's own --depth 1 clone (which is exactly the tip), and the parent is gone.
+	let ref1 = root.join("git1");
+	let out = git_try(
+		Path::new("."),
+		&[
+			"clone",
+			"--depth",
+			"1",
+			"-q",
+			&repo_url,
+			ref1.to_str().unwrap(),
+		],
+	);
+	assert!(
+		out.status.success(),
+		"git shallow clone failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	assert_eq!(
+		shallow_set(&gta1),
+		shallow_set(&ref1),
+		"gta and git disagree on the shallow boundary"
+	);
+	assert_eq!(shallow_set(&gta1), vec![tip.clone()]);
+	assert!(
+		!gta(&["-C", g1, "cat-file", "-t", &parent])
+			.await
+			.status
+			.success(),
+		"the parent past the shallow boundary must be absent"
+	);
+	// rev-list on the shallow clone stops at the boundary rather than chasing the absent parent.
+	assert_eq!(
+		gta_stdout(&gta(&["-C", g1, "rev-list", "HEAD"]).await, "rev-list"),
+		tip
+	);
+
+	// --depth 2: tip + parent present; the root (grandparent) past the boundary is absent; boundary = parent.
+	let gta2 = root.join("gta2");
+	let g2 = gta2.to_str().unwrap();
+	gta_ok(
+		&gta(&["clone", "--depth", "2", &repo_url, g2]).await,
+		"depth-2 clone",
+	);
+	let ref2 = root.join("git2");
+	let out = git_try(
+		Path::new("."),
+		&[
+			"clone",
+			"--depth",
+			"2",
+			"-q",
+			&repo_url,
+			ref2.to_str().unwrap(),
+		],
+	);
+	assert!(out.status.success(), "git depth-2 clone failed");
+	assert_eq!(shallow_set(&gta2), shallow_set(&ref2));
+	assert_eq!(shallow_set(&gta2), vec![parent.clone()]);
+	assert!(
+		gta(&["-C", g2, "cat-file", "-t", &parent])
+			.await
+			.status
+			.success(),
+		"the parent is present at depth 2"
+	);
+	assert!(
+		!gta(&["-C", g2, "cat-file", "-t", &grandparent])
+			.await
+			.status
+			.success(),
+		"the root past the depth-2 boundary is absent"
+	);
+}
+
+/// A shallow clone deepens only from branch tips, matching git: an annotated tag whose target is
+/// *within* the requested depth is kept (via `include-tag`), while a tag on history *outside* the depth
+/// is neither fetched nor recreated — so `--depth`/`--shallow-exclude` are not defeated by an old tag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gta_shallow_clone_keeps_reachable_tags_prunes_the_rest() {
+	if skip() {
+		return;
+	}
+	let root = tmp("client-shallow-tag");
+	let work = root.join("work");
+	std::fs::create_dir_all(&work).unwrap();
+	git(&work, &["init", "-q", "-b", "main", "."]);
+	git(&work, &["config", "user.name", "S"]);
+	git(&work, &["config", "user.email", "s@e"]);
+	std::fs::write(work.join("a.txt"), b"v0\n").unwrap();
+	git(&work, &["add", "."]);
+	git(&work, &["commit", "-qm", "c0"]);
+	git(&work, &["tag", "-a", "oldtag", "-m", "old"]); // annotated tag on the root, outside depth 1
+	let old = git(&work, &["rev-parse", "oldtag"]);
+	std::fs::write(work.join("a.txt"), b"v1\n").unwrap();
+	git(&work, &["add", "."]);
+	git(&work, &["commit", "-qm", "c1"]);
+	std::fs::write(work.join("a.txt"), b"v2\n").unwrap();
+	git(&work, &["add", "."]);
+	git(&work, &["commit", "-qm", "c2"]);
+	git(&work, &["tag", "-a", "newtag", "-m", "new"]); // annotated tag on the tip, within depth 1
+	let tip = git(&work, &["rev-parse", "HEAD"]);
+	let newtag = git(&work, &["rev-parse", "newtag"]);
+	let bare = root.join("repo.git");
+	let out = git_try(
+		Path::new("."),
+		&[
+			"clone",
+			"--bare",
+			"-q",
+			work.to_str().unwrap(),
+			bare.to_str().unwrap(),
+		],
+	);
+	assert!(out.status.success(), "bare clone failed");
+
+	let url = serve_git_http_backend(root.clone()).await;
+	let checkout = root.join("c");
+	let c = checkout.to_str().unwrap();
+	gta_ok(
+		&gta(&["clone", "--depth", "1", &format!("{url}/repo.git"), c]).await,
+		"shallow clone",
+	);
+	// The shallow boundary is the tip.
+	assert_eq!(shallow_set(&checkout), vec![tip]);
+	// The annotated tag pointing at the tip (within depth) is preserved at its tag-object id.
+	assert_eq!(
+		gta_stdout(
+			&gta(&["-C", c, "rev-parse", "newtag"]).await,
+			"rev-parse newtag"
+		),
+		newtag
+	);
+	// The tag on the pruned root is neither recreated nor fetched.
+	assert!(
+		!gta(&["-C", c, "rev-parse", "oldtag"])
+			.await
+			.status
+			.success(),
+		"a tag outside the shallow depth must not be recreated"
+	);
+	assert!(
+		!gta(&["-C", c, "cat-file", "-t", &old])
+			.await
+			.status
+			.success(),
+		"the tagged object outside the shallow depth must be absent"
 	);
 }
 

@@ -25,6 +25,7 @@ mod trust;
 pub use cherry_pick::{PickOutcome, abort_cherry_pick, cherry_pick, continue_cherry_pick};
 pub use commit::{commit, commit_signed};
 pub use commit_error::CommitError;
+pub use gitana_git_http::Deepen;
 pub use merge::{MergeOutcome, abort_merge, continue_merge, merge};
 pub use prune::{gc, prune};
 pub use rebase::{RebaseOutcome, abort_rebase, continue_rebase, rebase, skip_rebase};

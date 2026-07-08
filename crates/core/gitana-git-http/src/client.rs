@@ -9,6 +9,7 @@ use gitana_object::{HashAlgorithm, ObjectId, PktLine, parse_pkt, write_flush, wr
 
 use crate::GitHttpError;
 use crate::advertise::AGENT;
+use crate::deepen::Deepen;
 
 /// The refs (and HEAD target) parsed from a `GET /info/refs` advertisement.
 #[derive(Debug, Clone)]
@@ -20,6 +21,9 @@ pub struct Advertised<H: HashAlgorithm> {
 	/// The push-certificate nonce, from the `push-cert=<nonce>` capability (receive-pack
 	/// advertisements only). Present when the server accepts signed pushes.
 	pub push_cert_nonce: Option<String>,
+	/// The capability tokens on the advertisement's first ref line (e.g. `thin-pack`, `shallow`,
+	/// `deepen-since`), so a client can check for a feature — like shallow support — before requesting it.
+	pub capabilities: Vec<String>,
 }
 
 // Manual `Default` (not derived) so it does not impose `H: Default`.
@@ -29,6 +33,7 @@ impl<H: HashAlgorithm> Default for Advertised<H> {
 			refs: Vec::new(),
 			head_target: None,
 			push_cert_nonce: None,
+			capabilities: Vec::new(),
 		}
 	}
 }
@@ -41,6 +46,11 @@ impl<H: HashAlgorithm> Advertised<H> {
 			.iter()
 			.find(|(n, _)| n == name)
 			.map(|(_, oid)| *oid)
+	}
+
+	/// Whether the server advertised the bare capability token `cap` (e.g. `"shallow"`).
+	pub fn supports(&self, cap: &str) -> bool {
+		self.capabilities.iter().any(|token| token == cap)
 	}
 
 	/// Branch refs (`refs/heads/*`) and their tips.
@@ -103,6 +113,7 @@ pub fn parse_advertisement<H: HashAlgorithm>(body: &[u8]) -> Result<Advertised<H
 		if let Some(caps) = caps {
 			result.head_target = symref_target(caps);
 			result.push_cert_nonce = capability_value(caps, "push-cert=");
+			result.capabilities = parse_capabilities(caps);
 		}
 		let text = std::str::from_utf8(ref_part)
 			.map_err(|_| GitHttpError::MalformedRequest("non-utf8 ref line".to_owned()))?
@@ -130,6 +141,18 @@ fn symref_target(caps: &[u8]) -> Option<String> {
 	capability_value(caps, "symref=HEAD:")
 }
 
+/// All bare capability tokens in a capability list (split on spaces/newlines, empties dropped).
+fn parse_capabilities(caps: &[u8]) -> Vec<String> {
+	match std::str::from_utf8(caps) {
+		Ok(text) => text
+			.split([' ', '\n'])
+			.filter(|token| !token.is_empty())
+			.map(str::to_owned)
+			.collect(),
+		Err(_) => Vec::new(),
+	}
+}
+
 /// The value of a `<prefix><value>` capability token in a capability list.
 fn capability_value(caps: &[u8], prefix: &str) -> Option<String> {
 	let text = std::str::from_utf8(caps).ok()?;
@@ -139,17 +162,27 @@ fn capability_value(caps: &[u8], prefix: &str) -> Option<String> {
 		.map(str::to_owned)
 }
 
-/// Build a v0 upload-pack request: `want`s (the first carrying capabilities), a
-/// flush, the `have`s, then `done`.
+/// Build a v0 upload-pack request: `want`s (the first carrying capabilities), the client's current
+/// `shallow` boundary and any `deepen*` directive, a flush, the `have`s, then `done`. `shallow` and an
+/// empty [`Deepen`] emit nothing; `include_tag` false leaves the caps alone — so a normal (non-shallow)
+/// fetch is byte-for-byte unchanged.
+///
+/// `include_tag` requests git's `include-tag`: the server appends annotated tag objects reachable from
+/// the wants. A shallow clone deepens only branch tips, so it sets this to still receive tags pointing
+/// into the fetched history (a normal fetch wants every ref explicitly and does not need it).
 pub fn build_upload_pack_request<H: HashAlgorithm>(
 	wants: &[ObjectId<H>],
 	haves: &[ObjectId<H>],
+	shallow: &[ObjectId<H>],
+	deepen: &Deepen,
+	include_tag: bool,
 ) -> Vec<u8> {
 	let mut out = Vec::new();
 	for (index, want) in wants.iter().enumerate() {
 		let line = if index == 0 {
+			let tag_cap = if include_tag { "include-tag " } else { "" };
 			format!(
-				"want {} side-band-64k thin-pack ofs-delta object-format={} agent={AGENT}\n",
+				"want {} {tag_cap}side-band-64k thin-pack ofs-delta object-format={} agent={AGENT}\n",
 				want.to_hex(),
 				H::NAME
 			)
@@ -157,6 +190,20 @@ pub fn build_upload_pack_request<H: HashAlgorithm>(
 			format!("want {}\n", want.to_hex())
 		};
 		let _ = write_pkt(&mut out, line.as_bytes());
+	}
+	// The client's existing shallow boundary, then the deepen directive — both after the wants and
+	// before the flush, per git's upload-request grammar (want-list, *shallow-line, depth-request).
+	for oid in shallow {
+		let _ = write_pkt(&mut out, format!("shallow {}\n", oid.to_hex()).as_bytes());
+	}
+	if let Some(depth) = deepen.depth {
+		let _ = write_pkt(&mut out, format!("deepen {depth}\n").as_bytes());
+	}
+	if let Some(since) = deepen.since {
+		let _ = write_pkt(&mut out, format!("deepen-since {since}\n").as_bytes());
+	}
+	for reference in &deepen.not {
+		let _ = write_pkt(&mut out, format!("deepen-not {reference}\n").as_bytes());
 	}
 	write_flush(&mut out);
 	for have in haves {
@@ -166,10 +213,26 @@ pub fn build_upload_pack_request<H: HashAlgorithm>(
 	out
 }
 
-/// Extract the packfile from a v0 upload-pack response: skip the `NAK`/`ACK` lines and
-/// reassemble side-band channel 1 (channel 3 is a fatal server error).
-pub fn parse_upload_pack_response(body: &[u8]) -> Result<Vec<u8>, GitHttpError> {
+/// A parsed v0 upload-pack response: the packfile plus the server's shallow-boundary update.
+#[derive(Debug, Clone)]
+pub struct UploadPackResponse<H: HashAlgorithm> {
+	/// The reassembled packfile bytes.
+	pub pack: Vec<u8>,
+	/// Commits the server declared shallow (their parents are not in the pack) — `shallow <oid>`.
+	pub shallow: Vec<ObjectId<H>>,
+	/// Commits the server un-shallowed because it now sent their parents — `unshallow <oid>`.
+	pub unshallow: Vec<ObjectId<H>>,
+}
+
+/// Parse a v0 upload-pack response: the leading `shallow`/`unshallow` boundary lines, then the
+/// packfile carried on side-band channel 1 (skipping `NAK`/`ACK` control lines; channel 2 is progress
+/// and channel 3 a fatal server error).
+pub fn parse_upload_pack_response<H: HashAlgorithm>(
+	body: &[u8],
+) -> Result<UploadPackResponse<H>, GitHttpError> {
 	let mut pack = Vec::new();
+	let mut shallow = Vec::new();
+	let mut unshallow = Vec::new();
 	let mut cursor = 0;
 	while cursor < body.len() {
 		let (line, consumed) = parse_pkt(&body[cursor..])?;
@@ -177,6 +240,16 @@ pub fn parse_upload_pack_response(body: &[u8]) -> Result<Vec<u8>, GitHttpError> 
 		let PktLine::Data(data) = line else {
 			continue;
 		};
+		// Shallow-boundary lines precede the pack and are plain text (`shallow`/`unshallow` starts with
+		// an ASCII letter, never a side-band channel byte 1/2/3), so this cannot collide with pack data.
+		if let Some(rest) = data.strip_prefix(b"shallow ") {
+			shallow.push(parse_oid_line(rest)?);
+			continue;
+		}
+		if let Some(rest) = data.strip_prefix(b"unshallow ") {
+			unshallow.push(parse_oid_line(rest)?);
+			continue;
+		}
 		match data.first() {
 			Some(1) => pack.extend_from_slice(&data[1..]),
 			Some(2) => {} // progress
@@ -190,7 +263,19 @@ pub fn parse_upload_pack_response(body: &[u8]) -> Result<Vec<u8>, GitHttpError> 
 			_ => {}
 		}
 	}
-	Ok(pack)
+	Ok(UploadPackResponse {
+		pack,
+		shallow,
+		unshallow,
+	})
+}
+
+/// Parse the oid on a `shallow`/`unshallow` line (its trailing newline trimmed).
+fn parse_oid_line<H: HashAlgorithm>(rest: &[u8]) -> Result<ObjectId<H>, GitHttpError> {
+	let text = std::str::from_utf8(rest)
+		.map_err(|_| GitHttpError::MalformedRequest("non-utf8 shallow line".to_owned()))?
+		.trim();
+	Ok(ObjectId::from_hex(text)?)
 }
 
 /// A ref-update to push: the expected remote value, the new value, and the ref name.
@@ -301,7 +386,7 @@ mod tests {
 			&[],
 		);
 		assert!(String::from_utf8_lossy(&push).contains("object-format=sha256"));
-		let fetch = build_upload_pack_request(&[sha256], &[]);
+		let fetch = build_upload_pack_request(&[sha256], &[], &[], &Deepen::default(), false);
 		assert!(String::from_utf8_lossy(&fetch).contains("object-format=sha256"));
 
 		let sha1 = ObjectId::<Sha1>::compute(ObjectKind::Commit, b"c");
@@ -314,8 +399,74 @@ mod tests {
 			&[],
 		);
 		assert!(String::from_utf8_lossy(&push1).contains("object-format=sha1"));
-		let fetch1 = build_upload_pack_request(&[sha1], &[]);
+		let fetch1 = build_upload_pack_request(&[sha1], &[], &[], &Deepen::default(), false);
 		assert!(String::from_utf8_lossy(&fetch1).contains("object-format=sha1"));
+	}
+
+	#[test]
+	fn upload_pack_request_emits_shallow_and_deepen_lines() {
+		// A shallow fetch carries the client's current boundary as `shallow` lines and its deepen
+		// directive, all after the wants and before the flush (git's upload-request grammar).
+		let tip = ObjectId::<Sha1>::compute(ObjectKind::Commit, b"tip");
+		let boundary = ObjectId::<Sha1>::compute(ObjectKind::Commit, b"boundary");
+		let deepen = Deepen {
+			depth: Some(2),
+			since: Some(1_577_836_800),
+			not: vec!["refs/tags/v1".to_owned()],
+		};
+		let request = build_upload_pack_request(&[tip], &[], &[boundary], &deepen, true);
+		let text = String::from_utf8_lossy(&request);
+		assert!(text.contains(&format!("shallow {}", boundary.to_hex())));
+		assert!(text.contains("deepen 2\n"));
+		assert!(text.contains("deepen-since 1577836800\n"));
+		assert!(text.contains("deepen-not refs/tags/v1\n"));
+		// A shallow request asks for reachable annotated tags via `include-tag`.
+		assert!(text.contains("include-tag"));
+		// The shallow line precedes the deepen line, and both precede the `have`-less `done`.
+		let shallow_at = text.find("shallow ").unwrap();
+		let deepen_at = text.find("deepen 2").unwrap();
+		let done_at = text.find("done").unwrap();
+		assert!(shallow_at < deepen_at && deepen_at < done_at);
+	}
+
+	#[test]
+	fn empty_deepen_leaves_the_request_unchanged() {
+		// A normal (non-shallow) fetch emits no shallow/deepen lines at all.
+		let tip = ObjectId::<Sha1>::compute(ObjectKind::Commit, b"tip");
+		let request = build_upload_pack_request(&[tip], &[], &[], &Deepen::default(), false);
+		let text = String::from_utf8_lossy(&request);
+		assert!(!text.contains("shallow") && !text.contains("deepen"));
+		assert!(!text.contains("include-tag"));
+	}
+
+	#[test]
+	fn upload_pack_response_extracts_shallow_boundary_and_pack() {
+		// The response's leading `shallow`/`unshallow` lines are parsed out; the side-band channel-1
+		// bytes reassemble into the pack; NAK and progress lines are ignored.
+		let shallow = ObjectId::<Sha1>::compute(ObjectKind::Commit, b"s");
+		let unshallow = ObjectId::<Sha1>::compute(ObjectKind::Commit, b"u");
+		let mut body = Vec::new();
+		write_pkt(
+			&mut body,
+			format!("shallow {}\n", shallow.to_hex()).as_bytes(),
+		)
+		.unwrap();
+		write_pkt(
+			&mut body,
+			format!("unshallow {}\n", unshallow.to_hex()).as_bytes(),
+		)
+		.unwrap();
+		write_flush(&mut body); // ends the shallow-update section
+		write_pkt(&mut body, b"NAK\n").unwrap();
+		let mut sideband = vec![1u8];
+		sideband.extend_from_slice(b"PACKDATA");
+		write_pkt(&mut body, &sideband).unwrap();
+		write_flush(&mut body);
+
+		let response = parse_upload_pack_response::<Sha1>(&body).unwrap();
+		assert_eq!(response.shallow, vec![shallow]);
+		assert_eq!(response.unshallow, vec![unshallow]);
+		assert_eq!(response.pack, b"PACKDATA");
 	}
 
 	#[test]
@@ -336,6 +487,28 @@ mod tests {
 		assert_eq!(adv.head_target.as_deref(), Some("refs/heads/main"));
 		assert_eq!(adv.branches().count(), 1);
 		assert!(adv.oid_of("refs/heads/main").is_some());
+	}
+
+	#[test]
+	fn parses_advertised_capabilities() {
+		// A client checks these before requesting a feature (e.g. `shallow` before a shallow clone).
+		let oid = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"c").to_hex();
+		let mut body = Vec::new();
+		write_pkt(&mut body, b"# service=git-upload-pack\n").unwrap();
+		write_flush(&mut body);
+		write_pkt(
+			&mut body,
+			format!("{oid} HEAD\0shallow deepen-since deepen-not thin-pack object-format=sha256\n")
+				.as_bytes(),
+		)
+		.unwrap();
+		write_flush(&mut body);
+
+		let adv = parse_advertisement::<Sha256>(&body).expect("parse");
+		assert!(adv.supports("shallow"));
+		assert!(adv.supports("deepen-since"));
+		assert!(adv.supports("deepen-not"));
+		assert!(!adv.supports("multi_ack"));
 	}
 
 	#[test]

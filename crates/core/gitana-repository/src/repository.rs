@@ -412,6 +412,18 @@ where
 		crate::rebase_state::clear_rebase(self).await
 	}
 
+	/// The commit ids at this repository's shallow boundary (`.git/shallow`) — commits whose parents
+	/// are deliberately absent. Empty for a complete (non-shallow) repository.
+	pub async fn read_shallow(&self) -> Result<Vec<ObjectId<H>>, RepositoryError> {
+		crate::shallow::read_shallow(self).await
+	}
+
+	/// Replace the shallow boundary (`.git/shallow`) with `oids`; an empty `oids` deletes the file,
+	/// making the repository complete again.
+	pub async fn write_shallow(&self, oids: &[ObjectId<H>]) -> Result<(), RepositoryError> {
+		crate::shallow::write_shallow(self, oids).await
+	}
+
 	/// Resolve a revision spec (`HEAD`, `main`, `<oid>`, `HEAD~2`, `v1^{commit}`, …)
 	/// to an object id.
 	pub async fn rev_parse(&self, spec: &str) -> Result<ObjectId<H>, RepositoryError> {

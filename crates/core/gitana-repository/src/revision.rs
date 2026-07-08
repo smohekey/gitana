@@ -117,11 +117,14 @@ pub(crate) async fn peel_to_tree<H: HashAlgorithm>(
 	}
 }
 
-/// Walk commits reachable from `tips` in committer-date order (newest first).
+/// Walk commits reachable from `tips` in committer-date order (newest first). A commit at the
+/// repository's shallow boundary (`.git/shallow`) is treated as parentless, so the walk stops there
+/// instead of following an edge to a deliberately-absent parent object.
 pub(crate) async fn rev_list<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	tips: &[ObjectId<H>],
 ) -> Result<Vec<ObjectId<H>>, RepositoryError> {
+	let shallow = shallow_set(repo).await?;
 	let mut heap: BinaryHeap<(i64, ObjectId<H>)> = BinaryHeap::new();
 	let mut seen: HashSet<ObjectId<H>> = HashSet::new();
 
@@ -135,13 +138,34 @@ pub(crate) async fn rev_list<H: HashAlgorithm>(
 	let mut out = Vec::new();
 	while let Some((_, id)) = heap.pop() {
 		out.push(id);
-		for parent in read_commit(repo, id).await?.parents {
+		for parent in commit_parents(repo, id, &shallow).await? {
 			if seen.insert(parent) {
 				heap.push((committer_seconds(repo, parent).await?, parent));
 			}
 		}
 	}
 	Ok(out)
+}
+
+/// The commit's parents, honoring the shallow boundary: a commit in `shallow` is treated as having no
+/// parents (its parent objects are deliberately absent), so history walks stop at it rather than
+/// failing to read a missing parent. Shared by `rev-list` and the merge-base ancestry walks.
+pub(crate) async fn commit_parents<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	id: ObjectId<H>,
+	shallow: &HashSet<ObjectId<H>>,
+) -> Result<Vec<ObjectId<H>>, RepositoryError> {
+	if shallow.contains(&id) {
+		return Ok(Vec::new());
+	}
+	Ok(read_commit(repo, id).await?.parents)
+}
+
+/// The repository's shallow boundary as a set, for the ancestry walks (empty for a complete repo).
+pub(crate) async fn shallow_set<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+) -> Result<HashSet<ObjectId<H>>, RepositoryError> {
+	Ok(repo.read_shallow().await?.into_iter().collect())
 }
 
 fn parse_spec(spec: &str) -> Result<(&str, Vec<Op>), RepositoryError> {
@@ -270,9 +294,11 @@ async fn nth_parent<H: HashAlgorithm>(
 	if n == 0 {
 		return Ok(commit_id);
 	}
-	read_commit(repo, commit_id)
+	// A shallow-boundary commit is parentless, so `^n` past it fails (as in git) rather than returning
+	// a deliberately-absent parent id.
+	let shallow = shallow_set(repo).await?;
+	commit_parents(repo, commit_id, &shallow)
 		.await?
-		.parents
 		.get((n - 1) as usize)
 		.copied()
 		.ok_or_else(|| RepositoryError::InvalidRef(format!("{commit_id} has no parent {n}")))
@@ -283,11 +309,12 @@ async fn first_parent_n<H: HashAlgorithm>(
 	id: ObjectId<H>,
 	n: u32,
 ) -> Result<ObjectId<H>, RepositoryError> {
+	let shallow = shallow_set(repo).await?;
 	let mut current = peel_to_commit(repo, id).await?;
 	for _ in 0..n {
-		current = *read_commit(repo, current)
+		// A `~n` that would cross a shallow boundary fails, matching git — the parent is absent.
+		current = *commit_parents(repo, current, &shallow)
 			.await?
-			.parents
 			.first()
 			.ok_or_else(|| RepositoryError::InvalidRef(format!("{current} has no parent")))?;
 	}

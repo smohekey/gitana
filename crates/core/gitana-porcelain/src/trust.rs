@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use gitana_file_store::FileStore;
-use gitana_git_http::parse_advertisement;
+use gitana_git_http::{Deepen, parse_advertisement};
 use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit};
 use gitana_remote::{HttpTransport, Origin};
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
@@ -156,7 +156,15 @@ pub async fn trust_sync<F: FileStore, H: HashAlgorithm>(
 	// Download only the remote trust chain's objects (the tip and its ancestors we lack) so the
 	// candidate can be folded and verified locally.
 	let haves = gitana_remote::local_haves(repo).await?;
-	gitana_remote::fetch_pack(transport, origin, repo, &[remote_tip], &haves).await?;
+	gitana_remote::fetch_pack(
+		transport,
+		origin,
+		repo,
+		&[remote_tip],
+		&haves,
+		&Deepen::default(),
+	)
+	.await?;
 
 	// If the local chain already contains the remote tip, we are ahead of the remote: keep the richer
 	// local root rather than "rewinding" to it. (`verify_candidate_trust_update` only proves the

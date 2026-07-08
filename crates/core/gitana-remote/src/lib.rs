@@ -28,7 +28,7 @@ use anyhow::{Context, Result, bail};
 use gitana_config::GitConfig;
 use gitana_file_store::FileStore;
 use gitana_git_http::{
-	Advertised, build_upload_pack_request, parse_upload_pack_response, peek_object_format,
+	Advertised, Deepen, build_upload_pack_request, parse_upload_pack_response, peek_object_format,
 };
 use gitana_object::{
 	HashAlgorithm, HashKind, ObjectError, ObjectId, decode_pack_with_bases, pack_index_entries,
@@ -161,27 +161,70 @@ pub fn ensure_same_format(local: HashKind, remote: HashKind) -> Result<()> {
 }
 
 /// Download the objects reachable from `wants` but not `haves` into `repo`.
+///
+/// `deepen` requests a shallow history (git's `--depth` / `--shallow-since` / `--shallow-exclude`).
+/// The repository's current shallow boundary (`.git/shallow`) is sent so the server knows which
+/// history it already truncated, and the boundary the server reports back is persisted — so a plain
+/// (non-shallow, empty `deepen`) fetch behaves exactly as before.
 pub async fn fetch_pack<H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	origin: &Origin,
 	repo: &Repository<impl FileStore, H>,
 	wants: &[ObjectId<H>],
 	haves: &[ObjectId<H>],
+	deepen: &Deepen,
 ) -> Result<()> {
 	if wants.is_empty() {
 		return Ok(());
 	}
-	let request = build_upload_pack_request(wants, haves);
+	let shallow = repo.read_shallow().await?;
+	// A shallow request deepens only branch tips (the porcelain restricts `wants`), so ask the server
+	// to include annotated tags reachable from the fetched history — git's `include-tag`.
+	let include_tag = !deepen.is_empty();
+	let request = build_upload_pack_request(wants, haves, &shallow, deepen, include_tag);
 	let response = transport
 		.post(&origin.upload_pack(), UPLOAD_PACK_REQUEST, request)
 		.await?;
-	let pack = parse_upload_pack_response(&response)?;
-	// Skip an empty pack (server had nothing new). The 12-byte header carries the count.
-	if pack.len() >= 12 && pack_object_count(&pack) > 0 {
-		store_fetched_pack(repo, pack)
+	let response = parse_upload_pack_response::<H>(&response)?;
+	// No packfile at all means the server sent nothing — e.g. `git http-backend` exiting after the HTTP
+	// headers when a `--shallow-exclude` ref cannot be resolved (a 200 with an empty body). A legitimate
+	// up-to-date fetch still carries a valid 0-object packfile (12-byte header + trailer), so an empty
+	// body is a failure, not "nothing new" — surface it rather than report a successful empty clone.
+	if response.pack.is_empty() {
+		bail!("the remote returned no packfile; the upload-pack request may have failed on the server");
+	}
+	// Skip a valid but empty pack (server had nothing new). The 12-byte header carries the count.
+	if response.pack.len() >= 12 && pack_object_count(&response.pack) > 0 {
+		store_fetched_pack(repo, response.pack)
 			.await
 			.context("storing fetched pack")?;
 	}
+	persist_shallow(repo, &shallow, &response.shallow, &response.unshallow).await?;
+	Ok(())
+}
+
+/// Fold the server's shallow-boundary update into `.git/shallow`: the new boundary is the previous
+/// boundary plus the commits the server declared `shallow`, minus those it `unshallow`ed (whose
+/// parents it just sent). Only rewrites the file when the set actually changes, so a non-shallow fetch
+/// never touches it.
+async fn persist_shallow<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	previous: &[ObjectId<H>],
+	added: &[ObjectId<H>],
+	removed: &[ObjectId<H>],
+) -> Result<()> {
+	if added.is_empty() && removed.is_empty() {
+		return Ok(());
+	}
+	let removed: std::collections::HashSet<ObjectId<H>> = removed.iter().copied().collect();
+	let mut boundary: Vec<ObjectId<H>> = Vec::new();
+	let mut seen = std::collections::HashSet::new();
+	for oid in previous.iter().chain(added).copied() {
+		if !removed.contains(&oid) && seen.insert(oid) {
+			boundary.push(oid);
+		}
+	}
+	repo.write_shallow(&boundary).await?;
 	Ok(())
 }
 

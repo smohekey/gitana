@@ -20,6 +20,7 @@ mod rebase_state;
 mod refs;
 mod repository;
 mod revision;
+mod shallow;
 mod tree;
 
 pub use self::{

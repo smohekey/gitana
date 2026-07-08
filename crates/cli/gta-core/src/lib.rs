@@ -8,6 +8,7 @@ mod dispatch;
 mod error;
 mod identity;
 mod repo;
+mod shallow;
 mod signer;
 
 pub use error::{MergeConflict, SilentExit};

@@ -7,6 +7,7 @@
 use gitana_file_store_local::{DescriptorWorkDir, WorktreeFileStore};
 use gitana_object::HashAlgorithm;
 use gitana_object_store::ObjectStore;
+use gitana_porcelain::Deepen;
 use gitana_remote::Origin;
 use gitana_repository::Repository;
 
@@ -148,9 +149,17 @@ pub(crate) async fn clone<H: HashAlgorithm>(
 ) -> Result<(), RepoError> {
 	let transport = WasiHttpTransport;
 	let repo: Repository<WorktreeFileStore, H> = Repository::new(ObjectStore::new(store));
-	gitana_porcelain::clone(&transport, repo, origin, advertisement, work)
-		.await
-		.map_err(remote_error)
+	// The component does not expose shallow clone yet, so it always requests full history.
+	gitana_porcelain::clone(
+		&transport,
+		repo,
+		origin,
+		advertisement,
+		work,
+		&Deepen::default(),
+	)
+	.await
+	.map_err(remote_error)
 }
 
 /// The remote composites surface `anyhow::Error` (network, protocol, and storage failures all

@@ -7,6 +7,7 @@
 
 mod advertise;
 mod client;
+mod deepen;
 mod enforce;
 mod fetch;
 mod ls_refs;
@@ -22,9 +23,10 @@ mod upload_pack_v0;
 
 pub use advertise::{AGENT, advertise};
 pub use client::{
-	Advertised, RefUpdate, build_receive_pack_request, build_upload_pack_request,
+	Advertised, RefUpdate, UploadPackResponse, build_receive_pack_request, build_upload_pack_request,
 	parse_advertisement, parse_report_status, parse_upload_pack_response, peek_object_format,
 };
+pub use deepen::Deepen;
 pub use enforce::{TrustContext, TrustVerdict, verify_push, verify_push_with_ledger};
 pub use fetch::fetch;
 pub use gitana_trust::AuditEvent;

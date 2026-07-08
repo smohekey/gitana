@@ -11,7 +11,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use gitana_file_store::FileStore;
 use gitana_object::{HashAlgorithm, ObjectId};
 
-use crate::revision::{committer_seconds, peel_to_commit, read_commit};
+use crate::revision::{commit_parents, committer_seconds, peel_to_commit, shallow_set};
 use crate::{Repository, RepositoryError};
 
 // Per-commit paint flags during a two-tip walk.
@@ -57,13 +57,14 @@ pub(crate) async fn is_ancestor<H: HashAlgorithm>(
 	let ancestor = peel_to_commit(repo, ancestor).await?;
 	let descendant = peel_to_commit(repo, descendant).await?;
 
+	let shallow = shallow_set(repo).await?;
 	let mut seen = HashSet::from([descendant]);
 	let mut stack = vec![descendant];
 	while let Some(id) = stack.pop() {
 		if id == ancestor {
 			return Ok(true);
 		}
-		for parent in read_commit(repo, id).await?.parents {
+		for parent in commit_parents(repo, id, &shallow).await? {
 			if seen.insert(parent) {
 				stack.push(parent);
 			}
@@ -81,6 +82,7 @@ async fn paint_down<H: HashAlgorithm>(
 	one: ObjectId<H>,
 	others: &[ObjectId<H>],
 ) -> Result<Vec<ObjectId<H>>, RepositoryError> {
+	let shallow = shallow_set(repo).await?;
 	let mut flags: HashMap<ObjectId<H>, u8> = HashMap::new();
 	let mut heap: BinaryHeap<(i64, ObjectId<H>)> = BinaryHeap::new();
 
@@ -107,7 +109,7 @@ async fn paint_down<H: HashAlgorithm>(
 			}
 			to_parents |= STALE;
 		}
-		for parent in read_commit(repo, id).await?.parents {
+		for parent in commit_parents(repo, id, &shallow).await? {
 			let entry = flags.entry(parent).or_insert(0);
 			if *entry & to_parents == to_parents {
 				continue; // parent already carries these flags
@@ -259,5 +261,30 @@ mod tests {
 			sorted(merge_base(&repo, &[m1, m2]).await.unwrap()),
 			sorted(vec![a, b])
 		);
+	}
+
+	#[tokio::test]
+	async fn walks_stop_at_the_shallow_boundary() {
+		let (repo, tree) = new_repo().await;
+		let a = commit(&repo, tree, &[], 1).await; // past the boundary (a real shallow clone lacks it)
+		let b = commit(&repo, tree, &[a], 2).await; // the boundary commit
+		let c = commit(&repo, tree, &[b], 3).await; // the tip
+
+		// Mark `b` as shallow: its parent `a` is treated as absent, so history walks stop at `b`.
+		repo.write_shallow(&[b]).await.unwrap();
+
+		// rev-list from the tip halts at the boundary and never reaches `a`.
+		assert_eq!(repo.rev_list(&[c]).await.unwrap(), vec![c, b]);
+
+		// Ancestry is limited to the known history: `b` is still an ancestor of `c`, but `a` (past the
+		// boundary) is not discoverable — matching git's grafted view of a shallow repository.
+		assert!(is_ancestor(&repo, b, c).await.unwrap());
+		assert!(!is_ancestor(&repo, a, c).await.unwrap());
+
+		// rev-parse parent operators also honor the boundary: `c^` resolves (parent `b` is present), but
+		// crossing the boundary (`b^`, `c~2`) fails rather than returning the absent `a`.
+		assert_eq!(repo.rev_parse(&format!("{c}^")).await.unwrap(), b);
+		assert!(repo.rev_parse(&format!("{b}^")).await.is_err());
+		assert!(repo.rev_parse(&format!("{c}~2")).await.is_err());
 	}
 }

@@ -421,6 +421,16 @@ enum Command {
 		/// Directory to clone into (default: the repository slug).
 		#[arg(long)]
 		path: Option<PathBuf>,
+		/// Create a shallow clone, truncated to this many commits from each branch tip.
+		#[arg(long)]
+		depth: Option<u32>,
+		/// Shallow clone: keep only commits at or after this date (a Unix timestamp or an ISO-8601 UTC
+		/// date such as `2020-01-31` or `2020-01-31T14:00:00Z`).
+		#[arg(long, value_name = "date")]
+		shallow_since: Option<String>,
+		/// Shallow clone: do not deepen history past this ref or commit (may be given more than once).
+		#[arg(long, value_name = "ref")]
+		shallow_exclude: Vec<String>,
 	},
 	/// Download new objects from the origin and update remote-tracking refs.
 	Fetch {
@@ -739,7 +749,13 @@ impl Cli {
 				paths,
 			} => commands::mv::run(&cwd, force, dry_run, verbose, paths).await,
 			Command::Diff { cached } => commands::diff::run(&cwd, cached).await,
-			Command::Clone { url, path } => commands::clone::run(url, path).await,
+			Command::Clone {
+				url,
+				path,
+				depth,
+				shallow_since,
+				shallow_exclude,
+			} => commands::clone::run(url, path, depth, shallow_since, shallow_exclude).await,
 			Command::Fetch { tags, no_tags } => {
 				commands::fetch::run(&cwd, tags, no_tags).await.map(|_| ())
 			}

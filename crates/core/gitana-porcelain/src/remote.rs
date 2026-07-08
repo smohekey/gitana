@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_git_http::{
-	Advertised, CertCommand, PushCert, RefUpdate, build_pack_thin, build_push_cert,
+	Advertised, CertCommand, Deepen, PushCert, RefUpdate, build_pack_thin, build_push_cert,
 	build_receive_pack_request, parse_advertisement, parse_report_status,
 };
 use gitana_object::{HashAlgorithm, ObjectId};
@@ -62,7 +62,15 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 ) -> Result<FetchOutcome<H>> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
 	let haves = gitana_remote::local_haves(repo).await?;
-	download(transport, repo, origin, &advertised, &haves).await?;
+	download(
+		transport,
+		repo,
+		origin,
+		&advertised,
+		&haves,
+		&Deepen::default(),
+	)
+	.await?;
 
 	let config = repo.read_config().await?;
 	// Resolve the effective tag mode: an explicit CLI `--tags` / `--no-tags` (`All` / `None`) wins;
@@ -320,15 +328,23 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	origin: &Origin,
 	advertisement: &[u8],
 	work: W,
+	deepen: &Deepen,
 ) -> Result<()> {
 	repo.init().await?;
 
 	let advertised = parse_advertisement::<H>(advertisement)?;
-	download(transport, &repo, origin, &advertised, &[]).await?;
+	download(transport, &repo, origin, &advertised, &[], deepen).await?;
 
-	// Recreate the refs and HEAD locally.
+	// Recreate the refs and HEAD locally. A shallow clone fetches only branch history (see
+	// `download`), so an advertised ref whose target is outside that closure — e.g. a tag on the
+	// truncated history — is skipped rather than recreated as a dangling ref pointing at a missing
+	// object. A full clone holds the whole closure, so nothing is skipped there.
+	let shallow = !deepen.is_empty();
 	for (name, oid) in &advertised.refs {
 		if name.starts_with("refs/") {
+			if shallow && !repo.objects().exists_object(oid).await? {
+				continue;
+			}
 			repo.refs().update_ref(name, *oid, None).await?;
 		}
 	}
@@ -351,17 +367,64 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 }
 
 /// Download the objects reachable from the advertised tips that `haves` do not already cover, writing
-/// them into `repo`.
+/// them into `repo`. A normal fetch wants every advertised ref; a shallow one (non-empty `deepen`)
+/// deepens only from the branch tips (see [`shallow_wants`]).
 async fn download<F: FileStore, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
 	origin: &Origin,
 	advertised: &Advertised<H>,
 	haves: &[ObjectId<H>],
+	deepen: &Deepen,
 ) -> Result<()> {
-	let wants = gitana_remote::advertised_oids(advertised);
-	gitana_remote::fetch_pack(transport, origin, repo, &wants, haves).await?;
+	ensure_deepen_supported(advertised, deepen)?;
+	let wants = if deepen.is_empty() {
+		gitana_remote::advertised_oids(advertised)
+	} else {
+		shallow_wants(advertised)
+	};
+	gitana_remote::fetch_pack(transport, origin, repo, &wants, haves, deepen).await?;
 	Ok(())
+}
+
+/// Fail a shallow request the server cannot honor: if the advertisement lacks the matching capability
+/// (`shallow` for `--depth`, `deepen-since` / `deepen-not` for the date/exclude forms), the server
+/// would silently ignore the `deepen*` lines and return a full pack — so reject it up front, as git
+/// does ("Server does not support shallow requests"), rather than pretend the clone is shallow.
+fn ensure_deepen_supported<H: HashAlgorithm>(
+	advertised: &Advertised<H>,
+	deepen: &Deepen,
+) -> Result<()> {
+	if deepen.is_empty() {
+		return Ok(());
+	}
+	if deepen.depth.is_some() && !advertised.supports("shallow") {
+		bail!("the remote does not support shallow clones (no `shallow` capability advertised)");
+	}
+	if deepen.since.is_some() && !advertised.supports("deepen-since") {
+		bail!("the remote does not support --shallow-since (no `deepen-since` capability advertised)");
+	}
+	if !deepen.not.is_empty() && !advertised.supports("deepen-not") {
+		bail!("the remote does not support --shallow-exclude (no `deepen-not` capability advertised)");
+	}
+	Ok(())
+}
+
+/// The deepen roots for a shallow clone/fetch: the branch tips (`refs/heads/*`) and `HEAD`. Advertised
+/// tags and other refs are deliberately excluded — deepening from an old tag would pull history the
+/// `--depth` / `--shallow-exclude` request is meant to prune. Tags pointing *into* the fetched history
+/// are still preserved: the request sets git's `include-tag`, so the server appends the reachable
+/// annotated tag objects, and [`clone`] recreates each ref whose target then lands in the closure.
+fn shallow_wants<H: HashAlgorithm>(advertised: &Advertised<H>) -> Vec<ObjectId<H>> {
+	let mut oids: Vec<ObjectId<H>> = advertised
+		.refs
+		.iter()
+		.filter(|(name, _)| name == "HEAD" || name.starts_with("refs/heads/"))
+		.map(|(_, oid)| *oid)
+		.collect();
+	oids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+	oids.dedup();
+	oids
 }
 
 /// The result of a [`push`]. `results` is empty when everything was already up to date; `signed` is a
@@ -873,6 +936,41 @@ mod tests {
 
 	use super::*;
 	use crate::test_support::{TestIdentity, TestSigner, fixture, stage};
+
+	#[test]
+	fn deepen_requires_matching_server_capability() {
+		use gitana_object::Sha256;
+
+		let full: Advertised<Sha256> = Advertised {
+			capabilities: vec![
+				"shallow".to_owned(),
+				"deepen-since".to_owned(),
+				"deepen-not".to_owned(),
+			],
+			..Default::default()
+		};
+		let none = Advertised::<Sha256>::default();
+
+		// An empty deepen (a normal fetch) never needs a capability.
+		assert!(ensure_deepen_supported(&none, &Deepen::default()).is_ok());
+		// Each shallow directive requires its own advertised capability.
+		let depth = Deepen {
+			depth: Some(1),
+			..Default::default()
+		};
+		assert!(ensure_deepen_supported(&none, &depth).is_err());
+		assert!(ensure_deepen_supported(&full, &depth).is_ok());
+		let since = Deepen {
+			since: Some(1),
+			..Default::default()
+		};
+		assert!(ensure_deepen_supported(&none, &since).is_err());
+		let not = Deepen {
+			not: vec!["main".to_owned()],
+			..Default::default()
+		};
+		assert!(ensure_deepen_supported(&none, &not).is_err());
+	}
 
 	/// A [`HttpTransport`] double that records the single POSTed request and answers with a success
 	/// `report-status` (`unpack ok`), so a push completes without a real server.
