@@ -189,6 +189,14 @@ where
 		Ok(None)
 	}
 
+	/// Resolve a ref to an object id, following a bounded chain of symbolic (`ref:`) refs — so a
+	/// remote's symbolic `HEAD` (`refs/remotes/origin/HEAD` → `ref: refs/remotes/origin/main`) resolves
+	/// to the branch it names. `None` if the ref or its chain does not resolve. Unlike [`Self::resolve`],
+	/// which parses a ref's body as a hex oid, this accepts and follows a symbolic ref.
+	pub async fn resolve_symbolic(&self, name: &str) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		self.follow_symref(name).await
+	}
+
 	/// Compare-and-set a ref. `expected == None` requires the ref to be absent;
 	/// otherwise the current value must equal `expected`. A ref present only in
 	/// `packed-refs` counts as its packed value — updating it writes the loose

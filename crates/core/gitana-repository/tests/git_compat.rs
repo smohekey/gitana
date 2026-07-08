@@ -65,6 +65,79 @@ async fn init_open_and_loose_ref_cas() {
 }
 
 #[tokio::test]
+async fn rev_parse_dwims_remote_tracking_refs() {
+	// git's gitrevisions(7) search order resolves `origin/main` to `refs/remotes/origin/main`, and a
+	// bare remote name (or `origin/HEAD`) through the remote's symbolic `refs/remotes/origin/HEAD`.
+	let repo = mem_repo();
+	repo.init().await.unwrap();
+	let refs = repo.refs();
+
+	let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"remote-tip");
+	refs
+		.update_ref("refs/remotes/origin/main", tip, None)
+		.await
+		.unwrap();
+	// The remote's HEAD is a symbolic ref pointing at its default branch.
+	refs
+		.set_symbolic("refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+		.await
+		.unwrap();
+
+	assert_eq!(repo.rev_parse("origin/main").await.unwrap(), tip);
+	// The fully-qualified form resolves too.
+	assert_eq!(
+		repo.rev_parse("refs/remotes/origin/main").await.unwrap(),
+		tip
+	);
+	// A bare remote name resolves through refs/remotes/<name>/HEAD, following the symbolic ref.
+	assert_eq!(repo.rev_parse("origin").await.unwrap(), tip);
+	// `origin/HEAD` and its fully-qualified form both name that symbolic ref directly.
+	assert_eq!(repo.rev_parse("origin/HEAD").await.unwrap(), tip);
+	assert_eq!(
+		repo.rev_parse("refs/remotes/origin/HEAD").await.unwrap(),
+		tip
+	);
+}
+
+#[tokio::test]
+async fn rev_parse_treats_a_ref_directory_as_a_miss() {
+	// On a real (directory-backed) store, a bare name whose only match is a directory —
+	// `refs/remotes/origin` (holding `origin/main`), or a hierarchical branch namespace —
+	// must resolve to a clean UnknownRevision, not a backend directory-read error.
+	let work = unique_tmp("revdir");
+	let git_dir = work.join(".git");
+	create_skeleton(&git_dir);
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
+	repo.init().await.unwrap();
+	let refs = repo.refs();
+
+	let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"remote-tip");
+	refs
+		.update_ref("refs/remotes/origin/main", tip, None)
+		.await
+		.unwrap();
+	// A hierarchical local branch makes `refs/heads/feature` a directory.
+	refs
+		.update_ref("refs/heads/feature/x", tip, None)
+		.await
+		.unwrap();
+
+	// The leaf remote-tracking branch still resolves.
+	assert_eq!(repo.rev_parse("origin/main").await.unwrap(), tip);
+	// Bare names that only name a ref *directory* miss cleanly rather than erroring.
+	assert!(matches!(
+		repo.rev_parse("origin").await,
+		Err(gitana_repository::RepositoryError::UnknownRevision(_))
+	));
+	assert!(matches!(
+		repo.rev_parse("feature").await,
+		Err(gitana_repository::RepositoryError::UnknownRevision(_))
+	));
+}
+
+#[tokio::test]
 async fn abbreviations_resolve_across_loose_and_packed_objects() {
 	let repo = mem_repo();
 	repo.init().await.unwrap();

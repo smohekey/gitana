@@ -167,6 +167,7 @@ pub(crate) fn io_error(code: ErrorCode) -> std::io::Error {
 		ErrorCode::NoEntry => std::io::ErrorKind::NotFound,
 		ErrorCode::Exist => std::io::ErrorKind::AlreadyExists,
 		ErrorCode::NotDirectory => std::io::ErrorKind::NotADirectory,
+		ErrorCode::IsDirectory => std::io::ErrorKind::IsADirectory,
 		_ => std::io::ErrorKind::Other,
 	};
 	std::io::Error::new(kind, format!("wasi filesystem error: {code:?}"))

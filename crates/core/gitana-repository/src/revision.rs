@@ -193,14 +193,19 @@ async fn resolve_base<H: HashAlgorithm>(
 			.ok_or_else(|| RepositoryError::UnknownRevision("HEAD (unborn branch)".to_owned()));
 	}
 
-	// Ref search order, then oid.
+	// Ref search order, then oid. Mirrors git's gitrevisions(7) sequence for a bare name: verbatim,
+	// refs/, refs/tags/, refs/heads/, refs/remotes/, and finally the remote's symbolic HEAD
+	// (`origin` → refs/remotes/origin/HEAD). A remote's HEAD — and `refs/remotes/origin/HEAD` or
+	// `origin/HEAD` naming it — is a symbolic `ref:` pointer, so follow symbolic targets throughout.
 	for candidate in [
 		base.to_owned(),
 		format!("refs/{base}"),
 		format!("refs/tags/{base}"),
 		format!("refs/heads/{base}"),
+		format!("refs/remotes/{base}"),
+		format!("refs/remotes/{base}/HEAD"),
 	] {
-		if let Some(id) = repo.refs().resolve(&candidate).await? {
+		if let Some(id) = repo.refs().resolve_symbolic(&candidate).await? {
 			return Ok(id);
 		}
 	}

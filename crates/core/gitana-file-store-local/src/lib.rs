@@ -761,7 +761,12 @@ fn backend_err(error: std::io::Error) -> FileStoreError {
 
 fn read_err(error: std::io::Error) -> FileStoreError {
 	match error.kind() {
-		std::io::ErrorKind::NotFound => FileStoreError::NotFound,
+		// A path that resolves to a directory holds no byte value, so it reads as a miss — this lets a
+		// ref resolver treat `refs/remotes/origin` (a directory over `origin/main`) as absent rather
+		// than an error. `NotADirectory` (an ancestor is a file) is deliberately NOT folded in: a loose
+		// file shadowing a packed child is a name conflict, and mapping it to `NotFound` would let the
+		// packed-ref fallback resolve the child, diverging from git's unknown-revision result.
+		std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory => FileStoreError::NotFound,
 		_ => FileStoreError::Backend(error.to_string()),
 	}
 }
