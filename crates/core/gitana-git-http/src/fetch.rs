@@ -20,6 +20,7 @@ use gitana_repository::Repository;
 
 use crate::GitHttpError;
 use crate::deepen::Deepen;
+use crate::negotiate::{common_haves, ok_to_give_up};
 use crate::pack::{build_pack, build_pack_shallow, build_pack_thin};
 use crate::shallow::{compute_shallow, reachable_commits, reachable_tag_wants};
 use crate::sideband::write_sideband_pack;
@@ -61,11 +62,13 @@ pub async fn fetch<H: HashAlgorithm>(
 		return finish_with_pack(out, repo, &args).await;
 	}
 
-	// Negotiation round: acknowledge the haves we actually have.
+	// Negotiation round: acknowledge the haves we actually have, and decide whether we can build the pack
+	// yet (git's `ready`). We only give up once every want has a common ancestor — else we acknowledge the
+	// commons and let the client offer more haves, so the pack cuts as deep as the shared history allows.
 	let common = common_haves(repo, &args.haves).await?;
 	write_pkt(&mut out, b"acknowledgments\n")?;
 	if common.is_empty() {
-		// No shared history yet — the client will send another round (with `done`).
+		// No shared history yet — the client will send another round.
 		write_pkt(&mut out, b"NAK\n")?;
 		write_flush(&mut out);
 		return Ok(out);
@@ -73,7 +76,12 @@ pub async fn fetch<H: HashAlgorithm>(
 	for oid in &common {
 		write_pkt(&mut out, format!("ACK {oid}\n").as_bytes())?;
 	}
-	// We have a cut point, so we can build the pack now.
+	if !ok_to_give_up(repo, &args.wants, &common).await? {
+		// Commons found but a want still has no common ancestor: keep negotiating (no `ready`, no pack).
+		write_flush(&mut out);
+		return Ok(out);
+	}
+	// We have a sufficient cut point, so we can build the pack now.
 	write_pkt(&mut out, b"ready\n")?;
 	write_delim(&mut out);
 	finish_with_pack(out, repo, &args).await
@@ -136,21 +144,6 @@ async fn finish_with_pack<H: HashAlgorithm>(
 	write_sideband_pack(&mut out, &pack)?;
 	write_flush(&mut out);
 	Ok(out)
-}
-
-/// The subset of `haves` the server actually has (its negotiation cut points).
-async fn common_haves<H: HashAlgorithm>(
-	repo: &Repository<impl FileStore, H>,
-	haves: &[ObjectId<H>],
-) -> Result<Vec<ObjectId<H>>, GitHttpError> {
-	let store = repo.objects();
-	let mut common = Vec::new();
-	for &have in haves {
-		if store.exists_object(&have).await? {
-			common.push(have);
-		}
-	}
-	Ok(common)
 }
 
 /// Parse the `fetch` body: the `command=fetch` line and capabilities, a delimiter,

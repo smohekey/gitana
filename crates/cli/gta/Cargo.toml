@@ -19,6 +19,7 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 assert_cmd = { workspace = true }
 axum = { workspace = true }
 cap-std = { workspace = true }
+flate2 = { workspace = true }
 gitana-git-http = { workspace = true }
 gitana-file-store-local = { workspace = true }
 gitana-object.workspace = true

@@ -147,6 +147,9 @@ async fn info_refs(
 /// `POST /git-upload-pack`.
 async fn upload_pack(State(st): State<Served>, headers: HeaderMap, body: Bytes) -> Response {
 	let version = protocol(&headers);
+	// git gzips a large upload-pack request (`Content-Encoding: gzip`) — e.g. a multi-round fetch whose
+	// `have` batches grow big — so decompress it before the transport-agnostic handlers see raw pkt-lines.
+	let body = decode_body(&headers, body);
 	let out = match st.hash {
 		ServerHash::Sha1 => upload_pack_bytes::<Sha1>(&st.git_dir, version, &body).await,
 		ServerHash::Sha256 => upload_pack_bytes::<Sha256>(&st.git_dir, version, &body).await,
@@ -156,6 +159,23 @@ async fn upload_pack(State(st): State<Served>, headers: HeaderMap, body: Bytes) 
 		Bytes::from(out),
 	)
 		.into_response()
+}
+
+/// Decompress a request body git sent with `Content-Encoding: gzip`; pass any other body through
+/// unchanged. (A real Smart-HTTP server does the same before handing the pkt-line stream to upload-pack.)
+fn decode_body(headers: &HeaderMap, body: Bytes) -> Bytes {
+	let gzipped = headers
+		.get("content-encoding")
+		.and_then(|v| v.to_str().ok())
+		.is_some_and(|v| v.eq_ignore_ascii_case("gzip"));
+	if !gzipped {
+		return body;
+	}
+	use std::io::Read;
+	let mut decoder = flate2::read::GzDecoder::new(&body[..]);
+	let mut out = Vec::new();
+	decoder.read_to_end(&mut out).expect("gunzip request body");
+	Bytes::from(out)
 }
 
 /// `POST /git-receive-pack`.

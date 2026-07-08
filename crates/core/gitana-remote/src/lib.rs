@@ -184,11 +184,71 @@ pub async fn fetch_pack<H: HashAlgorithm>(
 		return Ok(());
 	}
 	let shallow = repo.read_shallow().await?;
-	let request = build_upload_pack_request(wants, haves, &shallow, deepen, include_tag);
-	let response = transport
+
+	// A shallow / deepen fetch negotiates through the `deepen` protocol, not have-batching, so it sends a
+	// single final round (`done`) carrying the ref-tip haves and the current boundary.
+	if !deepen.is_empty() || !shallow.is_empty() {
+		let request = build_upload_pack_request(wants, haves, &shallow, deepen, include_tag, true);
+		let response = post_upload_pack(transport, origin, request).await?;
+		let response = parse_upload_pack_response::<H>(&response)?;
+		return store_response(repo, &shallow, response).await;
+	}
+
+	// A plain fetch negotiates: offer local commits (walked back from the ref-tip `haves`) in batches,
+	// ending with `done` once the server signals `ready` or the haves run out — so it can cut the pack at
+	// the deepest shared commit. A server that ignores `multi_ack_detailed` and sends the pack on the
+	// first round is handled too: we take the pack as soon as one arrives.
+	let mut remaining = collect_have_commits(repo, haves).await?;
+	let mut offered: Vec<ObjectId<H>> = Vec::new();
+	let mut ready = false;
+	loop {
+		let done = ready || remaining.is_empty();
+		if !done {
+			let batch = remaining.len().min(HAVE_BATCH);
+			offered.extend(remaining.drain(..batch));
+		}
+		let request = build_upload_pack_request(wants, &offered, &[], deepen, include_tag, done);
+		let response = post_upload_pack(transport, origin, request).await?;
+		let response = parse_upload_pack_response::<H>(&response)?;
+		if !response.pack.is_empty() {
+			return store_response(repo, &shallow, response).await;
+		}
+		// A negotiation round carried only acknowledgments. Once we have sent `done`, the server owed us a
+		// pack — an empty body is a server-side failure (e.g. `git http-backend` exiting after the headers).
+		if done {
+			bail!(
+				"the remote returned no packfile; the upload-pack request may have failed on the server"
+			);
+		}
+		ready = response.ready;
+	}
+}
+
+/// The maximum `have`s offered per negotiation round.
+const HAVE_BATCH: usize = 16;
+
+/// A cap on the local commits walked to offer as `have`s, bounding a deep-divergence negotiation to a
+/// handful of rounds (git similarly stops after a bounded number of unacknowledged haves). Beyond it the
+/// client sends `done`; the pack may then be larger than optimal but is still correct.
+const HAVE_CAP: usize = 256;
+
+/// POST an upload-pack request and return the raw response body.
+async fn post_upload_pack(
+	transport: &impl HttpTransport,
+	origin: &Origin,
+	request: Vec<u8>,
+) -> Result<Vec<u8>> {
+	transport
 		.post(&origin.upload_pack(), UPLOAD_PACK_REQUEST, request)
-		.await?;
-	let response = parse_upload_pack_response::<H>(&response)?;
+		.await
+}
+
+/// Store a fetched pack response and fold in any shallow-boundary update.
+async fn store_response<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	shallow_before: &[ObjectId<H>],
+	response: gitana_git_http::UploadPackResponse<H>,
+) -> Result<()> {
 	// No packfile at all means the server sent nothing — e.g. `git http-backend` exiting after the HTTP
 	// headers when a `--shallow-exclude` ref cannot be resolved (a 200 with an empty body). A legitimate
 	// up-to-date fetch still carries a valid 0-object packfile (12-byte header + trailer), so an empty
@@ -202,8 +262,44 @@ pub async fn fetch_pack<H: HashAlgorithm>(
 			.await
 			.context("storing fetched pack")?;
 	}
-	persist_shallow(repo, &shallow, &response.shallow, &response.unshallow).await?;
+	persist_shallow(repo, shallow_before, &response.shallow, &response.unshallow).await?;
 	Ok(())
+}
+
+/// Walk local commits to offer as negotiation `have`s: a breadth-first sweep back from the ref-tip
+/// `roots` (tags peeled to their commit), newest-ish first, capped at [`HAVE_CAP`] to bound a
+/// deep-divergence negotiation. Best-effort — an unreadable or non-commit tip is simply not offered.
+async fn collect_have_commits<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	roots: &[ObjectId<H>],
+) -> Result<Vec<ObjectId<H>>> {
+	use std::collections::{HashSet, VecDeque};
+
+	let mut out: Vec<ObjectId<H>> = Vec::new();
+	let mut seen: HashSet<ObjectId<H>> = HashSet::new();
+	let mut queue: VecDeque<ObjectId<H>> = roots.iter().copied().collect();
+	while let Some(id) = queue.pop_front() {
+		if out.len() >= HAVE_CAP {
+			break;
+		}
+		if !seen.insert(id) {
+			continue;
+		}
+		// Best-effort: a ref we cannot read (or a tree/blob tip) is just not offered as a have.
+		if let Ok((kind, data)) = repo.objects().read_object(&id).await {
+			match kind {
+				gitana_object::ObjectKind::Commit => {
+					out.push(id);
+					queue.extend(gitana_object::parse_commit::<H>(&data)?.parents);
+				}
+				gitana_object::ObjectKind::Tag => {
+					queue.push_back(gitana_object::parse_tag::<H>(&data)?.object);
+				}
+				_ => {}
+			}
+		}
+	}
+	Ok(out)
 }
 
 /// Fold the server's shallow-boundary update into `.git/shallow`: the new boundary is the previous

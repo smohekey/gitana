@@ -213,6 +213,76 @@ async fn gta_fetches_tags_from_a_real_git_repo() {
 	);
 }
 
+/// A gta fetch with divergent *local* history exercises the client's multi-round negotiation: it walks
+/// its own commits into `have` batches and negotiates with the real git server until the shared base is
+/// acknowledged, then receives a correct pack. Asserts the advanced tip lands and the local commits and
+/// the fetched history are all intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gta_fetches_with_divergent_local_history() {
+	if skip() {
+		return;
+	}
+	let root = tmp("client-divergent-fetch");
+	build_bare(&root);
+	let url = serve_git_http_backend(root.clone()).await;
+	let bare = root.join("repo.git");
+
+	let checkout = root.join("c");
+	let c = checkout.to_str().unwrap();
+	gta_ok(
+		&gta(&["clone", &format!("{url}/repo.git"), c]).await,
+		"clone",
+	);
+	gta_ok(&gta(&["-C", c, "config", "user.name", "C"]).await, "name");
+	gta_ok(
+		&gta(&["-C", c, "config", "user.email", "c@e"]).await,
+		"email",
+	);
+
+	// Advance local `main` with several commits so the client has history to offer as `have`s.
+	for i in 0..6 {
+		std::fs::write(checkout.join("a.txt"), format!("local {i}\n")).unwrap();
+		gta_ok(&gta(&["-C", c, "add", "."]).await, "add");
+		gta_ok(
+			&gta(&["-C", c, "commit", "-m", &format!("local {i}")]).await,
+			"commit",
+		);
+	}
+	let local_tip = gta_stdout(&gta(&["-C", c, "rev-parse", "HEAD"]).await, "local tip");
+
+	// The server's `main` also advances (server-only history).
+	let work = root.join("work");
+	std::fs::write(work.join("b.txt"), b"server\n").unwrap();
+	git(&work, &["add", "."]);
+	git(&work, &["commit", "-qm", "server change"]);
+	git(&work, &["push", "-q", bare.to_str().unwrap(), "main"]);
+	let advanced = git(&work, &["rev-parse", "HEAD"]);
+
+	// The fetch negotiates through the divergence and lands the server tip into the tracking ref.
+	gta_ok(&gta(&["-C", c, "fetch"]).await, "fetch");
+	assert_eq!(
+		gta_stdout(
+			&gta(&["-C", c, "rev-parse", "refs/remotes/origin/main"]).await,
+			"tracking ref"
+		),
+		advanced,
+		"the fetch landed the server's advanced tip"
+	);
+	// The local divergent history is untouched, and the fetched objects are present.
+	assert_eq!(
+		gta_stdout(&gta(&["-C", c, "rev-parse", "HEAD"]).await, "local HEAD"),
+		local_tip,
+		"local history is untouched by the fetch"
+	);
+	assert!(
+		gta(&["-C", c, "cat-file", "-t", &advanced])
+			.await
+			.status
+			.success(),
+		"the fetched commit object is present"
+	);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gta_pushes_to_a_real_git_repo() {
 	if skip() {

@@ -170,6 +170,72 @@ async fn git_fetches_gitana_over_v0() {
 	fetch_case(0).await;
 }
 
+/// A fetch from gitana with a divergent local history exercises **multi-round** negotiation: the
+/// client's first `have` batches are its unrelated local commits, so gitana keeps acknowledging (never
+/// prematurely `ready`) until the shared base is offered, then sends the pack. Proves the multi-round
+/// ACK negotiation interoperates with a real git client, and the delivered result is complete.
+async fn multi_round_fetch_case(version: u8) {
+	let work = unique_tmp("interop-multiround");
+	let git_dir = work.join("srv.git");
+	build_linear_server::<Sha1>(&git_dir, 3).await; // c0 <- c1 <- c2 (tip)
+	let url = serve_gitana(git_dir.clone(), ServerHash::Sha1).await;
+
+	let checkout = work.join("c");
+	assert_cloned(&clone(&url, &checkout, version), version);
+	git(&checkout, &["config", "user.name", "C"]);
+	git(&checkout, &["config", "user.email", "c@e"]);
+
+	// A long divergent local branch: its (newest) commits fill the first have-batches with objects the
+	// server does not share, forcing more than one negotiation round before the common base is reached.
+	git(&checkout, &["checkout", "-qb", "work"]);
+	for i in 0..50 {
+		git(
+			&checkout,
+			&["commit", "-q", "--allow-empty", "-m", &format!("d{i}")],
+		);
+	}
+	git(&checkout, &["checkout", "-q", "main"]);
+
+	// The server advances `main`; the fetch must negotiate through the divergence and land the new tip.
+	let advanced = commit_on(&open::<Sha1>(&git_dir), "b.txt", b"more\n").await;
+	let out = git_try(
+		&checkout,
+		&[
+			"-c",
+			&format!("protocol.version={version}"),
+			"fetch",
+			"origin",
+			"main",
+		],
+	);
+	assert!(
+		out.status.success(),
+		"multi-round fetch (v{version}) failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	assert_eq!(
+		git(&checkout, &["rev-parse", "FETCH_HEAD"]),
+		advanced.to_hex(),
+		"the fetch landed the advanced tip after negotiating past the divergence"
+	);
+	let fsck = git_try(&checkout, &["fsck", "--full"]);
+	assert!(
+		fsck.status.success(),
+		"git fsck after multi-round fetch (v{version}) failed: {}",
+		String::from_utf8_lossy(&fsck.stderr)
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_multi_round_fetches_gitana_over_v2() {
+	multi_round_fetch_case(2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_multi_round_fetches_gitana_over_v0() {
+	multi_round_fetch_case(0).await;
+}
+
 /// A non-shallow single-branch clone honours `include-tag`: the annotated tag reachable from the
 /// fetched branch is delivered even though the client only `want`s the branch tip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

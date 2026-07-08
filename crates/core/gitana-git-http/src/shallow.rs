@@ -209,7 +209,7 @@ pub(crate) async fn reachable_commits<H: HashAlgorithm>(
 
 /// Peel a (possibly annotated, possibly chained) tag to the commit it names, or `None` if it does not
 /// resolve to a commit.
-async fn peel_to_commit<H: HashAlgorithm>(
+pub(crate) async fn peel_to_commit<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	mut id: ObjectId<H>,
 ) -> Result<Option<ObjectId<H>>, GitHttpError> {
@@ -225,7 +225,7 @@ async fn peel_to_commit<H: HashAlgorithm>(
 }
 
 /// Read `id` as a commit, or `None` when it is absent or not a commit.
-async fn read_commit<H: HashAlgorithm>(
+pub(crate) async fn read_commit<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	id: ObjectId<H>,
 ) -> Result<Option<gitana_object::Commit<H>>, GitHttpError> {

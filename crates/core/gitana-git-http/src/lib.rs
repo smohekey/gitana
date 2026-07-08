@@ -11,6 +11,7 @@ mod deepen;
 mod enforce;
 mod fetch;
 mod ls_refs;
+mod negotiate;
 mod no_replay_check;
 mod nonce_ledger;
 mod pack;

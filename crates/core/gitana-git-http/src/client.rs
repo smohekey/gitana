@@ -163,19 +163,24 @@ fn capability_value(caps: &[u8], prefix: &str) -> Option<String> {
 }
 
 /// Build a v0 upload-pack request: `want`s (the first carrying capabilities), the client's current
-/// `shallow` boundary and any `deepen*` directive, a flush, the `have`s, then `done`. `shallow` and an
-/// empty [`Deepen`] emit nothing; `include_tag` false leaves the caps alone — so a normal (non-shallow)
-/// fetch is byte-for-byte unchanged.
+/// `shallow` boundary and any `deepen*` directive, a flush, the `have`s, then either `done` (this is the
+/// final round) or a flush (a negotiation round — the server should acknowledge, not send a pack).
+/// `shallow` and an empty [`Deepen`] emit nothing.
 ///
 /// `include_tag` requests git's `include-tag`: the server appends annotated tag objects reachable from
 /// the wants. A shallow clone deepens only branch tips, so it sets this to still receive tags pointing
 /// into the fetched history (a normal fetch wants every ref explicitly and does not need it).
+///
+/// The client requests `multi_ack_detailed`, so a plain fetch can offer its `have`s in batches over
+/// several rounds (`done` false) and only end with `done` once the server signals `ready` or it runs out
+/// of haves — the server then sends the pack cut at the deepest shared commit.
 pub fn build_upload_pack_request<H: HashAlgorithm>(
 	wants: &[ObjectId<H>],
 	haves: &[ObjectId<H>],
 	shallow: &[ObjectId<H>],
 	deepen: &Deepen,
 	include_tag: bool,
+	done: bool,
 ) -> Vec<u8> {
 	let mut out = Vec::new();
 	for (index, want) in wants.iter().enumerate() {
@@ -190,8 +195,8 @@ pub fn build_upload_pack_request<H: HashAlgorithm>(
 				""
 			};
 			format!(
-				"want {} {tag_cap}{relative_cap}side-band-64k thin-pack ofs-delta object-format={} \
-				 agent={AGENT}\n",
+				"want {} {tag_cap}{relative_cap}multi_ack_detailed side-band-64k thin-pack ofs-delta \
+				 object-format={} agent={AGENT}\n",
 				want.to_hex(),
 				H::NAME
 			)
@@ -218,30 +223,41 @@ pub fn build_upload_pack_request<H: HashAlgorithm>(
 	for have in haves {
 		let _ = write_pkt(&mut out, format!("have {}\n", have.to_hex()).as_bytes());
 	}
-	let _ = write_pkt(&mut out, b"done\n");
+	if done {
+		let _ = write_pkt(&mut out, b"done\n");
+	} else {
+		// A negotiation round ends with a flush (no `done`): the server acknowledges the commons and the
+		// client offers more haves, rather than committing to a pack.
+		write_flush(&mut out);
+	}
 	out
 }
 
-/// A parsed v0 upload-pack response: the packfile plus the server's shallow-boundary update.
+/// A parsed v0 upload-pack response: the packfile plus the server's shallow-boundary update and the
+/// negotiation signal.
 #[derive(Debug, Clone)]
 pub struct UploadPackResponse<H: HashAlgorithm> {
-	/// The reassembled packfile bytes.
+	/// The reassembled packfile bytes (empty on a negotiation round that carried only acknowledgments).
 	pub pack: Vec<u8>,
 	/// Commits the server declared shallow (their parents are not in the pack) — `shallow <oid>`.
 	pub shallow: Vec<ObjectId<H>>,
 	/// Commits the server un-shallowed because it now sent their parents — `unshallow <oid>`.
 	pub unshallow: Vec<ObjectId<H>>,
+	/// The server sent `ACK <oid> ready`: it has a sufficient cut point, so the client can end
+	/// negotiation with `done` to receive the pack.
+	pub ready: bool,
 }
 
-/// Parse a v0 upload-pack response: the leading `shallow`/`unshallow` boundary lines, then the
-/// packfile carried on side-band channel 1 (skipping `NAK`/`ACK` control lines; channel 2 is progress
-/// and channel 3 a fatal server error).
+/// Parse a v0 upload-pack response: the leading `shallow`/`unshallow` boundary lines and `ACK`/`NAK`
+/// acknowledgments (noting a `ready`), then the packfile carried on side-band channel 1 (channel 2 is
+/// progress and channel 3 a fatal server error). A negotiation round carries no pack.
 pub fn parse_upload_pack_response<H: HashAlgorithm>(
 	body: &[u8],
 ) -> Result<UploadPackResponse<H>, GitHttpError> {
 	let mut pack = Vec::new();
 	let mut shallow = Vec::new();
 	let mut unshallow = Vec::new();
+	let mut ready = false;
 	let mut cursor = 0;
 	while cursor < body.len() {
 		let (line, consumed) = parse_pkt(&body[cursor..])?;
@@ -257,6 +273,12 @@ pub fn parse_upload_pack_response<H: HashAlgorithm>(
 		}
 		if let Some(rest) = data.strip_prefix(b"unshallow ") {
 			unshallow.push(parse_oid_line(rest)?);
+			continue;
+		}
+		// `ACK <oid> ready` tells the client it may stop offering haves and send `done`. Other `ACK`/`NAK`
+		// control lines carry no data we act on here.
+		if data.starts_with(b"ACK ") && data.ends_with(b" ready\n") {
+			ready = true;
 			continue;
 		}
 		match data.first() {
@@ -276,6 +298,7 @@ pub fn parse_upload_pack_response<H: HashAlgorithm>(
 		pack,
 		shallow,
 		unshallow,
+		ready,
 	})
 }
 
@@ -395,7 +418,7 @@ mod tests {
 			&[],
 		);
 		assert!(String::from_utf8_lossy(&push).contains("object-format=sha256"));
-		let fetch = build_upload_pack_request(&[sha256], &[], &[], &Deepen::default(), false);
+		let fetch = build_upload_pack_request(&[sha256], &[], &[], &Deepen::default(), false, true);
 		assert!(String::from_utf8_lossy(&fetch).contains("object-format=sha256"));
 
 		let sha1 = ObjectId::<Sha1>::compute(ObjectKind::Commit, b"c");
@@ -408,7 +431,7 @@ mod tests {
 			&[],
 		);
 		assert!(String::from_utf8_lossy(&push1).contains("object-format=sha1"));
-		let fetch1 = build_upload_pack_request(&[sha1], &[], &[], &Deepen::default(), false);
+		let fetch1 = build_upload_pack_request(&[sha1], &[], &[], &Deepen::default(), false, true);
 		assert!(String::from_utf8_lossy(&fetch1).contains("object-format=sha1"));
 	}
 
@@ -424,7 +447,7 @@ mod tests {
 			not: vec!["refs/tags/v1".to_owned()],
 			..Default::default()
 		};
-		let request = build_upload_pack_request(&[tip], &[], &[boundary], &deepen, true);
+		let request = build_upload_pack_request(&[tip], &[], &[boundary], &deepen, true, true);
 		let text = String::from_utf8_lossy(&request);
 		assert!(text.contains(&format!("shallow {}", boundary.to_hex())));
 		assert!(text.contains("deepen 2\n"));
@@ -450,7 +473,7 @@ mod tests {
 			relative: true,
 			..Default::default()
 		};
-		let request = build_upload_pack_request(&[tip], &[], &[], &deepen, false);
+		let request = build_upload_pack_request(&[tip], &[], &[], &deepen, false, true);
 		let text = String::from_utf8_lossy(&request);
 		assert!(text.contains("deepen 1\n"));
 		// The capability rides the first want line, and appears exactly once (no standalone line).
@@ -463,7 +486,7 @@ mod tests {
 	fn empty_deepen_leaves_the_request_unchanged() {
 		// A normal (non-shallow) fetch emits no shallow/deepen lines at all.
 		let tip = ObjectId::<Sha1>::compute(ObjectKind::Commit, b"tip");
-		let request = build_upload_pack_request(&[tip], &[], &[], &Deepen::default(), false);
+		let request = build_upload_pack_request(&[tip], &[], &[], &Deepen::default(), false, true);
 		let text = String::from_utf8_lossy(&request);
 		assert!(!text.contains("shallow") && !text.contains("deepen"));
 		assert!(!text.contains("include-tag"));

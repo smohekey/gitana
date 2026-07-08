@@ -1,11 +1,14 @@
 //! The protocol-v0 `upload-pack` request (`POST /git-upload-pack` with no `command=`
-//! line): `want`/`have`/`done` negotiation, answered with `NAK` and the packfile.
+//! line): `want`/`have`/`done` negotiation, answered with `multi_ack_detailed` acknowledgments and the
+//! packfile.
 //!
-//! v0 is stateless over HTTP: a clone sends its `want`s, a flush, then `done`; an
-//! incremental fetch adds `have`s. We acknowledge with a single `NAK` and send a pack
-//! of the wants minus the haves — the haves still trim the pack even without per-have
-//! `ACK`s, since the client terminated the round with `done`. When the client
-//! negotiated `side-band-64k` (as `git clone` does), the pack streams on channel 1.
+//! v0 is stateless over HTTP: each request re-sends the `want`s and the `have`s accumulated so far. A
+//! plain fetch negotiates — a round without `done` is answered with `ACK <oid> common` for the shared
+//! haves (and `ACK <oid> ready` once every want has a common ancestor), then `NAK`, and *no* pack; the
+//! client sends another round (deeper haves, or `done`). The `done` round is answered with a final `ACK
+//! <oid>` (the cut point) or `NAK` (a clone shares nothing), then the pack of the wants minus the haves.
+//! When the client negotiated `side-band-64k` (as `git clone` does), the pack streams on channel 1.
+//! Shallow/`deepen` requests keep the historical single `NAK` framing.
 
 use std::collections::HashSet;
 
@@ -15,6 +18,7 @@ use gitana_repository::Repository;
 
 use crate::GitHttpError;
 use crate::deepen::Deepen;
+use crate::negotiate::{common_haves, ok_to_give_up};
 use crate::pack::{build_pack, build_pack_shallow, build_pack_thin};
 use crate::shallow::{compute_shallow, reachable_commits, reachable_tag_wants};
 use crate::sideband::write_sideband_pack;
@@ -82,6 +86,25 @@ pub async fn upload_pack_v0<F: FileStore, H: HashAlgorithm>(
 		boundary = plan.boundary;
 		shallow_included = Some(plan.included);
 	}
+	// Negotiation acknowledgments (`multi_ack_detailed`) for a plain fetch. The shallow/deepen paths keep
+	// the historical single `NAK` (git and gitana's client both read the pack past any ack lines), and a
+	// shallow `!done` probe already returned above; only a plain fetch negotiates with `have`s here.
+	let shallow_context = !boundary.is_empty() || !have_boundary.is_empty();
+	if shallow_context {
+		write_pkt(&mut out, b"NAK\n")?;
+	} else {
+		let commons = common_haves(repo, &parsed.haves).await?;
+		if !parsed.done {
+			// A negotiation round: acknowledge the commons, signal `ready` once every want has a common
+			// ancestor, and return WITHOUT a pack — the client sends another round (deeper haves, or `done`).
+			let ready = ok_to_give_up(repo, &parsed.wants, &commons).await?;
+			write_v0_negotiation_acks(&mut out, &commons, ready)?;
+			return Ok(out);
+		}
+		// The client sent `done`: a final `ACK <common>` (or `NAK` when nothing is shared), then the pack.
+		write_v0_final_ack(&mut out, &commons)?;
+	}
+
 	// `include-tag`: append the annotated tags reachable within what this request sends, so a
 	// single-branch clone/fetch (shallow or not) still receives tags pointing into the fetched history.
 	if parsed.include_tag {
@@ -92,8 +115,6 @@ pub async fn upload_pack_v0<F: FileStore, H: HashAlgorithm>(
 		wants.extend(reachable_tag_wants(repo, &included).await?);
 	}
 
-	write_pkt(&mut out, b"NAK\n")?;
-	let shallow_context = !boundary.is_empty() || !have_boundary.is_empty();
 	let pack = if shallow_context {
 		build_pack_shallow(repo, &wants, &parsed.haves, &boundary, &have_boundary).await?
 	} else if parsed.thin {
@@ -109,6 +130,37 @@ pub async fn upload_pack_v0<F: FileStore, H: HashAlgorithm>(
 		out.extend_from_slice(&pack);
 	}
 	Ok(out)
+}
+
+/// Write the `multi_ack_detailed` acknowledgments for a negotiation round (no `done`): `ACK <oid>
+/// common` for each shared have, `ACK <oid> ready` on the last once the server can stop negotiating,
+/// then a closing `NAK`. No packfile follows — the client sends another round.
+fn write_v0_negotiation_acks<H: HashAlgorithm>(
+	out: &mut Vec<u8>,
+	commons: &[ObjectId<H>],
+	ready: bool,
+) -> Result<(), GitHttpError> {
+	for oid in commons {
+		write_pkt(out, format!("ACK {oid} common\n").as_bytes())?;
+	}
+	if ready && let Some(last) = commons.last() {
+		write_pkt(out, format!("ACK {last} ready\n").as_bytes())?;
+	}
+	write_pkt(out, b"NAK\n")?;
+	Ok(())
+}
+
+/// Write the final acknowledgment for a `done` round: a bare `ACK <oid>` against a shared have (the cut
+/// point the pack is built from), or `NAK` when nothing is shared (a clone). The packfile follows.
+fn write_v0_final_ack<H: HashAlgorithm>(
+	out: &mut Vec<u8>,
+	commons: &[ObjectId<H>],
+) -> Result<(), GitHttpError> {
+	match commons.last() {
+		Some(last) => write_pkt(out, format!("ACK {last}\n").as_bytes())?,
+		None => write_pkt(out, b"NAK\n")?,
+	}
+	Ok(())
 }
 
 /// Parse the v0 body: `want <oid> [caps]` lines (the first carries capabilities),
