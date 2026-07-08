@@ -12,7 +12,7 @@ use gitana_object::{HashAlgorithm, ObjectId, PktLine, parse_pkt, write_flush, wr
 use gitana_repository::Repository;
 
 use crate::GitHttpError;
-use crate::pack::build_pack;
+use crate::pack::{build_pack, build_pack_thin};
 use crate::sideband::write_sideband_pack;
 
 /// Parsed v0 upload-pack arguments.
@@ -23,6 +23,8 @@ struct V0Request<H: HashAlgorithm> {
 	haves: Vec<ObjectId<H>>,
 	/// The client negotiated `side-band-64k`.
 	sideband: bool,
+	/// The client negotiated `thin-pack` (deltas may reference bases it already has).
+	thin: bool,
 }
 
 /// Handle a v0 upload-pack request body, returning `NAK` plus the packfile.
@@ -39,7 +41,11 @@ pub async fn upload_pack_v0<F: FileStore, H: HashAlgorithm>(
 
 	let mut out = Vec::new();
 	write_pkt(&mut out, b"NAK\n")?;
-	let pack = build_pack(repo, &parsed.wants, &parsed.haves).await?;
+	let pack = if parsed.thin {
+		build_pack_thin(repo, &parsed.wants, &parsed.haves).await?
+	} else {
+		build_pack(repo, &parsed.wants, &parsed.haves).await?
+	};
 	if parsed.sideband {
 		write_sideband_pack(&mut out, &pack)?;
 		write_flush(&mut out);
@@ -57,6 +63,7 @@ fn parse_v0<H: HashAlgorithm>(request: &[u8]) -> Result<V0Request<H>, GitHttpErr
 		wants: Vec::new(),
 		haves: Vec::new(),
 		sideband: false,
+		thin: false,
 	};
 
 	let mut cursor = 0;
@@ -73,8 +80,9 @@ fn parse_v0<H: HashAlgorithm>(request: &[u8]) -> Result<V0Request<H>, GitHttpErr
 
 		if let Some(rest) = text.strip_prefix("want ") {
 			// The first want line trails the negotiated capabilities after the oid.
-			if parsed.wants.is_empty() && rest.contains("side-band-64k") {
-				parsed.sideband = true;
+			if parsed.wants.is_empty() {
+				parsed.sideband = rest.contains("side-band-64k");
+				parsed.thin = rest.contains("thin-pack");
 			}
 			parsed.wants.push(parse_oid(rest)?);
 		} else if let Some(rest) = text.strip_prefix("have ") {

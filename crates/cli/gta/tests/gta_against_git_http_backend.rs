@@ -365,6 +365,123 @@ async fn gta_pushes_follow_tags_to_a_real_git_repo() {
 	);
 }
 
+/// A large, delta-friendly blob tagged by `marker`; a one-byte-different successor deltas well
+/// against it, so a thin pack is produced when one side already has the other version.
+fn big(marker: u8) -> Vec<u8> {
+	let mut data = b"the quick brown fox jumps over the lazy dog. ".repeat(200);
+	data.push(marker);
+	data
+}
+
+/// Commit `big.txt` = `content` in the server's work tree and push it to the bare repo.
+fn server_push_big(root: &Path, content: &[u8], msg: &str) -> String {
+	let work = root.join("work");
+	std::fs::write(work.join("big.txt"), content).unwrap();
+	git(&work, &["add", "."]);
+	git(&work, &["commit", "-qm", msg]);
+	git(
+		&work,
+		&[
+			"push",
+			"-q",
+			root.join("repo.git").to_str().unwrap(),
+			"main",
+		],
+	);
+	git(&work, &["rev-parse", "HEAD"])
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gta_fetches_a_thin_pack_from_a_real_git_repo() {
+	if skip() {
+		return;
+	}
+	let root = tmp("client-thin-fetch");
+	build_bare(&root);
+	let url = serve_git_http_backend(root.clone()).await;
+
+	let checkout = root.join("c");
+	let repo_url = format!("{url}/repo.git");
+	let c = checkout.to_str().unwrap();
+	gta_ok(&gta(&["clone", &repo_url, c]).await, "clone");
+
+	// Seed a big file on the server and fetch it, so gta holds the base version.
+	server_push_big(&root, &big(b'A'), "add big");
+	gta_ok(&gta(&["-C", c, "fetch"]).await, "fetch base");
+
+	// Change the big file by one byte and fetch again: git http-backend serves a thin pack (gta
+	// negotiated `thin-pack` and reported the base version as a `have`); gta must complete it.
+	let advanced = server_push_big(&root, &big(b'B'), "tweak big");
+	gta_ok(&gta(&["-C", c, "fetch"]).await, "thin fetch");
+	assert_eq!(
+		gta_stdout(
+			&gta(&["-C", c, "rev-parse", "refs/remotes/origin/main"]).await,
+			"rev-parse tracking ref"
+		),
+		advanced
+	);
+
+	// The de-thinned blob is stored byte-for-byte: check it out and read it back.
+	gta_ok(
+		&gta(&["-C", c, "reset", "--hard", &advanced]).await,
+		"reset",
+	);
+	assert_eq!(std::fs::read(checkout.join("big.txt")).unwrap(), big(b'B'));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gta_pushes_a_thin_pack_to_a_real_git_repo() {
+	if skip() {
+		return;
+	}
+	let root = tmp("client-thin-push");
+	build_bare(&root);
+	let url = serve_git_http_backend(root.clone()).await;
+	let bare = root.join("repo.git");
+
+	let checkout = root.join("c");
+	let repo_url = format!("{url}/repo.git");
+	let c = checkout.to_str().unwrap();
+	gta_ok(&gta(&["clone", &repo_url, c]).await, "clone");
+	gta_ok(&gta(&["-C", c, "config", "user.name", "C"]).await, "config");
+	gta_ok(
+		&gta(&["-C", c, "config", "user.email", "c@e"]).await,
+		"config",
+	);
+
+	// Bring the base version onto both sides: the server has big('A') and gta holds it locally.
+	let base = server_push_big(&root, &big(b'A'), "add big");
+	gta_ok(&gta(&["-C", c, "fetch"]).await, "fetch base");
+	gta_ok(
+		&gta(&["-C", c, "reset", "--hard", &base]).await,
+		"reset to base",
+	);
+
+	// Change the big file by one byte and push: gta sends a thin pack (new blob as a REF delta
+	// against the base the remote advertises); real git's receive-pack must complete it.
+	std::fs::write(checkout.join("big.txt"), big(b'B')).unwrap();
+	gta_ok(&gta(&["-C", c, "add", "."]).await, "add");
+	gta_ok(
+		&gta(&["-C", c, "commit", "-m", "tweak big"]).await,
+		"commit",
+	);
+	let head = gta_stdout(&gta(&["-C", c, "rev-parse", "HEAD"]).await, "rev-parse");
+	gta_ok(&gta(&["-C", c, "push"]).await, "thin push");
+
+	// The ref moved, the repo is intact, and the delta-completed blob checks out byte-for-byte.
+	assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), head);
+	let fsck = git_try(&bare, &["fsck", "--full"]);
+	assert!(
+		fsck.status.success(),
+		"git fsck after a thin push failed: {}",
+		String::from_utf8_lossy(&fsck.stderr)
+	);
+	assert_eq!(
+		git(&bare, &["cat-file", "-p", &format!("{head}:big.txt")]),
+		String::from_utf8(big(b'B')).unwrap()
+	);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gta_deletes_a_remote_tag_by_bare_name() {
 	if skip() {

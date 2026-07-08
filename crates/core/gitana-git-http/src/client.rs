@@ -149,7 +149,7 @@ pub fn build_upload_pack_request<H: HashAlgorithm>(
 	for (index, want) in wants.iter().enumerate() {
 		let line = if index == 0 {
 			format!(
-				"want {} side-band-64k ofs-delta object-format={} agent={AGENT}\n",
+				"want {} side-band-64k thin-pack ofs-delta object-format={} agent={AGENT}\n",
 				want.to_hex(),
 				H::NAME
 			)

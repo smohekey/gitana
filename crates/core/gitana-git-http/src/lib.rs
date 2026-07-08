@@ -31,7 +31,7 @@ pub use gitana_trust::AuditEvent;
 pub use ls_refs::ls_refs;
 pub use no_replay_check::NoReplayCheck;
 pub use nonce_ledger::NonceLedger;
-pub use pack::build_pack;
+pub use pack::{build_pack, build_pack_thin};
 pub use push_cert::{
 	CertCommand, PushCert, build as build_push_cert, make_nonce, peek as peek_push_cert, verify_nonce,
 };

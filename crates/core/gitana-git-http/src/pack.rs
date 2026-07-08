@@ -8,44 +8,87 @@
 use std::collections::HashSet;
 
 use gitana_file_store::FileStore;
-use gitana_object::{HashAlgorithm, ObjectId, PackedObject, encode_pack, referenced_ids};
+use gitana_object::{
+	HashAlgorithm, ObjectId, PackedObject, encode_pack, encode_pack_with_bases, referenced_ids,
+};
 use gitana_object_store::ObjectStoreError;
 use gitana_repository::Repository;
 
 use crate::GitHttpError;
 
+/// Cap on the total payload of boundary objects retained as thin-pack delta bases. The
+/// have-closure can be the whole repository, but only objects near the tips make useful
+/// bases for an incremental change; a DFS from the have tips reaches those first, so
+/// this budget keeps recent boundary objects and drops the deep tail. Correctness is
+/// unaffected — dropping a base just forgoes a delta (the object is sent full).
+///
+/// Follow-up: git bounds thin bases to the *edge* objects adjacent to the cut rather
+/// than a byte budget over the closure; that is a tighter, more targeted heuristic.
+const MAX_THIN_BASE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Build a delta-compressed packfile carrying the objects reachable from `wants` but
 /// not from `haves`. An empty want set yields an empty (header + trailer) pack.
 ///
 /// Used server-side to answer a fetch, and client-side (`gta push`) to pack the
-/// objects a push must send.
+/// objects a push must send. The pack is **self-contained** (every delta base is
+/// carried in it); see [`build_pack_thin`] for the thin counterpart.
 pub async fn build_pack<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	wants: &[ObjectId<H>],
 	haves: &[ObjectId<H>],
 ) -> Result<Vec<u8>, GitHttpError> {
-	let objects = collect_objects(repo, wants, haves).await?;
+	let (objects, _bases) = collect_objects(repo, wants, haves, false).await?;
 	Ok(encode_pack(&objects))
 }
 
+/// Build a **thin** packfile for the same object set as [`build_pack`], additionally
+/// deltifying against the boundary objects the peer already has (the have-closure) as
+/// external bases referenced by id and never carried in the pack. The peer must
+/// complete the pack against its object store before storing it.
+///
+/// Used when the peer negotiated `thin-pack` (fetch) or on the push send path (stock
+/// git and gitana both complete an incoming thin pack).
+pub async fn build_pack_thin<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	wants: &[ObjectId<H>],
+	haves: &[ObjectId<H>],
+) -> Result<Vec<u8>, GitHttpError> {
+	let (objects, bases) = collect_objects(repo, wants, haves, true).await?;
+	Ok(encode_pack_with_bases(&objects, &bases))
+}
+
 /// Collect the objects to send: reachable-from-`wants` minus reachable-from-`haves`.
+/// When `thin`, also return the boundary objects (the have-closure, up to
+/// [`MAX_THIN_BASE_BYTES`]) to offer as external delta bases.
 async fn collect_objects<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	wants: &[ObjectId<H>],
 	haves: &[ObjectId<H>],
-) -> Result<Vec<PackedObject<H>>, GitHttpError> {
+	thin: bool,
+) -> Result<(Vec<PackedObject<H>>, Vec<PackedObject<H>>), GitHttpError> {
 	let store = repo.objects();
 
 	// Pass 1: mark everything reachable from the haves we actually have. An unknown
-	// have is ignored (the client may report objects the server lacks).
+	// have is ignored (the client may report objects the server lacks). When thin,
+	// retain the objects read here (near-tip first) as candidate delta bases, capped.
 	let mut excluded: HashSet<ObjectId<H>> = HashSet::new();
+	let mut bases: Vec<PackedObject<H>> = Vec::new();
+	let mut bases_bytes = 0usize;
 	let mut stack: Vec<ObjectId<H>> = haves.to_vec();
 	while let Some(id) = stack.pop() {
 		if !excluded.insert(id) {
 			continue;
 		}
 		match store.read_object(&id).await {
-			Ok((kind, data)) => stack.extend(referenced_ids::<H>(kind, &data)?),
+			Ok((kind, data)) => {
+				stack.extend(referenced_ids::<H>(kind, &data)?);
+				// Retain as a base only if it fits the remaining budget, so no single large
+				// object pushes the retained set past the cap (an oversize base is skipped).
+				if thin && bases_bytes.saturating_add(data.len()) <= MAX_THIN_BASE_BYTES {
+					bases_bytes += data.len();
+					bases.push(PackedObject { id, kind, data });
+				}
+			}
 			Err(ObjectStoreError::NotFound) => {}
 			Err(other) => return Err(other.into()),
 		}
@@ -64,5 +107,5 @@ async fn collect_objects<H: HashAlgorithm>(
 		stack.extend(referenced_ids::<H>(kind, &data)?);
 		result.push(PackedObject { id, kind, data });
 	}
-	Ok(result)
+	Ok((result, bases))
 }

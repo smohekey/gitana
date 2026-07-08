@@ -1,12 +1,18 @@
 //! Writer for git packfiles (v2): the encoder counterpart to [`crate::decode_pack`].
 //!
-//! Serialises a set of fully materialised objects into a self-contained pack,
-//! delta-compressing with a git-style sliding window (objects sorted by type then
-//! size, each tried against a small window of earlier objects of the same type).
-//! Deltas are emitted as `OBJ_OFS_DELTA` entries referencing an earlier entry by
-//! byte distance, so the pack is never thin. The trailer is the `H` hash of the
-//! whole pack. Round-trips through [`crate::decode_pack`] and is accepted by stock
-//! `git index-pack` for the matching object format.
+//! Serialises a set of fully materialised objects, delta-compressing with a git-style
+//! sliding window (objects sorted by type then size, each tried against a small window
+//! of earlier objects of the same type). In-pack deltas are emitted as `OBJ_OFS_DELTA`
+//! entries referencing an earlier entry by byte distance. The trailer is the `H` hash
+//! of the whole pack. Round-trips through [`crate::decode_pack`] and is accepted by
+//! stock `git index-pack` for the matching object format.
+//!
+//! [`encode_pack`] produces a **self-contained** pack (every delta base is carried in
+//! the pack). [`encode_pack_with_bases`] additionally allows deltifying against a pool
+//! of *external* base objects the peer is known to already have — emitted as
+//! `OBJ_REF_DELTA` entries referencing the base by id and never written into the pack —
+//! producing a **thin** pack. A thin pack must be completed against those bases (see
+//! [`crate::decode_pack_with_bases`]) before it can be stored for random access.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -15,13 +21,14 @@ use flate2::Compression;
 use flate2::write::ZlibEncoder;
 
 use crate::pack::PackedObject;
-use crate::{HashAlgorithm, ObjectKind};
+use crate::{HashAlgorithm, ObjectId, ObjectKind};
 
 const OBJ_COMMIT: u8 = 1;
 const OBJ_TREE: u8 = 2;
 const OBJ_BLOB: u8 = 3;
 const OBJ_TAG: u8 = 4;
 const OBJ_OFS_DELTA: u8 = 6;
+const OBJ_REF_DELTA: u8 = 7;
 
 /// How many earlier objects each candidate is tried against for delta compression.
 const WINDOW: usize = 10;
@@ -37,7 +44,7 @@ const MAX_INSERT: usize = 0x7f;
 const MAX_CANDIDATES: usize = 64;
 
 /// How one object is written into the pack.
-enum Encoding {
+enum Encoding<H: HashAlgorithm> {
 	/// Full object: its zlib-compressed payload.
 	Full,
 	/// OFS delta against an earlier emitted entry (by position in the write order).
@@ -47,6 +54,22 @@ enum Encoding {
 		/// The delta instructions transforming the base into this object.
 		delta: Vec<u8>,
 	},
+	/// REF delta against an external base the peer already has (not carried in the
+	/// pack): the base is referenced by id, making the pack thin.
+	Ref {
+		/// Id of the external base object.
+		base_id: ObjectId<H>,
+		/// The delta instructions transforming the base into this object.
+		delta: Vec<u8>,
+	},
+}
+
+/// One candidate delta base in the combined ordering: either an object being written
+/// (`Real`, an index into `objects`) or an external base (`Ext`, an index into
+/// `external_bases`) that is only referenced, never emitted.
+enum Candidate {
+	Real(usize),
+	Ext(usize),
 }
 
 /// Encode `objects` into a self-contained, delta-compressed packfile (v2) under the
@@ -54,64 +77,134 @@ enum Encoding {
 ///
 /// Order within `objects` does not matter; the encoder picks its own write order.
 pub fn encode_pack<H: HashAlgorithm>(objects: &[PackedObject<H>]) -> Vec<u8> {
-	let order = delta_order(objects);
-	let plans = plan_deltas(objects, &order);
+	encode_pack_with_bases(objects, &[])
+}
+
+/// Encode `objects` into a possibly-**thin** packfile, allowing deltas against
+/// `external_bases` — objects the peer already has, which are referenced by id
+/// (`OBJ_REF_DELTA`) but never written into the pack.
+///
+/// The external bases participate in the delta-compression window as candidate bases
+/// only; they are never emitted and never themselves deltified. With an empty
+/// `external_bases` this is byte-identical to [`encode_pack`] (a self-contained pack).
+/// A receiver must complete the resulting pack against the same bases (see
+/// [`crate::decode_pack_with_bases`]) before storing it for random access.
+pub fn encode_pack_with_bases<H: HashAlgorithm>(
+	objects: &[PackedObject<H>],
+	external_bases: &[PackedObject<H>],
+) -> Vec<u8> {
+	let combined = combined_order(objects, external_bases);
+	let (order, plans) = plan_deltas(objects, external_bases, &combined);
 	write_pack(objects, &order, &plans)
 }
 
-/// Choose the write order: group by type, then largest first (a bigger object is a
-/// better delta base), then by id for determinism.
-fn delta_order<H: HashAlgorithm>(objects: &[PackedObject<H>]) -> Vec<usize> {
-	let mut order: Vec<usize> = (0..objects.len()).collect();
-	order.sort_by(|&a, &b| {
-		let oa = &objects[a];
-		let ob = &objects[b];
+/// Order all candidate bases — the objects to write plus the external bases — by type,
+/// then largest first (a bigger object is a better delta base), then by id for
+/// determinism. Reals appear in this same relative order in the pack's write order.
+fn combined_order<H: HashAlgorithm>(
+	objects: &[PackedObject<H>],
+	external_bases: &[PackedObject<H>],
+) -> Vec<Candidate> {
+	let mut combined: Vec<Candidate> = (0..objects.len())
+		.map(Candidate::Real)
+		.chain((0..external_bases.len()).map(Candidate::Ext))
+		.collect();
+	let key = |c: &Candidate| -> &PackedObject<H> {
+		match *c {
+			Candidate::Real(i) => &objects[i],
+			Candidate::Ext(k) => &external_bases[k],
+		}
+	};
+	combined.sort_by(|a, b| {
+		let oa = key(a);
+		let ob = key(b);
 		type_rank(oa.kind)
 			.cmp(&type_rank(ob.kind))
 			.then(ob.data.len().cmp(&oa.data.len()))
 			.then(oa.id.as_bytes().cmp(ob.id.as_bytes()))
 	});
-	order
+	combined
 }
 
-/// For each object in write order, try to delta it against a window of earlier
-/// objects of the same type, keeping the smallest delta that beats the full form.
-fn plan_deltas<H: HashAlgorithm>(objects: &[PackedObject<H>], order: &[usize]) -> Vec<Encoding> {
-	let mut plans = Vec::with_capacity(order.len());
-	let mut depth = vec![0usize; order.len()];
+/// Plan each object's encoding against a window of earlier same-type candidates (which
+/// may be other objects in the pack → OFS, or external bases → REF), keeping the
+/// smallest delta that beats the full form. Returns the pack write order (indices into
+/// `objects`, a subsequence of the combined order) alongside the per-entry plans.
+fn plan_deltas<H: HashAlgorithm>(
+	objects: &[PackedObject<H>],
+	external_bases: &[PackedObject<H>],
+	combined: &[Candidate],
+) -> (Vec<usize>, Vec<Encoding<H>>) {
+	let payload = |c: &Candidate| -> (&[u8], ObjectKind) {
+		match *c {
+			Candidate::Real(i) => (&objects[i].data, objects[i].kind),
+			Candidate::Ext(k) => (&external_bases[k].data, external_bases[k].kind),
+		}
+	};
+	// Delta-chain depth per combined position (external bases stay 0: the receiver
+	// already holds them complete). Emit position per combined position, for reals.
+	let mut depth = vec![0usize; combined.len()];
+	let mut emit_pos: Vec<Option<usize>> = vec![None; combined.len()];
+	let mut order = Vec::new();
+	let mut plans = Vec::new();
 
-	for i in 0..order.len() {
-		let target = &objects[order[i]];
+	for i in 0..combined.len() {
+		let Candidate::Real(oi) = combined[i] else {
+			continue;
+		};
+		let target = &objects[oi];
 		let mut best: Option<(usize, Vec<u8>)> = None;
+		// In-pack (OFS) bases must precede this entry, so reals are only tried backward.
+		// External (REF) bases are referenced by id, independent of pack position, so
+		// they are also tried in the forward window — otherwise a target that sorts
+		// before its slightly-smaller external base (e.g. an append) would never find it.
 		let lo = i.saturating_sub(WINDOW);
-		for j in lo..i {
-			let base = &objects[order[j]];
-			if base.kind != target.kind || depth[j] >= MAX_DEPTH {
+		let hi = (i + WINDOW + 1).min(combined.len());
+		for j in lo..hi {
+			if j == i || matches!(combined[j], Candidate::Real(_) if j > i) {
 				continue;
 			}
-			let delta = encode_delta(&base.data, &target.data);
+			let (base_data, base_kind) = payload(&combined[j]);
+			if base_kind != target.kind || depth[j] >= MAX_DEPTH {
+				continue;
+			}
+			let delta = encode_delta(base_data, &target.data);
 			// Only worth it if smaller than the full payload; prefer the smallest.
 			if delta.len() < target.data.len() && best.as_ref().is_none_or(|(_, b)| delta.len() < b.len())
 			{
 				best = Some((j, delta));
 			}
 		}
+		let emit = order.len();
+		emit_pos[i] = Some(emit);
 		match best {
 			Some((j, delta)) => {
 				depth[i] = depth[j] + 1;
-				plans.push(Encoding::Ofs { base_pos: j, delta });
+				match combined[j] {
+					// A real base precedes this one in the combined order, so it has
+					// already been emitted: reference it by its write-order position.
+					Candidate::Real(_) => {
+						let base_pos = emit_pos[j].expect("a real base earlier in the order is emitted");
+						plans.push(Encoding::Ofs { base_pos, delta });
+					}
+					Candidate::Ext(k) => plans.push(Encoding::Ref {
+						base_id: external_bases[k].id,
+						delta,
+					}),
+				}
 			}
 			None => plans.push(Encoding::Full),
 		}
+		order.push(oi);
 	}
-	plans
+	(order, plans)
 }
 
 /// Serialise the planned objects, computing OFS distances and the trailer hash.
 fn write_pack<H: HashAlgorithm>(
 	objects: &[PackedObject<H>],
 	order: &[usize],
-	plans: &[Encoding],
+	plans: &[Encoding<H>],
 ) -> Vec<u8> {
 	let mut pack = Vec::new();
 	pack.extend_from_slice(b"PACK");
@@ -131,6 +224,11 @@ fn write_pack<H: HashAlgorithm>(
 			Encoding::Ofs { base_pos, delta } => {
 				write_obj_header(&mut pack, OBJ_OFS_DELTA, delta.len());
 				write_offset(&mut pack, entry_start - offsets[*base_pos]);
+				pack.extend_from_slice(&zlib(delta));
+			}
+			Encoding::Ref { base_id, delta } => {
+				write_obj_header(&mut pack, OBJ_REF_DELTA, delta.len());
+				pack.extend_from_slice(base_id.as_bytes());
 				pack.extend_from_slice(&zlib(delta));
 			}
 		}
@@ -428,5 +526,88 @@ mod tests {
 		reversed.reverse();
 		// The same set in any order yields the same pack bytes (deterministic order).
 		assert_eq!(encode_pack(&objects), encode_pack(&reversed));
+	}
+
+	#[test]
+	fn empty_bases_is_byte_identical_to_self_contained() {
+		// The thin encoder with no external bases must produce exactly the same pack as
+		// the self-contained encoder — the non-thin path is unchanged.
+		let objects = vec![
+			blob(b"the quick brown fox"),
+			blob(b"the quick brown fox jumps"),
+			blob(b"a wholly different payload here"),
+		];
+		assert_eq!(encode_pack(&objects), encode_pack_with_bases(&objects, &[]));
+	}
+
+	#[test]
+	fn thin_pack_ref_deltas_against_external_base() {
+		// A large base the peer already has; the object we send is a one-byte edit of it.
+		// With the base offered externally, the pack must carry the new object as a REF
+		// delta and NOT include the base — yet still complete against it.
+		let base_data = b"abcdefgh".repeat(2000);
+		let base = blob(&base_data);
+		let mut edited = base_data.clone();
+		edited.push(b'Z');
+		let target = blob(&edited);
+
+		let thin = encode_pack_with_bases(std::slice::from_ref(&target), std::slice::from_ref(&base));
+
+		// The base is not carried: a self-contained decode cannot resolve the REF delta.
+		assert!(matches!(
+			decode_pack::<Sha256>(&thin),
+			Err(crate::ObjectError::UnresolvedDeltaBase { .. })
+		));
+
+		// Completing against the external base yields the original object, byte-for-byte.
+		let mut bases = std::collections::HashMap::new();
+		bases.insert(base.id, (base.kind, base.data.clone()));
+		let decoded = crate::decode_pack_with_bases::<Sha256>(&thin, &bases).expect("complete thin");
+		assert_eq!(decoded, vec![target.clone()]);
+
+		// It really is thin: the pack is far smaller than the object it delivers.
+		assert!(
+			thin.len() < target.data.len() / 4,
+			"thin pack {} not much smaller than the object {}",
+			thin.len(),
+			target.data.len()
+		);
+	}
+
+	#[test]
+	fn thin_pack_mixes_ofs_and_ref_deltas() {
+		// Two objects to send that delta well against an external base and against each
+		// other: the encoder should use both a REF delta (external) and an OFS delta
+		// (in-pack), and the set must still reconstruct exactly.
+		let base_data = b"lorem ipsum dolor sit amet ".repeat(400);
+		let base = blob(&base_data);
+		let mut a = base_data.clone();
+		a.extend_from_slice(b"CONSECTETUR");
+		let mut b = a.clone();
+		b.extend_from_slice(b"ADIPISCING");
+		let obj_a = blob(&a);
+		let obj_b = blob(&b);
+
+		let objects = vec![obj_a.clone(), obj_b.clone()];
+		let thin = encode_pack_with_bases(&objects, std::slice::from_ref(&base));
+
+		let mut bases = std::collections::HashMap::new();
+		bases.insert(base.id, (base.kind, base.data.clone()));
+		let mut decoded =
+			crate::decode_pack_with_bases::<Sha256>(&thin, &bases).expect("complete thin");
+		decoded.sort_by(|x, y| x.data.len().cmp(&y.data.len()));
+		let mut expected = objects;
+		expected.sort_by(|x, y| x.data.len().cmp(&y.data.len()));
+		assert_eq!(decoded, expected);
+	}
+
+	#[test]
+	fn unused_external_bases_do_not_appear_in_the_pack() {
+		// An external base that nothing deltas against must not bloat or corrupt the pack:
+		// the output equals the self-contained pack of just the objects.
+		let objects = vec![blob(b"hello"), blob(b"world")];
+		let unrelated = blob(&b"z".repeat(500));
+		let thin = encode_pack_with_bases(&objects, std::slice::from_ref(&unrelated));
+		assert_eq!(decode_pack::<Sha256>(&thin).expect("decode"), objects);
 	}
 }

@@ -52,7 +52,7 @@ pub use pack::{
 	PackEntry, PackedObject, decode_object_at, decode_pack, decode_pack_entry,
 	decode_pack_with_bases, pack_index_entries, ref_delta_base_ids,
 };
-pub use pack_encode::encode_pack;
+pub use pack_encode::{encode_pack, encode_pack_with_bases};
 pub use pktline::{
 	DELIM_PKT, FLUSH_PKT, MAX_PKT_DATA, PktLine, RESPONSE_END_PKT, parse_pkt, write_delim,
 	write_flush, write_pkt,

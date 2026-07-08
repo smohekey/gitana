@@ -221,6 +221,117 @@ async fn git_clones_gitana_tags() {
 	assert_eq!(git(&checkout, &["rev-parse", "lw"]), head.to_hex());
 }
 
+// --- thin packs ---------------------------------------------------------------------------------
+
+/// A large, delta-friendly blob tagged by `marker`; a successor differing in one byte deltas well
+/// against it, forcing a thin pack when one side already has the other version.
+fn big(marker: u8) -> Vec<u8> {
+	let mut data = b"the quick brown fox jumps over the lazy dog. ".repeat(200);
+	data.push(marker);
+	data
+}
+
+/// Stock `git` fetches an incremental change to a big file from gitana. git negotiates `thin-pack`
+/// by default, so gitana serves a **thin** pack (the new blob as a REF delta against the old one the
+/// client already has); git must complete it (`index-pack --fix-thin`). fsck proves the result is
+/// intact and connected.
+async fn thin_fetch_case(version: u8) {
+	let work = unique_tmp("interop-thin-fetch");
+	let git_dir = work.join("srv.git");
+	std::fs::create_dir_all(&git_dir).unwrap();
+	let repo = open::<Sha1>(&git_dir);
+	repo.init().await.unwrap();
+	commit_on(&repo, "big.txt", &big(b'A')).await;
+	let url = serve_gitana(git_dir.clone(), ServerHash::Sha1).await;
+
+	let checkout = work.join("c");
+	assert_cloned(&clone(&url, &checkout, version), version);
+
+	// The server changes the big file by one byte; the client fetches it.
+	let advanced = commit_on(&open::<Sha1>(&git_dir), "big.txt", &big(b'B')).await;
+	let out = git_try(
+		&checkout,
+		&[
+			"-c",
+			&format!("protocol.version={version}"),
+			"fetch",
+			"origin",
+		],
+	);
+	assert!(
+		out.status.success(),
+		"git fetch (v{version}) failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	assert_eq!(
+		git(&checkout, &["rev-parse", "origin/main"]),
+		advanced.to_hex()
+	);
+	// A completed thin pack must be a valid, connected object graph.
+	let fsck = git_try(&checkout, &["fsck", "--full"]);
+	assert!(
+		fsck.status.success(),
+		"git fsck after a thin fetch failed: {}",
+		String::from_utf8_lossy(&fsck.stderr)
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_fetches_a_thin_pack_from_gitana_over_v2() {
+	thin_fetch_case(2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_fetches_a_thin_pack_from_gitana_over_v0() {
+	thin_fetch_case(0).await;
+}
+
+/// Stock `git` pushes an incremental change to a big file into gitana. git's send-pack sends a
+/// **thin** pack by default (the new blob as a REF delta against the old one gitana has); gitana's
+/// receive-pack must complete it against its store. The push succeeding at all requires connectivity
+/// to hold; we further read the de-thinned blob back to confirm it was stored byte-for-byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_pushes_a_thin_pack_into_gitana() {
+	let work = unique_tmp("interop-thin-push");
+	let git_dir = work.join("srv.git");
+	std::fs::create_dir_all(&git_dir).unwrap();
+	let repo = open::<Sha1>(&git_dir);
+	repo.init().await.unwrap();
+	commit_on(&repo, "big.txt", &big(b'A')).await;
+	let url = serve_gitana(git_dir.clone(), ServerHash::Sha1).await;
+
+	let checkout = work.join("c");
+	assert_cloned(&clone(&url, &checkout, 2), 2);
+
+	// Change the big file by one byte through stock git and push it back.
+	git(&checkout, &["config", "user.name", "C"]);
+	git(&checkout, &["config", "user.email", "c@e"]);
+	std::fs::write(checkout.join("big.txt"), big(b'B')).unwrap();
+	git(&checkout, &["commit", "-aqm", "tweak big"]);
+	let head = git(&checkout, &["rev-parse", "HEAD"]);
+	let blob = git(&checkout, &["rev-parse", "HEAD:big.txt"]);
+	let push = git_try(&checkout, &["push", "origin", "HEAD:refs/heads/main"]);
+	assert!(
+		push.status.success(),
+		"git thin push failed: {}",
+		String::from_utf8_lossy(&push.stderr)
+	);
+
+	// The ref moved, and the delta-completed blob is stored intact.
+	let server = open::<Sha1>(&git_dir);
+	assert_eq!(
+		server.refs().resolve("refs/heads/main").await.unwrap(),
+		Some(ObjectId::<Sha1>::from_hex(&head).unwrap())
+	);
+	let (kind, data) = server
+		.objects()
+		.read_object(&ObjectId::<Sha1>::from_hex(&blob).unwrap())
+		.await
+		.unwrap();
+	assert_eq!(kind, ObjectKind::Blob);
+	assert_eq!(data, big(b'B'));
+}
+
 // --- SHA-256 ------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

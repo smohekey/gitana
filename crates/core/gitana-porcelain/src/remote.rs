@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_git_http::{
-	Advertised, CertCommand, PushCert, RefUpdate, build_pack, build_push_cert,
+	Advertised, CertCommand, PushCert, RefUpdate, build_pack_thin, build_push_cert,
 	build_receive_pack_request, parse_advertisement, parse_report_status,
 };
 use gitana_object::{HashAlgorithm, ObjectId};
@@ -751,7 +751,9 @@ async fn pack_for<F: FileStore, H: HashAlgorithm>(
 		return Ok(Vec::new());
 	}
 	let haves = gitana_remote::advertised_oids(advertised);
-	Ok(build_pack(repo, &wants, &haves).await?)
+	// Send a thin pack: deltas against the advertised tips the remote already has. Both
+	// stock git and gitana's receive-pack complete an incoming thin pack before storing.
+	Ok(build_pack_thin(repo, &wants, &haves).await?)
 }
 
 /// Render metadata for each planned update.

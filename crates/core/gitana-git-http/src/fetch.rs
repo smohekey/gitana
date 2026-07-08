@@ -17,7 +17,7 @@ use gitana_object::{
 use gitana_repository::Repository;
 
 use crate::GitHttpError;
-use crate::pack::build_pack;
+use crate::pack::{build_pack, build_pack_thin};
 use crate::sideband::write_sideband_pack;
 
 /// Parsed `fetch` arguments.
@@ -28,6 +28,8 @@ struct FetchArgs<H: HashAlgorithm> {
 	haves: Vec<ObjectId<H>>,
 	/// The client has finished negotiating.
 	done: bool,
+	/// The client requested `thin-pack` (deltas may reference bases it already has).
+	thin: bool,
 }
 
 /// Handle a v2 `fetch` request body, returning the negotiation + packfile response.
@@ -74,7 +76,11 @@ async fn finish_with_pack<H: HashAlgorithm>(
 	args: &FetchArgs<H>,
 ) -> Result<Vec<u8>, GitHttpError> {
 	write_pkt(&mut out, b"packfile\n")?;
-	let pack = build_pack(repo, &args.wants, &args.haves).await?;
+	let pack = if args.thin {
+		build_pack_thin(repo, &args.wants, &args.haves).await?
+	} else {
+		build_pack(repo, &args.wants, &args.haves).await?
+	};
 	write_sideband_pack(&mut out, &pack)?;
 	write_flush(&mut out);
 	Ok(out)
@@ -102,6 +108,7 @@ fn parse_fetch<H: HashAlgorithm>(request: &[u8]) -> Result<FetchArgs<H>, GitHttp
 		wants: Vec::new(),
 		haves: Vec::new(),
 		done: false,
+		thin: false,
 	};
 	let mut saw_command = false;
 
@@ -123,6 +130,8 @@ fn parse_fetch<H: HashAlgorithm>(request: &[u8]) -> Result<FetchArgs<H>, GitHttp
 			saw_command = true;
 		} else if text == "done" {
 			args.done = true;
+		} else if text == "thin-pack" {
+			args.thin = true;
 		} else if let Some(oid) = text.strip_prefix("want ") {
 			args.wants.push(parse_oid(oid)?);
 		} else if let Some(oid) = text.strip_prefix("have ") {

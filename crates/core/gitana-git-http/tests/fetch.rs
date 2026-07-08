@@ -3,10 +3,14 @@
 //! requested objects. Stock-`git clone` interop belongs in higher-level HTTP
 //! integration tests.
 
+use std::collections::HashMap;
+
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_git_http::{fetch, upload_pack_v0};
 use gitana_object::Sha256;
-use gitana_object::{ObjectId, PktLine, decode_pack, parse_pkt};
+use gitana_object::{
+	ObjectId, PktLine, decode_pack, decode_pack_with_bases, parse_pkt, ref_delta_base_ids,
+};
 use gitana_object_store::ObjectStore;
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 
@@ -172,4 +176,152 @@ fn extract_pack_v0(body: &[u8]) -> Vec<u8> {
 		}
 	}
 	pack
+}
+
+// --- thin packs ---------------------------------------------------------------------
+
+/// A large, delta-friendly blob tagged by `marker`, so a successor differing by a byte
+/// deltas well against it.
+fn big_blob(marker: u8) -> Vec<u8> {
+	let mut data = b"the quick brown fox jumps over the lazy dog. ".repeat(200);
+	data.push(marker);
+	data
+}
+
+/// A repo with two commits to `file.txt`: a big blob, then a near-identical one. Returns
+/// the repo, both commit ids, and the second (new) blob's id.
+async fn repo_with_two_big_commits() -> (
+	Repository<MemoryFileStore, Sha256>,
+	ObjectId<Sha256>,
+	ObjectId<Sha256>,
+	ObjectId<Sha256>,
+) {
+	let repo = repo();
+	repo.init().await.expect("init");
+	let commit_file = async |content: &[u8], msg: &str| {
+		let blob = repo.write_blob(content).await.expect("blob");
+		let tree = repo
+			.write_tree(&[TreeBuildEntry {
+				path: "file.txt".to_owned(),
+				mode: FileMode::Regular,
+				id: blob,
+			}])
+			.await
+			.expect("tree");
+		let commit = repo
+			.commit_on_head(tree, "A <a@x> 1 +0000", "A <a@x> 1 +0000", msg)
+			.await
+			.expect("commit");
+		(blob, commit)
+	};
+	let (_, first) = commit_file(&big_blob(b'A'), "first\n").await;
+	let (second_blob, second) = commit_file(&big_blob(b'B'), "second\n").await;
+	(repo, first, second, second_blob)
+}
+
+/// Complete a (possibly thin) pack against the repo's object store — the client-side
+/// de-thinning: supply every referenced base we already have, then decode.
+async fn complete_against_store(
+	repo: &Repository<MemoryFileStore, Sha256>,
+	pack: &[u8],
+) -> Vec<gitana_object::PackedObject<Sha256>> {
+	let mut bases = HashMap::new();
+	for id in ref_delta_base_ids::<Sha256>(pack).expect("scan bases") {
+		if let Ok((kind, data)) = repo.objects().read_object(&id).await {
+			bases.insert(id, (kind, data));
+		}
+	}
+	decode_pack_with_bases::<Sha256>(pack, &bases).expect("complete")
+}
+
+/// Build a v2 `fetch` body wanting `want`, having `have`, optionally negotiating thin.
+fn v2_fetch_body(want: &ObjectId<Sha256>, have: &ObjectId<Sha256>, thin: bool) -> Vec<u8> {
+	let mut request = pkt("command=fetch\n");
+	request.extend_from_slice(b"0001");
+	if thin {
+		request.extend_from_slice(&pkt("thin-pack\n"));
+	}
+	request.extend_from_slice(&pkt(&format!("want {want}\n")));
+	request.extend_from_slice(&pkt(&format!("have {have}\n")));
+	request.extend_from_slice(&pkt("done\n"));
+	request.extend_from_slice(b"0000");
+	request
+}
+
+#[tokio::test]
+async fn v2_fetch_serves_a_thin_pack_only_when_negotiated() {
+	let (repo, first, second, second_blob) = repo_with_two_big_commits().await;
+
+	// Without `thin-pack`, the pack is self-contained: it decodes standalone.
+	let fat = extract_pack(
+		&fetch(&repo, &v2_fetch_body(&second, &first, false))
+			.await
+			.unwrap(),
+	);
+	assert!(
+		ref_delta_base_ids::<Sha256>(&fat).unwrap().is_empty(),
+		"a fat pack must carry no external REF-delta bases"
+	);
+	decode_pack::<Sha256>(&fat).expect("fat pack decodes standalone");
+
+	// With `thin-pack`, the new blob is a REF delta against the old one (not carried), so
+	// a standalone decode fails but completing against the store yields the new blob.
+	let thin = extract_pack(
+		&fetch(&repo, &v2_fetch_body(&second, &first, true))
+			.await
+			.unwrap(),
+	);
+	assert!(
+		!ref_delta_base_ids::<Sha256>(&thin).unwrap().is_empty(),
+		"a thin pack must reference an external base"
+	);
+	assert!(
+		thin.len() < fat.len(),
+		"the thin pack ({}) should be smaller than the fat one ({})",
+		thin.len(),
+		fat.len()
+	);
+	assert!(
+		decode_pack::<Sha256>(&thin).is_err(),
+		"thin pack is not self-contained"
+	);
+	let completed = complete_against_store(&repo, &thin).await;
+	assert!(
+		completed.iter().any(|o| o.id == second_blob),
+		"new blob resolved"
+	);
+	assert!(
+		completed.iter().any(|o| o.id == second),
+		"new commit present"
+	);
+}
+
+#[tokio::test]
+async fn v0_upload_pack_serves_a_thin_pack_only_when_negotiated() {
+	let (repo, first, second, second_blob) = repo_with_two_big_commits().await;
+
+	let body = |thin: bool| {
+		let caps = if thin {
+			"side-band-64k thin-pack ofs-delta"
+		} else {
+			"side-band-64k ofs-delta"
+		};
+		let mut request = pkt(&format!("want {second} {caps}\n"));
+		request.extend_from_slice(&pkt(&format!("want {second}\n")));
+		request.extend_from_slice(b"0000");
+		request.extend_from_slice(&pkt(&format!("have {first}\n")));
+		request.extend_from_slice(&pkt("done\n"));
+		request
+	};
+
+	let fat = extract_pack_v0(&upload_pack_v0(&repo, &body(false)).await.unwrap());
+	assert!(ref_delta_base_ids::<Sha256>(&fat).unwrap().is_empty());
+	decode_pack::<Sha256>(&fat).expect("fat pack decodes standalone");
+
+	let thin = extract_pack_v0(&upload_pack_v0(&repo, &body(true)).await.unwrap());
+	assert!(!ref_delta_base_ids::<Sha256>(&thin).unwrap().is_empty());
+	assert!(decode_pack::<Sha256>(&thin).is_err());
+	let completed = complete_against_store(&repo, &thin).await;
+	assert!(completed.iter().any(|o| o.id == second_blob));
+	assert!(completed.iter().any(|o| o.id == second));
 }

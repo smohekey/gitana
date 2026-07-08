@@ -21,6 +21,7 @@ pub use refspec::Refspec;
 #[cfg(feature = "reqwest-transport")]
 pub use reqwest_transport::ReqwestTransport;
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -29,7 +30,10 @@ use gitana_file_store::FileStore;
 use gitana_git_http::{
 	Advertised, build_upload_pack_request, parse_upload_pack_response, peek_object_format,
 };
-use gitana_object::{HashAlgorithm, HashKind, ObjectId};
+use gitana_object::{
+	HashAlgorithm, HashKind, ObjectError, ObjectId, decode_pack_with_bases, pack_index_entries,
+	ref_delta_base_ids,
+};
 use gitana_repository::Repository;
 
 const UPLOAD_PACK_REQUEST: &str = "application/x-git-upload-pack-request";
@@ -174,11 +178,58 @@ pub async fn fetch_pack<H: HashAlgorithm>(
 	let pack = parse_upload_pack_response(&response)?;
 	// Skip an empty pack (server had nothing new). The 12-byte header carries the count.
 	if pack.len() >= 12 && pack_object_count(&pack) > 0 {
-		repo
-			.objects()
-			.write_pack(pack)
+		store_fetched_pack(repo, pack)
 			.await
 			.context("storing fetched pack")?;
+	}
+	Ok(())
+}
+
+/// Persist a fetched pack. A self-contained pack is stored whole (pack + `.idx`, for
+/// random access), including one whose `REF_DELTA` bases all live in the pack. A **thin**
+/// pack — one whose deltas reference a base *outside* it, which the server may send
+/// because we negotiate `thin-pack` — cannot be stored directly (`write_pack` rejects
+/// it); complete it against the bases already in our store and materialise its objects
+/// loose, mirroring the receive-pack unpack path.
+async fn store_fetched_pack<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	pack: Vec<u8>,
+) -> Result<()> {
+	// No REF deltas at all → self-contained (the common clone/OFS case); a cheap header
+	// scan avoids decoding the whole pack twice.
+	if ref_delta_base_ids::<H>(&pack)?.is_empty() {
+		repo.objects().write_pack(pack).await?;
+		return Ok(());
+	}
+	// There are REF deltas: their bases may be carried in the pack (still self-contained)
+	// or external (thin). Probe by indexing — it resolves every delta, so it succeeds iff
+	// self-contained and fails with `UnresolvedDeltaBase` iff a base is genuinely missing.
+	match pack_index_entries::<H>(&pack) {
+		Ok(_) => repo.objects().write_pack(pack).await?,
+		Err(ObjectError::UnresolvedDeltaBase) => complete_thin_pack(repo, &pack).await?,
+		Err(other) => return Err(other.into()),
+	}
+	Ok(())
+}
+
+/// Complete a thin pack against the objects already in `repo` and store its objects loose.
+async fn complete_thin_pack<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	pack: &[u8],
+) -> Result<()> {
+	// Supply every referenced base we already have; in-pack bases resolve from the pack,
+	// external ones from this map. A base we lack surfaces as a decode error.
+	let mut bases = HashMap::new();
+	for id in ref_delta_base_ids::<H>(pack)? {
+		if let Ok(object) = repo.objects().read_object(&id).await {
+			bases.insert(id, object);
+		}
+	}
+	for object in decode_pack_with_bases(pack, &bases)? {
+		repo
+			.objects()
+			.write_object(object.kind, &object.data)
+			.await?;
 	}
 	Ok(())
 }
