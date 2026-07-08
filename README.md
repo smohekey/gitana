@@ -97,8 +97,10 @@ Major gaps:
   un-bitmapped frontier is walked), so the have side is never read for a non-shallow fetch.
   Ancestry queries consume it too: fetch negotiation (`ok_to_give_up`) and `is_ancestor`
   (behind `merge`/`rebase`/`merge-base`) answer from a commit-only reachability set over the
-  bitmap on a non-shallow repo. `rev-list`/`log` still walk the graph — they need ordered
-  output, which bitmaps do not provide.
+  bitmap on a non-shallow repo. `prune`/`gc` liveness consumes it as well: the reachable-object
+  closure that decides which loose objects survive takes the bitmap fast path on a non-shallow
+  repo (the same walk-fill), falling back to the graph walk when shallow or un-bitmapped.
+  `rev-list`/`log` still walk the graph — they need ordered output, which bitmaps do not provide.
 
 ## `gta` CLI
 

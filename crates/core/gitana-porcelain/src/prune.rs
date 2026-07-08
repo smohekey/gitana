@@ -197,12 +197,25 @@ async fn collect_roots<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 /// This matches the shallow view git presents, so prune/gc reclaim truncated history and `fetch`'s tag
 /// auto-follow (which tests reachability from the fetched branch tips) does not follow tags past the
 /// boundary.
+///
+/// When the repo is non-shallow and a usable reachability bitmap is present, this delegates to
+/// [`ObjectStore::reachable_object_closure`] (git's bitmap fill-in: a bitmapped commit contributes its
+/// whole closure in one step, only the un-bitmapped frontier is walked) — the same reachable set the
+/// walk below computes, since both skip a missing object and follow the identical [`referenced_ids`]
+/// edges. The gate mirrors slices 1-2: a bitmap is only written for a non-shallow repo, and it encodes
+/// full-history reachability that would cross a shallow boundary the walk must respect.
 pub(crate) async fn reachable_from<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	roots: Vec<ObjectId<H>>,
 ) -> Result<HashSet<ObjectId<H>>> {
 	let store = repo.objects();
 	let shallow: HashSet<ObjectId<H>> = repo.read_shallow().await?.into_iter().collect();
+	// The bitmap encodes full-history reachability (crossing any shallow boundary) and exists only for a
+	// non-shallow repo, so take the accelerated closure only with no boundary to respect. Lenient: a
+	// missing object is skipped, matching the walk below.
+	if shallow.is_empty() && store.has_reachability_bitmap().await? {
+		return Ok(store.reachable_object_closure(&roots, false).await?);
+	}
 	let mut reachable: HashSet<ObjectId<H>> = HashSet::new();
 	let mut stack = roots;
 	while let Some(id) = stack.pop() {
@@ -279,6 +292,55 @@ mod tests {
 			repo.objects().exists_object(&parent).await.unwrap(),
 			"the parent object is genuinely still on disk"
 		);
+	}
+
+	/// With a usable reachability bitmap on a non-shallow repo, `reachable_from` takes the accelerated
+	/// closure ([`ObjectStore::reachable_object_closure`]) instead of the graph walk. It must compute the
+	/// same reachable set either way — the whole safety of prune/gc liveness rests on that equivalence.
+	/// The graph mixes a bitmapped tip (whose closure the bitmap supplies in one step) with an
+	/// un-bitmapped side tip (whose objects the frontier walk must still fill in).
+	#[tokio::test]
+	async fn reachable_from_with_a_bitmap_matches_the_walk() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+
+		// c0 <- c1 <- c2 (main tip) and c1 <- c3 (side tip); distinct content ⇒ distinct trees/blobs.
+		let c0 = loose_commit(repo, Vec::new(), "f.txt", b"0").await;
+		let c1 = loose_commit(repo, vec![c0], "f.txt", b"1").await;
+		let c2 = loose_commit(repo, vec![c1], "f.txt", b"2").await;
+		let c3 = loose_commit(repo, vec![c1], "f.txt", b"3").await;
+		let roots = vec![c2, c3];
+
+		// Baseline: no bitmap yet, so this runs the graph walk.
+		assert!(
+			!repo.objects().has_reachability_bitmap().await.unwrap(),
+			"no bitmap before repack",
+		);
+		let from_walk = reachable_from(repo, roots.clone()).await.unwrap();
+
+		// Repack and bitmap only the main tip c2; c3's objects are left to the frontier walk-fill.
+		repo.objects().repack(u64::MAX).await.unwrap();
+		repo
+			.objects()
+			.write_reachability_bitmap(&[c2])
+			.await
+			.unwrap();
+		assert!(
+			repo.objects().has_reachability_bitmap().await.unwrap(),
+			"the repo should now have a reachability bitmap",
+		);
+
+		// With the bitmap present (and no shallow boundary) this takes the closure fast path.
+		let from_bitmap = reachable_from(repo, roots).await.unwrap();
+
+		assert_eq!(
+			from_walk, from_bitmap,
+			"the bitmap closure must equal the graph walk",
+		);
+		// Sanity: the set is the whole history, including the un-bitmapped side tip filled in by the walk.
+		for id in [c0, c1, c2, c3] {
+			assert!(from_bitmap.contains(&id), "commit {id} reachable");
+		}
 	}
 
 	/// `prune` must never delete a commit listed in `.git/shallow` — even a *stale* entry sitting behind
