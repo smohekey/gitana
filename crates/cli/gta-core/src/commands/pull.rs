@@ -61,6 +61,7 @@ async fn pull_into<H: HashAlgorithm>(
 		body,
 		true,
 		gitana_porcelain::TagFetch::Auto,
+		&gitana_porcelain::Deepen::default(),
 	)
 	.await?;
 	println!("Fetched from {}", origin.url);

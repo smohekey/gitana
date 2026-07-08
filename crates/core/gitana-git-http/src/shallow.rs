@@ -17,6 +17,10 @@ use gitana_repository::Repository;
 use crate::GitHttpError;
 use crate::deepen::Deepen;
 
+/// git's `INFINITE_DEPTH` sentinel — the absolute `deepen` a client sends for `fetch --unshallow`
+/// (request all history). The server treats it as "drop every shallow boundary", not a literal depth.
+const INFINITE_DEPTH: u32 = 0x7fff_ffff;
+
 /// The outcome of a shallow-boundary computation.
 pub(crate) struct ShallowPlan<H: HashAlgorithm> {
 	/// The commits inside the shallow view (their tree closure is sent; boundary commits included).
@@ -65,6 +69,17 @@ pub(crate) async fn compute_shallow<H: HashAlgorithm>(
 	for &want in wants {
 		if let Some(commit) = peel_to_commit(repo, want).await? {
 			queue.push_back((commit, seed_budget));
+		}
+	}
+	// `--unshallow` (an unbounded absolute `deepen`) drops *all* shallowness, so complete every commit the
+	// client listed as shallow — not just those reachable from the wants. A narrowed/negative refspec may
+	// leave a client shallow at a branch the wants no longer cover; git still unshallows it from the
+	// client's `shallow` lines, so seed the walk from them too (unbounded), letting them be included,
+	// unshallowed, and their now-exposed history sent. A finite `deepen N` re-depths only the wants (git
+	// leaves the other branches' boundaries untouched), so this seeding is confined to the unshallow case.
+	if !deepen.relative && deepen.depth == Some(INFINITE_DEPTH) {
+		for &oid in client_shallow {
+			queue.push_back((oid, None));
 		}
 	}
 	while let Some((id, popped_budget)) = queue.pop_front() {
@@ -462,6 +477,44 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn unshallow_completes_every_client_boundary_even_off_the_wants() {
+		let repo = new_repo().await;
+		// Two disjoint branches, each truncated at depth 1 on the client.
+		let a = commit(&repo, &[], 1).await;
+		let b = commit(&repo, &[a], 2).await; // "main" tip
+		let x = commit(&repo, &[], 3).await;
+		let y = commit(&repo, &[x], 4).await; // "other" tip
+		let client_shallow = [b, y];
+
+		// `--unshallow` wanting only `main` (b) still completes the unselected `other` (y) from the
+		// client's `shallow` lines — matching git.
+		let p = plan(&repo, &[b], unshallow(), &client_shallow).await;
+		assert_eq!(p.included, set(&[a, b, x, y]));
+		assert!(
+			p.boundary.is_empty(),
+			"no boundary remains after --unshallow"
+		);
+		assert!(p.shallow.is_empty());
+		assert_eq!(
+			set(&p.unshallow),
+			set(&[b, y]),
+			"both client boundaries unshallow"
+		);
+		// The pack is seeded with the now-exposed parents of both completed branches.
+		assert_eq!(set(&p.send_roots), set(&[a, x]));
+
+		// Contrast: a *finite* `--depth 1` re-depths only the wanted branch and leaves the unselected
+		// branch's boundary untouched (git does the same), so `other` (y) is neither included nor
+		// unshallowed.
+		let p = plan(&repo, &[b], depth(1), &client_shallow).await;
+		assert!(
+			!p.included.contains(&y),
+			"a finite depth does not touch the unselected branch"
+		);
+		assert!(p.unshallow.is_empty());
+	}
+
+	#[tokio::test]
 	async fn rejects_unresolved_deepen_not() {
 		let repo = new_repo().await;
 		let c = commit(&repo, &[], 1).await;
@@ -482,6 +535,14 @@ mod tests {
 	fn since(t: i64) -> Deepen {
 		Deepen {
 			since: Some(t),
+			..Default::default()
+		}
+	}
+
+	/// `fetch --unshallow`: the unbounded absolute deepen sentinel.
+	fn unshallow() -> Deepen {
+		Deepen {
+			depth: Some(INFINITE_DEPTH),
 			..Default::default()
 		}
 	}

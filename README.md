@@ -135,6 +135,12 @@ Implemented command groups:
   `remove`, `rename`, `set-url`). `fetch` honours the configured `remote.origin.fetch` refspecs —
   wildcard, exact, force (`+`), and negative (`^`) — mapping advertised refs to tracking refs and
   enforcing fast-forward for non-forced refspecs.
+- Shallow history, matching git: `clone --depth N` / `--shallow-since <date>` / `--shallow-exclude
+  <ref>` truncate the fetched history and record the boundary in `.git/shallow`. `fetch` then extends
+  it with `--depth N` (absolute), `--deepen N` (relative to the current boundary), `--shallow-since` /
+  `--shallow-exclude`, or fills it in completely with `--unshallow`. Ancestry walks (`log`,
+  `rev-list`, `merge-base`, `rev-parse`) and `prune`/`gc` stop at the boundary rather than chasing the
+  absent parents; `gc` skips the reachability bitmap for a shallow repo (as git does).
 - Tags over the wire, matching git: `fetch` auto-follows tags (writing `refs/tags/*` for advertised
   tags reachable from the fetched branches), with `--tags` to mirror every tag, `--no-tags` to opt
   out, and `remote.origin.tagOpt` honoured; `push --tags` sends all local tags and `push

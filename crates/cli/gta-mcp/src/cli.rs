@@ -440,6 +440,22 @@ enum Command {
 		/// Disable tag auto-follow: fetch no tags beyond what the configured refspecs name.
 		#[arg(short = 'n', long = "no-tags", conflicts_with = "tags")]
 		no_tags: bool,
+		/// Limit the fetched history to this many commits from each branch tip (an absolute depth).
+		#[arg(long)]
+		depth: Option<u32>,
+		/// Deepen the existing shallow history by this many commits from the current boundary.
+		#[arg(long, conflicts_with = "depth")]
+		deepen: Option<u32>,
+		/// Fill in the complete history of a shallow repository (convert it to a full clone).
+		#[arg(long)]
+		unshallow: bool,
+		/// Deepen history to include commits at or after this date (a Unix timestamp or an ISO-8601 UTC
+		/// date such as `2020-01-31` or `2020-01-31T14:00:00Z`).
+		#[arg(long, value_name = "date")]
+		shallow_since: Option<String>,
+		/// Do not deepen history past this ref or commit (may be given more than once).
+		#[arg(long, value_name = "ref")]
+		shallow_exclude: Vec<String>,
 	},
 	/// Fetch the current branch from the origin and fast-forward the working tree.
 	Pull,
@@ -756,9 +772,26 @@ impl Cli {
 				shallow_since,
 				shallow_exclude,
 			} => commands::clone::run(url, path, depth, shallow_since, shallow_exclude).await,
-			Command::Fetch { tags, no_tags } => {
-				commands::fetch::run(&cwd, tags, no_tags).await.map(|_| ())
-			}
+			Command::Fetch {
+				tags,
+				no_tags,
+				depth,
+				deepen,
+				unshallow,
+				shallow_since,
+				shallow_exclude,
+			} => commands::fetch::run(
+				&cwd,
+				tags,
+				no_tags,
+				depth,
+				deepen,
+				unshallow,
+				shallow_since,
+				shallow_exclude,
+			)
+			.await
+			.map(|_| ()),
 			Command::Pull => commands::pull::run(&cwd).await,
 			Command::Push {
 				repository,

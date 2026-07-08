@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
-use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_tag, referenced_ids};
+use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_commit, parse_tag, referenced_ids};
 use gitana_object_store::{BitmapReport, ObjectStoreError, PruneReport, RepackReport};
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
@@ -50,9 +50,17 @@ pub async fn gc<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		.objects()
 		.repack_geometric(max_pack_size, GEOMETRIC_FACTOR)
 		.await?;
-	// The store keeps only the packed commits among these tips (a tag object or loose tip is skipped).
-	let tips = ref_tip_ids(wt).await?;
-	let bitmap = repo.objects().write_reachability_bitmap(&tips).await?;
+	// A shallow repository's history stops at the `.git/shallow` boundary, so its objects are not the
+	// complete reachability closure a bitmap encodes — a boundary commit's parents are absent. Building
+	// a bitmap would walk into those missing parents; git likewise declines bitmaps on a shallow repo.
+	// Skip it (the bitmap is only a query accelerator, so a shallow repo simply runs without one).
+	let bitmap = if repo.read_shallow().await?.is_empty() {
+		// The store keeps only the packed commits among these tips (a tag object or loose tip is skipped).
+		let tips = ref_tip_ids(wt).await?;
+		repo.objects().write_reachability_bitmap(&tips).await?
+	} else {
+		None
+	};
 	Ok((prune, repack, bitmap))
 }
 
@@ -147,8 +155,12 @@ async fn refuse_if_operation_in_progress<F: FileStore, H: HashAlgorithm>(
 }
 
 /// Every root a prune must keep reachable: refs (direct *and* symbolic-ref targets), HEAD, the
-/// index (all stages, so a staged-but-uncommitted blob survives), the reflogs, and any
-/// in-progress-operation head (`ORIG_HEAD` and the merge / cherry-pick / revert / rebase heads).
+/// index (all stages, so a staged-but-uncommitted blob survives), the reflogs, any
+/// in-progress-operation head (`ORIG_HEAD` and the merge / cherry-pick / revert / rebase heads), and
+/// every `.git/shallow` boundary commit — a shallow entry is a commit the client *has* (only its
+/// parents are withheld), and it is what the client re-sends as a `shallow` line on a later
+/// deepen/`--unshallow`, so deleting it would leave `.git/shallow` naming a missing object. (The walk
+/// still stops *at* a boundary, so history past it is reclaimed; the boundary itself is kept.)
 async fn collect_roots<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
 ) -> Result<Vec<ObjectId<H>>> {
@@ -160,6 +172,7 @@ async fn collect_roots<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	roots.extend(refs.symbolic_ref_targets("refs/").await?);
 	roots.extend(refs.resolve_head().await?);
 	roots.extend(refs.reflog_object_ids().await?);
+	roots.extend(repo.read_shallow().await?);
 	roots.extend(repo.orig_head().await?);
 	roots.extend(repo.merge_head().await?);
 	roots.extend(repo.cherry_pick_head().await?);
@@ -174,15 +187,22 @@ async fn collect_roots<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	Ok(roots)
 }
 
-/// The transitive closure of `roots` over the object graph — each object's [`referenced_ids`],
-/// read loose or packed. A root that does not exist is skipped (an empty repo has none), matching
-/// the async walk used to build a fetch pack. Shared with `fetch`'s tag auto-follow, which tests
-/// whether a tag's target is reachable from the fetched branch tips.
+/// The transitive closure of `roots` over the object graph — each object's [`referenced_ids`], read
+/// loose or packed.
+///
+/// The walk respects `.git/shallow`: a boundary commit is treated as parentless (only its tree is
+/// enqueued), so history past the boundary is excluded even when those parent objects still exist on
+/// disk — as after `fetch --depth` truncates a full clone. A missing object is also a dead end
+/// (skipped), covering an empty repo's absent roots and a shallow clone's genuinely-absent parents.
+/// This matches the shallow view git presents, so prune/gc reclaim truncated history and `fetch`'s tag
+/// auto-follow (which tests reachability from the fetched branch tips) does not follow tags past the
+/// boundary.
 pub(crate) async fn reachable_from<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	roots: Vec<ObjectId<H>>,
 ) -> Result<HashSet<ObjectId<H>>> {
 	let store = repo.objects();
+	let shallow: HashSet<ObjectId<H>> = repo.read_shallow().await?.into_iter().collect();
 	let mut reachable: HashSet<ObjectId<H>> = HashSet::new();
 	let mut stack = roots;
 	while let Some(id) = stack.pop() {
@@ -190,10 +210,109 @@ pub(crate) async fn reachable_from<F: FileStore, H: HashAlgorithm>(
 			continue;
 		}
 		match store.read_object(&id).await {
+			// A shallow-boundary commit is parentless here: enqueue only its tree, not the parents past
+			// the boundary (which may still be on disk).
+			Ok((ObjectKind::Commit, data)) if shallow.contains(&id) => {
+				stack.push(parse_commit::<H>(&data)?.tree);
+			}
 			Ok((kind, data)) => stack.extend(referenced_ids::<H>(kind, &data)?),
 			Err(ObjectStoreError::NotFound) => {}
 			Err(other) => return Err(other.into()),
 		}
 	}
 	Ok(reachable)
+}
+
+#[cfg(test)]
+mod tests {
+	use gitana_object::{ObjectId, ObjectKind};
+
+	use super::*;
+	use crate::test_support::{fixture, loose_commit};
+
+	/// A shallow repository holds commits whose parents are deliberately absent (the `.git/shallow`
+	/// boundary). `prune`/`gc` must treat those parents as a dead end, not corruption — the reachability
+	/// walk already stops at any missing object, so a shallow clone can safely run maintenance.
+	#[tokio::test]
+	async fn prune_and_gc_tolerate_a_shallow_boundary() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+
+		// A boundary commit: its parent object is not in the store, as after a shallow fetch.
+		let absent_parent = ObjectId::compute(ObjectKind::Commit, b"absent-boundary-parent");
+		let tip = loose_commit(repo, vec![absent_parent], "f.txt", b"x").await;
+		repo
+			.refs()
+			.update_ref("refs/heads/main", tip, None)
+			.await
+			.unwrap();
+		repo.write_shallow(&[tip]).await.unwrap();
+
+		// Neither operation may choke walking into the absent parent, and the boundary tip survives.
+		prune(&wt).await.unwrap();
+		assert!(repo.objects().exists_object(&tip).await.unwrap());
+		gc(&wt).await.unwrap();
+		assert!(repo.objects().exists_object(&tip).await.unwrap());
+	}
+
+	/// The reachability walk stops at a `.git/shallow` boundary even when the parent objects are still on
+	/// disk (as after `fetch --depth` truncates a full clone) — the shallow view git presents, so prune
+	/// can reclaim the truncated history and auto-follow does not chase tags past the boundary.
+	#[tokio::test]
+	async fn reachable_from_stops_at_a_present_shallow_boundary() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+
+		// A real parent<-child chain: both commit objects are present on disk.
+		let parent = loose_commit(repo, Vec::new(), "f.txt", b"p").await;
+		let child = loose_commit(repo, vec![parent], "f.txt", b"c").await;
+		// Mark the child a shallow boundary, as a depth-1 truncation would.
+		repo.write_shallow(&[child]).await.unwrap();
+
+		let reachable = reachable_from(repo, vec![child]).await.unwrap();
+		assert!(reachable.contains(&child), "the boundary tip is reachable");
+		assert!(
+			!reachable.contains(&parent),
+			"the walk stops at the boundary, not chasing the still-present parent"
+		);
+		assert!(
+			repo.objects().exists_object(&parent).await.unwrap(),
+			"the parent object is genuinely still on disk"
+		);
+	}
+
+	/// `prune` must never delete a commit listed in `.git/shallow` — even a *stale* entry sitting behind
+	/// the current boundary (a repo re-shortened after a deepen) — because the client re-sends it as a
+	/// `shallow` line on a later `--unshallow`. Protecting shallow entries as roots keeps them while the
+	/// walk still stops at the boundary, so history *past* the boundary is reclaimed.
+	#[tokio::test]
+	async fn prune_keeps_stale_shallow_entries() {
+		let (_dir, wt) = fixture().await;
+		let repo = wt.repository();
+
+		// c0 <- c1 <- c2, all present; `main` at the tip c2.
+		let c0 = loose_commit(repo, Vec::new(), "f.txt", b"0").await;
+		let c1 = loose_commit(repo, vec![c0], "f.txt", b"1").await;
+		let c2 = loose_commit(repo, vec![c1], "f.txt", b"2").await;
+		repo
+			.refs()
+			.update_ref("refs/heads/main", c2, None)
+			.await
+			.unwrap();
+		// A re-shortened shallow file: the current boundary c2 plus a stale entry c1 behind it.
+		repo.write_shallow(&[c1, c2]).await.unwrap();
+
+		prune(&wt).await.unwrap();
+
+		// The tip and *both* shallow entries survive; only history past the boundary (c0) is reclaimed.
+		assert!(repo.objects().exists_object(&c2).await.unwrap(), "tip kept");
+		assert!(
+			repo.objects().exists_object(&c1).await.unwrap(),
+			"a stale shallow entry must not be pruned (it is named in .git/shallow)"
+		);
+		assert!(
+			!repo.objects().exists_object(&c0).await.unwrap(),
+			"history past the shallow boundary is reclaimed"
+		);
+	}
 }

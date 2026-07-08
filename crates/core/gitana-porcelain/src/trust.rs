@@ -163,6 +163,8 @@ pub async fn trust_sync<F: FileStore, H: HashAlgorithm>(
 		&[remote_tip],
 		&haves,
 		&Deepen::default(),
+		// The trust chain is fetched directly by tip; no tag auto-follow applies.
+		false,
 	)
 	.await?;
 

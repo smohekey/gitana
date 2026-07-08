@@ -181,8 +181,17 @@ pub fn build_upload_pack_request<H: HashAlgorithm>(
 	for (index, want) in wants.iter().enumerate() {
 		let line = if index == 0 {
 			let tag_cap = if include_tag { "include-tag " } else { "" };
+			// `deepen-relative` is a v0 *capability* on the first want line (git's `fetch --deepen`), not a
+			// standalone line — upload-pack's request grammar has no `deepen-relative` pkt-line, so a v0
+			// server rejects one. It makes `deepen` measure from the client's shallow boundary.
+			let relative_cap = if deepen.relative {
+				"deepen-relative "
+			} else {
+				""
+			};
 			format!(
-				"want {} {tag_cap}side-band-64k thin-pack ofs-delta object-format={} agent={AGENT}\n",
+				"want {} {tag_cap}{relative_cap}side-band-64k thin-pack ofs-delta object-format={} \
+				 agent={AGENT}\n",
 				want.to_hex(),
 				H::NAME
 			)
@@ -428,6 +437,26 @@ mod tests {
 		let deepen_at = text.find("deepen 2").unwrap();
 		let done_at = text.find("done").unwrap();
 		assert!(shallow_at < deepen_at && deepen_at < done_at);
+	}
+
+	#[test]
+	fn upload_pack_request_emits_deepen_relative_as_a_capability() {
+		// `fetch --deepen N` measures depth from the client's shallow boundary. In protocol v0 that is a
+		// *capability* on the first want line (the request grammar has no `deepen-relative` pkt-line, so a
+		// v0 upload-pack rejects one), alongside a plain `deepen N` line.
+		let tip = ObjectId::<Sha1>::compute(ObjectKind::Commit, b"tip");
+		let deepen = Deepen {
+			depth: Some(1),
+			relative: true,
+			..Default::default()
+		};
+		let request = build_upload_pack_request(&[tip], &[], &[], &deepen, false);
+		let text = String::from_utf8_lossy(&request);
+		assert!(text.contains("deepen 1\n"));
+		// The capability rides the first want line, and appears exactly once (no standalone line).
+		let want_line = text.lines().find(|l| l.contains("want ")).unwrap();
+		assert!(want_line.contains("deepen-relative "));
+		assert_eq!(text.matches("deepen-relative").count(), 1);
 	}
 
 	#[test]

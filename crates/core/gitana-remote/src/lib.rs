@@ -166,6 +166,11 @@ pub fn ensure_same_format(local: HashKind, remote: HashKind) -> Result<()> {
 /// The repository's current shallow boundary (`.git/shallow`) is sent so the server knows which
 /// history it already truncated, and the boundary the server reports back is persisted — so a plain
 /// (non-shallow, empty `deepen`) fetch behaves exactly as before.
+///
+/// `include_tag` asks the server to append annotated tags reachable from the fetched history (git's
+/// `include-tag`) — a shallow fetch/clone sets it so tags pointing into the truncated history still
+/// arrive, but `--no-tags` clears it (git omits `include-tag` then). A full fetch wants every ref
+/// explicitly, so it passes `false`.
 pub async fn fetch_pack<H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	origin: &Origin,
@@ -173,14 +178,12 @@ pub async fn fetch_pack<H: HashAlgorithm>(
 	wants: &[ObjectId<H>],
 	haves: &[ObjectId<H>],
 	deepen: &Deepen,
+	include_tag: bool,
 ) -> Result<()> {
 	if wants.is_empty() {
 		return Ok(());
 	}
 	let shallow = repo.read_shallow().await?;
-	// A shallow request deepens only branch tips (the porcelain restricts `wants`), so ask the server
-	// to include annotated tags reachable from the fetched history — git's `include-tag`.
-	let include_tag = !deepen.is_empty();
 	let request = build_upload_pack_request(wants, haves, &shallow, deepen, include_tag);
 	let response = transport
 		.post(&origin.upload_pack(), UPLOAD_PACK_REQUEST, request)

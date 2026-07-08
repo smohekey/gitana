@@ -186,6 +186,13 @@ impl Refspec {
 		self.negative && self.src.match_capture(name).is_some()
 	}
 
+	/// Whether this positive refspec's *source* pattern selects advertised ref `name` — i.e. the refspec
+	/// fetches it, even when it has no tracking destination (a source-only `refs/heads/main` fetch, which
+	/// [`destination`](Self::destination) reports as `None`). Always `false` for a negative refspec.
+	pub fn matches_source(&self, name: &str) -> bool {
+		!self.negative && self.src.match_capture(name).is_some()
+	}
+
 	/// The exact source ref this refspec names, if its source is not a wildcard. git errors when such a
 	/// ref is not advertised (`couldn't find remote ref …`); a wildcard matching nothing is not an error.
 	pub fn exact_source(&self) -> Option<&str> {
@@ -216,6 +223,26 @@ mod tests {
 		);
 		// A non-branch ref does not match.
 		assert_eq!(spec.destination("refs/tags/v1"), None);
+	}
+
+	#[test]
+	fn matches_source_selects_even_without_a_destination() {
+		// A source-only refspec (no tracking destination) still *selects* its source — used to pick a
+		// shallow fetch's deepen roots, where `destination` would wrongly drop it.
+		let source_only = Refspec::parse("refs/heads/main").unwrap();
+		assert_eq!(source_only.destination("refs/heads/main"), None);
+		assert!(source_only.matches_source("refs/heads/main"));
+		assert!(!source_only.matches_source("refs/heads/dev"));
+		// A wildcard positive refspec selects every matching source.
+		let wild = Refspec::parse("+refs/heads/*:refs/remotes/origin/*").unwrap();
+		assert!(wild.matches_source("refs/heads/feature/x"));
+		assert!(!wild.matches_source("refs/tags/v1"));
+		// A negative refspec never selects a source (it only excludes).
+		assert!(
+			!Refspec::parse("^refs/heads/large")
+				.unwrap()
+				.matches_source("refs/heads/large")
+		);
 	}
 
 	#[test]

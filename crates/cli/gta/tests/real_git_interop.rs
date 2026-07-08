@@ -530,6 +530,120 @@ async fn git_unshallows_gitana_over_v0() {
 	unshallow_case(0).await;
 }
 
+/// `git fetch --unshallow` against gitana completes *every* client boundary, including one for a branch
+/// the (narrowed) fetch refspec no longer selects: git sends `shallow` lines for its whole boundary and
+/// the gitana server unshallows all of them from those lines — not just the ones its `want`s reach.
+async fn narrowed_unshallow_case(version: u8) {
+	let work = unique_tmp("interop-narrowed-unshallow");
+	let git_dir = work.join("srv.git");
+	build_linear_server::<Sha1>(&git_dir, 2).await; // main: c0 <- c1 (tip)
+
+	// A disjoint `other` branch: x0 <- x1.
+	let repo = open::<Sha1>(&git_dir);
+	let entry = |id| TreeBuildEntry {
+		path: "b.txt".to_owned(),
+		mode: FileMode::Regular,
+		id,
+	};
+	let b0 = repo.write_blob(b"o0\n").await.unwrap();
+	let t0 = repo.write_tree(&[entry(b0)]).await.unwrap();
+	let x0 = repo
+		.create_commit(t0, vec![], WHO, WHO, "o0\n")
+		.await
+		.unwrap();
+	let b1 = repo.write_blob(b"o1\n").await.unwrap();
+	let t1 = repo.write_tree(&[entry(b1)]).await.unwrap();
+	let x1 = repo
+		.create_commit(t1, vec![x0], WHO, WHO, "o1\n")
+		.await
+		.unwrap();
+	repo
+		.refs()
+		.update_ref("refs/heads/other", x1, None)
+		.await
+		.unwrap();
+
+	let url = serve_gitana(git_dir, ServerHash::Sha1).await;
+
+	// A multi-branch depth-1 clone: both `main` and `other` are shallow.
+	let checkout = work.join("c");
+	let out = git_try(
+		Path::new("."),
+		&[
+			"-c",
+			&format!("protocol.version={version}"),
+			"clone",
+			"--no-single-branch",
+			"--depth",
+			"1",
+			&url,
+			checkout.to_str().unwrap(),
+		],
+	);
+	assert!(
+		out.status.success(),
+		"multi-branch shallow clone (v{version}) failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	assert_eq!(
+		shallow_file(&checkout).lines().count(),
+		2,
+		"both branches are shallow"
+	);
+
+	// Narrow the refspec to `main`, then unshallow. `other` is no longer selected by a want.
+	git(
+		&checkout,
+		&[
+			"config",
+			"remote.origin.fetch",
+			"+refs/heads/main:refs/remotes/origin/main",
+		],
+	);
+	let out = git_try(
+		&checkout,
+		&[
+			"-c",
+			&format!("protocol.version={version}"),
+			"fetch",
+			"--unshallow",
+			"origin",
+		],
+	);
+	assert!(
+		out.status.success(),
+		"narrowed unshallow (v{version}) failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	// The repo is fully complete — no `.git/shallow` — and the unselected branch's history is present,
+	// so git fsck accepts it.
+	assert!(
+		!checkout.join(".git/shallow").exists(),
+		"the unselected branch's boundary must also be completed"
+	);
+	assert_eq!(
+		git(&checkout, &["rev-list", "--count", &x1.to_hex()]),
+		"2",
+		"the unselected branch's full history is present"
+	);
+	let fsck = git_try(&checkout, &["fsck", "--full"]);
+	assert!(
+		fsck.status.success(),
+		"git fsck after narrowed unshallow (v{version}) failed: {}",
+		String::from_utf8_lossy(&fsck.stderr)
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_narrowed_unshallow_completes_all_boundaries_over_v2() {
+	narrowed_unshallow_case(2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_narrowed_unshallow_completes_all_boundaries_over_v0() {
+	narrowed_unshallow_case(0).await;
+}
+
 /// A shallow client fetching an *older* commit it does not have: the server must not subtract that
 /// commit through the client's shallow boundary. Regression for the have-walk bounding on non-deepen
 /// fetches.

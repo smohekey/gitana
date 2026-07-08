@@ -44,6 +44,7 @@ pub(crate) async fn fetch<H: HashAlgorithm>(
 		&advertisement,
 		false,
 		gitana_porcelain::TagFetch::Auto,
+		&gitana_porcelain::Deepen::default(),
 	)
 	.await
 	.map_err(remote_error)?;

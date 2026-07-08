@@ -33,6 +33,65 @@ pub fn build_deepen(
 	})
 }
 
+/// git's `deepen 0x7fffffff` sentinel: `fetch --unshallow` sends it to request the complete history
+/// above the client's current shallow boundary (an effectively unbounded depth).
+const UNSHALLOW_DEPTH: u32 = 0x7fff_ffff;
+
+/// Assemble the deepen directive for `gta fetch` from its shallow flags. Beyond clone's `--depth` /
+/// `--shallow-since` / `--shallow-exclude`, fetch adds `--deepen N` (deepen relative to the current
+/// shallow boundary) and `--unshallow` (fill in the complete history). An all-absent set yields an
+/// empty [`Deepen`], a normal (complete) fetch.
+///
+/// The depth forms are mutually exclusive as in git: `--unshallow` stands alone, and `--depth` and
+/// `--deepen` are two spellings of the same depth (absolute vs. relative).
+pub fn build_fetch_deepen(
+	depth: Option<u32>,
+	deepen: Option<u32>,
+	unshallow: bool,
+	shallow_since: Option<&str>,
+	shallow_exclude: Vec<String>,
+) -> Result<Deepen> {
+	if unshallow
+		&& (depth.is_some()
+			|| deepen.is_some()
+			|| shallow_since.is_some()
+			|| !shallow_exclude.is_empty())
+	{
+		bail!("--unshallow cannot be combined with other deepen options");
+	}
+	if depth.is_some() && deepen.is_some() {
+		bail!("--depth and --deepen are mutually exclusive");
+	}
+	// `--deepen` sends `deepen`, which git upload-pack refuses alongside `deepen-since`/`deepen-not` —
+	// so reject the combination rather than send a relative-depth request that silently drops the
+	// since/exclude values. (`build_deepen` enforces the same rule for the `--depth` form below.)
+	if deepen.is_some() && (shallow_since.is_some() || !shallow_exclude.is_empty()) {
+		bail!("--deepen cannot be combined with --shallow-since or --shallow-exclude");
+	}
+	if unshallow {
+		return Ok(Deepen {
+			depth: Some(UNSHALLOW_DEPTH),
+			since: None,
+			not: Vec::new(),
+			relative: false,
+		});
+	}
+	if let Some(n) = deepen {
+		// `--deepen 0` would advance the boundary by nothing; git requires a positive count.
+		if n == 0 {
+			bail!("--deepen must be a positive number of commits");
+		}
+		return Ok(Deepen {
+			depth: Some(n),
+			since: None,
+			not: Vec::new(),
+			relative: true,
+		});
+	}
+	// `--depth` / `--shallow-since` / `--shallow-exclude` behave exactly as they do for clone.
+	build_deepen(depth, shallow_since, shallow_exclude)
+}
+
 /// Parse a `--shallow-since` value to a Unix timestamp (seconds). Accepts a bare Unix timestamp (all
 /// digits, optionally negative) or an ISO-8601 **UTC** date/time: `YYYY-MM-DD`, optionally followed by
 /// `T` or a space and `HH:MM[:SS]`, with an optional trailing `Z`. git's relative forms
@@ -206,5 +265,45 @@ mod tests {
 		let deepen = build_deepen(None, Some("2020-01-01"), vec!["v1".to_owned()]).unwrap();
 		assert_eq!(deepen.since, Some(1_577_836_800));
 		assert_eq!(deepen.not, vec!["v1".to_owned()]);
+	}
+
+	#[test]
+	fn fetch_deepen_maps_the_depth_forms() {
+		// `--unshallow` is an absolute, effectively unbounded depth (git's 0x7fffffff sentinel).
+		let deepen = build_fetch_deepen(None, None, true, None, Vec::new()).unwrap();
+		assert_eq!(deepen.depth, Some(0x7fff_ffff));
+		assert!(!deepen.relative);
+		// `--deepen N` is a *relative* depth (measured from the current shallow boundary).
+		let deepen = build_fetch_deepen(None, Some(2), false, None, Vec::new()).unwrap();
+		assert_eq!(deepen.depth, Some(2));
+		assert!(deepen.relative);
+		// `--depth N` is an absolute depth, like clone.
+		let deepen = build_fetch_deepen(Some(2), None, false, None, Vec::new()).unwrap();
+		assert_eq!(deepen.depth, Some(2));
+		assert!(!deepen.relative);
+		// No flags: a normal (complete) fetch.
+		assert!(
+			build_fetch_deepen(None, None, false, None, Vec::new())
+				.unwrap()
+				.is_empty()
+		);
+	}
+
+	#[test]
+	fn fetch_deepen_enforces_mutual_exclusions() {
+		// `--unshallow` stands alone.
+		assert!(build_fetch_deepen(Some(1), None, true, None, Vec::new()).is_err());
+		assert!(build_fetch_deepen(None, Some(1), true, None, Vec::new()).is_err());
+		assert!(build_fetch_deepen(None, None, true, Some("2020-01-01"), Vec::new()).is_err());
+		assert!(build_fetch_deepen(None, None, true, None, vec!["v1".to_owned()]).is_err());
+		// `--depth` and `--deepen` are two spellings of the same depth.
+		assert!(build_fetch_deepen(Some(1), Some(1), false, None, Vec::new()).is_err());
+		// A zero relative depth is rejected, as a zero absolute depth is.
+		assert!(build_fetch_deepen(None, Some(0), false, None, Vec::new()).is_err());
+		// `--deepen` cannot ride alongside `--shallow-since`/`--shallow-exclude` (git upload-pack refuses
+		// `deepen` with `deepen-since`/`deepen-not`), and neither can `--depth`.
+		assert!(build_fetch_deepen(None, Some(1), false, Some("2020-01-01"), Vec::new()).is_err());
+		assert!(build_fetch_deepen(None, Some(1), false, None, vec!["v1".to_owned()]).is_err());
+		assert!(build_fetch_deepen(Some(1), None, false, Some("2020-01-01"), Vec::new()).is_err());
 	}
 }

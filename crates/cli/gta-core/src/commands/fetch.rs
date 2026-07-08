@@ -5,16 +5,40 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
-use gitana_porcelain::TagFetch;
+use gitana_porcelain::{Deepen, TagFetch};
 use gitana_remote::{self as transport, Origin, ReqwestTransport};
 
 use crate::dispatch;
 use crate::repo;
+use crate::shallow::build_fetch_deepen;
 
 /// Fetch all branches from the origin into `refs/remotes/origin/*`. By default git's tag auto-follow
 /// also lands tags reachable from the fetched branches; `all_tags` (`--tags`) mirrors every advertised
 /// `refs/tags/*`, and `no_tags` (`--no-tags`) disables tag fetching entirely. The two are exclusive.
-pub async fn run(cwd: &Path, all_tags: bool, no_tags: bool) -> Result<()> {
+///
+/// The shallow flags mirror git's: `depth` / `shallow_since` / `shallow_exclude` bound the fetched
+/// history like `clone` does, `deepen` extends the current shallow boundary by a relative number of
+/// commits, and `unshallow` fills in the complete history. They are mutually exclusive per
+/// [`build_fetch_deepen`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run(
+	cwd: &Path,
+	all_tags: bool,
+	no_tags: bool,
+	depth: Option<u32>,
+	deepen: Option<u32>,
+	unshallow: bool,
+	shallow_since: Option<String>,
+	shallow_exclude: Vec<String>,
+) -> Result<()> {
+	// Validate the shallow flags before any network round-trip.
+	let deepen = build_fetch_deepen(
+		depth,
+		deepen,
+		unshallow,
+		shallow_since.as_deref(),
+		shallow_exclude,
+	)?;
 	let found = repo::discover(cwd)?;
 	let origin = Origin::load(&found.common_dir)?;
 	let http = ReqwestTransport::new();
@@ -29,20 +53,33 @@ pub async fn run(cwd: &Path, all_tags: bool, no_tags: bool) -> Result<()> {
 		_ => TagFetch::Auto,
 	};
 	match local {
-		HashKind::Sha1 => fetch_into::<Sha1>(&http, &origin, &found, &body, tags).await,
-		HashKind::Sha256 => fetch_into::<Sha256>(&http, &origin, &found, &body, tags).await,
+		HashKind::Sha1 => {
+			fetch_into::<Sha1>(&http, &origin, &found, &body, tags, &deepen, unshallow).await
+		}
+		HashKind::Sha256 => {
+			fetch_into::<Sha256>(&http, &origin, &found, &body, tags, &deepen, unshallow).await
+		}
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_into<H: HashAlgorithm>(
 	http: &ReqwestTransport,
 	origin: &Origin,
 	found: &repo::Discovered,
 	body: &[u8],
 	tags: TagFetch,
+	deepen: &Deepen,
+	unshallow: bool,
 ) -> Result<()> {
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
-	let outcome = gitana_porcelain::fetch(http, &repository, origin, body, false, tags).await?;
+	// `--unshallow` only makes sense on a shallow repository; git rejects it on a complete one rather
+	// than pointlessly refetch the whole history.
+	if unshallow && repository.read_shallow().await?.is_empty() {
+		bail!("--unshallow on a complete repository does not make sense");
+	}
+	let outcome =
+		gitana_porcelain::fetch(http, &repository, origin, body, false, tags, deepen).await?;
 	println!("Fetched from {}", origin.url);
 	for (tracking, _) in &outcome.updated {
 		println!("   {tracking}");

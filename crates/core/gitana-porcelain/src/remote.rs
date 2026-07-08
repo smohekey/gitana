@@ -52,6 +52,10 @@ pub struct FetchOutcome<H: HashAlgorithm> {
 /// A plain fetch refuses to write the branch HEAD points at (git's rule — the work tree is not
 /// updated here). `update_head_ok` (set by `pull`) instead *skips* that destination silently: `pull`
 /// advances the checked-out branch and work tree through its merge step.
+///
+/// A non-empty `deepen` requests a shallow update (git's `fetch --depth` / `--deepen` / `--unshallow` /
+/// `--shallow-since` / `--shallow-exclude`): only the branch tips are deepened and the server's new
+/// shallow boundary is folded into `.git/shallow`. An empty `deepen` (the default) is a normal fetch.
 pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
@@ -59,18 +63,10 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	advertisement: &[u8],
 	update_head_ok: bool,
 	tags: TagFetch,
+	deepen: &Deepen,
 ) -> Result<FetchOutcome<H>> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
 	let haves = gitana_remote::local_haves(repo).await?;
-	download(
-		transport,
-		repo,
-		origin,
-		&advertised,
-		&haves,
-		&Deepen::default(),
-	)
-	.await?;
 
 	let config = repo.read_config().await?;
 	// Resolve the effective tag mode: an explicit CLI `--tags` / `--no-tags` (`All` / `None`) wins;
@@ -94,16 +90,6 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	let (positive, negative): (Vec<&Refspec>, Vec<&Refspec>) =
 		refspecs.iter().partition(|spec| !spec.negative);
 
-	// An exact (non-wildcard) source that the remote does not advertise is an error, as git reports
-	// `couldn't find remote ref …` — so a typo or deleted branch in the config is not a silent success.
-	for spec in &positive {
-		if let Some(source) = spec.exact_source()
-			&& !advertised.refs.iter().any(|(name, _)| name == source)
-		{
-			bail!("couldn't find remote ref {source}");
-		}
-	}
-
 	// The branch HEAD points at may not be fetched into directly — git refuses, because a plain fetch
 	// does not update the work tree. A bare repo has no work tree, so git allows it there (e.g. a
 	// `+refs/heads/*:refs/heads/*` mirror); `pull` allows it too and reconciles the work tree via merge.
@@ -116,6 +102,46 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 		(false, HeadState::Symbolic(branch)) => Some(branch),
 		_ => None,
 	};
+
+	// Validate the fetch's fatal, structural errors BEFORE downloading. A shallow fetch persists a
+	// `.git/shallow` boundary inside `download`, so a fetch that then bails must not leave the repo
+	// truncated (or objects half-fetched) for a command that failed. None of these checks need the
+	// fetched objects — the plan loop below re-derives the tracking updates once the pack is in hand.
+	validate_fetch_selection(
+		&advertised,
+		&positive,
+		&negative,
+		checked_out.as_deref(),
+		update_head_ok,
+	)?;
+
+	// A shallow fetch deepens from exactly the refs its refspecs select — a positive refspec's *source*
+	// matches (so a source-only `refs/heads/main`, which updates no tracking ref, is still deepened) and
+	// no negative refspec excludes it — matching git: each is its own shallow root. So an
+	// explicitly-requested tag (via `--tags` or a tag refspec) outside branch history is fetched and
+	// recorded, while a ref a negative/narrowed refspec excludes is neither fetched nor marked shallow. A
+	// full fetch wants every advertised ref anyway (see `download`), so these roots are unused then.
+	let deepen_roots: Vec<ObjectId<H>> = advertised
+		.refs
+		.iter()
+		.filter(|(name, _)| !negative.iter().any(|spec| spec.excludes(name)))
+		.filter(|(name, _)| positive.iter().any(|spec| spec.matches_source(name)))
+		.map(|(_, oid)| *oid)
+		.collect();
+	// A shallow fetch asks for reachable annotated tags (`include-tag`) so tags pointing into the fetched
+	// history arrive — unless `--no-tags` disabled tag fetching entirely, which git also omits it for.
+	let include_tag = !deepen.is_empty() && tags != TagFetch::None;
+	download(
+		transport,
+		repo,
+		origin,
+		&advertised,
+		&haves,
+		deepen,
+		&deepen_roots,
+		include_tag,
+	)
+	.await?;
 
 	// Plan the tracking-ref updates first: every positive refspec that maps an advertised ref writes
 	// its destination (git applies them all), deduped so one source→destination pair acts once. Two
@@ -195,6 +221,49 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	Ok(FetchOutcome { updated, rejected })
 }
 
+/// The fetch's fatal, structural errors — checked before any download so a fetch that fails persists no
+/// state (neither objects nor a `.git/shallow` boundary): an exact refspec source the remote does not
+/// advertise (git's `couldn't find remote ref …`), two different sources mapping onto one tracking ref,
+/// and a refspec mapping onto the checked-out branch when the caller does not permit it (`update_head_ok`
+/// is set only by `pull`). None of these need the fetched objects; the plan loop in [`fetch`] re-checks
+/// them per object once the pack is in hand.
+fn validate_fetch_selection<H: HashAlgorithm>(
+	advertised: &Advertised<H>,
+	positive: &[&Refspec],
+	negative: &[&Refspec],
+	checked_out: Option<&str>,
+	update_head_ok: bool,
+) -> Result<()> {
+	for spec in positive {
+		if let Some(source) = spec.exact_source()
+			&& !advertised.refs.iter().any(|(name, _)| name == source)
+		{
+			bail!("couldn't find remote ref {source}");
+		}
+	}
+	let mut claimed: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+	for (name, _) in &advertised.refs {
+		if negative.iter().any(|spec| spec.excludes(name)) {
+			continue;
+		}
+		for spec in positive {
+			let Some(tracking) = spec.destination(name) else {
+				continue;
+			};
+			if let Some(&other) = claimed.get(tracking.as_str())
+				&& other != name.as_str()
+			{
+				bail!("cannot fetch both {other} and {name} to {tracking}");
+			}
+			if checked_out == Some(tracking.as_str()) && !update_head_ok {
+				bail!("refusing to fetch into branch '{tracking}' checked out in the work tree");
+			}
+			claimed.insert(tracking, name.as_str());
+		}
+	}
+	Ok(())
+}
+
 /// Write a local `refs/tags/<name>` for each advertised tag whose target is reachable from a branch
 /// this fetch is following (git's tag auto-follow), skipping tags already present locally (git leaves
 /// existing tags alone in auto mode — it never clobbers or reports them here). "Reachable" means the
@@ -214,10 +283,15 @@ async fn auto_follow_tags<F: FileStore, H: HashAlgorithm>(
 	updated: &mut Vec<(String, ObjectId<H>)>,
 ) -> Result<()> {
 	// Candidate tags: advertised `refs/tags/*` not already present locally (git leaves existing tags
-	// alone in auto mode). If none, skip the reachability walk entirely.
+	// alone in auto mode). If none, skip the reachability walk entirely. A shallow fetch may advertise a
+	// tag whose object lies outside the fetched boundary (so it was not downloaded); that tag cannot be
+	// peeled or followed, so drop it here rather than fail reading an absent object below.
 	let mut candidates = Vec::new();
 	for (name, oid) in &advertised.refs {
-		if name.starts_with("refs/tags/") && repo.refs().resolve(name).await?.is_none() {
+		if name.starts_with("refs/tags/")
+			&& repo.refs().resolve(name).await?.is_none()
+			&& repo.objects().exists_object(oid).await?
+		{
 			candidates.push((name.clone(), *oid));
 		}
 	}
@@ -333,7 +407,21 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	repo.init().await?;
 
 	let advertised = parse_advertisement::<H>(advertisement)?;
-	download(transport, &repo, origin, &advertised, &[], deepen).await?;
+	// A shallow clone deepens from the branch tips and `HEAD` (see `shallow_wants`); a full clone ignores
+	// these roots and wants every advertised ref. A shallow clone requests reachable tags (`include-tag`)
+	// so tags pointing into the fetched history are preserved.
+	let roots = shallow_wants(&advertised);
+	download(
+		transport,
+		&repo,
+		origin,
+		&advertised,
+		&[],
+		deepen,
+		&roots,
+		!deepen.is_empty(),
+	)
+	.await?;
 
 	// Recreate the refs and HEAD locally. A shallow clone fetches only branch history (see
 	// `download`), so an advertised ref whose target is outside that closure — e.g. a tag on the
@@ -367,8 +455,13 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 }
 
 /// Download the objects reachable from the advertised tips that `haves` do not already cover, writing
-/// them into `repo`. A normal fetch wants every advertised ref; a shallow one (non-empty `deepen`)
-/// deepens only from the branch tips (see [`shallow_wants`]).
+/// them into `repo`. A normal fetch (empty `deepen`) wants every advertised ref; a shallow one deepens
+/// from `deepen_roots` — each root becomes its own shallow boundary. The caller chooses those roots:
+/// `clone` passes the branch tips and `HEAD` ([`shallow_wants`]); `fetch` passes the refs its refspecs
+/// select (so a negatively-excluded or unrequested ref is neither fetched nor marked shallow).
+///
+/// `include_tag` requests reachable annotated tags for a shallow fetch (git's `include-tag`); a caller
+/// disabling tags (`--no-tags`) passes `false`.
 async fn download<F: FileStore, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
@@ -376,21 +469,27 @@ async fn download<F: FileStore, H: HashAlgorithm>(
 	advertised: &Advertised<H>,
 	haves: &[ObjectId<H>],
 	deepen: &Deepen,
+	deepen_roots: &[ObjectId<H>],
+	include_tag: bool,
 ) -> Result<()> {
 	ensure_deepen_supported(advertised, deepen)?;
 	let wants = if deepen.is_empty() {
 		gitana_remote::advertised_oids(advertised)
 	} else {
-		shallow_wants(advertised)
+		let mut wants = deepen_roots.to_vec();
+		wants.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+		wants.dedup();
+		wants
 	};
-	gitana_remote::fetch_pack(transport, origin, repo, &wants, haves, deepen).await?;
+	gitana_remote::fetch_pack(transport, origin, repo, &wants, haves, deepen, include_tag).await?;
 	Ok(())
 }
 
 /// Fail a shallow request the server cannot honor: if the advertisement lacks the matching capability
-/// (`shallow` for `--depth`, `deepen-since` / `deepen-not` for the date/exclude forms), the server
-/// would silently ignore the `deepen*` lines and return a full pack — so reject it up front, as git
-/// does ("Server does not support shallow requests"), rather than pretend the clone is shallow.
+/// (`shallow` for `--depth`, `deepen-since` / `deepen-not` for the date/exclude forms, `deepen-relative`
+/// for `--deepen`), the server would silently ignore the directive and return a different (or full) pack
+/// — so reject it up front, as git does ("Server does not support shallow requests"), rather than
+/// pretend the request was honored.
 fn ensure_deepen_supported<H: HashAlgorithm>(
 	advertised: &Advertised<H>,
 	deepen: &Deepen,
@@ -401,6 +500,11 @@ fn ensure_deepen_supported<H: HashAlgorithm>(
 	if deepen.depth.is_some() && !advertised.supports("shallow") {
 		bail!("the remote does not support shallow clones (no `shallow` capability advertised)");
 	}
+	// `--deepen` (relative) needs `deepen-relative`: without it the server would read the `deepen N` as an
+	// absolute depth from the tips, silently producing a different boundary than the requested relative one.
+	if deepen.relative && !advertised.supports("deepen-relative") {
+		bail!("the remote does not support --deepen (no `deepen-relative` capability advertised)");
+	}
 	if deepen.since.is_some() && !advertised.supports("deepen-since") {
 		bail!("the remote does not support --shallow-since (no `deepen-since` capability advertised)");
 	}
@@ -410,11 +514,13 @@ fn ensure_deepen_supported<H: HashAlgorithm>(
 	Ok(())
 }
 
-/// The deepen roots for a shallow clone/fetch: the branch tips (`refs/heads/*`) and `HEAD`. Advertised
-/// tags and other refs are deliberately excluded — deepening from an old tag would pull history the
+/// The base deepen roots for a shallow clone/fetch: the branch tips (`refs/heads/*`) and `HEAD`.
+/// Advertised tags and other refs are excluded *here* — deepening from an old tag would pull history the
 /// `--depth` / `--shallow-exclude` request is meant to prune. Tags pointing *into* the fetched history
 /// are still preserved: the request sets git's `include-tag`, so the server appends the reachable
 /// annotated tag objects, and [`clone`] recreates each ref whose target then lands in the closure.
+/// (`fetch` additionally deepens from any *explicitly* requested tag/ref — `--tags`, a tag refspec — via
+/// `download`'s `extra_roots`, so those are fetched as their own shallow roots even outside branches.)
 fn shallow_wants<H: HashAlgorithm>(advertised: &Advertised<H>) -> Vec<ObjectId<H>> {
 	let mut oids: Vec<ObjectId<H>> = advertised
 		.refs
@@ -970,6 +1076,23 @@ mod tests {
 			..Default::default()
 		};
 		assert!(ensure_deepen_supported(&none, &not).is_err());
+		// `--deepen` (relative) additionally needs the `deepen-relative` capability: a server that offers
+		// `shallow` but not `deepen-relative` cannot honor it.
+		let relative = Deepen {
+			depth: Some(1),
+			relative: true,
+			..Default::default()
+		};
+		let shallow_only: Advertised<Sha256> = Advertised {
+			capabilities: vec!["shallow".to_owned()],
+			..Default::default()
+		};
+		assert!(ensure_deepen_supported(&shallow_only, &relative).is_err());
+		let with_relative: Advertised<Sha256> = Advertised {
+			capabilities: vec!["shallow".to_owned(), "deepen-relative".to_owned()],
+			..Default::default()
+		};
+		assert!(ensure_deepen_supported(&with_relative, &relative).is_ok());
 	}
 
 	/// A [`HttpTransport`] double that records the single POSTed request and answers with a success
