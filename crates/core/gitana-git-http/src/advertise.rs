@@ -42,7 +42,7 @@ fn write_v2_capabilities<H: HashAlgorithm>(out: &mut Vec<u8>) -> Result<(), GitH
 	write_pkt(out, b"version 2\n")?;
 	write_pkt(out, format!("agent={AGENT}\n").as_bytes())?;
 	write_pkt(out, b"ls-refs=unborn\n")?;
-	write_pkt(out, b"fetch=ofs-delta\n")?;
+	write_pkt(out, b"fetch=ofs-delta shallow\n")?;
 	write_pkt(out, format!("object-format={}\n", H::NAME).as_bytes())?;
 	write_flush(out);
 	Ok(())
@@ -102,7 +102,8 @@ fn base_capabilities<H: HashAlgorithm>(service: Service) -> String {
 	match service {
 		Service::UploadPack => {
 			format!(
-				"multi_ack_detailed side-band-64k thin-pack ofs-delta object-format={object_format} agent={AGENT}"
+				"multi_ack_detailed side-band-64k thin-pack ofs-delta shallow deepen-since deepen-not \
+				 deepen-relative include-tag object-format={object_format} agent={AGENT}"
 			)
 		}
 		Service::ReceivePack => {

@@ -413,6 +413,7 @@ mod tests {
 			depth: Some(2),
 			since: Some(1_577_836_800),
 			not: vec!["refs/tags/v1".to_owned()],
+			..Default::default()
 		};
 		let request = build_upload_pack_request(&[tip], &[], &[boundary], &deepen, true);
 		let text = String::from_utf8_lossy(&request);

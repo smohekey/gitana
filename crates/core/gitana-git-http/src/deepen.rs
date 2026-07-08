@@ -13,6 +13,9 @@ pub struct Deepen {
 	pub since: Option<i64>,
 	/// `deepen-not <ref>`: stop deepening at these refs/oids (and their ancestors). Repeatable.
 	pub not: Vec<String>,
+	/// `deepen-relative`: `depth` is measured from the client's current shallow boundary, not the want
+	/// tips (git's `fetch --deepen`). Server-side only — a fresh clone never sets it.
+	pub relative: bool,
 }
 
 impl Deepen {

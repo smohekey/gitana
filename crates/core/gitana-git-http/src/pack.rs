@@ -9,7 +9,8 @@ use std::collections::HashSet;
 
 use gitana_file_store::FileStore;
 use gitana_object::{
-	HashAlgorithm, ObjectId, PackedObject, encode_pack, encode_pack_with_bases, referenced_ids,
+	HashAlgorithm, ObjectId, ObjectKind, PackedObject, encode_pack, encode_pack_with_bases,
+	parse_commit, referenced_ids,
 };
 use gitana_object_store::ObjectStoreError;
 use gitana_repository::Repository;
@@ -37,7 +38,25 @@ pub async fn build_pack<H: HashAlgorithm>(
 	wants: &[ObjectId<H>],
 	haves: &[ObjectId<H>],
 ) -> Result<Vec<u8>, GitHttpError> {
-	let (objects, _bases) = collect_objects(repo, wants, haves, false).await?;
+	let (objects, _bases) =
+		collect_objects(repo, wants, haves, false, &HashSet::new(), &HashSet::new()).await?;
+	Ok(encode_pack(&objects))
+}
+
+/// Like [`build_pack`], but for a shallow fetch ([`crate::shallow`]): the commit walk stops at the
+/// send-side `boundary` (a boundary commit's tree is sent but its parents are not), and the have-side
+/// walk stops at `have_boundary` — the commits the client itself is shallow at, whose parents it does
+/// *not* have, so they must not be subtracted from the pack (letting `--unshallow`/deepen send them).
+/// Empty sets reduce to a normal complete pack.
+pub async fn build_pack_shallow<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	wants: &[ObjectId<H>],
+	haves: &[ObjectId<H>],
+	boundary: &HashSet<ObjectId<H>>,
+	have_boundary: &HashSet<ObjectId<H>>,
+) -> Result<Vec<u8>, GitHttpError> {
+	let (objects, _bases) =
+		collect_objects(repo, wants, haves, false, boundary, have_boundary).await?;
 	Ok(encode_pack(&objects))
 }
 
@@ -53,18 +72,23 @@ pub async fn build_pack_thin<H: HashAlgorithm>(
 	wants: &[ObjectId<H>],
 	haves: &[ObjectId<H>],
 ) -> Result<Vec<u8>, GitHttpError> {
-	let (objects, bases) = collect_objects(repo, wants, haves, true).await?;
+	let (objects, bases) =
+		collect_objects(repo, wants, haves, true, &HashSet::new(), &HashSet::new()).await?;
 	Ok(encode_pack_with_bases(&objects, &bases))
 }
 
 /// Collect the objects to send: reachable-from-`wants` minus reachable-from-`haves`.
 /// When `thin`, also return the boundary objects (the have-closure, up to
-/// [`MAX_THIN_BASE_BYTES`]) to offer as external delta bases.
+/// [`MAX_THIN_BASE_BYTES`]) to offer as external delta bases. A commit in `shallow_boundary` has its
+/// tree sent but its parents withheld — the walk stops there (a shallow fetch); an empty set is a
+/// normal complete walk.
 async fn collect_objects<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	wants: &[ObjectId<H>],
 	haves: &[ObjectId<H>],
 	thin: bool,
+	shallow_boundary: &HashSet<ObjectId<H>>,
+	have_boundary: &HashSet<ObjectId<H>>,
 ) -> Result<(Vec<PackedObject<H>>, Vec<PackedObject<H>>), GitHttpError> {
 	let store = repo.objects();
 
@@ -81,7 +105,14 @@ async fn collect_objects<H: HashAlgorithm>(
 		}
 		match store.read_object(&id).await {
 			Ok((kind, data)) => {
-				stack.extend(referenced_ids::<H>(kind, &data)?);
+				if kind == ObjectKind::Commit && have_boundary.contains(&id) {
+					// The client is shallow at this commit: it has the commit and its tree but NOT its
+					// parents, so the have-walk must stop here — otherwise we would subtract ancestors the
+					// client lacks and omit them from an `--unshallow`/deepen pack.
+					stack.push(parse_commit::<H>(&data)?.tree);
+				} else {
+					stack.extend(referenced_ids::<H>(kind, &data)?);
+				}
 				// Retain as a base only if it fits the remaining budget, so no single large
 				// object pushes the retained set past the cap (an oversize base is skipped).
 				if thin && bases_bytes.saturating_add(data.len()) <= MAX_THIN_BASE_BYTES {
@@ -104,7 +135,17 @@ async fn collect_objects<H: HashAlgorithm>(
 			continue;
 		}
 		let (kind, data) = store.read_object(&id).await?;
-		stack.extend(referenced_ids::<H>(kind, &data)?);
+		if kind == ObjectKind::Commit {
+			// A commit's tree is always sent; its parents are followed unless this is a shallow-boundary
+			// commit, whose parents are deliberately withheld so the walk stops here.
+			let commit = parse_commit::<H>(&data)?;
+			stack.push(commit.tree);
+			if !shallow_boundary.contains(&id) {
+				stack.extend(commit.parents.iter().copied());
+			}
+		} else {
+			stack.extend(referenced_ids::<H>(kind, &data)?);
+		}
 		result.push(PackedObject { id, kind, data });
 	}
 	Ok((result, bases))

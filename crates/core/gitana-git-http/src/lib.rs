@@ -18,6 +18,7 @@ mod push_cert;
 mod receive_pack;
 mod refs;
 mod service;
+mod shallow;
 mod sideband;
 mod upload_pack_v0;
 

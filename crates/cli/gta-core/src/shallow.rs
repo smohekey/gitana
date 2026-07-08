@@ -28,6 +28,8 @@ pub fn build_deepen(
 		depth,
 		since,
 		not: shallow_exclude,
+		// The gitana client only ever does absolute-depth shallow clones/fetches.
+		relative: false,
 	})
 }
 
