@@ -12,7 +12,7 @@ use gitana_object::{
 	HashAlgorithm, ObjectId, ObjectKind, PackedObject, encode_pack, encode_pack_with_bases,
 	parse_commit, referenced_ids,
 };
-use gitana_object_store::ObjectStoreError;
+use gitana_object_store::{ObjectStore, ObjectStoreError};
 use gitana_repository::Repository;
 
 use crate::GitHttpError;
@@ -92,6 +92,18 @@ async fn collect_objects<H: HashAlgorithm>(
 ) -> Result<(Vec<PackedObject<H>>, Vec<PackedObject<H>>), GitHttpError> {
 	let store = repo.objects();
 
+	// Fast path: with a reachability bitmap and no shallow cut, enumerate by set arithmetic over the
+	// bitmap — `closure(wants) \ closure(haves)` — instead of walking the whole object graph. The have
+	// side never reads a single object body (its closure comes straight from the bitmap), which is the
+	// decisive win for an incremental fetch of a large repository. A shallow fetch keeps the walk: the
+	// bitmap encodes full-history reachability and cannot honour a boundary.
+	if shallow_boundary.is_empty()
+		&& have_boundary.is_empty()
+		&& store.has_reachability_bitmap().await?
+	{
+		return collect_objects_bitmap(store, wants, haves, thin).await;
+	}
+
 	// Pass 1: mark everything reachable from the haves we actually have. An unknown
 	// have is ignored (the client may report objects the server lacks). When thin,
 	// retain the objects read here (near-tip first) as candidate delta bases, capped.
@@ -149,4 +161,77 @@ async fn collect_objects<H: HashAlgorithm>(
 		result.push(PackedObject { id, kind, data });
 	}
 	Ok((result, bases))
+}
+
+/// The bitmap-accelerated counterpart to the walk in [`collect_objects`], used when a reachability
+/// bitmap is present and the fetch is not shallow. The object set is `closure(wants) \ closure(haves)`
+/// computed by [`ObjectStore::reachable_object_closure`]: a bitmapped commit contributes its whole
+/// closure in one step, and only the uncovered frontier is walked. The `wants` closure is strict (a
+/// missing object is a connectivity error); the `haves` closure is lenient (a peer may offer objects
+/// the server lacks) and reads no object bodies at all.
+async fn collect_objects_bitmap<H: HashAlgorithm>(
+	store: &ObjectStore<impl FileStore, H>,
+	wants: &[ObjectId<H>],
+	haves: &[ObjectId<H>],
+	thin: bool,
+) -> Result<(Vec<PackedObject<H>>, Vec<PackedObject<H>>), GitHttpError> {
+	let excluded = store.reachable_object_closure(haves, false).await?;
+	let want_closure = store.reachable_object_closure(wants, true).await?;
+
+	// Read the bytes of exactly the objects to send (want-closure minus the have-closure). Order is
+	// irrelevant: `encode_pack` re-sorts candidates by type/size/id for delta selection.
+	let mut result: Vec<PackedObject<H>> = Vec::new();
+	for id in want_closure {
+		if excluded.contains(&id) {
+			continue;
+		}
+		let (kind, data) = store.read_object(&id).await?;
+		result.push(PackedObject { id, kind, data });
+	}
+
+	let bases = if thin {
+		collect_thin_bases(store, haves).await?
+	} else {
+		Vec::new()
+	};
+	Ok((result, bases))
+}
+
+/// A bounded, near-tip subset of the objects reachable from `haves`, offered as external thin-pack
+/// delta bases. Unlike the exclusion set — which the bitmap yields complete and unread — bases are a
+/// heuristic: a DFS from the have tips retains objects until [`MAX_THIN_BASE_BYTES`], so only recent
+/// boundary objects are read, never the whole have-closure. Dropping a base merely forgoes a delta
+/// (the object is then sent in full), so stopping early is always safe.
+async fn collect_thin_bases<H: HashAlgorithm>(
+	store: &ObjectStore<impl FileStore, H>,
+	haves: &[ObjectId<H>],
+) -> Result<Vec<PackedObject<H>>, GitHttpError> {
+	let mut bases: Vec<PackedObject<H>> = Vec::new();
+	let mut bases_bytes = 0usize;
+	let mut seen: HashSet<ObjectId<H>> = HashSet::new();
+	let mut stack: Vec<ObjectId<H>> = haves.to_vec();
+	while let Some(id) = stack.pop() {
+		if !seen.insert(id) {
+			continue;
+		}
+		match store.read_object(&id).await {
+			Ok((kind, data)) => {
+				stack.extend(referenced_ids::<H>(kind, &data)?);
+				// Retain only if it fits the remaining budget, so an oversize object is skipped rather
+				// than passed into delta planning — the same cap the walk path enforces.
+				if bases_bytes.saturating_add(data.len()) <= MAX_THIN_BASE_BYTES {
+					bases_bytes += data.len();
+					bases.push(PackedObject { id, kind, data });
+				}
+				// Bound the reads: once the budget is full, every further (deeper) object would fail the
+				// fit check anyway, so stop reading the have-closure entirely instead of walking it out.
+				if bases_bytes >= MAX_THIN_BASE_BYTES {
+					break;
+				}
+			}
+			Err(ObjectStoreError::NotFound) => {}
+			Err(other) => return Err(other.into()),
+		}
+	}
+	Ok(bases)
 }

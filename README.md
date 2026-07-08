@@ -91,8 +91,12 @@ Major gaps:
   repacks *incrementally* (git's geometric strategy — keeping the large packs, as does
   `gta repack --geometric`), and writes a multi-pack-index reachability bitmap over the
   ref tips that stock git reads and trusts (`git multi-pack-index verify` /
-  `rev-list --test-bitmap`). Gitana does not yet *consume* bitmaps to accelerate its own
-  reachability queries (fetch negotiation, `rev-list`).
+  `rev-list --test-bitmap`). The **pack builder consumes** that bitmap: serving a fetch or
+  push enumerates objects as `closure(wants) \ closure(haves)` over the bitmap (git's
+  fill-in — a bitmapped commit contributes its whole closure at once, and only an
+  un-bitmapped frontier is walked), so the have side is never read for a non-shallow fetch.
+  Fetch negotiation (`ok_to_give_up`) and `rev-list` still walk the graph — they do not yet
+  consume bitmaps.
 
 ## `gta` CLI
 

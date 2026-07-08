@@ -1324,3 +1324,146 @@ async fn find_by_prefix_reports_every_ambiguous_match() {
 	let matches = store.find_by_prefix(longer).await.expect("find");
 	assert!(matches.contains(&a) && !matches.contains(&b));
 }
+
+/// A packed linear history blob <- tree <- c1 <- c2 (c2 reuses c1's tree), returned as
+/// (blob, tree, c1, c2). Everything is repacked so a bitmap can be written over it.
+async fn packed_history(
+	store: &ObjectStore<MemoryFileStore, Sha256>,
+) -> (
+	ObjectId<Sha256>,
+	ObjectId<Sha256>,
+	ObjectId<Sha256>,
+	ObjectId<Sha256>,
+) {
+	let blob = store.write_object(ObjectKind::Blob, b"hi\n").await.unwrap();
+	let tree = store
+		.write_object(
+			ObjectKind::Tree,
+			&encode_tree(&[TreeEntry {
+				mode: "100644".to_owned(),
+				name: "f".to_owned(),
+				id: blob,
+			}]),
+		)
+		.await
+		.unwrap();
+	let sig = "A U Thor <a@x> 1700000000 +0000".to_owned();
+	let mk = |parents: Vec<ObjectId<Sha256>>, message: &str| {
+		encode_commit(&Commit {
+			tree,
+			parents,
+			author: sig.clone(),
+			committer: sig.clone(),
+			signature: None,
+			extra_headers: Vec::new(),
+			message: message.to_owned(),
+		})
+	};
+	let c1 = store
+		.write_object(ObjectKind::Commit, &mk(vec![], "one\n"))
+		.await
+		.unwrap();
+	let c2 = store
+		.write_object(ObjectKind::Commit, &mk(vec![c1], "two\n"))
+		.await
+		.unwrap();
+	store.repack(u64::MAX).await.expect("repack").expect("work");
+	(blob, tree, c1, c2)
+}
+
+#[tokio::test]
+async fn reachable_object_closure_bulk_adds_a_bitmapped_commit() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let (blob, tree, c1, c2) = packed_history(&store).await;
+	store
+		.write_reachability_bitmap(&[c1, c2])
+		.await
+		.expect("bitmap")
+		.expect("packs");
+
+	let closure = store.reachable_object_closure(&[c2], true).await.unwrap();
+	assert_eq!(closure, HashSet::from([c2, c1, tree, blob]));
+}
+
+#[tokio::test]
+async fn reachable_object_closure_walks_down_to_a_bitmapped_ancestor() {
+	// Bitmap only c1; c2 is packed but unbitmapped, so the closure must walk c2 and then bulk-add the
+	// bitmapped c1's closure — the fill-in path.
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let (blob, tree, c1, c2) = packed_history(&store).await;
+	store
+		.write_reachability_bitmap(&[c1])
+		.await
+		.expect("bitmap")
+		.expect("packs");
+
+	let closure = store.reachable_object_closure(&[c2], true).await.unwrap();
+	assert_eq!(closure, HashSet::from([c2, c1, tree, blob]));
+}
+
+#[tokio::test]
+async fn reachable_object_closure_without_a_bitmap_walks_the_graph() {
+	// No bitmap written: the closure is a plain walk and must still enumerate the whole history.
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let (blob, tree, c1, c2) = packed_history(&store).await;
+	assert!(!store.has_reachability_bitmap().await.unwrap());
+
+	let closure = store.reachable_object_closure(&[c2], true).await.unwrap();
+	assert_eq!(closure, HashSet::from([c2, c1, tree, blob]));
+}
+
+#[tokio::test]
+async fn reachable_object_closure_strict_errors_but_lenient_skips_a_missing_tip() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let stranger = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"absent");
+	// Lenient (the have side): an object the store lacks is skipped, leaving an empty closure.
+	assert!(
+		store
+			.reachable_object_closure(&[stranger], false)
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	// Strict (the want side): a missing object is a connectivity error.
+	assert!(
+		store
+			.reachable_object_closure(&[stranger], true)
+			.await
+			.is_err()
+	);
+}
+
+#[tokio::test]
+async fn a_bitmap_over_a_stale_midx_is_not_trusted() {
+	// A MIDX (and its checksum-matched bitmap) can outlive a pack it names if a pack is removed
+	// out-of-band. Object lookup treats such a MIDX as stale and scans packs directly; the bitmap
+	// bound to it must be distrusted the same way, so the pack builder falls back to the walk.
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let (_blob, _tree, c1, c2) = packed_history(&store).await;
+	store
+		.write_reachability_bitmap(&[c1, c2])
+		.await
+		.expect("bitmap")
+		.expect("packs");
+	assert!(store.has_reachability_bitmap().await.unwrap());
+
+	// Remove the pack the MIDX names, without rewriting the MIDX — the stale-index scenario.
+	let pack = store
+		.file_store()
+		.list_prefix("objects/pack/")
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|p| p.ends_with(".pack"))
+		.expect("a pack");
+	store
+		.file_store()
+		.delete_path(&pack, None)
+		.await
+		.expect("delete pack");
+
+	assert!(
+		!store.has_reachability_bitmap().await.unwrap(),
+		"a bitmap over a MIDX naming a deleted pack must not be trusted",
+	);
+}

@@ -18,14 +18,17 @@ use std::sync::Arc;
 use gitana_file_store::{FileStore, FileStoreError, WriteOutcome};
 
 use gitana_object::{
-	HashAlgorithm, MAX_OBJECT_SIZE, MidxEntry, MultiPackIndex, ObjectError, ObjectId, ObjectKind,
-	PackEntry, PackIndex, PackedObject, apply_delta, build_reachability_bitmaps, decode_loose,
-	decode_multi_pack_index, decode_object_at, decode_pack_entry, decode_pack_index, encode_loose,
-	encode_multi_pack_index, encode_multi_pack_index_with_reverse_index, encode_pack,
-	encode_pack_index, loose_object_path, pack_index_entries,
+	BitmapIndex, HashAlgorithm, MAX_OBJECT_SIZE, MidxEntry, MultiPackIndex, ObjectError, ObjectId,
+	ObjectKind, PackEntry, PackIndex, PackedObject, apply_delta, build_reachability_bitmaps,
+	decode_loose, decode_midx_bitmap, decode_multi_pack_index, decode_object_at, decode_pack_entry,
+	decode_pack_index, encode_loose, encode_multi_pack_index,
+	encode_multi_pack_index_with_reverse_index, encode_pack, encode_pack_index, loose_object_path,
+	pack_index_entries, referenced_ids,
 };
 use tokio::sync::Mutex;
 
+/// Re-exported so downstream layers name the parsed reachability bitmap through the store layer.
+pub use gitana_object::BitmapIndex as ReachabilityBitmap;
 /// Re-exported so downstream layers name object kinds through the store layer.
 pub use gitana_object::ObjectKind as Kind;
 
@@ -292,6 +295,14 @@ enum MidxCache<H: HashAlgorithm> {
 	Loaded(Option<Arc<MultiPackIndex<H>>>),
 }
 
+/// The parse-once cache for the current MIDX's reachability bitmap: whether it has been loaded, and
+/// if so the parsed bitmap (or `None` when there is no bitmap, it is unreadable, or it does not
+/// belong to the current MIDX — a stale bitmap is ignored). Invalidated whenever the MIDX is.
+enum BitmapCache {
+	Unloaded,
+	Loaded(Option<Arc<BitmapIndex>>),
+}
+
 /// Git object storage layered over a file-store backend `F`, scoped to one repo, with
 /// object ids under the hash algorithm `H`.
 pub struct ObjectStore<F, H: HashAlgorithm> {
@@ -305,6 +316,9 @@ pub struct ObjectStore<F, H: HashAlgorithm> {
 	pack_bytes: Mutex<HashMap<String, Arc<Vec<u8>>>>,
 	/// The parsed multi-pack-index, decoded on first lookup and invalidated by `repack`.
 	midx: Mutex<MidxCache<H>>,
+	/// The current MIDX's reachability bitmap, decoded on first lookup and invalidated whenever the
+	/// MIDX is (a bitmap is bound to one MIDX by checksum).
+	bitmap: Mutex<BitmapCache>,
 	_hash: PhantomData<H>,
 }
 
@@ -320,6 +334,7 @@ where
 			packs: Mutex::new(HashMap::new()),
 			pack_bytes: Mutex::new(HashMap::new()),
 			midx: Mutex::new(MidxCache::Unloaded),
+			bitmap: Mutex::new(BitmapCache::Unloaded),
 			_hash: PhantomData,
 		}
 	}
@@ -652,6 +667,142 @@ where
 		Ok(loaded)
 	}
 
+	/// The multi-pack-index only if it is still *usable* — every pack it names is present on disk.
+	/// A MIDX that points at a since-deleted pack is stale: [`Self::locate`] scans packs directly
+	/// rather than trust it, so the reachability bitmap bound to that MIDX must not be trusted either.
+	/// Re-checked per call (packs can be removed out-of-band), as `locate` does.
+	async fn usable_multi_pack_index(
+		&self,
+	) -> Result<Option<Arc<MultiPackIndex<H>>>, ObjectStoreError> {
+		let Some(midx) = self.multi_pack_index().await? else {
+			return Ok(None);
+		};
+		let on_disk: HashSet<String> = self
+			.files
+			.list_prefix(PACK_PREFIX)
+			.await?
+			.into_iter()
+			.filter(|path| path.ends_with(PACK_SUFFIX))
+			.map(|path| midx_pack_name(&path))
+			.collect();
+		if midx.pack_names().iter().all(|name| on_disk.contains(name)) {
+			Ok(Some(midx))
+		} else {
+			Ok(None)
+		}
+	}
+
+	/// Invalidate the cached multi-pack-index and its reachability bitmap together — the bitmap is
+	/// bound to one MIDX by checksum, so any change to the on-disk MIDX drops both; the next lookup
+	/// reloads from disk.
+	async fn invalidate_midx_caches(&self) {
+		*self.midx.lock().await = MidxCache::Unloaded;
+		*self.bitmap.lock().await = BitmapCache::Unloaded;
+	}
+
+	/// The reachability bitmap belonging to the current multi-pack-index, decoded on first use and
+	/// cached (invalidated whenever the MIDX is). `None` when there is no MIDX, no `.bitmap`, the
+	/// bitmap is malformed, or it does not belong to the current MIDX (checksum mismatch) — a bitmap
+	/// is an optimization, so any of these falls back to walking rather than failing.
+	async fn reachability_bitmap(&self) -> Result<Option<Arc<BitmapIndex>>, ObjectStoreError> {
+		if let BitmapCache::Loaded(bitmap) = &*self.bitmap.lock().await {
+			return Ok(bitmap.clone());
+		}
+		let loaded = self.load_reachability_bitmap().await?;
+		*self.bitmap.lock().await = BitmapCache::Loaded(loaded.clone());
+		Ok(loaded)
+	}
+
+	/// Read and validate the current MIDX's `.bitmap` from disk (no caching — see
+	/// [`Self::reachability_bitmap`]). A missing/malformed/foreign bitmap is `None`.
+	async fn load_reachability_bitmap(&self) -> Result<Option<Arc<BitmapIndex>>, ObjectStoreError> {
+		let Some(midx) = self.multi_pack_index().await? else {
+			return Ok(None);
+		};
+		let bytes = match self
+			.files
+			.read_path(&midx_bitmap_path(midx.checksum()))
+			.await
+		{
+			Ok(bytes) => bytes,
+			Err(FileStoreError::NotFound) => return Ok(None),
+			Err(other) => return Err(other.into()),
+		};
+		// A malformed bitmap is treated as absent (fall back to walking), never a hard error — as the
+		// MIDX itself is. Bind it to this MIDX by checksum so a stale file left over from a prior pack
+		// set is never trusted.
+		match decode_midx_bitmap::<H>(&bytes) {
+			Ok(bitmap) if bitmap.midx_checksum() == midx.checksum() => Ok(Some(Arc::new(bitmap))),
+			Ok(_) | Err(_) => Ok(None),
+		}
+	}
+
+	/// The current MIDX's reachability bitmap paired with that MIDX, or `None` when no *usable* bitmap
+	/// is present. Both are needed together to resolve a bitmap's set bits back to object ids. Gated on
+	/// [`Self::usable_multi_pack_index`], so a stale MIDX (naming a deleted pack) yields no bitmap even
+	/// though its checksum still matches the `.bitmap` on disk — matching what object lookup trusts.
+	async fn bitmap_and_midx(
+		&self,
+	) -> Result<Option<(Arc<BitmapIndex>, Arc<MultiPackIndex<H>>)>, ObjectStoreError> {
+		let Some(midx) = self.usable_multi_pack_index().await? else {
+			return Ok(None);
+		};
+		// The bitmap load validated its checksum against this same (cached) MIDX; a torn concurrent
+		// invalidation just yields `None` here and falls back to the walk rather than assume.
+		match self.reachability_bitmap().await? {
+			Some(bitmap) => Ok(Some((bitmap, midx))),
+			None => Ok(None),
+		}
+	}
+
+	/// Whether a *usable* reachability bitmap is available to accelerate object enumeration — one whose
+	/// MIDX still names only packs present on disk (see [`Self::bitmap_and_midx`]).
+	pub async fn has_reachability_bitmap(&self) -> Result<bool, ObjectStoreError> {
+		Ok(self.bitmap_and_midx().await?.is_some())
+	}
+
+	/// The set of every object id reachable from `tips`, using the reachability bitmap to cover a
+	/// bitmapped commit (and its whole closure — trees, blobs, and ancestors) in one step and walking
+	/// the object graph only for the uncovered frontier. With no bitmap this is a plain closure walk,
+	/// identical in result to the graph traversal it replaces.
+	///
+	/// When `strict`, a missing object reached from a tip is a connectivity error (the want side must
+	/// be complete); otherwise a missing object is skipped (a peer may advertise `have`s the store
+	/// lacks). A commit's parents and a tree's gitlink entries are followed via
+	/// [`referenced_ids`] exactly as the walk does, so a repo without a bitmap enumerates the same set
+	/// as one with a bitmap for every supported (non-submodule) history.
+	pub async fn reachable_object_closure(
+		&self,
+		tips: &[ObjectId<H>],
+		strict: bool,
+	) -> Result<HashSet<ObjectId<H>>, ObjectStoreError> {
+		let bitmap = self.bitmap_and_midx().await?;
+		let mut closure: HashSet<ObjectId<H>> = HashSet::new();
+		let mut stack: Vec<ObjectId<H>> = tips.to_vec();
+		while let Some(id) = stack.pop() {
+			if closure.contains(&id) {
+				continue;
+			}
+			// A bitmapped commit's entire reachable closure is known — add it in bulk and do not
+			// descend (the bitmap already accounts for its trees, blobs, and ancestors).
+			if let Some((bitmap, midx)) = &bitmap {
+				if let Some(ids) = bitmap.reachable_from(&id, midx) {
+					closure.extend(ids);
+					continue;
+				}
+			}
+			// Otherwise read and walk it. A missing object is fatal only on the strict (want) side.
+			let (kind, data) = match self.read_object(&id).await {
+				Ok(object) => object,
+				Err(ObjectStoreError::NotFound) if !strict => continue,
+				Err(other) => return Err(other),
+			};
+			closure.insert(id);
+			stack.extend(referenced_ids::<H>(kind, &data)?);
+		}
+		Ok(closure)
+	}
+
 	/// The cached metadata for one pack, built and cached on first use: its `.idx` (from the
 	/// sidecar, or rebuilt by decoding the pack once if the sidecar is absent — read-only, so no
 	/// sidecar is written on the read path), the offsets sorted ascending, and the pack size.
@@ -819,7 +970,7 @@ where
 				self
 					.write_or_clear_midx(&kept.iter().cloned().collect())
 					.await?;
-				*self.midx.lock().await = MidxCache::Unloaded;
+				self.invalidate_midx_caches().await;
 			}
 			return Ok(None);
 		}
@@ -910,7 +1061,7 @@ where
 		// The caches may name deleted packs (and the MIDX changed); drop them (reads reload lazily).
 		self.packs.lock().await.clear();
 		self.pack_bytes.lock().await.clear();
-		*self.midx.lock().await = MidxCache::Unloaded;
+		self.invalidate_midx_caches().await;
 
 		Ok(RepackReport {
 			packed_objects: meta.len(),
@@ -1035,7 +1186,7 @@ where
 		let midx_bytes =
 			encode_multi_pack_index_with_reverse_index::<H>(&names, &entries, preferred.0)?;
 		self.overwrite_path(MIDX_PATH, &midx_bytes).await?;
-		*self.midx.lock().await = MidxCache::Unloaded;
+		self.invalidate_midx_caches().await;
 		let midx = decode_multi_pack_index::<H>(&midx_bytes)?;
 
 		// Pre-read objects into sync maps for the builder: every object's kind (for the type indexes
@@ -1083,6 +1234,8 @@ where
 		self
 			.overwrite_path(&midx_bitmap_path(midx.checksum()), &bitmap_bytes)
 			.await?;
+		// Drop the (necessarily empty) cached bitmap so the next reader loads the one just written.
+		*self.bitmap.lock().await = BitmapCache::Unloaded;
 
 		Ok(Some(BitmapReport {
 			packs: pack_paths.len(),
