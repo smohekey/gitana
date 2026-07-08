@@ -7,8 +7,8 @@ use std::collections::HashSet;
 use gitana_file_store::FileStore;
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_object::{
-	Commit, ObjectId, ObjectKind, PackedObject, Sha256, TreeEntry, decode_midx_bitmap,
-	decode_multi_pack_index, encode_commit, encode_pack, encode_tree,
+	Commit, EwahBitmap, ObjectId, ObjectKind, PackedObject, Sha256, TreeEntry, decode_midx_bitmap,
+	decode_multi_pack_index, encode_commit, encode_midx_bitmap, encode_pack, encode_tree,
 };
 use gitana_object_store::ObjectStore;
 
@@ -1520,6 +1520,122 @@ async fn commit_reaches_any_walks_down_to_a_bitmapped_ancestor() {
 	assert!(
 		!store
 			.commit_reaches_any(c2, &HashSet::from([tree]))
+			.await
+			.unwrap()
+	);
+}
+
+#[tokio::test]
+async fn commit_reaches_any_through_a_bitmapped_parent_stays_commit_only() {
+	// Bitmap only c1; the query reaches it as a *parent* of the unbitmapped c2, taking the single-bit
+	// membership path. A tree/blob target's position is set in c1's reachability bitmap (they are
+	// reachable objects), so without the commit-type filter this would wrongly report them reachable —
+	// this locks in that only commit targets match through a bitmapped parent.
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let (blob, tree, c1, c2) = packed_history(&store).await;
+	store
+		.write_reachability_bitmap(&[c1])
+		.await
+		.expect("bitmap")
+		.expect("packs");
+	// The commit target c1 is found through the bitmapped parent.
+	assert!(
+		store
+			.commit_reaches_any(c2, &HashSet::from([c1]))
+			.await
+			.unwrap()
+	);
+	// Its reachable tree and blob are not commits, so they are not reachable *commits*.
+	assert!(
+		!store
+			.commit_reaches_any(c2, &HashSet::from([tree, blob]))
+			.await
+			.unwrap()
+	);
+}
+
+#[tokio::test]
+async fn commit_reaches_any_ignores_a_bitmap_over_a_midx_without_a_reverse_index() {
+	// A `.bitmap` can only map targets to bitmap positions through the MIDX reverse index. Forge the
+	// pathological pair our own writer never produces — a bitmap bound (by checksum) to a *plain* MIDX
+	// that carries no `RIDX` — and confirm the membership query treats it as absent and walks, rather
+	// than trusting `commit_reachability` and pruning a bitmapped parent on an unresolvable target set.
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let sig = "A U Thor <a@x> 1700000000 +0000".to_owned();
+	let mk = |parents: Vec<ObjectId<Sha256>>, message: &str| Commit {
+		tree: ObjectId::<Sha256>::compute(ObjectKind::Blob, b"placeholder"),
+		parents,
+		author: sig.clone(),
+		committer: sig.clone(),
+		signature: None,
+		extra_headers: Vec::new(),
+		message: message.to_owned(),
+	};
+	// A three-commit chain c1 <- c2 <- c3, so a bitmapped *parent* (c2) sits between the source (c3)
+	// and the target (c1) — the case where a wrongful prune would hide the target.
+	let c1 = store
+		.write_object(ObjectKind::Commit, &encode_commit(&mk(vec![], "one\n")))
+		.await
+		.unwrap();
+	let c2 = store
+		.write_object(ObjectKind::Commit, &encode_commit(&mk(vec![c1], "two\n")))
+		.await
+		.unwrap();
+	let c3 = store
+		.write_object(ObjectKind::Commit, &encode_commit(&mk(vec![c2], "three\n")))
+		.await
+		.unwrap();
+	// Enough incompressible weight to split repack into ≥ 2 packs, which is what makes it emit a MIDX
+	// (a lone pack needs none) — a plain one, with no reverse index.
+	for seed in 1..=6u64 {
+		store
+			.write_object(ObjectKind::Blob, &incompressible(seed, 200 * 1024))
+			.await
+			.unwrap();
+	}
+	store
+		.repack(512 * 1024)
+		.await
+		.expect("repack")
+		.expect("work");
+
+	// The plain MIDX has no reverse index; read it back for the checksum to bind a forged bitmap to.
+	let midx_bytes = store
+		.file_store()
+		.read_path("objects/pack/multi-pack-index")
+		.await
+		.expect("a MIDX was written");
+	let midx = decode_multi_pack_index::<Sha256>(&midx_bytes).expect("decode MIDX");
+	assert!(
+		midx.reverse_index().is_none(),
+		"a plain repack MIDX has no RIDX"
+	);
+	let c2_position = midx.object_position(&c2).expect("c2 is packed") as u32;
+
+	// Forge a bitmap bound to that MIDX by checksum, bitmapping c2 (content is immaterial — the query
+	// must never consult it). Write it where the store looks for the current MIDX's bitmap.
+	let empty = EwahBitmap::from_set_bits([]);
+	let bitmap_bytes = encode_midx_bitmap::<Sha256>(
+		midx.checksum(),
+		[&empty, &empty, &empty, &empty],
+		&[(c2_position, &empty)],
+	)
+	.expect("encode forged bitmap");
+	let checksum_hex: String = midx.checksum().iter().map(|b| format!("{b:02x}")).collect();
+	store
+		.file_store()
+		.write_path_replace(
+			&format!("objects/pack/multi-pack-index-{checksum_hex}.bitmap"),
+			&bitmap_bytes,
+		)
+		.await
+		.expect("write forged bitmap");
+
+	// Despite the (unusable) bitmap marking c2, the query walks past it to find c1 — the pre-bitmap
+	// behaviour. Without the reverse-index guard it would prune at c2 and wrongly answer `false`.
+	assert!(
+		store
+			.commit_reaches_any(c3, &HashSet::from([c1]))
 			.await
 			.unwrap()
 	);

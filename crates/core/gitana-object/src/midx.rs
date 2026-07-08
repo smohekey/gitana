@@ -7,6 +7,8 @@
 //! with [`encode_multi_pack_index`]; parse one with [`decode_multi_pack_index`]; look objects up
 //! with [`MultiPackIndex::lookup`].
 
+use std::sync::OnceLock;
+
 use crate::{HashAlgorithm, ObjectError, ObjectId};
 
 const MAGIC: [u8; 4] = *b"MIDX";
@@ -58,6 +60,9 @@ pub struct MultiPackIndex<H: HashAlgorithm> {
 	/// The `RIDX` reverse index (bitmap object order), present only in a bitmap-carrying MIDX:
 	/// `reverse_index[bitmap_position]` is the lexical index into [`Self::ids`].
 	reverse_index: Option<Vec<u32>>,
+	/// The inverse of [`Self::reverse_index`]: `forward_index[lexical] = bitmap_position`. Built lazily
+	/// on the first [`Self::bitmap_position`] query and cached; `None` when there is no reverse index.
+	forward_index: OnceLock<Option<Vec<u32>>>,
 	/// The MIDX's trailing checksum — a reachability `.bitmap` names the MIDX it belongs to by this.
 	checksum: Vec<u8>,
 }
@@ -111,6 +116,24 @@ impl<H: HashAlgorithm> MultiPackIndex<H> {
 	/// bitmap object order used by [`Self::object_at_bitmap_position`].
 	pub fn object_position(&self, id: &ObjectId<H>) -> Option<usize> {
 		self.ids.binary_search(id).ok()
+	}
+
+	/// The reachability-bitmap position of `id` — the inverse of [`Self::object_at_bitmap_position`].
+	/// `None` if this MIDX has no reverse index (only bitmap-carrying MIDXs do) or `id` is absent. The
+	/// inverse table is built once on first call and cached, so a bitmap consumer can test a target's
+	/// bit directly (`reachability.get(position)`) rather than materializing a commit's whole closure.
+	pub fn bitmap_position(&self, id: &ObjectId<H>) -> Option<u32> {
+		let forward = self.forward_index.get_or_init(|| {
+			self.reverse_index.as_ref().map(|reverse| {
+				let mut forward = vec![0u32; reverse.len()];
+				for (bitmap_position, &lexical) in reverse.iter().enumerate() {
+					forward[lexical as usize] = bitmap_position as u32;
+				}
+				forward
+			})
+		});
+		let lexical = self.object_position(id)?;
+		forward.as_ref()?.get(lexical).copied()
 	}
 
 	/// The MIDX's trailing checksum — a reachability `.bitmap` binds to its MIDX by this value.
@@ -419,6 +442,7 @@ pub fn decode_multi_pack_index<H: HashAlgorithm>(
 		ids,
 		locations,
 		reverse_index,
+		forward_index: OnceLock::new(),
 		checksum: bytes[body_end..].to_vec(),
 	})
 }
@@ -509,6 +533,38 @@ mod tests {
 
 		// A preferred pack outside the pack list is rejected.
 		assert!(encode_multi_pack_index_with_reverse_index(&names, &entries, 2).is_err());
+	}
+
+	#[test]
+	fn bitmap_position_inverts_object_at_bitmap_position() {
+		let names = vec!["pack-a.pack".to_owned(), "pack-b.pack".to_owned()];
+		let entries = vec![
+			entry::<Sha256>(b"one", 0, 12),
+			entry::<Sha256>(b"two", 1, 40),
+			entry::<Sha256>(b"three", 0, 77),
+			entry::<Sha256>(b"four", 1, 5),
+		];
+
+		// A MIDX with a reverse index: `bitmap_position` is the exact inverse of
+		// `object_at_bitmap_position` across every position.
+		let bytes = encode_multi_pack_index_with_reverse_index(&names, &entries, 1).expect("encode");
+		let midx = decode_multi_pack_index::<Sha256>(&bytes).expect("decode");
+		for position in 0..midx.len() {
+			let id = midx.object_at_bitmap_position(position).expect("in range");
+			assert_eq!(midx.bitmap_position(id), Some(position as u32));
+		}
+
+		// An absent id has no position; the cached table survives repeated queries.
+		let stranger = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"absent");
+		assert!(midx.bitmap_position(&stranger).is_none());
+		let four = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"four");
+		assert_eq!(midx.bitmap_position(&four), Some(0));
+
+		// A MIDX without a reverse index cannot answer bitmap positions at all.
+		let plain =
+			decode_multi_pack_index::<Sha256>(&encode_multi_pack_index(&names, &entries).unwrap())
+				.expect("decode plain");
+		assert!(plain.bitmap_position(&four).is_none());
 	}
 
 	#[test]

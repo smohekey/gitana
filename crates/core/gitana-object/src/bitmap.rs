@@ -118,31 +118,6 @@ impl BitmapIndex {
 		let position = midx.object_position(commit)? as u32;
 		self.reachable_object_ids(position, midx)
 	}
-
-	/// The **commit** ids reachable from `commit`: like [`Self::reachable_from`] but restricted to
-	/// commit objects, its reachability bitmap intersected with the commit type index. `None` unless
-	/// `midx` is the index this bitmap was built over and `commit` is bitmapped; also `None` if any set
-	/// bit fails to resolve (whole-or-nothing, as [`Self::reachable_object_ids`]). Used by ancestry
-	/// queries, which only follow commit→parent edges and never need the tree/blob closure.
-	pub fn reachable_commits<H: HashAlgorithm>(
-		&self,
-		commit: &ObjectId<H>,
-		midx: &MultiPackIndex<H>,
-	) -> Option<Vec<ObjectId<H>>> {
-		if self.midx_checksum != midx.checksum() {
-			return None;
-		}
-		let position = midx.object_position(commit)? as u32;
-		let reachable = self.commit_reachability(position)?;
-		// Both bitmaps index positions in bitmap object order, so a reachable position names a commit
-		// exactly when it is set in the commit type index.
-		let commit_positions: HashSet<u32> = self.commits.set_bits().collect();
-		reachable
-			.set_bits()
-			.filter(|position| commit_positions.contains(position))
-			.map(|position| midx.object_at_bitmap_position(position as usize).copied())
-			.collect()
-	}
 }
 
 /// Parse a version-1 MIDX reachability `.bitmap`. `H` sets the checksum width. Fails with

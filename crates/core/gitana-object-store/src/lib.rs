@@ -807,16 +807,14 @@ where
 	/// edges only — never reading a tree or blob. Each commit's *direct parents* are tested against
 	/// `targets` before anything deeper, so a target a step or two away short-circuits at once (the
 	/// common incremental-fetch case, where the client already has the tip's parent — even when the tip
-	/// itself is bitmapped). A parent that is itself bitmapped is tested against `targets` for its whole
-	/// ancestry in one step and then pruned, so deep history is never walked commit-by-commit. A missing
-	/// or non-commit frontier node contributes nothing.
+	/// itself is bitmapped). A parent that is itself bitmapped answers for its whole ancestry with a
+	/// single bit test per target — the target's position in its reachability bitmap — and is then
+	/// pruned, so deep history is never walked commit-by-commit nor materialized. A missing or
+	/// non-commit frontier node contributes nothing.
 	///
 	/// Follows every parent to the root, so it is only correct where there is no shallow boundary to
 	/// stop at — callers restrict it to a non-shallow repo (which is also the only kind that has a
 	/// bitmap). With no bitmap this degrades to a plain early-exit commit walk.
-	///
-	/// Follow-up: a bitmapped parent still materializes its commit-ancestry to test membership; a
-	/// single-bit test (mapping each target to its bitmap position) would avoid even that.
 	pub async fn commit_reaches_any(
 		&self,
 		source: ObjectId<H>,
@@ -826,6 +824,25 @@ where
 			return Ok(true);
 		}
 		let bitmap = self.bitmap_and_midx().await?;
+		// The single-bit path maps each target to a bitmap position via the MIDX reverse index. Without
+		// one — a foreign/corrupt `.bitmap` over a MIDX that carries no RIDX — no position resolves, so a
+		// bitmapped parent would prune on an empty target set and hide a deeper target. Treat such a
+		// bitmap as absent and walk, exactly as the pre-bitmap path (and the resolve-to-id path) did.
+		let bitmap = bitmap.filter(|(_, midx)| midx.reverse_index().is_some());
+		// Map each target to its bitmap position once, so a bitmapped parent below answers membership
+		// with an O(1) bit test rather than materializing its whole commit-ancestry. Only *commit*
+		// targets present in the MIDX are kept: a set bit at a non-commit's position means that object is
+		// reachable, not that a commit target is, so restricting to the commit type index preserves the
+		// commit-only contract. A target absent from the MIDX has no position and can never be reached
+		// from a bitmapped parent (whose full closure is packed into that MIDX), so dropping it is safe.
+		let target_positions: Vec<u32> = match &bitmap {
+			Some((bitmap, midx)) => targets
+				.iter()
+				.filter_map(|target| midx.bitmap_position(target))
+				.filter(|&position| bitmap.type_bitmap(ObjectKind::Commit).get(position))
+				.collect(),
+			None => Vec::new(),
+		};
 		let mut seen: HashSet<ObjectId<H>> = HashSet::from([source]);
 		let mut stack: Vec<ObjectId<H>> = vec![source];
 		while let Some(id) = stack.pop() {
@@ -845,15 +862,21 @@ where
 				if !seen.insert(parent) {
 					continue;
 				}
-				// A bitmapped parent answers for its whole ancestry at once: test the targets against it,
-				// then prune (every commit above it is within its reachability). Otherwise keep walking.
-				let reachable = match &bitmap {
-					Some((bitmap, midx)) => bitmap.reachable_commits(&parent, midx),
+				// A bitmapped parent's reachability bitmap has a set bit at every position it reaches, so a
+				// target is reachable exactly when its bit is set — test each and then prune (every commit
+				// above this parent is within that reachability). Otherwise keep walking.
+				let reachability = match &bitmap {
+					Some((bitmap, midx)) => midx
+						.object_position(&parent)
+						.and_then(|lexical| bitmap.commit_reachability(lexical as u32)),
 					None => None,
 				};
-				match reachable {
-					Some(commits) => {
-						if commits.iter().any(|commit| targets.contains(commit)) {
+				match reachability {
+					Some(reachability) => {
+						if target_positions
+							.iter()
+							.any(|&position| reachability.get(position))
+						{
 							return Ok(true);
 						}
 					}
