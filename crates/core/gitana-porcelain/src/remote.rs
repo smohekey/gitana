@@ -12,7 +12,7 @@ use gitana_git_http::{
 };
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_remote::{HttpTransport, Origin, PushRefspec, RECEIVE_PACK_REQUEST, Refspec};
-use gitana_repository::{HeadState, Repository};
+use gitana_repository::{HeadState, ReflogIntent, Repository};
 use gitana_worktree::WorkTree;
 
 use crate::Signer;
@@ -217,7 +217,11 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 				continue;
 			}
 		}
-		repo.refs().update_ref(&tracking, oid, current).await?;
+		// TODO(reflog slice 2): git logs `fetch <remote>: <status>` to tracking refs. Opt out for now.
+		repo
+			.refs()
+			.update_ref(&tracking, oid, current, ReflogIntent::Skip)
+			.await?;
 		updated.push((tracking, oid));
 	}
 
@@ -338,7 +342,11 @@ async fn auto_follow_tags<F: FileStore, H: HashAlgorithm>(
 		// Peel through any tag chain to the object the tag ultimately names (commit / tree / blob).
 		let target = peel_tag_target(repo, oid).await?;
 		if closure.contains(&target) {
-			repo.refs().update_ref(&name, oid, None).await?;
+			// TODO(reflog slice 2): git does not reflog fetched tags; keep opt-out.
+			repo
+				.refs()
+				.update_ref(&name, oid, None, ReflogIntent::Skip)
+				.await?;
 			updated.push((name, oid));
 		}
 	}
@@ -455,14 +463,21 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			if shallow && !repo.objects().exists_object(oid).await? {
 				continue;
 			}
-			repo.refs().update_ref(name, *oid, None).await?;
+			// TODO(reflog slice 2): git writes `clone: from <url>` reflogs. Opt out for now.
+			repo
+				.refs()
+				.update_ref(name, *oid, None, ReflogIntent::Skip)
+				.await?;
 		}
 	}
 	let head_target = advertised
 		.head_target
 		.clone()
 		.unwrap_or_else(|| "refs/heads/main".to_owned());
-	repo.refs().set_head_symbolic(&head_target).await?;
+	repo
+		.refs()
+		.set_head_symbolic(&head_target, ReflogIntent::Skip)
+		.await?;
 	origin.save(repo.objects().file_store()).await?;
 
 	// Populate the working tree from HEAD (if the repo had any commits).
@@ -1355,7 +1370,7 @@ mod tests {
 			.unwrap();
 		wt.repository()
 			.refs()
-			.update_ref("refs/heads/dev", tip, None)
+			.update_ref("refs/heads/dev", tip, None, ReflogIntent::Skip)
 			.await
 			.unwrap();
 

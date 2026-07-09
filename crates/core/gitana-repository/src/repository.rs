@@ -3,7 +3,7 @@ use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit, 
 use gitana_object_store::ObjectStore;
 
 use crate::tree::{FlatEntry, build_tree};
-use crate::{Config, HeadState, RefStore, RepositoryError, TreeBuildEntry};
+use crate::{Config, HeadState, RefStore, ReflogIntent, RepositoryError, TreeBuildEntry};
 
 /// A git repository: the object graph plus refs, over one repo-scoped store.
 ///
@@ -211,7 +211,10 @@ where
 		message: &str,
 	) -> Result<(), RepositoryError> {
 		let refs = self.refs();
-		refs.update_ref(target, commit, parent).await?;
+		// This method writes the branch and HEAD reflogs itself below, so the ref move opts out.
+		refs
+			.update_ref(target, commit, parent, ReflogIntent::Skip)
+			.await?;
 
 		let subject = message.lines().next().unwrap_or("");
 		let reflog = if parent.is_none() {
@@ -262,7 +265,10 @@ where
 		message: &str,
 	) -> Result<(), RepositoryError> {
 		let refs = self.refs();
-		refs.update_ref(target, commit, Some(parent)).await?;
+		// This method writes the branch and HEAD reflogs itself below, so the ref move opts out.
+		refs
+			.update_ref(target, commit, Some(parent), ReflogIntent::Skip)
+			.await?;
 		let subject = message.lines().next().unwrap_or("");
 		let reflog = format!("commit (merge): {subject}");
 		refs
@@ -295,18 +301,25 @@ where
 		// nothing to record (and nothing to move from) on an unborn branch.
 		if let Some(old) = old {
 			let current = refs.resolve("ORIG_HEAD").await?;
-			refs.update_ref("ORIG_HEAD", old, current).await?;
+			// ORIG_HEAD is not a logged namespace; this method writes the reflogs it wants below.
+			refs
+				.update_ref("ORIG_HEAD", old, current, ReflogIntent::Skip)
+				.await?;
 		}
 
 		match head {
 			HeadState::Symbolic(branch) => {
-				refs.update_ref(&branch, commit, old).await?;
+				refs
+					.update_ref(&branch, commit, old, ReflogIntent::Skip)
+					.await?;
 				refs
 					.append_reflog(&branch, old, commit, committer, message)
 					.await?;
 			}
 			HeadState::Detached(_) => {
-				refs.update_ref("HEAD", commit, old).await?;
+				refs
+					.update_ref("HEAD", commit, old, ReflogIntent::Skip)
+					.await?;
 			}
 		}
 		refs
@@ -320,7 +333,9 @@ where
 	pub async fn set_orig_head(&self, commit: ObjectId<H>) -> Result<(), RepositoryError> {
 		let refs = self.refs();
 		let current = refs.resolve("ORIG_HEAD").await?;
-		refs.update_ref("ORIG_HEAD", commit, current).await?;
+		refs
+			.update_ref("ORIG_HEAD", commit, current, ReflogIntent::Skip)
+			.await?;
 		Ok(())
 	}
 

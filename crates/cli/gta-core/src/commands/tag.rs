@@ -4,7 +4,7 @@ use crate::Backend;
 use anyhow::{Result, bail};
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_porcelain::Identity;
-use gitana_repository::Repository;
+use gitana_repository::{ReflogIntent, Repository};
 
 use crate::dispatch::{self, RepoCommand};
 use crate::identity::CliIdentity;
@@ -79,7 +79,11 @@ impl RepoCommand for Tag {
 		} else {
 			oid
 		};
-		repo.refs().update_ref(&full, tag_oid, None).await?;
+		// git does not keep a reflog for tags (they are immutable), so the ref move opts out.
+		repo
+			.refs()
+			.update_ref(&full, tag_oid, None, ReflogIntent::Skip)
+			.await?;
 		Ok(())
 	}
 }

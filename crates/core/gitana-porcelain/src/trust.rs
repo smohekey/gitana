@@ -10,7 +10,7 @@ use gitana_file_store::FileStore;
 use gitana_git_http::{Deepen, parse_advertisement};
 use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit};
 use gitana_remote::{HttpTransport, Origin};
-use gitana_repository::{FileMode, Repository, TreeBuildEntry};
+use gitana_repository::{FileMode, ReflogIntent, Repository, TreeBuildEntry};
 use gitana_trust::{
 	AuditEvent, KeyId, Policy, TRUST_DOCUMENT_PATH, TrustDocument, TrustRoot, TrustedKey,
 	fold_trust_root, verify_candidate_trust_update, verify_candidate_trust_update_anchored,
@@ -70,7 +70,12 @@ pub async fn trust_init<F: FileStore, H: HashAlgorithm>(
 	// anchored fold also surfaces the key that actually signed, for the audit event.
 	let folded = verify_candidate_trust_update_anchored(repo, None, tip).await?;
 
-	repo.refs().update_ref(TRUST_REF, tip, None).await?;
+	// The trust ref lives outside git's logged namespaces, so the move opts out and this writes the
+	// `trust:` reflog explicitly (as it has since the trust subsystem landed).
+	repo
+		.refs()
+		.update_ref(TRUST_REF, tip, None, ReflogIntent::Skip)
+		.await?;
 	let committer = identity.committer_or_default().await;
 	repo
 		.refs()
@@ -191,7 +196,7 @@ pub async fn trust_sync<F: FileStore, H: HashAlgorithm>(
 
 	repo
 		.refs()
-		.update_ref(TRUST_REF, remote_tip, local_tip)
+		.update_ref(TRUST_REF, remote_tip, local_tip, ReflogIntent::Skip)
 		.await?;
 	let committer = identity.committer_or_default().await;
 	repo
@@ -405,7 +410,7 @@ async fn trust_update<F: FileStore, H: HashAlgorithm>(
 	verify_candidate_trust_update(repo, Some(old_tip), new_tip).await?;
 	repo
 		.refs()
-		.update_ref(TRUST_REF, new_tip, Some(old_tip))
+		.update_ref(TRUST_REF, new_tip, Some(old_tip), ReflogIntent::Skip)
 		.await?;
 	let committer = identity.committer_or_default().await;
 	repo

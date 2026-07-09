@@ -20,7 +20,7 @@ use gitana_git_http::{
 };
 use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
-use gitana_repository::{FileMode, Repository, TreeBuildEntry};
+use gitana_repository::{FileMode, ReflogIntent, Repository, TreeBuildEntry};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -387,7 +387,7 @@ async fn push_delete_dwims_a_bare_tag_name() {
 		.unwrap();
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/tags/v1", tip, None)
+		.update_ref("refs/tags/v1", tip, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 
@@ -431,12 +431,12 @@ async fn push_delete_bare_name_is_ambiguous_when_branch_and_tag_both_exist() {
 		.unwrap();
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/heads/dup", tip, None)
+		.update_ref("refs/heads/dup", tip, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/tags/dup", tip, None)
+		.update_ref("refs/tags/dup", tip, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 
@@ -762,12 +762,12 @@ async fn pull_merges_the_refspec_mapped_source_not_the_same_name() {
 		let repo = open(&git_dir);
 		repo
 			.refs()
-			.update_ref("refs/heads/trunk", trunk_tip, None)
+			.update_ref("refs/heads/trunk", trunk_tip, None, ReflogIntent::Skip)
 			.await
 			.unwrap();
 		repo
 			.refs()
-			.update_ref("refs/heads/main", base, Some(trunk_tip))
+			.update_ref("refs/heads/main", base, Some(trunk_tip), ReflogIntent::Skip)
 			.await
 			.unwrap();
 	}
@@ -907,7 +907,7 @@ async fn pull_aborts_when_two_refspecs_target_the_checked_out_branch() {
 	let root = init_server(&git_dir, "f.txt", b"1\n").await;
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/heads/dev", root, None)
+		.update_ref("refs/heads/dev", root, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	let url = serve(git_dir.clone()).await;
@@ -956,7 +956,7 @@ async fn fetch_refuses_a_branch_checked_out_in_a_linked_worktree() {
 	// The server advertises a `dev` branch too, so a refspec can map straight onto local `dev`.
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/heads/dev", root, None)
+		.update_ref("refs/heads/dev", root, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	let url = serve(git_dir.clone()).await;
@@ -1061,7 +1061,7 @@ async fn pull_refuses_a_branch_checked_out_in_a_linked_worktree() {
 	let root = init_server(&git_dir, "f.txt", b"1\n").await;
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/heads/dev", root, None)
+		.update_ref("refs/heads/dev", root, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	let url = serve(git_dir.clone()).await;
@@ -1207,18 +1207,18 @@ async fn fetch_auto_follows_only_reachable_tags() {
 	// NOT reachable from `main` — advance `main` to a child, tag it, then rewind `main` back to root.
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/tags/reach", root, None)
+		.update_ref("refs/tags/reach", root, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	let child = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/tags/unreach", child, None)
+		.update_ref("refs/tags/unreach", child, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/heads/main", root, Some(child))
+		.update_ref("refs/heads/main", root, Some(child), ReflogIntent::Skip)
 		.await
 		.unwrap();
 
@@ -1268,7 +1268,7 @@ async fn fetch_auto_follows_a_reachable_blob_tag() {
 	let blob = open(&git_dir).write_blob(b"1\n").await.unwrap();
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/tags/blobtag", blob, None)
+		.update_ref("refs/tags/blobtag", blob, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 
@@ -1302,7 +1302,7 @@ async fn fetch_honors_tagopt_no_tags_config() {
 	let tip = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/tags/v1", tip, None)
+		.update_ref("refs/tags/v1", tip, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 
@@ -1343,7 +1343,7 @@ async fn fetch_no_tags_disables_auto_follow() {
 	let tip = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/tags/v1", tip, None)
+		.update_ref("refs/tags/v1", tip, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 
@@ -1392,7 +1392,7 @@ async fn fetch_tags_refuses_to_clobber_a_moved_tag() {
 		.unwrap();
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/tags/v1", root, None)
+		.update_ref("refs/tags/v1", root, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	ok(&gta(&["-C", t, "fetch", "--tags"]).await, "fetch --tags");
@@ -1409,7 +1409,7 @@ async fn fetch_tags_refuses_to_clobber_a_moved_tag() {
 	let child = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/tags/v1", child, Some(root))
+		.update_ref("refs/tags/v1", child, Some(root), ReflogIntent::Skip)
 		.await
 		.unwrap();
 	assert!(
@@ -1465,7 +1465,7 @@ async fn fetch_rejects_a_non_fast_forward_without_force() {
 	// Rewind the server branch to the root — a non-fast-forward from the tracking ref's point of view.
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/heads/main", root, Some(child))
+		.update_ref("refs/heads/main", root, Some(child), ReflogIntent::Skip)
 		.await
 		.unwrap();
 	// git treats the rejected update as a failed fetch (non-zero exit), even though nothing is written.
@@ -1534,7 +1534,7 @@ async fn fetch_aborts_when_two_refspecs_target_one_ref() {
 	// A second server branch so both refspecs below have a source to match.
 	open(&git_dir)
 		.refs()
-		.update_ref("refs/heads/dev", root, None)
+		.update_ref("refs/heads/dev", root, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	let url = serve(git_dir.clone()).await;

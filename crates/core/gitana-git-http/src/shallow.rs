@@ -412,7 +412,12 @@ mod tests {
 		let c = commit(&repo, &[b], 3).await;
 		repo
 			.refs()
-			.update_ref("refs/tags/mark", b, None)
+			.update_ref(
+				"refs/tags/mark",
+				b,
+				None,
+				gitana_repository::ReflogIntent::Skip,
+			)
 			.await
 			.unwrap();
 

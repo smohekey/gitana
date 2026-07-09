@@ -24,7 +24,14 @@ mod shallow;
 mod tree;
 
 pub use self::{
-	config::Config, detect::detect_hash_kind, error::RepositoryError, head::HeadState,
-	merge::TreeMerge, mode::FileMode, rebase_state::RebaseState, refs::RefStore,
-	repository::Repository, tree::TreeBuildEntry,
+	config::Config,
+	detect::detect_hash_kind,
+	error::RepositoryError,
+	head::HeadState,
+	merge::TreeMerge,
+	mode::FileMode,
+	rebase_state::RebaseState,
+	refs::{RefStore, ReflogIntent},
+	repository::Repository,
+	tree::TreeBuildEntry,
 };

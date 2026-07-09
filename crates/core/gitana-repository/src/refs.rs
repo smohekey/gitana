@@ -8,6 +8,38 @@ use crate::{HeadState, RepositoryError};
 /// The maximum symbolic-ref chain depth to follow (git's limit), a guard against a cycle.
 const MAX_SYMREF_DEPTH: usize = 5;
 
+/// Whether a ref update should append a reflog entry, and with what identity and message.
+///
+/// A required argument on the ref-moving methods ([`RefStore::update_ref`],
+/// [`RefStore::set_symbolic`]) so a call site cannot silently forget to decide. `Log` *requests* a
+/// reflog line but the write is still subject to git's `core.logAllRefUpdates` gating (namespace and
+/// bare-repo rules); `Skip` never writes one — for internal or plumbing moves git does not log.
+pub enum ReflogIntent<'a> {
+	/// Append a reflog entry (when gating permits) crediting `committer` with `message`. An empty
+	/// `message` records a line with no message (git omits the tab), as `git update-ref` does without
+	/// `-m`.
+	Log {
+		/// The reflog committer line (`Name <email> seconds ±hhmm`).
+		committer: &'a str,
+		/// The reflog message (e.g. `branch: Created from HEAD`), or `""` for none.
+		message: &'a str,
+	},
+	/// Do not write a reflog entry.
+	Skip,
+}
+
+/// git's `core.logAllRefUpdates` policy, resolved from a repository's config.
+#[derive(Clone, Copy)]
+enum ReflogPolicy {
+	/// Log every ref under `refs/` (config `always`).
+	Always,
+	/// Log the standard namespaces (`HEAD`, `refs/heads/*`, `refs/remotes/*`, `refs/notes/*`) and any
+	/// ref that already has a log (config `true`, or unset in a non-bare repo).
+	Enabled,
+	/// Log only refs that already have a log file (config `false`, or unset in a bare repo).
+	Disabled,
+}
+
 /// Reads and updates refs (loose files + symbolic HEAD) over a file store.
 ///
 /// Borrows the repository's file store and id, so it shares the one backend the
@@ -206,6 +238,7 @@ where
 		name: &str,
 		new: ObjectId<H>,
 		expected: Option<ObjectId<H>>,
+		reflog: ReflogIntent<'_>,
 	) -> Result<(), RepositoryError> {
 		let bytes = format!("{new}\n");
 		match self.files.read_path_versioned(name).await {
@@ -236,6 +269,12 @@ where
 					.map_err(map_cas(name))?;
 			}
 			Err(other) => return Err(other.into()),
+		}
+		// The pre-update value is whatever we just verified equal to `expected` (`None` on creation).
+		if let ReflogIntent::Log { committer, message } = reflog {
+			self
+				.log_ref_update(name, expected, new, committer, message)
+				.await?;
 		}
 		Ok(())
 	}
@@ -524,14 +563,40 @@ where
 	}
 
 	/// Point `HEAD` at a ref name (`ref: <target>`), overwriting any current HEAD.
-	pub async fn set_head_symbolic(&self, target: &str) -> Result<(), RepositoryError> {
-		self.set_symbolic("HEAD", target).await
+	pub async fn set_head_symbolic(
+		&self,
+		target: &str,
+		reflog: ReflogIntent<'_>,
+	) -> Result<(), RepositoryError> {
+		self.set_symbolic("HEAD", target, reflog).await
 	}
 
 	/// Point the symbolic ref `name` (e.g. `HEAD`) at `target`.
-	pub async fn set_symbolic(&self, name: &str, target: &str) -> Result<(), RepositoryError> {
+	///
+	/// Retargeting a symbolic ref moves the object it resolves to, so — like git — it appends a reflog
+	/// entry to `name` (from the pre-retarget resolved value to `target`'s), subject to the
+	/// [`ReflogIntent`] and `core.logAllRefUpdates` gating. Skipped when `target` does not yet resolve
+	/// (e.g. `HEAD` pointed at an unborn branch), which has no object movement to record.
+	pub async fn set_symbolic(
+		&self,
+		name: &str,
+		target: &str,
+		reflog: ReflogIntent<'_>,
+	) -> Result<(), RepositoryError> {
+		let old = self.follow_symref(name).await?;
 		let bytes = HeadState::<H>::Symbolic(target.to_owned()).render();
-		self.force_write(name, bytes.as_bytes()).await
+		self.force_write(name, bytes.as_bytes()).await?;
+		if let ReflogIntent::Log { committer, message } = reflog
+			// Follow the chain: `target` may itself be symbolic (e.g. `refs/remotes/origin/HEAD`), which
+			// `resolve` would try to parse as an object id and reject.
+			&& let Some(new) = self.follow_symref(target).await?
+			&& self.should_log(name, self.reflog_policy().await?).await?
+		{
+			self
+				.append_reflog(name, old, new, committer, message)
+				.await?;
+		}
+		Ok(())
 	}
 
 	/// The target of a symbolic ref `name`, or `None` if it is absent or not symbolic.
@@ -551,7 +616,9 @@ where
 	/// Append a reflog entry for `refname` (e.g. `HEAD`, `refs/heads/main`).
 	///
 	/// The file store has no append, so this is read-modify-write under the caller's
-	/// ref lock: `<old> <new> <committer>\t<message>\n` to `logs/<refname>`.
+	/// ref lock: `<old> <new> <committer>\t<message>\n` to `logs/<refname>`. An empty `message`
+	/// records `<old> <new> <committer>\n` with no tab, matching git (`log_ref_write_fd` adds the
+	/// tab and message only when the message is non-empty).
 	pub async fn append_reflog(
 		&self,
 		refname: &str,
@@ -561,7 +628,11 @@ where
 		message: &str,
 	) -> Result<(), RepositoryError> {
 		let old = old.map_or_else(|| "0".repeat(H::RAW_LEN * 2), |id| id.to_hex());
-		let line = format!("{old} {new} {committer}\t{message}\n");
+		let line = if message.is_empty() {
+			format!("{old} {new} {committer}\n")
+		} else {
+			format!("{old} {new} {committer}\t{message}\n")
+		};
 
 		let path = format!("logs/{refname}");
 		let mut content = match self.files.read_path(&path).await {
@@ -571,6 +642,113 @@ where
 		};
 		content.extend_from_slice(line.as_bytes());
 		self.force_write(&path, &content).await
+	}
+
+	/// Append the reflog line(s) for an [`update_ref`](Self::update_ref) that changed `name` from
+	/// `old` to `new`, when `core.logAllRefUpdates` gating permits. When `name` is a branch that
+	/// `HEAD` symbolically points at, git also mirrors the entry into `HEAD`'s reflog — the "split
+	/// HEAD update" — so this cascades there too (each subject to its own gating).
+	async fn log_ref_update(
+		&self,
+		name: &str,
+		old: Option<ObjectId<H>>,
+		new: ObjectId<H>,
+		committer: &str,
+		message: &str,
+	) -> Result<(), RepositoryError> {
+		let policy = self.reflog_policy().await?;
+		// git skips the direct reflog for a no-op update (the new value equals the old), logging only a
+		// real move or a creation.
+		if old != Some(new) && self.should_log(name, policy).await? {
+			self
+				.append_reflog(name, old, new, committer, message)
+				.await?;
+		}
+		// The split HEAD update mirrored into `HEAD` when it points at the branch is a distinct update
+		// that git logs even for a no-op (`update-ref` to the current branch's own tip still records a
+		// HEAD entry — verified against stock git), so it is not gated on `old != new`.
+		if name.starts_with("refs/heads/")
+			&& self.read_symbolic("HEAD").await?.as_deref() == Some(name)
+			&& self.should_log("HEAD", policy).await?
+		{
+			self
+				.append_reflog("HEAD", old, new, committer, message)
+				.await?;
+		}
+		Ok(())
+	}
+
+	/// Whether *creating* a new reflog for `name` is enabled under this repo's `core.logAllRefUpdates`
+	/// (namespace + bare-repo policy), ignoring the "a reflog already exists" carve-out. Exposed for
+	/// callers that write git's reflog layout directly rather than through [`Self::update_ref`] — e.g.
+	/// `worktree add` materialising a new worktree's per-worktree `logs/HEAD` — so they honour the
+	/// same setting.
+	pub async fn creates_reflog_for(&self, name: &str) -> Result<bool, RepositoryError> {
+		Ok(match self.reflog_policy().await? {
+			ReflogPolicy::Always => true,
+			ReflogPolicy::Enabled => is_standard_logged(name),
+			ReflogPolicy::Disabled => false,
+		})
+	}
+
+	/// Whether a ref update to `name` should be logged under `policy`, per git's
+	/// `core.logAllRefUpdates` rules (namespace, bare-repo default, and the "a reflog already exists"
+	/// carve-out).
+	async fn should_log(&self, name: &str, policy: ReflogPolicy) -> Result<bool, RepositoryError> {
+		match policy {
+			ReflogPolicy::Always => Ok(true),
+			ReflogPolicy::Enabled => Ok(is_standard_logged(name) || self.reflog_exists(name).await?),
+			ReflogPolicy::Disabled => self.reflog_exists(name).await,
+		}
+	}
+
+	/// Whether `logs/<name>` already exists (git always appends to an existing reflog, whatever the
+	/// `core.logAllRefUpdates` setting).
+	async fn reflog_exists(&self, name: &str) -> Result<bool, RepositoryError> {
+		match self.files.read_path(&format!("logs/{name}")).await {
+			Ok(_) => Ok(true),
+			Err(FileStoreError::NotFound) => Ok(false),
+			Err(other) => Err(other.into()),
+		}
+	}
+
+	/// Resolve `core.logAllRefUpdates` from config: `always`, a git boolean, or — unset — git's
+	/// default (on for a non-bare repo, off for a bare one). A missing or unparseable config falls
+	/// back to the non-bare default, as an on-disk gitana repo is never bare-by-omission.
+	async fn reflog_policy(&self) -> Result<ReflogPolicy, RepositoryError> {
+		let config = match self.files.read_path("config").await {
+			Ok(bytes) => std::str::from_utf8(&bytes)
+				.ok()
+				.and_then(|text| gitana_config::GitConfig::parse(text).ok()),
+			Err(FileStoreError::NotFound) => None,
+			Err(other) => return Err(other.into()),
+		};
+		let Some(config) = config else {
+			return Ok(ReflogPolicy::Enabled);
+		};
+		if config
+			.get_string("core", None, "logallrefupdates")
+			.is_some_and(|value| value.eq_ignore_ascii_case("always"))
+		{
+			return Ok(ReflogPolicy::Always);
+		}
+		match config.get_bool("core", None, "logallrefupdates") {
+			Ok(Some(true)) => Ok(ReflogPolicy::Enabled),
+			Ok(Some(false)) => Ok(ReflogPolicy::Disabled),
+			// Unset (or an unparseable value): git's default keys off whether the repo is bare.
+			_ => {
+				let bare = config
+					.get_bool("core", None, "bare")
+					.ok()
+					.flatten()
+					.unwrap_or(false);
+				Ok(if bare {
+					ReflogPolicy::Disabled
+				} else {
+					ReflogPolicy::Enabled
+				})
+			}
+		}
 	}
 
 	/// Every object id referenced by any reflog entry under `logs/`: the `<old>` and `<new>`
@@ -633,6 +811,15 @@ where
 	}
 }
 
+/// Whether `name` is in a namespace git logs by default under `core.logAllRefUpdates=true`:
+/// `HEAD`, local branches, remote-tracking refs, and notes (tags and other refs are excluded).
+fn is_standard_logged(name: &str) -> bool {
+	name == "HEAD"
+		|| name.starts_with("refs/heads/")
+		|| name.starts_with("refs/remotes/")
+		|| name.starts_with("refs/notes/")
+}
+
 fn parse_oid<H: HashAlgorithm>(name: &str, bytes: &[u8]) -> Result<ObjectId<H>, RepositoryError> {
 	let text = std::str::from_utf8(bytes)
 		.map_err(|_| RepositoryError::InvalidRef(name.to_owned()))?
@@ -655,7 +842,7 @@ mod tests {
 	use gitana_file_store_memory::MemoryFileStore;
 	use gitana_object::{ObjectId, ObjectKind, Sha256};
 
-	use super::RefStore;
+	use super::{RefStore, ReflogIntent};
 
 	#[tokio::test]
 	async fn reflog_object_ids_collects_ids_despite_a_non_utf8_message() {
@@ -1013,18 +1200,22 @@ mod tests {
 
 		// "Must be absent" refuses a ref that exists (packed-only)…
 		assert!(matches!(
-			store.update_ref("refs/heads/packed", new, None).await,
+			store
+				.update_ref("refs/heads/packed", new, None, ReflogIntent::Skip)
+				.await,
 			Err(crate::RepositoryError::RefMoved { .. })
 		));
 		// …a wrong expected value refuses…
 		assert!(matches!(
-			store.update_ref("refs/heads/packed", new, Some(new)).await,
+			store
+				.update_ref("refs/heads/packed", new, Some(new), ReflogIntent::Skip)
+				.await,
 			Err(crate::RepositoryError::RefMoved { .. })
 		));
 		// …and the packed value is the compare value: the update writes the
 		// shadowing loose file.
 		store
-			.update_ref("refs/heads/packed", new, Some(packed))
+			.update_ref("refs/heads/packed", new, Some(packed), ReflogIntent::Skip)
 			.await
 			.expect("CAS over the packed value");
 		assert_eq!(

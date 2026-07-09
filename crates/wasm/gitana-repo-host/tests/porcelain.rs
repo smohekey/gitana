@@ -18,7 +18,7 @@ mod support;
 
 use anyhow::{Result, anyhow};
 use gitana_object::{HashAlgorithm, ObjectId, Sha1, Sha256};
-use gitana_repository::{FileMode, TreeBuildEntry};
+use gitana_repository::{FileMode, ReflogIntent, TreeBuildEntry};
 
 use self::support::{AUTHOR, Session, committer, native_repo};
 
@@ -49,7 +49,7 @@ async fn seed_repo<H: HashAlgorithm>(git_dir: &std::path::Path) -> Result<String
 		.await?;
 	repo
 		.refs()
-		.update_ref("refs/heads/main", commit, None)
+		.update_ref("refs/heads/main", commit, None, ReflogIntent::Skip)
 		.await?;
 	Ok(commit.to_hex())
 }

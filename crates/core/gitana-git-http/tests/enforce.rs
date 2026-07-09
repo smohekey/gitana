@@ -17,7 +17,7 @@ use gitana_object::{
 	encode_tag, encode_tree, tag_signed_payload,
 };
 use gitana_object_store::ObjectStore;
-use gitana_repository::Repository;
+use gitana_repository::{ReflogIntent, Repository};
 use ssh_key::private::Ed25519Keypair;
 use ssh_key::{HashAlg, LineEnding, PrivateKey};
 
@@ -110,7 +110,7 @@ async fn install_root(repo: &Repo, signer: &PrivateKey, keys: &[&PrivateKey], po
 	let tip = tip.expect("commit");
 	repo
 		.refs()
-		.update_ref("refs/gitana/trust", tip, None)
+		.update_ref("refs/gitana/trust", tip, None, ReflogIntent::Skip)
 		.await
 		.expect("set trust ref");
 	tip
@@ -1073,7 +1073,7 @@ async fn fails_closed_when_the_current_trust_root_is_unverifiable() {
 		.expect("write commit");
 	repo
 		.refs()
-		.update_ref("refs/gitana/trust", bad, None)
+		.update_ref("refs/gitana/trust", bad, None, ReflogIntent::Skip)
 		.await
 		.expect("set trust ref");
 
@@ -1267,7 +1267,7 @@ async fn wire_require_applies_a_signed_delete_when_the_host_grants_deletes() {
 		.expect("write tree");
 	repo
 		.refs()
-		.update_ref("refs/heads/main", commit, None)
+		.update_ref("refs/heads/main", commit, None, ReflogIntent::Skip)
 		.await
 		.expect("set ref");
 

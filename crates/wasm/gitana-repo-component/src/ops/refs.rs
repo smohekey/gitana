@@ -2,7 +2,7 @@
 
 use gitana_file_store_local::WorktreeFileStore;
 use gitana_object::{HashAlgorithm, ObjectId};
-use gitana_repository::{HeadState as EngineHeadState, Repository};
+use gitana_repository::{HeadState as EngineHeadState, ReflogIntent, Repository};
 
 use crate::bindings::exports::gitana::repo::porcelain::{
 	HeadState, RefEntry, RepoError, SymbolicHead,
@@ -67,9 +67,11 @@ pub(crate) async fn update_ref<H: HashAlgorithm>(
 ) -> Result<(), RepoError> {
 	let new = repo.rev_parse(new).await.map_err(repo_error)?;
 	let expected = expected.map(expected_id::<H>).transpose()?;
+	// TODO(reflog follow-up): the component has no committer identity to credit, so this plumbing
+	// export does not write a reflog yet. Out of scope for the local-CLI reflog pass.
 	repo
 		.refs()
-		.update_ref(name, new, expected)
+		.update_ref(name, new, expected, ReflogIntent::Skip)
 		.await
 		.map_err(repo_error)
 }
@@ -101,7 +103,7 @@ pub(crate) async fn set_symbolic_ref<H: HashAlgorithm>(
 ) -> Result<(), RepoError> {
 	repo
 		.refs()
-		.set_symbolic(name, target)
+		.set_symbolic(name, target, ReflogIntent::Skip)
 		.await
 		.map_err(repo_error)
 }

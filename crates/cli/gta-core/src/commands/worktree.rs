@@ -10,10 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
-use gitana_repository::{HeadState, Repository};
+use gitana_repository::{HeadState, ReflogIntent, Repository};
 use gitana_worktree::WorkTree;
 
 use crate::dispatch::detect_algorithm;
+use crate::identity::signature_or_default;
 use crate::repo::{self, Discovered};
 use crate::{Backend, WorkDir};
 
@@ -177,16 +178,50 @@ async fn add_generic<H: HashAlgorithm>(
 		);
 	}
 
+	// The committer credited in the new branch's and the new worktree's reflogs (a default identity
+	// when unconfigured, as git does for reflog-only writes).
+	let committer = signature_or_default(&repo, "COMMITTER").await;
+
 	// Create the branch first (a shared ref), then materialise the admin directory and checkout. A
 	// `create` is only ever paired with a concrete commit (never an orphan).
 	if let Some((refname, expected)) = &plan.create {
 		let commit = plan
 			.commit
 			.expect("a branch to create implies a start commit");
-		repo.refs().update_ref(refname, commit, *expected).await?;
+		// git reflogs the start point as the user named it (default `HEAD`), and says `Reset to` rather
+		// than `Created from` when `-B` resets a branch that already existed (`expected` is `Some`).
+		let start = commit_ish.unwrap_or("HEAD");
+		let verb = if expected.is_some() {
+			"Reset to"
+		} else {
+			"Created from"
+		};
+		let message = format!("branch: {verb} {start}");
+		repo
+			.refs()
+			.update_ref(
+				refname,
+				commit,
+				*expected,
+				ReflogIntent::Log {
+					committer: &committer,
+					message: &message,
+				},
+			)
+			.await?;
 	}
 
-	let admin = write_admin_layout(&admin, target, &plan.head, plan.commit)?;
+	// git only seeds the new worktree's per-worktree `logs/HEAD` when reflogs are enabled
+	// (`core.logAllRefUpdates` — off for a bare repo or when explicitly disabled).
+	let log_head = repo.refs().creates_reflog_for("HEAD").await?;
+	let admin = write_admin_layout(
+		&admin,
+		target,
+		&plan.head,
+		plan.commit,
+		&committer,
+		log_head,
+	)?;
 
 	// Open the new worktree (per-worktree files under `admin`, shared files under `common`) and
 	// materialise the checkout. An orphan worktree has no commit, so it is left empty (as git does).
@@ -392,6 +427,8 @@ fn write_admin_layout<H: HashAlgorithm>(
 	target: &Path,
 	head: &HeadState<H>,
 	commit: Option<ObjectId<H>>,
+	committer: &str,
+	log_head: bool,
 ) -> Result<PathBuf> {
 	std::fs::create_dir_all(admin)
 		.map_err(|error| anyhow!("creating {}: {error}", admin.display()))?;
@@ -414,9 +451,34 @@ fn write_admin_layout<H: HashAlgorithm>(
 	// An orphan worktree has no start commit, so — like git — it gets no `ORIG_HEAD`.
 	if let Some(commit) = commit {
 		std::fs::write(admin.join("ORIG_HEAD"), format!("{commit}\n"))?;
+		if log_head {
+			write_worktree_head_reflog(&admin, head, commit, committer)?;
+		}
 	}
 	std::fs::write(&git_file, format!("gitdir: {}\n", admin.display()))?;
 	Ok(admin)
+}
+
+/// Write the new worktree's per-worktree `logs/HEAD`, matching git's `worktree add`: a creation line
+/// (`0…0 <commit> <committer>` with no message), then — only when `HEAD` is a branch, not a detached
+/// commit — a `<commit> <commit> <committer>\treset: moving to HEAD` line.
+fn write_worktree_head_reflog<H: HashAlgorithm>(
+	admin: &Path,
+	head: &HeadState<H>,
+	commit: ObjectId<H>,
+	committer: &str,
+) -> Result<()> {
+	let zero = "0".repeat(H::RAW_LEN * 2);
+	let oid = commit.to_hex();
+	let mut log = format!("{zero} {oid} {committer}\n");
+	if matches!(head, HeadState::Symbolic(_)) {
+		log.push_str(&format!("{oid} {oid} {committer}\treset: moving to HEAD\n"));
+	}
+	let logs = admin.join("logs");
+	std::fs::create_dir_all(&logs)
+		.map_err(|error| anyhow!("creating {}: {error}", logs.display()))?;
+	std::fs::write(logs.join("HEAD"), log)?;
+	Ok(())
 }
 
 /// The admin directory for a new worktree named after `base`, uniquified against the existing

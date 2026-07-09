@@ -14,7 +14,7 @@ use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, Tag, encode_tag};
 use gitana_object_store::ObjectStore;
 use gitana_repo_host::exports::gitana::repo::porcelain::{HashKind, RepoError};
 use gitana_repo_host::{Repo, State, engine, grant_dir, instantiate, store};
-use gitana_repository::{FileMode, Repository, TreeBuildEntry};
+use gitana_repository::{FileMode, ReflogIntent, Repository, TreeBuildEntry};
 use wasmtime::Store;
 use wasmtime::component::ResourceAny;
 
@@ -168,16 +168,22 @@ pub async fn build_fixture<H: HashAlgorithm>() -> Result<Fixture> {
 		.create_commit(tree_a, Vec::new(), AUTHOR, &committer(50), "orphan\n")
 		.await?;
 
-	repo.refs().update_ref("refs/heads/main", m, None).await?;
 	repo
 		.refs()
-		.update_ref("refs/heads/feature", d, None)
+		.update_ref("refs/heads/main", m, None, ReflogIntent::Skip)
 		.await?;
 	repo
 		.refs()
-		.update_ref("refs/heads/orphan", orphan, None)
+		.update_ref("refs/heads/feature", d, None, ReflogIntent::Skip)
 		.await?;
-	repo.refs().update_ref("refs/tags/lw", b, None).await?;
+	repo
+		.refs()
+		.update_ref("refs/heads/orphan", orphan, None, ReflogIntent::Skip)
+		.await?;
+	repo
+		.refs()
+		.update_ref("refs/tags/lw", b, None, ReflogIntent::Skip)
+		.await?;
 
 	let tag = Tag {
 		object: c,
@@ -193,7 +199,7 @@ pub async fn build_fixture<H: HashAlgorithm>() -> Result<Fixture> {
 		.await?;
 	repo
 		.refs()
-		.update_ref("refs/tags/annot", annot, None)
+		.update_ref("refs/tags/annot", annot, None, ReflogIntent::Skip)
 		.await?;
 
 	// No packed-refs writer exists in gitana; hand-write the file (header + `oid name`

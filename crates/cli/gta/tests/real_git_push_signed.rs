@@ -26,7 +26,7 @@ use gitana_git_http::{
 };
 use gitana_object::{Commit, ObjectId, ObjectKind, Sha1, TreeEntry, encode_commit, encode_tree};
 use gitana_object_store::ObjectStore;
-use gitana_repository::Repository;
+use gitana_repository::{ReflogIntent, Repository};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -176,7 +176,7 @@ async fn install_trust_root(git_dir: &Path, keys: &[String], sign_keyfile: &Path
 		.unwrap();
 	repo
 		.refs()
-		.update_ref("refs/gitana/trust", commit_id, None)
+		.update_ref("refs/gitana/trust", commit_id, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 }

@@ -12,7 +12,7 @@ mod support;
 use std::path::Path;
 
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, Sha1, Sha256, Tag, encode_tag};
-use gitana_repository::{FileMode, Repository, TreeBuildEntry};
+use gitana_repository::{FileMode, ReflogIntent, Repository, TreeBuildEntry};
 use support::{
 	ServerHash, git, git_supports_sha256, git_try, gta, gta_ok, open, serve_gitana, unique_tmp,
 };
@@ -49,12 +49,12 @@ async fn build_server<H: HashAlgorithm>(git_dir: &Path) -> (ObjectId<H>, ObjectI
 
 	repo
 		.refs()
-		.update_ref("refs/heads/dev", head, None)
+		.update_ref("refs/heads/dev", head, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	repo
 		.refs()
-		.update_ref("refs/tags/lw", head, None)
+		.update_ref("refs/tags/lw", head, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 
@@ -73,7 +73,7 @@ async fn build_server<H: HashAlgorithm>(git_dir: &Path) -> (ObjectId<H>, ObjectI
 		.unwrap();
 	repo
 		.refs()
-		.update_ref("refs/tags/v1", tag_id, None)
+		.update_ref("refs/tags/v1", tag_id, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	(head, tag_id)
@@ -376,7 +376,7 @@ async fn git_shallow_excludes_a_ref_from_gitana() {
 	let repo = open::<Sha1>(&git_dir);
 	repo
 		.refs()
-		.update_ref("refs/tags/mark", ids[1], None) // mark = c1
+		.update_ref("refs/tags/mark", ids[1], None, ReflogIntent::Skip) // mark = c1
 		.await
 		.unwrap();
 	let url = serve_gitana(git_dir, ServerHash::Sha1).await;
@@ -432,7 +432,7 @@ async fn git_shallow_clone_keeps_a_reachable_tag_from_gitana() {
 		.unwrap();
 	repo
 		.refs()
-		.update_ref("refs/tags/v1", near, None)
+		.update_ref("refs/tags/v1", near, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	let far = repo
@@ -442,7 +442,7 @@ async fn git_shallow_clone_keeps_a_reachable_tag_from_gitana() {
 		.unwrap();
 	repo
 		.refs()
-		.update_ref("refs/tags/old", far, None)
+		.update_ref("refs/tags/old", far, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 
@@ -625,7 +625,7 @@ async fn narrowed_unshallow_case(version: u8) {
 		.unwrap();
 	repo
 		.refs()
-		.update_ref("refs/heads/other", x1, None)
+		.update_ref("refs/heads/other", x1, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 
@@ -722,7 +722,7 @@ async fn git_shallow_client_fetches_an_older_branch_from_gitana() {
 	// A branch pointing at the root, which a depth-1 clone of `main` will not have.
 	repo
 		.refs()
-		.update_ref("refs/heads/base", ids[0], None)
+		.update_ref("refs/heads/base", ids[0], None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	let url = serve_gitana(git_dir, ServerHash::Sha1).await;
@@ -790,7 +790,7 @@ async fn git_shallow_clones_an_annotated_tag_from_gitana() {
 		.unwrap();
 	repo
 		.refs()
-		.update_ref("refs/tags/v1", tag_id, None)
+		.update_ref("refs/tags/v1", tag_id, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	let url = serve_gitana(git_dir, ServerHash::Sha1).await;

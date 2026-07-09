@@ -256,7 +256,12 @@ mod tests {
 		let tip = loose_commit(repo, vec![absent_parent], "f.txt", b"x").await;
 		repo
 			.refs()
-			.update_ref("refs/heads/main", tip, None)
+			.update_ref(
+				"refs/heads/main",
+				tip,
+				None,
+				gitana_repository::ReflogIntent::Skip,
+			)
 			.await
 			.unwrap();
 		repo.write_shallow(&[tip]).await.unwrap();
@@ -400,7 +405,12 @@ mod tests {
 		let c2 = loose_commit(repo, vec![c1], "f.txt", b"2").await;
 		repo
 			.refs()
-			.update_ref("refs/heads/main", c2, None)
+			.update_ref(
+				"refs/heads/main",
+				c2,
+				None,
+				gitana_repository::ReflogIntent::Skip,
+			)
 			.await
 			.unwrap();
 		// A re-shortened shallow file: the current boundary c2 plus a stale entry c1 behind it.

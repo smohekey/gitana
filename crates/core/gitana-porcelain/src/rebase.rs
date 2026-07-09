@@ -378,7 +378,12 @@ mod tests {
 	) {
 		wt.repository()
 			.refs()
-			.update_ref("refs/heads/upstream", tip, None)
+			.update_ref(
+				"refs/heads/upstream",
+				tip,
+				None,
+				gitana_repository::ReflogIntent::Skip,
+			)
 			.await
 			.unwrap();
 	}

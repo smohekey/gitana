@@ -15,7 +15,7 @@ use gitana_object::{
 	HashAlgorithm, ObjectId, ObjectKind, PktLine, decode_pack_with_bases, parse_pkt,
 	ref_delta_base_ids, referenced_ids, write_flush, write_pkt,
 };
-use gitana_repository::{Repository, RepositoryError};
+use gitana_repository::{ReflogIntent, Repository, RepositoryError};
 use gitana_trust::AuditEvent;
 
 use crate::push_cert::{self, PushCert};
@@ -358,8 +358,10 @@ async fn apply_command<F: FileStore, H: HashAlgorithm>(
 			{
 				return Err("non-fast-forward".to_owned());
 			}
+			// TODO(reflog follow-up): git's receive-pack writes `push` reflog entries server-side;
+			// out of scope for the local-CLI reflog pass, so opt out for now.
 			refs
-				.update_ref(&command.name, new, command.old)
+				.update_ref(&command.name, new, command.old, ReflogIntent::Skip)
 				.await
 				.map_err(reason)
 		}

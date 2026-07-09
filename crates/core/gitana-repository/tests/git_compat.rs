@@ -10,7 +10,7 @@ use gitana_file_store_local::LocalFileStore;
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_object::{ObjectId, ObjectKind, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
-use gitana_repository::{FileMode, HeadState, Repository, TreeBuildEntry};
+use gitana_repository::{FileMode, HeadState, ReflogIntent, Repository, TreeBuildEntry};
 
 fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
 	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
@@ -36,7 +36,7 @@ async fn init_open_and_loose_ref_cas() {
 
 	let first = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"c1");
 	refs
-		.update_ref("refs/heads/main", first, None)
+		.update_ref("refs/heads/main", first, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	assert_eq!(refs.resolve_head().await.unwrap(), Some(first));
@@ -45,12 +45,12 @@ async fn init_open_and_loose_ref_cas() {
 	let second = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"c2");
 	assert!(
 		refs
-			.update_ref("refs/heads/main", second, None)
+			.update_ref("refs/heads/main", second, None, ReflogIntent::Skip)
 			.await
 			.is_err()
 	);
 	refs
-		.update_ref("refs/heads/main", second, Some(first))
+		.update_ref("refs/heads/main", second, Some(first), ReflogIntent::Skip)
 		.await
 		.unwrap();
 	assert_eq!(refs.resolve("refs/heads/main").await.unwrap(), Some(second));
@@ -58,7 +58,7 @@ async fn init_open_and_loose_ref_cas() {
 	// Stale expected fails.
 	assert!(
 		refs
-			.update_ref("refs/heads/main", first, Some(first))
+			.update_ref("refs/heads/main", first, Some(first), ReflogIntent::Skip)
 			.await
 			.is_err()
 	);
@@ -74,12 +74,16 @@ async fn rev_parse_dwims_remote_tracking_refs() {
 
 	let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"remote-tip");
 	refs
-		.update_ref("refs/remotes/origin/main", tip, None)
+		.update_ref("refs/remotes/origin/main", tip, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	// The remote's HEAD is a symbolic ref pointing at its default branch.
 	refs
-		.set_symbolic("refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+		.set_symbolic(
+			"refs/remotes/origin/HEAD",
+			"refs/remotes/origin/main",
+			ReflogIntent::Skip,
+		)
 		.await
 		.unwrap();
 
@@ -115,12 +119,12 @@ async fn rev_parse_treats_a_ref_directory_as_a_miss() {
 
 	let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"remote-tip");
 	refs
-		.update_ref("refs/remotes/origin/main", tip, None)
+		.update_ref("refs/remotes/origin/main", tip, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 	// A hierarchical local branch makes `refs/heads/feature` a directory.
 	refs
-		.update_ref("refs/heads/feature/x", tip, None)
+		.update_ref("refs/heads/feature/x", tip, None, ReflogIntent::Skip)
 		.await
 		.unwrap();
 
