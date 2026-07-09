@@ -134,11 +134,17 @@ Implemented command groups:
 - Ref operations: `update-ref`, `symbolic-ref`, `branch`, `tag`.
 - Working-tree porcelain: `add`, `rm`, `mv`, `status`, `commit`, `merge`, `log`,
   `show`, `switch`, `checkout`, `restore`, `reset`, `diff`.
-- Linked working trees: `worktree` (`add`, `list [--porcelain]`, `remove [--force]`). `add` creates
-  git's admin layout and materialises the checkout — DWIMing a new branch named after the path's
-  basename by default, with `-b`/`-B <name>`, `--detach`, or a `<commit-ish>` (checking out a branch
-  by that name, else detaching), and refusing a branch already checked out in another worktree. The
-  result is byte-for-byte git's layout, so stock git reads and operates in a gta-created worktree.
+- Linked working trees: `worktree` (`add`, `list [--porcelain]`, `remove [--force]`,
+  `lock`/`unlock`, `prune`, `move`, `repair`). `add` creates git's admin layout and materialises the
+  checkout — DWIMing a new branch named after the path's basename by default, with `-b`/`-B <name>`,
+  `--detach`, or a `<commit-ish>` (checking out a branch by that name, else detaching), and refusing a
+  branch already checked out in another worktree. `lock`/`unlock` write and remove `<admin>/locked`;
+  `prune` drops the admin entries of worktrees whose checkout is gone (honouring locks and `--expire`).
+  `move` relocates a checkout (repointing the admin backlink, `mv`-style destination, refusing a locked
+  worktree without `-f -f`), and `repair` fixes the two cross-pointers after a manual move of a checkout
+  or the main worktree. `move`/`remove` refuse a worktree holding an initialized submodule, and
+  `worktree.useRelativePaths` pointers are preserved across a move/repair. The result is byte-for-byte
+  git's layout, so stock git reads and operates in a gta-created worktree.
 - Repository setup: `config` (local read/write).
 - Maintenance: `repack` (consolidate loose objects and packs; honors `pack.packSizeLimit`,
   splitting into multiple size-bounded packs when set; `--geometric` for an incremental

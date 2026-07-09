@@ -513,6 +513,25 @@ enum WorktreeAction {
 		#[arg(long, value_name = "time")]
 		expire: Option<String>,
 	},
+	/// Move a worktree to a new location.
+	#[command(alias = "mv")]
+	Move {
+		/// Path or name of the worktree to move.
+		#[arg(value_name = "worktree")]
+		worktree: PathBuf,
+		/// New path for the worktree.
+		#[arg(value_name = "new-path")]
+		new_path: PathBuf,
+		/// Move even if locked; repeat (`-ff`) as git requires for a locked worktree.
+		#[arg(short, long, action = clap::ArgAction::Count)]
+		force: u8,
+	},
+	/// Repair worktree administrative files after a manual move.
+	Repair {
+		/// Paths of moved worktrees to repair (default: the current worktree).
+		#[arg(value_name = "path")]
+		paths: Vec<PathBuf>,
+	},
 }
 
 /// A `trust` sub-command.
@@ -849,6 +868,16 @@ fn worktree_action(action: WorktreeAction) -> commands::worktree::Action {
 			verbose,
 			expire,
 		},
+		WorktreeAction::Move {
+			worktree,
+			new_path,
+			force,
+		} => Action::Move {
+			worktree,
+			new_path,
+			force,
+		},
+		WorktreeAction::Repair { paths } => Action::Repair { paths },
 	}
 }
 

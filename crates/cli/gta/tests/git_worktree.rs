@@ -1130,6 +1130,677 @@ fn remove_resolves_a_worktree_by_name() {
 	std::fs::remove_dir_all(&base).ok();
 }
 
+#[test]
+fn moves_worktrees_sha256() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	check_move("sha256");
+}
+
+#[test]
+fn moves_worktrees_sha1() {
+	check_move("sha1");
+}
+
+/// `worktree move` matches git: it relocates the checkout, repoints the admin `gitdir` at the new
+/// `.git` file (leaving the checkout's own `.git` file pointing back at the unmoved admin dir), moves
+/// *into* an existing directory under the source basename, refuses an occupied destination and the main
+/// worktree, and needs a second `-f` to move a locked worktree. The moved worktree is byte-for-byte
+/// git's layout, so git reads and lists it afterwards.
+fn check_move(object_format: &str) {
+	let base = unique_tmp(&format!("gta-wt-move-{object_format}"));
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(
+		base_s,
+		&["init", &format!("--object-format={object_format}"), repo_s],
+		b"",
+	);
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+
+	let wt = base.join("wt");
+	gta(repo_s, &["worktree", "add", wt.to_str().unwrap()], b"");
+
+	// A plain rename: the admin `gitdir` repoints at the new checkout, the checkout's `.git` still
+	// points back at the (unmoved) admin dir, and git then reads the relocated worktree.
+	let moved = base.join("moved");
+	gta(
+		repo_s,
+		&[
+			"worktree",
+			"move",
+			wt.to_str().unwrap(),
+			moved.to_str().unwrap(),
+		],
+		b"",
+	);
+	assert!(!wt.exists());
+	assert!(moved.join("f.txt").is_file());
+	assert_eq!(
+		std::fs::read_to_string(repo.join(".git/worktrees/wt/gitdir")).unwrap(),
+		format!("{}\n", real(&moved.join(".git"))),
+	);
+	assert_eq!(
+		std::fs::read_to_string(moved.join(".git")).unwrap(),
+		format!("gitdir: {}\n", real(&repo.join(".git/worktrees/wt"))),
+	);
+	// git reads what gta wrote: `list --porcelain` from both is byte-for-byte identical.
+	assert_eq!(
+		gta(repo_s, &["worktree", "list", "--porcelain"], b""),
+		git(repo_s, &["worktree", "list", "--porcelain"]),
+	);
+
+	// Moving into an existing directory drops the checkout inside it under its own basename (git's
+	// `mv`-like rule), exactly as git resolves the destination.
+	let into = base.join("into");
+	std::fs::create_dir(&into).unwrap();
+	gta(
+		repo_s,
+		&[
+			"worktree",
+			"move",
+			moved.to_str().unwrap(),
+			into.to_str().unwrap(),
+		],
+		b"",
+	);
+	assert!(into.join("moved/f.txt").is_file());
+	assert_eq!(
+		gta(repo_s, &["worktree", "list", "--porcelain"], b""),
+		git(repo_s, &["worktree", "list", "--porcelain"]),
+	);
+
+	// An occupied (non-empty) destination is refused, as is the main worktree. Moving into a directory
+	// whose computed target (`<dir>/<basename>`) already exists non-empty collides, matching git.
+	let occupied = base.join("occupied");
+	std::fs::create_dir_all(occupied.join("moved")).unwrap();
+	std::fs::write(occupied.join("moved/x"), "x").unwrap();
+	assert!(
+		gta_fail(
+			repo_s,
+			&[
+				"worktree",
+				"move",
+				into.join("moved").to_str().unwrap(),
+				occupied.to_str().unwrap(),
+			],
+		)
+		.contains("already exists"),
+	);
+	assert!(
+		gta_fail(
+			repo_s,
+			&["worktree", "move", ".", occupied.to_str().unwrap()]
+		)
+		.contains("is a main working tree"),
+	);
+
+	// A locked worktree needs two `-f`; one is not enough, matching git.
+	let cur = into.join("moved");
+	gta(repo_s, &["worktree", "lock", cur.to_str().unwrap()], b"");
+	let dest1 = base.join("dest1");
+	assert!(
+		gta_fail(
+			repo_s,
+			&[
+				"worktree",
+				"move",
+				"-f",
+				cur.to_str().unwrap(),
+				dest1.to_str().unwrap()
+			],
+		)
+		.contains("locked working tree"),
+	);
+	gta(
+		repo_s,
+		&[
+			"worktree",
+			"move",
+			"-ff",
+			cur.to_str().unwrap(),
+			dest1.to_str().unwrap(),
+		],
+		b"",
+	);
+	assert!(dest1.join("f.txt").is_file());
+	// The lock travels with the worktree (git leaves it locked after a forced move).
+	assert!(repo.join(".git/worktrees/wt/locked").exists());
+	assert_eq!(
+		gta(repo_s, &["worktree", "list", "--porcelain"], b""),
+		git(repo_s, &["worktree", "list", "--porcelain"]),
+	);
+
+	// A second worktree whose checkout is deleted leaves a stale registration. Moving another worktree
+	// onto that path is refused without `-f`; with `-f`, git (and gta) drop the stale admin entry rather
+	// than leave two admin dirs for one path — so `list` never reports a duplicate. (Unlock the mover
+	// first, so the refusal is the registration check, not the lock guard.)
+	gta(
+		repo_s,
+		&["worktree", "unlock", dest1.to_str().unwrap()],
+		b"",
+	);
+	let ghost = base.join("ghost");
+	gta(repo_s, &["worktree", "add", ghost.to_str().unwrap()], b"");
+	std::fs::remove_dir_all(&ghost).unwrap();
+	assert!(
+		gta_fail(
+			repo_s,
+			&[
+				"worktree",
+				"move",
+				dest1.to_str().unwrap(),
+				ghost.to_str().unwrap()
+			],
+		)
+		.contains("already registered"),
+	);
+	gta(
+		repo_s,
+		&[
+			"worktree",
+			"move",
+			"-f",
+			dest1.to_str().unwrap(),
+			ghost.to_str().unwrap(),
+		],
+		b"",
+	);
+	assert!(!repo.join(".git/worktrees/ghost").exists());
+	assert!(ghost.join("f.txt").is_file());
+	assert_eq!(
+		gta(repo_s, &["worktree", "list", "--porcelain"], b""),
+		git(repo_s, &["worktree", "list", "--porcelain"]),
+	);
+
+	// A stale registration that is *locked* is protected further: a single `-f` is refused (git's
+	// distinct "missing but locked" message), and only `-f -f` overrides it and drops the locked entry.
+	let locky = base.join("locky");
+	gta(repo_s, &["worktree", "add", locky.to_str().unwrap()], b"");
+	gta(repo_s, &["worktree", "lock", locky.to_str().unwrap()], b"");
+	std::fs::remove_dir_all(&locky).unwrap();
+	assert!(
+		gta_fail(
+			repo_s,
+			&[
+				"worktree",
+				"move",
+				"-f",
+				ghost.to_str().unwrap(),
+				locky.to_str().unwrap()
+			],
+		)
+		.contains("missing but locked"),
+	);
+	gta(
+		repo_s,
+		&[
+			"worktree",
+			"move",
+			"-ff",
+			ghost.to_str().unwrap(),
+			locky.to_str().unwrap(),
+		],
+		b"",
+	);
+	assert!(!repo.join(".git/worktrees/locky").exists());
+	assert!(locky.join("f.txt").is_file());
+	assert_eq!(
+		gta(repo_s, &["worktree", "list", "--porcelain"], b""),
+		git(repo_s, &["worktree", "list", "--porcelain"]),
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// `worktree move` on a git-created `worktree.useRelativePaths` worktree preserves the relative pointers
+/// (the whole point of that mode — the tree can be relocated as a unit), rewriting both the admin
+/// `gitdir` and the checkout's own `.git` for the new depth, byte-for-byte as git does, so git still
+/// operates in the moved worktree.
+#[test]
+fn move_preserves_relative_path_pointers() {
+	if !git_supports_relative_worktrees() {
+		eprintln!("skipping: git without worktree.useRelativePaths");
+		return;
+	}
+	let base = unique_tmp("gta-wt-move-rel");
+	let repo = base.join("main");
+	let repo_s = repo.to_str().unwrap();
+
+	std::fs::create_dir_all(&repo).unwrap();
+	git(repo_s, &["init", "-q", "."]);
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	git(repo_s, &["config", "worktree.useRelativePaths", "true"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	git(repo_s, &["add", "."]);
+	git(repo_s, &["commit", "-q", "-m", "base"]);
+
+	let wt = base.join("wt");
+	git(
+		repo_s,
+		&["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "feat"],
+	);
+	// git records relative pointers under this mode.
+	assert!(
+		Path::new(
+			std::fs::read_to_string(wt.join(".git"))
+				.unwrap()
+				.trim_start_matches("gitdir: ")
+				.trim()
+		)
+		.is_relative()
+	);
+
+	// Move the checkout a directory deeper, so a relative pointer must be recomputed.
+	let sub = base.join("sub");
+	std::fs::create_dir(&sub).unwrap();
+	let moved = sub.join("moved");
+	gta(
+		repo_s,
+		&[
+			"worktree",
+			"move",
+			wt.to_str().unwrap(),
+			moved.to_str().unwrap(),
+		],
+		b"",
+	);
+	// Both pointers stay relative and resolve correctly — git reads and operates in the moved worktree.
+	assert!(
+		Path::new(
+			std::fs::read_to_string(moved.join(".git"))
+				.unwrap()
+				.trim_start_matches("gitdir: ")
+				.trim()
+		)
+		.is_relative()
+	);
+	assert!(
+		Path::new(
+			std::fs::read_to_string(repo.join(".git/worktrees/wt/gitdir"))
+				.unwrap()
+				.trim()
+		)
+		.is_relative()
+	);
+	assert_eq!(
+		git(
+			moved.to_str().unwrap(),
+			&["rev-parse", "--abbrev-ref", "HEAD"]
+		)
+		.trim(),
+		"feat",
+	);
+	assert_eq!(
+		gta(repo_s, &["worktree", "list", "--porcelain"], b""),
+		git(repo_s, &["worktree", "list", "--porcelain"]),
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// gitana has no submodule support, so — like git — it refuses to `move` or `remove` a worktree holding
+/// an *initialized* submodule (whose `.git` link would otherwise be left dangling / orphaned), while
+/// still allowing a worktree whose submodule is only registered, not checked out. `move` refuses even
+/// with force; `remove` is overridden by a single `--force`, matching git. Skipped where local-file
+/// submodules cannot be set up (older git, or `protocol.file` blocked).
+#[test]
+fn move_and_remove_refuse_a_worktree_with_an_initialized_submodule() {
+	let base = unique_tmp("gta-wt-move-submod");
+	let sub = base.join("sub");
+	let sub_s = sub.to_str().unwrap();
+	let repo = base.join("main");
+	let repo_s = repo.to_str().unwrap();
+
+	// A tiny upstream for the submodule, then a superproject embedding it.
+	std::fs::create_dir_all(&sub).unwrap();
+	git(sub_s, &["init", "-q", "."]);
+	git(sub_s, &["config", "user.name", "T"]);
+	git(sub_s, &["config", "user.email", "t@e"]);
+	std::fs::write(sub.join("s.txt"), "s\n").unwrap();
+	git(sub_s, &["add", "."]);
+	git(sub_s, &["commit", "-q", "-m", "s"]);
+
+	std::fs::create_dir_all(&repo).unwrap();
+	git(repo_s, &["init", "-q", "."]);
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	git(repo_s, &["add", "."]);
+	git(repo_s, &["commit", "-q", "-m", "base"]);
+	// Local-file submodules need `protocol.file.allow=always` on recent git; bail out of the test if the
+	// environment refuses (the submodule working tree won't be initialized).
+	let added = run_ok(&[
+		"-C",
+		repo_s,
+		"-c",
+		"protocol.file.allow=always",
+		"submodule",
+		"add",
+		"-q",
+		sub_s,
+		"sub",
+	]);
+	if added.is_none() {
+		eprintln!("skipping: local-file submodules unavailable");
+		std::fs::remove_dir_all(&base).ok();
+		return;
+	}
+	git(repo_s, &["commit", "-q", "-m", "submodule"]);
+
+	// A worktree whose submodule is only *registered* (empty dir) may move — as git allows.
+	let wt = base.join("wt");
+	git(repo_s, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+	let moved = base.join("moved");
+	gta(
+		repo_s,
+		&[
+			"worktree",
+			"move",
+			wt.to_str().unwrap(),
+			moved.to_str().unwrap(),
+		],
+		b"",
+	);
+	assert!(moved.join("f.txt").is_file());
+
+	// Initialize the submodule in the moved worktree; now a move must be refused, byte-for-byte git's
+	// message, and the worktree is left untouched.
+	if run_ok(&[
+		"-C",
+		moved.to_str().unwrap(),
+		"-c",
+		"protocol.file.allow=always",
+		"submodule",
+		"update",
+		"--init",
+		"-q",
+	])
+	.is_none()
+		|| !moved.join("sub/.git").exists()
+	{
+		eprintln!("skipping: submodule init unavailable");
+		std::fs::remove_dir_all(&base).ok();
+		return;
+	}
+	let err = gta_fail(
+		repo_s,
+		&[
+			"worktree",
+			"move",
+			moved.to_str().unwrap(),
+			base.join("moved2").to_str().unwrap(),
+		],
+	);
+	assert!(err.contains("working trees containing submodules cannot be moved or removed"));
+	assert!(moved.join("f.txt").is_file()); // untouched
+	assert_eq!(
+		gta(repo_s, &["worktree", "list", "--porcelain"], b""),
+		git(repo_s, &["worktree", "list", "--porcelain"]),
+	);
+
+	// The refusal does not rely on the working-copy `.gitmodules`: delete it (an unstaged change) and the
+	// move is still refused, detected via the absorbed submodule git dir under the admin — as git does.
+	std::fs::remove_file(moved.join(".gitmodules")).unwrap();
+	assert!(
+		gta_fail(
+			repo_s,
+			&[
+				"worktree",
+				"move",
+				moved.to_str().unwrap(),
+				base.join("moved3").to_str().unwrap()
+			],
+		)
+		.contains("working trees containing submodules cannot be moved or removed"),
+	);
+	assert!(moved.join("f.txt").is_file());
+
+	// `remove` guards the same way, but — matching git — a single `--force` overrides it (whereas `move`
+	// refuses even with force). A plain `remove` is refused; `--force` deletes the worktree.
+	assert!(
+		gta_fail(repo_s, &["worktree", "remove", moved.to_str().unwrap()])
+			.contains("working trees containing submodules cannot be moved or removed"),
+	);
+	assert!(moved.join("f.txt").is_file()); // untouched by the refusal
+	gta(
+		repo_s,
+		&["worktree", "remove", "--force", moved.to_str().unwrap()],
+		b"",
+	);
+	assert!(!moved.exists());
+	// The admin dir keeps its original basename (`wt`) across the move; `remove` clears it.
+	assert!(!repo.join(".git/worktrees/wt").exists());
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// `worktree repair` on a `worktree.useRelativePaths` worktree whose checkout was moved by hand to a new
+/// depth reconciles *both* pointers (the checkout's relative `.git` is stale at the new depth, so it too
+/// must be recomputed), matching git — where a stale relative pointer would otherwise leave the worktree
+/// unusable even after a successful-looking repair.
+#[test]
+fn repair_reconciles_relative_pointers_after_a_depth_change() {
+	if !git_supports_relative_worktrees() {
+		eprintln!("skipping: git without worktree.useRelativePaths");
+		return;
+	}
+	let base = unique_tmp("gta-wt-repair-rel");
+	let repo = base.join("main");
+	let repo_s = repo.to_str().unwrap();
+
+	std::fs::create_dir_all(&repo).unwrap();
+	git(repo_s, &["init", "-q", "."]);
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	git(repo_s, &["config", "worktree.useRelativePaths", "true"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	git(repo_s, &["add", "."]);
+	git(repo_s, &["commit", "-q", "-m", "base"]);
+
+	let wt = base.join("wt");
+	git(
+		repo_s,
+		&["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "feat"],
+	);
+
+	// Move the checkout a level deeper by hand: its relative `.git` pointer (and the admin backlink) are
+	// now both stale for the new depth.
+	let deep = base.join("deep");
+	std::fs::create_dir(&deep).unwrap();
+	let moved = deep.join("wt");
+	std::fs::rename(&wt, &moved).unwrap();
+
+	gta(
+		repo_s,
+		&["worktree", "repair", moved.to_str().unwrap()],
+		b"",
+	);
+
+	// Both pointers are recomputed (staying relative) and resolve — git reads the repaired worktree.
+	assert!(
+		Path::new(
+			std::fs::read_to_string(moved.join(".git"))
+				.unwrap()
+				.trim_start_matches("gitdir: ")
+				.trim()
+		)
+		.is_relative()
+	);
+	assert_eq!(
+		git(
+			moved.to_str().unwrap(),
+			&["rev-parse", "--abbrev-ref", "HEAD"]
+		)
+		.trim(),
+		"feat",
+	);
+	assert_eq!(
+		gta(repo_s, &["worktree", "list", "--porcelain"], b""),
+		git(repo_s, &["worktree", "list", "--porcelain"]),
+	);
+	// A second repair is a clean no-op now that both pointers are consistent.
+	assert!(gta_stderr(repo_s, &["worktree", "repair", moved.to_str().unwrap()]).is_empty());
+
+	// Deleting the checkout `.git` entirely: repair recreates it in *relative* form (inferred from the
+	// still-relative admin backlink), keeping the worktree relocatable — as git does.
+	std::fs::remove_file(moved.join(".git")).unwrap();
+	gta_stderr(repo_s, &["worktree", "repair", moved.to_str().unwrap()]);
+	assert!(
+		Path::new(
+			std::fs::read_to_string(moved.join(".git"))
+				.unwrap()
+				.trim_start_matches("gitdir: ")
+				.trim()
+		)
+		.is_relative()
+	);
+	assert_eq!(
+		git(
+			moved.to_str().unwrap(),
+			&["rev-parse", "--abbrev-ref", "HEAD"]
+		)
+		.trim(),
+		"feat",
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn repairs_worktrees_sha256() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	check_repair("sha256");
+}
+
+#[test]
+fn repairs_worktrees_sha1() {
+	check_repair("sha1");
+}
+
+/// `worktree repair` matches git in both directions. When a checkout is moved by hand, `repair
+/// <new-path>` fixes the admin `gitdir` backlink (git's `repair: gitdir incorrect` line). When the main
+/// worktree is moved, a no-arg `repair` fixes each linked checkout's `.git` file (git's `repair: .git
+/// file broken` line). After each repair git reads the reconciled layout.
+fn check_repair(object_format: &str) {
+	let base = unique_tmp(&format!("gta-wt-repair-{object_format}"));
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("main");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(
+		base_s,
+		&["init", &format!("--object-format={object_format}"), repo_s],
+		b"",
+	);
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+
+	let wt = base.join("wt");
+	gta(repo_s, &["worktree", "add", wt.to_str().unwrap()], b"");
+
+	// Move the checkout by hand: the admin `gitdir` backlink is now stale. `repair <new-path>` fixes it
+	// and reports the same `gitdir incorrect` line git does.
+	let reloc = base.join("reloc");
+	std::fs::rename(&wt, &reloc).unwrap();
+	let report = gta_stderr(repo_s, &["worktree", "repair", reloc.to_str().unwrap()]);
+	assert_eq!(
+		report.trim(),
+		format!(
+			"repair: gitdir incorrect: {}",
+			real(&repo.join(".git/worktrees/wt/gitdir"))
+		),
+	);
+	assert_eq!(
+		std::fs::read_to_string(repo.join(".git/worktrees/wt/gitdir")).unwrap(),
+		format!("{}\n", real(&reloc.join(".git"))),
+	);
+	// A second repair is a no-op (nothing left to fix), like git.
+	assert!(gta_stderr(repo_s, &["worktree", "repair", reloc.to_str().unwrap()]).is_empty());
+	assert_eq!(
+		gta(repo_s, &["worktree", "list", "--porcelain"], b""),
+		git(repo_s, &["worktree", "list", "--porcelain"]),
+	);
+
+	// Move the main worktree by hand: each linked checkout's `.git` file now points at the old admin
+	// path. A no-arg `repair` from the moved main rewrites them, reporting `. git file broken`.
+	let main2 = base.join("main2");
+	std::fs::rename(&repo, &main2).unwrap();
+	let main2_s = main2.to_str().unwrap();
+	let report = gta_stderr(main2_s, &["worktree", "repair"]);
+	assert_eq!(
+		report.trim(),
+		format!("repair: .git file broken: {}", real(&reloc)),
+	);
+	assert_eq!(
+		std::fs::read_to_string(reloc.join(".git")).unwrap(),
+		format!("gitdir: {}\n", real(&main2.join(".git/worktrees/wt"))),
+	);
+	assert_eq!(
+		gta(main2_s, &["worktree", "list", "--porcelain"], b""),
+		git(main2_s, &["worktree", "list", "--porcelain"]),
+	);
+
+	// A no-arg repair run from a *subdirectory* of a hand-moved checkout still repairs it: the default
+	// target is the discovered worktree root, not the raw cwd.
+	std::fs::create_dir(reloc.join("sub")).unwrap();
+	let reloc2 = base.join("reloc2");
+	std::fs::rename(&reloc, &reloc2).unwrap();
+	gta_stderr(
+		reloc2.join("sub").to_str().unwrap(),
+		&["worktree", "repair"],
+	);
+	assert_eq!(
+		std::fs::read_to_string(main2.join(".git/worktrees/wt/gitdir")).unwrap(),
+		format!("{}\n", real(&reloc2.join(".git"))),
+	);
+	assert_eq!(
+		gta(main2_s, &["worktree", "list", "--porcelain"], b""),
+		git(main2_s, &["worktree", "list", "--porcelain"]),
+	);
+
+	// An explicit repair path that is not a worktree is an error, not a silent success — as git treats it.
+	assert!(
+		gta_fail(main2_s, &["worktree", "repair", "/no/such/path/xyz"]).contains("not a valid path"),
+	);
+	// An explicit *main* worktree path is accepted (git does), a no-op here since its links are healthy.
+	gta(main2_s, &["worktree", "repair", main2_s], b"");
+	assert_eq!(
+		gta(main2_s, &["worktree", "list", "--porcelain"], b""),
+		git(main2_s, &["worktree", "list", "--porcelain"]),
+	);
+
+	// A checkout whose `.git` file is deleted but which the admin still registers is recreated by an
+	// explicit `repair <path>` (via the admin backlink), not rejected — matching git.
+	std::fs::remove_file(reloc2.join(".git")).unwrap();
+	gta_stderr(main2_s, &["worktree", "repair", reloc2.to_str().unwrap()]);
+	assert_eq!(
+		std::fs::read_to_string(reloc2.join(".git")).unwrap(),
+		format!("gitdir: {}\n", real(&main2.join(".git/worktrees/wt"))),
+	);
+	assert_eq!(
+		gta(main2_s, &["worktree", "list", "--porcelain"], b""),
+		git(main2_s, &["worktree", "list", "--porcelain"]),
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
 fn gta(dir: &str, args: &[&str], stdin: &[u8]) -> String {
 	let out = assert_cmd::Command::cargo_bin("gta")
 		.unwrap()
@@ -1218,6 +1889,12 @@ fn set_mtime(path: &Path, stamp: &str) {
 	assert!(ok, "touch -t {stamp} {} failed", path.display());
 }
 
+/// A path's real (canonicalised) form as a string — resolves the `/var`→`/private/var` symlink the
+/// macOS temp dir uses, so an expected pointer matches the realpath gta (and git) writes.
+fn real(path: &Path) -> String {
+	path.canonicalize().unwrap().display().to_string()
+}
+
 fn unique_tmp(tag: &str) -> PathBuf {
 	use std::sync::atomic::{AtomicU64, Ordering};
 	static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1241,4 +1918,51 @@ fn git_supports_sha256() -> bool {
 		let _ = std::fs::remove_dir_all(&probe);
 		ok
 	})
+}
+
+/// Whether the `git` under test honours `worktree.useRelativePaths` (git 2.48+), so the relative-path
+/// interop assertions can run — skipped gracefully on an older git.
+fn git_supports_relative_worktrees() -> bool {
+	use std::sync::OnceLock;
+	static SUPPORTED: OnceLock<bool> = OnceLock::new();
+	*SUPPORTED.get_or_init(|| {
+		let probe = unique_tmp("probe-relwt");
+		let repo = probe.join("main");
+		let repo_s = repo.to_str().unwrap();
+		std::fs::create_dir_all(&repo).unwrap();
+		let ok = (|| {
+			run_ok(&["init", "-q", repo_s])?;
+			run_ok(&["-C", repo_s, "config", "user.name", "T"])?;
+			run_ok(&["-C", repo_s, "config", "user.email", "t@e"])?;
+			run_ok(&["-C", repo_s, "config", "worktree.useRelativePaths", "true"])?;
+			std::fs::write(repo.join("f.txt"), "x\n").ok()?;
+			run_ok(&["-C", repo_s, "add", "."])?;
+			run_ok(&["-C", repo_s, "commit", "-q", "-m", "i"])?;
+			run_ok(&[
+				"-C",
+				repo_s,
+				"worktree",
+				"add",
+				"-q",
+				probe.join("wt").to_str().unwrap(),
+			])?;
+			// The relative-paths mode is honoured only when git writes a *relative* gitdir pointer.
+			let dotgit = std::fs::read_to_string(probe.join("wt").join(".git")).ok()?;
+			let pointer = dotgit.trim().strip_prefix("gitdir:")?.trim();
+			Some(Path::new(pointer).is_relative())
+		})()
+		.unwrap_or(false);
+		let _ = std::fs::remove_dir_all(&probe);
+		ok
+	})
+}
+
+/// Run `git` with `args`, returning `Some(())` on success — a terse helper for capability probes.
+fn run_ok(args: &[&str]) -> Option<()> {
+	Command::new("git")
+		.args(args)
+		.output()
+		.ok()
+		.filter(|out| out.status.success())
+		.map(|_| ())
 }

@@ -52,6 +52,16 @@ pub enum Action {
 		verbose: bool,
 		expire: Option<String>,
 	},
+	/// Move the linked worktree at `worktree` to `new_path`. `force` is a count (git's repeatable `-f`):
+	/// two forces move a locked worktree, one moves onto a path registered to a since-deleted worktree.
+	Move {
+		worktree: PathBuf,
+		new_path: PathBuf,
+		force: u8,
+	},
+	/// Repair the cross-pointers of the worktrees at `paths` (default: the current worktree) after a
+	/// manual move of a checkout or the main worktree.
+	Repair { paths: Vec<PathBuf> },
 }
 
 /// Manage the repository's linked working trees.
@@ -83,6 +93,12 @@ pub async fn run(cwd: &Path, action: Action) -> Result<()> {
 			verbose,
 			expire,
 		} => prune(cwd, dry_run, verbose, expire.as_deref()),
+		Action::Move {
+			worktree,
+			new_path,
+			force,
+		} => move_worktree(cwd, &worktree, &new_path, force),
+		Action::Repair { paths } => repair(cwd, &paths),
 	}
 }
 
@@ -692,6 +708,13 @@ async fn remove(cwd: &Path, path: &Path, force: u8) -> Result<()> {
 		}
 	}
 
+	// gitana has no submodule support; git refuses to remove a worktree holding an initialized submodule
+	// (deleting it would orphan the submodule's git data), so gitana refuses too rather than corrupt a
+	// git-created one. Unlike `move`, a single `--force` overrides this for `remove`, matching git.
+	if force < 1 && target.exists() && worktree_has_submodule(&admin, &target) {
+		bail!("working trees containing submodules cannot be moved or removed");
+	}
+
 	// A still-present dirty checkout needs one `-f`; a stale one has nothing to check.
 	if force < 1 && target.exists() {
 		let dirty = match detect_algorithm(common)? {
@@ -987,6 +1010,400 @@ fn parse_relative_span(spec: &str) -> Option<u64> {
 		_ => return None,
 	};
 	Some(count.saturating_mul(factor))
+}
+
+// ---------------------------------------------------------------------------
+// move
+// ---------------------------------------------------------------------------
+
+/// Relocate a linked worktree's checkout to `new_path` (git `worktree move`): move the directory, then
+/// repoint the admin's `gitdir` backlink at the checkout's new `.git` file. `force` is git's repeatable
+/// flag — two forces move a locked worktree, one moves onto a path still registered to a since-deleted
+/// worktree. git's destination rule matches `mv`: when `new_path` is an existing directory the checkout
+/// moves *into* it under its own basename, otherwise `new_path` is the literal target.
+fn move_worktree(cwd: &Path, worktree: &Path, new_path: &Path, force: u8) -> Result<()> {
+	let found = repo::discover(cwd)?;
+	let common = &found.common_dir;
+	let (admin, source) = match find_worktree(common, cwd, worktree) {
+		Some(WorktreeRef::Main { .. }) => bail!("'{}' is a main working tree", worktree.display()),
+		Some(WorktreeRef::Linked { admin, path }) => (admin, path),
+		None => bail!("'{}' is not a working tree", worktree.display()),
+	};
+
+	// The checkout must be present and genuinely this worktree's before we relocate it (git's
+	// `validate_worktree`): its `.git` file must exist and point back at this admin directory. A stale or
+	// foreign checkout is refused rather than moved.
+	let gitfile = source.join(".git");
+	if !gitfile.is_file() {
+		bail!(
+			"validation failed, cannot move working tree: '{}' does not exist",
+			gitfile.display()
+		);
+	}
+	if !checkout_points_to(&gitfile, &admin) {
+		bail!(
+			"validation failed, cannot move working tree: '{}' is not a .git file",
+			gitfile.display()
+		);
+	}
+
+	// gitana has no submodule support; git refuses to move a worktree holding an initialized submodule
+	// (the submodule's own `.git` link would be left dangling at the old path), so gitana refuses too
+	// rather than corrupt a git-created one. An *uninitialized* submodule is no obstacle, as git allows.
+	if worktree_has_submodule(&admin, &source) {
+		bail!("working trees containing submodules cannot be moved or removed");
+	}
+
+	// A locked worktree needs two `-f` to move (one is not enough), echoing the reason as git does.
+	if let Some(reason) = read_lock_reason(&admin)
+		&& force < 2
+	{
+		if reason.is_empty() {
+			bail!("cannot move a locked working tree;\nuse 'move -f -f' to override or unlock first");
+		}
+		bail!(
+			"cannot move a locked working tree, lock reason: {reason}\nuse 'move -f -f' to override or unlock first"
+		);
+	}
+
+	// The destination, computed git's way: into an existing directory under the source's basename, else
+	// the literal path. `display` mirrors what git prints (the argument, with the basename appended when
+	// moving into a directory).
+	let base = source
+		.file_name()
+		.and_then(|name| name.to_str())
+		.ok_or_else(|| {
+			anyhow!(
+				"could not figure out destination name from '{}'",
+				source.display()
+			)
+		})?;
+	let raw = absolute(cwd, new_path);
+	let (dest, display) = if raw.is_dir() {
+		let arg = new_path.to_string_lossy();
+		(
+			raw.join(base),
+			format!("{}/{base}", arg.trim_end_matches('/')),
+		)
+	} else {
+		(raw, new_path.to_string_lossy().into_owned())
+	};
+
+	// An occupied destination (a non-empty directory or a file) is refused; an empty directory is fine,
+	// as git moves onto one.
+	if dest.exists() && dir_non_empty(&dest)? {
+		bail!("'{display}' already exists");
+	}
+	// A destination still registered to another — since-deleted — worktree needs a force; with it, that
+	// stale admin entry is dropped (as git does) so the repository never ends up with two admin dirs for
+	// one checkout path. A *locked* stale registration is protected: like `remove`, it takes a second
+	// `-f` (git refuses one), so a lock set to prevent cleanup is not discarded by a single force.
+	let stale_registration =
+		admin_dir_for(common, &canonical(&dest)).filter(|other| !canonical_eq(other, &admin));
+	if let Some(other) = &stale_registration {
+		if read_lock_reason(other).is_some() {
+			if force < 2 {
+				bail!(
+					"'{display}' is a missing but locked worktree;\nuse 'move -f -f' to override, or 'unlock' and 'prune' or 'remove' to clear"
+				);
+			}
+		} else if force < 1 {
+			bail!(
+				"'{display}' is a missing but already registered worktree;\nuse 'move -f' to override, or 'prune' or 'remove' to clear"
+			);
+		}
+	}
+
+	// Preserve each pointer's representation across the move: a git `worktree.useRelativePaths` worktree
+	// records relative pointers so the tree can be relocated as a unit, and forcing them to absolute would
+	// defeat that. Capture whether each side is relative *before* the rename (source still in place).
+	let checkout_relative = gitfile_is_relative(&gitfile);
+	let admin_relative = admin_gitdir_is_relative(&admin.join("gitdir"));
+
+	// An empty directory left at the destination would block `rename`; clear it first (validated empty).
+	if dest.is_dir() {
+		std::fs::remove_dir(&dest).map_err(|error| anyhow!("removing {}: {error}", dest.display()))?;
+	}
+	std::fs::rename(&source, &dest).map_err(|error| {
+		anyhow!(
+			"failed to move '{}' to '{}': {error}",
+			source.display(),
+			new_path.display()
+		)
+	})?;
+	// Drop the stale destination registration only *after* the move succeeds, so a failed rename leaves
+	// that (recoverable) admin entry intact rather than discarding it, as git does.
+	if let Some(other) = &stale_registration {
+		std::fs::remove_dir_all(other)
+			.map_err(|error| anyhow!("removing {}: {error}", other.display()))?;
+	}
+
+	// Repoint the admin's backlink at the checkout's new `.git` file, and — only when the checkout used a
+	// relative pointer, now wrong at the new depth — rewrite the checkout's own `.git` file too. An
+	// absolute checkout pointer moved with the directory and still names the (unmoved) admin directory.
+	let git_file = dest.join(".git");
+	let backlink = admin.join("gitdir");
+	std::fs::write(
+		&backlink,
+		format!("{}\n", pointer(&admin, &git_file, admin_relative)),
+	)
+	.map_err(|error| anyhow!("updating {}: {error}", backlink.display()))?;
+	if checkout_relative {
+		std::fs::write(
+			&git_file,
+			format!("gitdir: {}\n", pointer(&dest, &admin, true)),
+		)
+		.map_err(|error| anyhow!("updating {}: {error}", git_file.display()))?;
+	}
+	Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// repair
+// ---------------------------------------------------------------------------
+
+/// Repair the cross-pointers between linked checkouts and their admin directories after a manual move
+/// (git `worktree repair`), reconciling both directions. Two passes, each reconciling a worktree's two
+/// pointers: first each given checkout path (default the current worktree) with the admin it names, then
+/// every registered admin under `<common>/worktrees/*` with its recorded checkout. Each correction is
+/// reported to stderr; a healthy link is silent.
+///
+/// The admin directory is the stable anchor — it lives under the common dir, which discovery resolves
+/// reliably — so even a checkout whose relative `.git` pointer is stale at a new depth is matched by the
+/// admin *name* (the pointer's final component) and fully repaired, both pointers, as git does.
+fn repair(cwd: &Path, paths: &[PathBuf]) -> Result<()> {
+	let found = repo::discover(cwd)?;
+	let common = &found.common_dir;
+
+	// Pass 1 — reconcile each given checkout with the admin its `.git` file names. The no-arg default is
+	// the discovered worktree *root* (not the raw cwd, which may be a subdirectory of a moved checkout).
+	if paths.is_empty() {
+		// `work` is `None` only in a bare repo, which has no linked checkout to repair from here.
+		if let Some(root) = &found.work
+			&& let Some(admin) = admin_for_checkout(common, root)
+		{
+			reconcile(&admin, root)?;
+		}
+	} else {
+		for path in paths {
+			let checkout = absolute(cwd, path);
+			// git errors on a repair target that is not a worktree rather than silently succeeding: a
+			// non-existent path, or an existing one with no readable `.git` file naming a known admin.
+			if !checkout.exists() {
+				bail!("not a valid path: {}", path.display());
+			}
+			// The main worktree (its `.git` is a directory) is a valid explicit target with no backlink of
+			// its own — git accepts it and leaves the linked-checkout repairs to pass 2.
+			if checkout.join(".git").is_dir() {
+				continue;
+			}
+			// Find the admin from the checkout's own `.git` pointer, or — when that file is missing or
+			// garbage — from the admin that still registers this checkout path, so an explicitly named
+			// checkout with a broken `.git` file is recreated (as git does) rather than rejected.
+			let admin = admin_for_checkout(common, &checkout)
+				.or_else(|| admin_dir_for(common, &canonical(&checkout)));
+			let Some(admin) = admin else {
+				bail!(
+					"unable to locate repository; .git file broken: {}",
+					canonical(&checkout).join(".git").display()
+				);
+			};
+			reconcile(&admin, &checkout)?;
+		}
+	}
+
+	// Pass 2 — reconcile every registered admin with its recorded checkout (present on disk; git leaves a
+	// missing one to `prune`). Pointers pass 1 already fixed re-verify as healthy here, so nothing is
+	// reported twice.
+	if let Ok(entries) = std::fs::read_dir(common.join("worktrees")) {
+		let mut admins: Vec<PathBuf> = entries
+			.flatten()
+			.map(|entry| entry.path())
+			.filter(|admin| admin.join("gitdir").is_file())
+			.collect();
+		admins.sort();
+		for admin in admins {
+			if let Some(checkout) = checkout_for_admin(&admin)
+				&& checkout.is_dir()
+			{
+				reconcile(&admin, &checkout)?;
+			}
+		}
+	}
+	Ok(())
+}
+
+/// Reconcile the two cross-pointers of one linked worktree: `<admin>/gitdir` must name the checkout's
+/// `.git` file, and `<checkout>/.git` must name the admin directory. Each side is rewritten — preserving
+/// its absolute/relative representation for the new location — only when it does not already resolve
+/// correctly, reporting the correction to stderr (the admin backlink first, as git orders them). A write
+/// failure is surfaced as an error rather than a false "repaired", so the worktree is not left broken.
+fn reconcile(admin: &Path, checkout: &Path) -> Result<()> {
+	let dotgit = checkout.join(".git");
+	let backlink = admin.join("gitdir");
+
+	// Both pointers share the worktree's absolute/relative choice (`worktree.useRelativePaths`); when the
+	// side being rewritten is itself missing, infer its form from the surviving side so a recreated
+	// pointer stays relative (keeping the tree relocatable as a unit), as git does.
+	let relative = admin_gitdir_is_relative(&backlink) || gitfile_is_relative(&dotgit);
+
+	// `<admin>/gitdir` → the checkout's `.git` file.
+	let backlink_ok = std::fs::read_to_string(&backlink)
+		.ok()
+		.is_some_and(|raw| canonical_eq(&resolve_pointer(admin, &raw), &dotgit));
+	if !backlink_ok {
+		std::fs::write(
+			&backlink,
+			format!("{}\n", pointer(admin, &dotgit, relative)),
+		)
+		.map_err(|error| anyhow!("updating {}: {error}", backlink.display()))?;
+		// git reports the file's normalised absolute path (the pointer itself keeps its form).
+		eprintln!(
+			"repair: gitdir incorrect: {}",
+			canonical(&backlink).display()
+		);
+	}
+
+	// `<checkout>/.git` → the admin directory.
+	let dotgit_ok = gitfile_target(&dotgit).is_some_and(|target| canonical_eq(&target, admin));
+	if !dotgit_ok {
+		std::fs::write(
+			&dotgit,
+			format!("gitdir: {}\n", pointer(checkout, admin, relative)),
+		)
+		.map_err(|error| anyhow!("updating {}: {error}", dotgit.display()))?;
+		eprintln!(
+			"repair: .git file broken: {}",
+			canonical(checkout).display()
+		);
+	}
+	Ok(())
+}
+
+/// The admin directory for the checkout at `checkout`, located by its `.git` pointer's final component
+/// (the admin dir's name — stable even when a relative pointer's *depth* is stale) under the reliable
+/// common dir. `None` for the main worktree (whose `.git` is a directory) or an unknown admin.
+fn admin_for_checkout(common: &Path, checkout: &Path) -> Option<PathBuf> {
+	let content = std::fs::read_to_string(checkout.join(".git")).ok()?;
+	let raw = content.lines().next()?.strip_prefix("gitdir:")?.trim();
+	let name = Path::new(raw).file_name()?;
+	let admin = common.join("worktrees").join(name);
+	admin.join("gitdir").is_file().then_some(admin)
+}
+
+/// The checkout directory an admin records — the parent of the `.git` file its `gitdir` pointer names
+/// (resolved against the admin when relative). `None` if the `gitdir` file is unreadable.
+fn checkout_for_admin(admin: &Path) -> Option<PathBuf> {
+	let raw = std::fs::read_to_string(admin.join("gitdir")).ok()?;
+	resolve_pointer(admin, &raw).parent().map(Path::to_path_buf)
+}
+
+// ---------------------------------------------------------------------------
+// worktree pointers (absolute, or git's `worktree.useRelativePaths` relative form)
+// ---------------------------------------------------------------------------
+
+/// A pointer string from `from_dir` to `target`: relative when `prefer_relative` and a relative form
+/// exists, else the absolute (real) path. Mirrors git's choice between an absolute pointer and a
+/// `worktree.useRelativePaths` relative one, so a move/repair preserves whichever the worktree used.
+fn pointer(from_dir: &Path, target: &Path, prefer_relative: bool) -> String {
+	if prefer_relative && let Some(relative) = relativize(from_dir, target) {
+		return relative;
+	}
+	canonical(target).display().to_string()
+}
+
+/// `target` expressed relative to the directory `from_dir` (both resolved to their real paths first), as
+/// git writes a `worktree.useRelativePaths` pointer. `None` when a relative form cannot be built — the
+/// two share no component at all (different roots, e.g. Windows drives), or either cannot be resolved —
+/// so the caller falls back to an absolute one. Two directories under one filesystem root always share
+/// that root, so on Unix a relative form (however many `..`) is always produced, matching git.
+fn relativize(from_dir: &Path, target: &Path) -> Option<String> {
+	let from = from_dir.canonicalize().ok()?;
+	let from: Vec<_> = from.components().collect();
+	let to = target.canonicalize().ok()?;
+	let to: Vec<_> = to.components().collect();
+	let shared = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+	// No shared component at all means no relative form exists; the caller writes an absolute pointer.
+	if shared == 0 {
+		return None;
+	}
+	let mut parts = vec!["..".to_owned(); from.len() - shared];
+	parts.extend(
+		to[shared..]
+			.iter()
+			.map(|component| component.as_os_str().to_string_lossy().into_owned()),
+	);
+	(!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// Resolve a worktree pointer against `base` when it is relative, leaving an absolute one unchanged —
+/// git records either form (relative when `worktree.useRelativePaths` is set).
+fn resolve_pointer(base: &Path, pointer: &str) -> PathBuf {
+	let pointer = Path::new(pointer.trim());
+	if pointer.is_absolute() {
+		pointer.to_path_buf()
+	} else {
+		base.join(pointer)
+	}
+}
+
+/// The `gitdir:` target recorded in a checkout `.git` file, resolved to an absolute path (a relative
+/// pointer resolves against the checkout directory), or `None` when the file is absent or not a gitfile
+/// (e.g. the main worktree, whose `.git` is a directory).
+fn gitfile_target(gitfile: &Path) -> Option<PathBuf> {
+	let content = std::fs::read_to_string(gitfile).ok()?;
+	let raw = content.lines().next()?.strip_prefix("gitdir:")?;
+	Some(resolve_pointer(gitfile.parent()?, raw))
+}
+
+/// Whether a checkout `.git` file records its `gitdir:` pointer in relative form.
+fn gitfile_is_relative(gitfile: &Path) -> bool {
+	std::fs::read_to_string(gitfile)
+		.ok()
+		.and_then(|content| {
+			content
+				.lines()
+				.next()
+				.and_then(|line| line.strip_prefix("gitdir:"))
+				.map(|dir| Path::new(dir.trim()).is_relative())
+		})
+		.unwrap_or(false)
+}
+
+/// Whether an admin `gitdir` file records a relative pointer.
+fn admin_gitdir_is_relative(gitdir: &Path) -> bool {
+	std::fs::read_to_string(gitdir)
+		.ok()
+		.map(|content| Path::new(content.trim()).is_relative())
+		.unwrap_or(false)
+}
+
+/// Whether the worktree (admin dir `admin`, checkout `checkout`) holds an **initialized** submodule.
+/// git refuses to `move` (or `remove`) such a worktree because the submodule's `.git` link would be left
+/// dangling; gitana has no submodule support, so it likewise refuses rather than corrupt a git-created
+/// one. An *uninitialized* submodule (a gitlink with an empty directory) is no obstacle, matching git.
+///
+/// The authoritative signal is `<admin>/modules/` — where git absorbs an initialized submodule's git
+/// directory — which survives even a deleted working-copy `.gitmodules`; a populated in-tree submodule
+/// declared by `.gitmodules` is caught as a fallback (an older, un-absorbed layout).
+fn worktree_has_submodule(admin: &Path, checkout: &Path) -> bool {
+	let absorbed =
+		std::fs::read_dir(admin.join("modules")).is_ok_and(|mut entries| entries.next().is_some());
+	absorbed || declared_submodule_initialized(checkout)
+}
+
+/// Whether a path declared in the checkout's `.gitmodules` has a populated working tree (a `.git` entry
+/// present) — the fallback signal for a submodule whose git directory is not absorbed under the admin.
+fn declared_submodule_initialized(checkout: &Path) -> bool {
+	let Ok(modules) = std::fs::read_to_string(checkout.join(".gitmodules")) else {
+		return false;
+	};
+	// `.gitmodules` is git-config format; each submodule section carries a `path = <dir>` line.
+	modules
+		.lines()
+		.filter_map(|line| line.trim().strip_prefix("path"))
+		.filter_map(|rest| rest.trim_start().strip_prefix('='))
+		.any(|value| checkout.join(value.trim()).join(".git").exists())
 }
 
 // ---------------------------------------------------------------------------

@@ -200,6 +200,17 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   for `--expire`). A shared `find_worktree` resolves a worktree by exact path or a unique name/id
   suffix (git's rule), retrofitted into `remove`. Oracle-tested against stock git (sha1 + sha256).
   Follow-up slice: `move`/`repair`.
+- [x] Add `worktree move`/`repair`. `move <worktree> <new-path>` relocates the checkout (git's
+  `mv`-style destination: into an existing directory under the source basename, else the literal path),
+  repoints the admin `gitdir` backlink at the new `.git` file, refuses an occupied destination, the main
+  worktree, and a locked worktree without a second `-f` (one `-f` moves onto a since-deleted registered
+  path; a *locked* stale registration needs `-f -f`). `repair [<path>...]` reconciles the two
+  cross-pointers both directions via a shared `reconcile` — matching a moved checkout to its admin by the
+  `.git` pointer's tail-name (or, when broken, a reverse registration lookup that recreates it) and
+  fixing each linked `.git` after a main-worktree move — reporting each correction to stderr. Both
+  `move` and `remove` refuse a worktree with an initialized submodule (git parity: `move` unconditionally,
+  `remove` overridable by `--force`), and `worktree.useRelativePaths` pointers are preserved across
+  move/repair. Oracle-tested against stock git (sha1 + sha256, incl. relative-paths + submodule cases).
 
 ## User Experience
 
