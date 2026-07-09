@@ -78,8 +78,23 @@ async fn fetch_into<H: HashAlgorithm>(
 	if unshallow && repository.read_shallow().await?.is_empty() {
 		bail!("--unshallow on a complete repository does not make sense");
 	}
-	let outcome =
-		gitana_porcelain::fetch(http, &repository, origin, body, false, tags, deepen).await?;
+	// Refuse a refspec that would update a branch checked out in any *other* worktree, not just this
+	// one's HEAD (which the porcelain guards itself).
+	let linked = repo::branches_checked_out_elsewhere(&found.git_dir)
+		.into_iter()
+		.map(|(branch, path)| (branch, path.display().to_string()))
+		.collect::<Vec<_>>();
+	let outcome = gitana_porcelain::fetch(
+		http,
+		&repository,
+		origin,
+		body,
+		false,
+		tags,
+		deepen,
+		&linked,
+	)
+	.await?;
 	println!("Fetched from {}", origin.url);
 	for (tracking, _) in &outcome.updated {
 		println!("   {tracking}");

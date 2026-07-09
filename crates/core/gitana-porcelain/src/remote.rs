@@ -53,9 +53,17 @@ pub struct FetchOutcome<H: HashAlgorithm> {
 /// updated here). `update_head_ok` (set by `pull`) instead *skips* that destination silently: `pull`
 /// advances the checked-out branch and work tree through its merge step.
 ///
+/// `linked_checkouts` lists branches checked out in *other* worktrees of this repository, each with
+/// that worktree's path (the caller enumerates them — this crate has no view of the on-disk worktree
+/// layout). A refspec mapping onto any of them is refused outright, mirroring git: `update_head_ok`
+/// does not exempt them, because `pull`'s merge advances only the *current* HEAD, never another
+/// worktree's branch. The current worktree's own branch is excluded from this list and guarded by the
+/// `HEAD` logic above instead.
+///
 /// A non-empty `deepen` requests a shallow update (git's `fetch --depth` / `--deepen` / `--unshallow` /
 /// `--shallow-since` / `--shallow-exclude`): only the branch tips are deepened and the server's new
 /// shallow boundary is folded into `.git/shallow`. An empty `deepen` (the default) is a normal fetch.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
@@ -64,6 +72,7 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	update_head_ok: bool,
 	tags: TagFetch,
 	deepen: &Deepen,
+	linked_checkouts: &[(String, String)],
 ) -> Result<FetchOutcome<H>> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
 	let haves = gitana_remote::local_haves(repo).await?;
@@ -113,6 +122,7 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 		&negative,
 		checked_out.as_deref(),
 		update_head_ok,
+		linked_checkouts,
 	)?;
 
 	// A shallow fetch deepens from exactly the refs its refspecs select — a positive refspec's *source*
@@ -233,6 +243,7 @@ fn validate_fetch_selection<H: HashAlgorithm>(
 	negative: &[&Refspec],
 	checked_out: Option<&str>,
 	update_head_ok: bool,
+	linked_checkouts: &[(String, String)],
 ) -> Result<()> {
 	for spec in positive {
 		if let Some(source) = spec.exact_source()
@@ -254,6 +265,14 @@ fn validate_fetch_selection<H: HashAlgorithm>(
 				&& other != name.as_str()
 			{
 				bail!("cannot fetch both {other} and {name} to {tracking}");
+			}
+			// A branch checked out in another worktree is refused unconditionally — `pull`'s merge can
+			// only advance the current HEAD, so `update_head_ok` does not exempt it (git's rule).
+			if let Some((_, path)) = linked_checkouts
+				.iter()
+				.find(|(b, _)| b == tracking.as_str())
+			{
+				bail!("refusing to fetch into branch '{tracking}' checked out at '{path}'");
 			}
 			if checked_out == Some(tracking.as_str()) && !update_head_ok {
 				bail!("refusing to fetch into branch '{tracking}' checked out in the work tree");

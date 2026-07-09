@@ -191,9 +191,38 @@ pub(crate) fn branch_checkout_location(
 	exclude: Option<&Path>,
 ) -> Option<PathBuf> {
 	let exclude = exclude.map(canonical);
+	worktree_git_dirs(common_dir)
+		.into_iter()
+		.find(|candidate| {
+			exclude.as_ref() != Some(&canonical(candidate))
+				&& head_symbolic_target(candidate).as_deref() == Some(branch)
+		})
+		.map(|candidate| worktree_path_of(&candidate))
+}
 
-	// Every worktree's git directory: the main worktree (`common_dir`, unless the repo is bare, where
-	// its HEAD is not a checkout) and each `<common_dir>/worktrees/<name>`.
+/// Every branch checked out in a worktree *other* than `git_dir` (the caller's own), paired with that
+/// worktree's working directory. This is the set a plain `fetch` (or `pull`) must refuse to update: git
+/// shares a branch ref across a repository's worktrees, so fetching directly into a branch another
+/// worktree has checked out would desync that checkout's index/work tree from its ref.
+///
+/// The current worktree's own branch is excluded — the caller guards that separately (a `pull` may
+/// still advance it via its merge step). Detached / unborn worktrees contribute nothing.
+pub(crate) fn branches_checked_out_elsewhere(git_dir: &Path) -> Vec<(String, PathBuf)> {
+	let common_dir = common_dir_of(git_dir);
+	let exclude = canonical(git_dir);
+	worktree_git_dirs(&common_dir)
+		.into_iter()
+		.filter(|candidate| canonical(candidate) != exclude)
+		.filter_map(|candidate| {
+			head_symbolic_target(&candidate).map(|branch| (branch, worktree_path_of(&candidate)))
+		})
+		.collect()
+}
+
+/// Every worktree's git directory for the repository at `common_dir`: the main worktree (`common_dir`
+/// itself, unless the repo is bare, where its HEAD is not a checkout) and each
+/// `<common_dir>/worktrees/<name>`.
+fn worktree_git_dirs(common_dir: &Path) -> Vec<PathBuf> {
 	let mut git_dirs = Vec::new();
 	if !is_bare(common_dir) {
 		git_dirs.push(common_dir.to_path_buf());
@@ -205,17 +234,12 @@ pub(crate) fn branch_checkout_location(
 			}
 		}
 	}
-
 	git_dirs
-		.into_iter()
-		.find(|candidate| {
-			exclude.as_ref() != Some(&canonical(candidate)) && head_points_at(candidate, branch)
-		})
-		.map(|candidate| worktree_path_of(&candidate))
 }
 
-/// Whether `<git_dir>/HEAD` is the symbolic ref `branch` (e.g. `refs/heads/main`).
-fn head_points_at(git_dir: &Path, branch: &str) -> bool {
+/// The symbolic ref `<git_dir>/HEAD` points at (e.g. `refs/heads/main`), or `None` when HEAD is
+/// detached (a raw object id) or unreadable.
+fn head_symbolic_target(git_dir: &Path) -> Option<String> {
 	std::fs::read_to_string(git_dir.join("HEAD"))
 		.ok()
 		.and_then(|head| {
@@ -223,7 +247,6 @@ fn head_points_at(git_dir: &Path, branch: &str) -> bool {
 				.strip_prefix("ref:")
 				.map(|target| target.trim().to_owned())
 		})
-		.is_some_and(|target| target == branch)
 }
 
 /// The working directory for a worktree named by its git directory: the parent of the `.git` file a

@@ -52,6 +52,12 @@ async fn pull_into<H: HashAlgorithm>(
 		found.git_dir.clone(),
 	);
 
+	// A refspec mapping onto a branch checked out in another worktree is still refused (pull's merge
+	// advances only this worktree's HEAD, not another's).
+	let linked = repo::branches_checked_out_elsewhere(&found.git_dir)
+		.into_iter()
+		.map(|(branch, path)| (branch, path.display().to_string()))
+		.collect::<Vec<_>>();
 	// `update_head_ok`: a fetch refspec may map straight into the checked-out branch (a mirror config
 	// like `+refs/heads/*:refs/heads/*`); the merge below advances that branch and the work tree.
 	let outcome = gitana_porcelain::fetch(
@@ -62,6 +68,7 @@ async fn pull_into<H: HashAlgorithm>(
 		true,
 		gitana_porcelain::TagFetch::Auto,
 		&gitana_porcelain::Deepen::default(),
+		&linked,
 	)
 	.await?;
 	println!("Fetched from {}", origin.url);

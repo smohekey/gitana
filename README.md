@@ -153,7 +153,8 @@ Implemented command groups:
 - Remote operations: `clone`, `fetch`, `pull`, `push`, `remote` (list/`-v`, `add`,
   `remove`, `rename`, `set-url`). `fetch` honours the configured `remote.origin.fetch` refspecs —
   wildcard, exact, force (`+`), and negative (`^`) — mapping advertised refs to tracking refs and
-  enforcing fast-forward for non-forced refspecs.
+  enforcing fast-forward for non-forced refspecs. A refspec that would write a branch checked out in
+  any worktree — the current one or a linked one — is refused, as git does.
 - Shallow history, matching git: `clone --depth N` / `--shallow-since <date>` / `--shallow-exclude
   <ref>` truncate the fetched history and record the boundary in `.git/shallow`. `fetch` then extends
   it with `--depth N` (absolute), `--deepen N` (relative to the current boundary), `--shallow-since` /

@@ -949,6 +949,105 @@ async fn pull_aborts_when_two_refspecs_target_the_checked_out_branch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_refuses_a_branch_checked_out_in_a_linked_worktree() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	let root = init_server(&git_dir, "f.txt", b"1\n").await;
+	// The server advertises a `dev` branch too, so a refspec can map straight onto local `dev`.
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/heads/dev", root, None)
+		.await
+		.unwrap();
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	// Check `dev` out in a *linked* worktree (not the current HEAD, which stays on `main`).
+	let wt = dst.path().join("wt-dev");
+	ok(
+		&gta(&["-C", t, "worktree", "add", wt.to_str().unwrap(), "dev"]).await,
+		"worktree add dev",
+	);
+	// A refspec that would write straight into local `dev`.
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"+refs/heads/dev:refs/heads/dev",
+		])
+		.await,
+		"config dev refspec",
+	);
+
+	// git refuses this ("checked out at '<path>'"), even though `dev` is not the current HEAD; gta must
+	// too, and must leave the branch untouched.
+	let out = gta(&["-C", t, "fetch"]).await;
+	assert!(
+		!out.status.success(),
+		"fetch must refuse a branch checked out in a linked worktree"
+	);
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	assert!(
+		stderr.contains("checked out at"),
+		"expected git-style linked-worktree refusal, got: {stderr}"
+	);
+	assert_eq!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "refs/heads/dev"]).await,
+			"rev-parse dev",
+		),
+		root.to_hex(),
+		"the linked worktree's branch must be untouched"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_refuses_a_branch_checked_out_in_a_linked_worktree() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	let root = init_server(&git_dir, "f.txt", b"1\n").await;
+	open(&git_dir)
+		.refs()
+		.update_ref("refs/heads/dev", root, None)
+		.await
+		.unwrap();
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	let wt = dst.path().join("wt-dev");
+	ok(
+		&gta(&["-C", t, "worktree", "add", wt.to_str().unwrap(), "dev"]).await,
+		"worktree add dev",
+	);
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"+refs/heads/dev:refs/heads/dev",
+		])
+		.await,
+		"config dev refspec",
+	);
+
+	// `pull` sets update-head-ok, which exempts only the *current* HEAD — a branch checked out in
+	// another worktree is still refused (pull's merge advances only the current HEAD).
+	assert!(
+		!gta(&["-C", t, "pull"]).await.status.success(),
+		"pull must refuse a branch checked out in a linked worktree"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pull_refuses_a_forced_mirror_that_would_discard_local_commits() {
 	let srv = TempDir::new().unwrap();
 	let git_dir = srv.path().join("srv.git");

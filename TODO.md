@@ -95,10 +95,13 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   the checked-out branch is refused (safe-error) rather than git's destructive force-reset. Still
   `origin`-only (no `gta fetch <remote>` arg yet) and the object download is a safe superset of the
   matched refs.
-- [ ] Refuse a fetch refspec that updates a branch checked out in a *linked* worktree, not only the
-  current `HEAD`. Fetch currently guards the current worktree's checked-out branch; git refuses a
-  direct-mapping refspec (e.g. `+refs/heads/dev:refs/heads/dev`) whenever `dev` is checked out in any
-  worktree, which needs enumerating `.git/worktrees/*/HEAD`. Belongs with the linked-worktree subsystem.
+- [x] Refuse a fetch refspec that updates a branch checked out in a *linked* worktree, not only the
+  current `HEAD`. `fetch`/`pull` now enumerate every other worktree's `HEAD`
+  (`repo::branches_checked_out_elsewhere`, factored out of `branch_checkout_location`) and pass the set
+  into `gitana_porcelain::fetch`, which refuses any refspec mapping onto one — unconditionally, since
+  `update_head_ok` (pull) exempts only the current HEAD. Message matches git
+  (`refusing to fetch into branch '<ref>' checked out at '<path>'`). Oracle-tested (fetch + pull). The
+  in-component wasm fetch passes an empty set (no sibling-worktree view through its descriptors).
 - [x] Support explicit push refspecs. `gta push [<remote>] [<refspec>...]` sends `[+]<src>[:<dst>]`
   (force `+`, delete `:<dst>`, exact and DWIM-src forms), enforcing fast-forward for non-forced specs
   (`d40ce107`).

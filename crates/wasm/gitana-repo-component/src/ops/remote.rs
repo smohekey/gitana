@@ -37,6 +37,8 @@ pub(crate) async fn fetch<H: HashAlgorithm>(
 		)));
 	}
 
+	// The component sees a single worktree through its capability descriptors, so it has no view of any
+	// sibling linked worktrees; the current HEAD is still guarded inside the porcelain.
 	let outcome = gitana_porcelain::fetch(
 		&transport,
 		repo,
@@ -45,6 +47,7 @@ pub(crate) async fn fetch<H: HashAlgorithm>(
 		false,
 		gitana_porcelain::TagFetch::Auto,
 		&gitana_porcelain::Deepen::default(),
+		&[],
 	)
 	.await
 	.map_err(remote_error)?;
