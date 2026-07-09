@@ -37,3 +37,4 @@ pub mod symbolic_ref;
 pub mod tag;
 pub mod trust;
 pub mod update_ref;
+pub mod worktree;

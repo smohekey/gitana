@@ -134,6 +134,11 @@ Implemented command groups:
 - Ref operations: `update-ref`, `symbolic-ref`, `branch`, `tag`.
 - Working-tree porcelain: `add`, `rm`, `mv`, `status`, `commit`, `merge`, `log`,
   `show`, `switch`, `checkout`, `restore`, `reset`, `diff`.
+- Linked working trees: `worktree` (`add`, `list [--porcelain]`, `remove [--force]`). `add` creates
+  git's admin layout and materialises the checkout — DWIMing a new branch named after the path's
+  basename by default, with `-b`/`-B <name>`, `--detach`, or a `<commit-ish>` (checking out a branch
+  by that name, else detaching), and refusing a branch already checked out in another worktree. The
+  result is byte-for-byte git's layout, so stock git reads and operates in a gta-created worktree.
 - Repository setup: `config` (local read/write).
 - Maintenance: `repack` (consolidate loose objects and packs; honors `pack.packSizeLimit`,
   splitting into multiple size-bounded packs when set; `--geometric` for an incremental

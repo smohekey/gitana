@@ -75,6 +75,11 @@ where
 		crate::revision::peel_to_tree(self, id).await
 	}
 
+	/// Peel `id` to a commit id, dereferencing an (annotated) tag chain; errors on a non-commit.
+	pub async fn peel_to_commit(&self, id: ObjectId<H>) -> Result<ObjectId<H>, RepositoryError> {
+		crate::revision::peel_to_commit(self, id).await
+	}
+
 	/// Read and parse the full git `config` file.
 	pub async fn read_config(&self) -> Result<gitana_config::GitConfig, RepositoryError> {
 		let bytes = self.objects.file_store().read_path("config").await?;

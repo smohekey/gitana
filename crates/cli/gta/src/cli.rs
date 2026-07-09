@@ -441,6 +441,51 @@ enum Command {
 		#[command(subcommand)]
 		action: TrustAction,
 	},
+	/// Create, list, or remove linked working trees.
+	Worktree {
+		#[command(subcommand)]
+		action: WorktreeAction,
+	},
+}
+
+/// A `worktree` sub-command.
+#[derive(Subcommand)]
+enum WorktreeAction {
+	/// Create a worktree at <path> and check out <commit-ish> (default: a new branch named after the
+	/// path's basename, or HEAD when detached).
+	Add {
+		/// Path for the new worktree.
+		#[arg(value_name = "path")]
+		path: PathBuf,
+		/// Branch or commit to check out.
+		#[arg(value_name = "commit-ish")]
+		commit_ish: Option<String>,
+		/// Create a new branch <name> and check it out.
+		#[arg(short = 'b', value_name = "name", conflicts_with_all = ["force_branch", "detach"])]
+		branch: Option<String>,
+		/// Create or reset branch <name> and check it out.
+		#[arg(short = 'B', value_name = "name", conflicts_with = "detach")]
+		force_branch: Option<String>,
+		/// Check out a detached HEAD rather than a branch.
+		#[arg(long)]
+		detach: bool,
+	},
+	/// List the repository's worktrees.
+	List {
+		/// Machine-readable output.
+		#[arg(long)]
+		porcelain: bool,
+	},
+	/// Remove a worktree.
+	#[command(alias = "rm")]
+	Remove {
+		/// Path of the worktree to remove.
+		#[arg(value_name = "path")]
+		path: PathBuf,
+		/// Remove even if the worktree has changes; repeat (`-ff`) to remove a locked worktree.
+		#[arg(short, long, action = clap::ArgAction::Count)]
+		force: u8,
+	},
 }
 
 /// A `trust` sub-command.
@@ -741,7 +786,31 @@ impl Cli {
 				commands::remote::run(&cwd, remote_action(verbose, action)).await
 			}
 			Command::Trust { action } => commands::trust::run(&cwd, trust_action(action)).await,
+			Command::Worktree { action } => commands::worktree::run(&cwd, worktree_action(action)).await,
 		}
+	}
+}
+
+/// Map the clap `worktree` sub-command to the `gta-core` action. `-b`/`-B <name>` collapse to a
+/// branch name plus a force flag (git's `-B` is the force-create form).
+fn worktree_action(action: WorktreeAction) -> commands::worktree::Action {
+	use commands::worktree::Action;
+	match action {
+		WorktreeAction::Add {
+			path,
+			commit_ish,
+			branch,
+			force_branch,
+			detach,
+		} => Action::Add {
+			path,
+			commit_ish,
+			branch: branch.or_else(|| force_branch.clone()),
+			force_branch: force_branch.is_some(),
+			detach,
+		},
+		WorktreeAction::List { porcelain } => Action::List { porcelain },
+		WorktreeAction::Remove { path, force } => Action::Remove { path, force },
 	}
 }
 

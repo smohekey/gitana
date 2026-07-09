@@ -187,7 +187,13 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [ ] Add sparse checkout support.
 - [ ] Add submodule entry handling beyond tree mode representation.
 - [x] Operate correctly inside linked working trees (`git worktree add`): resolve the `.git`-file pointer and route per-worktree files (`HEAD`, `index`) vs. shared common-dir files (`objects`, `refs`, `config`).
-- [ ] Add a `gta worktree` command (`add`/`list`/`remove`) to create and manage linked working trees.
+- [x] Add a `gta worktree` command (`add`/`list`/`remove`) to create and manage linked working trees.
+  `add` writes git's admin layout (`<common>/worktrees/<name>/` with `HEAD`/`commondir`/`gitdir`/`ORIG_HEAD`
+  plus the checkout's `.git` file) and materialises the checkout, DWIMing a branch from the path's basename
+  (`-b`/`-B`/`--detach`/`<commit-ish>` as git does) and refusing a branch already checked out elsewhere;
+  `list [--porcelain]` and `remove [--force]` match git. Oracle-tested against stock git (sha1 + sha256):
+  git reads and operates in gta-created worktrees and `list --porcelain` is byte-for-byte identical.
+  Follow-up slices: `lock`/`unlock`/`prune`, then `move`/`repair`.
 
 ## User Experience
 

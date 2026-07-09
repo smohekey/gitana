@@ -175,16 +175,30 @@ pub fn discover_worktree_with_prefix(start: &Path) -> Result<(Discovered, String
 /// `git_dir` is the current checkout's per-worktree git directory, excluded from the scan (switching
 /// to the branch this worktree is already on is not a conflict).
 pub fn branch_checked_out_elsewhere(git_dir: &Path, branch: &str) -> Option<PathBuf> {
-	let common = common_dir_of(git_dir);
-	let here = canonical(git_dir);
+	branch_checkout_location(&common_dir_of(git_dir), branch, Some(git_dir))
+}
 
-	// Every worktree's git directory: the main worktree (`common`, unless the repo is bare, where its
-	// HEAD is not a checkout) and each `<common>/worktrees/<name>`.
+/// The working directory of a worktree (the main one, or a linked one under `common_dir`) whose
+/// `HEAD` is the symbolic ref `branch`, skipping `exclude` (a git directory to ignore — typically the
+/// caller's own). git shares a branch ref across a repository's worktrees, so a branch may be checked
+/// out in at most one at a time; this locates that one.
+///
+/// Unlike [`branch_checked_out_elsewhere`], `common_dir` is passed directly, so this works before the
+/// caller's own git directory exists (as `worktree add` needs, checking a not-yet-created worktree).
+pub(crate) fn branch_checkout_location(
+	common_dir: &Path,
+	branch: &str,
+	exclude: Option<&Path>,
+) -> Option<PathBuf> {
+	let exclude = exclude.map(canonical);
+
+	// Every worktree's git directory: the main worktree (`common_dir`, unless the repo is bare, where
+	// its HEAD is not a checkout) and each `<common_dir>/worktrees/<name>`.
 	let mut git_dirs = Vec::new();
-	if !is_bare(&common) {
-		git_dirs.push(common.clone());
+	if !is_bare(common_dir) {
+		git_dirs.push(common_dir.to_path_buf());
 	}
-	if let Ok(entries) = std::fs::read_dir(common.join("worktrees")) {
+	if let Ok(entries) = std::fs::read_dir(common_dir.join("worktrees")) {
 		for entry in entries.flatten() {
 			if entry.path().join("HEAD").is_file() {
 				git_dirs.push(entry.path());
@@ -194,7 +208,9 @@ pub fn branch_checked_out_elsewhere(git_dir: &Path, branch: &str) -> Option<Path
 
 	git_dirs
 		.into_iter()
-		.find(|candidate| canonical(candidate) != here && head_points_at(candidate, branch))
+		.find(|candidate| {
+			exclude.as_ref() != Some(&canonical(candidate)) && head_points_at(candidate, branch)
+		})
 		.map(|candidate| worktree_path_of(&candidate))
 }
 
@@ -210,12 +226,20 @@ fn head_points_at(git_dir: &Path, branch: &str) -> bool {
 		.is_some_and(|target| target == branch)
 }
 
-/// The working directory for a worktree named by its git directory, for error messages: the parent
-/// of the `.git` file a linked worktree's `gitdir` points at, or the parent of the main `.git`.
-fn worktree_path_of(git_dir: &Path) -> PathBuf {
+/// The working directory for a worktree named by its git directory: the parent of the `.git` file a
+/// linked worktree's `gitdir` points at, or the parent of the main `.git`.
+pub(crate) fn worktree_path_of(git_dir: &Path) -> PathBuf {
 	if let Ok(text) = std::fs::read_to_string(git_dir.join("gitdir")) {
-		// `gitdir` points at the worktree's `.git` file; its parent is the working directory.
-		if let Some(parent) = Path::new(text.trim()).parent() {
+		// `gitdir` points at the worktree's `.git` file; its parent is the working directory. git may
+		// write a relative pointer (`worktree.useRelativePaths` / `--relative-paths`), resolved against
+		// the admin directory — not the caller's cwd.
+		let pointer = Path::new(text.trim());
+		let git_file = if pointer.is_absolute() {
+			pointer.to_path_buf()
+		} else {
+			git_dir.join(pointer)
+		};
+		if let Some(parent) = git_file.parent() {
 			return parent.to_path_buf();
 		}
 	}
@@ -226,7 +250,7 @@ fn worktree_path_of(git_dir: &Path) -> PathBuf {
 /// Whether the repository at `common_dir` is bare (`core.bare`), so it has no main working tree and
 /// its `HEAD` is not a checkout. Uses git's boolean grammar (`true`/`yes`/`on`/`1`/valueless), not a
 /// literal `"true"` match.
-fn is_bare(common_dir: &Path) -> bool {
+pub(crate) fn is_bare(common_dir: &Path) -> bool {
 	std::fs::read_to_string(common_dir.join("config"))
 		.ok()
 		.and_then(|text| gitana_config::GitConfig::parse(&text).ok())
