@@ -993,8 +993,8 @@ async fn fetch_refuses_a_branch_checked_out_in_a_linked_worktree() {
 	);
 	let stderr = String::from_utf8_lossy(&out.stderr);
 	assert!(
-		stderr.contains("checked out at"),
-		"expected git-style linked-worktree refusal, got: {stderr}"
+		stderr.contains("checked out at") && stderr.contains("wt-dev"),
+		"expected git-style linked-worktree refusal naming the worktree path, got: {stderr}"
 	);
 	assert_eq!(
 		stdout(
@@ -1003,6 +1003,54 @@ async fn fetch_refuses_a_branch_checked_out_in_a_linked_worktree() {
 		),
 		root.to_hex(),
 		"the linked worktree's branch must be untouched"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_refuses_the_current_branch_naming_the_worktree_path() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(&gta(&["clone", &url, t]).await, "clone");
+	// A mirror refspec maps the remote branch straight onto the local `main` — the current HEAD.
+	ok(
+		&gta(&[
+			"-C",
+			t,
+			"config",
+			"remote.origin.fetch",
+			"+refs/heads/*:refs/heads/*",
+		])
+		.await,
+		"config mirror refspec",
+	);
+	let tip = commit_file(&open(&git_dir), "f.txt", b"2\n").await;
+
+	// A plain fetch refuses the current branch too — and now names its worktree path, exactly like git
+	// (`checked out at '<path>'`), rather than the old path-less "in the work tree".
+	let out = gta(&["-C", t, "fetch"]).await;
+	assert!(
+		!out.status.success(),
+		"plain fetch must refuse the current branch under a mirror refspec"
+	);
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	assert!(
+		stderr.contains("checked out at") && stderr.contains("clone"),
+		"expected git-style refusal naming the current worktree path, got: {stderr}"
+	);
+	// `main` is untouched; the fetch did not advance it to the server tip.
+	assert_ne!(
+		stdout(
+			&gta(&["-C", t, "rev-parse", "refs/heads/main"]).await,
+			"rev-parse main",
+		),
+		tip.to_hex(),
+		"the current branch must be untouched by the refused fetch"
 	);
 }
 

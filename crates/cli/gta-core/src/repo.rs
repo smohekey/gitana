@@ -200,19 +200,17 @@ pub(crate) fn branch_checkout_location(
 		.map(|candidate| worktree_path_of(&candidate))
 }
 
-/// Every branch checked out in a worktree *other* than `git_dir` (the caller's own), paired with that
-/// worktree's working directory. This is the set a plain `fetch` (or `pull`) must refuse to update: git
-/// shares a branch ref across a repository's worktrees, so fetching directly into a branch another
-/// worktree has checked out would desync that checkout's index/work tree from its ref.
+/// Every branch checked out in a worktree of this repository — the main one and each linked one —
+/// paired with that worktree's working directory. This is the set a plain `fetch` (or `pull`) must
+/// refuse to update: git shares a branch ref across a repository's worktrees, so fetching directly into
+/// a branch a worktree has checked out would desync that checkout's index/work tree from its ref.
 ///
-/// The current worktree's own branch is excluded — the caller guards that separately (a `pull` may
-/// still advance it via its merge step). Detached / unborn worktrees contribute nothing.
-pub(crate) fn branches_checked_out_elsewhere(git_dir: &Path) -> Vec<(String, PathBuf)> {
-	let common_dir = common_dir_of(git_dir);
-	let exclude = canonical(git_dir);
-	worktree_git_dirs(&common_dir)
+/// The *current* worktree is included; the fetch guard tells it apart from the others by `HEAD` (a
+/// `pull` may still advance the current branch via its merge step, whereas any other checked-out branch
+/// is refused outright). Detached / unborn worktrees contribute nothing.
+pub(crate) fn branch_checkouts(common_dir: &Path) -> Vec<(String, PathBuf)> {
+	worktree_git_dirs(common_dir)
 		.into_iter()
-		.filter(|candidate| canonical(candidate) != exclude)
 		.filter_map(|candidate| {
 			head_symbolic_target(&candidate).map(|branch| (branch, worktree_path_of(&candidate)))
 		})

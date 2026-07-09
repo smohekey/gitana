@@ -49,16 +49,14 @@ pub struct FetchOutcome<H: HashAlgorithm> {
 /// negative `^<pattern>` refspec excludes it. A non-forced refspec advances its tracking ref only on a
 /// fast-forward; a non-fast-forward under such a refspec is reported in [`FetchOutcome::rejected`].
 ///
-/// A plain fetch refuses to write the branch HEAD points at (git's rule — the work tree is not
-/// updated here). `update_head_ok` (set by `pull`) instead *skips* that destination silently: `pull`
-/// advances the checked-out branch and work tree through its merge step.
-///
-/// `linked_checkouts` lists branches checked out in *other* worktrees of this repository, each with
-/// that worktree's path (the caller enumerates them — this crate has no view of the on-disk worktree
-/// layout). A refspec mapping onto any of them is refused outright, mirroring git: `update_head_ok`
-/// does not exempt them, because `pull`'s merge advances only the *current* HEAD, never another
-/// worktree's branch. The current worktree's own branch is excluded from this list and guarded by the
-/// `HEAD` logic above instead.
+/// `checkouts` lists every branch checked out in a worktree of this repository — the current one and
+/// each linked one — paired with that worktree's path (the caller enumerates them; this crate has no
+/// view of the on-disk worktree layout). A refspec mapping onto a checked-out branch is refused, git's
+/// way: `refusing to fetch into branch '<ref>' checked out at '<path>'`, because a plain fetch does not
+/// update the work tree. The sole exception is the *current* worktree's own branch under
+/// `update_head_ok` (set by `pull`): that destination is skipped here and `pull` advances the branch and
+/// work tree through its merge step. Any *other* worktree's branch is refused even under
+/// `update_head_ok`, since a merge advances only the current HEAD, never another worktree's branch.
 ///
 /// A non-empty `deepen` requests a shallow update (git's `fetch --depth` / `--deepen` / `--unshallow` /
 /// `--shallow-since` / `--shallow-exclude`): only the branch tips are deepened and the server's new
@@ -72,7 +70,7 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	update_head_ok: bool,
 	tags: TagFetch,
 	deepen: &Deepen,
-	linked_checkouts: &[(String, String)],
+	checkouts: &[(String, String)],
 ) -> Result<FetchOutcome<H>> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
 	let haves = gitana_remote::local_haves(repo).await?;
@@ -99,9 +97,10 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	let (positive, negative): (Vec<&Refspec>, Vec<&Refspec>) =
 		refspecs.iter().partition(|spec| !spec.negative);
 
-	// The branch HEAD points at may not be fetched into directly — git refuses, because a plain fetch
-	// does not update the work tree. A bare repo has no work tree, so git allows it there (e.g. a
-	// `+refs/heads/*:refs/heads/*` mirror); `pull` allows it too and reconciles the work tree via merge.
+	// Which branch *this* worktree has checked out — the one `pull` may advance through its merge, and
+	// the one destination the refusal below exempts under `update_head_ok`. A bare repo has no work tree
+	// (git allows a `+refs/heads/*:refs/heads/*` mirror there), so it names no current branch; `checkouts`
+	// is likewise empty for a bare repo, so nothing is refused.
 	let bare = config
 		.get_bool("core", None, "bare")
 		.ok()
@@ -122,7 +121,7 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 		&negative,
 		checked_out.as_deref(),
 		update_head_ok,
-		linked_checkouts,
+		checkouts,
 	)?;
 
 	// A shallow fetch deepens from exactly the refs its refspecs select — a positive refspec's *source*
@@ -243,7 +242,7 @@ fn validate_fetch_selection<H: HashAlgorithm>(
 	negative: &[&Refspec],
 	checked_out: Option<&str>,
 	update_head_ok: bool,
-	linked_checkouts: &[(String, String)],
+	checkouts: &[(String, String)],
 ) -> Result<()> {
 	for spec in positive {
 		if let Some(source) = spec.exact_source()
@@ -266,15 +265,19 @@ fn validate_fetch_selection<H: HashAlgorithm>(
 			{
 				bail!("cannot fetch both {other} and {name} to {tracking}");
 			}
-			// A branch checked out in another worktree is refused unconditionally — `pull`'s merge can
-			// only advance the current HEAD, so `update_head_ok` does not exempt it (git's rule).
-			if let Some((_, path)) = linked_checkouts
-				.iter()
-				.find(|(b, _)| b == tracking.as_str())
-			{
-				bail!("refusing to fetch into branch '{tracking}' checked out at '{path}'");
-			}
-			if checked_out == Some(tracking.as_str()) && !update_head_ok {
+			// A branch checked out in any worktree can't be fetched into directly (git's message names
+			// the worktree's path). The sole exception is the current worktree's own branch under
+			// `update_head_ok` (`pull`), which advances it via its merge step; every other worktree's
+			// branch is refused even then, since a merge advances only the current HEAD.
+			if let Some((_, path)) = checkouts.iter().find(|(b, _)| b == tracking.as_str()) {
+				let is_current = checked_out == Some(tracking.as_str());
+				if !(is_current && update_head_ok) {
+					bail!("refusing to fetch into branch '{tracking}' checked out at '{path}'");
+				}
+			} else if checked_out == Some(tracking.as_str()) && !update_head_ok {
+				// Fallback for a caller that supplies no checkout paths (the in-component fetch, which
+				// can't see worktree paths through its descriptors): still refuse the current branch here,
+				// before `download`, so a failed fetch performs no network / object-store side effects.
 				bail!("refusing to fetch into branch '{tracking}' checked out in the work tree");
 			}
 			claimed.insert(tracking, name.as_str());
