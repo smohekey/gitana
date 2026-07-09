@@ -193,7 +193,13 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   (`-b`/`-B`/`--detach`/`<commit-ish>` as git does) and refusing a branch already checked out elsewhere;
   `list [--porcelain]` and `remove [--force]` match git. Oracle-tested against stock git (sha1 + sha256):
   git reads and operates in gta-created worktrees and `list --porcelain` is byte-for-byte identical.
-  Follow-up slices: `lock`/`unlock`/`prune`, then `move`/`repair`.
+- [x] Add `worktree lock`/`unlock`/`prune`. `lock [--reason]`/`unlock` write/remove `<admin>/locked`
+  (git's exact `<reason>\n`/empty-file format, interoperable both directions); `prune [-n] [-v]
+  [--expire <time>]` removes the admin dirs of worktrees whose checkout is gone (git's
+  `should_prune_worktree`: honours locks, reports to stderr, compares the per-worktree `index` mtime
+  for `--expire`). A shared `find_worktree` resolves a worktree by exact path or a unique name/id
+  suffix (git's rule), retrofitted into `remove`. Oracle-tested against stock git (sha1 + sha256).
+  Follow-up slice: `move`/`repair`.
 
 ## User Experience
 

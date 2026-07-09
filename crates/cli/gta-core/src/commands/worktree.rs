@@ -6,6 +6,7 @@
 //! `.git` file) plus a checkout whose `.git` is a file pointing back at that admin directory.
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
@@ -35,6 +36,22 @@ pub enum Action {
 	/// Remove the linked worktree at `path`. `force` is a count (git's repeatable `-f`): one force
 	/// removes a dirty worktree, two removes a locked one.
 	Remove { path: PathBuf, force: u8 },
+	/// Lock the worktree at `path` (write `<admin>/locked`), recording an optional `reason`. A locked
+	/// worktree is protected from `prune` and needs a second `-f` to `remove`.
+	Lock {
+		path: PathBuf,
+		reason: Option<String>,
+	},
+	/// Unlock the worktree at `path` (remove `<admin>/locked`).
+	Unlock { path: PathBuf },
+	/// Prune the admin directories of worktrees whose checkout is gone (honouring locks). `dry_run`
+	/// (`-n`) reports without removing; `verbose` (`-v`) reports each removal; `expire` keeps a stale
+	/// worktree whose per-worktree `index` is newer than the given time.
+	Prune {
+		dry_run: bool,
+		verbose: bool,
+		expire: Option<String>,
+	},
 }
 
 /// Manage the repository's linked working trees.
@@ -59,6 +76,13 @@ pub async fn run(cwd: &Path, action: Action) -> Result<()> {
 		}
 		Action::List { porcelain } => list(cwd, porcelain).await,
 		Action::Remove { path, force } => remove(cwd, &path, force).await,
+		Action::Lock { path, reason } => lock(cwd, &path, reason.as_deref()),
+		Action::Unlock { path } => unlock(cwd, &path),
+		Action::Prune {
+			dry_run,
+			verbose,
+			expire,
+		} => prune(cwd, dry_run, verbose, expire.as_deref()),
 	}
 }
 
@@ -629,17 +653,14 @@ fn render_porcelain(entries: &[WorktreeInfo]) -> String {
 async fn remove(cwd: &Path, path: &Path, force: u8) -> Result<()> {
 	let found = repo::discover(cwd)?;
 	let common = &found.common_dir;
-	// The checkout may already be gone (deleted or moved) — git still cleans up such a stale entry — so
-	// resolve leniently rather than requiring the path to exist.
-	let target = canonical(&absolute(cwd, path));
-
-	// The main worktree cannot be removed (git: "is a main working tree").
-	if !repo::is_bare(common) && canonical_eq(&repo::worktree_path_of(common), &target) {
-		bail!("'{}' is a main working tree", path.display());
-	}
-
-	let admin = admin_dir_for(common, &target)
-		.ok_or_else(|| anyhow!("'{}' is not a working tree", path.display()))?;
+	// Resolve by git's rules (exact path, then a unique name/id suffix). The checkout may already be
+	// gone (deleted or moved) — git still cleans up such a stale entry — so `find_worktree` matches on
+	// the recorded path without requiring it to exist.
+	let (admin, target) = match find_worktree(common, cwd, path) {
+		Some(WorktreeRef::Main { .. }) => bail!("'{}' is a main working tree", path.display()),
+		Some(WorktreeRef::Linked { admin, path }) => (admin, path),
+		None => bail!("'{}' is not a working tree", path.display()),
+	};
 
 	// A locked worktree is protected: git requires two `-f` to remove it (one is not enough).
 	if let Some(reason) = read_lock_reason(&admin)
@@ -738,6 +759,320 @@ fn checkout_points_to(gitfile: &Path, admin: &Path) -> bool {
 				})
 		})
 		.unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// lock / unlock
+// ---------------------------------------------------------------------------
+
+/// Lock the worktree named by `arg` (git `worktree lock`): write `<admin>/locked`, holding the reason
+/// if one is given. A locked worktree resists `prune` and needs a second `-f` to `remove`.
+fn lock(cwd: &Path, arg: &Path, reason: Option<&str>) -> Result<()> {
+	let found = repo::discover(cwd)?;
+	let admin = resolve_lockable(&found.common_dir, cwd, arg)?;
+	// git refuses to re-lock an already-locked worktree, echoing the existing reason.
+	if let Some(existing) = read_lock_reason(&admin) {
+		if existing.is_empty() {
+			bail!("'{}' is already locked", arg.display());
+		}
+		bail!("'{}' is already locked, reason: {existing}", arg.display());
+	}
+	// git writes the reason followed by a newline, or an empty file when locked without a reason.
+	let body = match reason {
+		Some(reason) if !reason.is_empty() => format!("{reason}\n"),
+		_ => String::new(),
+	};
+	std::fs::write(admin.join("locked"), body)
+		.map_err(|error| anyhow!("locking {}: {error}", arg.display()))?;
+	Ok(())
+}
+
+/// Unlock the worktree named by `arg` (git `worktree unlock`): remove `<admin>/locked`.
+fn unlock(cwd: &Path, arg: &Path) -> Result<()> {
+	let found = repo::discover(cwd)?;
+	let admin = resolve_lockable(&found.common_dir, cwd, arg)?;
+	if read_lock_reason(&admin).is_none() {
+		bail!("'{}' is not locked", arg.display());
+	}
+	std::fs::remove_file(admin.join("locked"))
+		.map_err(|error| anyhow!("unlocking {}: {error}", arg.display()))?;
+	Ok(())
+}
+
+/// Resolve `arg` to a *linked* worktree's admin directory for lock/unlock, rejecting the main
+/// worktree (git: "The main working tree cannot be locked or unlocked") and an unknown worktree
+/// (git: "'<arg>' is not a working tree").
+fn resolve_lockable(common: &Path, cwd: &Path, arg: &Path) -> Result<PathBuf> {
+	match find_worktree(common, cwd, arg) {
+		Some(WorktreeRef::Linked { admin, .. }) => Ok(admin),
+		Some(WorktreeRef::Main { .. }) => {
+			bail!("The main working tree cannot be locked or unlocked")
+		}
+		None => bail!("'{}' is not a working tree", arg.display()),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// prune
+// ---------------------------------------------------------------------------
+
+/// Prune the admin directories of worktrees whose checkout has gone (git `worktree prune`). Mirrors
+/// git's `should_prune_worktree`: a locked worktree is kept; a missing/empty `gitdir` file, or a
+/// `gitdir` whose target `.git` file is gone, marks the entry stale. When stale, `--expire` keeps it
+/// if its per-worktree `index` is newer than the cutoff (git compares the `index` mtime). `dry_run`
+/// (`-n`) reports without removing; each removal is reported to stderr when `dry_run` or `verbose`.
+fn prune(cwd: &Path, dry_run: bool, verbose: bool, expire: Option<&str>) -> Result<()> {
+	let found = repo::discover(cwd)?;
+	let common = &found.common_dir;
+	// Default (no `--expire`): remove every stale worktree — git uses an effectively-infinite cutoff.
+	let cutoff = match expire {
+		Some(spec) => parse_expiry(spec)?,
+		None => u64::MAX,
+	};
+	let worktrees = common.join("worktrees");
+	let mut names: Vec<String> = match std::fs::read_dir(&worktrees) {
+		Ok(entries) => entries
+			.flatten()
+			.filter_map(|entry| entry.file_name().into_string().ok())
+			.collect(),
+		Err(_) => return Ok(()),
+	};
+	// A stable order keeps the (stderr) report deterministic; git walks readdir order.
+	names.sort();
+	for name in names {
+		let admin = worktrees.join(&name);
+		let Some(reason) = prune_reason(&admin, cutoff) else {
+			continue;
+		};
+		if dry_run || verbose {
+			eprintln!("Removing worktrees/{name}: {reason}");
+		}
+		if !dry_run {
+			// A malformed entry that is a plain file (`not a valid directory`) must be unlinked, not
+			// `remove_dir_all`-ed — prune is the cleanup path for exactly such corrupt admin entries.
+			let removed = if admin.is_dir() {
+				std::fs::remove_dir_all(&admin)
+			} else {
+				std::fs::remove_file(&admin)
+			};
+			removed.map_err(|error| anyhow!("removing {}: {error}", admin.display()))?;
+		}
+	}
+	Ok(())
+}
+
+/// The reason to prune the admin directory `admin`, or `None` to keep it — git's
+/// `should_prune_worktree`:
+/// - not a directory → "not a valid directory";
+/// - a `locked` file present → keep (a lock protects a stale worktree from pruning);
+/// - `gitdir` file missing → "gitdir file does not exist";
+/// - `gitdir` file empty → "invalid gitdir file";
+/// - the `.git` file it points at is gone → "gitdir file points to non-existent location", *unless*
+///   the per-worktree `index` is newer than `cutoff` (then keep — the worktree was used recently).
+fn prune_reason(admin: &Path, cutoff: u64) -> Option<String> {
+	if !admin.is_dir() {
+		return Some("not a valid directory".to_owned());
+	}
+	if admin.join("locked").exists() {
+		return None;
+	}
+	let pointer = match std::fs::read_to_string(admin.join("gitdir")) {
+		Ok(text) => text,
+		Err(_) => return Some("gitdir file does not exist".to_owned()),
+	};
+	let pointer = pointer.trim();
+	if pointer.is_empty() {
+		return Some("invalid gitdir file".to_owned());
+	}
+	// `gitdir` records the checkout's `.git` file; a relative pointer resolves against the admin dir.
+	let git_file = {
+		let pointer = Path::new(pointer);
+		if pointer.is_absolute() {
+			pointer.to_path_buf()
+		} else {
+			admin.join(pointer)
+		}
+	};
+	if git_file.exists() {
+		return None;
+	}
+	// Stale: keep it only when `--expire` leaves the per-worktree index newer than the cutoff. A
+	// missing index (an orphan worktree never checked out, or one already cleaned) is always prunable.
+	if index_mtime_secs(admin).is_some_and(|mtime| mtime > cutoff) {
+		return None;
+	}
+	Some("gitdir file points to non-existent location".to_owned())
+}
+
+/// The mtime (seconds since the Unix epoch) of the worktree's per-worktree `index`, or `None` when it
+/// has none. git compares this against `--expire`.
+fn index_mtime_secs(admin: &Path) -> Option<u64> {
+	let mtime = std::fs::metadata(admin.join("index"))
+		.ok()?
+		.modified()
+		.ok()?;
+	Some(mtime.duration_since(UNIX_EPOCH).ok()?.as_secs())
+}
+
+/// A bare integer is accepted as a `--expire` value only when it is large enough to be an unambiguous
+/// Unix timestamp (roughly 1973 onward). git's `approxidate` treats *small* integers as fuzzy date
+/// components rather than epoch seconds — and does so non-monotonically (`0` and `100` prune, `1`
+/// keeps) — which gta deliberately does not reproduce; a small integer is rejected with a clear error
+/// rather than silently mis-dated as literal epoch seconds (which would behave like `never`).
+const MIN_EPOCH_EXPIRY: u64 = 100_000_000;
+
+/// Parse a git `--expire` time into seconds since the Unix epoch. Supports the forms gta needs: a
+/// Unix timestamp (a large integer — git's approxidate also reads one as epoch seconds), `now`, `all`,
+/// `never`, and simple relative spans (`2.weeks.ago`, `3 days ago`, `1.year`). git's full approxidate
+/// grammar (absolute calendar dates, `yesterday`, small fuzzy integers, …) is intentionally not
+/// reproduced — a clear error is returned rather than silently mis-dating a prune.
+fn parse_expiry(spec: &str) -> Result<u64> {
+	let spec = spec.trim();
+	match spec {
+		// git's `parse_expiry_date` special-cases these: `now`/`all` mean "expire everything" (an
+		// effectively infinite cutoff — *not* the current time, so a future-dated index is still
+		// pruned), and `never`/`false` mean "do not expire by age" (a zero cutoff is older than any
+		// real mtime, so a stale worktree with an index is kept).
+		"now" | "all" => return Ok(u64::MAX),
+		"never" | "false" => return Ok(0),
+		_ => {}
+	}
+	if let Ok(secs) = spec.parse::<u64>()
+		&& secs >= MIN_EPOCH_EXPIRY
+	{
+		return Ok(secs);
+	}
+	if let Some(span) = parse_relative_span(spec) {
+		return Ok(now_secs()?.saturating_sub(span));
+	}
+	bail!(
+		"unsupported expiry time: '{spec}' (use a Unix timestamp, 'now', 'never', or e.g. '2.weeks.ago')"
+	)
+}
+
+/// The current time in seconds since the Unix epoch.
+fn now_secs() -> Result<u64> {
+	Ok(
+		SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map_err(|error| anyhow!("system clock is before the Unix epoch: {error}"))?
+			.as_secs(),
+	)
+}
+
+/// Parse a relative span like `2.weeks.ago`, `3 days`, or `1.year.ago` into a number of seconds, or
+/// `None` if it isn't a span gta recognises. Approximate (a month is 30 days, a year 365) — precise
+/// enough for a prune cutoff, as git's own approxidate is for these forms.
+fn parse_relative_span(spec: &str) -> Option<u64> {
+	// Both `.`-separated (`2.weeks.ago`) and space-separated (`2 weeks ago`) forms tokenise the same.
+	let normalised = spec.replace('.', " ");
+	let mut parts = normalised.split_whitespace();
+	let count: u64 = parts.next()?.parse().ok()?;
+	let unit = parts.next()?;
+	// An optional trailing `ago` is the only extra token allowed.
+	match parts.next() {
+		Some("ago") if parts.next().is_none() => {}
+		Some(_) => return None,
+		None => {}
+	}
+	let unit = unit.strip_suffix('s').unwrap_or(unit);
+	let factor: u64 = match unit {
+		"second" | "sec" => 1,
+		"minute" | "min" => 60,
+		"hour" => 3_600,
+		"day" => 86_400,
+		"week" => 604_800,
+		"month" => 2_592_000, // 30 days
+		"year" => 31_536_000, // 365 days
+		_ => return None,
+	};
+	Some(count.saturating_mul(factor))
+}
+
+// ---------------------------------------------------------------------------
+// worktree resolution (git's `find_worktree`)
+// ---------------------------------------------------------------------------
+
+/// A worktree resolved from a user-supplied path or name: the main worktree (no admin directory) or a
+/// linked one (its admin directory under `<common>/worktrees/*`). Both carry the canonical checkout
+/// path git records for the worktree.
+enum WorktreeRef {
+	Main { path: PathBuf },
+	Linked { admin: PathBuf, path: PathBuf },
+}
+
+impl WorktreeRef {
+	fn path(&self) -> &Path {
+		match self {
+			WorktreeRef::Main { path } | WorktreeRef::Linked { path, .. } => path,
+		}
+	}
+}
+
+/// Resolve a worktree by git's `find_worktree` rules: first by exact canonical path, then — failing
+/// that — by a unique path *suffix* at a directory boundary (so a bare name like `feature` or a tail
+/// like `sub/feature` selects `.../sub/feature`). An ambiguous or unmatched suffix resolves to `None`,
+/// which callers surface as "is not a working tree" (git's behaviour).
+fn find_worktree(common: &Path, cwd: &Path, arg: &Path) -> Option<WorktreeRef> {
+	let worktrees = enumerate_worktrees(common);
+	// By exact path: canonicalise the argument against the caller's cwd and match a recorded path.
+	let wanted = canonical(&absolute(cwd, arg));
+	if let Some(idx) = worktrees
+		.iter()
+		.position(|worktree| canonical_eq(worktree.path(), &wanted))
+	{
+		return worktrees.into_iter().nth(idx);
+	}
+	// By suffix: the argument, as given, must match the tail of exactly one worktree's path.
+	let suffix = arg.to_string_lossy();
+	let mut hits = worktrees
+		.iter()
+		.enumerate()
+		.filter(|(_, worktree)| path_has_dir_suffix(worktree.path(), &suffix));
+	let idx = hits.next()?.0;
+	if hits.next().is_some() {
+		return None; // ambiguous — git reports "is not a working tree"
+	}
+	worktrees.into_iter().nth(idx)
+}
+
+/// Enumerate the repository's worktrees: the main worktree first (the bare repository's directory when
+/// bare, else the checkout at the common dir's parent), then each linked worktree under
+/// `<common>/worktrees/*` that carries a `gitdir` pointer. Paths are canonicalised for comparison.
+fn enumerate_worktrees(common: &Path) -> Vec<WorktreeRef> {
+	let mut out = Vec::new();
+	let main_path = if repo::is_bare(common) {
+		canonical(common)
+	} else {
+		canonical(&repo::worktree_path_of(common))
+	};
+	out.push(WorktreeRef::Main { path: main_path });
+
+	if let Ok(entries) = std::fs::read_dir(common.join("worktrees")) {
+		let mut admins: Vec<PathBuf> = entries
+			.flatten()
+			.map(|entry| entry.path())
+			.filter(|admin| admin.join("gitdir").is_file())
+			.collect();
+		admins.sort();
+		for admin in admins {
+			let path = canonical(&repo::worktree_path_of(&admin));
+			out.push(WorktreeRef::Linked { admin, path });
+		}
+	}
+	out
+}
+
+/// Whether `path`'s string form ends with `suffix` at a directory boundary — git's
+/// `find_worktree_by_suffix` match (the suffix must begin at the start of a path component).
+fn path_has_dir_suffix(path: &Path, suffix: &str) -> bool {
+	let haystack = path.to_string_lossy();
+	if suffix.is_empty() || suffix.len() > haystack.len() {
+		return false;
+	}
+	let start = haystack.len() - suffix.len();
+	let at_boundary = start == 0 || haystack.as_bytes()[start - 1] == b'/';
+	at_boundary && &haystack[start..] == suffix
 }
 
 // ---------------------------------------------------------------------------

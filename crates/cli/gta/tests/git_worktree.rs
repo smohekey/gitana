@@ -5,7 +5,7 @@
 //!
 //! Cross-checked against stock `git` so the routing matches git's own behaviour.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// gta reads `HEAD`, the branch tip, objects, and config through a linked worktree, and a commit
@@ -815,6 +815,321 @@ fn honors_locked_and_prunable_worktree_state() {
 	std::fs::remove_dir_all(&base).ok();
 }
 
+#[test]
+fn locks_and_unlocks_worktrees_sha256() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	check_lock_unlock("sha256");
+}
+
+#[test]
+fn locks_and_unlocks_worktrees_sha1() {
+	check_lock_unlock("sha1");
+}
+
+/// `lock`/`unlock` match git: they write/remove `<admin>/locked` with git's exact reason format,
+/// interoperate with git-authored lock state (each tool reads the other's lock), resolve a worktree
+/// by a bare name as well as a path, and reject the main worktree, an unknown worktree, and a
+/// double-lock/double-unlock the way git does.
+fn check_lock_unlock(object_format: &str) {
+	let base = unique_tmp(&format!("gta-wt-lock2-{object_format}"));
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(
+		base_s,
+		&["init", &format!("--object-format={object_format}"), repo_s],
+		b"",
+	);
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+
+	let a = base.join("a");
+	let b = base.join("b");
+	gta(repo_s, &["worktree", "add", a.to_str().unwrap()], b"");
+	gta(repo_s, &["worktree", "add", b.to_str().unwrap()], b"");
+
+	// Lock with a reason writes git's exact `<reason>\n` body; both list forms then match git.
+	gta(
+		repo_s,
+		&[
+			"worktree",
+			"lock",
+			"--reason",
+			"busy building",
+			a.to_str().unwrap(),
+		],
+		b"",
+	);
+	assert_eq!(
+		std::fs::read_to_string(repo.join(".git/worktrees/a/locked")).unwrap(),
+		"busy building\n",
+	);
+	assert_eq!(
+		gta(repo_s, &["worktree", "list", "--porcelain"], b""),
+		git(repo_s, &["worktree", "list", "--porcelain"]),
+	);
+	// Re-locking is refused, echoing the recorded reason.
+	assert!(
+		gta_fail(repo_s, &["worktree", "lock", a.to_str().unwrap()])
+			.contains("is already locked, reason: busy building"),
+	);
+
+	// A bare name resolves like a path (git's `find_worktree` suffix match).
+	gta(repo_s, &["worktree", "lock", "b"], b"");
+	assert!(repo.join(".git/worktrees/b/locked").exists());
+
+	// git reads gta's lock: it refuses to re-lock, then unlocks it.
+	assert!(
+		!Command::new("git")
+			.args(["-C", repo_s, "worktree", "lock", b.to_str().unwrap()])
+			.status()
+			.unwrap()
+			.success(),
+		"git should refuse to re-lock a gta-locked worktree",
+	);
+	git(repo_s, &["worktree", "unlock", b.to_str().unwrap()]);
+	assert!(!repo.join(".git/worktrees/b/locked").exists());
+
+	// gta reads git's lock: git locks (no reason), gta unlocks by name.
+	git(repo_s, &["worktree", "lock", b.to_str().unwrap()]);
+	gta(repo_s, &["worktree", "unlock", "b"], b"");
+	assert!(!repo.join(".git/worktrees/b/locked").exists());
+
+	// Unlock the reasoned lock, then a second unlock is refused.
+	gta(repo_s, &["worktree", "unlock", a.to_str().unwrap()], b"");
+	assert!(!repo.join(".git/worktrees/a/locked").exists());
+	assert!(gta_fail(repo_s, &["worktree", "unlock", a.to_str().unwrap()]).contains("is not locked"),);
+
+	// The main worktree and an unknown worktree are rejected as git rejects them.
+	assert!(
+		gta_fail(repo_s, &["worktree", "lock", "."]).contains("main working tree cannot be locked"),
+	);
+	assert!(
+		gta_fail(repo_s, &["worktree", "unlock", "."]).contains("main working tree cannot be locked"),
+	);
+	assert!(gta_fail(repo_s, &["worktree", "lock", "ghost"]).contains("is not a working tree"));
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn prunes_worktrees_sha256() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	check_prune("sha256");
+}
+
+#[test]
+fn prunes_worktrees_sha1() {
+	check_prune("sha1");
+}
+
+/// `prune` matches git: it removes the admin dirs of worktrees whose checkout is gone, keeps locked
+/// and fresh ones, honours `--dry-run`, and honours `--expire` by comparing the per-worktree `index`
+/// mtime (a bare integer is epoch seconds to both tools). Reports match git byte-for-byte.
+fn check_prune(object_format: &str) {
+	let base = unique_tmp(&format!("gta-wt-prune-{object_format}"));
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(
+		base_s,
+		&["init", &format!("--object-format={object_format}"), repo_s],
+		b"",
+	);
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+
+	// A fresh worktree, a stale one (checkout removed), and a locked-then-stale one.
+	let keep = base.join("keep");
+	let stale = base.join("stale");
+	let held = base.join("held");
+	for path in [&keep, &stale, &held] {
+		gta(repo_s, &["worktree", "add", path.to_str().unwrap()], b"");
+	}
+	git(repo_s, &["worktree", "lock", held.to_str().unwrap()]);
+	std::fs::remove_dir_all(&stale).unwrap();
+	std::fs::remove_dir_all(&held).unwrap();
+
+	// A dry run reports exactly what git reports (sorted, so it is independent of readdir order) and
+	// removes nothing.
+	assert_eq!(
+		sorted_lines(&gta_stderr(repo_s, &["worktree", "prune", "-n", "-v"])),
+		sorted_lines(&git_stderr(repo_s, &["worktree", "prune", "-n", "-v"])),
+	);
+	assert!(
+		repo.join(".git/worktrees/stale").exists(),
+		"dry run kept the admin dir",
+	);
+
+	// A real prune removes the stale admin dir, keeps the locked-stale and the fresh ones.
+	gta_stderr(repo_s, &["worktree", "prune", "-v"]);
+	assert!(!repo.join(".git/worktrees/stale").exists());
+	assert!(
+		repo.join(".git/worktrees/held").exists(),
+		"a locked worktree is protected from pruning",
+	);
+	assert!(repo.join(".git/worktrees/keep").exists());
+	assert_eq!(
+		gta(repo_s, &["worktree", "list", "--porcelain"], b""),
+		git(repo_s, &["worktree", "list", "--porcelain"]),
+	);
+
+	// `--expire` keeps a stale worktree whose index is newer than the cutoff and prunes an older one;
+	// gta and git agree on both (a bare integer is epoch seconds to each).
+	let recent = base.join("recent");
+	gta(repo_s, &["worktree", "add", recent.to_str().unwrap()], b"");
+	std::fs::remove_dir_all(&recent).unwrap();
+	set_mtime(&repo.join(".git/worktrees/recent/index"), "200101010000"); // ~2001
+
+	assert_eq!(
+		gta_stderr(
+			repo_s,
+			&["worktree", "prune", "-n", "-v", "--expire=500000000"]
+		),
+		git_stderr(
+			repo_s,
+			&["worktree", "prune", "-n", "-v", "--expire=500000000"]
+		),
+	);
+	assert!(
+		gta_stderr(
+			repo_s,
+			&["worktree", "prune", "-n", "-v", "--expire=500000000"]
+		)
+		.is_empty(),
+		"index newer than the 1985 cutoff is kept",
+	);
+	assert_eq!(
+		sorted_lines(&gta_stderr(
+			repo_s,
+			&["worktree", "prune", "-n", "-v", "--expire=1500000000"],
+		)),
+		sorted_lines(&git_stderr(
+			repo_s,
+			&["worktree", "prune", "-n", "-v", "--expire=1500000000"],
+		)),
+	);
+	assert!(
+		gta_stderr(
+			repo_s,
+			&["worktree", "prune", "-n", "-v", "--expire=1500000000"],
+		)
+		.contains("worktrees/recent"),
+		"index older than the 2017 cutoff is pruned",
+	);
+
+	// `--expire=all` (and `now`) prune every stale worktree regardless of index age — git maps them to
+	// an infinite cutoff, not the current time — while `never` keeps a stale worktree that still has an
+	// index. Verified against git on a stale worktree whose index mtime is ~now.
+	let fresh = base.join("fresh");
+	gta(repo_s, &["worktree", "add", fresh.to_str().unwrap()], b"");
+	std::fs::remove_dir_all(&fresh).unwrap();
+	assert_eq!(
+		sorted_lines(&gta_stderr(
+			repo_s,
+			&["worktree", "prune", "-n", "-v", "--expire=all"]
+		)),
+		sorted_lines(&git_stderr(
+			repo_s,
+			&["worktree", "prune", "-n", "-v", "--expire=all"]
+		)),
+	);
+	assert!(
+		gta_stderr(repo_s, &["worktree", "prune", "-n", "-v", "--expire=all"])
+			.contains("worktrees/fresh"),
+		"a fresh-index stale worktree is still pruned by --expire=all",
+	);
+	assert_eq!(
+		gta_stderr(repo_s, &["worktree", "prune", "-n", "-v", "--expire=never"]),
+		git_stderr(repo_s, &["worktree", "prune", "-n", "-v", "--expire=never"]),
+	);
+	assert!(
+		gta_stderr(repo_s, &["worktree", "prune", "-n", "-v", "--expire=never"]).is_empty(),
+		"--expire=never keeps every stale worktree that still has an index",
+	);
+
+	// A small bare integer is not an epoch timestamp to git's approxidate (which parses it fuzzily and
+	// non-monotonically). Rather than silently mis-dating it — parsing `0` as literal epoch 0 would
+	// behave like `never` — gta rejects it with a clear error.
+	assert!(
+		gta_fail(repo_s, &["worktree", "prune", "--expire=0"]).contains("unsupported expiry time"),
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// A malformed admin entry that is a plain file — not a directory — is pruned and *unlinked* (git:
+/// "not a valid directory"). `prune` is the cleanup path for exactly such corruption, so it must not
+/// choke trying to `remove_dir_all` a file.
+#[test]
+fn prune_removes_a_non_directory_admin_entry() {
+	let base = unique_tmp("gta-wt-junk");
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(base_s, &["init", "--object-format=sha1", repo_s], b"");
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+
+	let junk = repo.join(".git/worktrees/junk");
+	std::fs::create_dir_all(junk.parent().unwrap()).unwrap();
+	std::fs::write(&junk, b"garbage").unwrap();
+
+	let report = gta_stderr(repo_s, &["worktree", "prune", "-v"]);
+	assert!(
+		report.contains("Removing worktrees/junk: not a valid directory"),
+		"unexpected prune report: {report:?}",
+	);
+	assert!(!junk.exists(), "the stray file entry was unlinked");
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// `remove` resolves a worktree by a bare name (git's `find_worktree`), not only by an explicit path —
+/// exercising the resolution retrofit shared with `lock`/`unlock`.
+#[test]
+fn remove_resolves_a_worktree_by_name() {
+	let base = unique_tmp("gta-wt-name");
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(base_s, &["init", "--object-format=sha1", repo_s], b"");
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+
+	let solo = base.join("solo");
+	gta(repo_s, &["worktree", "add", solo.to_str().unwrap()], b"");
+	assert!(repo.join(".git/worktrees/solo").exists());
+
+	gta(repo_s, &["worktree", "remove", "solo"], b"");
+	assert!(!repo.join(".git/worktrees/solo").exists());
+	assert!(!solo.exists());
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
 fn gta(dir: &str, args: &[&str], stdin: &[u8]) -> String {
 	let out = assert_cmd::Command::cargo_bin("gta")
 		.unwrap()
@@ -853,6 +1168,54 @@ fn git(dir: &str, args: &[&str]) -> String {
 		String::from_utf8_lossy(&out.stderr)
 	);
 	String::from_utf8(out.stdout).expect("git stdout utf8")
+}
+
+/// Run `gta` expecting success; return its stderr (`worktree prune -v` reports there, like git).
+fn gta_stderr(dir: &str, args: &[&str]) -> String {
+	let out = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", dir])
+		.args(args)
+		.output()
+		.expect("run gta");
+	assert!(
+		out.status.success(),
+		"gta {args:?} failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	String::from_utf8(out.stderr).expect("gta stderr utf8")
+}
+
+/// Run `git` expecting success; return its stderr.
+fn git_stderr(dir: &str, args: &[&str]) -> String {
+	let mut full = vec!["-C", dir];
+	full.extend_from_slice(args);
+	let out = Command::new("git").args(&full).output().expect("run git");
+	assert!(
+		out.status.success(),
+		"git {args:?} failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	String::from_utf8(out.stderr).expect("git stderr utf8")
+}
+
+/// The lines of a prune report, sorted — so a multi-worktree comparison is independent of the
+/// readdir order git walks in.
+fn sorted_lines(text: &str) -> Vec<String> {
+	let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+	lines.sort();
+	lines
+}
+
+/// Set a file's mtime via `touch -t <[[CC]YY]MMDDhhmm>`, so a stale worktree's `index` gets a known
+/// age for the `--expire` comparison.
+fn set_mtime(path: &Path, stamp: &str) {
+	let ok = Command::new("touch")
+		.args(["-t", stamp, path.to_str().unwrap()])
+		.status()
+		.expect("run touch")
+		.success();
+	assert!(ok, "touch -t {stamp} {} failed", path.display());
 }
 
 fn unique_tmp(tag: &str) -> PathBuf {

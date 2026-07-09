@@ -546,6 +546,33 @@ enum WorktreeAction {
 		#[arg(long, action = clap::ArgAction::Count)]
 		force: u8,
 	},
+	/// Lock a worktree to keep it from being pruned or removed.
+	Lock {
+		/// Path or name of the worktree to lock.
+		#[arg(long)]
+		path: PathBuf,
+		/// Reason to record for the lock.
+		#[arg(long, value_name = "string")]
+		reason: Option<String>,
+	},
+	/// Unlock a locked worktree.
+	Unlock {
+		/// Path or name of the worktree to unlock.
+		#[arg(long)]
+		path: PathBuf,
+	},
+	/// Prune worktree admin entries whose checkout is gone.
+	Prune {
+		/// Do not remove anything; only report what would be pruned.
+		#[arg(long = "dry-run")]
+		dry_run: bool,
+		/// Report each pruned worktree.
+		#[arg(long)]
+		verbose: bool,
+		/// Only prune worktrees whose per-worktree index is older than <time>.
+		#[arg(long, value_name = "time")]
+		expire: Option<String>,
+	},
 }
 
 /// A `trust` sub-command.
@@ -898,6 +925,17 @@ fn worktree_action(action: WorktreeAction) -> commands::worktree::Action {
 		},
 		WorktreeAction::List { porcelain } => Action::List { porcelain },
 		WorktreeAction::Remove { path, force } => Action::Remove { path, force },
+		WorktreeAction::Lock { path, reason } => Action::Lock { path, reason },
+		WorktreeAction::Unlock { path } => Action::Unlock { path },
+		WorktreeAction::Prune {
+			dry_run,
+			verbose,
+			expire,
+		} => Action::Prune {
+			dry_run,
+			verbose,
+			expire,
+		},
 	}
 }
 
