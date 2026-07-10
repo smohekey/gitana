@@ -192,7 +192,10 @@ one component instance.
   (empty = no common ancestor, data not error), `is-ancestor`.
 - **Refs**: `list-refs(prefix)` (packed-refs merged, loose wins), `head` (unborn / symbolic /
   detached), `resolve-ref`, CAS `update-ref`/`delete-ref` (`ref-moved` on mismatch; delete
-  rewrites `packed-refs`), `read`/`set-symbolic-ref`.
+  rewrites `packed-refs`), `read`/`set-symbolic-ref`. `gitana:repo@0.7.0` added an optional
+  `reflog-request` (committer line + message) to `update-ref`/`set-symbolic-ref`: the component
+  reads no env or clock, so the host supplies the reflog identity — present logs the move (still
+  gated by `core.logAllRefUpdates`, including the split-HEAD cascade), absent writes none.
 - **Writes**: `write-blob`, `write-tree` (`file-mode` enum input), `create-commit` (specs
   strictly kind-checked; raw identity lines).
 - **Maintenance**: `repack(geometric)` honoring `pack.packSizeLimit` (geometric factor 2, as

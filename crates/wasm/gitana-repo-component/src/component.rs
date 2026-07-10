@@ -4,7 +4,7 @@ use wasip2::filesystem::types::Descriptor;
 
 use crate::bindings::exports::gitana::repo::porcelain::{
 	CommitInfo, FetchOutcome, Guest, GuestRepository, HashKind, HeadState, ObjectInfo, PushOutcome,
-	RefEntry, RepackReport, RepoError, Repository, TagInfo, TreeBuildEntry, TreeEntry,
+	RefEntry, ReflogRequest, RepackReport, RepoError, Repository, TagInfo, TreeBuildEntry, TreeEntry,
 	WorktreeStatus,
 };
 use crate::inner::Inner;
@@ -106,8 +106,11 @@ impl GuestRepository for GitanaRepository {
 		name: String,
 		new: String,
 		expected: Option<String>,
+		reflog: Option<ReflogRequest>,
 	) -> Result<(), RepoError> {
-		self.inner.update_ref(&name, &new, expected.as_deref())
+		self
+			.inner
+			.update_ref(&name, &new, expected.as_deref(), reflog.as_ref())
 	}
 
 	fn delete_ref(&self, name: String, expected: String) -> Result<(), RepoError> {
@@ -118,8 +121,13 @@ impl GuestRepository for GitanaRepository {
 		self.inner.read_symbolic_ref(&name)
 	}
 
-	fn set_symbolic_ref(&self, name: String, target: String) -> Result<(), RepoError> {
-		self.inner.set_symbolic_ref(&name, &target)
+	fn set_symbolic_ref(
+		&self,
+		name: String,
+		target: String,
+		reflog: Option<ReflogRequest>,
+	) -> Result<(), RepoError> {
+		self.inner.set_symbolic_ref(&name, &target, reflog.as_ref())
 	}
 
 	fn write_blob(&self, data: Vec<u8>) -> Result<String, RepoError> {

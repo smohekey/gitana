@@ -9,8 +9,8 @@ use gitana_worktree::WorkTree;
 use wasip2::filesystem::types::Descriptor;
 
 use crate::bindings::exports::gitana::repo::porcelain::{
-	CommitInfo, FetchOutcome, HashKind, HeadState, ObjectInfo, PushOutcome, RefEntry, RepackReport,
-	RepoError, TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
+	CommitInfo, FetchOutcome, HashKind, HeadState, ObjectInfo, PushOutcome, RefEntry, ReflogRequest,
+	RepackReport, RepoError, TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
 };
 use crate::block_on::block_on;
 use crate::ops;
@@ -233,8 +233,9 @@ impl Inner {
 		name: &str,
 		new: &str,
 		expected: Option<&str>,
+		reflog: Option<&ReflogRequest>,
 	) -> Result<(), RepoError> {
-		dispatch!(self, held => block_on(ops::update_ref(held.repository(), name, new, expected)))
+		dispatch!(self, held => block_on(ops::update_ref(held.repository(), name, new, expected, reflog)))
 	}
 
 	pub(crate) fn delete_ref(&self, name: &str, expected: &str) -> Result<(), RepoError> {
@@ -245,8 +246,13 @@ impl Inner {
 		dispatch!(self, held => block_on(ops::read_symbolic_ref(held.repository(), name)))
 	}
 
-	pub(crate) fn set_symbolic_ref(&self, name: &str, target: &str) -> Result<(), RepoError> {
-		dispatch!(self, held => block_on(ops::set_symbolic_ref(held.repository(), name, target)))
+	pub(crate) fn set_symbolic_ref(
+		&self,
+		name: &str,
+		target: &str,
+		reflog: Option<&ReflogRequest>,
+	) -> Result<(), RepoError> {
+		dispatch!(self, held => block_on(ops::set_symbolic_ref(held.repository(), name, target, reflog)))
 	}
 
 	pub(crate) fn write_blob(&self, data: &[u8]) -> Result<String, RepoError> {

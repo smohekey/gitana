@@ -24,12 +24,12 @@ async fn cas_matrix_and_packed_delete() -> Result<()> {
 
 	// Create requires absence…
 	porcelain
-		.call_update_ref(&mut *store, handle, "refs/heads/guest", "main", None)
+		.call_update_ref(&mut *store, handle, "refs/heads/guest", "main", None, None)
 		.await?
 		.map_err(|error| anyhow!("create: {error:?}"))?;
 	// …so a second create collides.
 	let collide = porcelain
-		.call_update_ref(&mut *store, handle, "refs/heads/guest", "main", None)
+		.call_update_ref(&mut *store, handle, "refs/heads/guest", "main", None, None)
 		.await?;
 	assert!(
 		matches!(collide, Err(RepoError::RefMoved(_))),
@@ -44,6 +44,7 @@ async fn cas_matrix_and_packed_delete() -> Result<()> {
 			"refs/heads/guest",
 			"feature",
 			Some(&fixture.a),
+			None,
 		)
 		.await?;
 	assert!(matches!(wrong, Err(RepoError::RefMoved(_))), "{wrong:?}");
@@ -54,6 +55,7 @@ async fn cas_matrix_and_packed_delete() -> Result<()> {
 			"refs/heads/guest",
 			"feature",
 			Some("main"),
+			None,
 		)
 		.await?;
 	assert!(
@@ -69,6 +71,7 @@ async fn cas_matrix_and_packed_delete() -> Result<()> {
 			"refs/heads/guest",
 			"feature",
 			Some(&fixture.m),
+			None,
 		)
 		.await?
 		.map_err(|error| anyhow!("update: {error:?}"))?;
@@ -99,7 +102,7 @@ async fn cas_matrix_and_packed_delete() -> Result<()> {
 	// A packed-only ref participates in CAS: create-over is refused, its packed
 	// value is the compare value, and an update writes the shadowing loose file.
 	let packed_create = porcelain
-		.call_update_ref(&mut *store, handle, "refs/heads/packed", "main", None)
+		.call_update_ref(&mut *store, handle, "refs/heads/packed", "main", None, None)
 		.await?;
 	assert!(
 		matches!(packed_create, Err(RepoError::RefMoved(_))),
@@ -112,6 +115,7 @@ async fn cas_matrix_and_packed_delete() -> Result<()> {
 			"refs/heads/packed",
 			"feature",
 			Some(&fixture.a),
+			None,
 		)
 		.await?
 		.map_err(|error| anyhow!("update packed: {error:?}"))?;
@@ -159,7 +163,7 @@ async fn head_states() -> Result<()> {
 
 	// The guest moves HEAD back onto an existing branch; native gitana agrees.
 	porcelain
-		.call_set_symbolic_ref(&mut *store, handle, "HEAD", "refs/heads/feature")
+		.call_set_symbolic_ref(&mut *store, handle, "HEAD", "refs/heads/feature", None)
 		.await?
 		.map_err(|error| anyhow!("set-symbolic-ref: {error:?}"))?;
 	match porcelain
@@ -181,7 +185,7 @@ async fn head_states() -> Result<()> {
 
 	// HEAD at a not-yet-existing branch is unborn.
 	porcelain
-		.call_set_symbolic_ref(&mut *store, handle, "HEAD", "refs/heads/unborn")
+		.call_set_symbolic_ref(&mut *store, handle, "HEAD", "refs/heads/unborn", None)
 		.await?
 		.map_err(|error| anyhow!("set-symbolic-ref unborn: {error:?}"))?;
 	match porcelain
@@ -322,7 +326,7 @@ async fn init_creates_a_fresh_repository() -> Result<()> {
 			.await?
 			.map_err(|error| anyhow!("create-commit: {error:?}"))?;
 		porcelain
-			.call_update_ref(&mut *store, handle, "refs/heads/main", &commit, None)
+			.call_update_ref(&mut *store, handle, "refs/heads/main", &commit, None, None)
 			.await?
 			.map_err(|error| anyhow!("update-ref: {error:?}"))?;
 		match porcelain

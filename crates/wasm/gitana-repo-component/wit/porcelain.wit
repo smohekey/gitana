@@ -1,4 +1,4 @@
-package gitana:repo@0.6.0;
+package gitana:repo@0.7.0;
 
 /// Repository operations over a capability-granted git directory.
 ///
@@ -107,6 +107,18 @@ interface porcelain {
 		name: string,
 		/// The object id the ref points at (hex).
 		id: string,
+	}
+
+	/// A request to append a reflog entry for a ref move. Present means "log this move"
+	/// (still subject to git's `core.logAllRefUpdates` gating); absent means "do not log",
+	/// as git's internal/plumbing moves do. The component reads no process env or clock, so
+	/// the host supplies the committer line — there is no identity to fall back on.
+	record reflog-request {
+		/// The reflog committer line (`Name <email> seconds ±hhmm`).
+		committer: string,
+		/// The reflog message (e.g. `branch: Created from HEAD`), or `""` for none — git
+		/// records a line with no message, as `git update-ref` does without `-m`.
+		message: string,
 	}
 
 	/// The outcome of a `fetch`: the tracking refs it advanced, and any it declined to.
@@ -307,7 +319,9 @@ interface porcelain {
 		/// Compare-and-set `name` to `new` (a spec). `expected` is the ref's
 		/// current value as a full hex id, or absent to require that the ref
 		/// does not exist yet (create). A mismatch fails with `ref-moved`.
-		update-ref: func(name: string, new: string, expected: option<string>) -> result<_, repo-error>;
+		/// `reflog` requests a reflog entry for the move (subject to
+		/// `core.logAllRefUpdates` gating); absent writes none.
+		update-ref: func(name: string, new: string, expected: option<string>, reflog: option<reflog-request>) -> result<_, repo-error>;
 
 		/// Compare-and-delete `name`; `expected` is its current full hex id.
 		/// Also removes the name from `packed-refs`.
@@ -318,7 +332,9 @@ interface porcelain {
 		read-symbolic-ref: func(name: string) -> result<option<string>, repo-error>;
 
 		/// Point the symbolic ref `name` at `target` (name `HEAD` moves HEAD).
-		set-symbolic-ref: func(name: string, target: string) -> result<_, repo-error>;
+		/// `reflog` requests a reflog entry for the retarget (subject to
+		/// `core.logAllRefUpdates` gating); absent writes none.
+		set-symbolic-ref: func(name: string, target: string, reflog: option<reflog-request>) -> result<_, repo-error>;
 
 		/// Write `data` as a loose blob object; returns its id (hex). Writing a
 		/// blob that already exists is a no-op returning the same id.

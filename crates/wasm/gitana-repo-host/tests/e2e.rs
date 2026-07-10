@@ -289,7 +289,14 @@ async fn roundtrip<H: HashAlgorithm>(expected_kind: HashKind) -> Result<()> {
 		.map_err(|error| anyhow!("create-commit (repeat): {error:?}"))?;
 	assert_eq!(same, guest_commit);
 	porcelain
-		.call_update_ref(&mut *store, handle, "refs/heads/guest", &guest_commit, None)
+		.call_update_ref(
+			&mut *store,
+			handle,
+			"refs/heads/guest",
+			&guest_commit,
+			None,
+			None,
+		)
 		.await?
 		.map_err(|error| anyhow!("update-ref: {error:?}"))?;
 

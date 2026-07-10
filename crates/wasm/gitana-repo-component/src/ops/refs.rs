@@ -5,10 +5,19 @@ use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::{HeadState as EngineHeadState, ReflogIntent, Repository};
 
 use crate::bindings::exports::gitana::repo::porcelain::{
-	HeadState, RefEntry, RepoError, SymbolicHead,
+	HeadState, RefEntry, ReflogRequest, RepoError, SymbolicHead,
 };
 
 use super::repo_error;
+
+/// Map a host-supplied [`ReflogRequest`] to a [`ReflogIntent`]: present means "log this move"
+/// (still gated by `core.logAllRefUpdates`), absent means "do not log".
+fn reflog_intent(reflog: Option<&ReflogRequest>) -> ReflogIntent<'_> {
+	match reflog {
+		Some(ReflogRequest { committer, message }) => ReflogIntent::Log { committer, message },
+		None => ReflogIntent::Skip,
+	}
+}
 
 /// Parse a CAS `expected` value: an exact full hex id, never a spec.
 fn expected_id<H: HashAlgorithm>(hex: &str) -> Result<ObjectId<H>, RepoError> {
@@ -64,14 +73,13 @@ pub(crate) async fn update_ref<H: HashAlgorithm>(
 	name: &str,
 	new: &str,
 	expected: Option<&str>,
+	reflog: Option<&ReflogRequest>,
 ) -> Result<(), RepoError> {
 	let new = repo.rev_parse(new).await.map_err(repo_error)?;
 	let expected = expected.map(expected_id::<H>).transpose()?;
-	// TODO(reflog follow-up): the component has no committer identity to credit, so this plumbing
-	// export does not write a reflog yet. Out of scope for the local-CLI reflog pass.
 	repo
 		.refs()
-		.update_ref(name, new, expected, ReflogIntent::Skip)
+		.update_ref(name, new, expected, reflog_intent(reflog))
 		.await
 		.map_err(repo_error)
 }
@@ -100,10 +108,11 @@ pub(crate) async fn set_symbolic_ref<H: HashAlgorithm>(
 	repo: &Repository<WorktreeFileStore, H>,
 	name: &str,
 	target: &str,
+	reflog: Option<&ReflogRequest>,
 ) -> Result<(), RepoError> {
 	repo
 		.refs()
-		.set_symbolic(name, target, ReflogIntent::Skip)
+		.set_symbolic(name, target, reflog_intent(reflog))
 		.await
 		.map_err(repo_error)
 }

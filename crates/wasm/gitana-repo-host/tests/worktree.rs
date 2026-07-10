@@ -62,7 +62,7 @@ async fn routes_across_two_descriptors<H: HashAlgorithm>() -> Result<()> {
 	// -- per-worktree write: moving HEAD lands in the worktree dir and leaves the common dir's
 	//    HEAD untouched.
 	porcelain
-		.call_set_symbolic_ref(&mut *store, handle, "HEAD", "refs/heads/orphan")
+		.call_set_symbolic_ref(&mut *store, handle, "HEAD", "refs/heads/orphan", None)
 		.await?
 		.map_err(|error| anyhow!("set-symbolic-ref: {error:?}"))?;
 	assert_eq!(
@@ -76,7 +76,14 @@ async fn routes_across_two_descriptors<H: HashAlgorithm>() -> Result<()> {
 
 	// -- shared write: a new branch under refs/heads/ lands in the common dir, never the worktree.
 	porcelain
-		.call_update_ref(&mut *store, handle, "refs/heads/wt-new", &fixture.d, None)
+		.call_update_ref(
+			&mut *store,
+			handle,
+			"refs/heads/wt-new",
+			&fixture.d,
+			None,
+			None,
+		)
 		.await?
 		.map_err(|error| anyhow!("update-ref: {error:?}"))?;
 	assert_eq!(
