@@ -281,13 +281,25 @@ where
 
 	/// Delete a ref, requiring its current resolved value to equal `expected` (CAS).
 	///
-	/// Removes the loose ref file (if any) and drops the ref from `packed-refs` (if
-	/// present), so the ref no longer resolves by either path. Errors with
-	/// [`RepositoryError::RefMoved`] if the current value differs from `expected`.
+	/// Removes the loose ref file (if any), drops the ref from `packed-refs` (if present), and
+	/// deletes its reflog, so the ref no longer resolves by either path and leaves no stale log — as
+	/// git does when a ref is deleted. Errors with [`RepositoryError::RefMoved`] if the current value
+	/// differs from `expected`.
+	///
+	/// `reflog` mirrors [`update_ref`](Self::update_ref)'s split-HEAD cascade for a deletion: with
+	/// `Log`, deleting the branch `HEAD` points at appends a `<old> <zero>` entry to `logs/HEAD`
+	/// (subject to `core.logAllRefUpdates` gating), as git's receive-pack does when it removes the
+	/// current branch. The ref's own reflog is always removed, whatever the intent. `Skip` writes no
+	/// HEAD entry.
+	///
+	/// The HEAD entry is written *before* the ref is removed — like git, which writes reflogs in its
+	/// transaction's prepare phase and mutates refs only on commit — so a HEAD-log failure rejects the
+	/// deletion without having touched the ref, rather than reporting failure for a ref already gone.
 	pub async fn delete_ref(
 		&self,
 		name: &str,
 		expected: Option<ObjectId<H>>,
+		reflog: ReflogIntent<'_>,
 	) -> Result<(), RepositoryError> {
 		let current = self.resolve(name).await?;
 		if current != expected {
@@ -297,6 +309,18 @@ where
 		}
 		if current.is_none() {
 			return Err(RepositoryError::InvalidRef(format!("{name}: no such ref")));
+		}
+		// Mirror the deletion into `HEAD`'s reflog when HEAD points at the deleted branch — git's
+		// split-HEAD update, recording `<old> <zero>` (a `None` new). Done first, so a failure here
+		// leaves the ref in place and the deletion is honestly rejected. Gated like any HEAD log.
+		if let ReflogIntent::Log { committer, message } = reflog
+			&& name.starts_with("refs/heads/")
+			&& self.read_symbolic("HEAD").await?.as_deref() == Some(name)
+			&& self.should_log("HEAD", self.reflog_policy().await?).await?
+		{
+			self
+				.append_reflog("HEAD", current, None, committer, message)
+				.await?;
 		}
 		// Delete the loose ref file under a version check (no-op if packed-only).
 		match self.files.read_path_versioned(name).await {
@@ -311,7 +335,13 @@ where
 			Err(other) => return Err(other.into()),
 		}
 		// Drop the ref (and its peeled line) from packed-refs if present.
-		self.remove_from_packed(name).await
+		self.remove_from_packed(name).await?;
+		// Remove the ref's reflog: git deletes `logs/<name>` with the ref, so no stale log survives.
+		// Best-effort, as git is (it warns but proceeds if the reflog cannot be unlinked): the ref is
+		// already gone, so a cleanup failure — e.g. `logs/<name>` left as a directory by a former nested
+		// reflog — must not turn a completed deletion into a reported failure.
+		let _ = self.files.delete_path(&format!("logs/{name}"), None).await;
+		Ok(())
 	}
 
 	/// Delete every ref under `prefix` — loose (direct *or* symbolic), its reflog, and any packed
@@ -593,7 +623,7 @@ where
 			&& self.should_log(name, self.reflog_policy().await?).await?
 		{
 			self
-				.append_reflog(name, old, new, committer, message)
+				.append_reflog(name, old, Some(new), committer, message)
 				.await?;
 		}
 		Ok(())
@@ -618,16 +648,19 @@ where
 	/// The file store has no append, so this is read-modify-write under the caller's
 	/// ref lock: `<old> <new> <committer>\t<message>\n` to `logs/<refname>`. An empty `message`
 	/// records `<old> <new> <committer>\n` with no tab, matching git (`log_ref_write_fd` adds the
-	/// tab and message only when the message is non-empty).
+	/// tab and message only when the message is non-empty). A `None` `old` (creation) or `new`
+	/// (deletion) renders the all-zero id git writes for that side.
 	pub async fn append_reflog(
 		&self,
 		refname: &str,
 		old: Option<ObjectId<H>>,
-		new: ObjectId<H>,
+		new: Option<ObjectId<H>>,
 		committer: &str,
 		message: &str,
 	) -> Result<(), RepositoryError> {
-		let old = old.map_or_else(|| "0".repeat(H::RAW_LEN * 2), |id| id.to_hex());
+		let zero = || "0".repeat(H::RAW_LEN * 2);
+		let old = old.map_or_else(zero, |id| id.to_hex());
+		let new = new.map_or_else(zero, |id| id.to_hex());
 		let line = if message.is_empty() {
 			format!("{old} {new} {committer}\n")
 		} else {
@@ -661,7 +694,7 @@ where
 		// real move or a creation.
 		if old != Some(new) && self.should_log(name, policy).await? {
 			self
-				.append_reflog(name, old, new, committer, message)
+				.append_reflog(name, old, Some(new), committer, message)
 				.await?;
 		}
 		// The split HEAD update mirrored into `HEAD` when it points at the branch is a distinct update
@@ -672,7 +705,7 @@ where
 			&& self.should_log("HEAD", policy).await?
 		{
 			self
-				.append_reflog("HEAD", old, new, committer, message)
+				.append_reflog("HEAD", old, Some(new), committer, message)
 				.await?;
 		}
 		Ok(())

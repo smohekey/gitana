@@ -1145,6 +1145,7 @@ async fn run_receive(repo: &Repo, request: &[u8]) -> ReceiveOutcome<Sha256> {
 			trust: &context(),
 			now: NOW,
 			nonce_ledger: &NoReplayCheck,
+			reflog: None,
 		},
 	)
 	.await
@@ -1293,6 +1294,7 @@ async fn wire_require_applies_a_signed_delete_when_the_host_grants_deletes() {
 			trust: &context(),
 			now: NOW,
 			nonce_ledger: &NoReplayCheck,
+			reflog: None,
 		},
 	)
 	.await
@@ -1504,6 +1506,7 @@ async fn wire_none_context_fails_closed_on_a_trust_configured_repo() {
 			trust: &TrustContext::none(),
 			now: NOW,
 			nonce_ledger: &NoReplayCheck,
+			reflog: None,
 		},
 	)
 	.await

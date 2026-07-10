@@ -92,7 +92,7 @@ pub(crate) async fn delete_ref<H: HashAlgorithm>(
 	let expected = expected_id::<H>(expected)?;
 	repo
 		.refs()
-		.delete_ref(name, Some(expected))
+		.delete_ref(name, Some(expected), ReflogIntent::Skip)
 		.await
 		.map_err(repo_error)
 }

@@ -98,6 +98,7 @@ async fn git_receive_pack(State(state): State<AppState>, body: Bytes) -> impl In
 			trust: &trust,
 			now: NOW,
 			nonce_ledger: &NoReplayCheck,
+			reflog: None,
 		},
 	)
 	.await

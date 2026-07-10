@@ -249,6 +249,7 @@ async fn signed_push_moves_ref_and_surfaces_cert() {
 			trust: &TrustContext::none(),
 			now: 0,
 			nonce_ledger: &NoReplayCheck,
+			reflog: None,
 		},
 	)
 	.await

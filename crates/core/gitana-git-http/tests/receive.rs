@@ -5,16 +5,19 @@
 use std::sync::LazyLock;
 
 use gitana_file_store_memory::MemoryFileStore;
-use gitana_git_http::{NoReplayCheck, ReceiveOptions, TrustContext, receive_pack};
+use gitana_git_http::{NoReplayCheck, PushReflog, ReceiveOptions, TrustContext, receive_pack};
 use gitana_object::Sha256;
 use gitana_object::{
 	Commit, ObjectId, ObjectKind, PackedObject, PktLine, TreeEntry, encode_commit, encode_pack,
 	encode_tree, parse_pkt,
 };
 use gitana_object_store::ObjectStore;
-use gitana_repository::Repository;
+use gitana_repository::{ReflogIntent, Repository};
 
 const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// A server committer line for the reflog-enabled push tests.
+const COMMITTER: &str = "S E Rver <server@example.com> 1700000000 +0000";
 
 /// These protocol tests do not configure trust, so every push runs against an empty trust context
 /// (verification short-circuits to accept on a repo with no trust root).
@@ -28,6 +31,18 @@ fn opts(force: bool) -> ReceiveOptions<'static, NoReplayCheck> {
 		trust: &NO_TRUST,
 		now: 0,
 		nonce_ledger: &NoReplayCheck,
+		reflog: None,
+	}
+}
+
+/// Like [`opts`], but crediting push reflogs to a fixed server identity — the shape a reflog-writing
+/// server pushes with.
+fn opts_with_reflog(force: bool) -> ReceiveOptions<'static, NoReplayCheck> {
+	ReceiveOptions {
+		reflog: Some(PushReflog {
+			committer: COMMITTER,
+		}),
+		..opts(force)
 	}
 }
 
@@ -348,5 +363,51 @@ async fn force_push_allows_a_non_fast_forward_update() {
 			.expect("resolve"),
 		Some(second_id),
 		"force-push moved the ref to the unrelated commit"
+	);
+}
+
+/// A create that loses the CAS race — the ref already exists at the pushed tip (a concurrent push
+/// won) — is reported `ng` without disturbing the winner's ref. The reflog-failure rollback must fire
+/// only for a genuine post-CAS reflog failure, never for a `RefMoved`, or concurrent identical pushes
+/// would undo each other.
+#[tokio::test]
+async fn losing_create_race_does_not_roll_back_the_winner() {
+	let repo = repo();
+	repo.init().await.expect("init");
+
+	let (objects, commit) = commit_objects(b"hello\n");
+	// A concurrent winner has already created the ref at `commit`.
+	repo
+		.refs()
+		.update_ref("refs/heads/main", commit, None, ReflogIntent::Skip)
+		.await
+		.expect("pre-create");
+
+	// Our create (old=zero) collides with the existing ref: `update_ref` returns `RefMoved` before
+	// writing anything. With reflogs enabled, the rollback must recognise this as a lost race and
+	// leave the winner's ref in place — not treat `resolve == new` as its own move and delete it.
+	let request = push_request(
+		ZERO,
+		&commit.to_hex(),
+		"refs/heads/main",
+		&encode_pack(&objects),
+	);
+	let report = receive_pack(&repo, &request, opts_with_reflog(false))
+		.await
+		.expect("receive")
+		.report;
+	let lines = pkt_lines(&report);
+	assert!(
+		lines.iter().any(|l| l.starts_with("ng refs/heads/main")),
+		"{lines:?}"
+	);
+	assert_eq!(
+		repo
+			.refs()
+			.resolve("refs/heads/main")
+			.await
+			.expect("resolve"),
+		Some(commit),
+		"the winner's ref must survive a losing create race"
 	);
 }

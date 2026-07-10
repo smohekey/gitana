@@ -46,9 +46,9 @@ impl<H: HashAlgorithm> Command<H> {
 }
 
 /// The host inputs a receive-pack needs beyond the request body: whether destructive updates are
-/// permitted, the trust context and clock the pre-receive trust check runs against, and the push-nonce
-/// ledger. A host that does not enforce one-time nonces passes
-/// [`&NoReplayCheck`](crate::NoReplayCheck).
+/// permitted, the trust context and clock the pre-receive trust check runs against, the push-nonce
+/// ledger, and the server identity to credit push reflogs to. A host that does not enforce one-time
+/// nonces passes [`&NoReplayCheck`](crate::NoReplayCheck).
 pub struct ReceiveOptions<'a, L: NonceLedger> {
 	/// Permits the destructive updates git withholds by default: non-fast-forward ref updates and
 	/// ref deletions. The host grants it only to a sufficiently privileged capability (the
@@ -64,6 +64,22 @@ pub struct ReceiveOptions<'a, L: NonceLedger> {
 	/// Records used push-cert nonces so a replayed one is rejected. [`NoReplayCheck`](crate::NoReplayCheck)
 	/// disables the check (v1's default — replay within the freshness window is accepted).
 	pub nonce_ledger: &'a L,
+	/// The server identity to credit accepted-update reflog entries to, or `None` to write none.
+	/// See [`PushReflog`].
+	pub reflog: Option<PushReflog<'a>>,
+}
+
+/// The server identity a receive-pack push reflog is credited to.
+///
+/// Git writes a `push` reflog entry per updated ref, credited to the *server's* committer identity
+/// (`git_committer_info` on the serving side), not the pusher. The host supplies the full committer
+/// line so this crate stays clock-free, exactly as it does for [`ReceiveOptions::now`]; `None`
+/// writes no push reflog (a host with no configured identity). Whether a line actually lands still
+/// follows git's `core.logAllRefUpdates` gating — a bare server with the default config writes none —
+/// applied by [`update_ref`](gitana_repository::RefStore::update_ref).
+pub struct PushReflog<'a> {
+	/// The reflog committer line (`Name <email> seconds ±hhmm`).
+	pub committer: &'a str,
 }
 
 /// The result of a receive-pack: the `report-status` bytes and the refs that were
@@ -213,7 +229,8 @@ pub async fn receive_pack<F: FileStore, H: HashAlgorithm, L: NonceLedger>(
 			)?;
 			continue;
 		}
-		match apply_command(repo, command, options.force).await {
+		let reflog_committer = options.reflog.as_ref().map(|reflog| reflog.committer);
+		match apply_command(repo, command, options.force, reflog_committer).await {
 			Ok(()) => {
 				write_pkt(&mut out, format!("ok {}\n", command.name).as_bytes())?;
 				applied.push(command.name.clone());
@@ -340,12 +357,26 @@ fn reachable_pushed<H: HashAlgorithm>(
 /// Apply one ref-update command via compare-and-set. Updates require fast-forward and
 /// deletions are refused unless `force` is granted. Returns a `report-status` reason
 /// string on rejection.
+///
+/// `reflog_committer` is the server identity to credit the reflog to (message `push`, as git's
+/// receive-pack hardcodes), or `None` to write none. A deletion still removes the ref's own reflog;
+/// the intent only governs the `logs/HEAD` deletion entry git writes when the deleted branch is the
+/// one HEAD points at. `update_ref`/`delete_ref` apply `core.logAllRefUpdates` gating, so a bare
+/// default-config server logs nothing.
 async fn apply_command<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	command: &Command<H>,
 	force: bool,
+	reflog_committer: Option<&str>,
 ) -> Result<(), String> {
 	let refs = repo.refs();
+	let intent = match reflog_committer {
+		Some(committer) => ReflogIntent::Log {
+			committer,
+			message: "push",
+		},
+		None => ReflogIntent::Skip,
+	};
 	match (command.old, command.new) {
 		(_, Some(new)) => {
 			// Update or create. For an update, require the new tip to descend from the old
@@ -358,12 +389,45 @@ async fn apply_command<F: FileStore, H: HashAlgorithm>(
 			{
 				return Err("non-fast-forward".to_owned());
 			}
-			// TODO(reflog follow-up): git's receive-pack writes `push` reflog entries server-side;
-			// out of scope for the local-CLI reflog pass, so opt out for now.
-			refs
-				.update_ref(&command.name, new, command.old, ReflogIntent::Skip)
+			match refs
+				.update_ref(&command.name, new, command.old, intent)
 				.await
-				.map_err(reason)
+			{
+				Ok(()) => Ok(()),
+				Err(err) => {
+					// `update_ref` moves the ref and *then* appends its reflog — gitana's file store has
+					// no atomic ref+reflog transaction. If the reflog write failed after the ref moved
+					// (e.g. a directory/file conflict from a stray `logs/` entry), git rejects the update
+					// without moving the ref, so undo the move before reporting `ng` rather than tell the
+					// client the push failed while the branch advanced.
+					//
+					// Only undo a genuine post-CAS reflog failure: reflog writing was requested, the
+					// error is not a `RefMoved` CAS conflict (`update_ref` funnels every lost race — the
+					// pre-write mismatch and the write-time version clash — through `RefMoved`, so a
+					// non-`RefMoved` error means our CAS succeeded and the reflog append is what failed),
+					// and the ref really landed on `new`. This never rolls back a ref a concurrent push
+					// legitimately advanced to the same tip. The undo carries no reflog and is
+					// best-effort — a rollback that itself fails leaves the already-failing store as-is.
+					if reflog_committer.is_some()
+						&& !matches!(err, RepositoryError::RefMoved { .. })
+						&& refs.resolve(&command.name).await.ok().flatten() == Some(new)
+					{
+						let _ = match command.old {
+							Some(old) => {
+								refs
+									.update_ref(&command.name, old, Some(new), ReflogIntent::Skip)
+									.await
+							}
+							None => {
+								refs
+									.delete_ref(&command.name, Some(new), ReflogIntent::Skip)
+									.await
+							}
+						};
+					}
+					Err(reason(err))
+				}
+			}
 		}
 		// Deletion: withheld unless `force` is granted (the `delete-refs` capability).
 		(Some(old), None) => {
@@ -371,7 +435,7 @@ async fn apply_command<F: FileStore, H: HashAlgorithm>(
 				return Err("deletion denied".to_owned());
 			}
 			refs
-				.delete_ref(&command.name, Some(old))
+				.delete_ref(&command.name, Some(old), intent)
 				.await
 				.map_err(reason)
 		}

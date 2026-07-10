@@ -22,8 +22,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use gitana_file_store_local::LocalFileStore;
 use gitana_git_http::{
-	NoReplayCheck, ProtocolVersion, ReceiveOptions, Service, TrustContext, advertise, fetch, ls_refs,
-	receive_pack, upload_pack_v0,
+	NoReplayCheck, ProtocolVersion, PushReflog, ReceiveOptions, Service, TrustContext, advertise,
+	fetch, ls_refs, receive_pack, upload_pack_v0,
 };
 use gitana_object::{HashAlgorithm, PktLine, Sha1, Sha256, parse_pkt};
 use gitana_object_store::ObjectStore;
@@ -57,6 +57,9 @@ pub enum ServerHash {
 struct Served {
 	git_dir: PathBuf,
 	hash: ServerHash,
+	/// The server committer line to credit push reflogs to (`Name <email> secs ±hhmm`), or `None` to
+	/// write none — the default interop server has no identity, matching git's default bare server.
+	reflog_committer: Option<String>,
 }
 
 /// The `Git-Protocol` version the request asks for (git repeats the header on every request).
@@ -103,8 +106,13 @@ async fn upload_pack_bytes<H: HashAlgorithm>(
 	}
 }
 
-/// Serve a receive-pack POST: `force` on, trust unconfigured (interop, not trust).
-async fn receive_pack_bytes<H: HashAlgorithm>(git_dir: &Path, body: &[u8]) -> Vec<u8> {
+/// Serve a receive-pack POST: `force` on, trust unconfigured (interop, not trust). `reflog_committer`
+/// credits accepted-update push reflogs to the server identity, or `None` writes none.
+async fn receive_pack_bytes<H: HashAlgorithm>(
+	git_dir: &Path,
+	body: &[u8],
+	reflog_committer: Option<&str>,
+) -> Vec<u8> {
 	receive_pack(
 		&open::<H>(git_dir),
 		body,
@@ -113,6 +121,7 @@ async fn receive_pack_bytes<H: HashAlgorithm>(git_dir: &Path, body: &[u8]) -> Ve
 			trust: &TrustContext::none(),
 			now: 0,
 			nonce_ledger: &NoReplayCheck,
+			reflog: reflog_committer.map(|committer| PushReflog { committer }),
 		},
 	)
 	.await
@@ -180,9 +189,10 @@ fn decode_body(headers: &HeaderMap, body: Bytes) -> Bytes {
 
 /// `POST /git-receive-pack`.
 async fn git_receive_pack(State(st): State<Served>, body: Bytes) -> Response {
+	let committer = st.reflog_committer.as_deref();
 	let out = match st.hash {
-		ServerHash::Sha1 => receive_pack_bytes::<Sha1>(&st.git_dir, &body).await,
-		ServerHash::Sha256 => receive_pack_bytes::<Sha256>(&st.git_dir, &body).await,
+		ServerHash::Sha1 => receive_pack_bytes::<Sha1>(&st.git_dir, &body, committer).await,
+		ServerHash::Sha256 => receive_pack_bytes::<Sha256>(&st.git_dir, &body, committer).await,
 	};
 	(
 		[(CONTENT_TYPE, Service::ReceivePack.result_content_type())],
@@ -194,11 +204,36 @@ async fn git_receive_pack(State(st): State<Served>, body: Bytes) -> Response {
 /// Serve gitana's `git_dir` (hash `hash`) on an ephemeral loopback port; returns the base URL. The
 /// listener is bound before returning, so there is no startup race.
 pub async fn serve_gitana(git_dir: PathBuf, hash: ServerHash) -> String {
+	serve(Served {
+		git_dir,
+		hash,
+		reflog_committer: None,
+	})
+	.await
+}
+
+/// Like [`serve_gitana`], but crediting server-side push reflogs to `committer` (a git reflog
+/// committer line, `Name <email> secs ±hhmm`) — for the receive-pack reflog oracle.
+pub async fn serve_gitana_with_reflog(
+	git_dir: PathBuf,
+	hash: ServerHash,
+	committer: String,
+) -> String {
+	serve(Served {
+		git_dir,
+		hash,
+		reflog_committer: Some(committer),
+	})
+	.await
+}
+
+/// Bind an ephemeral loopback port and serve `state`'s repo; returns the base URL.
+async fn serve(state: Served) -> String {
 	let app = Router::new()
 		.route("/info/refs", get(info_refs))
 		.route("/git-upload-pack", post(upload_pack))
 		.route("/git-receive-pack", post(git_receive_pack))
-		.with_state(Served { git_dir, hash });
+		.with_state(state);
 	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
 	let addr = listener.local_addr().expect("addr");
 	tokio::spawn(async move {

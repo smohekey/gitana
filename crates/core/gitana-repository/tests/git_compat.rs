@@ -431,7 +431,7 @@ async fn revisions_and_packed_refs_match_git() {
 	// Deleting a packed-only ref rewrites packed-refs; the engine and git both see it gone.
 	repo
 		.refs()
-		.delete_ref("refs/heads/main", Some(c3))
+		.delete_ref("refs/heads/main", Some(c3), ReflogIntent::Skip)
 		.await
 		.unwrap();
 	assert_eq!(repo.refs().resolve("refs/heads/main").await.unwrap(), None);

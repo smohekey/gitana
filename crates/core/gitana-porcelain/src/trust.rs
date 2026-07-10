@@ -79,7 +79,7 @@ pub async fn trust_init<F: FileStore, H: HashAlgorithm>(
 	let committer = identity.committer_or_default().await;
 	repo
 		.refs()
-		.append_reflog(TRUST_REF, None, tip, &committer, "trust: bootstrap")
+		.append_reflog(TRUST_REF, None, Some(tip), &committer, "trust: bootstrap")
 		.await?;
 	Ok((
 		tip,
@@ -201,7 +201,13 @@ pub async fn trust_sync<F: FileStore, H: HashAlgorithm>(
 	let committer = identity.committer_or_default().await;
 	repo
 		.refs()
-		.append_reflog(TRUST_REF, local_tip, remote_tip, &committer, "trust: sync")
+		.append_reflog(
+			TRUST_REF,
+			local_tip,
+			Some(remote_tip),
+			&committer,
+			"trust: sync",
+		)
 		.await?;
 	Ok(TrustSyncOutcome::Updated {
 		old: local_tip,
@@ -418,7 +424,7 @@ async fn trust_update<F: FileStore, H: HashAlgorithm>(
 		.append_reflog(
 			TRUST_REF,
 			Some(old_tip),
-			new_tip,
+			Some(new_tip),
 			&committer,
 			&format!("trust: {label}"),
 		)

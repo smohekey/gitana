@@ -78,6 +78,7 @@ async fn git_receive_pack(State(git_dir): State<PathBuf>, body: Bytes) -> Bytes 
 				trust: &TrustContext::none(),
 				now: 0,
 				nonce_ledger: &NoReplayCheck,
+				reflog: None,
 			},
 		)
 		.await

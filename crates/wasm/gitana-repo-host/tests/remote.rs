@@ -100,6 +100,7 @@ async fn receive_pack_srv(State(st): State<ServerState>, body: Bytes) -> Bytes {
 		trust: &no_trust,
 		now: 0,
 		nonce_ledger: &NoReplayCheck,
+		reflog: None,
 	};
 	let report = match st.kind {
 		HashKind::Sha1 => {
