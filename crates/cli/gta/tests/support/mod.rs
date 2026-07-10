@@ -60,6 +60,10 @@ struct Served {
 	/// The server committer line to credit push reflogs to (`Name <email> secs ±hhmm`), or `None` to
 	/// write none — the default interop server has no identity, matching git's default bare server.
 	reflog_committer: Option<String>,
+	/// Whether receive-pack grants the destructive updates git withholds by default — non-fast-forward
+	/// moves and deletions. The interop matrix runs with it on; the atomic oracle runs with it off, so a
+	/// non-fast-forward ref is rejected (git's `receive.denyNonFastForwards`).
+	force: bool,
 }
 
 /// The `Git-Protocol` version the request asks for (git repeats the header on every request).
@@ -112,12 +116,13 @@ async fn receive_pack_bytes<H: HashAlgorithm>(
 	git_dir: &Path,
 	body: &[u8],
 	reflog_committer: Option<&str>,
+	force: bool,
 ) -> Vec<u8> {
 	receive_pack(
 		&open::<H>(git_dir),
 		body,
 		ReceiveOptions {
-			force: true,
+			force,
 			trust: &TrustContext::none(),
 			now: 0,
 			nonce_ledger: &NoReplayCheck,
@@ -191,8 +196,10 @@ fn decode_body(headers: &HeaderMap, body: Bytes) -> Bytes {
 async fn git_receive_pack(State(st): State<Served>, body: Bytes) -> Response {
 	let committer = st.reflog_committer.as_deref();
 	let out = match st.hash {
-		ServerHash::Sha1 => receive_pack_bytes::<Sha1>(&st.git_dir, &body, committer).await,
-		ServerHash::Sha256 => receive_pack_bytes::<Sha256>(&st.git_dir, &body, committer).await,
+		ServerHash::Sha1 => receive_pack_bytes::<Sha1>(&st.git_dir, &body, committer, st.force).await,
+		ServerHash::Sha256 => {
+			receive_pack_bytes::<Sha256>(&st.git_dir, &body, committer, st.force).await
+		}
 	};
 	(
 		[(CONTENT_TYPE, Service::ReceivePack.result_content_type())],
@@ -208,6 +215,7 @@ pub async fn serve_gitana(git_dir: PathBuf, hash: ServerHash) -> String {
 		git_dir,
 		hash,
 		reflog_committer: None,
+		force: true,
 	})
 	.await
 }
@@ -223,6 +231,20 @@ pub async fn serve_gitana_with_reflog(
 		git_dir,
 		hash,
 		reflog_committer: Some(committer),
+		force: true,
+	})
+	.await
+}
+
+/// Like [`serve_gitana`], but withholding the destructive-update grant (`force: false`), so a
+/// non-fast-forward ref move is rejected — git's `receive.denyNonFastForwards`. Used by the atomic
+/// oracle, where one ref of a push must fail for `--atomic` to have anything to roll back.
+pub async fn serve_gitana_no_force(git_dir: PathBuf, hash: ServerHash) -> String {
+	serve(Served {
+		git_dir,
+		hash,
+		reflog_committer: None,
+		force: false,
 	})
 	.await
 }

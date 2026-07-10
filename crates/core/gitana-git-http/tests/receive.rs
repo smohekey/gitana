@@ -103,6 +103,23 @@ fn push_request(old: &str, new: &str, name: &str, pack: &[u8]) -> Vec<u8> {
 	out
 }
 
+/// Frame several `<old> <new> <ref>` commands (with `report-status atomic` caps on the first line)
+/// + flush + pack — a `git push --atomic` request.
+fn atomic_push_request(commands: &[(&str, &str, &str)], pack: &[u8]) -> Vec<u8> {
+	let mut out = Vec::new();
+	for (index, (old, new, name)) in commands.iter().enumerate() {
+		let line = if index == 0 {
+			format!("{old} {new} {name}\0report-status atomic object-format=sha256\n")
+		} else {
+			format!("{old} {new} {name}\n")
+		};
+		out.extend_from_slice(format!("{:04x}{line}", line.len() + 4).as_bytes());
+	}
+	out.extend_from_slice(b"0000");
+	out.extend_from_slice(pack);
+	out
+}
+
 fn pkt_lines(body: &[u8]) -> Vec<String> {
 	let mut lines = Vec::new();
 	let mut cursor = 0;
@@ -409,5 +426,143 @@ async fn losing_create_race_does_not_roll_back_the_winner() {
 			.expect("resolve"),
 		Some(commit),
 		"the winner's ref must survive a losing create race"
+	);
+}
+
+/// An `--atomic` push whose commands all succeed moves every ref in one transaction — including a
+/// fast-forward of an existing ref, whose objects the same push delivered.
+#[tokio::test]
+async fn atomic_push_moves_every_ref() {
+	let repo = repo();
+	repo.init().await.expect("init");
+
+	let (a_objects, a) = commit_objects(b"a\n");
+	let (b_objects, b) = commit_objects(b"b\n");
+	let pack = encode_pack(&[a_objects, b_objects].concat());
+	let request = atomic_push_request(
+		&[
+			(ZERO, &a.to_hex(), "refs/heads/main"),
+			(ZERO, &b.to_hex(), "refs/heads/feature"),
+		],
+		&pack,
+	);
+	let lines = pkt_lines(
+		&receive_pack(&repo, &request, opts(false))
+			.await
+			.expect("receive")
+			.report,
+	);
+	assert!(
+		lines.iter().any(|l| l == "ok refs/heads/main\n"),
+		"{lines:?}"
+	);
+	assert!(
+		lines.iter().any(|l| l == "ok refs/heads/feature\n"),
+		"{lines:?}"
+	);
+	assert_eq!(
+		repo.refs().resolve("refs/heads/main").await.unwrap(),
+		Some(a)
+	);
+	assert_eq!(
+		repo.refs().resolve("refs/heads/feature").await.unwrap(),
+		Some(b)
+	);
+}
+
+/// An `--atomic` push with one rejected command rejects the *whole* batch: the offending ref reports
+/// its reason, every other the collateral `atomic push failure`, and no ref moves.
+#[tokio::test]
+async fn atomic_push_rejects_the_whole_batch() {
+	let repo = repo();
+	repo.init().await.expect("init");
+
+	// Establish refs/heads/main at the first commit.
+	let (first, first_id) = commit_objects(b"one\n");
+	receive_pack(
+		&repo,
+		&push_request(
+			ZERO,
+			&first_id.to_hex(),
+			"refs/heads/main",
+			&encode_pack(&first),
+		),
+		opts(false),
+	)
+	.await
+	.expect("establish main");
+
+	// Atomically push a good create (feature) alongside a non-fast-forward of main: the whole batch
+	// must fail without force.
+	let (second, second_id) = commit_objects(b"two\n");
+	let request = atomic_push_request(
+		&[
+			(&first_id.to_hex(), &second_id.to_hex(), "refs/heads/main"),
+			(ZERO, &first_id.to_hex(), "refs/heads/feature"),
+		],
+		&encode_pack(&second),
+	);
+	let lines = pkt_lines(
+		&receive_pack(&repo, &request, opts(false))
+			.await
+			.expect("receive")
+			.report,
+	);
+	assert!(lines.iter().any(|l| l == "unpack ok\n"), "{lines:?}");
+	assert!(
+		lines
+			.iter()
+			.any(|l| l.contains("ng refs/heads/main non-fast-forward")),
+		"the offending ref keeps its own reason: {lines:?}"
+	);
+	assert!(
+		lines
+			.iter()
+			.any(|l| l.contains("ng refs/heads/feature atomic push failure")),
+		"the collateral ref reports the atomic failure: {lines:?}"
+	);
+	// Neither ref moved: main is still the first commit, feature was never created.
+	assert_eq!(
+		repo.refs().resolve("refs/heads/main").await.unwrap(),
+		Some(first_id)
+	);
+	assert_eq!(
+		repo.refs().resolve("refs/heads/feature").await.unwrap(),
+		None
+	);
+}
+
+/// An `--atomic` push naming the same ref twice is rejected outright (git's "multiple updates for a
+/// ref"), moving nothing — a `RefStore::transact` that validated both against the same pre-value would
+/// otherwise let the last update silently win.
+#[tokio::test]
+async fn atomic_push_rejects_a_duplicate_ref() {
+	let repo = repo();
+	repo.init().await.expect("init");
+
+	let (a_objects, a) = commit_objects(b"a\n");
+	let (b_objects, b) = commit_objects(b"b\n");
+	let pack = encode_pack(&[a_objects, b_objects].concat());
+	let request = atomic_push_request(
+		&[
+			(ZERO, &a.to_hex(), "refs/heads/main"),
+			(ZERO, &b.to_hex(), "refs/heads/main"),
+		],
+		&pack,
+	);
+	let lines = pkt_lines(
+		&receive_pack(&repo, &request, opts(false))
+			.await
+			.expect("receive")
+			.report,
+	);
+	assert!(
+		lines.iter().any(|l| l.starts_with("ng refs/heads/main")),
+		"the duplicate ref is rejected: {lines:?}"
+	);
+	assert_eq!(
+		repo.refs().resolve("refs/heads/main").await.unwrap(),
+		None,
+		"nothing is created when a ref is named twice in an atomic push"
 	);
 }

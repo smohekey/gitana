@@ -15,7 +15,7 @@ use gitana_object::{
 	HashAlgorithm, ObjectId, ObjectKind, PktLine, decode_pack_with_bases, parse_pkt,
 	ref_delta_base_ids, referenced_ids, write_flush, write_pkt,
 };
-use gitana_repository::{ReflogIntent, Repository, RepositoryError};
+use gitana_repository::{RefOp, ReflogIntent, Repository, RepositoryError};
 use gitana_trust::AuditEvent;
 
 use crate::push_cert::{self, PushCert};
@@ -112,6 +112,7 @@ pub async fn receive_pack<F: FileStore, H: HashAlgorithm, L: NonceLedger>(
 ) -> Result<ReceiveOutcome<H>, GitHttpError> {
 	let ParsedRequest {
 		commands,
+		atomic,
 		push_cert,
 		pack,
 	} = parse_receive(request)?;
@@ -203,46 +204,95 @@ pub async fn receive_pack<F: FileStore, H: HashAlgorithm, L: NonceLedger>(
 			}
 		};
 
-	// Migrate only the objects reachable from accepted updates. A trust-rejected ref must not leave
-	// its (unsigned/untrusted) objects behind in the store — objects reachable from an accepted ref
-	// are the ones verify_push cleared (or the repo has no policy). The rest stay in quarantine and
-	// are discarded with this request.
-	let accepted_tips: Vec<ObjectId<H>> = commands
-		.iter()
-		.filter(|command| !rejected.contains_key(&command.name))
-		.filter_map(|command| command.new)
-		.collect();
-	let migrate = reachable_pushed(&objects, &accepted_tips)?;
-	for (id, (kind, data)) in &objects {
-		if migrate.contains(id) {
-			repo.objects().write_object(*kind, data).await?;
-		}
-	}
+	// The reflog intent every accepted update carries: the server identity + literal `push` message,
+	// or `Skip` when the host configured no server identity.
+	let intent = match options.reflog.as_ref().map(|reflog| reflog.committer) {
+		Some(committer) => ReflogIntent::Log {
+			committer,
+			message: "push",
+		},
+		None => ReflogIntent::Skip,
+	};
+
+	// Migrate the objects reachable from accepted (non-trust-rejected) updates *before* touching refs,
+	// so the pushed commits are visible to the fast-forward walk below. A trust-rejected ref must not
+	// leave its (unsigned/untrusted) objects behind — those stay in quarantine and drop with the
+	// request; the rest are the objects verify_push cleared (or the repo has no policy).
+	migrate_accepted(repo, &objects, &commands, &rejected).await?;
 	write_pkt(&mut out, b"unpack ok\n")?;
+
 	let mut updated = Vec::new();
 	let mut applied = Vec::new();
-	for command in &commands {
-		if let Some(reason) = rejected.get(&command.name) {
-			write_pkt(
-				&mut out,
-				format!("ng {} {reason}\n", command.name).as_bytes(),
-			)?;
-			continue;
-		}
-		let reflog_committer = options.reflog.as_ref().map(|reflog| reflog.committer);
-		match apply_command(repo, command, options.force, reflog_committer).await {
-			Ok(()) => {
-				write_pkt(&mut out, format!("ok {}\n", command.name).as_bytes())?;
-				applied.push(command.name.clone());
-				if let Some(new) = command.new {
-					updated.push((command.name.clone(), new));
+	if atomic {
+		// git's `--atomic`: one transaction, all-or-nothing. Plan every command against the now-migrated
+		// objects; any rejection — a trust denial, a non-fast-forward, a denied deletion, or a ref named
+		// twice — sinks the whole batch. The report gives the offending ref its own reason and every
+		// other the collateral `atomic push failure` (git's wording); nothing moves.
+		let mut ops: Vec<RefOp<H>> = Vec::new();
+		let mut seen: HashSet<&str> = HashSet::new();
+		let mut first_failure: Option<(String, String)> = None;
+		for command in &commands {
+			let planned = if !seen.insert(&command.name) {
+				Err("duplicate ref update".to_owned())
+			} else if let Some(reason) = rejected.get(&command.name) {
+				Err(reason.clone())
+			} else {
+				plan_command(repo, command, options.force, intent).await
+			};
+			match planned {
+				Ok(op) => ops.push(op),
+				Err(reason) => {
+					first_failure.get_or_insert_with(|| (command.name.clone(), reason));
 				}
 			}
-			Err(reason) => {
+		}
+		// Commit the whole batch only when every command planned; otherwise the first failure (or a
+		// residual CAS race surfaced by `transact`) rejects it.
+		let outcome = match &first_failure {
+			Some((bad, reason)) => Err((bad.clone(), reason.clone())),
+			None => repo
+				.refs()
+				.transact(&ops)
+				.await
+				.map_err(|(bad, error)| (bad, reason(error))),
+		};
+		match outcome {
+			Ok(()) => {
+				for op in &ops {
+					write_pkt(&mut out, format!("ok {}\n", op.name).as_bytes())?;
+					applied.push(op.name.clone());
+					if let Some(new) = op.new {
+						updated.push((op.name.clone(), new));
+					}
+				}
+			}
+			Err((bad, reason)) => write_atomic_rejection(&mut out, &commands, &bad, &reason)?,
+		}
+	} else {
+		// Default receive-pack: apply each command independently, per-ref `ok`/`ng`. Each
+		// `apply_command` is itself an atomic one-ref transaction.
+		for command in &commands {
+			if let Some(reason) = rejected.get(&command.name) {
 				write_pkt(
 					&mut out,
 					format!("ng {} {reason}\n", command.name).as_bytes(),
 				)?;
+				continue;
+			}
+			match apply_command(repo, command, options.force, intent).await {
+				Ok(()) => {
+					write_pkt(&mut out, format!("ok {}\n", command.name).as_bytes())?;
+					applied.push(command.name.clone());
+					if let Some(new) = command.new {
+						updated.push((command.name.clone(), new));
+					}
+				}
+				Err(reason) => {
+					write_pkt(
+						&mut out,
+						format!("ng {} {reason}\n", command.name).as_bytes(),
+					)?;
+				}
 			}
 		}
 	}
@@ -354,29 +404,24 @@ fn reachable_pushed<H: HashAlgorithm>(
 	Ok(migrate)
 }
 
-/// Apply one ref-update command via compare-and-set. Updates require fast-forward and
-/// deletions are refused unless `force` is granted. Returns a `report-status` reason
-/// string on rejection.
+/// The collateral `report-status` reason git gives every *other* ref of a failed `--atomic` push —
+/// the one that actually failed keeps its own reason.
+const ATOMIC_COLLATERAL: &str = "atomic push failure";
+
+/// Plan one ref-update command into the [`RefOp`] a ref transaction commits, applying receive-pack's
+/// pre-transaction policy: an update must fast-forward unless `force` is granted, and a deletion is
+/// refused unless `force` is granted (the `delete-refs` capability). Returns a `report-status` reason
+/// string when the command is rejected before it can be committed.
 ///
-/// `reflog_committer` is the server identity to credit the reflog to (message `push`, as git's
-/// receive-pack hardcodes), or `None` to write none. A deletion still removes the ref's own reflog;
-/// the intent only governs the `logs/HEAD` deletion entry git writes when the deleted branch is the
-/// one HEAD points at. `update_ref`/`delete_ref` apply `core.logAllRefUpdates` gating, so a bare
-/// default-config server logs nothing.
-async fn apply_command<F: FileStore, H: HashAlgorithm>(
+/// `intent` is the reflog intent the op carries — the server identity + `push` message, or `Skip`.
+/// A deletion still removes the ref's own reflog regardless; the intent governs only the `logs/HEAD`
+/// deletion entry git writes when the deleted branch is the one HEAD points at.
+async fn plan_command<'i, F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	command: &Command<H>,
 	force: bool,
-	reflog_committer: Option<&str>,
-) -> Result<(), String> {
-	let refs = repo.refs();
-	let intent = match reflog_committer {
-		Some(committer) => ReflogIntent::Log {
-			committer,
-			message: "push",
-		},
-		None => ReflogIntent::Skip,
-	};
+	intent: ReflogIntent<'i>,
+) -> Result<RefOp<'i, H>, String> {
 	match (command.old, command.new) {
 		(_, Some(new)) => {
 			// Update or create. For an update, require the new tip to descend from the old
@@ -389,26 +434,90 @@ async fn apply_command<F: FileStore, H: HashAlgorithm>(
 			{
 				return Err("non-fast-forward".to_owned());
 			}
-			// `update_ref` is an atomic ref transaction (reflog written before the ref, under the ref's
-			// lock), so a reflog-write failure or a lost race leaves the ref unmoved — git's
-			// reject-without-moving, with no rollback to undo.
-			refs
-				.update_ref(&command.name, new, command.old, intent)
-				.await
-				.map_err(reason)
+			Ok(RefOp {
+				name: command.name.clone(),
+				expected: command.old,
+				new: Some(new),
+				reflog: intent,
+			})
 		}
 		// Deletion: withheld unless `force` is granted (the `delete-refs` capability).
 		(Some(old), None) => {
 			if !force {
 				return Err("deletion denied".to_owned());
 			}
-			refs
-				.delete_ref(&command.name, Some(old), intent)
-				.await
-				.map_err(reason)
+			Ok(RefOp {
+				name: command.name.clone(),
+				expected: Some(old),
+				new: None,
+				reflog: intent,
+			})
 		}
 		(None, None) => Err("no-op command".to_owned()),
 	}
+}
+
+/// Apply one ref-update command as its own atomic one-ref transaction (git's default per-ref
+/// receive-pack). Returns a `report-status` reason string on rejection.
+///
+/// The transaction writes the reflog before the ref under the ref's lock, so a reflog-write failure
+/// or a lost CAS race leaves the ref unmoved — git's reject-without-moving, with nothing to roll
+/// back — and applies `core.logAllRefUpdates` gating (a bare default-config server logs nothing).
+async fn apply_command<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	command: &Command<H>,
+	force: bool,
+	intent: ReflogIntent<'_>,
+) -> Result<(), String> {
+	let op = plan_command(repo, command, force, intent).await?;
+	repo
+		.refs()
+		.transact(std::slice::from_ref(&op))
+		.await
+		.map_err(|(_, error)| reason(error))
+}
+
+/// Migrate the pushed objects reachable from the accepted (non-trust-rejected) ref tips into the
+/// store. A trust-rejected ref's objects stay in quarantine and are dropped with the request; objects
+/// reachable from an accepted ref are the ones `verify_push` cleared (or the repo has no policy).
+async fn migrate_accepted<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	objects: &HashMap<ObjectId<H>, (ObjectKind, Vec<u8>)>,
+	commands: &[Command<H>],
+	rejected: &HashMap<String, String>,
+) -> Result<(), GitHttpError> {
+	let accepted_tips: Vec<ObjectId<H>> = commands
+		.iter()
+		.filter(|command| !rejected.contains_key(&command.name))
+		.filter_map(|command| command.new)
+		.collect();
+	let migrate = reachable_pushed(objects, &accepted_tips)?;
+	for (id, (kind, data)) in objects {
+		if migrate.contains(id) {
+			repo.objects().write_object(*kind, data).await?;
+		}
+	}
+	Ok(())
+}
+
+/// Append a whole-batch `--atomic` rejection: `ng` for every command — the one that sank the batch
+/// (`bad`) with its own `reason`, every other with the collateral `atomic push failure` (git's
+/// wording). The caller has already written `unpack ok` and moved nothing.
+fn write_atomic_rejection<H: HashAlgorithm>(
+	out: &mut Vec<u8>,
+	commands: &[Command<H>],
+	bad: &str,
+	reason: &str,
+) -> Result<(), GitHttpError> {
+	for command in commands {
+		let text = if command.name == bad {
+			format!("ng {} {reason}\n", command.name)
+		} else {
+			format!("ng {} {ATOMIC_COLLATERAL}\n", command.name)
+		};
+		write_pkt(out, text.as_bytes())?;
+	}
+	Ok(())
 }
 
 /// Whether `new` reaches `old` through its history (a fast-forward update).
@@ -448,16 +557,18 @@ fn report_unpack_failure<H: HashAlgorithm>(
 	out
 }
 
-/// The parsed command section: the ref-update commands, the push certificate (if the
-/// push was signed), and the trailing packfile bytes.
+/// The parsed command section: the ref-update commands, whether the client requested the `atomic`
+/// capability, the push certificate (if the push was signed), and the trailing packfile bytes.
 struct ParsedRequest<'a, H: HashAlgorithm> {
 	commands: Vec<Command<H>>,
+	atomic: bool,
 	push_cert: Option<PushCert>,
 	pack: &'a [u8],
 }
 
 /// Parse the command section (a plain command list, or a signed `push-cert` block).
 fn parse_receive<H: HashAlgorithm>(request: &[u8]) -> Result<ParsedRequest<'_, H>, GitHttpError> {
+	let atomic = requested_atomic(request);
 	if push_cert::is_push_cert(request) {
 		let (cert, pack) = push_cert::parse(request)?;
 		let commands = cert
@@ -473,6 +584,7 @@ fn parse_receive<H: HashAlgorithm>(request: &[u8]) -> Result<ParsedRequest<'_, H
 			.collect::<Result<Vec<_>, GitHttpError>>()?;
 		return Ok(ParsedRequest {
 			commands,
+			atomic,
 			push_cert: Some(cert),
 			pack,
 		});
@@ -491,9 +603,28 @@ fn parse_receive<H: HashAlgorithm>(request: &[u8]) -> Result<ParsedRequest<'_, H
 	}
 	Ok(ParsedRequest {
 		commands,
+		atomic,
 		push_cert: None,
 		pack: &request[cursor..],
 	})
+}
+
+/// Whether the client asked for the `atomic` capability (`git push --atomic`). Both request forms
+/// carry the capability list after the first NUL of the first pkt-line — a plain command line
+/// (`<old> <new> <ref>\0<caps>`) or the push-cert marker (`push-cert\0<caps>`) — so one peek covers
+/// both. A malformed or capability-less first line reads as not requested.
+fn requested_atomic(request: &[u8]) -> bool {
+	let Ok((PktLine::Data(data), _)) = parse_pkt(request) else {
+		return false;
+	};
+	let mut halves = data.splitn(2, |&b| b == 0);
+	let _command = halves.next();
+	let Some(caps) = halves.next() else {
+		return false;
+	};
+	caps
+		.split(|b| b.is_ascii_whitespace())
+		.any(|token| token == b"atomic")
 }
 
 /// Parse one command line: `<old> <new> <ref>`, with capabilities trailing the first

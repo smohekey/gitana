@@ -477,6 +477,9 @@ enum Command {
 		/// Allow a non-fast-forward update.
 		#[arg(short = 'f', long)]
 		force: bool,
+		/// Apply all pushed refs in one all-or-nothing transaction (requires server support).
+		#[arg(long)]
+		atomic: bool,
 		/// Delete a remote ref instead of pushing (sugar for a `:<ref>` refspec).
 		#[arg(long, value_name = "ref")]
 		delete: Option<String>,
@@ -891,6 +894,7 @@ impl Cli {
 				signed,
 				signing_key,
 				force,
+				atomic,
 				delete,
 				tags,
 				follow_tags,
@@ -909,6 +913,7 @@ impl Cli {
 					signed,
 					signing_key,
 					force,
+					atomic,
 					delete,
 					tags,
 					follow_tags,

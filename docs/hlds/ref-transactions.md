@@ -128,9 +128,11 @@ The gating already lives in `RefStore` (`reflog_policy` / `should_log` / the spl
 - **Phase 2 — `RefTransaction`.** The module above; rewrite the three primitives as wrappers; remove
   the receive-pack rollback. Unit tests: concurrency (racing writers — one wins, no spurious reflog),
   reflog D/F preflight rejects before mutating, abort leaves nothing, wrappers match prior behaviour.
-- **Phase 3 — multi-ref receive-pack + `atomic`.** Advertise/parse/apply as above. Oracle: extend
-  `git_receive_reflog.rs` — the rollback test now passes via the transaction; add `git push --atomic`
-  all-or-nothing parity and confirm the non-atomic default still lands the good refs.
+- **Phase 3 — multi-ref receive-pack + `atomic`. Done.** Advertise/parse/apply as above, plus the
+  `gta push --atomic` client. Oracle in a new `git_atomic_push.rs` (a stock-`git` client → bare `git`
+  server and a `gta` client → gitana server run the same good-ref + rejected-ref push in parallel):
+  `--atomic` leaves both servers' refs untouched, the non-atomic default lands the good ref per-ref —
+  byte-identical ref state on both. See the Phase-3 implementation notes below.
 
 Each phase: full workspace green + `cargo fmt` + `codex review --base main` clean, then squash-merged
 after Scott's approval.
@@ -208,6 +210,37 @@ Deltas from the design above and from `codex` review, recorded here rather than 
   per-worktree file, interoperably with git.
 - **`RefLocked`** is the new `RepositoryError` variant when a `<ref>.lock` stays contended past the
   retries.
+
+## Implementation notes (as built, Phase 3)
+
+- **`atomic` advertised beside `report-status delete-refs`** in the `Service::ReceivePack` arm of
+  `base_capabilities`.
+- **Request-capability parse is one peek.** Both request forms carry the capability list after the
+  first NUL of the first pkt-line — a plain command line (`<old> <new> <ref>\0<caps>`) or the
+  push-cert marker (`push-cert\0<caps>`) — so a single `requested_atomic(request)` covers signed and
+  unsigned pushes, feeding a new `ParsedRequest::atomic`.
+- **Apply reuses `RefStore::transact` — no new engine.** `plan_command` turns each command into a
+  `RefOp` after applying receive-pack policy (fast-forward unless `force`, deletion only with `force`);
+  the default path commits each op as its own one-op transaction (per-ref `ok`/`ng`, unchanged), and
+  `atomic` commits every planned op in one `transact` call. `apply_command` is now `plan_command` +
+  a one-op `transact`, so the two paths share the policy check.
+- **Planning runs *after* `migrate_accepted`, in both modes.** The fast-forward check
+  (`is_fast_forward` → `rev_list`) walks the object store, so the pushed commits must be migrated
+  first — otherwise an ordinary atomic fast-forward to an existing ref would be rejected for want of
+  objects that are still in quarantine. So the order is migrate → plan → `transact`; a `--atomic`
+  batch that is then rejected (a non-fast-forward, a denied deletion, a ref named twice, or the
+  residual CAS race inside `transact`) `ng`s the whole batch — the offending ref by its reason, the
+  rest with git's collateral `atomic push failure` — and **moves no ref**, but (like the existing
+  per-ref path) may leave the migrated-but-unreferenced objects behind for gc. Git's quarantine
+  discards them instead; matching that is a separate, pre-existing gitana gap, not specific to atomic.
+- **Duplicate ref names sink an atomic batch.** git's receive-pack rejects a ref updated twice in one
+  push; the atomic path detects a repeated `command.name` up front and fails the batch (the default
+  per-ref path already rejects the second update by its now-stale compare-and-set).
+- **Client (`gta push --atomic`).** `build_receive_pack_request` / `push_caps` emit the `atomic` token
+  only when requested; `push` / `push_signed` first call `ensure_atomic_supported`, which errors
+  (git's "the receiving end does not support --atomic push") when the server did not advertise it,
+  rather than silently degrading to a per-ref push. The wasm component push is a single ref, so it
+  passes `atomic: false` and does not widen the WIT surface.
 
 ## Pre-existing smells surfaced (not fixed here, per conventions)
 

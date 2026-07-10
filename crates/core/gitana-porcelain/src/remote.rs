@@ -745,16 +745,19 @@ pub enum PushTags {
 /// tags per git's `--tags` / `--follow-tags`. `advertisement` is the already-fetched
 /// `git-receive-pack` `GET /info/refs` body. For a signed push (`gta push --signed`), see
 /// [`push_signed`].
+#[allow(clippy::too_many_arguments)]
 pub async fn push<F: FileStore, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
 	origin: &Origin,
 	advertisement: &[u8],
 	force: bool,
+	atomic: bool,
 	refspecs: Vec<PushRefspec>,
 	tags: PushTags,
 ) -> Result<PushOutcome> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
+	ensure_atomic_supported(&advertised, atomic)?;
 	let planned = plan_push(repo, &advertised, refspecs, force, tags).await?;
 	if planned.is_empty() {
 		return Ok(PushOutcome {
@@ -764,7 +767,7 @@ pub async fn push<F: FileStore, H: HashAlgorithm>(
 	}
 	let updates: Vec<RefUpdate<H>> = planned.iter().map(|p| p.update.clone()).collect();
 	let pack = pack_for(repo, &advertised, &planned).await?;
-	let request = build_receive_pack_request(&updates, &pack);
+	let request = build_receive_pack_request(&updates, atomic, &pack);
 	send_receive_pack(transport, origin, request).await?;
 	Ok(PushOutcome {
 		results: results_of(&planned),
@@ -778,18 +781,21 @@ pub async fn push<F: FileStore, H: HashAlgorithm>(
 /// certificate body — both invoked only after confirming the server offers push-cert, so an
 /// unconfigured identity or an unresolvable signing key does not mask "the server does not accept
 /// signed pushes".
+#[allow(clippy::too_many_arguments)]
 pub async fn push_signed<F: FileStore, H: HashAlgorithm, S: Signer>(
 	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,
 	origin: &Origin,
 	advertisement: &[u8],
 	force: bool,
+	atomic: bool,
 	refspecs: Vec<PushRefspec>,
 	tags: PushTags,
 	pusher: impl AsyncFnOnce() -> Result<String>,
 	signer: &S,
 ) -> Result<PushOutcome> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
+	ensure_atomic_supported(&advertised, atomic)?;
 	let planned = plan_push(repo, &advertised, refspecs, force, tags).await?;
 	if planned.is_empty() {
 		return Ok(PushOutcome {
@@ -807,7 +813,7 @@ pub async fn push_signed<F: FileStore, H: HashAlgorithm, S: Signer>(
 	// receive-pack verifies via `verify_sshsig(cert.payload(), cert.signature, keys, "git")`.
 	cert.signature = signer.sign(&cert.payload()).await?;
 	let pack = pack_for(repo, &advertised, &planned).await?;
-	let request = build_push_cert(&cert, &push_caps::<H>(), &pack);
+	let request = build_push_cert(&cert, &push_caps::<H>(atomic), &pack);
 	send_receive_pack(transport, origin, request).await?;
 	Ok(PushOutcome {
 		results: results_of(&planned),
@@ -1186,9 +1192,23 @@ fn build_cert<H: HashAlgorithm>(
 	}
 }
 
-/// Capabilities echoed on the push request's first line / cert marker, for hash `H`.
-fn push_caps<H: HashAlgorithm>() -> String {
-	format!("report-status object-format={}", H::NAME)
+/// Capabilities echoed on the push request's first line / cert marker, for hash `H`. `atomic`
+/// requests git's all-or-nothing `--atomic` capability.
+fn push_caps<H: HashAlgorithm>(atomic: bool) -> String {
+	let atomic = if atomic { " atomic" } else { "" };
+	format!("report-status{atomic} object-format={}", H::NAME)
+}
+
+/// Fail an `--atomic` push the server cannot honor: git requires the receiving end to advertise the
+/// `atomic` capability, and errors out rather than silently applying the refs per-ref.
+fn ensure_atomic_supported<H: HashAlgorithm>(
+	advertised: &Advertised<H>,
+	atomic: bool,
+) -> Result<()> {
+	if atomic && !advertised.supports("atomic") {
+		bail!("the receiving end does not support --atomic push");
+	}
+	Ok(())
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -1255,6 +1275,29 @@ mod tests {
 		assert!(ensure_deepen_supported(&with_relative, &relative).is_ok());
 	}
 
+	#[test]
+	fn atomic_requires_matching_server_capability() {
+		use gitana_object::Sha256;
+
+		let with: Advertised<Sha256> = Advertised {
+			capabilities: vec!["report-status".to_owned(), "atomic".to_owned()],
+			..Default::default()
+		};
+		let without: Advertised<Sha256> = Advertised {
+			capabilities: vec!["report-status".to_owned()],
+			..Default::default()
+		};
+		// A default (non-atomic) push never needs the capability.
+		assert!(ensure_atomic_supported(&without, false).is_ok());
+		// `--atomic` requires the server to advertise `atomic`, else it errors rather than degrading to
+		// a per-ref push.
+		assert!(ensure_atomic_supported(&without, true).is_err());
+		assert!(ensure_atomic_supported(&with, true).is_ok());
+		// The client echoes the `atomic` token only when requested.
+		assert!(push_caps::<Sha256>(true).contains("atomic"));
+		assert!(!push_caps::<Sha256>(false).contains("atomic"));
+	}
+
 	/// A [`HttpTransport`] double that records the single POSTed request and answers with a success
 	/// `report-status` (`unpack ok`), so a push completes without a real server.
 	struct CapturingTransport {
@@ -1315,6 +1358,7 @@ mod tests {
 			wt.repository(),
 			&origin,
 			&advertisement,
+			false,
 			false,
 			vec![],
 			PushTags::None,
@@ -1387,6 +1431,7 @@ mod tests {
 			&origin,
 			&advertisement,
 			false,
+			false,
 			vec![PushRefspec::parse(":main").unwrap()],
 			PushTags::None,
 			async || Ok("Dev <dev@x.test> 1700000000 +0000".to_owned()),
@@ -1453,6 +1498,7 @@ mod tests {
 			&origin,
 			&advertisement,
 			false,
+			false,
 			vec![],
 			PushTags::None,
 			async || panic!("pusher resolved despite no push-cert support"),
@@ -1516,6 +1562,7 @@ mod tests {
 			wt.repository(),
 			&origin,
 			&advertisement,
+			false,
 			false,
 			vec![
 				PushRefspec::parse("main:dup").unwrap(),

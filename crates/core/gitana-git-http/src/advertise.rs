@@ -107,7 +107,9 @@ fn base_capabilities<H: HashAlgorithm>(service: Service) -> String {
 			)
 		}
 		Service::ReceivePack => {
-			format!("report-status delete-refs ofs-delta object-format={object_format} agent={AGENT}")
+			format!(
+				"report-status delete-refs atomic ofs-delta object-format={object_format} agent={AGENT}"
+			)
 		}
 	}
 }

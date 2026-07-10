@@ -105,12 +105,15 @@ pub(crate) async fn push<H: HashAlgorithm>(
 			gitana_remote::PushRefspec::parse("HEAD").map_err(|e| RepoError::Invalid(e.to_string()))?,
 		],
 	};
+	// The component surface pushes a single ref, so atomicity would be a no-op; it is not exposed in
+	// the WIT contract.
 	let outcome = gitana_porcelain::push(
 		&transport,
 		repo,
 		&origin,
 		&advertisement,
 		force,
+		false,
 		refspecs,
 		gitana_porcelain::PushTags::None,
 	)

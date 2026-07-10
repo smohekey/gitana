@@ -30,6 +30,7 @@ pub async fn run(
 	signed: bool,
 	signing_key: Option<PathBuf>,
 	force: bool,
+	atomic: bool,
 	delete: Option<String>,
 	all_tags: bool,
 	follow_tags: bool,
@@ -80,6 +81,7 @@ pub async fn run(
 				signed,
 				signing_key,
 				force,
+				atomic,
 				tags,
 				cwd,
 			)
@@ -95,6 +97,7 @@ pub async fn run(
 				signed,
 				signing_key,
 				force,
+				atomic,
 				tags,
 				cwd,
 			)
@@ -113,6 +116,7 @@ async fn push_into<H: HashAlgorithm>(
 	signed: bool,
 	signing_key: Option<PathBuf>,
 	force: bool,
+	atomic: bool,
 	tags: PushTags,
 	cwd: &Path,
 ) -> Result<()> {
@@ -128,6 +132,7 @@ async fn push_into<H: HashAlgorithm>(
 			origin,
 			body,
 			force,
+			atomic,
 			refspecs,
 			tags,
 			async || pusher_ident(&repository).await,
@@ -135,7 +140,17 @@ async fn push_into<H: HashAlgorithm>(
 		)
 		.await?
 	} else {
-		gitana_porcelain::push(http, &repository, origin, body, force, refspecs, tags).await?
+		gitana_porcelain::push(
+			http,
+			&repository,
+			origin,
+			body,
+			force,
+			atomic,
+			refspecs,
+			tags,
+		)
+		.await?
 	};
 
 	if outcome.is_up_to_date() {

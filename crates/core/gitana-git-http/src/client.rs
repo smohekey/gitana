@@ -322,12 +322,15 @@ pub struct RefUpdate<H: HashAlgorithm> {
 }
 
 /// Build a receive-pack request: `<old> <new> <ref>` command lines (the first
-/// carrying capabilities), a flush, then the raw packfile.
+/// carrying capabilities), a flush, then the raw packfile. `atomic` requests git's `--atomic`
+/// capability, so the server applies every command in one transaction (all-or-nothing).
 pub fn build_receive_pack_request<H: HashAlgorithm>(
 	updates: &[RefUpdate<H>],
+	atomic: bool,
 	pack: &[u8],
 ) -> Vec<u8> {
 	let mut out = Vec::new();
+	let atomic_cap = if atomic { " atomic" } else { "" };
 	for (index, update) in updates.iter().enumerate() {
 		let command = format!(
 			"{} {} {}",
@@ -337,7 +340,7 @@ pub fn build_receive_pack_request<H: HashAlgorithm>(
 		);
 		let line = if index == 0 {
 			format!(
-				"{command}\0report-status object-format={} ofs-delta agent={AGENT}\n",
+				"{command}\0report-status{atomic_cap} object-format={} ofs-delta agent={AGENT}\n",
 				H::NAME
 			)
 		} else {
@@ -415,6 +418,7 @@ mod tests {
 				new: Some(sha256),
 				name: "refs/heads/main".to_owned(),
 			}],
+			false,
 			&[],
 		);
 		assert!(String::from_utf8_lossy(&push).contains("object-format=sha256"));
@@ -428,11 +432,27 @@ mod tests {
 				new: Some(sha1),
 				name: "refs/heads/main".to_owned(),
 			}],
+			false,
 			&[],
 		);
 		assert!(String::from_utf8_lossy(&push1).contains("object-format=sha1"));
 		let fetch1 = build_upload_pack_request(&[sha1], &[], &[], &Deepen::default(), false, true);
 		assert!(String::from_utf8_lossy(&fetch1).contains("object-format=sha1"));
+	}
+
+	#[test]
+	fn receive_pack_request_carries_atomic_only_when_requested() {
+		// `--atomic` adds the bare `atomic` capability to the first command line; a default push omits it.
+		let oid = ObjectId::<Sha1>::compute(ObjectKind::Commit, b"c");
+		let update = |name: &str| RefUpdate {
+			old: None,
+			new: Some(oid),
+			name: name.to_owned(),
+		};
+		let with = build_receive_pack_request(&[update("refs/heads/main")], true, &[]);
+		assert!(String::from_utf8_lossy(&with).contains(" atomic "));
+		let without = build_receive_pack_request(&[update("refs/heads/main")], false, &[]);
+		assert!(!String::from_utf8_lossy(&without).contains("atomic"));
 	}
 
 	#[test]
