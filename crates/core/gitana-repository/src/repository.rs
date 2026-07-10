@@ -211,6 +211,11 @@ where
 	/// new tip of branch `target`: advance it via CAS and append `commit`/`commit (initial)` reflog
 	/// entries to the branch and `HEAD`. The ref half of [`Self::commit_on_head`], split out so the
 	/// signed-commit path — which builds and signs the object first — reuses the identical logic.
+	///
+	/// `target` is the branch `HEAD` symbolically points at (every caller resolves it from
+	/// [`Self::head_branch_tip`] or the equivalent, both of which reject detached HEAD), so the
+	/// `update_ref` reflog cascade writes both the branch and the mirrored `HEAD` entry — under the
+	/// same `core.logAllRefUpdates` gating git applies.
 	pub async fn record_commit(
 		&self,
 		target: &str,
@@ -219,25 +224,24 @@ where
 		committer: &str,
 		message: &str,
 	) -> Result<(), RepositoryError> {
-		let refs = self.refs();
-		// This method writes the branch and HEAD reflogs itself below, so the ref move opts out.
-		refs
-			.update_ref(target, commit, parent, ReflogIntent::Skip)
-			.await?;
-
 		let subject = message.lines().next().unwrap_or("");
 		let reflog = if parent.is_none() {
 			format!("commit (initial): {subject}")
 		} else {
 			format!("commit: {subject}")
 		};
-		refs
-			.append_reflog(target, parent, commit, committer, &reflog)
-			.await?;
-		refs
-			.append_reflog("HEAD", parent, commit, committer, &reflog)
-			.await?;
-		Ok(())
+		self
+			.refs()
+			.update_ref(
+				target,
+				commit,
+				parent,
+				ReflogIntent::Log {
+					committer,
+					message: &reflog,
+				},
+			)
+			.await
 	}
 
 	/// Create a commit on the branch `HEAD` points at, advancing the branch via CAS
@@ -273,26 +277,32 @@ where
 		committer: &str,
 		message: &str,
 	) -> Result<(), RepositoryError> {
-		let refs = self.refs();
-		// This method writes the branch and HEAD reflogs itself below, so the ref move opts out.
-		refs
-			.update_ref(target, commit, Some(parent), ReflogIntent::Skip)
-			.await?;
 		let subject = message.lines().next().unwrap_or("");
 		let reflog = format!("commit (merge): {subject}");
-		refs
-			.append_reflog(target, Some(parent), commit, committer, &reflog)
-			.await?;
-		refs
-			.append_reflog("HEAD", Some(parent), commit, committer, &reflog)
-			.await?;
-		Ok(())
+		// As in `record_commit`, `target` is the branch `HEAD` points at, so the `update_ref` cascade
+		// writes both the branch and the mirrored `HEAD` reflog under git's gating.
+		self
+			.refs()
+			.update_ref(
+				target,
+				commit,
+				Some(parent),
+				ReflogIntent::Log {
+					committer,
+					message: &reflog,
+				},
+			)
+			.await
 	}
 
 	/// Move the current branch (or detached `HEAD`) to `commit` via CAS, recording the previous
 	/// tip in `ORIG_HEAD` and appending a reflog entry (`message`, e.g. `reset: moving to
-	/// HEAD~1`) to the branch and `HEAD`. The index and working tree are not touched. Mirrors the
-	/// ref half of [`Self::commit_on_head`], but for a reset rather than a new commit.
+	/// HEAD~1`). The index and working tree are not touched. Mirrors the ref half of
+	/// [`Self::commit_on_head`], but for a reset rather than a new commit.
+	///
+	/// The reflog is left to the `update_ref` cascade so it matches git's no-op handling: a reset to
+	/// the current tip logs the mirrored `HEAD` entry but not a redundant branch entry (the direct
+	/// reflog skips a no-op move), and a no-op reset on detached `HEAD` logs nothing.
 	pub async fn reset_head(
 		&self,
 		commit: ObjectId<H>,
@@ -310,31 +320,21 @@ where
 		// nothing to record (and nothing to move from) on an unborn branch.
 		if let Some(old) = old {
 			let current = refs.resolve("ORIG_HEAD").await?;
-			// ORIG_HEAD is not a logged namespace; this method writes the reflogs it wants below.
+			// ORIG_HEAD is not a logged namespace, so the move opts out of the reflog.
 			refs
 				.update_ref("ORIG_HEAD", old, current, ReflogIntent::Skip)
 				.await?;
 		}
 
-		match head {
-			HeadState::Symbolic(branch) => {
-				refs
-					.update_ref(&branch, commit, old, ReflogIntent::Skip)
-					.await?;
-				refs
-					.append_reflog(&branch, old, commit, committer, message)
-					.await?;
-			}
-			HeadState::Detached(_) => {
-				refs
-					.update_ref("HEAD", commit, old, ReflogIntent::Skip)
-					.await?;
-			}
-		}
+		// A symbolic HEAD moves its branch (the cascade mirrors the entry into `HEAD`); a detached HEAD
+		// is the direct ref that moves.
+		let name = match &head {
+			HeadState::Symbolic(branch) => branch.as_str(),
+			HeadState::Detached(_) => "HEAD",
+		};
 		refs
-			.append_reflog("HEAD", old, commit, committer, message)
-			.await?;
-		Ok(())
+			.update_ref(name, commit, old, ReflogIntent::Log { committer, message })
+			.await
 	}
 
 	/// Record `commit` as `ORIG_HEAD` so it can be recovered (`gta reset ORIG_HEAD`), as git does

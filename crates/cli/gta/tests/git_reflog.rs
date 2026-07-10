@@ -85,6 +85,34 @@ fn detached_head_and_disabled_reflogs_match_git_sha1() {
 	check_edge_cases("sha1");
 }
 
+#[test]
+fn commit_and_reset_reflogs_match_git_sha256() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	check_commit_reset_reflogs("sha256");
+}
+
+#[test]
+fn commit_and_reset_reflogs_match_git_sha1() {
+	check_commit_reset_reflogs("sha1");
+}
+
+#[test]
+fn disabled_first_commit_writes_no_reflog_sha256() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	check_disabled_first_commit("sha256");
+}
+
+#[test]
+fn disabled_first_commit_writes_no_reflog_sha1() {
+	check_disabled_first_commit("sha1");
+}
+
 /// A branch created off a detached HEAD records the literal `HEAD`, and disabling
 /// `core.logAllRefUpdates` suppresses new reflogs (branch and the worktree's per-worktree HEAD).
 fn check_edge_cases(fmt: &str) {
@@ -114,6 +142,96 @@ fn check_edge_cases(fmt: &str) {
 		sole_worktree_head_log_opt(&h).is_none(),
 		"git seeded a per-worktree logs/HEAD despite disabled reflogs (probe assumption wrong)"
 	);
+
+	cleanup(&g, &h);
+}
+
+/// `commit` and `reset` write `logs/HEAD` and the branch reflog exactly as git does — including
+/// git's no-op handling, which the ref-move reflog cascade drives: a `reset` to the current tip
+/// records the mirrored `HEAD` entry but not a redundant branch entry (the direct reflog skips a
+/// no-op move), and a no-op reset on a detached `HEAD` records nothing at all.
+fn check_commit_reset_reflogs(fmt: &str) {
+	let (g, h) = two_repos(fmt);
+
+	// A real second commit advances the branch: the branch and HEAD reflogs both gain a `commit:` line.
+	std::fs::write(g.join("b.txt"), "x\n").unwrap();
+	std::fs::write(h.join("b.txt"), "x\n").unwrap();
+	both(&g, &h, &["add", "."]);
+	both(&g, &h, &["commit", "-m", "second"]);
+	assert_log_eq(&g, &h, "logs/HEAD");
+	assert_log_eq(&g, &h, "logs/refs/heads/main");
+
+	// A no-op `reset --hard HEAD`: git records the mirrored HEAD entry (`reset: moving to HEAD`) but
+	// leaves the branch reflog untouched. The branch bytes must be unchanged, and both files must
+	// still match git.
+	let branch_before = std::fs::read(g.join(".git/logs/refs/heads/main")).unwrap();
+	both(&g, &h, &["reset", "--hard", "HEAD"]);
+	assert_eq!(
+		std::fs::read(g.join(".git/logs/refs/heads/main")).unwrap(),
+		branch_before,
+		"no-op reset must not append a branch reflog entry"
+	);
+	assert_log_eq(&g, &h, "logs/HEAD");
+	assert_log_eq(&g, &h, "logs/refs/heads/main");
+
+	// A real `reset --hard HEAD~1` moves the branch: both reflogs gain a `reset: moving to HEAD~1` line.
+	both(&g, &h, &["reset", "--hard", "HEAD~1"]);
+	assert_log_eq(&g, &h, "logs/HEAD");
+	assert_log_eq(&g, &h, "logs/refs/heads/main");
+
+	// A no-op reset on a *detached* HEAD records nothing (the direct HEAD reflog skips a no-op move,
+	// and there is no branch to mirror into). Detach both at the current tip (gta cannot detach via
+	// checkout yet, so write the file git also reads), then reset to it.
+	let head = gta(&g, &["rev-parse", "HEAD"]).trim().to_owned();
+	std::fs::write(g.join(".git/HEAD"), format!("{head}\n")).unwrap();
+	std::fs::write(h.join(".git/HEAD"), format!("{head}\n")).unwrap();
+	let head_log_before = std::fs::read(g.join(".git/logs/HEAD")).unwrap();
+	both(&g, &h, &["reset", "--hard", "HEAD"]);
+	assert_eq!(
+		std::fs::read(g.join(".git/logs/HEAD")).unwrap(),
+		head_log_before,
+		"no-op detached reset must not append a HEAD reflog entry"
+	);
+	assert_log_eq(&g, &h, "logs/HEAD");
+
+	cleanup(&g, &h);
+}
+
+/// With `core.logAllRefUpdates=false`, the first commit on a branch with no existing reflog writes no
+/// reflog at all — matching git, which gates creating a brand-new reflog on the setting (whereas an
+/// already-existing reflog is always appended).
+fn check_disabled_first_commit(fmt: &str) {
+	let base = unique_tmp(&format!("reflog-disabled-{fmt}"));
+	let g = base.join("gta");
+	let h = base.join("git");
+	std::fs::create_dir_all(&g).unwrap();
+	std::fs::create_dir_all(&h).unwrap();
+	gta(&g, &["init", &format!("--object-format={fmt}")]);
+	git(
+		&h,
+		&[
+			"init",
+			"-q",
+			"-b",
+			"main",
+			&format!("--object-format={fmt}"),
+			".",
+		],
+	);
+
+	// Disable reflogs before the first commit, so no branch/HEAD reflog exists to fall under git's
+	// append-existing carve-out.
+	both(&g, &h, &["config", "core.logAllRefUpdates", "false"]);
+
+	std::fs::write(g.join("a.txt"), "hi\n").unwrap();
+	std::fs::write(h.join("a.txt"), "hi\n").unwrap();
+	both(&g, &h, &["add", "."]);
+	both(&g, &h, &["commit", "-m", "initial"]);
+
+	for repo in [&g, &h] {
+		assert_absent(repo, "logs/HEAD");
+		assert_absent(repo, "logs/refs/heads/main");
+	}
 
 	cleanup(&g, &h);
 }
