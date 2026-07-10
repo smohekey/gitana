@@ -285,6 +285,24 @@ pub(crate) async fn peel_to_commit<H: HashAlgorithm>(
 	}
 }
 
+/// Like [`peel_to_commit`], but returns `None` when `id` does not peel to a commit — a blob or tree,
+/// e.g. a lightweight tag pointing straight at one — rather than erroring. For callers that must
+/// classify a possibly-non-commit ref without aborting (fetch's fast-forward vs "storing tag"
+/// wording).
+pub(crate) async fn try_peel_to_commit<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	mut id: ObjectId<H>,
+) -> Result<Option<ObjectId<H>>, RepositoryError> {
+	loop {
+		let (kind, payload) = repo.objects().read_object(&id).await?;
+		match kind {
+			ObjectKind::Commit => return Ok(Some(id)),
+			ObjectKind::Tag => id = parse_tag::<H>(&payload)?.object,
+			_ => return Ok(None),
+		}
+	}
+}
+
 async fn nth_parent<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	id: ObjectId<H>,

@@ -4,8 +4,10 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use gitana_object::{HashKind, Sha1, Sha256};
+use gitana_porcelain::Identity;
 use gitana_remote::{self as transport, Origin, ReqwestTransport};
 
+use crate::identity::CliIdentity;
 use crate::repo;
 use crate::shallow::build_deepen;
 
@@ -56,9 +58,13 @@ pub async fn run(
 	}
 
 	// A freshly cloned repository is an ordinary checkout: its per-worktree and common dirs coincide.
+	// git records `clone: from <url>` on HEAD and the checked-out branch, using the URL exactly as typed
+	// (before `Origin::parse` trims it); the committer falls back to a placeholder when unconfigured, as
+	// git's reflog writes do. Resolved before `repo` moves into clone.
 	match kind {
 		HashKind::Sha1 => {
 			let repo = repo::open_generic::<Sha1>(&git_dir, &git_dir)?;
+			let committer = CliIdentity::new(&repo).committer_or_default().await;
 			gitana_porcelain::clone(
 				&http,
 				repo,
@@ -66,11 +72,16 @@ pub async fn run(
 				&body,
 				repo::open_work_dir(&target)?,
 				&deepen,
+				Some(gitana_porcelain::CloneReflog {
+					committer: &committer,
+					url: &url,
+				}),
 			)
 			.await?;
 		}
 		HashKind::Sha256 => {
 			let repo = repo::open_generic::<Sha256>(&git_dir, &git_dir)?;
+			let committer = CliIdentity::new(&repo).committer_or_default().await;
 			gitana_porcelain::clone(
 				&http,
 				repo,
@@ -78,6 +89,10 @@ pub async fn run(
 				&body,
 				repo::open_work_dir(&target)?,
 				&deepen,
+				Some(gitana_porcelain::CloneReflog {
+					committer: &committer,
+					url: &url,
+				}),
 			)
 			.await?;
 		}

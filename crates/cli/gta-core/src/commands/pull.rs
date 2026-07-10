@@ -5,6 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
+use gitana_porcelain::Identity;
 use gitana_remote::{self as transport, Origin, ReqwestTransport};
 use gitana_repository::HeadState;
 use gitana_worktree::WorkTree;
@@ -61,6 +62,12 @@ async fn pull_into<H: HashAlgorithm>(
 		.collect::<Vec<_>>();
 	// `update_head_ok`: a fetch refspec may map straight into the checked-out branch (a mirror config
 	// like `+refs/heads/*:refs/heads/*`); the merge below advances that branch and the work tree.
+	let identity = CliIdentity::new(worktree.repository());
+	// Under a pull, git reflogs the tracking-ref updates with the `pull` action (not `fetch`), honouring
+	// `GIT_REFLOG_ACTION` if set. The merge step below records HEAD/branch separately; this covers only
+	// the tracking refs.
+	let committer = identity.committer_or_default().await;
+	let action = crate::identity::reflog_action("pull");
 	let outcome = gitana_porcelain::fetch(
 		http,
 		worktree.repository(),
@@ -70,6 +77,10 @@ async fn pull_into<H: HashAlgorithm>(
 		gitana_porcelain::TagFetch::Auto,
 		&gitana_porcelain::Deepen::default(),
 		&checkouts,
+		Some(gitana_porcelain::FetchReflog {
+			committer: &committer,
+			action: &action,
+		}),
 	)
 	.await?;
 	println!("Fetched from {}", origin.url);
@@ -90,7 +101,6 @@ async fn pull_into<H: HashAlgorithm>(
 		.with_context(|| format!("origin has no {short} to merge (or a refspec excludes it)"))?;
 	let message = format!("Merge branch '{short}' of {}", origin.url);
 
-	let identity = CliIdentity::new(worktree.repository());
 	// A pull's merge commit is signed when git config requests it, like a plain `gta merge`.
 	let signer = signer::config_signer(worktree.repository(), cwd).await?;
 	let outcome = gitana_porcelain::merge(

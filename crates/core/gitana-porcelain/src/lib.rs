@@ -30,8 +30,8 @@ pub use merge::{MergeOutcome, abort_merge, continue_merge, merge};
 pub use prune::{gc, prune};
 pub use rebase::{RebaseOutcome, abort_rebase, continue_rebase, rebase, skip_rebase};
 pub use remote::{
-	FetchOutcome, PushOutcome, PushResult, PushTags, TagFetch, clone, fetch, pull_upstream, push,
-	push_signed,
+	CloneReflog, FetchOutcome, FetchReflog, PushOutcome, PushResult, PushTags, TagFetch, clone,
+	fetch, pull_upstream, push, push_signed,
 };
 pub use revert::{RevertOutcome, abort_revert, continue_revert, revert};
 pub use tag::{tag, tag_signed};

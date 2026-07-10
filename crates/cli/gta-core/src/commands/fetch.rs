@@ -5,10 +5,11 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
-use gitana_porcelain::{Deepen, TagFetch};
+use gitana_porcelain::{Deepen, Identity, TagFetch};
 use gitana_remote::{self as transport, Origin, ReqwestTransport};
 
 use crate::dispatch;
+use crate::identity::CliIdentity;
 use crate::repo;
 use crate::shallow::build_fetch_deepen;
 
@@ -84,6 +85,11 @@ async fn fetch_into<H: HashAlgorithm>(
 		.into_iter()
 		.map(|(branch, path)| (branch, path.display().to_string()))
 		.collect::<Vec<_>>();
+	// git logs each advanced tracking ref as `<action>: <status>`; the committer falls back to a
+	// placeholder when unconfigured, as git's reflog writes do. The action mirrors git: `GIT_REFLOG_ACTION`
+	// if set, else `fetch` (a plain `gta fetch` names no remote, exactly like `git fetch`).
+	let committer = CliIdentity::new(&repository).committer_or_default().await;
+	let action = crate::identity::reflog_action("fetch");
 	let outcome = gitana_porcelain::fetch(
 		http,
 		&repository,
@@ -93,6 +99,10 @@ async fn fetch_into<H: HashAlgorithm>(
 		tags,
 		deepen,
 		&checkouts,
+		Some(gitana_porcelain::FetchReflog {
+			committer: &committer,
+			action: &action,
+		}),
 	)
 	.await?;
 	println!("Fetched from {}", origin.url);

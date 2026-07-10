@@ -40,6 +40,29 @@ pub struct FetchOutcome<H: HashAlgorithm> {
 	pub rejected: Vec<String>,
 }
 
+/// The reflog identity for a [`fetch`]'s tracking-ref updates: the committer line and the action
+/// prefix. git writes `<action>: <status>` (e.g. `fetch origin: fast-forward`), where `<action>` is
+/// its `GIT_REFLOG_ACTION` — the invoking command (`fetch origin`, or `pull origin` when a pull drives
+/// the fetch). `None` (the in-component fetch, which resolves no configured identity) writes no reflog,
+/// leaving the tracking refs unlogged.
+pub struct FetchReflog<'a> {
+	/// The reflog committer line (`Name <email> seconds ±hhmm`).
+	pub committer: &'a str,
+	/// The action prefix (`fetch <remote>` / `pull <remote>`).
+	pub action: &'a str,
+}
+
+/// The reflog identity for a [`clone`]'s `clone: from <url>` entries (on `HEAD` and the checked-out
+/// branch): the committer line and the clone source *as given*. git records the command-line URL
+/// verbatim — before normalization (e.g. a trailing slash is kept) — so this carries the raw text, not
+/// the parsed `Origin`. `None` (the in-component clone, with no configured identity) writes no reflog.
+pub struct CloneReflog<'a> {
+	/// The reflog committer line (`Name <email> seconds ±hhmm`).
+	pub committer: &'a str,
+	/// The clone source URL exactly as given on the command line.
+	pub url: &'a str,
+}
+
 /// Fetch from `origin`, downloading the objects we do not already have and updating the tracking refs
 /// its configured `remote.origin.fetch` refspecs map the advertised refs to (falling back to the
 /// default `+refs/heads/*:refs/remotes/origin/*` when none are configured). `advertisement` is the
@@ -61,6 +84,9 @@ pub struct FetchOutcome<H: HashAlgorithm> {
 /// A non-empty `deepen` requests a shallow update (git's `fetch --depth` / `--deepen` / `--unshallow` /
 /// `--shallow-since` / `--shallow-exclude`): only the branch tips are deepened and the server's new
 /// shallow boundary is folded into `.git/shallow`. An empty `deepen` (the default) is a normal fetch.
+///
+/// `reflog` supplies the committer and action prefix for the tracking-ref reflog each advanced ref
+/// records (git's `<action>: <status>`); `None` writes no reflog (see [`FetchReflog`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
@@ -71,6 +97,7 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	tags: TagFetch,
 	deepen: &Deepen,
 	checkouts: &[(String, String)],
+	reflog: Option<FetchReflog<'_>>,
 ) -> Result<FetchOutcome<H>> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
 	let haves = gitana_remote::local_haves(repo).await?;
@@ -156,7 +183,10 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	// its destination (git applies them all), deduped so one source→destination pair acts once. Two
 	// *different* sources mapping to the same destination is a config error git aborts on, so detect
 	// it before writing anything.
-	let mut plan: Vec<(ObjectId<H>, String, bool)> = Vec::new();
+	// Each entry is `(new oid, destination tracking ref, advertised source ref, forced)`. The source ref
+	// is kept so the reflog can word a create by the *source* namespace (git's `storing head` vs
+	// `storing tag`), matching git.
+	let mut plan: Vec<(ObjectId<H>, String, String, bool)> = Vec::new();
 	let mut claimed: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
 	let mut rejected = Vec::new();
 	for (name, oid) in &advertised.refs {
@@ -195,32 +225,90 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 				}
 				continue;
 			}
-			plan.push((*oid, tracking, spec.force));
+			plan.push((*oid, tracking, name.clone(), spec.force));
 		}
 	}
 
 	let mut updated = Vec::new();
-	for (oid, tracking, force) in plan {
+	for (oid, tracking, source, force) in plan {
 		let current = repo.refs().resolve(&tracking).await?;
 		if current == Some(oid) {
 			continue;
 		}
-		// Without `+`, a non-forced update to an existing ref is refused unless allowed. A branch may
-		// advance on a fast-forward; but an existing tag is immutable — git rejects repointing a
-		// `refs/tags/*` that already exists to a different object even on a fast-forward (a tag is a
-		// fixed name, not a moving branch tip). A fresh tracking ref (`current` is `None`) always
-		// applies. (The push side enforces the same tag immutability in `plan_push`.)
-		if !force && let Some(existing) = current {
-			let allowed = !tracking.starts_with("refs/tags/") && repo.is_ancestor(existing, oid).await?;
+		// Fast-forward classification is commit-only and follows annotated-tag chains, matching git: an
+		// update between two commits is a fast-forward when the old is an ancestor of the new, else a
+		// forced rewrite. A side that does not peel to a commit — a blob/tree tag — is neither, and git
+		// records such a move as a "storing" entry. Peel *gently* (never erroring on a non-commit) so a
+		// moved blob/tree tag does not abort the fetch. Skipped when nothing needs the result: a forced
+		// refspec with no reflog, or a create (`current` is `None`), which is classified below anyway.
+		let classify = current.is_some() && (reflog.is_some() || !force);
+		let old_commit = match current {
+			Some(existing) if classify => repo.try_peel_to_commit(existing).await?,
+			_ => None,
+		};
+		let new_commit = if classify {
+			repo.try_peel_to_commit(oid).await?
+		} else {
+			None
+		};
+		// A fast-forward advances one commit to a descendant — only meaningful when both sides peel to
+		// commits. A side that does not (a blob/tree tag) is not a commit update at all.
+		let both_commits = old_commit.is_some() && new_commit.is_some();
+		let fast_forward = match (old_commit, new_commit) {
+			(Some(old), Some(new)) => repo.is_ancestor(old, new).await?,
+			_ => false,
+		};
+		// Gate a non-forced update to an existing ref (git's client-side check). A `refs/tags/*`
+		// *destination* is immutable — any change needs `+` (git's "would clobber existing tag"). Elsewhere
+		// a commit update must fast-forward, but a non-commit update (a blob/tree tag) git simply stores.
+		// A create (`current` is `None`) always applies. (The push side enforces tag immutability in
+		// `plan_push`.)
+		if !force && current.is_some() {
+			let allowed = !tracking.starts_with("refs/tags/") && (fast_forward || !both_commits);
 			if !allowed {
 				rejected.push(tracking);
 				continue;
 			}
 		}
-		// TODO(reflog slice 2): git logs `fetch <remote>: <status>` to tracking refs. Opt out for now.
+		// git words each advanced tracking ref as `<action>: <status>`. A *create* (or a non-commit "tag"
+		// store to a non-`refs/tags/*` destination) is `storing head` / `storing tag` / `storing ref` — by
+		// the *source* ref's namespace (git's `ref->name`). An update to an existing `refs/tags/*`
+		// *destination* (only reachable when forced) is `updating tag`, whatever the object kind or
+		// ancestry. Otherwise a commit fast-forward is `fast-forward` and a forced commit rewrite is
+		// `forced-update`. `update_ref`'s own gating still skips an unlogged destination (e.g. a
+		// `refs/tags/*` dest under the default `core.logAllRefUpdates`), so `--tags` stays unlogged even
+		// though a message is computed here.
+		let message = reflog.as_ref().map(|r| {
+			let storing = if source.starts_with("refs/tags/") {
+				"storing tag"
+			} else if source.starts_with("refs/heads/") {
+				"storing head"
+			} else {
+				"storing ref"
+			};
+			let status = if current.is_none() {
+				storing
+			} else if tracking.starts_with("refs/tags/") {
+				"updating tag"
+			} else if !both_commits {
+				storing
+			} else if fast_forward {
+				"fast-forward"
+			} else {
+				"forced-update"
+			};
+			format!("{}: {status}", r.action)
+		});
+		let intent = match (&reflog, &message) {
+			(Some(r), Some(msg)) => ReflogIntent::Log {
+				committer: r.committer,
+				message: msg,
+			},
+			_ => ReflogIntent::Skip,
+		};
 		repo
 			.refs()
-			.update_ref(&tracking, oid, current, ReflogIntent::Skip)
+			.update_ref(&tracking, oid, current, intent)
 			.await?;
 		updated.push((tracking, oid));
 	}
@@ -229,7 +317,15 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	// not already present and whose target is reachable from a branch this fetch is following. `--tags`
 	// mirrors tags through a refspec above (so it skips this); `--no-tags` disables it.
 	if tags == TagFetch::Auto {
-		auto_follow_tags(repo, &advertised, &positive, &negative, &mut updated).await?;
+		auto_follow_tags(
+			repo,
+			&advertised,
+			&positive,
+			&negative,
+			&reflog,
+			&mut updated,
+		)
+		.await?;
 	}
 	Ok(FetchOutcome { updated, rejected })
 }
@@ -306,6 +402,7 @@ async fn auto_follow_tags<F: FileStore, H: HashAlgorithm>(
 	advertised: &Advertised<H>,
 	positive: &[&Refspec],
 	negative: &[&Refspec],
+	reflog: &Option<FetchReflog<'_>>,
 	updated: &mut Vec<(String, ObjectId<H>)>,
 ) -> Result<()> {
 	// Candidate tags: advertised `refs/tags/*` not already present locally (git leaves existing tags
@@ -338,15 +435,24 @@ async fn auto_follow_tags<F: FileStore, H: HashAlgorithm>(
 		.collect();
 	let closure = crate::prune::reachable_from(repo, roots).await?;
 
+	// An auto-followed tag is always a fresh `refs/tags/*` create, so git words it `storing tag`. That
+	// namespace is unlogged by default, so `update_ref`'s gating drops the entry unless
+	// `core.logAllRefUpdates=always` (or an existing tag reflog) — exactly when git records it too.
+	let message = reflog
+		.as_ref()
+		.map(|r| format!("{}: storing tag", r.action));
 	for (name, oid) in candidates {
 		// Peel through any tag chain to the object the tag ultimately names (commit / tree / blob).
 		let target = peel_tag_target(repo, oid).await?;
 		if closure.contains(&target) {
-			// TODO(reflog slice 2): git does not reflog fetched tags; keep opt-out.
-			repo
-				.refs()
-				.update_ref(&name, oid, None, ReflogIntent::Skip)
-				.await?;
+			let intent = match (reflog, &message) {
+				(Some(r), Some(msg)) => ReflogIntent::Log {
+					committer: r.committer,
+					message: msg,
+				},
+				_ => ReflogIntent::Skip,
+			};
+			repo.refs().update_ref(&name, oid, None, intent).await?;
 			updated.push((name, oid));
 		}
 	}
@@ -426,6 +532,10 @@ pub async fn pull_upstream<F: FileStore, H: HashAlgorithm>(
 /// origin, and check out `HEAD`. `advertisement` is the already-fetched `GET /info/refs` body. The
 /// origin is persisted through `repo`'s file store (no ambient filesystem access), so this runs over
 /// any [`FileStore`] — a local checkout or the wasm descriptor backend.
+///
+/// `reflog` supplies the committer and verbatim source URL for the `clone: from <url>` entries git
+/// records on `HEAD` and the checked-out branch; `None` (the in-component clone, with no configured
+/// identity) writes no reflog.
 pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	repo: Repository<F, H>,
@@ -433,6 +543,7 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	advertisement: &[u8],
 	work: W,
 	deepen: &Deepen,
+	reflog: Option<CloneReflog<'_>>,
 ) -> Result<()> {
 	repo.init().await?;
 
@@ -453,23 +564,10 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	)
 	.await?;
 
-	// Recreate the refs and HEAD locally. A shallow clone fetches only branch history (see
-	// `download`), so an advertised ref whose target is outside that closure — e.g. a tag on the
-	// truncated history — is skipped rather than recreated as a dangling ref pointing at a missing
-	// object. A full clone holds the whole closure, so nothing is skipped there.
-	let shallow = !deepen.is_empty();
-	for (name, oid) in &advertised.refs {
-		if name.starts_with("refs/") {
-			if shallow && !repo.objects().exists_object(oid).await? {
-				continue;
-			}
-			// TODO(reflog slice 2): git writes `clone: from <url>` reflogs. Opt out for now.
-			repo
-				.refs()
-				.update_ref(name, *oid, None, ReflogIntent::Skip)
-				.await?;
-		}
-	}
+	// Point HEAD at the remote's default branch *before* recreating the refs, so that when the loop
+	// writes that branch, `update_ref`'s "split HEAD update" cascades clone's reflog into `logs/HEAD`
+	// as a creation (old = zero), exactly as git records it. Retargeting an unborn branch logs nothing
+	// (and we pass Skip regardless), so no stray HEAD entry precedes the branch write.
 	let head_target = advertised
 		.head_target
 		.clone()
@@ -478,6 +576,31 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		.refs()
 		.set_head_symbolic(&head_target, ReflogIntent::Skip)
 		.await?;
+
+	// Recreate the refs and HEAD locally. A shallow clone fetches only branch history (see
+	// `download`), so an advertised ref whose target is outside that closure — e.g. a tag on the
+	// truncated history — is skipped rather than recreated as a dangling ref pointing at a missing
+	// object. A full clone holds the whole closure, so nothing is skipped there.
+	let clone_reflog = reflog.map(|r| (r.committer, format!("clone: from {}", r.url)));
+	let shallow = !deepen.is_empty();
+	for (name, oid) in &advertised.refs {
+		if name.starts_with("refs/") {
+			if shallow && !repo.objects().exists_object(oid).await? {
+				continue;
+			}
+			// Only the checked-out branch (HEAD's target) carries clone's reflog — writing it cascades the
+			// entry into `logs/HEAD`. The other refs gta recreates here stand in for git's remote-tracking
+			// refs, which git leaves unlogged, so they pass Skip.
+			let intent = match &clone_reflog {
+				Some((c, msg)) if *name == head_target => ReflogIntent::Log {
+					committer: c,
+					message: msg,
+				},
+				_ => ReflogIntent::Skip,
+			};
+			repo.refs().update_ref(name, *oid, None, intent).await?;
+		}
+	}
 	origin.save(repo.objects().file_store()).await?;
 
 	// Populate the working tree from HEAD (if the repo had any commits).

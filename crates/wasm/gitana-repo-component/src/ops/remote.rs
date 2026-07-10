@@ -48,6 +48,9 @@ pub(crate) async fn fetch<H: HashAlgorithm>(
 		gitana_porcelain::TagFetch::Auto,
 		&gitana_porcelain::Deepen::default(),
 		&[],
+		// The component resolves no committer identity through its descriptors, so its tracking-ref
+		// updates go unlogged (a deferred follow-up, like the plumbing `update_ref` exports).
+		None,
 	)
 	.await
 	.map_err(remote_error)?;
@@ -161,6 +164,8 @@ pub(crate) async fn clone<H: HashAlgorithm>(
 		advertisement,
 		work,
 		&Deepen::default(),
+		// No committer identity through the component's descriptors, so clone writes no reflog here.
+		None,
 	)
 	.await
 	.map_err(remote_error)

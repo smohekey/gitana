@@ -213,6 +213,59 @@ async fn gta_fetches_tags_from_a_real_git_repo() {
 	);
 }
 
+/// Regression: re-fetching an existing *non-commit* tag (one pointing straight at a blob) that the
+/// server has force-moved must not crash. The tracking-ref reflog's fast-forward classification is
+/// commit-only; querying ancestry on a blob-backed tag would peel it to a commit and error, aborting
+/// the fetch. gta must skip that classification for `refs/tags/*` destinations and simply reject the
+/// non-fast-forward tag move (git leaves an existing tag put unless forced).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gta_fetch_tags_tolerates_a_moved_blob_tag() {
+	if skip() {
+		return;
+	}
+	let root = tmp("client-blob-tag");
+	build_bare(&root);
+	let url = serve_git_http_backend(root.clone()).await;
+	let work = root.join("work");
+	let bare = root.join("repo.git");
+
+	// A lightweight tag pointing straight at a blob — no commit history to peel.
+	std::fs::write(work.join("blob1.txt"), b"one\n").unwrap();
+	let blob1 = git(&work, &["hash-object", "-w", "blob1.txt"]);
+	git(&work, &["tag", "bt", &blob1]);
+	git(&work, &["push", "-q", bare.to_str().unwrap(), "bt"]);
+
+	let checkout = root.join("c");
+	let c = checkout.to_str().unwrap();
+	gta_ok(
+		&gta(&["clone", &format!("{url}/repo.git"), c]).await,
+		"clone",
+	);
+
+	// The server force-moves the tag to a *different* blob (a non-fast-forward tag move).
+	std::fs::write(work.join("blob2.txt"), b"two\n").unwrap();
+	let blob2 = git(&work, &["hash-object", "-w", "blob2.txt"]);
+	git(&work, &["tag", "-f", "bt", &blob2]);
+	git(&work, &["push", "-q", "-f", bare.to_str().unwrap(), "bt"]);
+
+	// `--tags` maps `refs/tags/*` non-forced, so the moved tag is rejected as a non-fast-forward — a
+	// controlled outcome (the CLI exits non-zero saying so), NOT an abort from peeling the blob tag.
+	let out = gta(&["-C", c, "fetch", "--tags"]).await;
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	assert!(
+		stderr.contains("non-fast-forward"),
+		"fetch should reject the moved blob tag as non-fast-forward, not crash peeling it: {stderr}"
+	);
+	// The tag stays at its original blob — the non-fast-forward move was declined, as git does.
+	assert_eq!(
+		gta_stdout(
+			&gta(&["-C", c, "rev-parse", "refs/tags/bt"]).await,
+			"rev-parse bt"
+		),
+		blob1
+	);
+}
+
 /// A gta fetch with divergent *local* history exercises the client's multi-round negotiation: it walks
 /// its own commits into `have` batches and negotiates with the real git server until the shared base is
 /// acknowledged, then receives a correct pack. Asserts the advanced tip lands and the local commits and

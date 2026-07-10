@@ -80,6 +80,15 @@ where
 		crate::revision::peel_to_commit(self, id).await
 	}
 
+	/// Peel `id` to a commit id, dereferencing an (annotated) tag chain; `None` when it does not reach a
+	/// commit (a blob/tree tag) rather than erroring.
+	pub async fn try_peel_to_commit(
+		&self,
+		id: ObjectId<H>,
+	) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		crate::revision::try_peel_to_commit(self, id).await
+	}
+
 	/// Read and parse the full git `config` file.
 	pub async fn read_config(&self) -> Result<gitana_config::GitConfig, RepositoryError> {
 		let bytes = self.objects.file_store().read_path("config").await?;

@@ -72,6 +72,14 @@ fn env_override(role: &str, field: &str) -> Option<String> {
 	std::env::var(format!("GIT_{role}_{field}")).ok()
 }
 
+/// The reflog action prefix for a remote op, mirroring git: the `GIT_REFLOG_ACTION` override whenever
+/// the variable is *set* (git treats even an explicit empty value as set, recording `: <status>`), else
+/// `default` — the command name git would use for that invocation (`fetch` for a plain `gta fetch`,
+/// which like `git fetch` names no remote; `pull` for `gta pull`).
+pub(crate) fn reflog_action(default: &str) -> String {
+	std::env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| default.to_owned())
+}
+
 /// The commit time: the `GIT_<role>_DATE` override, or the current time as `seconds +0000`.
 fn when(role: &str) -> String {
 	std::env::var(format!("GIT_{role}_DATE")).unwrap_or_else(|_| {
