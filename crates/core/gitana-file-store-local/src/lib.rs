@@ -254,10 +254,42 @@ impl FileStore for LocalFileStore {
 		.await
 	}
 
+	async fn delete_path_unlocked(&self, path: &str) -> Result<DeleteOutcome> {
+		let path = self.resolve(path)?.to_owned();
+
+		// In-process serialisation only — no `<path>.lock` file (the caller owns cross-writer
+		// exclusion), mirroring `write_path_replace`; taking `<path>.lock` here would deadlock against
+		// a lock the caller already holds.
+		#[cfg(not(target_arch = "wasm32"))]
+		let _task_guard = self.lock_for(&path).lock_owned().await;
+
+		let fs = Arc::clone(&self.backend);
+		blocking(move || {
+			if read_current_version(&*fs, &path)?.is_none() {
+				return Ok(DeleteOutcome::NotFound);
+			}
+			fs.remove_file(&path).map_err(backend_err)?;
+			Ok(DeleteOutcome::Deleted)
+		})
+		.await
+	}
+
+	async fn remove_dir(&self, path: &str) -> Result<()> {
+		let path = self.resolve(path)?.to_owned();
+		let fs = Arc::clone(&self.backend);
+		blocking(move || fs.remove_dir(&path).map_err(backend_err)).await
+	}
+
 	async fn exists(&self, path: &str) -> Result<bool> {
 		let path = self.resolve(path)?.to_owned();
 		let fs = Arc::clone(&self.backend);
 		blocking(move || exists_at(&*fs, &path)).await
+	}
+
+	async fn is_dir(&self, path: &str) -> Result<bool> {
+		let path = self.resolve(path)?.to_owned();
+		let fs = Arc::clone(&self.backend);
+		blocking(move || fs.is_dir(&path).map_err(read_err)).await
 	}
 
 	async fn size(&self, path: &str) -> Result<u64> {
@@ -404,7 +436,11 @@ trait Backend: Send + Sync + 'static {
 	fn open_read(&self, path: &str) -> std::io::Result<Box<dyn Read + Send>>;
 	fn rename(&self, from: &str, to: &str) -> std::io::Result<()>;
 	fn remove_file(&self, path: &str) -> std::io::Result<()>;
+	/// Remove the directory at `path`; errors unless it is an empty directory.
+	fn remove_dir(&self, path: &str) -> std::io::Result<()>;
 	fn exists(&self, path: &str) -> std::io::Result<bool>;
+	/// Whether `path` is a directory (`false` if it is a file or absent).
+	fn is_dir(&self, path: &str) -> std::io::Result<bool>;
 	/// The byte length of the value at `path`.
 	fn size(&self, path: &str) -> std::io::Result<u64>;
 	/// Raw entry names directly under `dir_rel` (`""` = root); empty if the dir is absent.
@@ -458,9 +494,21 @@ impl Backend for CapBackend {
 		self.dir.remove_file(path)
 	}
 
+	fn remove_dir(&self, path: &str) -> std::io::Result<()> {
+		self.dir.remove_dir(path)
+	}
+
 	fn exists(&self, path: &str) -> std::io::Result<bool> {
 		match self.dir.metadata(path) {
 			Ok(_) => Ok(true),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+			Err(error) => Err(error),
+		}
+	}
+
+	fn is_dir(&self, path: &str) -> std::io::Result<bool> {
+		match self.dir.metadata(path) {
+			Ok(meta) => Ok(meta.is_dir()),
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
 			Err(error) => Err(error),
 		}

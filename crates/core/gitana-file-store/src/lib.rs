@@ -105,8 +105,33 @@ pub trait FileStore {
 		expected: Option<&Version>,
 	) -> impl Future<Output = Result<DeleteOutcome>>;
 
+	/// Delete the value at `path` unconditionally, taking **no** internal `<path>.lock`.
+	///
+	/// The delete twin of [`Self::write_path_replace`]: like it, there is no version check and no
+	/// `<path>.lock` acquisition, so a caller already holding a `<path>.lock` (e.g. a ref transaction
+	/// mid-commit) can remove `path` without deadlocking against the store's own compare-and-set lock.
+	/// A caller that needs the version check, or does not hold an external lock, uses
+	/// [`Self::delete_path`] instead.
+	fn delete_path_unlocked(&self, path: &str) -> impl Future<Output = Result<DeleteOutcome>>;
+
+	/// Remove the directory at `path` if it is empty.
+	///
+	/// For pruning directories left behind by ref writes/locks (git removes empty ref directories so a
+	/// stale `refs/heads/foo/` cannot block a later `refs/heads/foo`). Errors if `path` is not an empty
+	/// directory (a non-empty directory, a value, or absent), which a best-effort pruner treats as
+	/// "stop here". A backend without a directory concept always errors.
+	fn remove_dir(&self, path: &str) -> impl Future<Output = Result<()>>;
+
 	/// Whether a value exists at `path` within `repo`.
 	fn exists(&self, path: &str) -> impl Future<Output = Result<bool>>;
+
+	/// Whether `path` is a directory (as opposed to a value or absent).
+	///
+	/// Lets a caller preflight a directory/file conflict before writing a value at `path` — e.g. a ref
+	/// transaction checking that `refs/heads/foo` (or its reflog `logs/refs/heads/foo`) is not a
+	/// directory left by a nested ref. A backend without a directory concept (an in-memory map) always
+	/// returns `false`.
+	fn is_dir(&self, path: &str) -> impl Future<Output = Result<bool>>;
 
 	/// The byte length of the value at `path`. [`FileStoreError::NotFound`] if it is absent.
 	fn size(&self, path: &str) -> impl Future<Output = Result<u64>>;

@@ -279,12 +279,13 @@ async fn push_delete_current_branch_cascades_head_reflog() {
 	assert_logs_match(&git_srv, &gitana_srv);
 }
 
-/// When the server can move a ref but not write its reflog (a directory/file conflict in `logs/`),
-/// receive-pack rolls the ref back and reports the rejection — git rejects such an update without
-/// moving the ref, rather than leaving the branch advanced while the client is told it failed.
+/// When the server cannot write a ref's reflog (a directory/file conflict in `logs/`), the atomic ref
+/// transaction never writes the ref — receive-pack reports the rejection with the branch untouched,
+/// git's reject-without-moving. (The reflog is written before the ref under the ref's lock, so the
+/// failure aborts before any mutation; there is no move to undo.)
 #[tokio::test]
-async fn push_reflog_write_failure_rolls_back_the_ref() {
-	let root = tmp("recv-reflog-rollback");
+async fn push_reflog_write_failure_leaves_the_ref_unwritten() {
+	let root = tmp("recv-reflog-atomic");
 	let gitana_srv = root.join("gitana.git");
 	init_bare_server(&gitana_srv, true);
 	let url = serve_gitana_with_reflog(gitana_srv.clone(), ServerHash::Sha1, committer_line()).await;
@@ -298,11 +299,11 @@ async fn push_reflog_write_failure_rolls_back_the_ref() {
 	);
 
 	// Plant a stray reflog *file* where `refs/heads/foo/bar`'s reflog directory must go, so the
-	// server's post-move reflog append hits a directory/file conflict.
+	// server's reflog append hits a directory/file conflict.
 	std::fs::write(gitana_srv.join("logs/refs/heads/foo"), b"stray\n").unwrap();
 
-	// Create refs/heads/foo/bar: the ref write succeeds, the reflog append fails. The server must undo
-	// the move and reject, not report a false success with the branch left in place.
+	// Create refs/heads/foo/bar: the reflog append fails, so the transaction commits no ref. The push
+	// must be rejected, not report a false success with the branch left in place.
 	let out = gta(&["-C", c, "push", "origin", "main:refs/heads/foo/bar"]).await;
 	assert!(
 		!out.status.success(),
@@ -311,7 +312,7 @@ async fn push_reflog_write_failure_rolls_back_the_ref() {
 	);
 	assert!(
 		!gitana_srv.join("refs/heads/foo/bar").exists(),
-		"the ref must be rolled back when its reflog cannot be written"
+		"the ref must not be written when its reflog cannot be"
 	);
 }
 

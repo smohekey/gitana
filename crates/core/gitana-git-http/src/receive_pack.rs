@@ -389,45 +389,13 @@ async fn apply_command<F: FileStore, H: HashAlgorithm>(
 			{
 				return Err("non-fast-forward".to_owned());
 			}
-			match refs
+			// `update_ref` is an atomic ref transaction (reflog written before the ref, under the ref's
+			// lock), so a reflog-write failure or a lost race leaves the ref unmoved — git's
+			// reject-without-moving, with no rollback to undo.
+			refs
 				.update_ref(&command.name, new, command.old, intent)
 				.await
-			{
-				Ok(()) => Ok(()),
-				Err(err) => {
-					// `update_ref` moves the ref and *then* appends its reflog — gitana's file store has
-					// no atomic ref+reflog transaction. If the reflog write failed after the ref moved
-					// (e.g. a directory/file conflict from a stray `logs/` entry), git rejects the update
-					// without moving the ref, so undo the move before reporting `ng` rather than tell the
-					// client the push failed while the branch advanced.
-					//
-					// Only undo a genuine post-CAS reflog failure: reflog writing was requested, the
-					// error is not a `RefMoved` CAS conflict (`update_ref` funnels every lost race — the
-					// pre-write mismatch and the write-time version clash — through `RefMoved`, so a
-					// non-`RefMoved` error means our CAS succeeded and the reflog append is what failed),
-					// and the ref really landed on `new`. This never rolls back a ref a concurrent push
-					// legitimately advanced to the same tip. The undo carries no reflog and is
-					// best-effort — a rollback that itself fails leaves the already-failing store as-is.
-					if reflog_committer.is_some()
-						&& !matches!(err, RepositoryError::RefMoved { .. })
-						&& refs.resolve(&command.name).await.ok().flatten() == Some(new)
-					{
-						let _ = match command.old {
-							Some(old) => {
-								refs
-									.update_ref(&command.name, old, Some(new), ReflogIntent::Skip)
-									.await
-							}
-							None => {
-								refs
-									.delete_ref(&command.name, Some(new), ReflogIntent::Skip)
-									.await
-							}
-						};
-					}
-					Err(reason(err))
-				}
-			}
+				.map_err(reason)
 		}
 		// Deletion: withheld unless `force` is granted (the `delete-refs` capability).
 		(Some(old), None) => {

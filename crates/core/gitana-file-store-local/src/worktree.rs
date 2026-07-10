@@ -73,14 +73,22 @@ impl WorktreeFileStore {
 
 /// Whether a git-relative `path` is private to one worktree (lives in the worktree's own git dir)
 /// rather than in the shared common dir. Follows git's worktree layout for the paths gitana touches:
-/// `HEAD`/`index` (and its `index.lock`), the in-progress operation state (`MERGE_HEAD`/`MERGE_MSG`, `CHERRY_PICK_HEAD`,
-/// `REVERT_HEAD`, and gitana's `REBASE_*` files), and the per-worktree ref namespaces. gitana's other
-/// refs (`refs/heads`, `refs/tags`, `refs/remotes`) are shared.
+/// `HEAD` (and its ref-transaction `HEAD.lock`), `index` (and its `index.lock`), the in-progress
+/// operation state (`MERGE_HEAD`/`MERGE_MSG`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, and gitana's
+/// `REBASE_*` files), and the per-worktree ref namespaces. gitana's other refs (`refs/heads`,
+/// `refs/tags`, `refs/remotes`) are shared.
 ///
 /// Routing the operation state per-worktree is critical: otherwise a rebase/cherry-pick/revert
 /// started in one linked worktree would be visible — and `--abort`/`--continue`-able — from another,
-/// mutating the wrong branch.
+/// mutating the wrong branch. A `<path>.lock` always routes with `<path>` (a ref transaction or index
+/// write must lock the *real* per-worktree file, interoperably with git's own `<path>.lock`) — so
+/// `HEAD.lock`, `ORIG_HEAD.lock`, `index.lock`, etc. follow their targets, while a shared ref's lock
+/// (`refs/heads/main.lock`) stays shared. Refs cannot themselves end in `.lock` (git forbids it), so
+/// stripping the suffix is unambiguous.
 fn is_per_worktree(path: &str) -> bool {
+	if let Some(base) = path.strip_suffix(".lock") {
+		return is_per_worktree(base);
+	}
 	matches!(
 		path,
 		"HEAD"
@@ -92,7 +100,6 @@ fn is_per_worktree(path: &str) -> bool {
 			| "REVERT_HEAD"
 			| "COMMIT_EDITMSG"
 			| "index"
-			| "index.lock"
 	) || path == "logs/HEAD"
 		|| path.starts_with("REBASE_")
 		|| path.starts_with("refs/worktree/")
@@ -138,8 +145,20 @@ impl FileStore for WorktreeFileStore {
 		self.store(path).delete_path(path, expected)
 	}
 
+	fn delete_path_unlocked(&self, path: &str) -> impl Future<Output = Result<DeleteOutcome>> {
+		self.store(path).delete_path_unlocked(path)
+	}
+
 	fn exists(&self, path: &str) -> impl Future<Output = Result<bool>> {
 		self.store(path).exists(path)
+	}
+
+	fn is_dir(&self, path: &str) -> impl Future<Output = Result<bool>> {
+		self.store(path).is_dir(path)
+	}
+
+	fn remove_dir(&self, path: &str) -> impl Future<Output = Result<()>> {
+		self.store(path).remove_dir(path)
 	}
 
 	fn size(&self, path: &str) -> impl Future<Output = Result<u64>> {
@@ -197,19 +216,26 @@ mod tests {
 			"REBASE_TODO",
 			"COMMIT_EDITMSG",
 			"index",
+			// The lock files must route with their targets, so a ref transaction / index write locks
+			// the real per-worktree file (interoperably with git).
+			"HEAD.lock",
+			"ORIG_HEAD.lock",
+			"index.lock",
 			"logs/HEAD",
 			"refs/worktree/foo",
+			"refs/worktree/foo.lock",
 			"refs/bisect/bad",
 			"refs/rewritten/onto",
 		] {
 			assert!(is_per_worktree(path), "{path} should be per-worktree");
 		}
-		// Shared across linked worktrees → the common dir.
+		// Shared across linked worktrees → the common dir (including a shared ref's `.lock`).
 		for path in [
 			"config",
 			"packed-refs",
 			"objects/aa/bbcc",
 			"refs/heads/main",
+			"refs/heads/main.lock",
 			"refs/tags/v1",
 			"refs/remotes/origin/main",
 			"logs/refs/heads/main",

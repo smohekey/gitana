@@ -114,6 +114,16 @@ impl FileStore for MemoryFileStore {
 		}
 	}
 
+	async fn delete_path_unlocked(&self, path: &str) -> Result<DeleteOutcome> {
+		// The map removal is already atomic under the write lock; there are no `<path>.lock` files in
+		// the memory backend, so this is just an unconditional remove.
+		let mut files = self.files.write().expect("file store lock poisoned");
+		match files.remove(&path.to_owned()) {
+			Some(_) => Ok(DeleteOutcome::Deleted),
+			None => Ok(DeleteOutcome::NotFound),
+		}
+	}
+
 	async fn exists(&self, path: &str) -> Result<bool> {
 		Ok(
 			self
@@ -122,6 +132,16 @@ impl FileStore for MemoryFileStore {
 				.expect("file store lock poisoned")
 				.contains_key(&path.to_owned()),
 		)
+	}
+
+	async fn is_dir(&self, _path: &str) -> Result<bool> {
+		// The in-memory store is a flat key→value map with no directories.
+		Ok(false)
+	}
+
+	async fn remove_dir(&self, _path: &str) -> Result<()> {
+		// No directories exist to remove; report absence so a best-effort pruner stops.
+		Err(FileStoreError::NotFound)
 	}
 
 	async fn size(&self, path: &str) -> Result<u64> {

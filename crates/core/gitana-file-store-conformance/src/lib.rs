@@ -10,6 +10,8 @@ pub async fn check_file_store<S: FileStore>(store: &S) {
 	check_immutable_writes(store).await;
 	check_cas_writes(store).await;
 	check_deletes(store).await;
+	check_unlocked_deletes(store).await;
+	check_is_dir(store).await;
 	check_listing(store).await;
 	check_streaming(store).await;
 }
@@ -249,4 +251,72 @@ async fn check_deletes(store: &impl FileStore) {
 			.expect("delete of an absent path must not error"),
 		DeleteOutcome::NotFound,
 	);
+}
+
+/// [`FileStore::is_dir`] reports `false` for a regular value and for an absent path (both backends
+/// agree on these; a backend with real directories additionally reports `true` for one, covered by
+/// its own tests).
+async fn check_is_dir(store: &impl FileStore) {
+	store
+		.write_path_replace("refs/heads/isdir", b"x")
+		.await
+		.expect("create for is_dir test");
+	assert!(
+		!store.is_dir("refs/heads/isdir").await.expect("is_dir file"),
+		"a value is not a directory",
+	);
+	assert!(
+		!store
+			.is_dir("refs/heads/absent")
+			.await
+			.expect("is_dir absent"),
+		"an absent path is not a directory",
+	);
+	// Removing a non-existent directory errors (both backends agree; a best-effort pruner treats it
+	// as "stop"). Removing an actual empty directory is backend-specific and covered by those tests.
+	assert!(
+		store.remove_dir("refs/heads/absent").await.is_err(),
+		"removing an absent directory must error",
+	);
+}
+
+/// [`FileStore::delete_path_unlocked`] removes unconditionally (no version check) and reports
+/// `Deleted` / `NotFound`, and — crucially — does not deadlock when the caller already holds the
+/// path's `<path>.lock` (the reason it exists).
+async fn check_unlocked_deletes(store: &impl FileStore) {
+	let temp = "refs/heads/unlocked-temp";
+
+	store
+		.write_path_cas(temp, b"x", None)
+		.await
+		.expect("create for unlocked delete test");
+
+	// Take the path's own `<path>.lock` (as a ref transaction does mid-commit), then delete: the
+	// locked variant would spin and fail here, so this proves the unlocked variant does not contend.
+	let lock = format!("{temp}.lock");
+	assert_eq!(
+		store
+			.write_path_if_absent(&lock, b"")
+			.await
+			.expect("acquire the path's lock"),
+		WriteOutcome::Written,
+	);
+	assert_eq!(
+		store
+			.delete_path_unlocked(temp)
+			.await
+			.expect("unlocked delete while the path lock is held must succeed"),
+		DeleteOutcome::Deleted,
+	);
+	assert_eq!(
+		store
+			.delete_path_unlocked(temp)
+			.await
+			.expect("unlocked delete of an absent path must not error"),
+		DeleteOutcome::NotFound,
+	);
+	store
+		.delete_path_unlocked(&lock)
+		.await
+		.expect("release the path lock");
 }

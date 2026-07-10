@@ -8,7 +8,9 @@
 
 use std::io::{Read, Write};
 
-use wasip2::filesystem::types::{Descriptor, DescriptorFlags, ErrorCode, OpenFlags, PathFlags};
+use wasip2::filesystem::types::{
+	Descriptor, DescriptorFlags, DescriptorType, ErrorCode, OpenFlags, PathFlags,
+};
 
 use crate::{Backend, DescriptorReader, DescriptorWriter};
 
@@ -94,9 +96,21 @@ impl Backend for DescriptorBackend {
 		self.dir.unlink_file_at(path).map_err(io_error)
 	}
 
+	fn remove_dir(&self, path: &str) -> std::io::Result<()> {
+		self.dir.remove_directory_at(path).map_err(io_error)
+	}
+
 	fn exists(&self, path: &str) -> std::io::Result<bool> {
 		match self.dir.stat_at(PathFlags::SYMLINK_FOLLOW, path) {
 			Ok(_) => Ok(true),
+			Err(ErrorCode::NoEntry) => Ok(false),
+			Err(code) => Err(io_error(code)),
+		}
+	}
+
+	fn is_dir(&self, path: &str) -> std::io::Result<bool> {
+		match self.dir.stat_at(PathFlags::SYMLINK_FOLLOW, path) {
+			Ok(stat) => Ok(stat.type_ == DescriptorType::Directory),
 			Err(ErrorCode::NoEntry) => Ok(false),
 			Err(code) => Err(io_error(code)),
 		}

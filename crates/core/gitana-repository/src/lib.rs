@@ -17,6 +17,7 @@ mod merge_state;
 mod mode;
 mod object_source;
 mod rebase_state;
+mod ref_op;
 mod refs;
 mod repository;
 mod revision;
@@ -31,6 +32,7 @@ pub use self::{
 	merge::TreeMerge,
 	mode::FileMode,
 	rebase_state::RebaseState,
+	ref_op::RefOp,
 	refs::{RefStore, ReflogIntent},
 	repository::Repository,
 	tree::TreeBuildEntry,

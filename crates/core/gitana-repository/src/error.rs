@@ -23,6 +23,12 @@ pub enum RepositoryError {
 		/// The ref whose update was rejected.
 		name: String,
 	},
+	/// A ref transaction could not acquire a ref's `<ref>.lock` — another writer holds it.
+	#[error("ref locked: {name} is being updated by another process")]
+	RefLocked {
+		/// The ref whose lock was contended.
+		name: String,
+	},
 	/// A referenced object does not exist (the hex id is recorded for diagnostics).
 	#[error("missing object {0}")]
 	MissingObject(String),

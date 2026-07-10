@@ -18,6 +18,11 @@ gitana-object-store.workspace = true
 gitana-trust.workspace = true
 thiserror.workspace = true
 
+# Native ref-lock backoff sleeps on the blocking pool (`spawn_blocking`); wasm is single-process and
+# backs off with a cooperative yield instead, so it needs no tokio runtime.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt"] }
+
 [dev-dependencies]
 gitana-file-store-local.workspace = true
 gitana-file-store-memory.workspace = true

@@ -1,12 +1,47 @@
 use std::marker::PhantomData;
 
-use gitana_file_store::{FileStore, FileStoreError};
+use gitana_file_store::{FileStore, FileStoreError, WriteOutcome};
 use gitana_object::{HashAlgorithm, ObjectId};
 
-use crate::{HeadState, RepositoryError};
+use crate::{HeadState, RefOp, RepositoryError};
 
 /// The maximum symbolic-ref chain depth to follow (git's limit), a guard against a cycle.
 const MAX_SYMREF_DEPTH: usize = 5;
+
+/// How many times to retry acquiring a contended `<ref>.lock`, and the wait between tries — mirrors
+/// the file store's own `LockFileGuard` (50 × 10 ms), so a ref transaction waits for stock git (or
+/// another gitana writer) to release the lock instead of failing instantly.
+const LOCK_ATTEMPTS: usize = 50;
+#[cfg(not(target_arch = "wasm32"))]
+const LOCK_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Wait before retrying a contended ref lock. Native sleeps on the blocking pool (keeping the reactor
+/// free without a tokio timer feature), so it actually waits out a cross-process holder; wasm is
+/// single-process, so a cooperative yield — letting the in-runtime lock holder progress — suffices.
+#[cfg(not(target_arch = "wasm32"))]
+async fn lock_backoff() {
+	let _ = tokio::task::spawn_blocking(|| std::thread::sleep(LOCK_BACKOFF)).await;
+}
+#[cfg(target_arch = "wasm32")]
+async fn lock_backoff() {
+	use std::future::Future;
+	use std::pin::Pin;
+	use std::task::{Context, Poll};
+
+	struct YieldOnce(bool);
+	impl Future for YieldOnce {
+		type Output = ();
+		fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+			if std::mem::replace(&mut self.0, true) {
+				Poll::Ready(())
+			} else {
+				cx.waker().wake_by_ref();
+				Poll::Pending
+			}
+		}
+	}
+	YieldOnce(false).await
+}
 
 /// Whether a ref update should append a reflog entry, and with what identity and message.
 ///
@@ -14,6 +49,7 @@ const MAX_SYMREF_DEPTH: usize = 5;
 /// [`RefStore::set_symbolic`]) so a call site cannot silently forget to decide. `Log` *requests* a
 /// reflog line but the write is still subject to git's `core.logAllRefUpdates` gating (namespace and
 /// bare-repo rules); `Skip` never writes one — for internal or plumbing moves git does not log.
+#[derive(Clone, Copy)]
 pub enum ReflogIntent<'a> {
 	/// Append a reflog entry (when gating permits) crediting `committer` with `message`. An empty
 	/// `message` records a line with no message (git omits the tab), as `git update-ref` does without
@@ -229,10 +265,12 @@ where
 		self.follow_symref(name).await
 	}
 
-	/// Compare-and-set a ref. `expected == None` requires the ref to be absent;
-	/// otherwise the current value must equal `expected`. A ref present only in
-	/// `packed-refs` counts as its packed value — updating it writes the loose
-	/// file, which shadows the packed entry from then on (as git does).
+	/// Compare-and-set a ref. `expected == None` requires the ref to be absent; otherwise the current
+	/// value must equal `expected`. A ref present only in `packed-refs` counts as its packed value —
+	/// updating it writes the loose file, which shadows the packed entry from then on (as git does).
+	///
+	/// A one-op [`transact`](Self::transact): the ref is locked, its reflog written, then the ref
+	/// committed — so a reflog-write failure (or a lost race) leaves the ref unmoved.
 	pub async fn update_ref(
 		&self,
 		name: &str,
@@ -240,108 +278,356 @@ where
 		expected: Option<ObjectId<H>>,
 		reflog: ReflogIntent<'_>,
 	) -> Result<(), RepositoryError> {
-		let bytes = format!("{new}\n");
-		match self.files.read_path_versioned(name).await {
-			Ok((current_bytes, version)) => {
-				let current = parse_oid(name, &current_bytes)?;
-				if expected != Some(current) {
-					return Err(RepositoryError::RefMoved {
-						name: name.to_owned(),
-					});
-				}
-				self
-					.files
-					.write_path_cas(name, bytes.as_bytes(), Some(&version))
-					.await
-					.map_err(map_cas(name))?;
-			}
-			Err(FileStoreError::NotFound) => {
-				// No loose file: the ref's current value, if any, is its packed one.
-				if expected != self.resolve_packed(name).await? {
-					return Err(RepositoryError::RefMoved {
-						name: name.to_owned(),
-					});
-				}
-				self
-					.files
-					.write_path_cas(name, bytes.as_bytes(), None)
-					.await
-					.map_err(map_cas(name))?;
-			}
-			Err(other) => return Err(other.into()),
-		}
-		// The pre-update value is whatever we just verified equal to `expected` (`None` on creation).
-		if let ReflogIntent::Log { committer, message } = reflog {
-			self
-				.log_ref_update(name, expected, new, committer, message)
-				.await?;
-		}
-		Ok(())
+		let op = RefOp {
+			name: name.to_owned(),
+			expected,
+			new: Some(new),
+			reflog,
+		};
+		self
+			.transact(std::slice::from_ref(&op))
+			.await
+			.map_err(|(_, error)| error)
 	}
 
 	/// Delete a ref, requiring its current resolved value to equal `expected` (CAS).
 	///
-	/// Removes the loose ref file (if any), drops the ref from `packed-refs` (if present), and
-	/// deletes its reflog, so the ref no longer resolves by either path and leaves no stale log — as
-	/// git does when a ref is deleted. Errors with [`RepositoryError::RefMoved`] if the current value
-	/// differs from `expected`.
+	/// Removes the loose ref file (if any), drops the ref from `packed-refs` (if present), and deletes
+	/// its reflog, so the ref no longer resolves by either path and leaves no stale log — as git does.
+	/// Errors with [`RepositoryError::RefMoved`] if the current value differs from `expected`, and
+	/// [`RepositoryError::InvalidRef`] if there is no such ref.
 	///
 	/// `reflog` mirrors [`update_ref`](Self::update_ref)'s split-HEAD cascade for a deletion: with
 	/// `Log`, deleting the branch `HEAD` points at appends a `<old> <zero>` entry to `logs/HEAD`
 	/// (subject to `core.logAllRefUpdates` gating), as git's receive-pack does when it removes the
-	/// current branch. The ref's own reflog is always removed, whatever the intent. `Skip` writes no
-	/// HEAD entry.
-	///
-	/// The HEAD entry is written *before* the ref is removed — like git, which writes reflogs in its
-	/// transaction's prepare phase and mutates refs only on commit — so a HEAD-log failure rejects the
-	/// deletion without having touched the ref, rather than reporting failure for a ref already gone.
+	/// current branch. A one-op [`transact`](Self::transact): the reflog is written before the ref is
+	/// removed, under the ref's lock, so a failure rejects without having touched anything.
 	pub async fn delete_ref(
 		&self,
 		name: &str,
 		expected: Option<ObjectId<H>>,
 		reflog: ReflogIntent<'_>,
 	) -> Result<(), RepositoryError> {
-		let current = self.resolve(name).await?;
-		if current != expected {
-			return Err(RepositoryError::RefMoved {
-				name: name.to_owned(),
-			});
+		let op = RefOp {
+			name: name.to_owned(),
+			expected,
+			new: None,
+			reflog,
+		};
+		self
+			.transact(std::slice::from_ref(&op))
+			.await
+			.map_err(|(_, error)| error)
+	}
+
+	/// Apply `ops` as one atomic ref transaction — git's ref-lock model.
+	///
+	/// Every op's ref (and `HEAD`, for a split-HEAD reflog cascade) is locked via `<ref>.lock`,
+	/// acquired in a fixed sorted order so concurrent transactions cannot deadlock; every precondition
+	/// is validated; then each op's reflog is written and its ref committed. Any failure applies
+	/// nothing and returns the offending ref name and error.
+	///
+	/// Because an op writes its reflog *before* its ref while holding the lock, a reflog-write failure
+	/// or a lost CAS race leaves the ref untouched — the atomicity a raw ref move lacked.
+	/// [`update_ref`](Self::update_ref) and [`delete_ref`](Self::delete_ref) are one-op wrappers; a
+	/// caller wanting all-or-nothing across several refs (a `--atomic` push) passes them together.
+	pub async fn transact(&self, ops: &[RefOp<'_, H>]) -> Result<(), (String, RepositoryError)> {
+		let anon = |error| (String::new(), error);
+		let policy = self.reflog_policy().await.map_err(anon)?;
+		// The branch HEAD points at (read once, before locking): an op on it cascades into `logs/HEAD`,
+		// so HEAD joins the lock set.
+		let head_target = self.read_symbolic("HEAD").await.map_err(anon)?;
+		let cascades: Vec<bool> = ops
+			.iter()
+			.map(|op| op.name.starts_with("refs/heads/") && head_target.as_deref() == Some(&op.name))
+			.collect();
+
+		let mut lock_names: Vec<String> = ops.iter().map(|op| op.name.clone()).collect();
+		if cascades.iter().any(|&c| c) {
+			lock_names.push("HEAD".to_owned());
 		}
-		if current.is_none() {
-			return Err(RepositoryError::InvalidRef(format!("{name}: no such ref")));
+		let acquired = self.lock_all(&lock_names).await?;
+
+		// Confirm the cascade under the acquired locks (catching a `HEAD` retarget in the
+		// pre-lock→lock window), then validate and commit — releasing every lock on any path.
+		let outcome = match self.confirm_cascades(ops, cascades).await {
+			Ok(cascades) => self.transact_locked(ops, &cascades, policy).await,
+			Err(error) => Err(error),
+		};
+
+		for name in &acquired {
+			self.unlock_ref(name).await;
 		}
-		// Mirror the deletion into `HEAD`'s reflog when HEAD points at the deleted branch — git's
-		// split-HEAD update, recording `<old> <zero>` (a `None` new). Done first, so a failure here
-		// leaves the ref in place and the deletion is honestly rejected. Gated like any HEAD log.
-		if let ReflogIntent::Log { committer, message } = reflog
-			&& name.starts_with("refs/heads/")
-			&& self.read_symbolic("HEAD").await?.as_deref() == Some(name)
-			&& self.should_log("HEAD", self.reflog_policy().await?).await?
-		{
+		outcome
+	}
+
+	/// Re-derive the HEAD cascade flags under the acquired locks. `HEAD` is read once *before* locking
+	/// to fix the lock set (it is locked iff some op cascades); re-reading it here — while we hold
+	/// `HEAD.lock` when it matters — catches a concurrent `set_symbolic` in the pre-lock→lock window.
+	/// An op then cascades only when we hold `HEAD.lock` **and** `HEAD` still points at it, so the
+	/// transaction never appends to `logs/HEAD` without holding `HEAD.lock`.
+	async fn confirm_cascades(
+		&self,
+		ops: &[RefOp<'_, H>],
+		cascades: Vec<bool>,
+	) -> Result<Vec<bool>, (String, RepositoryError)> {
+		if !cascades.iter().any(|&c| c) {
+			// No op cascaded pre-lock, so `HEAD` was not locked; leave the flags off rather than trust a
+			// fresh read we could not act on safely.
+			return Ok(cascades);
+		}
+		let head = self
+			.read_symbolic("HEAD")
+			.await
+			.map_err(|error| (String::new(), error))?;
+		Ok(
+			ops
+				.iter()
+				.zip(cascades)
+				.map(|(op, cascade)| cascade && head.as_deref() == Some(&op.name))
+				.collect(),
+		)
+	}
+
+	/// Validate every op, then commit every op — assuming the full lock set is held. Split out so
+	/// [`transact`](Self::transact) releases the locks on every return path.
+	async fn transact_locked(
+		&self,
+		ops: &[RefOp<'_, H>],
+		cascades: &[bool],
+		policy: ReflogPolicy,
+	) -> Result<(), (String, RepositoryError)> {
+		// Validate all preconditions before mutating anything — so the common rejections (a stale
+		// `expected`, deleting a missing ref) apply nothing, even in a multi-op transaction.
+		let mut olds = Vec::with_capacity(ops.len());
+		for (op, &cascade) in ops.iter().zip(cascades) {
+			let current = self
+				.resolve(&op.name)
+				.await
+				.map_err(|e| (op.name.clone(), e))?;
+			if current != op.expected {
+				return Err((
+					op.name.clone(),
+					RepositoryError::RefMoved {
+						name: op.name.clone(),
+					},
+				));
+			}
+			if op.new.is_none() && current.is_none() {
+				return Err((
+					op.name.clone(),
+					RepositoryError::InvalidRef(format!("{}: no such ref", op.name)),
+				));
+			}
+			// Preflight every directory/file conflict a commit could otherwise hit — so a validated
+			// transaction cannot fail at commit (bar catastrophic I/O), keeping even a multi-op
+			// `--atomic` batch all-or-nothing. Which reflog paths get written:
+			//   - a move (`new` set) writes the ref and, when logged, its branch reflog;
+			//   - a move *or a delete* that cascades writes the mirrored `logs/HEAD`.
+			let mut logged: Vec<&str> = Vec::new();
+			if op.new.is_some() {
+				if self
+					.path_write_blocked(&op.name)
+					.await
+					.map_err(|e| (op.name.clone(), e))?
+				{
+					return Err((
+						op.name.clone(),
+						RepositoryError::InvalidRef(format!(
+							"{}: blocked by an existing directory or file",
+							op.name
+						)),
+					));
+				}
+				// The *direct* branch reflog is skipped for a no-op (`current == new`), matching
+				// `log_ref_update` — so don't preflight it there either, or a no-op update would be
+				// rejected over a `logs/<ref>` conflict the commit never touches. (The HEAD cascade below
+				// is still written for a no-op, so it is not gated this way.)
+				if matches!(op.reflog, ReflogIntent::Log { .. })
+					&& op.new != current
+					&& self
+						.should_log(&op.name, policy)
+						.await
+						.map_err(|e| (op.name.clone(), e))?
+				{
+					logged.push(&op.name);
+				}
+			}
+			if matches!(op.reflog, ReflogIntent::Log { .. })
+				&& cascade
+				&& self
+					.should_log("HEAD", policy)
+					.await
+					.map_err(|e| (op.name.clone(), e))?
+			{
+				logged.push("HEAD");
+			}
+			for name in logged {
+				if self
+					.path_write_blocked(&format!("logs/{name}"))
+					.await
+					.map_err(|e| (op.name.clone(), e))?
+				{
+					return Err((
+						op.name.clone(),
+						RepositoryError::InvalidRef(format!(
+							"{}: reflog path {name} blocked by an existing file or directory",
+							op.name
+						)),
+					));
+				}
+			}
+			olds.push(current);
+		}
+
+		// Commit each op. Validation preflighted every directory/file conflict, so a commit can now
+		// fail only on catastrophic I/O — nothing else moves a ref and then reports failure.
+		for ((op, &old), &cascade) in ops.iter().zip(&olds).zip(cascades) {
 			self
-				.append_reflog("HEAD", current, None, committer, message)
-				.await?;
+				.commit_op(op, old, cascade, policy)
+				.await
+				.map_err(|e| (op.name.clone(), e))?;
 		}
-		// Delete the loose ref file under a version check (no-op if packed-only).
-		match self.files.read_path_versioned(name).await {
-			Ok((_, version)) => {
+		Ok(())
+	}
+
+	/// Commit one validated op under its held lock: the ref, then its reflog(s).
+	async fn commit_op(
+		&self,
+		op: &RefOp<'_, H>,
+		old: Option<ObjectId<H>>,
+		cascade: bool,
+		policy: ReflogPolicy,
+	) -> Result<(), RepositoryError> {
+		match op.new {
+			Some(new) => {
+				// Reflog first, then the ref. Validation preflighted both paths, so neither write can hit
+				// a directory/file conflict; writing the reflog first means that even a catastrophic
+				// backend failure on `logs/` leaves the ref unpublished, so a reported failure never
+				// advances the branch (receive-pack relies on this). The HEAD cascade uses the prepared
+				// `cascade` (HEAD was locked accordingly), not a fresh read.
+				if let ReflogIntent::Log { committer, message } = op.reflog {
+					self
+						.log_ref_update(&op.name, old, new, committer, message, cascade, policy)
+						.await?;
+				}
+				// We hold the lock and validated the value, so a plain replace commits the move — no CAS,
+				// and no `<ref>.lock` of its own to deadlock against ours.
 				self
 					.files
-					.delete_path(name, Some(&version))
-					.await
-					.map_err(map_cas(name))?;
+					.write_path_replace(&op.name, format!("{new}\n").as_bytes())
+					.await?;
 			}
-			Err(FileStoreError::NotFound) => {}
-			Err(other) => return Err(other.into()),
+			None => {
+				// Deletion: mirror the `<old> <zero>` HEAD entry (before removing anything), then remove
+				// the loose ref, its packed entry, and its own reflog.
+				if let ReflogIntent::Log { committer, message } = op.reflog
+					&& cascade
+					&& self.should_log("HEAD", policy).await?
+				{
+					self
+						.append_reflog("HEAD", old, None, committer, message)
+						.await?;
+				}
+				self.files.delete_path_unlocked(&op.name).await?;
+				self.remove_from_packed(&op.name).await?;
+				// Best-effort, like git: a stale reflog (e.g. a leftover `logs/<name>` directory) must
+				// not turn a completed deletion into a reported failure. Prune the reflog's now-empty
+				// parent dirs too (the ref's own are pruned when its lock is released), so a later ref
+				// there is not blocked by a leftover `logs/` directory.
+				let logs = format!("logs/{}", op.name);
+				let _ = self.files.delete_path_unlocked(&logs).await;
+				self.prune_empty_dirs(&logs).await;
+			}
 		}
-		// Drop the ref (and its peeled line) from packed-refs if present.
-		self.remove_from_packed(name).await?;
-		// Remove the ref's reflog: git deletes `logs/<name>` with the ref, so no stale log survives.
-		// Best-effort, as git is (it warns but proceeds if the reflog cannot be unlinked): the ref is
-		// already gone, so a cleanup failure — e.g. `logs/<name>` left as a directory by a former nested
-		// reflog — must not turn a completed deletion into a reported failure.
-		let _ = self.files.delete_path(&format!("logs/{name}"), None).await;
 		Ok(())
+	}
+
+	/// Whether writing a value at `target` would hit a directory/file conflict: `target` is itself a
+	/// directory (a leftover from a nested ref/reflog, e.g. `refs/heads/foo` when `refs/heads/foo/bar`
+	/// exists, or an empty dir a delete left behind), or a strict ancestor is a *file* (blocking the
+	/// intermediate directory, e.g. a stray `logs/refs/heads/foo` file under `logs/refs/heads/foo/bar`).
+	///
+	/// A transaction preflights this for a move's ref path and its reflog path, so a validated commit
+	/// cannot fail on such a conflict. `is_dir` catches the directory case (including empty dirs);
+	/// `read_path` catches a file ancestor — it reads back `Ok` only for a file (a directory or absent
+	/// path errors, with a backend-varying kind, so we key on `Ok`).
+	async fn path_write_blocked(&self, target: &str) -> Result<bool, RepositoryError> {
+		if self.files.is_dir(target).await? {
+			return Ok(true);
+		}
+		for (index, _) in target.match_indices('/') {
+			if self.files.read_path(&target[..index]).await.is_ok() {
+				return Ok(true);
+			}
+		}
+		Ok(false)
+	}
+
+	/// Acquire every `<name>.lock` in `names`, sorted and deduped so concurrent transactions take
+	/// shared locks in the same order (deadlock-free). On the first contended lock, releases those
+	/// already taken and reports it.
+	async fn lock_all(&self, names: &[String]) -> Result<Vec<String>, (String, RepositoryError)> {
+		let mut sorted: Vec<String> = names.to_vec();
+		sorted.sort();
+		sorted.dedup();
+		let mut acquired: Vec<String> = Vec::with_capacity(sorted.len());
+		for name in sorted {
+			if let Err(error) = self.lock_ref(&name).await {
+				for held in &acquired {
+					self.unlock_ref(held).await;
+				}
+				return Err((name, error));
+			}
+			acquired.push(name);
+		}
+		Ok(acquired)
+	}
+
+	/// Take `<name>.lock` (git's ref lock), retrying briefly on contention before giving up with
+	/// [`RepositoryError::RefLocked`].
+	async fn lock_ref(&self, name: &str) -> Result<(), RepositoryError> {
+		let path = format!("{name}.lock");
+		for attempt in 0..LOCK_ATTEMPTS {
+			match self.files.write_path_if_absent(&path, &[]).await? {
+				WriteOutcome::Written => return Ok(()),
+				WriteOutcome::AlreadyExists => {
+					if attempt + 1 < LOCK_ATTEMPTS {
+						lock_backoff().await;
+					}
+				}
+			}
+		}
+		Err(RepositoryError::RefLocked {
+			name: name.to_owned(),
+		})
+	}
+
+	/// Release `<name>.lock`, using the lock-free unlink so it never contends for the very lock it is
+	/// removing, then prune any now-empty parent directories.
+	async fn unlock_ref(&self, name: &str) {
+		let _ = self
+			.files
+			.delete_path_unlocked(&format!("{name}.lock"))
+			.await;
+		// Acquiring `<name>.lock` may have created `<name>`'s parent directories (e.g. `refs/heads/foo/`
+		// for `refs/heads/foo/bar.lock`); an aborted transaction, or a delete that emptied the tree,
+		// leaves them behind. Git prunes such empty ref directories so a stale `refs/heads/foo/` cannot
+		// masquerade as a directory/file conflict blocking a later `refs/heads/foo`.
+		self.prune_empty_dirs(name).await;
+	}
+
+	/// Best-effort removal of `path`'s now-empty ancestor directories, from the innermost up, stopping
+	/// at the first that is not an empty directory (or on any error / a backend without directories).
+	async fn prune_empty_dirs(&self, path: &str) {
+		let mut current = path;
+		while let Some(index) = current.rfind('/') {
+			let parent = &current[..index];
+			if parent.is_empty() || self.files.remove_dir(parent).await.is_err() {
+				break;
+			}
+			current = parent;
+		}
 	}
 
 	/// Delete every ref under `prefix` — loose (direct *or* symbolic), its reflog, and any packed
@@ -613,19 +899,53 @@ where
 		target: &str,
 		reflog: ReflogIntent<'_>,
 	) -> Result<(), RepositoryError> {
+		// Hold `<name>.lock` across the reflog write and the retarget — like a ref transaction, so a
+		// reflog failure leaves the symbolic ref unchanged and no concurrent writer interleaves.
+		self.lock_ref(name).await?;
+		let result = self.set_symbolic_locked(name, target, reflog).await;
+		self.unlock_ref(name).await;
+		result
+	}
+
+	/// The body of [`set_symbolic`](Self::set_symbolic), run with `<name>.lock` held.
+	async fn set_symbolic_locked(
+		&self,
+		name: &str,
+		target: &str,
+		reflog: ReflogIntent<'_>,
+	) -> Result<(), RepositoryError> {
+		// Preflight the destination's writability before appending any reflog (as `transact` does): a
+		// directory/file conflict at `name` (or, when logged, at `logs/<name>`) must reject the retarget
+		// rather than record a reflog for a move that then fails on the ref write.
+		if self.path_write_blocked(name).await? {
+			return Err(RepositoryError::InvalidRef(format!(
+				"{name}: blocked by an existing directory or file"
+			)));
+		}
 		let old = self.follow_symref(name).await?;
-		let bytes = HeadState::<H>::Symbolic(target.to_owned()).render();
-		self.force_write(name, bytes.as_bytes()).await?;
+		// Reflog first (before retargeting), gated, and only when `target` resolves — no object
+		// movement to record otherwise.
 		if let ReflogIntent::Log { committer, message } = reflog
 			// Follow the chain: `target` may itself be symbolic (e.g. `refs/remotes/origin/HEAD`), which
 			// `resolve` would try to parse as an object id and reject.
 			&& let Some(new) = self.follow_symref(target).await?
 			&& self.should_log(name, self.reflog_policy().await?).await?
 		{
+			if self.path_write_blocked(&format!("logs/{name}")).await? {
+				return Err(RepositoryError::InvalidRef(format!(
+					"{name}: reflog path blocked by an existing file or directory"
+				)));
+			}
 			self
 				.append_reflog(name, old, Some(new), committer, message)
 				.await?;
 		}
+		// Commit the retarget under the held lock (a plain replace, no `<name>.lock` of its own).
+		let bytes = HeadState::<H>::Symbolic(target.to_owned()).render();
+		self
+			.files
+			.write_path_replace(name, bytes.as_bytes())
+			.await?;
 		Ok(())
 	}
 
@@ -688,8 +1008,9 @@ where
 		new: ObjectId<H>,
 		committer: &str,
 		message: &str,
+		cascade: bool,
+		policy: ReflogPolicy,
 	) -> Result<(), RepositoryError> {
-		let policy = self.reflog_policy().await?;
 		// git skips the direct reflog for a no-op update (the new value equals the old), logging only a
 		// real move or a creation.
 		if old != Some(new) && self.should_log(name, policy).await? {
@@ -699,11 +1020,10 @@ where
 		}
 		// The split HEAD update mirrored into `HEAD` when it points at the branch is a distinct update
 		// that git logs even for a no-op (`update-ref` to the current branch's own tip still records a
-		// HEAD entry — verified against stock git), so it is not gated on `old != new`.
-		if name.starts_with("refs/heads/")
-			&& self.read_symbolic("HEAD").await?.as_deref() == Some(name)
-			&& self.should_log("HEAD", policy).await?
-		{
+		// HEAD entry — verified against stock git), so it is not gated on `old != new`. It is gated on
+		// the transaction's *prepared* `cascade` (HEAD was read and locked accordingly) — not a fresh
+		// `HEAD` read here, which could race a concurrent retarget and append without `HEAD.lock`.
+		if cascade && self.should_log("HEAD", policy).await? {
 			self
 				.append_reflog("HEAD", old, Some(new), committer, message)
 				.await?;
@@ -858,15 +1178,6 @@ fn parse_oid<H: HashAlgorithm>(name: &str, bytes: &[u8]) -> Result<ObjectId<H>, 
 		.map_err(|_| RepositoryError::InvalidRef(name.to_owned()))?
 		.trim();
 	ObjectId::from_hex(text).map_err(|_| RepositoryError::InvalidRef(format!("{name}: {text}")))
-}
-
-fn map_cas(name: &str) -> impl Fn(FileStoreError) -> RepositoryError + '_ {
-	move |error| match error {
-		FileStoreError::VersionMismatch => RepositoryError::RefMoved {
-			name: name.to_owned(),
-		},
-		other => other.into(),
-	}
 }
 
 #[cfg(test)]
@@ -1259,5 +1570,324 @@ mod tests {
 			files.read_path("refs/heads/packed").await.is_ok(),
 			"a loose file now shadows the packed entry"
 		);
+	}
+
+	#[tokio::test]
+	async fn transact_applies_every_op_on_success() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let a = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"a");
+		let b = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"b");
+		let ops = [
+			crate::RefOp {
+				name: "refs/heads/one".to_owned(),
+				expected: None,
+				new: Some(a),
+				reflog: ReflogIntent::Skip,
+			},
+			crate::RefOp {
+				name: "refs/heads/two".to_owned(),
+				expected: None,
+				new: Some(b),
+				reflog: ReflogIntent::Skip,
+			},
+		];
+		store.transact(&ops).await.expect("both creates apply");
+		assert_eq!(store.resolve("refs/heads/one").await.unwrap(), Some(a));
+		assert_eq!(store.resolve("refs/heads/two").await.unwrap(), Some(b));
+	}
+
+	#[tokio::test]
+	async fn transact_is_all_or_nothing() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let a = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"a");
+		let b = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"b");
+		store
+			.update_ref("refs/heads/one", a, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		// Create `two` and update `one` with a *stale* expected value in one transaction: the stale op
+		// rejects the whole batch, so `two` is never created and `one` is untouched.
+		let ops = [
+			crate::RefOp {
+				name: "refs/heads/two".to_owned(),
+				expected: None,
+				new: Some(b),
+				reflog: ReflogIntent::Skip,
+			},
+			crate::RefOp {
+				name: "refs/heads/one".to_owned(),
+				expected: Some(b),
+				new: Some(b),
+				reflog: ReflogIntent::Skip,
+			},
+		];
+		let (name, error) = store
+			.transact(&ops)
+			.await
+			.expect_err("a stale expected must reject the batch");
+		assert_eq!(name, "refs/heads/one");
+		assert!(matches!(error, crate::RepositoryError::RefMoved { .. }));
+		assert_eq!(
+			store.resolve("refs/heads/two").await.unwrap(),
+			None,
+			"a rejected batch creates no ref"
+		);
+		assert_eq!(
+			store.resolve("refs/heads/one").await.unwrap(),
+			Some(a),
+			"a rejected batch moves no ref"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_held_ref_lock_blocks_then_is_released() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let a = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"a");
+
+		// Another writer holds refs/heads/x.lock: the update retries, then rejects, writing nothing.
+		files
+			.write_path_if_absent("refs/heads/x.lock", b"")
+			.await
+			.unwrap();
+		let error = store
+			.update_ref("refs/heads/x", a, None, ReflogIntent::Skip)
+			.await
+			.expect_err("a held lock blocks the update");
+		assert!(matches!(error, crate::RepositoryError::RefLocked { .. }));
+		assert_eq!(
+			store.resolve("refs/heads/x").await.unwrap(),
+			None,
+			"nothing is written while the ref is locked"
+		);
+
+		// Release it: the update now lands and leaves no lock behind.
+		files
+			.delete_path_unlocked("refs/heads/x.lock")
+			.await
+			.unwrap();
+		store
+			.update_ref("refs/heads/x", a, None, ReflogIntent::Skip)
+			.await
+			.expect("update after the lock is released");
+		assert_eq!(store.resolve("refs/heads/x").await.unwrap(), Some(a));
+		assert!(
+			!files.exists("refs/heads/x.lock").await.unwrap(),
+			"the transaction released its own lock"
+		);
+	}
+
+	/// A multi-op transaction where one op's reflog path has a directory/file conflict rejects the
+	/// whole batch in validation — no ref is moved and no reflog is written. Uses `LocalFileStore`, the
+	/// only backend with real directory/file semantics.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn transact_is_atomic_across_a_reflog_conflict() {
+		use gitana_file_store_local::LocalFileStore;
+
+		let tmp = std::env::temp_dir().join(format!("gitana-reftx-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(&tmp).unwrap();
+		let files = LocalFileStore::from_dir(
+			cap_std::fs::Dir::open_ambient_dir(&tmp, cap_std::ambient_authority()).unwrap(),
+		);
+		let store: RefStore<'_, LocalFileStore, Sha256> = RefStore::new(&files);
+		let a = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"a");
+		let b = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"b");
+		let who = "C O Mitter <c@e> 0 +0000";
+		let log = ReflogIntent::Log {
+			committer: who,
+			message: "create",
+		};
+
+		// A stray *file* where refs/heads/foo/bar's reflog directory must go.
+		files
+			.write_path_replace("logs/refs/heads/foo", b"stray\n")
+			.await
+			.unwrap();
+
+		// One transaction creating a clean ref and the conflicted one, both logging: the conflict must
+		// reject the whole batch during validation, before either ref (or reflog) is written.
+		let ops = [
+			crate::RefOp {
+				name: "refs/heads/one".to_owned(),
+				expected: None,
+				new: Some(a),
+				reflog: log,
+			},
+			crate::RefOp {
+				name: "refs/heads/foo/bar".to_owned(),
+				expected: None,
+				new: Some(b),
+				reflog: log,
+			},
+		];
+		let (name, _) = store
+			.transact(&ops)
+			.await
+			.expect_err("a reflog directory/file conflict must reject the batch");
+		assert_eq!(name, "refs/heads/foo/bar");
+		assert_eq!(
+			store.resolve("refs/heads/one").await.unwrap(),
+			None,
+			"the clean ref is not created by a rejected batch"
+		);
+		assert_eq!(store.resolve("refs/heads/foo/bar").await.unwrap(), None);
+		assert!(
+			files.read_path("logs/refs/heads/one").await.is_err(),
+			"no reflog is written for a rejected batch"
+		);
+
+		let _ = std::fs::remove_dir_all(&tmp);
+	}
+
+	/// A directory/file conflict at the *ref* path (creating `refs/heads/foo` while
+	/// `refs/heads/foo/bar` makes it a directory) rejects the update without writing a reflog — the
+	/// ref write is committed first, so it fails before the log records a movement that never happened.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn a_ref_name_conflict_rejects_without_a_reflog() {
+		use gitana_file_store_local::LocalFileStore;
+
+		let tmp = std::env::temp_dir().join(format!("gitana-refdf-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(&tmp).unwrap();
+		let files = LocalFileStore::from_dir(
+			cap_std::fs::Dir::open_ambient_dir(&tmp, cap_std::ambient_authority()).unwrap(),
+		);
+		let store: RefStore<'_, LocalFileStore, Sha256> = RefStore::new(&files);
+		let a = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"a");
+
+		// Create refs/heads/foo/bar, so refs/heads/foo is now a directory.
+		store
+			.update_ref("refs/heads/foo/bar", a, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		// Creating refs/heads/foo is a directory/file conflict at the ref path: it must reject, and
+		// leave no reflog behind (the ref write fails before the reflog is appended).
+		let error = store
+			.update_ref(
+				"refs/heads/foo",
+				a,
+				None,
+				ReflogIntent::Log {
+					committer: "C O Mitter <c@e> 0 +0000",
+					message: "create",
+				},
+			)
+			.await
+			.expect_err("a ref-name conflict must reject the update");
+		assert!(
+			!matches!(error, crate::RepositoryError::RefMoved { .. }),
+			"the rejection is the write conflict, not a CAS mismatch"
+		);
+		assert!(
+			files.read_path("logs/refs/heads/foo").await.is_err(),
+			"no reflog is written when the ref itself cannot be created"
+		);
+		assert_eq!(
+			store.resolve("refs/heads/foo/bar").await.unwrap(),
+			Some(a),
+			"the pre-existing nested ref is untouched"
+		);
+
+		let _ = std::fs::remove_dir_all(&tmp);
+	}
+
+	/// A multi-op batch where a *later* op has a ref-name conflict rejects the whole batch — an earlier,
+	/// clean op is not left committed. (The conflict is caught in validation, before any commit.)
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn transact_is_atomic_across_a_ref_name_conflict() {
+		use gitana_file_store_local::LocalFileStore;
+
+		let tmp = std::env::temp_dir().join(format!("gitana-refdf2-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(&tmp).unwrap();
+		let files = LocalFileStore::from_dir(
+			cap_std::fs::Dir::open_ambient_dir(&tmp, cap_std::ambient_authority()).unwrap(),
+		);
+		let store: RefStore<'_, LocalFileStore, Sha256> = RefStore::new(&files);
+		let a = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"a");
+		let b = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"b");
+
+		// refs/heads/foo is a directory (refs/heads/foo/bar exists).
+		store
+			.update_ref("refs/heads/foo/bar", a, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		// A batch creating a clean ref and then the conflicted one: the conflict rejects the batch, so
+		// the clean ref is never committed.
+		let ops = [
+			crate::RefOp {
+				name: "refs/heads/one".to_owned(),
+				expected: None,
+				new: Some(b),
+				reflog: ReflogIntent::Skip,
+			},
+			crate::RefOp {
+				name: "refs/heads/foo".to_owned(),
+				expected: None,
+				new: Some(b),
+				reflog: ReflogIntent::Skip,
+			},
+		];
+		let (name, _) = store
+			.transact(&ops)
+			.await
+			.expect_err("a ref-name conflict must reject the batch");
+		assert_eq!(name, "refs/heads/foo");
+		assert_eq!(
+			store.resolve("refs/heads/one").await.unwrap(),
+			None,
+			"the earlier clean op is not left committed"
+		);
+
+		let _ = std::fs::remove_dir_all(&tmp);
+	}
+
+	/// Aborting a transaction that locked a nested ref prunes the empty directory the lock created, so
+	/// a later create of the parent ref is not blocked as a directory/file conflict.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn an_aborted_nested_lock_does_not_block_a_later_ref() {
+		use gitana_file_store_local::LocalFileStore;
+
+		let tmp = std::env::temp_dir().join(format!("gitana-lockprune-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(&tmp).unwrap();
+		let files = LocalFileStore::from_dir(
+			cap_std::fs::Dir::open_ambient_dir(&tmp, cap_std::ambient_authority()).unwrap(),
+		);
+		let store: RefStore<'_, LocalFileStore, Sha256> = RefStore::new(&files);
+		let a = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"a");
+
+		// Lock refs/heads/foo/bar (creating refs/heads/foo/) but abort in validation (a stale expected
+		// value for a ref that is absent).
+		let ops = [crate::RefOp {
+			name: "refs/heads/foo/bar".to_owned(),
+			expected: Some(a),
+			new: Some(a),
+			reflog: ReflogIntent::Skip,
+		}];
+		store
+			.transact(&ops)
+			.await
+			.expect_err("a stale expected value aborts the transaction");
+
+		// The abort pruned the empty refs/heads/foo/ the lock created, so creating refs/heads/foo now
+		// succeeds instead of being rejected as a leftover-directory conflict.
+		store
+			.update_ref("refs/heads/foo", a, None, ReflogIntent::Skip)
+			.await
+			.expect("create refs/heads/foo after the aborted nested lock");
+		assert_eq!(store.resolve("refs/heads/foo").await.unwrap(), Some(a));
+
+		let _ = std::fs::remove_dir_all(&tmp);
 	}
 }
