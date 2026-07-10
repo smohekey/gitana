@@ -61,7 +61,7 @@ async fn create<H: HashAlgorithm>(
 		Some(start) => start.to_owned(),
 		None => start_from_head(repo).await?,
 	};
-	let committer = signature_or_default(repo, "COMMITTER").await;
+	let committer = signature_or_default(repo, "COMMITTER").await?;
 	let message = format!("branch: Created from {from}");
 	repo
 		.refs()

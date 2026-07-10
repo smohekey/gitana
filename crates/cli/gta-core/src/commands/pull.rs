@@ -66,7 +66,7 @@ async fn pull_into<H: HashAlgorithm>(
 	// Under a pull, git reflogs the tracking-ref updates with the `pull` action (not `fetch`), honouring
 	// `GIT_REFLOG_ACTION` if set. The merge step below records HEAD/branch separately; this covers only
 	// the tracking refs.
-	let committer = identity.committer_or_default().await;
+	let committer = identity.committer_or_default().await?;
 	let action = crate::identity::reflog_action("pull");
 	let outcome = gitana_porcelain::fetch(
 		http,

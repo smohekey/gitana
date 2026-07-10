@@ -95,7 +95,7 @@ pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 		if !overwrite.is_empty() {
 			bail!("{}", would_overwrite_message(&overwrite));
 		}
-		let committer = identity.committer_or_default().await;
+		let committer = identity.committer_or_default().await?;
 		repository
 			.reset_head(
 				theirs,

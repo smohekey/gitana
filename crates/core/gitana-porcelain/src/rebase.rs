@@ -90,7 +90,7 @@ pub async fn rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 		}
 	}
 
-	let committer = identity.committer_or_default().await;
+	let committer = identity.committer_or_default().await?;
 
 	// Nothing to replay: the branch is already on (or behind) the base — a fast-forward or no-op.
 	if todo.is_empty() {
@@ -194,7 +194,7 @@ pub async fn abort_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	let Some(state) = repository.rebase_state().await? else {
 		bail!("no rebase in progress (no rebase-merge state)");
 	};
-	let committer = identity.committer_or_default().await;
+	let committer = identity.committer_or_default().await?;
 	repository
 		.reset_head(state.orig_head, &committer, "rebase: aborting")
 		.await?;

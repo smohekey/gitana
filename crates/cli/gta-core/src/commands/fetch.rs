@@ -88,7 +88,7 @@ async fn fetch_into<H: HashAlgorithm>(
 	// git logs each advanced tracking ref as `<action>: <status>`; the committer falls back to a
 	// placeholder when unconfigured, as git's reflog writes do. The action mirrors git: `GIT_REFLOG_ACTION`
 	// if set, else `fetch` (a plain `gta fetch` names no remote, exactly like `git fetch`).
-	let committer = CliIdentity::new(&repository).committer_or_default().await;
+	let committer = CliIdentity::new(&repository).committer_or_default().await?;
 	let action = crate::identity::reflog_action("fetch");
 	let outcome = gitana_porcelain::fetch(
 		http,

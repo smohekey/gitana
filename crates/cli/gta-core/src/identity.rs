@@ -30,41 +30,44 @@ impl<H: HashAlgorithm> Identity for CliIdentity<'_, H> {
 	async fn committer(&self) -> Result<String> {
 		signature(self.repo, "COMMITTER").await
 	}
-	async fn committer_or_default(&self) -> String {
+	async fn committer_or_default(&self) -> Result<String> {
 		signature_or_default(self.repo, "COMMITTER").await
 	}
 }
 
 /// Build a `role` (`AUTHOR` or `COMMITTER`) identity line from the `GIT_<role>_*` environment,
 /// falling back to `user.name`/`user.email` in config. Errors when neither is set — for operations
-/// like `commit` that must record a real identity.
+/// like `commit` that must record a real identity. Config is resolved across git's full precedence
+/// stack (system, global, local), so a globally-configured identity is honoured.
 pub async fn signature<H: HashAlgorithm>(
 	repo: &Repository<Backend, H>,
 	role: &str,
 ) -> Result<String> {
-	let config = repo.read_config().await.ok();
+	let config = crate::git_config::effective_config(repo).await?;
 	gitana_identity::signature(
 		role,
 		env_override(role, "NAME"),
 		env_override(role, "EMAIL"),
-		config.as_ref(),
+		Some(&config),
 		&when(role),
 	)
 }
 
-/// Like [`signature`], but never fails: an unset name or email falls back to a placeholder. Used for
-/// reflog entries (e.g. `reset`), which git records without requiring configuration.
+/// Like [`signature`], but defaults a *missing* name or email to a placeholder rather than failing —
+/// for reflog entries (e.g. `reset`) that git records without a configured identity. It still errors
+/// if the config stack itself cannot be read (a malformed global/system file), as git aborts the
+/// whole operation on a bad config. Config is resolved across git's full precedence stack.
 pub async fn signature_or_default<H: HashAlgorithm>(
 	repo: &Repository<Backend, H>,
 	role: &str,
-) -> String {
-	let config = repo.read_config().await.ok();
-	gitana_identity::signature_or_default(
+) -> Result<String> {
+	let config = crate::git_config::effective_config(repo).await?;
+	Ok(gitana_identity::signature_or_default(
 		env_override(role, "NAME"),
 		env_override(role, "EMAIL"),
-		config.as_ref(),
+		Some(&config),
 		&when(role),
-	)
+	))
 }
 
 /// The `GIT_<role>_<field>` environment override, if set.

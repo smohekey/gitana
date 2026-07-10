@@ -145,7 +145,15 @@ Implemented command groups:
   or the main worktree. `move`/`remove` refuse a worktree holding an initialized submodule, and
   `worktree.useRelativePaths` pointers are preserved across a move/repair. The result is byte-for-byte
   git's layout, so stock git reads and operates in a gta-created worktree.
-- Repository setup: `config` (local read/write).
+- Repository setup: `config`, scoped like git — `--local` (the repository `.git/config`, the default
+  for writes), `--global` (`$GIT_CONFIG_GLOBAL`, else `~/.gitconfig` / the XDG file), and `--system`
+  (`$GIT_CONFIG_SYSTEM`, else `/etc/gitconfig`). An unscoped read resolves across git's whole
+  precedence stack (system → global → local, plus `-c`/`GIT_CONFIG_COUNT` command-line entries on top),
+  and works outside a repository; an unscoped write lands in the local file. Writes are atomic through a
+  `.lock` file, follow symlinks, and preserve the target's mode, matching git. Author/committer
+  identity (and every reflog line) resolves `user.name` / `user.email` across the same stack, so a
+  globally-configured identity is honoured — including by `clone`, which resolves its committer before
+  a local config exists.
 - Maintenance: `repack` (consolidate loose objects and packs; honors `pack.packSizeLimit`,
   splitting into multiple size-bounded packs when set; `--geometric` for an incremental
   repack), `prune` (delete unreachable loose objects), `gc` (prune, geometric repack, then

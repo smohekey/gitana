@@ -45,7 +45,7 @@ impl WorkTreeCommand for Switch<'_> {
 	) -> Result<()> {
 		let repo = worktree.repository();
 		let branch = format!("refs/heads/{}", self.name);
-		let committer = signature_or_default(repo, "COMMITTER").await;
+		let committer = signature_or_default(repo, "COMMITTER").await?;
 		// Describe what HEAD points at now, before it moves — the `from` half of the checkout reflog.
 		let from = head_description(repo).await?;
 

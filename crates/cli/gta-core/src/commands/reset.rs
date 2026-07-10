@@ -93,7 +93,7 @@ impl WorkTreeCommand for Reset {
 			worktree.reset_index(tree).await?;
 		}
 
-		let committer = identity::signature_or_default(repo, "COMMITTER").await;
+		let committer = identity::signature_or_default(repo, "COMMITTER").await?;
 		repo
 			.reset_head(commit, &committer, &format!("reset: moving to {rev}"))
 			.await?;

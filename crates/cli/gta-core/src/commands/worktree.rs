@@ -180,7 +180,7 @@ async fn add_generic<H: HashAlgorithm>(
 
 	// The committer credited in the new branch's and the new worktree's reflogs (a default identity
 	// when unconfigured, as git does for reflog-only writes).
-	let committer = signature_or_default(&repo, "COMMITTER").await;
+	let committer = signature_or_default(&repo, "COMMITTER").await?;
 
 	// Create the branch first (a shared ref), then materialise the admin directory and checkout. A
 	// `create` is only ever paired with a concrete commit (never an orphan).

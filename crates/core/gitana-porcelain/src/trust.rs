@@ -76,7 +76,7 @@ pub async fn trust_init<F: FileStore, H: HashAlgorithm>(
 		.refs()
 		.update_ref(TRUST_REF, tip, None, ReflogIntent::Skip)
 		.await?;
-	let committer = identity.committer_or_default().await;
+	let committer = identity.committer_or_default().await?;
 	repo
 		.refs()
 		.append_reflog(TRUST_REF, None, Some(tip), &committer, "trust: bootstrap")
@@ -198,7 +198,7 @@ pub async fn trust_sync<F: FileStore, H: HashAlgorithm>(
 		.refs()
 		.update_ref(TRUST_REF, remote_tip, local_tip, ReflogIntent::Skip)
 		.await?;
-	let committer = identity.committer_or_default().await;
+	let committer = identity.committer_or_default().await?;
 	repo
 		.refs()
 		.append_reflog(
@@ -418,7 +418,7 @@ async fn trust_update<F: FileStore, H: HashAlgorithm>(
 		.refs()
 		.update_ref(TRUST_REF, new_tip, Some(old_tip), ReflogIntent::Skip)
 		.await?;
-	let committer = identity.committer_or_default().await;
+	let committer = identity.committer_or_default().await?;
 	repo
 		.refs()
 		.append_reflog(

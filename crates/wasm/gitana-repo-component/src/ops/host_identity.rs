@@ -20,7 +20,7 @@ impl Identity for HostIdentity<'_> {
 		Ok(self.committer.to_owned())
 	}
 
-	async fn committer_or_default(&self) -> String {
-		self.committer.to_owned()
+	async fn committer_or_default(&self) -> Result<String> {
+		Ok(self.committer.to_owned())
 	}
 }

@@ -201,7 +201,10 @@ enum Command {
 		/// The object to show (default: HEAD).
 		object: Option<String>,
 	},
-	/// Read or write local repository configuration (`.git/config`).
+	/// Read or write git configuration.
+	///
+	/// A read without a scope resolves across git's precedence stack (system → global → local); a
+	/// write without a scope lands in the repository-local `.git/config`, as git does.
 	Config {
 		/// Read the value of a key (the default with a key and no value).
 		#[arg(long)]
@@ -227,6 +230,15 @@ enum Command {
 		/// Interpret the read value as an integer.
 		#[arg(long = "int")]
 		as_int: bool,
+		/// Use the user's global config (`~/.gitconfig` / XDG).
+		#[arg(long, conflicts_with_all = ["system", "local"])]
+		global: bool,
+		/// Use the system config (`/etc/gitconfig`).
+		#[arg(long, conflicts_with_all = ["global", "local"])]
+		system: bool,
+		/// Use the repository-local config (`.git/config`); the default for writes.
+		#[arg(long, conflicts_with_all = ["global", "system"])]
+		local: bool,
 		/// The dotted key (`section[.subsection].name`).
 		name: Option<String>,
 		/// The value to set or add.
@@ -623,90 +635,81 @@ impl Cli {
 			Some(dir) => dir,
 			None => std::env::current_dir()?,
 		};
-		match self.command {
-			Command::Init {
-				path,
-				object_format,
-			} => commands::init::run(path.unwrap_or(cwd), &object_format).await,
-			Command::HashObject {
-				kind,
-				write,
-				stdin,
-				file,
-			} => commands::hash_object::run(&cwd, &kind, write, stdin, file).await,
-			Command::CatFile {
-				show_type,
-				show_size,
-				pretty,
-				object,
-			} => commands::cat_file::run(&cwd, show_type, show_size, pretty, &object).await,
-			Command::LsTree { recursive, treeish } => {
-				commands::ls_tree::run(&cwd, recursive, &treeish).await
-			}
-			Command::RevParse { spec } => commands::rev_parse::run(&cwd, &spec).await,
-			Command::RevList { spec } => commands::rev_list::run(&cwd, &spec).await,
-			Command::MergeBase {
-				all,
-				is_ancestor,
-				commits,
-			} => commands::merge_base::run(&cwd, all, is_ancestor, commits).await,
-			Command::LsFiles => commands::ls_files::run(&cwd).await,
-			Command::UpdateRef { name, value } => commands::update_ref::run(&cwd, &name, &value).await,
-			Command::SymbolicRef { name, target } => {
-				commands::symbolic_ref::run(&cwd, &name, target).await
-			}
-			Command::Add { pathspecs } => commands::add::run(&cwd, &pathspecs).await,
-			Command::Status => commands::status::run(&cwd).await,
-			Command::Commit {
-				message,
-				sign,
-				no_sign,
-				signing_key,
-			} => commands::commit::run(&cwd, &message, sign, no_sign, signing_key).await,
-			Command::Merge {
-				commit,
-				message,
-				no_ff,
-				ff_only,
-				abort,
-				continue_,
-			} => commands::merge::run(&cwd, commit, message, no_ff, ff_only, abort, continue_).await,
-			Command::CherryPick {
-				commit,
-				abort,
-				continue_,
-			} => commands::cherry_pick::run(&cwd, commit, abort, continue_).await,
-			Command::Revert {
-				commit,
-				abort,
-				continue_,
-			} => commands::revert::run(&cwd, commit, abort, continue_).await,
-			Command::Rebase {
-				upstream,
-				onto,
-				abort,
-				continue_,
-				skip,
-			} => commands::rebase::run(&cwd, upstream, onto, abort, continue_, skip).await,
-			Command::Repack { geometric } => commands::repack::run(&cwd, geometric).await,
-			Command::Prune => commands::prune::run(&cwd).await,
-			Command::Gc => commands::gc::run(&cwd).await,
-			Command::Log => commands::log::run(&cwd).await,
-			Command::Show { object } => commands::show::run(&cwd, object).await,
-			Command::Config {
-				get,
-				get_all,
-				add,
-				replace_all,
-				unset,
-				list,
-				as_bool,
-				as_int,
-				name,
-				value,
-			} => {
-				commands::config::run(
-					&cwd,
+		// Establish the command's working directory so relative config-file overrides
+		// (GIT_CONFIG_GLOBAL/SYSTEM) resolve against it, as git does under `-C`.
+		let command = self.command;
+		gta_core::with_command_cwd(cwd.clone(), async move {
+			match command {
+				Command::Init {
+					path,
+					object_format,
+				} => commands::init::run(path.unwrap_or(cwd), &object_format).await,
+				Command::HashObject {
+					kind,
+					write,
+					stdin,
+					file,
+				} => commands::hash_object::run(&cwd, &kind, write, stdin, file).await,
+				Command::CatFile {
+					show_type,
+					show_size,
+					pretty,
+					object,
+				} => commands::cat_file::run(&cwd, show_type, show_size, pretty, &object).await,
+				Command::LsTree { recursive, treeish } => {
+					commands::ls_tree::run(&cwd, recursive, &treeish).await
+				}
+				Command::RevParse { spec } => commands::rev_parse::run(&cwd, &spec).await,
+				Command::RevList { spec } => commands::rev_list::run(&cwd, &spec).await,
+				Command::MergeBase {
+					all,
+					is_ancestor,
+					commits,
+				} => commands::merge_base::run(&cwd, all, is_ancestor, commits).await,
+				Command::LsFiles => commands::ls_files::run(&cwd).await,
+				Command::UpdateRef { name, value } => commands::update_ref::run(&cwd, &name, &value).await,
+				Command::SymbolicRef { name, target } => {
+					commands::symbolic_ref::run(&cwd, &name, target).await
+				}
+				Command::Add { pathspecs } => commands::add::run(&cwd, &pathspecs).await,
+				Command::Status => commands::status::run(&cwd).await,
+				Command::Commit {
+					message,
+					sign,
+					no_sign,
+					signing_key,
+				} => commands::commit::run(&cwd, &message, sign, no_sign, signing_key).await,
+				Command::Merge {
+					commit,
+					message,
+					no_ff,
+					ff_only,
+					abort,
+					continue_,
+				} => commands::merge::run(&cwd, commit, message, no_ff, ff_only, abort, continue_).await,
+				Command::CherryPick {
+					commit,
+					abort,
+					continue_,
+				} => commands::cherry_pick::run(&cwd, commit, abort, continue_).await,
+				Command::Revert {
+					commit,
+					abort,
+					continue_,
+				} => commands::revert::run(&cwd, commit, abort, continue_).await,
+				Command::Rebase {
+					upstream,
+					onto,
+					abort,
+					continue_,
+					skip,
+				} => commands::rebase::run(&cwd, upstream, onto, abort, continue_, skip).await,
+				Command::Repack { geometric } => commands::repack::run(&cwd, geometric).await,
+				Command::Prune => commands::prune::run(&cwd).await,
+				Command::Gc => commands::gc::run(&cwd).await,
+				Command::Log => commands::log::run(&cwd).await,
+				Command::Show { object } => commands::show::run(&cwd, object).await,
+				Command::Config {
 					get,
 					get_all,
 					add,
@@ -715,23 +718,32 @@ impl Cli {
 					list,
 					as_bool,
 					as_int,
+					global,
+					system,
+					local,
 					name,
 					value,
-				)
-				.await
-			}
-			Command::Branch { name, start } => commands::branch::run(&cwd, name, start).await,
-			Command::Tag {
-				name,
-				target,
-				annotate,
-				sign,
-				no_sign,
-				message,
-				signing_key,
-			} => {
-				commands::tag::run(
-					&cwd,
+				} => {
+					commands::config::run(
+						&cwd,
+						get,
+						get_all,
+						add,
+						replace_all,
+						unset,
+						list,
+						as_bool,
+						as_int,
+						global,
+						system,
+						local,
+						name,
+						value,
+					)
+					.await
+				}
+				Command::Branch { name, start } => commands::branch::run(&cwd, name, start).await,
+				Command::Tag {
 					name,
 					target,
 					annotate,
@@ -739,88 +751,86 @@ impl Cli {
 					no_sign,
 					message,
 					signing_key,
+				} => {
+					commands::tag::run(
+						&cwd,
+						name,
+						target,
+						annotate,
+						sign,
+						no_sign,
+						message,
+						signing_key,
+					)
+					.await
+				}
+				Command::Switch {
+					create,
+					force,
+					name,
+					start,
+				} => commands::switch::run(&cwd, &name, create, start, force).await,
+				Command::Checkout {
+					force,
+					target,
+					paths,
+				} => commands::checkout::run(&cwd, force, target, paths).await,
+				Command::Restore {
+					worktree,
+					staged,
+					source,
+					paths,
+				} => commands::restore::run(&cwd, worktree, staged, source, paths).await,
+				Command::Reset {
+					soft,
+					mixed,
+					hard,
+					target,
+					paths,
+				} => commands::reset::run(&cwd, soft, mixed, hard, target, paths).await,
+				Command::Rm {
+					cached,
+					force,
+					recursive,
+					dry_run,
+					pathspecs,
+				} => commands::rm::run(&cwd, cached, force, recursive, dry_run, pathspecs).await,
+				Command::Mv {
+					force,
+					dry_run,
+					verbose,
+					paths,
+				} => commands::mv::run(&cwd, force, dry_run, verbose, paths).await,
+				Command::Diff { cached } => commands::diff::run(&cwd, cached).await,
+				Command::Clone {
+					url,
+					path,
+					depth,
+					shallow_since,
+					shallow_exclude,
+				} => commands::clone::run(url, path, depth, shallow_since, shallow_exclude).await,
+				Command::Fetch {
+					tags,
+					no_tags,
+					depth,
+					deepen,
+					unshallow,
+					shallow_since,
+					shallow_exclude,
+				} => commands::fetch::run(
+					&cwd,
+					tags,
+					no_tags,
+					depth,
+					deepen,
+					unshallow,
+					shallow_since,
+					shallow_exclude,
 				)
 				.await
-			}
-			Command::Switch {
-				create,
-				force,
-				name,
-				start,
-			} => commands::switch::run(&cwd, &name, create, start, force).await,
-			Command::Checkout {
-				force,
-				target,
-				paths,
-			} => commands::checkout::run(&cwd, force, target, paths).await,
-			Command::Restore {
-				worktree,
-				staged,
-				source,
-				paths,
-			} => commands::restore::run(&cwd, worktree, staged, source, paths).await,
-			Command::Reset {
-				soft,
-				mixed,
-				hard,
-				target,
-				paths,
-			} => commands::reset::run(&cwd, soft, mixed, hard, target, paths).await,
-			Command::Rm {
-				cached,
-				force,
-				recursive,
-				dry_run,
-				pathspecs,
-			} => commands::rm::run(&cwd, cached, force, recursive, dry_run, pathspecs).await,
-			Command::Mv {
-				force,
-				dry_run,
-				verbose,
-				paths,
-			} => commands::mv::run(&cwd, force, dry_run, verbose, paths).await,
-			Command::Diff { cached } => commands::diff::run(&cwd, cached).await,
-			Command::Clone {
-				url,
-				path,
-				depth,
-				shallow_since,
-				shallow_exclude,
-			} => commands::clone::run(url, path, depth, shallow_since, shallow_exclude).await,
-			Command::Fetch {
-				tags,
-				no_tags,
-				depth,
-				deepen,
-				unshallow,
-				shallow_since,
-				shallow_exclude,
-			} => commands::fetch::run(
-				&cwd,
-				tags,
-				no_tags,
-				depth,
-				deepen,
-				unshallow,
-				shallow_since,
-				shallow_exclude,
-			)
-			.await
-			.map(|_| ()),
-			Command::Pull => commands::pull::run(&cwd).await,
-			Command::Push {
-				repository,
-				refspecs,
-				signed,
-				signing_key,
-				force,
-				atomic,
-				delete,
-				tags,
-				follow_tags,
-			} => {
-				commands::push::run(
-					&cwd,
+				.map(|_| ()),
+				Command::Pull => commands::pull::run(&cwd).await,
+				Command::Push {
 					repository,
 					refspecs,
 					signed,
@@ -830,15 +840,31 @@ impl Cli {
 					delete,
 					tags,
 					follow_tags,
-				)
-				.await
+				} => {
+					commands::push::run(
+						&cwd,
+						repository,
+						refspecs,
+						signed,
+						signing_key,
+						force,
+						atomic,
+						delete,
+						tags,
+						follow_tags,
+					)
+					.await
+				}
+				Command::Remote { verbose, action } => {
+					commands::remote::run(&cwd, remote_action(verbose, action)).await
+				}
+				Command::Trust { action } => commands::trust::run(&cwd, trust_action(action)).await,
+				Command::Worktree { action } => {
+					commands::worktree::run(&cwd, worktree_action(action)).await
+				}
 			}
-			Command::Remote { verbose, action } => {
-				commands::remote::run(&cwd, remote_action(verbose, action)).await
-			}
-			Command::Trust { action } => commands::trust::run(&cwd, trust_action(action)).await,
-			Command::Worktree { action } => commands::worktree::run(&cwd, worktree_action(action)).await,
-		}
+		})
+		.await
 	}
 }
 

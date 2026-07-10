@@ -23,7 +23,7 @@ impl RepoCommand for UpdateRef<'_> {
 		let new = repo.rev_parse(self.value).await?;
 		let current = repo.refs().resolve(self.name).await?;
 		// git logs an update to a logged ref even without `-m`, recording an empty message (no tab).
-		let committer = signature_or_default(&repo, "COMMITTER").await;
+		let committer = signature_or_default(&repo, "COMMITTER").await?;
 		repo
 			.refs()
 			.update_ref(

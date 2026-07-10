@@ -6,12 +6,14 @@
 pub mod commands;
 mod dispatch;
 mod error;
+mod git_config;
 mod identity;
 mod repo;
 mod shallow;
 mod signer;
 
 pub use error::{MergeConflict, SilentExit};
+pub use git_config::with_command_cwd;
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
 
 /// The local file-store backend every command operates over: a [`WorktreeFileStore`], which routes

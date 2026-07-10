@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use gitana_object::HashAlgorithm;
@@ -34,36 +34,47 @@ pub struct Discovered {
 /// directory (a linked worktree created by `git worktree add`); the latter names its shared common
 /// directory via a `commondir` file.
 pub fn discover(start: &Path) -> Result<Discovered> {
+	try_discover(start)?.ok_or_else(|| {
+		anyhow!(
+			"not a gitana repository (or any parent up to /): {}",
+			start.display()
+		)
+	})
+}
+
+/// Like [`discover`], but distinguishes a genuine absence — `Ok(None)`, having walked to the
+/// filesystem root without finding a repository — from a discovery *error* (a malformed `.git` file
+/// or unreadable gitdir), which is propagated. This lets an unscoped `gta config` read fall back to
+/// ambient config only when there truly is no repository, while still aborting on a corrupted one, as
+/// git does.
+pub fn try_discover(start: &Path) -> Result<Option<Discovered>> {
 	let mut dir = start.to_path_buf();
 	loop {
 		let git = dir.join(".git");
 		if git.is_dir() {
-			return Ok(Discovered {
+			return Ok(Some(Discovered {
 				work: Some(dir),
 				common_dir: git.clone(),
 				git_dir: git,
-			});
+			}));
 		}
 		if git.is_file() {
 			let (git_dir, common_dir) = resolve_gitdir_file(&git)?;
-			return Ok(Discovered {
+			return Ok(Some(Discovered {
 				work: Some(dir),
 				git_dir,
 				common_dir,
-			});
+			}));
 		}
 		if is_git_dir(&dir) {
-			return Ok(Discovered {
+			return Ok(Some(Discovered {
 				work: None,
 				common_dir: dir.clone(),
 				git_dir: dir,
-			});
+			}));
 		}
 		if !dir.pop() {
-			bail!(
-				"not a gitana repository (or any parent up to /): {}",
-				start.display()
-			);
+			return Ok(None);
 		}
 	}
 }

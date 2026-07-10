@@ -17,9 +17,9 @@
 use std::ops::Range;
 
 use crate::ConfigError;
-use crate::config::{Element, GitConfig, Section, Variable};
+use crate::source::{Element, GitConfigSource, Section, Variable};
 
-pub(crate) fn parse(text: &str) -> Result<GitConfig, ConfigError> {
+pub(crate) fn parse(text: &str) -> Result<GitConfigSource, ConfigError> {
 	let mut parser = Parser { text, pos: 0 };
 	let mut elements = Vec::new();
 	// The section/subsection in scope, denormalised onto each variable so lookups need no
@@ -79,7 +79,7 @@ pub(crate) fn parse(text: &str) -> Result<GitConfig, ConfigError> {
 		}
 	}
 
-	Ok(GitConfig::from_elements(elements))
+	Ok(GitConfigSource::from_elements(elements))
 }
 
 struct Parser<'a> {

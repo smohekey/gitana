@@ -49,9 +49,10 @@ pub trait Identity {
 	async fn author(&self) -> Result<String>;
 	/// The committer line; errors if no identity is configured.
 	async fn committer(&self) -> Result<String>;
-	/// The committer line, falling back to a placeholder rather than failing — for reflog entries
-	/// (fast-forward, abort) that git records without requiring a configured identity.
-	async fn committer_or_default(&self) -> String;
+	/// The committer line for a reflog entry, defaulting a *missing* identity to a placeholder rather
+	/// than failing — git records these (fast-forward, abort) without a configured identity. It still
+	/// errors if the configuration itself cannot be loaded, so a malformed config aborts the operation.
+	async fn committer_or_default(&self) -> Result<String>;
 }
 
 /// Produces a git-format SSH signature (an `SSHSIG` armor block, git's `git` namespace) over given
@@ -145,9 +146,9 @@ pub(crate) mod test_support {
 			self.asked.set(true);
 			Ok(WHO.to_owned())
 		}
-		async fn committer_or_default(&self) -> String {
+		async fn committer_or_default(&self) -> Result<String> {
 			self.asked.set(true);
-			WHO.to_owned()
+			Ok(WHO.to_owned())
 		}
 	}
 
@@ -162,8 +163,8 @@ pub(crate) mod test_support {
 		async fn committer(&self) -> Result<String> {
 			anyhow::bail!("identity name not set")
 		}
-		async fn committer_or_default(&self) -> String {
-			WHO.to_owned()
+		async fn committer_or_default(&self) -> Result<String> {
+			Ok(WHO.to_owned())
 		}
 	}
 

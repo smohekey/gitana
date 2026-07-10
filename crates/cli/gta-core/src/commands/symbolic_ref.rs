@@ -23,7 +23,7 @@ impl RepoCommand for SymbolicRef<'_> {
 		match self.target {
 			Some(target) => {
 				// git records an empty-message reflog entry when retargeting a logged symref (e.g. HEAD).
-				let committer = signature_or_default(&repo, "COMMITTER").await;
+				let committer = signature_or_default(&repo, "COMMITTER").await?;
 				repo
 					.refs()
 					.set_symbolic(
