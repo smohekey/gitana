@@ -1801,6 +1801,55 @@ fn check_repair(object_format: &str) {
 	std::fs::remove_dir_all(&base).ok();
 }
 
+/// `gta worktree list` matches stock git for a `--separate-git-dir` repository, where the git
+/// directory lives apart from the checkout. git reports the main worktree as the git-dir path — its
+/// `get_main_worktree` strips a trailing `/.git` from the common dir, ignoring the real work tree and
+/// `core.worktree` — and the answer is the same whether listed from the main worktree or a linked
+/// one. Regression guard: the repository-discovery extraction must not reintroduce a vantage-dependent
+/// main-worktree path.
+#[test]
+fn worktree_list_matches_git_for_a_separate_git_dir() {
+	let base = unique_tmp("gta-worktree-sgd");
+	let base_s = base.to_str().unwrap();
+	let gd = base.join("gd");
+	let work = base.join("work");
+	let linked = base.join("linked");
+	let work_s = work.to_str().unwrap();
+	let linked_s = linked.to_str().unwrap();
+
+	// A repo whose git directory is separate from its checkout, plus a linked worktree.
+	git(
+		base_s,
+		&[
+			"init",
+			"-q",
+			&format!("--separate-git-dir={}", gd.display()),
+			work_s,
+		],
+	);
+	git(work_s, &["config", "user.name", "T"]);
+	git(work_s, &["config", "user.email", "t@e"]);
+	git(work_s, &["commit", "-q", "--allow-empty", "-m", "base"]);
+	git(work_s, &["worktree", "add", "-q", linked_s, "-b", "lk"]);
+
+	// The listed paths must match git's, and be the same from every vantage (main and linked).
+	for vantage in [work_s, linked_s] {
+		let want = worktree_paths(&git(vantage, &["worktree", "list"]));
+		let got = worktree_paths(&gta(vantage, &["worktree", "list"], b""));
+		assert_eq!(got, want, "worktree paths differ from vantage {vantage}");
+	}
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// The leading path column of each `worktree list` line.
+fn worktree_paths(listing: &str) -> Vec<String> {
+	listing
+		.lines()
+		.filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+		.collect()
+}
+
 fn gta(dir: &str, args: &[&str], stdin: &[u8]) -> String {
 	let out = assert_cmd::Command::cargo_bin("gta")
 		.unwrap()

@@ -79,7 +79,7 @@ pub async fn run(cwd: &Path, action: Action) -> Result<()> {
 /// Fetch the origin's `git-upload-pack` advertisement and adopt its `refs/gitana/trust` — after
 /// verifying it as a forward-only candidate over the local root — then print the resulting root.
 async fn sync(cwd: &Path, expect: Option<String>) -> Result<()> {
-	let found = repo::discover(cwd)?;
+	let found = repo::discover(cwd).await?;
 	let origin = Origin::load(&found.common_dir)?;
 	let http = ReqwestTransport::new();
 	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
@@ -96,7 +96,7 @@ async fn sync(cwd: &Path, expect: Option<String>) -> Result<()> {
 async fn sync_into<H: HashAlgorithm>(
 	http: &ReqwestTransport,
 	origin: &Origin,
-	found: &repo::Discovered,
+	found: &repo::RepositoryLayout,
 	body: &[u8],
 	expect: Option<String>,
 ) -> Result<()> {

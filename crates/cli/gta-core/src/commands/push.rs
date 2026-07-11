@@ -62,7 +62,7 @@ pub async fn run(
 		specs.push(PushRefspec::parse(&format!(":{target}"))?);
 	}
 
-	let found = repo::discover(cwd)?;
+	let found = repo::discover(cwd).await?;
 	let origin = Origin::load(&found.common_dir)?;
 	let http = ReqwestTransport::new();
 	let body = transport::fetch_advertisement(&http, &origin, "git-receive-pack").await?;
@@ -110,7 +110,7 @@ pub async fn run(
 async fn push_into<H: HashAlgorithm>(
 	http: &ReqwestTransport,
 	origin: &Origin,
-	found: &repo::Discovered,
+	found: &repo::RepositoryLayout,
 	body: &[u8],
 	refspecs: Vec<PushRefspec>,
 	signed: bool,

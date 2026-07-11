@@ -33,7 +33,7 @@ pub async fn run(
 	// matches `git hash-object` in a sha1 repo. Outside any repository, `-w` has nowhere to
 	// write (propagate the discovery error), and a bare compute falls back to sha256 (the
 	// format `gta init` defaults to).
-	match repo::discover(cwd) {
+	match repo::discover(cwd).await {
 		Ok(_) => {
 			dispatch::on_repo(
 				cwd,
@@ -45,13 +45,15 @@ pub async fn run(
 			)
 			.await
 		}
-		Err(error) => {
-			if write {
-				return Err(error);
-			}
+		// Only a genuine absence falls back to a bare (sha256) compute. Corrupt or inaccessible
+		// repository metadata — a broken `.git` file, a malformed `commondir` — is a real error even for
+		// a compute-only run: a `-w` has nowhere to write, and a plain compute could otherwise emit the
+		// wrong-format id for the checkout it is standing in.
+		Err(repo::DiscoveryError::NotFound { .. }) if !write => {
 			println!("{}", Oid::compute(kind, &content));
 			Ok(())
 		}
+		Err(error) => Err(error.into()),
 	}
 }
 

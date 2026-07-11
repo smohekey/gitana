@@ -1793,6 +1793,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitana-repository-layout"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "gitana-trust"
 version = "0.1.0"
 dependencies = [
@@ -1870,6 +1879,7 @@ dependencies = [
  "gitana-porcelain",
  "gitana-remote",
  "gitana-repository",
+ "gitana-repository-layout",
  "gitana-trust",
  "gitana-worktree",
  "sha2",

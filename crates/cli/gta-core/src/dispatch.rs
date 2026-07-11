@@ -15,7 +15,7 @@ use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
 
 use crate::Backend;
-use crate::repo::{self, Discovered};
+use crate::repo::{self, RepositoryLayout};
 
 /// Read a repository's object-hash algorithm from `<common_dir>/config` without committing to a
 /// type. `common_dir` is the repository's shared git directory (the same as the git directory for
@@ -54,7 +54,7 @@ pub trait WorkTreeCommand {
 /// Discover the repository containing `cwd`, then run `command` under the repo's hash
 /// algorithm. The single runtime→type bridge for object-graph commands.
 pub async fn on_repo<C: RepoCommand>(cwd: &Path, command: C) -> Result<()> {
-	let found = repo::discover(cwd)?;
+	let found = repo::discover(cwd).await?;
 	match detect_algorithm(&found.common_dir)? {
 		HashKind::Sha1 => command.run(open::<Sha1>(&found).await?).await,
 		HashKind::Sha256 => command.run(open::<Sha256>(&found).await?).await,
@@ -64,8 +64,8 @@ pub async fn on_repo<C: RepoCommand>(cwd: &Path, command: C) -> Result<()> {
 /// Discover the working tree containing `cwd`, then run `command` under the repo's hash
 /// algorithm. Errors in a bare repository (no work tree).
 pub async fn on_worktree<C: WorkTreeCommand>(cwd: &Path, command: C) -> Result<()> {
-	let (found, prefix) = repo::discover_worktree_with_prefix(cwd)?;
-	let work = found.work.clone().expect("discovered work tree");
+	let (found, prefix) = repo::discover_worktree_with_prefix(cwd).await?;
+	let work = found.worktree_root.clone().expect("discovered work tree");
 	let work = repo::open_work_dir(&work)?;
 	match detect_algorithm(&found.common_dir)? {
 		HashKind::Sha1 => {
@@ -82,7 +82,7 @@ pub async fn on_worktree<C: WorkTreeCommand>(cwd: &Path, command: C) -> Result<(
 /// Open the discovered repository under `H`, routing per-worktree and shared files correctly.
 /// [`repo::open_generic`] installs the effective (merged) config as it opens, so every command
 /// dispatched here reads git's global/system layers for the keys git resolves that way.
-async fn open<H: HashAlgorithm>(found: &Discovered) -> Result<Repository<Backend, H>> {
+async fn open<H: HashAlgorithm>(found: &RepositoryLayout) -> Result<Repository<Backend, H>> {
 	repo::open_generic::<H>(&found.git_dir, &found.common_dir).await
 }
 
@@ -100,7 +100,7 @@ pub trait ObjectCommand {
 /// Resolve `spec` to an object in the repository containing `cwd`, then run `command`
 /// under the repo's hash algorithm.
 pub async fn on_object<C: ObjectCommand>(cwd: &Path, spec: &str, command: C) -> Result<()> {
-	let found = repo::discover(cwd)?;
+	let found = repo::discover(cwd).await?;
 	match detect_algorithm(&found.common_dir)? {
 		HashKind::Sha1 => {
 			let (repo, oid) = resolve_object::<Sha1>(&found, spec).await?;
@@ -117,13 +117,13 @@ pub async fn on_object<C: ObjectCommand>(cwd: &Path, spec: &str, command: C) -> 
 /// opens the work tree (which holds the index); every other spec resolves against the
 /// repository alone, so object-only lookups do not require a work tree.
 async fn resolve_object<H: HashAlgorithm>(
-	found: &Discovered,
+	found: &RepositoryLayout,
 	spec: &str,
 ) -> Result<(Repository<Backend, H>, ObjectId<H>)> {
 	let repo = open::<H>(found).await?;
 	let oid = if spec.starts_with(':') {
 		let work = found
-			.work
+			.worktree_root
 			.clone()
 			.ok_or_else(|| anyhow!("this operation must be run in a work tree"))?;
 		let work = repo::open_work_dir(&work)?;

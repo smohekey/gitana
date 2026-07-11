@@ -15,7 +15,7 @@ use gitana_worktree::WorkTree;
 
 use crate::dispatch::detect_algorithm;
 use crate::identity::signature_or_default;
-use crate::repo::{self, Discovered};
+use crate::repo::{self, RepositoryLayout};
 use crate::{Backend, WorkDir};
 
 /// A `gta worktree` operation.
@@ -87,19 +87,19 @@ pub async fn run(cwd: &Path, action: Action) -> Result<()> {
 		}
 		Action::List { porcelain } => list(cwd, porcelain).await,
 		Action::Remove { path, force } => remove(cwd, &path, force).await,
-		Action::Lock { path, reason } => lock(cwd, &path, reason.as_deref()),
-		Action::Unlock { path } => unlock(cwd, &path),
+		Action::Lock { path, reason } => lock(cwd, &path, reason.as_deref()).await,
+		Action::Unlock { path } => unlock(cwd, &path).await,
 		Action::Prune {
 			dry_run,
 			verbose,
 			expire,
-		} => prune(cwd, dry_run, verbose, expire.as_deref()),
+		} => prune(cwd, dry_run, verbose, expire.as_deref()).await,
 		Action::Move {
 			worktree,
 			new_path,
 			force,
-		} => move_worktree(cwd, &worktree, &new_path, force),
-		Action::Repair { paths } => repair(cwd, &paths),
+		} => move_worktree(cwd, &worktree, &new_path, force).await,
+		Action::Repair { paths } => repair(cwd, &paths).await,
 	}
 }
 
@@ -115,7 +115,7 @@ async fn add(
 	force_branch: bool,
 	detach: bool,
 ) -> Result<()> {
-	let found = repo::discover(cwd)?;
+	let found = repo::discover(cwd).await?;
 	let target = absolute(cwd, path);
 	// git refuses an existing, non-empty destination (an empty directory is fine).
 	if target.exists() && dir_non_empty(&target)? {
@@ -141,7 +141,7 @@ async fn add(
 }
 
 async fn add_generic<H: HashAlgorithm>(
-	found: &Discovered,
+	found: &RepositoryLayout,
 	target: &Path,
 	commit_ish: Option<&str>,
 	branch: Option<&str>,
@@ -513,7 +513,7 @@ fn report_add<H: HashAlgorithm>(label: &Label, commit: Option<ObjectId<H>>) {
 // ---------------------------------------------------------------------------
 
 async fn list(cwd: &Path, porcelain: bool) -> Result<()> {
-	let found = repo::discover(cwd)?;
+	let found = repo::discover(cwd).await?;
 	let entries = match detect_algorithm(&found.common_dir)? {
 		HashKind::Sha1 => collect::<Sha1>(&found.common_dir).await?,
 		HashKind::Sha256 => collect::<Sha256>(&found.common_dir).await?,
@@ -729,7 +729,7 @@ fn render_porcelain(entries: &[WorktreeInfo]) -> String {
 // ---------------------------------------------------------------------------
 
 async fn remove(cwd: &Path, path: &Path, force: u8) -> Result<()> {
-	let found = repo::discover(cwd)?;
+	let found = repo::discover(cwd).await?;
 	let common = &found.common_dir;
 	// Resolve by git's rules (exact path, then a unique name/id suffix). The checkout may already be
 	// gone (deleted or moved) — git still cleans up such a stale entry — so `find_worktree` matches on
@@ -852,8 +852,8 @@ fn checkout_points_to(gitfile: &Path, admin: &Path) -> bool {
 
 /// Lock the worktree named by `arg` (git `worktree lock`): write `<admin>/locked`, holding the reason
 /// if one is given. A locked worktree resists `prune` and needs a second `-f` to `remove`.
-fn lock(cwd: &Path, arg: &Path, reason: Option<&str>) -> Result<()> {
-	let found = repo::discover(cwd)?;
+async fn lock(cwd: &Path, arg: &Path, reason: Option<&str>) -> Result<()> {
+	let found = repo::discover(cwd).await?;
 	let admin = resolve_lockable(&found.common_dir, cwd, arg)?;
 	// git refuses to re-lock an already-locked worktree, echoing the existing reason.
 	if let Some(existing) = read_lock_reason(&admin) {
@@ -873,8 +873,8 @@ fn lock(cwd: &Path, arg: &Path, reason: Option<&str>) -> Result<()> {
 }
 
 /// Unlock the worktree named by `arg` (git `worktree unlock`): remove `<admin>/locked`.
-fn unlock(cwd: &Path, arg: &Path) -> Result<()> {
-	let found = repo::discover(cwd)?;
+async fn unlock(cwd: &Path, arg: &Path) -> Result<()> {
+	let found = repo::discover(cwd).await?;
 	let admin = resolve_lockable(&found.common_dir, cwd, arg)?;
 	if read_lock_reason(&admin).is_none() {
 		bail!("'{}' is not locked", arg.display());
@@ -906,8 +906,8 @@ fn resolve_lockable(common: &Path, cwd: &Path, arg: &Path) -> Result<PathBuf> {
 /// `gitdir` whose target `.git` file is gone, marks the entry stale. When stale, `--expire` keeps it
 /// if its per-worktree `index` is newer than the cutoff (git compares the `index` mtime). `dry_run`
 /// (`-n`) reports without removing; each removal is reported to stderr when `dry_run` or `verbose`.
-fn prune(cwd: &Path, dry_run: bool, verbose: bool, expire: Option<&str>) -> Result<()> {
-	let found = repo::discover(cwd)?;
+async fn prune(cwd: &Path, dry_run: bool, verbose: bool, expire: Option<&str>) -> Result<()> {
+	let found = repo::discover(cwd).await?;
 	let common = &found.common_dir;
 	// Default (no `--expire`): remove every stale worktree — git uses an effectively-infinite cutoff.
 	let cutoff = match expire {
@@ -1083,8 +1083,8 @@ fn parse_relative_span(spec: &str) -> Option<u64> {
 /// flag — two forces move a locked worktree, one moves onto a path still registered to a since-deleted
 /// worktree. git's destination rule matches `mv`: when `new_path` is an existing directory the checkout
 /// moves *into* it under its own basename, otherwise `new_path` is the literal target.
-fn move_worktree(cwd: &Path, worktree: &Path, new_path: &Path, force: u8) -> Result<()> {
-	let found = repo::discover(cwd)?;
+async fn move_worktree(cwd: &Path, worktree: &Path, new_path: &Path, force: u8) -> Result<()> {
+	let found = repo::discover(cwd).await?;
 	let common = &found.common_dir;
 	let (admin, source) = match find_worktree(common, cwd, worktree) {
 		Some(WorktreeRef::Main { .. }) => bail!("'{}' is a main working tree", worktree.display()),
@@ -1233,15 +1233,15 @@ fn move_worktree(cwd: &Path, worktree: &Path, new_path: &Path, force: u8) -> Res
 /// The admin directory is the stable anchor — it lives under the common dir, which discovery resolves
 /// reliably — so even a checkout whose relative `.git` pointer is stale at a new depth is matched by the
 /// admin *name* (the pointer's final component) and fully repaired, both pointers, as git does.
-fn repair(cwd: &Path, paths: &[PathBuf]) -> Result<()> {
-	let found = repo::discover(cwd)?;
+async fn repair(cwd: &Path, paths: &[PathBuf]) -> Result<()> {
+	let found = repo::discover(cwd).await?;
 	let common = &found.common_dir;
 
 	// Pass 1 — reconcile each given checkout with the admin its `.git` file names. The no-arg default is
 	// the discovered worktree *root* (not the raw cwd, which may be a subdirectory of a moved checkout).
 	if paths.is_empty() {
 		// `work` is `None` only in a bare repo, which has no linked checkout to repair from here.
-		if let Some(root) = &found.work
+		if let Some(root) = &found.worktree_root
 			&& let Some(admin) = admin_for_checkout(common, root)
 		{
 			reconcile(&admin, root)?;

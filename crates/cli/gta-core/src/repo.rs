@@ -1,5 +1,11 @@
-//! Local repository discovery and construction.
+//! Local repository construction over the reusable [`gitana_repository_layout`] discovery API.
+//!
+//! Discovery itself — walking up to a repository, resolving `.git` files, `commondir`, and bare
+//! repositories to a canonical [`RepositoryLayout`] — lives in `gitana-repository-layout` and is re-exported
+//! here. This module keeps the gta-specific pieces: minting filesystem capabilities from the
+//! discovered paths, installing git's effective config, and the worktree-checkout guards.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
@@ -13,114 +19,7 @@ use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
 
 use crate::{Backend, WorkDir};
 
-/// A discovered repository: where its working tree, its (possibly per-worktree) git directory, and
-/// its shared *common* directory live.
-pub struct Discovered {
-	/// The working-tree root, or `None` for a bare repository.
-	pub work: Option<PathBuf>,
-	/// The git directory holding this checkout's per-worktree files (`HEAD`, `index`, ...). For an
-	/// ordinary repository this is `<work>/.git`; for a linked worktree it is
-	/// `<main>/.git/worktrees/<name>`.
-	pub git_dir: PathBuf,
-	/// The shared directory holding `objects`, `refs`, `config`, ... For an ordinary repository this
-	/// equals `git_dir`; for a linked worktree it is the main `.git`.
-	pub common_dir: PathBuf,
-}
-
-/// Walk up from `start` to find a repository: the nearest ancestor with a `.git` entry (its work
-/// tree), or a directory that is itself a git directory (a bare repo).
-///
-/// `.git` may be a directory (an ordinary repository) or a file pointing at a per-worktree git
-/// directory (a linked worktree created by `git worktree add`); the latter names its shared common
-/// directory via a `commondir` file.
-pub fn discover(start: &Path) -> Result<Discovered> {
-	try_discover(start)?.ok_or_else(|| {
-		anyhow!(
-			"not a gitana repository (or any parent up to /): {}",
-			start.display()
-		)
-	})
-}
-
-/// Like [`discover`], but distinguishes a genuine absence — `Ok(None)`, having walked to the
-/// filesystem root without finding a repository — from a discovery *error* (a malformed `.git` file
-/// or unreadable gitdir), which is propagated. This lets an unscoped `gta config` read fall back to
-/// ambient config only when there truly is no repository, while still aborting on a corrupted one, as
-/// git does.
-pub fn try_discover(start: &Path) -> Result<Option<Discovered>> {
-	let mut dir = start.to_path_buf();
-	loop {
-		let git = dir.join(".git");
-		if git.is_dir() {
-			return Ok(Some(Discovered {
-				work: Some(dir),
-				common_dir: git.clone(),
-				git_dir: git,
-			}));
-		}
-		if git.is_file() {
-			let (git_dir, common_dir) = resolve_gitdir_file(&git)?;
-			return Ok(Some(Discovered {
-				work: Some(dir),
-				git_dir,
-				common_dir,
-			}));
-		}
-		if is_git_dir(&dir) {
-			return Ok(Some(Discovered {
-				work: None,
-				common_dir: dir.clone(),
-				git_dir: dir,
-			}));
-		}
-		if !dir.pop() {
-			return Ok(None);
-		}
-	}
-}
-
-/// Resolve a linked worktree's `.git` file to `(git_dir, common_dir)`. The file holds a single
-/// `gitdir: <path>` line naming the per-worktree git directory; that directory holds a `commondir`
-/// file naming the shared common directory (usually relative, e.g. `../..`).
-fn resolve_gitdir_file(git_file: &Path) -> Result<(PathBuf, PathBuf)> {
-	let content = std::fs::read_to_string(git_file)
-		.map_err(|error| anyhow!("reading {}: {error}", git_file.display()))?;
-	let pointer = content
-		.lines()
-		.next()
-		.and_then(|line| line.strip_prefix("gitdir:"))
-		.map(str::trim)
-		.filter(|path| !path.is_empty())
-		.ok_or_else(|| anyhow!("malformed .git file: {}", git_file.display()))?;
-	// git writes an absolute path here; resolve a relative one against the worktree directory.
-	let git_dir = match Path::new(pointer) {
-		path if path.is_absolute() => path.to_path_buf(),
-		path => git_file.parent().unwrap_or(Path::new(".")).join(path),
-	};
-
-	let common_dir = common_dir_of(&git_dir);
-	Ok((git_dir, common_dir))
-}
-
-/// The shared common directory for a (possibly per-worktree) `git_dir`: resolved from its
-/// `commondir` file, or `git_dir` itself when there is none (an ordinary or main git directory).
-fn common_dir_of(git_dir: &Path) -> PathBuf {
-	match std::fs::read_to_string(git_dir.join("commondir")) {
-		Ok(text) => {
-			let common = git_dir.join(text.trim());
-			// `commondir` is typically `../..`; canonicalise so later path comparisons are clean.
-			common.canonicalize().unwrap_or(common)
-		}
-		// No `commondir`: a self-contained git directory shares nothing.
-		Err(_) => git_dir.to_path_buf(),
-	}
-}
-
-/// Whether `dir` is itself a git directory (as a bare repo is): it holds `HEAD`, `objects/`, and
-/// `refs/`.
-fn is_git_dir(dir: &Path) -> bool {
-	dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir()
-}
+pub use gitana_repository_layout::{DiscoveryError, RepositoryLayout, discover, try_discover};
 
 /// The error for a work-tree operation run in a bare repo (or outside a work tree).
 fn work_tree_required() -> anyhow::Error {
@@ -162,18 +61,23 @@ pub fn open_work_dir(work: &Path) -> Result<WorkDir> {
 	Ok(CapWorkDir::from_dir(dir))
 }
 
-/// Discover the working tree containing `start` as a [`Discovered`] plus the pathspec `prefix`,
+/// Discover the working tree containing `start` as a [`RepositoryLayout`] plus the pathspec `prefix`,
 /// without constructing a typed `WorkTree`. The runtime dispatch needs the paths so it can build a
 /// `WorkTree<_, H>` for whichever hash algorithm the repo uses. The prefix is the `/`-joined path
 /// from the work-tree root down to `start` (empty at the root), making pathspecs relative to the
 /// caller's subdirectory, the way `git -C <subdir>` does.
-pub fn discover_worktree_with_prefix(start: &Path) -> Result<(Discovered, String)> {
+pub async fn discover_worktree_with_prefix(start: &Path) -> Result<(RepositoryLayout, String)> {
 	// Resolve symlinks before discovering, so the prefix reflects the physical location of the
 	// caller's directory under the work tree (e.g. `-C linksub` where `linksub -> sub`).
-	// Otherwise the lexical name would be matched/recorded as a tracked path.
+	// Otherwise the lexical name would be matched/recorded as a tracked path. Discovery canonicalizes
+	// internally too, so `worktree_root` is a canonical ancestor of this canonical `start` — the strip
+	// below stays purely lexical.
 	let start = std::fs::canonicalize(start)?;
-	let found = discover(&start)?;
-	let work = found.work.as_ref().ok_or_else(work_tree_required)?;
+	let found = discover(&start).await?;
+	let work = found
+		.worktree_root
+		.as_ref()
+		.ok_or_else(work_tree_required)?;
 	// `work` is the canonical `start` with trailing components removed, so this strip succeeds.
 	let prefix = start
 		.strip_prefix(work)
@@ -190,9 +94,11 @@ pub fn discover_worktree_with_prefix(start: &Path) -> Result<(Discovered, String
 /// worktrees at once: the branch ref is shared, so the two checkouts would race when committing.
 ///
 /// `git_dir` is the current checkout's per-worktree git directory, excluded from the scan (switching
-/// to the branch this worktree is already on is not a conflict).
-pub fn branch_checked_out_elsewhere(git_dir: &Path, branch: &str) -> Option<PathBuf> {
-	branch_checkout_location(&common_dir_of(git_dir), branch, Some(git_dir))
+/// to the branch this worktree is already on is not a conflict). Errors if `git_dir`'s `commondir` is
+/// corrupt (rather than silently treating the repository as self-contained).
+pub async fn branch_checked_out_elsewhere(git_dir: &Path, branch: &str) -> Result<Option<PathBuf>> {
+	let common_dir = gitana_repository_layout::common_dir_of(git_dir).await?;
+	Ok(branch_checkout_location(&common_dir, branch, Some(git_dir)))
 }
 
 /// The working directory of a worktree (the main one, or a linked one under `common_dir`) whose
@@ -264,8 +170,15 @@ fn head_symbolic_target(git_dir: &Path) -> Option<String> {
 		})
 }
 
-/// The working directory for a worktree named by its git directory: the parent of the `.git` file a
-/// linked worktree's `gitdir` points at, or the parent of the main `.git`.
+/// The working directory for a worktree named by its git directory, matching git's own resolution:
+///
+/// - A **linked** worktree's admin directory carries a `gitdir` backlink to the worktree's `.git`
+///   file; its parent is the working directory (git's `get_linked_worktree`).
+/// - The **main** worktree is the common directory with a trailing `/.git` stripped (git's
+///   `get_main_worktree`): an ordinary `<work>/.git` yields `<work>`, while a git directory detached
+///   from its work tree — `--separate-git-dir` or a symlinked `.git`, canonicalized by discovery —
+///   yields the git directory itself. git resolves this from the common directory alone, ignoring the
+///   real working tree and `core.worktree`, so the result is the same from any worktree.
 pub(crate) fn worktree_path_of(git_dir: &Path) -> PathBuf {
 	if let Ok(text) = std::fs::read_to_string(git_dir.join("gitdir")) {
 		// `gitdir` points at the worktree's `.git` file; its parent is the working directory. git may
@@ -281,8 +194,13 @@ pub(crate) fn worktree_path_of(git_dir: &Path) -> PathBuf {
 			return parent.to_path_buf();
 		}
 	}
-	// The main worktree: `git_dir` is `<work>/.git`.
-	git_dir.parent().unwrap_or(git_dir).to_path_buf()
+	// The main worktree: strip a trailing `.git` component from the common (git) directory.
+	if git_dir.file_name() == Some(OsStr::new(".git"))
+		&& let Some(parent) = git_dir.parent()
+	{
+		return parent.to_path_buf();
+	}
+	git_dir.to_path_buf()
 }
 
 /// Whether the repository at `common_dir` is bare (`core.bare`), so it has no main working tree and

@@ -18,7 +18,7 @@ use crate::signer;
 
 /// Pull `HEAD`'s branch from the origin.
 pub async fn run(cwd: &Path) -> Result<()> {
-	let found = repo::discover(cwd)?;
+	let found = repo::discover(cwd).await?;
 	let origin = Origin::load(&found.common_dir)?;
 	let http = ReqwestTransport::new();
 	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
@@ -38,12 +38,12 @@ pub async fn run(cwd: &Path) -> Result<()> {
 async fn pull_into<H: HashAlgorithm>(
 	http: &ReqwestTransport,
 	origin: &Origin,
-	found: &repo::Discovered,
+	found: &repo::RepositoryLayout,
 	body: &[u8],
 	cwd: &Path,
 ) -> Result<()> {
 	let work = found
-		.work
+		.worktree_root
 		.clone()
 		.context("cannot pull in a bare repository")?;
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir).await?;

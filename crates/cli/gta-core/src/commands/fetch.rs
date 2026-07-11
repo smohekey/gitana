@@ -40,7 +40,7 @@ pub async fn run(
 		shallow_since.as_deref(),
 		shallow_exclude,
 	)?;
-	let found = repo::discover(cwd)?;
+	let found = repo::discover(cwd).await?;
 	let origin = Origin::load(&found.common_dir)?;
 	let http = ReqwestTransport::new();
 	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
@@ -67,7 +67,7 @@ pub async fn run(
 async fn fetch_into<H: HashAlgorithm>(
 	http: &ReqwestTransport,
 	origin: &Origin,
-	found: &repo::Discovered,
+	found: &repo::RepositoryLayout,
 	body: &[u8],
 	tags: TagFetch,
 	deepen: &Deepen,

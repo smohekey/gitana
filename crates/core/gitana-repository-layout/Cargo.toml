@@ -1,0 +1,18 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "gitana-repository-layout"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

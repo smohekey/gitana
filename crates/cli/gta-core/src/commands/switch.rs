@@ -81,7 +81,9 @@ impl WorkTreeCommand for Switch<'_> {
 		// A branch's ref is shared across a repository's worktrees, so git forbids checking the same
 		// branch out in two of them at once (their commits would race on one ref). Refuse before
 		// touching the working tree, as git does.
-		if let Some(other) = crate::repo::branch_checked_out_elsewhere(worktree.git_dir(), &branch) {
+		if let Some(other) =
+			crate::repo::branch_checked_out_elsewhere(worktree.git_dir(), &branch).await?
+		{
 			bail!(
 				"'{}' is already checked out at '{}'",
 				self.name,

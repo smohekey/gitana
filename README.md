@@ -205,6 +205,10 @@ Implemented command groups:
 - `crates/core/gitana-trust`: Pure trust core — verifies SSHSIG- and OpenPGP-signed
   commits and tags against trusted keys, and folds the `refs/gitana/trust` commit chain
   (via an `ObjectSource` capability) into the effective trust root.
+- `crates/core/gitana-repository-layout`: Ambient, native-only repository discovery — walks up
+  to the containing repository (ordinary, linked worktree, or bare) and resolves its
+  canonical layout (`RepositoryLayout`: worktree root, git dir, common dir). Reads only the
+  filesystem — no `git` subprocess, config, or network.
 - `crates/cli/gta-core`: Shared command implementations.
 - `crates/cli/gta`: User-facing CLI.
 - `crates/cli/gta-mcp`: MCP wrapper around the same command surface.
