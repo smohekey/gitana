@@ -100,7 +100,7 @@ async fn sync_into<H: HashAlgorithm>(
 	body: &[u8],
 	expect: Option<String>,
 ) -> Result<()> {
-	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
+	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir).await?;
 	let identity = CliIdentity::new(&repository);
 	// On a first-use bootstrap, `trust_sync` asks whether to adopt the unseen root; the fast-forward
 	// path never calls this. `--expect` pins the anchor for a non-interactive decision; otherwise a

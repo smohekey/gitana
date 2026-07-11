@@ -1224,6 +1224,83 @@ fn config_rejects_missing_dash_c_dir() {
 	std::fs::remove_dir_all(&gdir).ok();
 }
 
+/// A global `core.logallrefupdates` governs the engine's reflog writes, not just a local setting.
+/// The discriminator: a *non-bare* repo defaults to reflogs **enabled**, so a global `false` can only
+/// suppress `.git/logs/HEAD` if the reflog policy reads git's merged config. Without global-awareness
+/// gitana would see no local setting, fall back to the non-bare default, and wrongly write the reflog.
+/// Cross-checked against stock git, which reads the same merged key.
+#[test]
+fn global_logallrefupdates_governs_core_reflog_writes() {
+	let home = unique_tmp("gta-global-reflog-home");
+	let global = home.join(".gitconfig");
+	std::fs::write(
+		&global,
+		"[user]\n\tname = A U Thor\n\temail = a@example.com\n[core]\n\tlogallrefupdates = false\n",
+	)
+	.unwrap();
+	let env = &[("GIT_CONFIG_GLOBAL", global.to_str().unwrap())];
+
+	// gta and stock git, given the same global config, must reach the same reflog decision.
+	for tool in ["gta", "git"] {
+		let work = unique_tmp(&format!("gta-global-reflog-{tool}"));
+		let w = work.to_str().unwrap();
+		std::fs::write(work.join("a.txt"), b"hello\n").unwrap();
+		let run = |args: &[&str]| {
+			let out = if tool == "gta" {
+				gta_env(w, args, env)
+			} else {
+				git_env(w, args, env)
+			};
+			assert!(
+				out.status.success(),
+				"{tool} {args:?} failed: {}",
+				String::from_utf8_lossy(&out.stderr)
+			);
+		};
+		run(&["init"]);
+		run(&["add", "a.txt"]);
+		run(&["commit", "-m", "c"]);
+		assert!(
+			!work.join(".git/logs/HEAD").exists(),
+			"{tool}: a global core.logallrefupdates=false must suppress the HEAD reflog"
+		);
+		std::fs::remove_dir_all(&work).ok();
+	}
+	std::fs::remove_dir_all(&home).ok();
+}
+
+/// Regression guard for the raw-local boundary: repository *format* is repo-local identity, read raw
+/// from `.git/config` (never the merged stack), so a global `extensions.objectformat = sha256` must
+/// not make a sha1 repo behave as sha256. The effective-config plumbing must never reach the
+/// format-detection path.
+#[test]
+fn global_objectformat_does_not_change_repo_format() {
+	let home = unique_tmp("gta-global-objfmt-home");
+	let global = home.join(".gitconfig");
+	std::fs::write(&global, "[extensions]\n\tobjectformat = sha256\n").unwrap();
+	let env = &[("GIT_CONFIG_GLOBAL", global.to_str().unwrap())];
+
+	let work = unique_tmp("gta-global-objfmt");
+	let w = work.to_str().unwrap();
+	assert!(
+		gta_env(w, &["init", "--object-format=sha1"], env)
+			.status
+			.success(),
+		"init --object-format=sha1 should succeed"
+	);
+	std::fs::write(work.join("a.txt"), b"hi\n").unwrap();
+	// hash-object must produce a **sha1** (40-hex) id: the global sha256 override must not leak into
+	// the repo's format. A 64-hex id would mean the format read consulted the merged config.
+	let oid = ok_stdout(gta_env(w, &["hash-object", "a.txt"], env));
+	assert_eq!(
+		oid.trim().len(),
+		40,
+		"expected a sha1 (40-hex) object id, got {oid:?} — global objectformat leaked into repo format"
+	);
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&home).ok();
+}
+
 /// The environment an isolated config test clears before applying its own, so a resolved identity or
 /// value comes only from the config files under test — never from the runner's identity env or its
 /// real `~/.gitconfig` / system config. Tests re-supply exactly what they want (`HOME`,

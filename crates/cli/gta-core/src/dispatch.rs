@@ -56,8 +56,8 @@ pub trait WorkTreeCommand {
 pub async fn on_repo<C: RepoCommand>(cwd: &Path, command: C) -> Result<()> {
 	let found = repo::discover(cwd)?;
 	match detect_algorithm(&found.common_dir)? {
-		HashKind::Sha1 => command.run(open::<Sha1>(&found)?).await,
-		HashKind::Sha256 => command.run(open::<Sha256>(&found)?).await,
+		HashKind::Sha1 => command.run(open::<Sha1>(&found).await?).await,
+		HashKind::Sha256 => command.run(open::<Sha256>(&found).await?).await,
 	}
 }
 
@@ -69,19 +69,21 @@ pub async fn on_worktree<C: WorkTreeCommand>(cwd: &Path, command: C) -> Result<(
 	let work = repo::open_work_dir(&work)?;
 	match detect_algorithm(&found.common_dir)? {
 		HashKind::Sha1 => {
-			let wt = WorkTree::new(open::<Sha1>(&found)?, work, found.git_dir);
+			let wt = WorkTree::new(open::<Sha1>(&found).await?, work, found.git_dir);
 			command.run(wt, prefix).await
 		}
 		HashKind::Sha256 => {
-			let wt = WorkTree::new(open::<Sha256>(&found)?, work, found.git_dir);
+			let wt = WorkTree::new(open::<Sha256>(&found).await?, work, found.git_dir);
 			command.run(wt, prefix).await
 		}
 	}
 }
 
 /// Open the discovered repository under `H`, routing per-worktree and shared files correctly.
-fn open<H: HashAlgorithm>(found: &Discovered) -> Result<Repository<Backend, H>> {
-	repo::open_generic::<H>(&found.git_dir, &found.common_dir)
+/// [`repo::open_generic`] installs the effective (merged) config as it opens, so every command
+/// dispatched here reads git's global/system layers for the keys git resolves that way.
+async fn open<H: HashAlgorithm>(found: &Discovered) -> Result<Repository<Backend, H>> {
+	repo::open_generic::<H>(&found.git_dir, &found.common_dir).await
 }
 
 /// A command that operates on a single object named by a revision `spec`, written once
@@ -118,14 +120,14 @@ async fn resolve_object<H: HashAlgorithm>(
 	found: &Discovered,
 	spec: &str,
 ) -> Result<(Repository<Backend, H>, ObjectId<H>)> {
-	let repo = open::<H>(found)?;
+	let repo = open::<H>(found).await?;
 	let oid = if spec.starts_with(':') {
 		let work = found
 			.work
 			.clone()
 			.ok_or_else(|| anyhow!("this operation must be run in a work tree"))?;
 		let work = repo::open_work_dir(&work)?;
-		WorkTree::new(open::<H>(found)?, work, found.git_dir.clone())
+		WorkTree::new(open::<H>(found).await?, work, found.git_dir.clone())
 			.rev_parse(spec)
 			.await?
 	} else {

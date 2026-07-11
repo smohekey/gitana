@@ -84,6 +84,11 @@ enum ReflogPolicy {
 /// which fixes the width of the object ids refs resolve to.
 pub struct RefStore<'a, F, H> {
 	files: &'a F,
+	/// The effective (merged) config lent by [`Repository::refs`], borrowed for the store's
+	/// lifetime. `reflog_policy` reads `core.logallrefupdates` from it so a global/system setting is
+	/// honoured; `None` (a store built directly over a file store, as in tests) falls back to the
+	/// raw-local `config` file.
+	effective: Option<&'a gitana_config::GitConfig>,
 	_hash: PhantomData<H>,
 }
 
@@ -96,8 +101,16 @@ where
 	pub fn new(files: &'a F) -> Self {
 		Self {
 			files,
+			effective: None,
 			_hash: PhantomData,
 		}
+	}
+
+	/// Lend the store the effective (merged) config for its reflog-policy read. Called by
+	/// [`Repository::refs`]; a `None` leaves the store on the raw-local `config` fallback.
+	pub fn with_effective_config(mut self, effective: Option<&'a gitana_config::GitConfig>) -> Self {
+		self.effective = effective;
+		self
 	}
 
 	/// Read and parse `HEAD`.
@@ -1068,15 +1081,21 @@ where
 	/// Resolve `core.logAllRefUpdates` from config: `always`, a git boolean, or — unset — git's
 	/// default (on for a non-bare repo, off for a bare one). A missing or unparseable config falls
 	/// back to the non-bare default, as an on-disk gitana repo is never bare-by-omission.
+	///
+	/// `logallrefupdates` follows git's merged precedence when the frontend installed the effective
+	/// config (a global `true` enables reflogs); the `core.bare` fallback stays repo-local, matching
+	/// the rest of gitana — a *global* `core.bare` is a footgun, so it is not honoured.
 	async fn reflog_policy(&self) -> Result<ReflogPolicy, RepositoryError> {
-		let config = match self.files.read_path("config").await {
+		// The repo-local config: the sole source for `core.bare`, and the `logallrefupdates` source
+		// when no effective (merged) config was installed (tests, the wasm sandbox).
+		let local = match self.files.read_path("config").await {
 			Ok(bytes) => std::str::from_utf8(&bytes)
 				.ok()
 				.and_then(|text| gitana_config::GitConfig::parse(text).ok()),
 			Err(FileStoreError::NotFound) => None,
 			Err(other) => return Err(other.into()),
 		};
-		let Some(config) = config else {
+		let Some(config) = self.effective.or(local.as_ref()) else {
 			return Ok(ReflogPolicy::Enabled);
 		};
 		if config
@@ -1088,12 +1107,12 @@ where
 		match config.get_bool("core", None, "logallrefupdates") {
 			Ok(Some(true)) => Ok(ReflogPolicy::Enabled),
 			Ok(Some(false)) => Ok(ReflogPolicy::Disabled),
-			// Unset (or an unparseable value): git's default keys off whether the repo is bare.
+			// Unset (or an unparseable value): git's default keys off whether the repo is bare. Read
+			// `core.bare` from the local config only — a global bare is deliberately not honoured.
 			_ => {
-				let bare = config
-					.get_bool("core", None, "bare")
-					.ok()
-					.flatten()
+				let bare = local
+					.as_ref()
+					.and_then(|c| c.get_bool("core", None, "bare").ok().flatten())
 					.unwrap_or(false);
 				Ok(if bare {
 					ReflogPolicy::Disabled

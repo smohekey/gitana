@@ -131,20 +131,26 @@ fn work_tree_required() -> anyhow::Error {
 /// under `common_dir`, under an explicit hash algorithm `H`. (The two are the same path for an
 /// ordinary, non-linked repository.) The runtime dispatch (see [`crate::dispatch`]) picks `H` from
 /// the repo's config and calls this, so each command body is monomorphised once per algorithm.
-pub fn open_generic<H: HashAlgorithm>(
+///
+/// This is the program edge — the one place gta mints ambient filesystem authority from a path — so
+/// it also assembles git's effective (merged) configuration here ([`crate::git_config`] needs the
+/// same ambient path access) and installs it on the repository. The engine then honours a
+/// global/system `remote.*` / `pack.packSizeLimit` / `core.logallrefupdates`, matching git; a
+/// malformed global/system file aborts the command, as git does. A repo whose local `config` does
+/// not exist yet (a fresh `init`/`clone`) still resolves the global and system layers.
+pub async fn open_generic<H: HashAlgorithm>(
 	git_dir: &Path,
 	common_dir: &Path,
 ) -> Result<Repository<Backend, H>> {
 	// The store is capability-pure: open the (already-created) directories here, at the
-	// program edge, and hand the capabilities in. This is the one place gta mints ambient
-	// filesystem authority from a path.
+	// program edge, and hand the capabilities in.
 	let common = Dir::open_ambient_dir(common_dir, ambient_authority())
 		.map_err(|error| anyhow!("opening {}: {error}", common_dir.display()))?;
 	let git = Dir::open_ambient_dir(git_dir, ambient_authority())
 		.map_err(|error| anyhow!("opening {}: {error}", git_dir.display()))?;
-	Ok(Repository::new(ObjectStore::new(WorktreeFileStore::new(
-		common, git,
-	))))
+	let mut repo = Repository::new(ObjectStore::new(WorktreeFileStore::new(common, git)));
+	repo.set_effective_config(crate::git_config::effective_config(&repo).await?);
+	Ok(repo)
 }
 
 /// Open the working tree at `work` as a filesystem capability. Like [`open_generic`], this is a

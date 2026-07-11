@@ -151,7 +151,7 @@ async fn add_generic<H: HashAlgorithm>(
 	let common = &found.common_dir;
 	// Resolve the start point and the checkout mode against the *current* repository (its refs and
 	// objects are shared with the new worktree, so either repo resolves them identically).
-	let repo = repo::open_generic::<H>(&found.git_dir, common)?;
+	let repo = repo::open_generic::<H>(&found.git_dir, common).await?;
 	let plan = plan_checkout::<H>(&repo, target, commit_ish, branch, force_branch, detach).await?;
 
 	// The admin directory name is the destination's basename, uniquified against existing worktrees
@@ -226,7 +226,7 @@ async fn add_generic<H: HashAlgorithm>(
 	// Open the new worktree (per-worktree files under `admin`, shared files under `common`) and
 	// materialise the checkout. An orphan worktree has no commit, so it is left empty (as git does).
 	if let Some(commit) = plan.commit {
-		let new_repo = repo::open_generic::<H>(&admin, common)?;
+		let new_repo = repo::open_generic::<H>(&admin, common).await?;
 		let work: WorkDir = repo::open_work_dir(target)?;
 		let worktree = WorkTree::new(new_repo, work, admin.clone());
 		let tree = worktree.repository().commit_tree(commit).await?;
@@ -549,7 +549,7 @@ enum State {
 /// Gather the worktrees: the main worktree first (the bare repository itself when bare), then each
 /// linked worktree under `<common>/worktrees/*`, sorted by admin-directory name (git's order).
 async fn collect<H: HashAlgorithm>(common: &Path) -> Result<Vec<WorktreeInfo>> {
-	let repo = repo::open_generic::<H>(common, common)?;
+	let repo = repo::open_generic::<H>(common, common).await?;
 	let mut out = Vec::new();
 
 	if repo::is_bare(common) {
@@ -805,7 +805,7 @@ async fn remove(cwd: &Path, path: &Path, force: u8) -> Result<()> {
 /// Whether the worktree checked out at `target` (per-worktree files under `admin`) has staged,
 /// unstaged, or untracked changes — anything git counts as "modified or untracked".
 async fn is_dirty<H: HashAlgorithm>(common: &Path, admin: &Path, target: &Path) -> Result<bool> {
-	let repo = repo::open_generic::<H>(admin, common)?;
+	let repo = repo::open_generic::<H>(admin, common).await?;
 	let work: WorkDir = repo::open_work_dir(target)?;
 	let worktree = WorkTree::new(repo, work, admin.to_path_buf());
 	let status = worktree.status().await?;

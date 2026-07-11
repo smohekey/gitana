@@ -31,12 +31,14 @@ pub async fn run(target: PathBuf, object_format: &str) -> Result<()> {
 	// dispatches on the requested format and writes a config matching it.
 	match kind {
 		HashKind::Sha1 => {
-			repo::open_generic::<Sha1>(&git_dir, &git_dir)?
+			repo::open_generic::<Sha1>(&git_dir, &git_dir)
+				.await?
 				.init()
 				.await?
 		}
 		HashKind::Sha256 => {
-			repo::open_generic::<Sha256>(&git_dir, &git_dir)?
+			repo::open_generic::<Sha256>(&git_dir, &git_dir)
+				.await?
 				.init()
 				.await?
 		}

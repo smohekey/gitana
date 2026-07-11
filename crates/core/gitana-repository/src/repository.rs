@@ -15,6 +15,13 @@ use crate::{Config, HeadState, RefStore, ReflogIntent, RepositoryError, TreeBuil
 /// local wiring.
 pub struct Repository<F, H: HashAlgorithm> {
 	objects: ObjectStore<F, H>,
+	/// The effective (merged) configuration — the repo-local `.git/config` underlaid with git's
+	/// global and system files — injected by the frontend after opening. The engine cannot assemble
+	/// it (its file store is scoped to the git dir, with no reach to `~/.gitconfig` or
+	/// `/etc/gitconfig`), so a caller with ambient path access sets it. `None` on a bare engine
+	/// (tests, the wasm sandbox): [`Repository::effective_config`] then falls back to the raw-local
+	/// [`Repository::read_config`], honestly reflecting that no ambient config is available.
+	effective: Option<gitana_config::GitConfig>,
 }
 
 impl<F, H> Repository<F, H>
@@ -24,7 +31,10 @@ where
 {
 	/// Wrap a repo-scoped object store as a repository.
 	pub fn new(objects: ObjectStore<F, H>) -> Self {
-		Self { objects }
+		Self {
+			objects,
+			effective: None,
+		}
 	}
 
 	/// The object store (read/write objects, packs).
@@ -32,9 +42,20 @@ where
 		&self.objects
 	}
 
-	/// The ref store (HEAD, branches, tags).
+	/// Install the effective (merged) configuration, resolved by the frontend across git's
+	/// precedence stack (system → global → local, plus any `-c` overlay). Once set,
+	/// [`Repository::effective_config`] and the [`RefStore`] (via [`Repository::refs`]) read the
+	/// merged view for the keys git resolves that way. It does **not** replace
+	/// [`Repository::read_config`], which stays raw-local so a `gta config --local` read-modify-write
+	/// never folds global entries into `.git/config`.
+	pub fn set_effective_config(&mut self, config: gitana_config::GitConfig) {
+		self.effective = Some(config);
+	}
+
+	/// The ref store (HEAD, branches, tags), lent the effective config so reflog-policy reads
+	/// (`core.logallrefupdates`) honour git's merged precedence when the frontend has installed it.
 	pub fn refs(&self) -> RefStore<'_, F, H> {
-		RefStore::new(self.objects.file_store())
+		RefStore::new(self.objects.file_store()).with_effective_config(self.effective.as_ref())
 	}
 
 	/// Write the metadata files for a fresh repo: a `config` matching the hash algorithm
@@ -89,7 +110,11 @@ where
 		crate::revision::try_peel_to_commit(self, id).await
 	}
 
-	/// Read and parse the full git `config` file.
+	/// Read and parse the repository-local `config` file. This is the **raw-local** view — it never
+	/// includes the global/system layers even when an effective config has been installed — so the
+	/// `gta config --local` read-modify-write path and any repo-format read stay confined to
+	/// `.git/config`. For the keys git resolves across its precedence stack, use
+	/// [`Repository::effective_config`].
 	pub async fn read_config(&self) -> Result<gitana_config::GitConfig, RepositoryError> {
 		let bytes = self.objects.file_store().read_path("config").await?;
 		let text = std::str::from_utf8(&bytes)
@@ -98,13 +123,24 @@ where
 			.map_err(|error| RepositoryError::UnsupportedFormat(error.to_string()))
 	}
 
+	/// The effective configuration git would resolve for keys it reads across its precedence stack —
+	/// the frontend-installed merged view ([`Repository::set_effective_config`]) if present, else the
+	/// raw-local [`Repository::read_config`]. Used for `remote.*`, `pack.packSizeLimit`, and (via the
+	/// [`RefStore`]) `core.logallrefupdates`, which git honours from a global/system setting.
+	pub async fn effective_config(&self) -> Result<gitana_config::GitConfig, RepositoryError> {
+		match &self.effective {
+			Some(config) => Ok(config.clone()),
+			None => self.read_config().await,
+		}
+	}
+
 	/// The maximum pack size `repack` should target (`pack.packSizeLimit`), clamped to
 	/// `[1 MiB, MAX_PACK_SIZE]`. Unset or non-positive falls back to `MAX_PACK_SIZE`, i.e. a single
 	/// pack. Blob-store or memory-constrained deployments set a lower value to split into several
 	/// packs.
 	pub async fn pack_size_limit(&self) -> Result<u64, RepositoryError> {
 		const MIN_PACK_SIZE: u64 = 1 << 20;
-		let config = self.read_config().await?;
+		let config = self.effective_config().await?;
 		let configured = config
 			.get_int("pack", None, "packsizelimit")
 			.map_err(|error| {

@@ -63,7 +63,7 @@ pub async fn run(
 	// git's reflog writes do. Resolved before `repo` moves into clone.
 	match kind {
 		HashKind::Sha1 => {
-			let repo = repo::open_generic::<Sha1>(&git_dir, &git_dir)?;
+			let repo = repo::open_generic::<Sha1>(&git_dir, &git_dir).await?;
 			let committer = CliIdentity::new(&repo).committer_or_default().await?;
 			gitana_porcelain::clone(
 				&http,
@@ -80,7 +80,7 @@ pub async fn run(
 			.await?;
 		}
 		HashKind::Sha256 => {
-			let repo = repo::open_generic::<Sha256>(&git_dir, &git_dir)?;
+			let repo = repo::open_generic::<Sha256>(&git_dir, &git_dir).await?;
 			let committer = CliIdentity::new(&repo).committer_or_default().await?;
 			gitana_porcelain::clone(
 				&http,

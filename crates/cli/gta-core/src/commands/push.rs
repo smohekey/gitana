@@ -120,7 +120,7 @@ async fn push_into<H: HashAlgorithm>(
 	tags: PushTags,
 	cwd: &Path,
 ) -> Result<()> {
-	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
+	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir).await?;
 	// A signed push certificate is signed like `commit -S`: the format follows `gpg.format` (unset →
 	// OpenPGP, git's default), and the key is resolved lazily so a "server does not accept signed
 	// pushes" error is not masked by a missing signing key.

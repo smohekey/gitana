@@ -102,7 +102,9 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	let advertised = parse_advertisement::<H>(advertisement)?;
 	let haves = gitana_remote::local_haves(repo).await?;
 
-	let config = repo.read_config().await?;
+	// `remote.origin.*` follows git's merged precedence, so a globally-configured `tagOpt`/refspec is
+	// honoured (the frontend installs the effective config; a bare engine falls back to local).
+	let config = repo.effective_config().await?;
 	// Resolve the effective tag mode: an explicit CLI `--tags` / `--no-tags` (`All` / `None`) wins;
 	// otherwise the default (`Auto`) honors git's `remote.origin.tagOpt` config (`--tags` / `--no-tags`,
 	// set e.g. by `git clone --no-tags`), and only then falls back to auto-follow.
@@ -127,11 +129,14 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	// Which branch *this* worktree has checked out — the one `pull` may advance through its merge, and
 	// the one destination the refusal below exempts under `update_head_ok`. A bare repo has no work tree
 	// (git allows a `+refs/heads/*:refs/heads/*` mirror there), so it names no current branch; `checkouts`
-	// is likewise empty for a bare repo, so nothing is refused.
-	let bare = config
-		.get_bool("core", None, "bare")
+	// is likewise empty for a bare repo, so nothing is refused. `core.bare` is repo identity — read it
+	// from the **local** config only, never the merged view, so a global/system `core.bare` (a footgun)
+	// cannot flip a non-bare worktree into refusing a fetch into its own branch (or vice versa).
+	let bare = repo
+		.read_config()
+		.await
 		.ok()
-		.flatten()
+		.and_then(|local| local.get_bool("core", None, "bare").ok().flatten())
 		.unwrap_or(false);
 	let checked_out = match (bare, repo.refs().read_head().await?) {
 		(false, HeadState::Symbolic(branch)) => Some(branch),
@@ -504,7 +509,7 @@ pub async fn pull_upstream<F: FileStore, H: HashAlgorithm>(
 	advertisement: &[u8],
 	branch: &str,
 ) -> Result<Option<ObjectId<H>>> {
-	let config = repo.read_config().await?;
+	let config = repo.effective_config().await?;
 	let refspecs = parse_fetch_refspecs(&config)?;
 	let advertised = parse_advertisement::<H>(advertisement)?;
 	let excluded = |name: &str| refspecs.iter().any(|spec| spec.excludes(name));
@@ -1047,7 +1052,7 @@ async fn default_refspecs<F: FileStore, H: HashAlgorithm>(
 	if !refspecs.is_empty() {
 		return Ok(refspecs);
 	}
-	if let Ok(config) = repo.read_config().await {
+	if let Ok(config) = repo.effective_config().await {
 		let configured = config.get_all("remote", Some("origin"), "push");
 		if !configured.is_empty() {
 			return configured.iter().map(|s| PushRefspec::parse(s)).collect();

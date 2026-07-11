@@ -73,7 +73,7 @@ async fn fetch_into<H: HashAlgorithm>(
 	deepen: &Deepen,
 	unshallow: bool,
 ) -> Result<()> {
-	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir)?;
+	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir).await?;
 	// `--unshallow` only makes sense on a shallow repository; git rejects it on a complete one rather
 	// than pointlessly refetch the whole history.
 	if unshallow && repository.read_shallow().await?.is_empty() {
