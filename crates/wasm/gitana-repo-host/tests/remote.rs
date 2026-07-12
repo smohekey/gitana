@@ -19,6 +19,8 @@ use anyhow::{Result, anyhow};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{RawQuery, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use gitana_file_store_local::LocalFileStore;
 use gitana_git_http::{
@@ -27,7 +29,9 @@ use gitana_git_http::{
 };
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 use gitana_repo_host::exports::gitana::repo::porcelain::PushOutcome;
-use gitana_repo_host::{engine, grant_dir, instantiate, store};
+use gitana_repo_host::{
+	StoreFileCredentials, engine, grant_dir, instantiate, store, store_with_credentials,
+};
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 use tokio::net::TcpListener;
 
@@ -122,10 +126,35 @@ async fn receive_pack_srv(State(st): State<ServerState>, body: Bytes) -> Bytes {
 /// Start the server over `git_dir` on an ephemeral port; the listener is bound before this returns,
 /// so there is no startup race with the fetch below.
 async fn serve(git_dir: PathBuf, kind: HashKind) -> String {
+	serve_gated(git_dir, kind, None).await
+}
+
+/// Like [`serve`], but gating every request behind `401 WWW-Authenticate: Basic` unless it presents the
+/// `user:pass` Basic credential — the server side of the in-component credential flow.
+async fn serve_basic_auth(git_dir: PathBuf, kind: HashKind, user: &str, pass: &str) -> String {
+	serve_gated(git_dir, kind, Some((user.to_owned(), pass.to_owned()))).await
+}
+
+/// Bind an ephemeral loopback port and serve `git_dir`, optionally behind a Basic-auth gate; returns
+/// the base URL.
+async fn serve_gated(
+	git_dir: PathBuf,
+	kind: HashKind,
+	basic_auth: Option<(String, String)>,
+) -> String {
+	let expected = basic_auth.map(|(user, pass)| {
+		format!(
+			"Basic {}",
+			base64_encode(format!("{user}:{pass}").as_bytes())
+		)
+	});
 	let app = Router::new()
 		.route("/info/refs", get(info_refs))
 		.route("/git-upload-pack", post(upload_pack))
 		.route("/git-receive-pack", post(receive_pack_srv))
+		.layer(axum::middleware::from_fn(move |req, next| {
+			basic_auth_gate(expected.clone(), req, next)
+		}))
 		.with_state(ServerState { git_dir, kind });
 	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
 	let addr = listener.local_addr().expect("addr");
@@ -133,6 +162,59 @@ async fn serve(git_dir: PathBuf, kind: HashKind) -> String {
 		axum::serve(listener, app).await.expect("serve");
 	});
 	format!("http://{addr}")
+}
+
+/// Reject a request lacking the `expected` `Authorization` header with `401 WWW-Authenticate: Basic`;
+/// `None` means the server is anonymous and every request passes — mirrors an authenticated git
+/// http-backend.
+async fn basic_auth_gate(
+	expected: Option<String>,
+	req: axum::extract::Request,
+	next: axum::middleware::Next,
+) -> Response {
+	if let Some(expected) = expected {
+		let presented = req
+			.headers()
+			.get("authorization")
+			.and_then(|value| value.to_str().ok());
+		if presented != Some(expected.as_str()) {
+			return (
+				StatusCode::UNAUTHORIZED,
+				[("WWW-Authenticate", "Basic realm=\"gitana\"")],
+				"authentication required",
+			)
+				.into_response();
+		}
+	}
+	next.run(req).await
+}
+
+/// Standard base64 (RFC 4648) of `input` — the server side of the Basic-auth oracle, so the harness
+/// needs no base64 dependency of its own.
+fn base64_encode(input: &[u8]) -> String {
+	const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	let mut out = String::new();
+	for chunk in input.chunks(3) {
+		let b = [
+			chunk[0],
+			*chunk.get(1).unwrap_or(&0),
+			*chunk.get(2).unwrap_or(&0),
+		];
+		let group = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+		out.push(ALPHABET[(group >> 18) as usize & 0x3f] as char);
+		out.push(ALPHABET[(group >> 12) as usize & 0x3f] as char);
+		out.push(if chunk.len() > 1 {
+			ALPHABET[(group >> 6) as usize & 0x3f] as char
+		} else {
+			'='
+		});
+		out.push(if chunk.len() > 2 {
+			ALPHABET[group as usize & 0x3f] as char
+		} else {
+			'='
+		});
+	}
+	out
 }
 
 /// The object format `H` names, as a runtime [`HashKind`] for the server state.
@@ -390,4 +472,195 @@ async fn push_refuses_non_fast_forward_sha256() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn push_refuses_non_fast_forward_sha1() {
 	push_refuses_non_fast_forward::<Sha1>().await.unwrap();
+}
+
+// --- HTTP credentials: the host answers the guest's `credentials` import ------------------------
+
+/// The store line granting `alice:s3cr3t` for the ephemeral host `url` names (`http://…@host`), plus the
+/// store-file path — written under `dir` so it lives as long as the fixture.
+fn seed_store(dir: &Path, url: &str) -> Result<PathBuf> {
+	let host = url
+		.strip_prefix("http://")
+		.ok_or_else(|| anyhow!("http url"))?;
+	let store = dir.join("credential-store");
+	std::fs::write(&store, format!("http://alice:s3cr3t@{host}\n"))?;
+	Ok(store)
+}
+
+/// Against a `401`-gated server, the component authenticates the fetch with the credential the host
+/// resolves from its store file — proving the whole path: `AuthTransport` unauth-first → `401` → the WIT
+/// `fill` import → the host's `StoreFileCredentials` → retry with `Authorization: Basic` → `200`.
+async fn fetch_authenticates_via_host_credentials<H: HashAlgorithm>() -> Result<()> {
+	let srv = tempfile::tempdir()?;
+	let server_git = srv.path().join("srv.git");
+	std::fs::create_dir_all(&server_git)?;
+	let server = open::<H>(&server_git);
+	server.init().await?;
+	let tip = commit_file(&server, "hello.txt", b"world\n").await;
+	let url = serve_basic_auth(server_git, kind_of::<H>(), "alice", "s3cr3t").await;
+	let store = seed_store(srv.path(), &url)?;
+
+	// An empty client repo of the same object format.
+	let cli = tempfile::tempdir()?;
+	let client_git = cli.path().join("client.git");
+	std::fs::create_dir_all(&client_git)?;
+	open::<H>(&client_git).init().await?;
+
+	// Fetch through the component, with the host answering credentials from the store file.
+	let mut session =
+		Session::open_with_credentials(&client_git, Box::new(StoreFileCredentials::new(&store)))
+			.await?;
+	let outcome = session
+		.repo
+		.gitana_repo_porcelain()
+		.repository()
+		.call_fetch(&mut session.store, session.handle, &url)
+		.await?
+		.map_err(|error| anyhow!("fetch: {error:?}"))?;
+
+	// The authenticated fetch advanced the tracking ref and the objects landed.
+	assert!(
+		outcome
+			.updated
+			.iter()
+			.any(|r| r.name == "refs/remotes/origin/main" && r.id == tip.to_hex()),
+		"expected refs/remotes/origin/main at {}, got {:?}",
+		tip.to_hex(),
+		outcome.updated
+	);
+	let client = native_repo::<H>(&client_git)?;
+	assert_eq!(
+		client.refs().resolve("refs/remotes/origin/main").await?,
+		Some(tip)
+	);
+	client.commit_tree(tip).await?;
+
+	// The server accepted the credential, so `approve` ran and de-duped rather than appended: the store
+	// still holds exactly the one entry (proof the report path reached the host, not just `fill`).
+	assert_eq!(
+		std::fs::read_to_string(&store)?.lines().count(),
+		1,
+		"approve should leave a single de-duped store entry"
+	);
+	Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_authenticates_sha256() {
+	fetch_authenticates_via_host_credentials::<Sha256>()
+		.await
+		.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_authenticates_sha1() {
+	fetch_authenticates_via_host_credentials::<Sha1>()
+		.await
+		.unwrap();
+}
+
+/// With no credential source granted (the default anonymous `State`), a `401`-gated server's challenge
+/// stands: the component sends nothing to authenticate with, and the fetch fails rather than succeeding.
+async fn fetch_without_credential_leaves_401_standing<H: HashAlgorithm>() -> Result<()> {
+	let srv = tempfile::tempdir()?;
+	let server_git = srv.path().join("srv.git");
+	std::fs::create_dir_all(&server_git)?;
+	let server = open::<H>(&server_git);
+	server.init().await?;
+	commit_file(&server, "hello.txt", b"world\n").await;
+	let url = serve_basic_auth(server_git, kind_of::<H>(), "alice", "s3cr3t").await;
+
+	let cli = tempfile::tempdir()?;
+	let client_git = cli.path().join("client.git");
+	std::fs::create_dir_all(&client_git)?;
+	open::<H>(&client_git).init().await?;
+
+	// The default session grants no credential source — every `fill` yields nothing.
+	let mut session = Session::open(&client_git).await?;
+	let result = session
+		.repo
+		.gitana_repo_porcelain()
+		.repository()
+		.call_fetch(&mut session.store, session.handle, &url)
+		.await?;
+	assert!(
+		result.is_err(),
+		"expected the 401 to stand without a credential, got {result:?}"
+	);
+	// Nothing was fetched: the tracking ref was never created.
+	let client = native_repo::<H>(&client_git)?;
+	assert_eq!(
+		client.refs().resolve("refs/remotes/origin/main").await?,
+		None
+	);
+	Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_without_credential_leaves_401_standing_sha256() {
+	fetch_without_credential_leaves_401_standing::<Sha256>()
+		.await
+		.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_without_credential_leaves_401_standing_sha1() {
+	fetch_without_credential_leaves_401_standing::<Sha1>()
+		.await
+		.unwrap();
+}
+
+/// Clone exercises the credential path through both entry points — the advertisement `GET`
+/// (`clone_negotiate`) and the pack `POST` (`clone`) — so a `401`-gated server is cloned end to end
+/// with the host-resolved credential: objects land, `HEAD` resolves, the working tree materialises.
+async fn clone_authenticates_via_host_credentials<H: HashAlgorithm>() -> Result<()> {
+	let srv = tempfile::tempdir()?;
+	let server_git = srv.path().join("srv.git");
+	std::fs::create_dir_all(&server_git)?;
+	let server = open::<H>(&server_git);
+	server.init().await?;
+	let tip = commit_file(&server, "hello.txt", b"world\n").await;
+	let url = serve_basic_auth(server_git, kind_of::<H>(), "alice", "s3cr3t").await;
+	let store = seed_store(srv.path(), &url)?;
+
+	// An empty client checkout: the working dir and its `.git`, both empty.
+	let cli = tempfile::tempdir()?;
+	let work = cli.path().join("checkout");
+	let git = work.join(".git");
+	std::fs::create_dir_all(&git)?;
+
+	// Clone through the component, the host answering credentials from the store file.
+	let engine = engine()?;
+	let mut store_handle =
+		store_with_credentials(&engine, Box::new(StoreFileCredentials::new(&store)));
+	let repo = instantiate(&engine, &mut store_handle, build_component()).await?;
+	let git_desc = grant_dir(&mut store_handle, &git)?;
+	let work_desc = grant_dir(&mut store_handle, &work)?;
+	repo
+		.gitana_repo_porcelain()
+		.repository()
+		.call_clone(&mut store_handle, git_desc, work_desc, &url)
+		.await?
+		.map_err(|error| anyhow!("clone: {error:?}"))?;
+
+	// The authenticated clone populated the checkout.
+	let client = native_repo::<H>(&git)?;
+	assert_eq!(client.refs().resolve_head().await?, Some(tip));
+	client.commit_tree(tip).await?;
+	assert_eq!(std::fs::read(work.join("hello.txt"))?, b"world\n");
+	Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clone_authenticates_sha256() {
+	clone_authenticates_via_host_credentials::<Sha256>()
+		.await
+		.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clone_authenticates_sha1() {
+	clone_authenticates_via_host_credentials::<Sha1>()
+		.await
+		.unwrap();
 }

@@ -13,7 +13,10 @@ use gitana_file_store_local::LocalFileStore;
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, Tag, encode_tag};
 use gitana_object_store::ObjectStore;
 use gitana_repo_host::exports::gitana::repo::porcelain::{HashKind, RepoError};
-use gitana_repo_host::{Repo, State, engine, grant_dir, instantiate, store};
+use gitana_repo_host::{
+	HostCredentialProvider, Repo, State, engine, grant_dir, instantiate, store,
+	store_with_credentials,
+};
 use gitana_repository::{FileMode, ReflogIntent, Repository, TreeBuildEntry};
 use wasmtime::Store;
 use wasmtime::component::ResourceAny;
@@ -238,6 +241,30 @@ impl Session {
 	pub async fn open(git_dir: &Path) -> Result<Self> {
 		let engine = engine()?;
 		let mut store = store(&engine);
+		let repo = instantiate(&engine, &mut store, build_component()).await?;
+		let dir = grant_dir(&mut store, git_dir)?;
+		let handle = repo
+			.gitana_repo_porcelain()
+			.repository()
+			.call_open(&mut store, dir)
+			.await?
+			.map_err(|error| anyhow!("open: {error:?}"))?;
+		Ok(Self {
+			store,
+			repo,
+			handle,
+		})
+	}
+
+	/// Like [`Session::open`], but granting `credentials` as the host source answering the guest's
+	/// credential import — so a fetch/push against a `401`-gated remote authenticates with what the
+	/// source resolves.
+	pub async fn open_with_credentials(
+		git_dir: &Path,
+		credentials: Box<dyn HostCredentialProvider>,
+	) -> Result<Self> {
+		let engine = engine()?;
+		let mut store = store_with_credentials(&engine, credentials);
 		let repo = instantiate(&engine, &mut store, build_component()).await?;
 		let dir = grant_dir(&mut store, git_dir)?;
 		let handle = repo

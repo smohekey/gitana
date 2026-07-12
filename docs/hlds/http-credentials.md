@@ -225,13 +225,17 @@ preserved verbatim — the component obtains only a credential the host chose to
 Add an import to `world repo`:
 
 ```wit
-// gitana:repo/credentials — the host answers credential requests for the remote porcelain.
+// gitana:repo/credentials — the host answers credential requests for the remote porcelain. As built,
+// the record and callbacks mirror the post-slice-2 native `CredentialProvider`: the request carries
+// `wwwauth` (the 401 challenge) and `approve`/`reject` take the request (a helper keys its store on it).
 interface credentials {
-  record credential-request { protocol: string, host: string, path: option<string>, username: option<string> }
+  record credential-request {
+    protocol: string, host: string, path: option<string>, username: option<string>, wwwauth: list<string>,
+  }
   record credential { username: string, password: string }
   fill: func(request: credential-request) -> option<credential>;
-  approve: func(cred: credential);
-  reject: func(cred: credential);
+  approve: func(request: credential-request, cred: credential);
+  reject: func(request: credential-request, cred: credential);
 }
 world repo {
   import wasi:filesystem/types@0.2.12;
@@ -241,12 +245,14 @@ world repo {
 }
 ```
 
-The host (`gitana-repo-host`) implements the generated `credentials::Host` trait on `State` (three
-methods, canned in the test harness, embedder-supplied in production) and the bindgen adds it to the
-linker — **manual wiring, unlike `wasi:http`**, which gets wasmtime's prebuilt
-`add_only_http_to_linker_async`. That is the one extra cost, and it is modest: no new crate
-dependency, no `with:` remap (the interface is in our own `gitana:repo` package). The harness supplies
-a canned credential to prove the in-component Basic flow end-to-end.
+The package version bumps `0.7.0` → `0.8.0` (a new import). The host (`gitana-repo-host`) implements the
+generated `credentials::Host` trait on `State` and the bindgen adds it to the linker — **manual wiring,
+unlike `wasi:http`**, which gets wasmtime's prebuilt `add_only_http_to_linker_async`. That is the one
+extra cost, and it is modest: no new crate dependency, no `with:` remap (the interface is in our own
+`gitana:repo` package). Rather than a canned constant, `State` holds a pluggable
+`Option<Box<dyn HostCredentialProvider>>` — the embedder's real seam — and the harness ships a
+`StoreFileCredentials` default (git's `credential-store` file format) so the end-to-end Basic-auth test
+proves a genuine `fill` → `approve` (persist) → re-`fill` round-trip, not a hardcoded value.
 
 **Conventions.** `CredentialProvider` is a native `async fn` trait (edition 2024, no `async_trait`),
 like `Identity`/`Signer`/`HttpTransport`. It, `HttpClient`, `AuthTransport`, and `Unauthenticated`
@@ -315,8 +321,14 @@ Each slice: its own worktree+branch, workspace green **including `wasm32-wasip2 
   intentional divergence: `credential.<url>` matching keys on the URL-userinfo username only, so a
   username *learned* from `credential.username`/a helper does not retroactively enable a
   username-qualified `credential.<user>@host` section (git's single-pass config walk can).
-- **Slice 3 — wasm host-import credential capability.** WIT `credentials` import + `gitana-repo-host`
-  impl + `WasiCredentialProvider` + component wiring; host-harness end-to-end Basic auth test.
+- **Slice 3 — wasm host-import credential capability. ✅ DONE.** WIT `credentials` import (package
+  `0.8.0`, record mirroring the post-slice-2 native trait — `wwwauth` on the request, the request on
+  `approve`/`reject`) + `WasiCredentialProvider` (guest, own file, swapping the three
+  `Unauthenticated::new` for `AuthTransport::with_userinfo`) + `gitana-repo-host` `credentials::Host` on
+  `State` behind a pluggable `HostCredentialProvider` (with a `StoreFileCredentials` default) + linker
+  wiring. Host-harness end-to-end: a `401`-gated axum server, a store-file-backed `fetch`/`clone` that
+  authenticates in both hash formats, and a no-credential run where the `401` stands. No error/quit
+  channel over WIT (a host declines by returning `none` from `fill`).
 - **Slice 4 — URL rewriting, redirects + extra headers.** Apply `url.*.insteadOf`/`pushInsteadOf` in
   the transport path (currently display-only), `http.extraHeader`, per-URL `credential.*` matching,
   possibly Bearer tokens, and **cross-host redirect following for auth** (`http.followRedirects`). The

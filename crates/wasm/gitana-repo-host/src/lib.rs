@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use wasmtime::component::{Component, Linker, Resource};
+use wasmtime::component::{Component, HasSelf, Linker, Resource};
 use wasmtime::error::Context as _;
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::filesystem::{Descriptor, Dir};
@@ -40,12 +40,20 @@ wasmtime::component::bindgen!({
 	},
 });
 
-/// Store state: the WASI context (no preopens), the `wasi:http` context, and the resource
-/// table descriptors are minted into.
+mod credential_provider;
+mod store_file_credentials;
+
+pub use self::credential_provider::HostCredentialProvider;
+pub use self::store_file_credentials::StoreFileCredentials;
+
+/// Store state: the WASI context (no preopens), the `wasi:http` context, the resource
+/// table descriptors are minted into, and the credential source answering the guest's
+/// `credentials` import (`None` = anonymous, every `fill` yields no credential).
 pub struct State {
 	ctx: WasiCtx,
 	http_ctx: WasiHttpCtx,
 	table: ResourceTable,
+	credentials: Option<Box<dyn HostCredentialProvider>>,
 }
 
 impl WasiView for State {
@@ -72,9 +80,28 @@ pub fn engine() -> Result<Engine> {
 	Ok(Engine::new(&wasmtime::Config::new())?)
 }
 
-/// A store whose WASI context grants **nothing**: no preopens, no args, no env.
-/// (stderr is inherited so a guest panic is visible when a test fails.)
+/// A store whose WASI context grants **nothing**: no preopens, no args, no env, and no credential
+/// source — every guest `fill` yields no credential, so the remote porcelain stays anonymous. (stderr
+/// is inherited so a guest panic is visible when a test fails.)
 pub fn store(engine: &Engine) -> Store<State> {
+	build_store(engine, None)
+}
+
+/// Like [`store`], but granting `credentials` as the source answering the guest's credential import —
+/// so a `401`-gated remote authenticates with what the source resolves. This is the host edge where an
+/// embedder plugs in its credential authority (the harness uses [`StoreFileCredentials`]).
+pub fn store_with_credentials(
+	engine: &Engine,
+	credentials: Box<dyn HostCredentialProvider>,
+) -> Store<State> {
+	build_store(engine, Some(credentials))
+}
+
+/// Build a store with an optional credential source (shared by [`store`]/[`store_with_credentials`]).
+fn build_store(
+	engine: &Engine,
+	credentials: Option<Box<dyn HostCredentialProvider>>,
+) -> Store<State> {
 	let ctx = WasiCtxBuilder::new().inherit_stderr().build();
 	Store::new(
 		engine,
@@ -82,8 +109,41 @@ pub fn store(engine: &Engine) -> Store<State> {
 			ctx,
 			http_ctx: WasiHttpCtx::new(),
 			table: ResourceTable::new(),
+			credentials,
 		},
 	)
+}
+
+impl gitana::repo::credentials::Host for State {
+	async fn fill(
+		&mut self,
+		request: gitana::repo::credentials::CredentialRequest,
+	) -> Option<gitana::repo::credentials::Credential> {
+		self
+			.credentials
+			.as_ref()
+			.and_then(|source| source.fill(&request))
+	}
+
+	async fn approve(
+		&mut self,
+		request: gitana::repo::credentials::CredentialRequest,
+		cred: gitana::repo::credentials::Credential,
+	) {
+		if let Some(source) = &self.credentials {
+			source.approve(&request, &cred);
+		}
+	}
+
+	async fn reject(
+		&mut self,
+		request: gitana::repo::credentials::CredentialRequest,
+		cred: gitana::repo::credentials::Credential,
+	) {
+		if let Some(source) = &self.credentials {
+			source.reject(&request, &cred);
+		}
+	}
 }
 
 /// Instantiate the component at `component_path` against the p2 WASI linker.
@@ -97,6 +157,10 @@ pub async fn instantiate(
 	let mut linker = Linker::new(engine);
 	wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 	wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
+	// Our own `credentials` import: unlike `wasi:http`'s prebuilt linker, its host side is wired here.
+	gitana::repo::credentials::add_to_linker::<_, HasSelf<_>>(&mut linker, |state: &mut State| {
+		state
+	})?;
 	Ok(Repo::instantiate_async(store, &component, &linker).await?)
 }
 

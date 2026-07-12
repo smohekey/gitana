@@ -9,6 +9,7 @@ mod refs;
 mod remote;
 mod repo;
 mod revisions;
+mod wasi_credentials;
 mod worktree;
 
 pub(crate) use self::{
@@ -20,8 +21,9 @@ pub(crate) use self::{
 	refs::{
 		delete_ref, head, list_refs, read_symbolic_ref, resolve_ref, set_symbolic_ref, update_ref,
 	},
-	remote::{clone, clone_negotiate, fetch, push},
+	remote::{auth_transport, clone, clone_negotiate, fetch, push},
 	repo::{init_layout, init_repo, read_config, repack},
 	revisions::{is_ancestor, merge_base, rev_list, rev_parse},
+	wasi_credentials::WasiCredentialProvider,
 	worktree::{add, checkout, commit, status},
 };

@@ -152,7 +152,11 @@ impl Inner {
 		url: &str,
 	) -> Result<(), RepoError> {
 		let origin = Origin::parse(url).map_err(|e| RepoError::Invalid(e.to_string()))?;
-		let (advertisement, kind) = block_on(ops::clone_negotiate(&origin))?;
+		// One transport for the whole clone: the credential it authenticates during negotiation (the
+		// advertisement `GET`) is cached and reused by the pack `POST` below, so a host that answers
+		// `fill` only once still authenticates both phases.
+		let transport = ops::auth_transport(&origin);
+		let (advertisement, kind) = block_on(ops::clone_negotiate(&transport, &origin))?;
 
 		let git = LocalFileStore::from_descriptor(git_dir);
 		block_on(ops::init_layout(&git))?;
@@ -160,8 +164,20 @@ impl Inner {
 		let work = DescriptorWorkDir::from_descriptor(work_dir);
 
 		match kind {
-			HashKind::Sha1 => block_on(ops::clone::<Sha1>(store, work, &origin, &advertisement)),
-			HashKind::Sha256 => block_on(ops::clone::<Sha256>(store, work, &origin, &advertisement)),
+			HashKind::Sha1 => block_on(ops::clone::<Sha1>(
+				&transport,
+				store,
+				work,
+				&origin,
+				&advertisement,
+			)),
+			HashKind::Sha256 => block_on(ops::clone::<Sha256>(
+				&transport,
+				store,
+				work,
+				&origin,
+				&advertisement,
+			)),
 		}
 	}
 

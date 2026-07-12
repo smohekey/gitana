@@ -41,9 +41,13 @@ What works today:
   (`status`, `add`, `checkout`, `commit`) over a repository opened with its
   working tree (`open-worktree`, which grants a third `work-dir` descriptor), and
   the Smart HTTP remote operations (`fetch`, `push`, and `clone`) over a
-  host-granted `wasi:http` capability — no `reqwest`, no ambient network. The
-  component's only filesystem authority is the `wasi:filesystem` directory
-  descriptors passed in by the host (no preopens, no ambient access).
+  host-granted `wasi:http` capability — no `reqwest`, no ambient network. A `401`
+  challenge on those operations is authenticated the git way, with the credential
+  answered by the host over a `credentials` WIT import (`fill`/`approve`/`reject`,
+  the `wasi:http` capability model) — the component reaches for no ambient netrc,
+  helper, or prompt. The component's only filesystem authority is the
+  `wasi:filesystem` directory descriptors passed in by the host (no preopens, no
+  ambient access).
   `crates/wasm/gitana-repo-host` embeds it under wasmtime; see
   `docs/hlds/wasi-component-porcelain.md` and `docs/hlds/wasi-http-transport.md`.
 - A trust and signing subsystem (`docs/hlds/secure-git-trust-signing.md`) that makes

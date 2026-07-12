@@ -1,4 +1,50 @@
-package gitana:repo@0.7.0;
+package gitana:repo@0.8.0;
+
+/// HTTP credential resolution, granted by the host.
+///
+/// The remote porcelain (`fetch`/`push`/`clone`) authenticates a Smart HTTP `401` the git way, but the
+/// component holds no ambient authority to read a netrc, run a credential helper, or prompt — so it
+/// *imports* this capability and the **host** answers it, mirroring the native
+/// `gitana-remote::CredentialProvider`. The component asks for a credential only when a server answers
+/// `401 WWW-Authenticate: Basic`, and reports the outcome so the host may persist or erase it. A host
+/// that has no credential to offer returns `none` from `fill`, and the `401` stands as the error —
+/// there is no error/abort channel, matching the capability's best-effort nature.
+interface credentials {
+	/// The context a credential is resolved for — git's credential attributes, carried across the
+	/// component boundary from the native `CredentialRequest`.
+	record credential-request {
+		/// The URL scheme, e.g. `https`.
+		protocol: string,
+		/// The authority, `host` or `host:port`.
+		host: string,
+		/// The repository path with no leading slash (e.g. `acme/app.git`), percent-encoded as it
+		/// appeared in the URL; absent when the URL has none.
+		path: option<string>,
+		/// A known username the credential must be for, if any (URL userinfo or `credential.username`).
+		username: option<string>,
+		/// The server's `WWW-Authenticate` challenge values, one per header field, in order — empty
+		/// unless this request accompanies a `401` being filled.
+		wwwauth: list<string>,
+	}
+
+	/// A resolved username/password pair (the "password" may be a token).
+	record credential {
+		username: string,
+		password: string,
+	}
+
+	/// Resolve a credential for `request`. `none` means none is available (anonymous, none configured,
+	/// or the host declined) and the caller proceeds unauthenticated, letting the server's `401` stand.
+	fill: func(request: credential-request) -> option<credential>;
+
+	/// Record that `cred` (for `request`) was accepted by the server, so the host may persist it
+	/// (git's `credential approve`). Best-effort — it never fails the operation it just authorised.
+	approve: func(request: credential-request, cred: credential);
+
+	/// Record that `cred` (for `request`) was rejected by the server, so the host may erase a stale
+	/// entry (git's `credential reject`). Best-effort, like `approve`.
+	reject: func(request: credential-request, cred: credential);
+}
 
 /// Repository operations over a capability-granted git directory.
 ///
@@ -410,6 +456,9 @@ world repo {
 	// The network capability for the remote porcelain (fetch/clone/push): the host grants a
 	// `wasi:http` outgoing handler, the component's only means of reaching a Smart HTTP remote.
 	import wasi:http/outgoing-handler@0.2.12;
+	// The credential capability for authenticating a Smart HTTP `401`: the host answers `fill`/`approve`/
+	// `reject`, so the component reaches for no ambient netrc/helper/prompt.
+	import credentials;
 
 	export porcelain;
 }
