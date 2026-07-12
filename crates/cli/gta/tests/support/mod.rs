@@ -64,6 +64,10 @@ struct Served {
 	/// moves and deletions. The interop matrix runs with it on; the atomic oracle runs with it off, so a
 	/// non-fast-forward ref is rejected (git's `receive.denyNonFastForwards`).
 	force: bool,
+	/// When `Some((user, pass))`, every request must carry `Authorization: Basic base64(user:pass)` or
+	/// the server answers `401 WWW-Authenticate: Basic` — the HTTP-credential oracle. `None` is the
+	/// default anonymous server.
+	basic_auth: Option<(String, String)>,
 }
 
 /// The `Git-Protocol` version the request asks for (git repeats the header on every request).
@@ -216,6 +220,26 @@ pub async fn serve_gitana(git_dir: PathBuf, hash: ServerHash) -> String {
 		hash,
 		reflog_committer: None,
 		force: true,
+		basic_auth: None,
+	})
+	.await
+}
+
+/// Like [`serve_gitana`], but requiring HTTP Basic auth: every request must present
+/// `Authorization: Basic base64(user:pass)`, else the server answers `401 WWW-Authenticate: Basic`.
+/// The HTTP-credential oracle — a `gta` client must acquire and send these credentials to succeed.
+pub async fn serve_gitana_basic_auth(
+	git_dir: PathBuf,
+	hash: ServerHash,
+	user: &str,
+	pass: &str,
+) -> String {
+	serve(Served {
+		git_dir,
+		hash,
+		reflog_committer: None,
+		force: true,
+		basic_auth: Some((user.to_owned(), pass.to_owned())),
 	})
 	.await
 }
@@ -232,6 +256,7 @@ pub async fn serve_gitana_with_reflog(
 		hash,
 		reflog_committer: Some(committer),
 		force: true,
+		basic_auth: None,
 	})
 	.await
 }
@@ -245,16 +270,26 @@ pub async fn serve_gitana_no_force(git_dir: PathBuf, hash: ServerHash) -> String
 		hash,
 		reflog_committer: None,
 		force: false,
+		basic_auth: None,
 	})
 	.await
 }
 
 /// Bind an ephemeral loopback port and serve `state`'s repo; returns the base URL.
 async fn serve(state: Served) -> String {
+	let expected_auth = state.basic_auth.as_ref().map(|(user, pass)| {
+		format!(
+			"Basic {}",
+			base64_encode(format!("{user}:{pass}").as_bytes())
+		)
+	});
 	let app = Router::new()
 		.route("/info/refs", get(info_refs))
 		.route("/git-upload-pack", post(upload_pack))
 		.route("/git-receive-pack", post(git_receive_pack))
+		.layer(axum::middleware::from_fn(move |req, next| {
+			basic_auth_gate(expected_auth.clone(), req, next)
+		}))
 		.with_state(state);
 	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
 	let addr = listener.local_addr().expect("addr");
@@ -262,6 +297,59 @@ async fn serve(state: Served) -> String {
 		axum::serve(listener, app).await.expect("serve");
 	});
 	format!("http://{addr}")
+}
+
+/// Reject a request lacking the `expected` `Authorization` header with `401 WWW-Authenticate: Basic`;
+/// `None` means the server is anonymous and every request passes. Modelled on how an authenticated
+/// git http-backend gates access.
+async fn basic_auth_gate(
+	expected: Option<String>,
+	req: axum::extract::Request,
+	next: axum::middleware::Next,
+) -> Response {
+	if let Some(expected) = expected {
+		let presented = req
+			.headers()
+			.get("authorization")
+			.and_then(|value| value.to_str().ok());
+		if presented != Some(expected.as_str()) {
+			return (
+				StatusCode::UNAUTHORIZED,
+				[("WWW-Authenticate", "Basic realm=\"gitana\"")],
+				"authentication required",
+			)
+				.into_response();
+		}
+	}
+	next.run(req).await
+}
+
+/// Standard base64 (RFC 4648) — the server side of the Basic-auth oracle, so the harness needs no
+/// base64 dependency of its own.
+fn base64_encode(input: &[u8]) -> String {
+	const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	let mut out = String::new();
+	for chunk in input.chunks(3) {
+		let b = [
+			chunk[0],
+			*chunk.get(1).unwrap_or(&0),
+			*chunk.get(2).unwrap_or(&0),
+		];
+		let group = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+		out.push(ALPHABET[(group >> 18) as usize & 0x3f] as char);
+		out.push(ALPHABET[(group >> 12) as usize & 0x3f] as char);
+		out.push(if chunk.len() > 1 {
+			ALPHABET[(group >> 6) as usize & 0x3f] as char
+		} else {
+			'='
+		});
+		out.push(if chunk.len() > 2 {
+			ALPHABET[group as usize & 0x3f] as char
+		} else {
+			'='
+		});
+	}
+	out
 }
 
 // --- Direction B: serve a real git repo via `git http-backend` (CGI) ----------------------------
@@ -396,13 +484,24 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
 
 /// Run the `gta` binary with `args` (subprocess), off the runtime so a server task keeps serving.
 pub async fn gta(args: &[&str]) -> Output {
+	gta_env(args, &[]).await
+}
+
+/// Like [`gta`], but with extra environment variables set (e.g. `GIT_ASKPASS`, `GIT_TERMINAL_PROMPT`)
+/// — for the HTTP-credential oracle, where a scripted askpass supplies the password.
+pub async fn gta_env(args: &[&str], env: &[(&str, &str)]) -> Output {
 	let args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+	let env: Vec<(String, String)> = env
+		.iter()
+		.map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+		.collect();
 	tokio::task::spawn_blocking(move || {
-		assert_cmd::Command::cargo_bin("gta")
-			.unwrap()
-			.args(&args)
-			.output()
-			.expect("run gta")
+		let mut command = assert_cmd::Command::cargo_bin("gta").unwrap();
+		command.args(&args);
+		for (key, value) in &env {
+			command.env(key, value);
+		}
+		command.output().expect("run gta")
 	})
 	.await
 	.unwrap()

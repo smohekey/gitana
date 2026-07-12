@@ -4,17 +4,21 @@
 //! gitana engine and working tree in-process and print their results to stdout.
 
 pub mod commands;
+mod credential;
 mod dispatch;
 mod error;
 mod git_config;
 mod identity;
+mod prompt;
 mod repo;
 mod shallow;
 mod signer;
 
+pub use credential::{CliCredentialProvider, transport_for};
 pub use error::{MergeConflict, SilentExit};
 pub use git_config::with_command_cwd;
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
+pub use prompt::with_terminal_prompts_disabled;
 
 /// The local file-store backend every command operates over: a [`WorktreeFileStore`], which routes
 /// git's per-worktree files and shared files to the right directory so commands work the same in

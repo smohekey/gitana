@@ -1,14 +1,16 @@
 //! Remote operations — `fetch`, `push`, and `clone` over the in-guest `wasi:http` transport.
 //!
 //! These reuse `gitana-porcelain`'s remote composites unchanged, injecting the component's
-//! [`WasiHttpTransport`] as the `HttpTransport` capability. The advertisement GET and the pack POST
-//! both flow through `wasi:http`; nothing here reaches for `reqwest`.
+//! [`WasiHttpTransport`] (an `HttpClient`) wrapped as an unauthenticated `HttpTransport`. The
+//! advertisement GET and the pack POST both flow through `wasi:http`; nothing here reaches for
+//! `reqwest`. HTTP credentials are not yet granted to the component (a later slice adds a host
+//! credential import), so the remote must be anonymous.
 
 use gitana_file_store_local::{DescriptorWorkDir, WorktreeFileStore};
 use gitana_object::HashAlgorithm;
 use gitana_object_store::ObjectStore;
 use gitana_porcelain::Deepen;
-use gitana_remote::Origin;
+use gitana_remote::{Origin, Unauthenticated};
 use gitana_repository::Repository;
 
 use crate::bindings::exports::gitana::repo::porcelain::{
@@ -23,7 +25,7 @@ pub(crate) async fn fetch<H: HashAlgorithm>(
 	url: &str,
 ) -> Result<FetchOutcome, RepoError> {
 	let origin = Origin::parse(url).map_err(|e| RepoError::Invalid(e.to_string()))?;
-	let transport = WasiHttpTransport;
+	let transport = Unauthenticated::new(WasiHttpTransport);
 
 	let advertisement = gitana_remote::fetch_advertisement(&transport, &origin, "git-upload-pack")
 		.await
@@ -78,7 +80,7 @@ pub(crate) async fn push<H: HashAlgorithm>(
 	delete: Option<String>,
 ) -> Result<WitPushOutcome, RepoError> {
 	let origin = Origin::parse(url).map_err(|e| RepoError::Invalid(e.to_string()))?;
-	let transport = WasiHttpTransport;
+	let transport = Unauthenticated::new(WasiHttpTransport);
 
 	let advertisement = gitana_remote::fetch_advertisement(&transport, &origin, "git-receive-pack")
 		.await
@@ -136,7 +138,7 @@ pub(crate) async fn push<H: HashAlgorithm>(
 /// step of `clone`, run before any local repository exists to detect a format from. The caller then
 /// creates the repository as `HashKind` and hands the advertisement to [`clone`] (no second GET).
 pub(crate) async fn clone_negotiate(origin: &Origin) -> Result<(Vec<u8>, HashKind), RepoError> {
-	let transport = WasiHttpTransport;
+	let transport = Unauthenticated::new(WasiHttpTransport);
 	let advertisement = gitana_remote::fetch_advertisement(&transport, origin, "git-upload-pack")
 		.await
 		.map_err(remote_error)?;
@@ -157,7 +159,7 @@ pub(crate) async fn clone<H: HashAlgorithm>(
 	origin: &Origin,
 	advertisement: &[u8],
 ) -> Result<(), RepoError> {
-	let transport = WasiHttpTransport;
+	let transport = Unauthenticated::new(WasiHttpTransport);
 	let repo: Repository<WorktreeFileStore, H> = Repository::new(ObjectStore::new(store));
 	// The component does not expose shallow clone yet, so it always requests full history.
 	gitana_porcelain::clone(

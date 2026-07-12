@@ -26,6 +26,11 @@ gitana-repository-layout.workspace = true
 gitana-repository.workspace = true
 gitana-trust.workspace = true
 gitana-worktree.workspace = true
+# Terminal credential prompting (git-faithful fallback): `rpassword` reads a password from the TTY
+# with echo off, `rprompt` the username line with echo on. Both use raw mode, so `Ctrl-C` is handled
+# as input and the terminal is restored — no signal handler, no `unsafe`.
+rpassword = "7"
+rprompt = "2"
 sha2.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "process"] }
 

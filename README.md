@@ -163,6 +163,14 @@ Implemented command groups:
   wildcard, exact, force (`+`), and negative (`^`) — mapping advertised refs to tracking refs and
   enforcing fast-forward for non-forced refspecs. A refspec that would write a branch checked out in
   any worktree — the current one or a linked one — is refused, as git does.
+- HTTP authentication, matching git's credential flow: a remote that answers `401 WWW-Authenticate:
+  Basic` is retried once with an `Authorization: Basic` header. Credentials resolve in git's order —
+  URL userinfo (`https://user:pass@host`, with the password kept out of the saved `remote.origin.url`),
+  then `credential.username`, then an interactive prompt (`GIT_ASKPASS` → `core.askPass` →
+  `SSH_ASKPASS` → the terminal, honouring `GIT_TERMINAL_PROMPT=0` and declining cleanly with no tty).
+  A working credential is cached for the rest of the operation, so a clone/fetch/push authenticates
+  once. (Credential *helpers* — `osxkeychain`, `store`, … — and `url.*.insteadOf` rewriting are not
+  yet wired.)
 - Shallow history, matching git: `clone --depth N` / `--shallow-since <date>` / `--shallow-exclude
   <ref>` truncate the fetched history and record the boundary in `.git/shallow`. `fetch` then extends
   it with `--depth N` (absolute), `--deepen N` (relative to the current boundary), `--shallow-since` /

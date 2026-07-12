@@ -714,9 +714,11 @@ impl Cli {
 			None => std::env::current_dir()?,
 		};
 		// Establish the command's working directory so relative config-file overrides
-		// (GIT_CONFIG_GLOBAL/SYSTEM) resolve against it, as git does under `-C`.
+		// (GIT_CONFIG_GLOBAL/SYSTEM) resolve against it, as git does under `-C`. Terminal credential
+		// prompts are disabled for the whole MCP dispatch: there is no interactive user behind an MCP
+		// tool call, so a command must never block on `/dev/tty` (askpass helpers still apply).
 		let command = self.command;
-		gta_core::with_command_cwd(cwd.clone(), async move {
+		gta_core::with_terminal_prompts_disabled(gta_core::with_command_cwd(cwd.clone(), async move {
 			match command {
 				Command::Init {
 					path,
@@ -948,7 +950,7 @@ impl Cli {
 					commands::worktree::run(&cwd, worktree_action(action)).await
 				}
 			}
-		})
+		}))
 		.await
 	}
 }

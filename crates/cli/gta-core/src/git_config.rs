@@ -36,6 +36,13 @@ pub async fn with_command_cwd<F: Future>(cwd: PathBuf, future: F) -> F::Output {
 	COMMAND_CWD.scope(cwd, future).await
 }
 
+/// The command's effective working directory ([`COMMAND_CWD`]), if established — for resolving a
+/// relative program/path (e.g. a `core.askPass` helper) against the `-C` directory as git does,
+/// since gitana records `-C` in this task-local rather than changing the process cwd.
+pub(crate) fn command_cwd() -> Option<PathBuf> {
+	COMMAND_CWD.try_with(|cwd| cwd.clone()).ok()
+}
+
 /// Which git configuration file a `gta config` operation targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigScope {
@@ -60,6 +67,19 @@ pub async fn effective_config<H: HashAlgorithm>(
 		.read_config()
 		.await
 		.unwrap_or_else(|_| GitConfig::new());
+	config.underlay(global_and_system_sources().await?);
+	config.overlay(env_config_source()?);
+	Ok(config)
+}
+
+/// The effective configuration keyed on a git/common directory path rather than an open
+/// [`Repository`] — for the remote commands, which resolve credentials (and build the transport)
+/// before opening the repo (or, for `fetch`/`push`, before the hash algorithm the repo is generic
+/// over is even known). Reads the local `<dir>/config` and underlays global/system, then overlays the
+/// `-c`/`GIT_CONFIG_*` command-line entries, exactly like [`effective_config`]. A missing local
+/// config resolves from the global/system layers alone.
+pub async fn effective_config_at(dir: &Path) -> Result<GitConfig> {
+	let mut config = read_file(&dir.join("config")).await?;
 	config.underlay(global_and_system_sources().await?);
 	config.overlay(env_config_source()?);
 	Ok(config)
@@ -393,7 +413,7 @@ fn env_bool(name: &str) -> Result<bool> {
 }
 
 /// Git's boolean grammar for an environment value (see [`env_bool`]); `None` for a value git rejects.
-fn parse_git_bool(value: &str) -> Option<bool> {
+pub(crate) fn parse_git_bool(value: &str) -> Option<bool> {
 	match value.to_ascii_lowercase().as_str() {
 		"true" | "yes" | "on" => Some(true),
 		"" | "false" | "no" | "off" => Some(false),

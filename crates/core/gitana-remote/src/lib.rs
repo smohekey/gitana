@@ -9,17 +9,29 @@
 //! the default `reqwest-transport` feature) by default, or (on `wasm32-wasip2`) an in-guest
 //! `wasi:http` client.
 
+mod auth_transport;
+mod credential;
+mod credential_provider;
+mod credential_request;
+mod http_client;
 mod http_transport;
 mod push_refspec;
 mod refspec;
 #[cfg(feature = "reqwest-transport")]
 mod reqwest_transport;
+mod unauthenticated;
 
+pub use auth_transport::AuthTransport;
+pub use credential::Credential;
+pub use credential_provider::CredentialProvider;
+pub use credential_request::CredentialRequest;
+pub use http_client::{HttpClient, HttpResponse};
 pub use http_transport::HttpTransport;
 pub use push_refspec::PushRefspec;
 pub use refspec::Refspec;
 #[cfg(feature = "reqwest-transport")]
 pub use reqwest_transport::ReqwestTransport;
+pub use unauthenticated::Unauthenticated;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -44,23 +56,116 @@ pub const RECEIVE_PACK_REQUEST: &str = "application/x-git-receive-pack-request";
 /// configured `fetch` line): mirror every remote branch into `refs/remotes/origin/*`, force-updated.
 pub const ORIGIN_FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
 
+/// Strip any `user[:pass]@` userinfo from `url`, keeping the rest **verbatim** — git's
+/// `transport_anonymize_url`, used where a URL is recorded or displayed (e.g. a clone reflog) so a
+/// credential in the URL is never persisted, while trailing slashes and the exact path are preserved.
+/// A URL without a scheme or userinfo is returned unchanged.
+pub fn anonymize_url(url: &str) -> String {
+	let Some((scheme, rest)) = url.split_once("://") else {
+		return url.to_owned();
+	};
+	// The authority runs to the first `/`, `?`, or `#`; keep the tail exactly as given.
+	let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+	let (authority, tail) = rest.split_at(authority_end);
+	match authority.rsplit_once('@') {
+		Some((_userinfo, host)) => format!("{scheme}://{host}{tail}"),
+		None => url.to_owned(),
+	}
+}
+
+/// Percent-decode `s` (`%XX` → byte), decoding the resulting bytes as UTF-8 (lossily, since a
+/// credential is otherwise opaque). A lone `%` or a `%` not followed by two hex digits is kept
+/// literally, matching lenient URL decoders.
+fn percent_decode(s: &str) -> String {
+	let bytes = s.as_bytes();
+	let mut out = Vec::with_capacity(bytes.len());
+	let mut i = 0;
+	while i < bytes.len() {
+		if bytes[i] == b'%'
+			&& i + 2 < bytes.len()
+			&& let (Some(hi), Some(lo)) = (
+				(bytes[i + 1] as char).to_digit(16),
+				(bytes[i + 2] as char).to_digit(16),
+			) {
+			out.push((hi * 16 + lo) as u8);
+			i += 3;
+		} else {
+			out.push(bytes[i]);
+			i += 1;
+		}
+	}
+	String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Percent-encode `s` for a URL userinfo field, escaping every byte outside the RFC 3986 unreserved
+/// set (`A-Za-z0-9-._~`). Conservative but always safe — it guarantees the persisted username
+/// round-trips through `percent_decode`, so a `user@name` becomes `user%40name`. Public so the CLI can
+/// build the same credential-prompt URL git does (a username shown re-encoded, e.g. `a%40b`).
+pub fn percent_encode_userinfo(s: &str) -> String {
+	let mut out = String::with_capacity(s.len());
+	for &byte in s.as_bytes() {
+		if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+			out.push(byte as char);
+		} else {
+			out.push('%');
+			out.push_str(&format!("{byte:02X}"));
+		}
+	}
+	out
+}
+
 /// The configured origin remote. This is the base Smart HTTP URL, e.g.
-/// `https://example.com/acme/project.git`.
+/// `https://example.com/acme/project.git`, with any `user[:pass]@` userinfo split off (see
+/// [`parse`](Origin::parse)) so the URL sent to the transport carries no embedded credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Origin {
-	/// The repository base URL.
+	/// The repository base URL, **without** userinfo — safe to send to the transport and to build
+	/// endpoints from.
 	pub url: String,
+	/// A username taken from the URL's `user[:pass]@` userinfo, if any — git's highest-priority
+	/// credential hint (and reconstructed into the persisted `remote.origin.url` by [`save`](Origin::save)).
+	pub username: Option<String>,
+	/// A password taken from the URL's userinfo, if any. Never persisted to config (git stores the
+	/// username but not the password); used only for the current operation.
+	pub password: Option<String>,
 }
 
 impl Origin {
-	/// Validate and normalise a Smart HTTP remote URL.
+	/// Validate and normalise a Smart HTTP remote URL, splitting off any `user[:pass]@` userinfo. The
+	/// userinfo delimiter is the **last** `@` in the authority (so a password may contain an unescaped
+	/// `@`), and the username/password split is the first `:` in the userinfo. Each field is
+	/// **percent-decoded** (git decodes URL credentials, so `alice%40host`/`p%3Ass` become
+	/// `alice@host`/`p:ass`). Field *presence* is preserved: an explicitly empty field is `Some("")`,
+	/// not `None` — git treats `https://alice:@host` as the present empty password `alice:` and
+	/// `https://:token@host` as username-less. The stored [`url`](Self::url) is the credential-free
+	/// remainder.
 	pub fn parse(url: &str) -> Result<Self> {
 		let trimmed = url.trim_end_matches('/');
 		if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
 			bail!("only http(s) Smart HTTP remotes are supported");
 		}
+		// Safe: the scheme check above guarantees a `://`.
+		let (scheme, rest) = trimmed.split_once("://").expect("scheme has ://");
+		// The authority runs to the first `/`, `?`, or `#`; the rest is the path/query to keep verbatim.
+		let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+		let (authority, tail) = rest.split_at(authority_end);
+		let (userinfo, host) = match authority.rsplit_once('@') {
+			Some((userinfo, host)) => (Some(userinfo), host),
+			None => (None, authority),
+		};
+		// A present userinfo yields a present (possibly empty) username; a `:` additionally introduces a
+		// present (possibly empty) password. Absent userinfo → both `None`.
+		let (username, password) = match userinfo {
+			Some(userinfo) => match userinfo.split_once(':') {
+				Some((user, pass)) => (Some(percent_decode(user)), Some(percent_decode(pass))),
+				None => (Some(percent_decode(userinfo)), None),
+			},
+			None => (None, None),
+		};
 		Ok(Self {
-			url: trimmed.to_owned(),
+			url: format!("{scheme}://{host}{tail}"),
+			username,
+			password,
 		})
 	}
 
@@ -90,7 +195,7 @@ impl Origin {
 		let bytes = store.read_path("config").await.context("reading config")?;
 		let text = String::from_utf8(bytes).context("config is not UTF-8")?;
 		let mut config = GitConfig::parse(&text).context("parsing config")?;
-		config.set("remote", Some("origin"), "url", &self.url)?;
+		config.set("remote", Some("origin"), "url", &self.persisted_url())?;
 		config.set("remote", Some("origin"), "fetch", ORIGIN_FETCH_REFSPEC)?;
 		store
 			.write_path_replace("config", config.render().as_bytes())
@@ -109,6 +214,21 @@ impl Origin {
 			.get_string("remote", Some("origin"), "url")
 			.context("no remote.origin.url configured")?;
 		Self::parse(url)
+	}
+
+	/// The URL to persist in `remote.origin.url`: the clean URL with the userinfo **username**
+	/// re-embedded (matching git, which keeps the username but never writes the password), so a later
+	/// bare `gta fetch`/`push` still knows which user to authenticate as. The username is
+	/// percent-encoded so a value with reserved characters (`@`, `:`) round-trips back through
+	/// [`parse`](Self::parse).
+	fn persisted_url(&self) -> String {
+		match &self.username {
+			Some(username) => match self.url.split_once("://") {
+				Some((scheme, rest)) => format!("{scheme}://{}@{rest}", percent_encode_userinfo(username)),
+				None => self.url.clone(),
+			},
+			None => self.url.clone(),
+		}
 	}
 
 	fn info_refs(&self, service: &str) -> String {
@@ -451,6 +571,92 @@ mod tests {
 		assert_eq!(
 			parsed.get_string("remote", Some("origin"), "url"),
 			Some(origin.url.as_str())
+		);
+	}
+
+	#[test]
+	fn parse_splits_userinfo_off_the_url() {
+		let origin = Origin::parse("https://alice:s3cr3t@example.com/acme/app.git").unwrap();
+		assert_eq!(origin.url, "https://example.com/acme/app.git");
+		assert_eq!(origin.username.as_deref(), Some("alice"));
+		assert_eq!(origin.password.as_deref(), Some("s3cr3t"));
+	}
+
+	#[test]
+	fn parse_keeps_a_bare_username_and_no_userinfo() {
+		let user_only = Origin::parse("https://alice@example.com/app").unwrap();
+		assert_eq!(user_only.url, "https://example.com/app");
+		assert_eq!(user_only.username.as_deref(), Some("alice"));
+		assert_eq!(user_only.password, None);
+
+		let none = Origin::parse("https://example.com/app").unwrap();
+		assert_eq!(none.username, None);
+		assert_eq!(none.password, None);
+	}
+
+	#[test]
+	fn anonymize_url_strips_userinfo_but_keeps_the_url_verbatim() {
+		// Userinfo removed; scheme, host, path, and trailing slash kept exactly.
+		assert_eq!(
+			anonymize_url("https://alice:s3cr3t@example.com/acme/app.git/"),
+			"https://example.com/acme/app.git/"
+		);
+		// No userinfo → unchanged (including the trailing slash git preserves in the reflog).
+		assert_eq!(
+			anonymize_url("http://example.com/repo.git/"),
+			"http://example.com/repo.git/"
+		);
+	}
+
+	#[test]
+	fn parse_preserves_explicitly_empty_userinfo_fields() {
+		// `alice:@host` → a present empty password (git would send `alice:`).
+		let empty_pass = Origin::parse("https://alice:@example.com/app").unwrap();
+		assert_eq!(empty_pass.username.as_deref(), Some("alice"));
+		assert_eq!(empty_pass.password.as_deref(), Some(""));
+		// `:token@host` → a present empty username.
+		let empty_user = Origin::parse("https://:token@example.com/app").unwrap();
+		assert_eq!(empty_user.username.as_deref(), Some(""));
+		assert_eq!(empty_user.password.as_deref(), Some("token"));
+	}
+
+	#[test]
+	fn parse_percent_decodes_userinfo() {
+		// `alice%40host` → `alice@host`, `pa%3Ass` → `pa:ss` (git decodes URL credentials).
+		let origin = Origin::parse("https://alice%40host:pa%3Ass@example.com/app").unwrap();
+		assert_eq!(origin.username.as_deref(), Some("alice@host"));
+		assert_eq!(origin.password.as_deref(), Some("pa:ss"));
+		assert_eq!(origin.url, "https://example.com/app");
+	}
+
+	#[test]
+	fn persisted_url_percent_encodes_the_username_round_trip() {
+		let origin = Origin::parse("https://alice%40host:pw@example.com/app").unwrap();
+		// The persisted url re-encodes the `@` so it parses back to the same username.
+		assert_eq!(
+			origin.persisted_url(),
+			"https://alice%40host@example.com/app"
+		);
+		let reparsed = Origin::parse(&origin.persisted_url()).unwrap();
+		assert_eq!(reparsed.username.as_deref(), Some("alice@host"));
+	}
+
+	#[test]
+	fn parse_takes_the_last_at_and_first_colon() {
+		// A password may contain an unescaped `@`; the delimiter is the last `@` in the authority, and
+		// the user/pass split is the first `:`.
+		let origin = Origin::parse("https://user:p@ss@example.com/app").unwrap();
+		assert_eq!(origin.url, "https://example.com/app");
+		assert_eq!(origin.username.as_deref(), Some("user"));
+		assert_eq!(origin.password.as_deref(), Some("p@ss"));
+	}
+
+	#[test]
+	fn save_re_embeds_the_username_but_not_the_password() {
+		let origin = Origin::parse("https://alice:s3cr3t@example.com/acme/app.git").unwrap();
+		assert_eq!(
+			origin.persisted_url(),
+			"https://alice@example.com/acme/app.git"
 		);
 	}
 }

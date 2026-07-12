@@ -1,19 +1,23 @@
-//! In-guest `wasi:http` transport for the Smart HTTP remote porcelain.
+//! In-guest `wasi:http` client for the Smart HTTP remote porcelain.
 //!
-//! Implements [`gitana_remote::HttpTransport`] over the host-granted
-//! `wasi:http/outgoing-handler` capability. Every method is synchronous under the hood — it blocks
-//! on `wasi:io` pollables inline ([`Pollable::block`], [`InputStream::blocking_read`],
-//! [`OutputStream::blocking_write_and_flush`]) and returns an already-`Ready` future — so the
-//! component's noop-waker [`block_on`](crate::block_on) drives it without ever seeing `Pending`,
-//! exactly as the descriptor file store does. That keeps the WASI 0.2 sync-export invariant intact:
-//! no future parked on a pollable ever reaches the executor.
+//! Implements [`gitana_remote::HttpClient`] over the host-granted `wasi:http/outgoing-handler`
+//! capability. Every method is synchronous under the hood — it blocks on `wasi:io` pollables inline
+//! ([`Pollable::block`], [`InputStream::blocking_read`], [`OutputStream::blocking_write_and_flush`])
+//! and returns an already-`Ready` future — so the component's noop-waker
+//! [`block_on`](crate::block_on) drives it without ever seeing `Pending`, exactly as the descriptor
+//! file store does. That keeps the WASI 0.2 sync-export invariant intact: no future parked on a
+//! pollable ever reaches the executor.
+//!
+//! As a raw [`HttpClient`], it reports the response **status** rather than turning a non-2xx into an
+//! error and forwards the caller's request headers verbatim (e.g. an `Authorization`) — the
+//! credential-aware wrapping is done above it, in `gitana-remote`.
 //!
 //! Smart HTTP v0 is request → whole response, so the response body is read to completion here; no
 //! sideband is streamed. Request bodies are written in ≤4 KiB chunks because WASI's
 //! `blocking-write-and-flush` accepts no more per call.
 
 use anyhow::{Result, anyhow, bail};
-use gitana_remote::HttpTransport;
+use gitana_remote::{HttpClient, HttpResponse};
 
 use wasip2::http::outgoing_handler;
 use wasip2::http::types::{
@@ -26,29 +30,47 @@ const WRITE_CHUNK: usize = 4096;
 /// Response-body read granularity.
 const READ_CHUNK: u64 = 64 * 1024;
 
-/// An [`HttpTransport`] over the component's `wasi:http` outgoing-handler capability.
+/// An [`HttpClient`] over the component's `wasi:http` outgoing-handler capability.
 pub(crate) struct WasiHttpTransport;
 
-impl HttpTransport for WasiHttpTransport {
-	async fn get(&self, url: &str) -> Result<Vec<u8>> {
-		request(Method::Get, url, None, &[])
+impl HttpClient for WasiHttpTransport {
+	async fn get(&self, url: &str, headers: &[(String, String)]) -> Result<HttpResponse> {
+		request(Method::Get, url, None, &[], headers)
 	}
 
-	async fn post(&self, url: &str, content_type: &str, body: Vec<u8>) -> Result<Vec<u8>> {
-		request(Method::Post, url, Some(content_type), &body)
+	async fn post(
+		&self,
+		url: &str,
+		content_type: &str,
+		body: Vec<u8>,
+		headers: &[(String, String)],
+	) -> Result<HttpResponse> {
+		request(Method::Post, url, Some(content_type), &body, headers)
 	}
 }
 
-/// Issue one request and read the whole response body, failing on a non-2xx status. Fully
-/// synchronous: the only waits are inline `Pollable::block` / blocking stream I/O.
-fn request(method: Method, url: &str, content_type: Option<&str>, body: &[u8]) -> Result<Vec<u8>> {
+/// Issue one request and read the whole response body, returning its status and bytes (no non-2xx
+/// handling — the credential layer above decides). Fully synchronous: the only waits are inline
+/// `Pollable::block` / blocking stream I/O.
+fn request(
+	method: Method,
+	url: &str,
+	content_type: Option<&str>,
+	body: &[u8],
+	extra_headers: &[(String, String)],
+) -> Result<HttpResponse> {
 	let (scheme, authority, path_with_query) = split_url(url)?;
 
-	let headers = match content_type {
-		Some(ct) => Fields::from_list(&[("content-type".to_owned(), ct.as_bytes().to_vec())])
-			.map_err(|e| anyhow!("building request headers: {e:?}"))?,
-		None => Fields::new(),
-	};
+	// content-type (POST) plus any caller-supplied request headers (e.g. `Authorization`).
+	let mut header_list: Vec<(String, Vec<u8>)> = Vec::new();
+	if let Some(ct) = content_type {
+		header_list.push(("content-type".to_owned(), ct.as_bytes().to_vec()));
+	}
+	for (name, value) in extra_headers {
+		header_list.push((name.clone(), value.as_bytes().to_vec()));
+	}
+	let headers =
+		Fields::from_list(&header_list).map_err(|e| anyhow!("building request headers: {e:?}"))?;
 
 	let request = OutgoingRequest::new(headers);
 	request
@@ -88,11 +110,27 @@ fn request(method: Method, url: &str, content_type: Option<&str>, body: &[u8]) -
 		.map_err(|e| anyhow!("{url}: request failed: {e:?}"))?;
 
 	let status = response.status();
+	let www_authenticate = www_authenticate(&response);
 	let body = read_body(&response)?;
-	if !(200..300).contains(&status) {
-		bail!("{url}: HTTP {status}: {}", String::from_utf8_lossy(&body));
-	}
-	Ok(body)
+	Ok(HttpResponse {
+		status,
+		www_authenticate,
+		body,
+	})
+}
+
+/// The response's `WWW-Authenticate` challenge, if present — surfaced so the credential layer only
+/// offers Basic when the server asked for it. All matching header fields (case-insensitive name,
+/// UTF-8 decodable) are joined, since a 401 may split its schemes across several fields.
+fn www_authenticate(response: &IncomingResponse) -> Option<String> {
+	let challenges: Vec<String> = response
+		.headers()
+		.entries()
+		.into_iter()
+		.filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+		.filter_map(|(_, value)| String::from_utf8(value).ok())
+		.collect();
+	(!challenges.is_empty()).then(|| challenges.join(", "))
 }
 
 /// Write `bytes` to the request's outgoing body in ≤[`WRITE_CHUNK`] slices (empty = no write).

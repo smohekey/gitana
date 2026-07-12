@@ -11,8 +11,10 @@ use crate::Backend;
 use anyhow::Result;
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_porcelain::PushTags;
-use gitana_remote::{self as transport, Origin, PushRefspec, ReqwestTransport};
+use gitana_remote::{self as transport, HttpTransport, Origin, PushRefspec};
 use gitana_repository::Repository;
+
+use crate::{git_config, transport_for};
 
 use crate::dispatch;
 use crate::repo;
@@ -64,7 +66,16 @@ pub async fn run(
 
 	let found = repo::discover(cwd).await?;
 	let origin = Origin::load(&found.common_dir)?;
-	let http = ReqwestTransport::new();
+	// A relative askpass resolves against the worktree root, as git runs it from there (bare: git dir).
+	let askpass_cwd = found
+		.worktree_root
+		.clone()
+		.unwrap_or_else(|| found.common_dir.clone());
+	let http = transport_for(
+		git_config::effective_config_at(&found.common_dir).await?,
+		&origin,
+		askpass_cwd,
+	);
 	let body = transport::fetch_advertisement(&http, &origin, "git-receive-pack").await?;
 
 	let local = dispatch::detect_algorithm(&found.common_dir)?;
@@ -108,7 +119,7 @@ pub async fn run(
 
 #[allow(clippy::too_many_arguments)]
 async fn push_into<H: HashAlgorithm>(
-	http: &ReqwestTransport,
+	http: &impl HttpTransport,
 	origin: &Origin,
 	found: &repo::RepositoryLayout,
 	body: &[u8],

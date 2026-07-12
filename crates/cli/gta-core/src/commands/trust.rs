@@ -12,7 +12,7 @@ use gitana_porcelain::{
 	TRUST_REF, TrustSyncOutcome, trust_add_key, trust_init, trust_list, trust_remove_key,
 	trust_set_policy, trust_sync,
 };
-use gitana_remote::{self as transport, Origin, ReqwestTransport};
+use gitana_remote::{self as transport, HttpTransport, Origin};
 use gitana_repository::Repository;
 use gitana_trust::{AuditEvent, KeyId, Policy, TrustRoot, TrustedKey};
 
@@ -21,6 +21,7 @@ use crate::dispatch::{self, RepoCommand};
 use crate::identity::CliIdentity;
 use crate::repo;
 use crate::signer::{self, CliSigner};
+use crate::{git_config, transport_for};
 
 /// A `trust` sub-command.
 pub enum Action {
@@ -81,7 +82,16 @@ pub async fn run(cwd: &Path, action: Action) -> Result<()> {
 async fn sync(cwd: &Path, expect: Option<String>) -> Result<()> {
 	let found = repo::discover(cwd).await?;
 	let origin = Origin::load(&found.common_dir)?;
-	let http = ReqwestTransport::new();
+	// A relative askpass resolves against the worktree root, as git runs it from there (bare: git dir).
+	let askpass_cwd = found
+		.worktree_root
+		.clone()
+		.unwrap_or_else(|| found.common_dir.clone());
+	let http = transport_for(
+		git_config::effective_config_at(&found.common_dir).await?,
+		&origin,
+		askpass_cwd,
+	);
 	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
 
 	let local = dispatch::detect_algorithm(&found.common_dir)?;
@@ -94,7 +104,7 @@ async fn sync(cwd: &Path, expect: Option<String>) -> Result<()> {
 }
 
 async fn sync_into<H: HashAlgorithm>(
-	http: &ReqwestTransport,
+	http: &impl HttpTransport,
 	origin: &Origin,
 	found: &repo::RepositoryLayout,
 	body: &[u8],

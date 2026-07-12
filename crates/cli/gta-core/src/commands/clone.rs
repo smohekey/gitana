@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use gitana_object::{HashKind, Sha1, Sha256};
 use gitana_porcelain::Identity;
-use gitana_remote::{self as transport, Origin, ReqwestTransport};
+use gitana_remote::{self as transport, Origin};
 
 use crate::identity::CliIdentity;
-use crate::repo;
 use crate::shallow::build_deepen;
+use crate::{git_config, repo, transport_for};
 
 /// Clone the repository at `url` into `dir` (default: the repo slug). Anonymous: works
 /// for public repos. The local repository is created in whatever object format the
@@ -40,8 +40,12 @@ pub async fn run(
 		);
 	}
 
-	// Negotiate the remote's object format before creating anything locally.
-	let http = ReqwestTransport::new();
+	// Negotiate the remote's object format before creating anything locally. Credentials resolve from
+	// the ambient (global/system) config plus any URL userinfo — there is no local config yet — and the
+	// one transport carries them through the advertisement GET and the pack POST alike.
+	// A relative askpass resolves against the launch directory for `clone` (there is no worktree yet).
+	let askpass_cwd = git_config::command_cwd().unwrap_or_else(|| PathBuf::from("."));
+	let http = transport_for(git_config::ambient_effective().await?, &origin, askpass_cwd);
 	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
 	let kind = transport::negotiated_kind(&body)?;
 
@@ -58,9 +62,12 @@ pub async fn run(
 	}
 
 	// A freshly cloned repository is an ordinary checkout: its per-worktree and common dirs coincide.
-	// git records `clone: from <url>` on HEAD and the checked-out branch, using the URL exactly as typed
-	// (before `Origin::parse` trims it); the committer falls back to a placeholder when unconfigured, as
-	// git's reflog writes do. Resolved before `repo` moves into clone.
+	// git records `clone: from <url>` on HEAD and the checked-out branch, using the URL **verbatim**
+	// (trailing slash and all, before `Origin::parse` trims it) except with any `user:pass@` userinfo
+	// stripped — git's `transport_anonymize_url` — so a credential in the URL is never persisted into
+	// `.git/logs/*`. The committer falls back to a placeholder when unconfigured, as git's reflog writes
+	// do. Resolved before `repo` moves into clone.
+	let reflog_url = transport::anonymize_url(&url);
 	match kind {
 		HashKind::Sha1 => {
 			let repo = repo::open_generic::<Sha1>(&git_dir, &git_dir).await?;
@@ -74,7 +81,7 @@ pub async fn run(
 				&deepen,
 				Some(gitana_porcelain::CloneReflog {
 					committer: &committer,
-					url: &url,
+					url: &reflog_url,
 				}),
 			)
 			.await?;
@@ -91,7 +98,7 @@ pub async fn run(
 				&deepen,
 				Some(gitana_porcelain::CloneReflog {
 					committer: &committer,
-					url: &url,
+					url: &reflog_url,
 				}),
 			)
 			.await?;

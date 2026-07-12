@@ -6,21 +6,30 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_porcelain::Identity;
-use gitana_remote::{self as transport, Origin, ReqwestTransport};
+use gitana_remote::{self as transport, HttpTransport, Origin};
 use gitana_repository::HeadState;
 use gitana_worktree::WorkTree;
 
 use crate::commands::merge;
 use crate::dispatch;
 use crate::identity::CliIdentity;
-use crate::repo;
 use crate::signer;
+use crate::{git_config, repo, transport_for};
 
 /// Pull `HEAD`'s branch from the origin.
 pub async fn run(cwd: &Path) -> Result<()> {
 	let found = repo::discover(cwd).await?;
 	let origin = Origin::load(&found.common_dir)?;
-	let http = ReqwestTransport::new();
+	// A relative askpass resolves against the worktree root, as git runs it from there (bare: git dir).
+	let askpass_cwd = found
+		.worktree_root
+		.clone()
+		.unwrap_or_else(|| found.common_dir.clone());
+	let http = transport_for(
+		git_config::effective_config_at(&found.common_dir).await?,
+		&origin,
+		askpass_cwd,
+	);
 	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
 
 	let local = dispatch::detect_algorithm(&found.common_dir)?;
@@ -36,7 +45,7 @@ pub async fn run(cwd: &Path) -> Result<()> {
 /// porcelain composites; this composes them, printing the "Fetched from" line *between* — so a merge
 /// that then fails (e.g. a dirty work tree) still reports the completed fetch, as git does.
 async fn pull_into<H: HashAlgorithm>(
-	http: &ReqwestTransport,
+	http: &impl HttpTransport,
 	origin: &Origin,
 	found: &repo::RepositoryLayout,
 	body: &[u8],
