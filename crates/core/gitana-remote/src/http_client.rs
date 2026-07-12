@@ -11,7 +11,7 @@ use std::future::Future;
 
 use anyhow::Result;
 
-/// One HTTP response: the status code, the `WWW-Authenticate` challenge (if any), and the complete
+/// One HTTP response: the status code, the `WWW-Authenticate` challenge(s) (if any), and the complete
 /// body. Smart HTTP v0 as gitana speaks it is request → whole response (the pack response is parsed in
 /// full, no sideband interleave), so the body is always read to completion — a raw client never
 /// streams. The challenge is surfaced so [`AuthTransport`](crate::AuthTransport) only offers Basic
@@ -21,8 +21,10 @@ use anyhow::Result;
 pub struct HttpResponse {
 	/// The HTTP status code (e.g. `200`, `401`).
 	pub status: u16,
-	/// The `WWW-Authenticate` header value on a `401`, if the server sent one (e.g. `Basic realm="…"`).
-	pub www_authenticate: Option<String>,
+	/// The `WWW-Authenticate` header values on a `401`, one per header field the server sent, in order
+	/// (e.g. `["Basic realm=\"…\""]`, or `["Negotiate", "Basic realm=\"…\""]` when split across fields).
+	/// Kept unjoined so each is passed to a credential helper as a distinct `wwwauth[]` line, as git does.
+	pub www_authenticate: Vec<String>,
 	/// The complete response body.
 	pub body: Vec<u8>,
 }
@@ -39,15 +41,14 @@ impl HttpResponse {
 	/// realm="tenant, Basic admin"`) is not mistaken for a Basic offer. A scheme is the first token of a
 	/// segment; matching is case-insensitive, per RFC 7235.
 	pub fn offers_basic_auth(&self) -> bool {
-		let Some(challenge) = &self.www_authenticate else {
-			return false;
-		};
-		split_outside_quotes(challenge).into_iter().any(|segment| {
-			segment
-				.trim()
-				.split_whitespace()
-				.next()
-				.is_some_and(|token| token.eq_ignore_ascii_case("basic"))
+		self.www_authenticate.iter().any(|challenge| {
+			split_outside_quotes(challenge).into_iter().any(|segment| {
+				segment
+					.trim()
+					.split_whitespace()
+					.next()
+					.is_some_and(|token| token.eq_ignore_ascii_case("basic"))
+			})
 		})
 	}
 
@@ -128,7 +129,7 @@ mod tests {
 	fn challenge(www_authenticate: Option<&str>) -> HttpResponse {
 		HttpResponse {
 			status: 401,
-			www_authenticate: www_authenticate.map(str::to_owned),
+			www_authenticate: www_authenticate.map(str::to_owned).into_iter().collect(),
 			body: Vec::new(),
 		}
 	}
@@ -154,5 +155,16 @@ mod tests {
 		assert!(!challenge(Some("Digest realm=\"tenant, Basic admin\"")).offers_basic_auth());
 		// But a genuine second Basic scheme after a quoted realm still counts.
 		assert!(challenge(Some("Digest realm=\"a, b\", Basic realm=\"x\"")).offers_basic_auth());
+	}
+
+	#[test]
+	fn detects_basic_split_across_separate_header_fields() {
+		// git surfaces one `WWW-Authenticate` field per element; a Basic offer in any field counts.
+		let response = HttpResponse {
+			status: 401,
+			www_authenticate: vec!["Negotiate".to_owned(), "Basic realm=\"x\"".to_owned()],
+			body: Vec::new(),
+		};
+		assert!(response.offers_basic_auth());
 	}
 }

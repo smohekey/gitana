@@ -102,26 +102,30 @@ impl<C: HttpClient, P: CredentialProvider> AuthTransport<C, P> {
 		}
 	}
 
-	/// Report an accepted `credential` to the provider (best-effort), keyed on the repository base URL
-	/// with the credential's username — the `request` a helper stores under. A `base_url` with no
-	/// keyable host simply skips the callback.
+	/// Report an accepted `credential` to the provider (best-effort). A `base_url` with no keyable host
+	/// simply skips the callback.
 	async fn note_approved(&self, credential: &Credential) {
-		if let Some(request) = self.request_for(credential) {
+		if let Some(request) = self.callback_request() {
 			let _ = self.provider.approve(&request, credential).await;
 		}
 	}
 
 	/// Report a rejected `credential` to the provider (best-effort); see [`note_approved`](Self::note_approved).
 	async fn note_rejected(&self, credential: &Credential) {
-		if let Some(request) = self.request_for(credential) {
+		if let Some(request) = self.callback_request() {
 			let _ = self.provider.reject(&request, credential).await;
 		}
 	}
 
-	/// The credential request identifying `credential`'s location — the repository base keyed on the
-	/// credential's own username (what a helper stores/erases under).
-	fn request_for(&self, credential: &Credential) -> Option<CredentialRequest> {
-		CredentialRequest::from_url(&self.base_url, Some(credential.username.clone()))
+	/// The credential request for the `approve`/`reject` callbacks — keyed exactly as the `fill` request
+	/// (the repository base URL plus the URL-userinfo username *hint*), **not** the credential's finally
+	/// resolved username. git settles which helpers/`useHttpPath` apply once, during fill, from the
+	/// pre-helper attributes; keying the callbacks the same way makes `approve`/`reject` run that same
+	/// helper chain (a username a helper *learned* must not retroactively enable a username-qualified
+	/// `credential.<user>@host` section that fill never consulted). The credential's own username is still
+	/// what the provider *writes* to each helper.
+	fn callback_request(&self) -> Option<CredentialRequest> {
+		CredentialRequest::from_url(&self.base_url, self.username_hint.clone())
 	}
 
 	/// Issue `request` once with `headers`.
@@ -154,7 +158,7 @@ impl<C: HttpClient, P: CredentialProvider> AuthTransport<C, P> {
 		// git never sends a credential before a challenge, but does re-send an accepted one pre-emptively.
 		let attached = self.cached.lock().expect("cache not poisoned").clone();
 		let headers = attached.as_ref().map(auth_headers).unwrap_or_default();
-		let response = self.send(&request, &headers).await?;
+		let mut response = self.send(&request, &headers).await?;
 		if response.status != 401 {
 			// Success or a non-auth failure — nothing to negotiate (an accepted credential was approved when
 			// it was cached).
@@ -170,30 +174,48 @@ impl<C: HttpClient, P: CredentialProvider> AuthTransport<C, P> {
 			*self.cached.lock().expect("cache not poisoned") = None;
 		}
 
+		// Try the URL-userinfo credential first (taken once), but only against a challenge that offers
+		// Basic — gitana never sends Basic the server did not ask for. On its own `401`, **adopt that
+		// response** so the subsequent provider fill sees the server's *latest* challenge (a new realm, or
+		// a switch away from Basic), matching git's re-read of `WWW-Authenticate` on each rejection.
+		if response.offers_basic_auth()
+			&& let Some(url_credential) = self
+				.url_credential
+				.lock()
+				.expect("cache not poisoned")
+				.take()
+		{
+			let retry = self.send(&request, &auth_headers(&url_credential)).await?;
+			if retry.status == 401 {
+				self.note_rejected(&url_credential).await;
+				response = retry;
+			} else {
+				if retry.is_success() {
+					self.note_approved(&url_credential).await;
+					*self.cached.lock().expect("cache not poisoned") = Some(url_credential);
+				}
+				return retry.into_body(url);
+			}
+		}
+
 		if !response.offers_basic_auth() {
-			// A `401` that does not offer Basic (Bearer/Negotiate, or no challenge at all): gitana speaks
-			// only Basic, so do not prompt for or transmit Basic credentials the server did not ask for —
-			// let the server's `401` stand.
+			// The current `401` does not offer Basic (Bearer/Negotiate, or no challenge at all): gitana
+			// speaks only Basic, so do not prompt for or transmit Basic credentials the server did not ask
+			// for — let the server's `401` stand.
 			return response.into_body(url);
 		}
 
-		// Now resolve and send a credential. Try the URL userinfo credential first (taken once); on a repeat
-		// `401` it falls through to the provider (config / helper / prompt) — matching git's order.
-		let url_credential = self
-			.url_credential
-			.lock()
-			.expect("cache not poisoned")
-			.take();
-		if let Some(url_credential) = url_credential
-			&& let Some(body) = self.attempt(&request, url_credential, url).await?
-		{
-			return Ok(body);
-		}
-
-		// The provider fills from the repository *base* URL (not this service endpoint) so a path-sensitive
-		// lookup matches git's. An unkeyable URL or no credential leaves the original 401 to stand.
+		// Fill from the provider once and retry. git does a single fill+retry for Basic: on a rejecting
+		// `401` its `handle_curl_result` returns `HTTP_NOAUTH` (not `HTTP_REAUTH`, which is reserved for
+		// multistage NTLM/Kerberos), so it does **not** re-enter resolution within one operation — it
+		// erases the credential and fails, and a *rerun* then finds the helper empty and prompts. So a
+		// stale helper credential is rejected (erased) here and the `401` stands; there is deliberately no
+		// refill loop (which git lacks, and which could spin on a helper minting fresh credentials). The
+		// provider fills from the repository *base* URL (not this service endpoint) so a path-sensitive
+		// lookup matches git's; the `401`'s challenge rides along so a helper receives it as `wwwauth[]`.
 		let Some(cred_request) =
 			CredentialRequest::from_url(&self.base_url, self.username_hint.clone())
+				.map(|request| request.with_wwwauth(response.www_authenticate.clone()))
 		else {
 			return response.into_body(url);
 		};
@@ -202,7 +224,8 @@ impl<C: HttpClient, P: CredentialProvider> AuthTransport<C, P> {
 		};
 		let retry = self.send(&request, &auth_headers(&credential)).await?;
 		if retry.status == 401 {
-			// The filled credential was rejected too — surface the server's 401.
+			// The filled credential was rejected too — erase it (git's `credential_reject`) and let the
+			// server's 401 stand.
 			self.note_rejected(&credential).await;
 			return retry.into_body(url);
 		}
@@ -211,27 +234,6 @@ impl<C: HttpClient, P: CredentialProvider> AuthTransport<C, P> {
 			*self.cached.lock().expect("cache not poisoned") = Some(credential);
 		}
 		retry.into_body(url)
-	}
-
-	/// Retry `request` once with `credential`. `Ok(Some(body))` when the server accepted it (approved and
-	/// cached for the rest of the operation); `Ok(None)` when it was rejected with a `401` (the caller
-	/// falls through to the next credential source); the non-2xx error otherwise.
-	async fn attempt(
-		&self,
-		request: &Request<'_>,
-		credential: Credential,
-		url: &str,
-	) -> Result<Option<Vec<u8>>> {
-		let response = self.send(request, &auth_headers(&credential)).await?;
-		if response.status == 401 {
-			self.note_rejected(&credential).await;
-			return Ok(None);
-		}
-		if response.is_success() {
-			self.note_approved(&credential).await;
-			*self.cached.lock().expect("cache not poisoned") = Some(credential);
-		}
-		response.into_body(url).map(Some)
 	}
 }
 
@@ -280,13 +282,13 @@ mod tests {
 			if auth.as_deref() == Some(self.expected.as_str()) {
 				HttpResponse {
 					status: 200,
-					www_authenticate: None,
+					www_authenticate: Vec::new(),
 					body: b"ok".to_vec(),
 				}
 			} else {
 				HttpResponse {
 					status: 401,
-					www_authenticate: Some("Basic realm=\"x\"".to_owned()),
+					www_authenticate: vec!["Basic realm=\"x\"".to_owned()],
 					body: Vec::new(),
 				}
 			}
@@ -424,5 +426,135 @@ mod tests {
 			log[1].as_deref(),
 			Some(header_for("alice", "s3cr3t").as_str())
 		);
+	}
+
+	/// A client whose challenge *shifts*: the unauthenticated request gets a Basic `401`, but once a
+	/// (wrong) credential is presented the server answers `401` offering only Bearer. Records each
+	/// `Authorization` value it saw.
+	struct ShiftingChallengeClient {
+		log: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+	}
+
+	impl ShiftingChallengeClient {
+		fn answer(&self, headers: &[(String, String)]) -> HttpResponse {
+			let auth = headers
+				.iter()
+				.find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+				.map(|(_, value)| value.clone());
+			self.log.lock().unwrap().push(auth.clone());
+			let challenge = if auth.is_none() {
+				"Basic realm=\"x\""
+			} else {
+				// Once a credential is offered, the server no longer accepts Basic.
+				"Bearer realm=\"y\""
+			};
+			HttpResponse {
+				status: 401,
+				www_authenticate: vec![challenge.to_owned()],
+				body: Vec::new(),
+			}
+		}
+	}
+
+	impl HttpClient for ShiftingChallengeClient {
+		async fn get(&self, _url: &str, headers: &[(String, String)]) -> Result<HttpResponse> {
+			Ok(self.answer(headers))
+		}
+
+		async fn post(
+			&self,
+			_url: &str,
+			_content_type: &str,
+			_body: Vec<u8>,
+			headers: &[(String, String)],
+		) -> Result<HttpResponse> {
+			Ok(self.answer(headers))
+		}
+	}
+
+	#[tokio::test]
+	async fn a_rejected_url_credential_that_shifts_the_challenge_stops_before_the_provider() {
+		let base = "https://example.com/acme/app.git";
+		let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+		// The URL credential is wrong; its rejection returns a challenge that no longer offers Basic, so
+		// the provider (which would panic) must not be consulted and no further Basic credential is sent.
+		let transport = AuthTransport::with_userinfo(
+			ShiftingChallengeClient { log: log.clone() },
+			PanicProvider,
+			base.to_owned(),
+			Some("alice".to_owned()),
+			Some("wrong".to_owned()),
+		);
+
+		let result = transport
+			.get(&format!("{base}/info/refs?service=git-upload-pack"))
+			.await;
+		// The server's 401 stands as an error; the provider was never reached (no panic).
+		assert!(result.is_err());
+		let log = log.lock().unwrap();
+		// Exactly two sends: unauthenticated, then the URL credential — and no third (no post-shift Basic).
+		assert_eq!(log.len(), 2);
+		assert_eq!(log[0], None);
+		assert_eq!(
+			log[1].as_deref(),
+			Some(header_for("alice", "wrong").as_str())
+		);
+	}
+
+	/// A provider that fills a fixed credential and records every credential it is asked to `reject`.
+	struct RejectRecordingProvider {
+		username: String,
+		password: String,
+		rejected: Arc<std::sync::Mutex<Vec<Credential>>>,
+	}
+
+	impl CredentialProvider for RejectRecordingProvider {
+		async fn fill(&self, _request: &CredentialRequest) -> Result<Option<Credential>> {
+			Ok(Some(Credential {
+				username: self.username.clone(),
+				password: self.password.clone(),
+			}))
+		}
+
+		async fn approve(&self, _request: &CredentialRequest, _cred: &Credential) -> Result<()> {
+			Ok(())
+		}
+
+		async fn reject(&self, _request: &CredentialRequest, cred: &Credential) -> Result<()> {
+			self.rejected.lock().unwrap().push(cred.clone());
+			Ok(())
+		}
+	}
+
+	#[tokio::test]
+	async fn a_rejected_filled_credential_is_erased_and_the_401_stands() {
+		let base = "https://example.com/acme/app.git";
+		let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+		let rejected = Arc::new(std::sync::Mutex::new(Vec::new()));
+		// The provider fills a wrong credential the server never accepts. git does a single fill+retry for
+		// Basic, then gives up (`handle_curl_result` returns `HTTP_NOAUTH`, not `HTTP_REAUTH`): the
+		// credential is erased (rejected) exactly once and the 401 stands — there is no refill loop.
+		let transport = AuthTransport::new(
+			AuthRequiredClient {
+				expected: header_for("alice", "right"),
+				log: log.clone(),
+			},
+			RejectRecordingProvider {
+				username: "alice".to_owned(),
+				password: "wrong".to_owned(),
+				rejected: rejected.clone(),
+			},
+			base.to_owned(),
+		);
+
+		let result = transport
+			.get(&format!("{base}/info/refs?service=git-upload-pack"))
+			.await;
+		assert!(result.is_err(), "the server's 401 should stand");
+		// Exactly one rejection (erase), then done — no re-fill, no loop.
+		assert_eq!(rejected.lock().unwrap().len(), 1);
+		assert_eq!(rejected.lock().unwrap()[0].password, "wrong");
+		// Two sends: unauthenticated, then the single filled credential.
+		assert_eq!(log.lock().unwrap().len(), 2);
 	}
 }

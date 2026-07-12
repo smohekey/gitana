@@ -119,18 +119,18 @@ fn request(
 	})
 }
 
-/// The response's `WWW-Authenticate` challenge, if present — surfaced so the credential layer only
-/// offers Basic when the server asked for it. All matching header fields (case-insensitive name,
-/// UTF-8 decodable) are joined, since a 401 may split its schemes across several fields.
-fn www_authenticate(response: &IncomingResponse) -> Option<String> {
-	let challenges: Vec<String> = response
+/// The response's `WWW-Authenticate` challenge values, one per matching header field (case-insensitive
+/// name, UTF-8 decodable), in order — surfaced so the credential layer only offers Basic when the
+/// server asked for it. Kept unjoined, since a 401 may split its schemes across several fields and each
+/// is forwarded to a credential helper as its own `wwwauth[]` line.
+fn www_authenticate(response: &IncomingResponse) -> Vec<String> {
+	response
 		.headers()
 		.entries()
 		.into_iter()
 		.filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
 		.filter_map(|(_, value)| String::from_utf8(value).ok())
-		.collect();
-	(!challenges.is_empty()).then(|| challenges.join(", "))
+		.collect()
 }
 
 /// Write `bytes` to the request's outgoing body in ≤[`WRITE_CHUNK`] slices (empty = no write).

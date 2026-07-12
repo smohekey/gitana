@@ -24,15 +24,15 @@ impl ReqwestTransport {
 async fn read_response(response: reqwest::Response) -> Result<HttpResponse> {
 	let status = response.status().as_u16();
 	// A 401 may carry the challenge across several `WWW-Authenticate` fields (e.g. `Negotiate` then
-	// `Basic`); aggregate them all so a Basic offer in any field is seen.
-	let challenges: Vec<String> = response
+	// `Basic`); keep each field as a distinct value so a Basic offer in any is seen and each is forwarded
+	// to a credential helper as its own `wwwauth[]` line, as git does.
+	let www_authenticate: Vec<String> = response
 		.headers()
 		.get_all(reqwest::header::WWW_AUTHENTICATE)
 		.iter()
 		.filter_map(|value| value.to_str().ok())
 		.map(str::to_owned)
 		.collect();
-	let www_authenticate = (!challenges.is_empty()).then(|| challenges.join(", "));
 	let body = response.bytes().await.context("reading response body")?;
 	Ok(HttpResponse {
 		status,

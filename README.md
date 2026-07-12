@@ -166,11 +166,15 @@ Implemented command groups:
 - HTTP authentication, matching git's credential flow: a remote that answers `401 WWW-Authenticate:
   Basic` is retried once with an `Authorization: Basic` header. Credentials resolve in git's order —
   URL userinfo (`https://user:pass@host`, with the password kept out of the saved `remote.origin.url`),
-  then `credential.username`, then an interactive prompt (`GIT_ASKPASS` → `core.askPass` →
-  `SSH_ASKPASS` → the terminal, honouring `GIT_TERMINAL_PROMPT=0` and declining cleanly with no tty).
-  A working credential is cached for the rest of the operation, so a clone/fetch/push authenticates
-  once. (Credential *helpers* — `osxkeychain`, `store`, … — and `url.*.insteadOf` rewriting are not
-  yet wired.)
+  then `credential.username`, then the configured credential *helpers* (`credential.helper` and
+  per-URL `credential.<url>.helper` — `osxkeychain`, `store`, `manager`, …, invoked over git's
+  `get`/`store`/`erase` protocol, honouring `credential.useHttpPath`), then an interactive prompt
+  (`GIT_ASKPASS` → `core.askPass` → `SSH_ASKPASS` → the terminal, honouring `GIT_TERMINAL_PROMPT=0`
+  and declining cleanly with no tty). A helper can supply a credential without prompting; on success it
+  is handed back to every helper's `store`, and a rejected one to `erase`. `credential.<url>` matching
+  is git's own (scheme, `*`-wildcard host, port, path-prefix at a `/` boundary; scheme-less patterns
+  match exactly). A working credential is cached for the rest of the operation, so a clone/fetch/push
+  authenticates once. (`url.*.insteadOf` rewriting is not yet wired.)
 - Shallow history, matching git: `clone --depth N` / `--shallow-since <date>` / `--shallow-exclude
   <ref>` truncate the fetched history and record the boundary in `.git/shallow`. `fetch` then extends
   it with `--depth N` (absolute), `--deepen N` (relative to the current boundary), `--shallow-since` /

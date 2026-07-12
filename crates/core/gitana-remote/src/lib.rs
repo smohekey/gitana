@@ -75,8 +75,19 @@ pub fn anonymize_url(url: &str) -> String {
 
 /// Percent-decode `s` (`%XX` → byte), decoding the resulting bytes as UTF-8 (lossily, since a
 /// credential is otherwise opaque). A lone `%` or a `%` not followed by two hex digits is kept
-/// literally, matching lenient URL decoders.
-fn percent_decode(s: &str) -> String {
+/// literally, matching lenient URL decoders. Public so the CLI's credential-helper layer can decode a
+/// `credential.<url>` pattern path the same way git normalises URLs before matching. Use
+/// [`percent_decode_bytes`] where a non-UTF-8 octet must survive (a helper's raw `path=` bytes).
+pub fn percent_decode(s: &str) -> String {
+	String::from_utf8_lossy(&percent_decode_bytes(s)).into_owned()
+}
+
+/// Percent-decode `s` to raw bytes — like [`percent_decode`] but preserving each decoded octet exactly
+/// (a `%FF` becomes the byte `0xFF`, not a UTF-8 replacement), which git relies on so a helper's
+/// `path=` line carries the server's bytes and distinct paths (`%FF` vs `%FE`) stay distinct keys. An
+/// encoded NUL (`%00`) is kept literal (git never decodes it into a credential value, where it would
+/// truncate the helper's `key=value` line); a lone/`%XX`-malformed `%` is kept verbatim.
+pub fn percent_decode_bytes(s: &str) -> Vec<u8> {
 	let bytes = s.as_bytes();
 	let mut out = Vec::with_capacity(bytes.len());
 	let mut i = 0;
@@ -87,14 +98,19 @@ fn percent_decode(s: &str) -> String {
 				(bytes[i + 1] as char).to_digit(16),
 				(bytes[i + 2] as char).to_digit(16),
 			) {
-			out.push((hi * 16 + lo) as u8);
+			let byte = (hi * 16 + lo) as u8;
+			if byte == 0 {
+				out.extend_from_slice(&bytes[i..i + 3]);
+			} else {
+				out.push(byte);
+			}
 			i += 3;
 		} else {
 			out.push(bytes[i]);
 			i += 1;
 		}
 	}
-	String::from_utf8_lossy(&out).into_owned()
+	out
 }
 
 /// Percent-encode `s` for a URL userinfo field, escaping every byte outside the RFC 3986 unreserved
@@ -627,6 +643,15 @@ mod tests {
 		assert_eq!(origin.username.as_deref(), Some("alice@host"));
 		assert_eq!(origin.password.as_deref(), Some("pa:ss"));
 		assert_eq!(origin.url, "https://example.com/app");
+	}
+
+	#[test]
+	fn percent_decode_preserves_an_encoded_nul() {
+		// `%20` → space, but `%00` stays literal — decoding it would embed a NUL that truncates a
+		// credential helper's `key=value` line (git preserves it, so we do too).
+		assert_eq!(percent_decode("a%20b"), "a b");
+		assert_eq!(percent_decode("a%00b"), "a%00b");
+		assert_eq!(percent_decode("%2F"), "/");
 	}
 
 	#[test]

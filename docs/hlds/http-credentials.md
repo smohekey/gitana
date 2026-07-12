@@ -277,10 +277,44 @@ Each slice: its own worktree+branch, workspace green **including `wasm32-wasip2 
   (honour `GIT_TERMINAL_PROMPT`, decline cleanly with no tty). wasm builds with `Unauthenticated`
   (unchanged behaviour) until slice 3. Oracle: a Basic-auth-gated axum server in
   `crates/cli/gta/tests/support/mod.rs`.
-- **Slice 2 — Credential helper protocol (native).** `CliCredentialProvider` invokes external helpers
-  (`get`/`store`/`erase`), `credential.helper` list + per-URL, `useHttpPath`; wire `approve`/`reject`
-  to persist. Unlocks osxkeychain/manager/store. Oracle: built-in `store` helper round-trip vs real
-  git.
+- **Slice 2 — Credential helper protocol (native). ✅ Done.** `CliCredentialProvider` now drives
+  external helpers over git's protocol: `fill` runs the resolved `get` chain (feeding forward the known
+  username and the `401`'s `wwwauth[]`, stopping when both fields are known, aborting on a helper's
+  `quit`) *before* prompting; `approve`/`reject` run every helper's `store`/`erase`. Implemented in a
+  new `gta-core` `credential_helper` module — `Helper` (the three value forms `!shell` / absolute path
+  / `git credential-<name>`, run via `sh -c` from `cwd`, mirroring git's `use_shell`) and `resolve`
+  (which helpers apply, plus `username` and `useHttpPath`). **Full `credential.<url>` matching** is
+  git-faithful (`urlmatch.c` `match_urls` for a full URL — scheme-exact, optional-user-exact, host with
+  `*` wildcarding a single label, port after default-port stripping, path prefix at a `/` boundary —
+  and `credential.c` `credential_match` for a scheme-less partial; **credentials use `select_all`, so
+  there is no specificity ranking — every matching entry applies in read order, single keys last-wins,
+  `helper` accumulates with `helper=` resetting**). Wire format verified empirically against git 2.50:
+  git sends decomposed `protocol`/`host`/`path`(only under `useHttpPath`)/`username`/`password`
+  + `wwwauth[]` to helpers and does **not** send `url` (that attribute is a *caller→git-credential*
+  input convenience, never a git→helper output), so gitana threads `wwwauth[]` (surfacing it end to end
+  by making `HttpResponse.www_authenticate` a `Vec<String>` and carrying it on the fill
+  `CredentialRequest`) and omits `url`. No gitana-native store — external `git-credential-*` only.
+  Oracle: a self-contained file-backed `git-credential`-style helper in `git_http_auth.rs` exercising
+  the `get` / `approve→store` / `reject→erase` round-trip, plus regression that the slice-1 userinfo /
+  askpass / prompt flows are unchanged when no helper is configured. Hardened over ~16 codex rounds
+  against git 2.50 source + probes: the full `get`/`store`/`erase`/`quit`/`url=` state machine (a `url=`
+  clears the credential *and* the helper chain, so no later helper runs and no `store`/`erase` fires; a
+  malformed `quit`/`url=` aborts as git dies; a `get` helper's output is consumed even on a non-zero
+  exit); `credential.<url>` URL normalisation reproducing git's `url_normalize`/`credential_format`
+  asymmetry (unreserved-only decode on the pattern vs full `credential_format` re-encode on the request,
+  so `a%2Fb`↔`a/b`, `a%00b`→`%2500`, a literal `:` pattern *not* matching, wildcard/`*` host, one-dot
+  FQDN strip, IPv6 brackets, malformed `%XX`/`%00` → exact partial fallback, numeric-port default
+  stripping); byte-exact helper `path=` (raw `0xFF` survives, `%00` kept literal so no `key=value`
+  truncation); `approve`/`reject` re-running the *same* helper chain `fill` settled (keyed on the
+  fill-time username hint, suppressed entirely after a `url=` reset), matching git's once-per-operation
+  `credential_apply_config`; the `401` re-auth being a single fill+retry then give-up (git's
+  `HTTP_NOAUTH`, not a refill loop); and userinfo redacted from all malformed-`url=` error messages.
+  **Deliberately deferred (not needed for osxkeychain/store/manager/cache):** `capability[]`/`authtype`/
+  `state[]` negotiation, `password_expiry_utc`/`oauth_refresh_token`, threading a helper's refined
+  `protocol`/`host`/`path` forward, and `.`/`..` path dot-segment resolution (repo paths lack them). One
+  intentional divergence: `credential.<url>` matching keys on the URL-userinfo username only, so a
+  username *learned* from `credential.username`/a helper does not retroactively enable a
+  username-qualified `credential.<user>@host` section (git's single-pass config walk can).
 - **Slice 3 — wasm host-import credential capability.** WIT `credentials` import + `gitana-repo-host`
   impl + `WasiCredentialProvider` + component wiring; host-harness end-to-end Basic auth test.
 - **Slice 4 — URL rewriting, redirects + extra headers.** Apply `url.*.insteadOf`/`pushInsteadOf` in
