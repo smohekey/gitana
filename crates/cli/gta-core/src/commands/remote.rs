@@ -1,12 +1,11 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use gitana_config::GitConfig;
 use gitana_object::HashAlgorithm;
 use gitana_repository::Repository;
 
-use crate::Backend;
 use crate::dispatch::{self, RepoCommand};
+use crate::{Backend, url_rewrite};
 
 /// A `gta remote` operation: list the configured remotes, or add / remove / retarget one.
 pub enum Action {
@@ -49,9 +48,9 @@ impl RepoCommand for RemoteCmd {
 /// `pushurl` verbatim, or — with none — every `url` with `pushInsteadOf` rewriting (falling back to
 /// `insteadOf`), matching what `git remote -v` reports.
 async fn list<H: HashAlgorithm>(repo: &Repository<Backend, H>, verbose: bool) -> Result<()> {
-	let config = repo.read_config().await?;
-	let fetch_rules = rewrite_rules(&config, "insteadOf");
-	let push_rules = rewrite_rules(&config, "pushInsteadOf");
+	// The merged (system/global/local) config, so `remote -v` applies a `url.*.insteadOf` rule set in
+	// global/system config — exactly what git shows and what the fetch/push transport now uses.
+	let config = repo.effective_config().await?;
 
 	let mut names = config.subsections("remote");
 	names.sort_unstable();
@@ -60,68 +59,35 @@ async fn list<H: HashAlgorithm>(repo: &Repository<Backend, H>, verbose: bool) ->
 			println!("{name}");
 			continue;
 		}
-		// An empty-string `url`/`pushurl` is treated as absent, as git does for `remote -v`.
-		let urls: Vec<&str> = non_empty(config.get_all("remote", Some(name), "url"));
+		// The surviving `url`/`pushurl` values (git's empty-value reset applied), as fetch/push use.
+		let urls = url_rewrite::remote_urls(&config, name, "url")?;
 		match urls.first() {
-			Some(url) => println!("{name}\t{} (fetch)", rewrite(url, &fetch_rules)),
+			Some(url) => println!(
+				"{name}\t{} (fetch)",
+				url_rewrite::rewrite_fetch_url(&config, url)?
+			),
 			None => println!("{name}\t"),
 		}
 		// Push destinations. git applies `pushInsteadOf` only when falling back to `url` (no explicit
 		// `pushurl`); an explicit `pushurl` gets plain `insteadOf` rewriting like any other URL.
-		let pushurls = non_empty(config.get_all("remote", Some(name), "pushurl"));
+		let pushurls = url_rewrite::remote_urls(&config, name, "pushurl")?;
 		if pushurls.is_empty() {
 			for &url in &urls {
-				let rewritten = if starts_with_rule(url, &push_rules) {
-					rewrite(url, &push_rules)
-				} else {
-					rewrite(url, &fetch_rules)
-				};
-				println!("{name}\t{rewritten} (push)");
+				println!(
+					"{name}\t{} (push)",
+					url_rewrite::rewrite_push_url(&config, url)?
+				);
 			}
 		} else {
 			for push in pushurls {
-				println!("{name}\t{} (push)", rewrite(push, &fetch_rules));
+				println!(
+					"{name}\t{} (push)",
+					url_rewrite::rewrite_fetch_url(&config, push)?
+				);
 			}
 		}
 	}
 	Ok(())
-}
-
-/// The URL-rewrite rules for `key` (`insteadOf` or `pushInsteadOf`): each `url.<base>.<key> =
-/// <prefix>` as a `(prefix, base)` pair, in config file order so ties resolve to the first rule as
-/// git does. A URL's longest matching prefix is replaced with its base.
-fn rewrite_rules<'a>(config: &'a GitConfig, key: &str) -> Vec<(&'a str, &'a str)> {
-	config
-		.variables_named("url", key)
-		.into_iter()
-		.filter_map(|(base, prefix)| Some((prefix?, base?)))
-		.collect()
-}
-
-/// Drop empty-string values (git treats an empty URL/pushurl as absent).
-fn non_empty(values: Vec<&str>) -> Vec<&str> {
-	values.into_iter().filter(|v| !v.is_empty()).collect()
-}
-
-/// Whether any rule's prefix is a prefix of `url`.
-fn starts_with_rule(url: &str, rules: &[(&str, &str)]) -> bool {
-	rules.iter().any(|(prefix, _)| url.starts_with(prefix))
-}
-
-/// Rewrite `url` by the longest matching rule prefix (replacing it with that rule's base), or return
-/// it unchanged when nothing matches. On an equal-length tie the first rule in config order wins, as
-/// git does.
-fn rewrite(url: &str, rules: &[(&str, &str)]) -> String {
-	let mut best: Option<&(&str, &str)> = None;
-	for rule in rules.iter().filter(|(prefix, _)| url.starts_with(prefix)) {
-		if best.is_none_or(|current| rule.0.len() > current.0.len()) {
-			best = Some(rule);
-		}
-	}
-	match best {
-		Some((prefix, base)) => format!("{base}{}", &url[prefix.len()..]),
-		None => url.to_owned(),
-	}
 }
 
 async fn add<H: HashAlgorithm>(repo: &Repository<Backend, H>, name: &str, url: &str) -> Result<()> {

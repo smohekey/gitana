@@ -9,11 +9,13 @@ mod credential_helper;
 mod dispatch;
 mod error;
 mod git_config;
+mod http_headers;
 mod identity;
 mod prompt;
 mod repo;
 mod shallow;
 mod signer;
+mod url_rewrite;
 
 pub use credential::{CliCredentialProvider, transport_for};
 pub use error::{MergeConflict, SilentExit};

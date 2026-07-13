@@ -18,8 +18,8 @@ use gitana_remote::{
 	AuthTransport, Credential, CredentialProvider, CredentialRequest, Origin, ReqwestTransport,
 };
 
-use crate::credential_helper;
 use crate::prompt::{self, Echo};
+use crate::{credential_helper, http_headers};
 
 /// The CLI's authenticating HTTP transport for `origin`: a native `ReqwestTransport` wrapped with a
 /// [`CliCredentialProvider`] reading `config`, seeded with any userinfo the URL carried. Every remote
@@ -27,19 +27,21 @@ use crate::prompt::{self, Echo};
 /// credential flow applies uniformly. `cwd` is the directory a relative askpass helper resolves
 /// against — the worktree root for a repo command, the launch directory for `clone` — matching the
 /// directory git runs the helper from. The one transport is threaded through both the advertisement
-/// `GET` and the pack `POST`, sharing the credential it resolves.
+/// `GET` and the pack `POST`, sharing the credential it resolves. The transport also carries the
+/// `http.extraHeader` values `config` sets for `origin.url` (git's URL-matched extra request headers).
 pub fn transport_for(
 	config: GitConfig,
 	origin: &Origin,
 	cwd: PathBuf,
-) -> AuthTransport<ReqwestTransport, CliCredentialProvider> {
-	AuthTransport::with_userinfo(
-		ReqwestTransport::new(),
+) -> Result<AuthTransport<ReqwestTransport, CliCredentialProvider>> {
+	let extra_headers = http_headers::extra_headers(&config, &origin.url)?;
+	Ok(AuthTransport::with_userinfo(
+		ReqwestTransport::with_extra_headers(extra_headers),
 		CliCredentialProvider::new(config, cwd),
 		origin.url.clone(),
 		origin.username.clone(),
 		origin.password.clone(),
-	)
+	))
 }
 
 /// Resolves HTTP credentials from git config and interactive prompts. Holds a snapshot of the

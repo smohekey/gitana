@@ -208,10 +208,18 @@ impl Origin {
 	/// through the `store` capability — so this works over any [`FileStore`] (a local
 	/// checkout or the wasm descriptor backend) with no ambient filesystem access.
 	pub async fn save(&self, store: &impl FileStore) -> Result<()> {
+		self.save_as(store, &self.persisted_url()).await
+	}
+
+	/// Like [`save`](Self::save), but persisting the given `url` as `remote.origin.url` instead of this
+	/// origin's own [`persisted_url`](Self::persisted_url). `clone` uses this to record the URL git would
+	/// — the *original* argument, not the `url.*.insteadOf`-rewritten transport URL — so a later change
+	/// to the rewrite rules still applies. `url` is written verbatim; the caller redacts any password.
+	pub async fn save_as(&self, store: &impl FileStore, url: &str) -> Result<()> {
 		let bytes = store.read_path("config").await.context("reading config")?;
 		let text = String::from_utf8(bytes).context("config is not UTF-8")?;
 		let mut config = GitConfig::parse(&text).context("parsing config")?;
-		config.set("remote", Some("origin"), "url", &self.persisted_url())?;
+		config.set("remote", Some("origin"), "url", url)?;
 		config.set("remote", Some("origin"), "fetch", ORIGIN_FETCH_REFSPEC)?;
 		store
 			.write_path_replace("config", config.render().as_bytes())

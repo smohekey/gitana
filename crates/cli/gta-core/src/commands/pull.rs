@@ -14,22 +14,20 @@ use crate::commands::merge;
 use crate::dispatch;
 use crate::identity::CliIdentity;
 use crate::signer;
-use crate::{git_config, repo, transport_for};
+use crate::{git_config, repo, transport_for, url_rewrite};
 
 /// Pull `HEAD`'s branch from the origin.
 pub async fn run(cwd: &Path) -> Result<()> {
 	let found = repo::discover(cwd).await?;
-	let origin = Origin::load(&found.common_dir)?;
+	// The origin URL is `remote.origin.url` with `url.*.insteadOf` applied, read from the merged config.
+	let config = git_config::effective_config_at(&found.common_dir).await?;
+	let origin = url_rewrite::fetch_origin(&config, "origin")?;
 	// A relative askpass resolves against the worktree root, as git runs it from there (bare: git dir).
 	let askpass_cwd = found
 		.worktree_root
 		.clone()
 		.unwrap_or_else(|| found.common_dir.clone());
-	let http = transport_for(
-		git_config::effective_config_at(&found.common_dir).await?,
-		&origin,
-		askpass_cwd,
-	);
+	let http = transport_for(config, &origin, askpass_cwd)?;
 	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
 
 	let local = dispatch::detect_algorithm(&found.common_dir)?;

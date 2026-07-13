@@ -178,7 +178,15 @@ Implemented command groups:
   is handed back to every helper's `store`, and a rejected one to `erase`. `credential.<url>` matching
   is git's own (scheme, `*`-wildcard host, port, path-prefix at a `/` boundary; scheme-less patterns
   match exactly). A working credential is cached for the rest of the operation, so a clone/fetch/push
-  authenticates once. (`url.*.insteadOf` rewriting is not yet wired.)
+  authenticates once.
+- URL rewriting and extra headers, matching git: `clone`/`fetch`/`pull`/`push` rewrite the remote URL
+  through `url.<base>.insteadOf` (longest-prefix wins, ties to the first rule) before talking to it, so
+  a configured alias reaches its real target; a push additionally honours `url.<base>.pushInsteadOf`
+  (falling back to `insteadOf`) and an explicit `remote.<name>.pushurl`. Every request carries the
+  `http.extraHeader` values configured for the remote — resolved with git's URL-match specificity, so a
+  `http.<url>.extraHeader` for a more specific URL replaces the section-level one (`git remote -v` shows
+  the same rewriting). (Cross-host redirect following for auth is deferred to a later slice; a
+  cross-host-redirected repository fails to authenticate rather than leaking a credential.)
 - Shallow history, matching git: `clone --depth N` / `--shallow-since <date>` / `--shallow-exclude
   <ref>` truncate the fetched history and record the boundary in `.git/shallow`. `fetch` then extends
   it with `--depth N` (absolute), `--deepen N` (relative to the current boundary), `--shallow-since` /

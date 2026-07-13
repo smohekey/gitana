@@ -329,14 +329,27 @@ Each slice: its own worktree+branch, workspace green **including `wasm32-wasip2 
   wiring. Host-harness end-to-end: a `401`-gated axum server, a store-file-backed `fetch`/`clone` that
   authenticates in both hash formats, and a no-credential run where the `401` stands. No error/quit
   channel over WIT (a host declines by returning `none` from `fill`).
-- **Slice 4 — URL rewriting, redirects + extra headers.** Apply `url.*.insteadOf`/`pushInsteadOf` in
-  the transport path (currently display-only), `http.extraHeader`, per-URL `credential.*` matching,
-  possibly Bearer tokens, and **cross-host redirect following for auth** (`http.followRedirects`). The
-  last belongs here, not slice 1: it is URL-rewriting-shaped (remember the redirect target and
-  re-address subsequent requests), and doing it *safely* (never sending a credential across an origin
-  it was not resolved for) is a self-contained problem best designed with its own cross-origin test
-  matrix. Slice 1 deliberately relies on reqwest's safe default instead — a cross-host-redirected
-  repository fails to authenticate rather than leaking a credential.
+- **Slice 4 — URL rewriting + extra headers. ✅ DONE (insteadOf + extraHeader).** `url.*.insteadOf`
+  and `pushInsteadOf` are applied in the transport path (were display-only): a shared `gta-core`
+  `url_rewrite` module resolves the fetch/push [`Origin`] (honouring an explicit `remote.<name>.pushurl`)
+  and `remote -v` reuses it. `http.extraHeader` (section-level and per-URL `http.<url>.extraHeader`) is
+  resolved with git's full urlmatch **specificity** (most-specific matching level wins and replaces the
+  rest; ties accumulate; empty resets; `*.` single-label host wildcard; default-port strip;
+  case-insensitive scheme/host — all verified against `git config --get-urlmatch` probes) in a new
+  `http_headers` module, and attached to every request by a `ReqwestTransport` carrying the headers.
+  `clone` persists the *original* argument (not the rewritten transport URL) as `remote.origin.url`, as
+  git does. Per-URL `credential.*` matching already shipped in slice 2. **Multi-destination push** (git
+  pushes to every `remote.<name>.pushurl`) is not supported — gta pushes to a single destination and
+  errors on multiple non-empty `pushurl` values rather than silently pushing to one; a deferred feature. Oracle: `git_url_config.rs` (insteadOf
+  clone/fetch reach a server behind a fictional URL; a `require_header` server proves `http.extraHeader`
+  reaches the wire) plus unit tests. **Deferred to its own later slice:** Bearer `authtype` negotiation
+  (manual Bearer already works via `extraHeader`) and **cross-host redirect following for auth**
+  (`http.followRedirects`) — it is URL-rewriting-shaped (remember the redirect target and re-address
+  subsequent requests) and doing it *safely* (never sending a credential across an origin it was not
+  resolved for) needs its own cross-origin test matrix. gitana relies on reqwest's safe default until
+  then — a cross-host-redirected repository fails to authenticate rather than leaking a credential. A
+  known follow-up smell: the `http_headers` urlmatch duplicates the credential matcher's URL logic;
+  they are candidates for a shared `urlmatch` module.
 
 ## Verification
 

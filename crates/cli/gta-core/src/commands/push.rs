@@ -14,7 +14,7 @@ use gitana_porcelain::PushTags;
 use gitana_remote::{self as transport, HttpTransport, Origin, PushRefspec};
 use gitana_repository::Repository;
 
-use crate::{git_config, transport_for};
+use crate::{git_config, transport_for, url_rewrite};
 
 use crate::dispatch;
 use crate::repo;
@@ -65,17 +65,16 @@ pub async fn run(
 	}
 
 	let found = repo::discover(cwd).await?;
-	let origin = Origin::load(&found.common_dir)?;
+	// git's push-URL selection: `remote.origin.pushurl` (with `insteadOf`) if set, else
+	// `remote.origin.url` with `pushInsteadOf` (falling back to `insteadOf`) — over the merged config.
+	let config = git_config::effective_config_at(&found.common_dir).await?;
+	let origin = url_rewrite::push_origin(&config, "origin")?;
 	// A relative askpass resolves against the worktree root, as git runs it from there (bare: git dir).
 	let askpass_cwd = found
 		.worktree_root
 		.clone()
 		.unwrap_or_else(|| found.common_dir.clone());
-	let http = transport_for(
-		git_config::effective_config_at(&found.common_dir).await?,
-		&origin,
-		askpass_cwd,
-	);
+	let http = transport_for(config, &origin, askpass_cwd)?;
 	let body = transport::fetch_advertisement(&http, &origin, "git-receive-pack").await?;
 
 	let local = dispatch::detect_algorithm(&found.common_dir)?;

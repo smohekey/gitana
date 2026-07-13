@@ -21,7 +21,7 @@ use crate::dispatch::{self, RepoCommand};
 use crate::identity::CliIdentity;
 use crate::repo;
 use crate::signer::{self, CliSigner};
-use crate::{git_config, transport_for};
+use crate::{git_config, transport_for, url_rewrite};
 
 /// A `trust` sub-command.
 pub enum Action {
@@ -81,17 +81,17 @@ pub async fn run(cwd: &Path, action: Action) -> Result<()> {
 /// verifying it as a forward-only candidate over the local root — then print the resulting root.
 async fn sync(cwd: &Path, expect: Option<String>) -> Result<()> {
 	let found = repo::discover(cwd).await?;
-	let origin = Origin::load(&found.common_dir)?;
+	// The origin URL is `remote.origin.url` with `url.*.insteadOf` applied, read from the merged config.
+	// (`trust sync` both fetches and pushes the trust ref over this one origin; it uses fetch-direction
+	// `insteadOf` rather than `pushInsteadOf`, which would only differ under a push-specific rewrite.)
+	let config = git_config::effective_config_at(&found.common_dir).await?;
+	let origin = url_rewrite::fetch_origin(&config, "origin")?;
 	// A relative askpass resolves against the worktree root, as git runs it from there (bare: git dir).
 	let askpass_cwd = found
 		.worktree_root
 		.clone()
 		.unwrap_or_else(|| found.common_dir.clone());
-	let http = transport_for(
-		git_config::effective_config_at(&found.common_dir).await?,
-		&origin,
-		askpass_cwd,
-	);
+	let http = transport_for(config, &origin, askpass_cwd)?;
 	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
 
 	let local = dispatch::detect_algorithm(&found.common_dir)?;

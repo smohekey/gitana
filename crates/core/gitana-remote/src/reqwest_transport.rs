@@ -5,16 +5,29 @@ use anyhow::{Context, Result};
 
 use crate::{HttpClient, HttpResponse};
 
-/// An [`HttpClient`] over a pooled `reqwest::Client`.
+/// An [`HttpClient`] over a pooled `reqwest::Client`, optionally attaching a fixed set of extra request
+/// headers to every request (git's `http.extraHeader`).
 #[derive(Debug, Clone, Default)]
 pub struct ReqwestTransport {
 	client: reqwest::Client,
+	/// Headers added to every request, ahead of any the caller passes (e.g. `Authorization`) — git's
+	/// configured `http.extraHeader` values. Empty for a plain transport.
+	extra_headers: Vec<(String, String)>,
 }
 
 impl ReqwestTransport {
-	/// A transport with a fresh client (its own connection pool).
+	/// A transport with a fresh client (its own connection pool) and no extra headers.
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// A transport that attaches `extra_headers` (git's `http.extraHeader`) to every request it issues,
+	/// ahead of any per-request headers the auth layer adds.
+	pub fn with_extra_headers(extra_headers: Vec<(String, String)>) -> Self {
+		Self {
+			client: reqwest::Client::new(),
+			extra_headers,
+		}
 	}
 }
 
@@ -54,7 +67,8 @@ fn with_headers(
 
 impl HttpClient for ReqwestTransport {
 	async fn get(&self, url: &str, headers: &[(String, String)]) -> Result<HttpResponse> {
-		let response = with_headers(self.client.get(url), headers)
+		let builder = with_headers(self.client.get(url), &self.extra_headers);
+		let response = with_headers(builder, headers)
 			.send()
 			.await
 			.with_context(|| format!("GET {url}"))?;
@@ -73,6 +87,7 @@ impl HttpClient for ReqwestTransport {
 			.post(url)
 			.header(reqwest::header::CONTENT_TYPE, content_type)
 			.body(body);
+		let builder = with_headers(builder, &self.extra_headers);
 		let response = with_headers(builder, headers)
 			.send()
 			.await

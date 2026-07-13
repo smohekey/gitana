@@ -200,6 +200,8 @@ pub(crate) async fn clone<H: HashAlgorithm>(
 		&Deepen::default(),
 		// No committer identity through the component's descriptors, so clone writes no reflog here.
 		None,
+		// No `insteadOf` rewriting in the component, so the origin's own URL is the one to persist.
+		None,
 	)
 	.await
 	.map_err(remote_error)

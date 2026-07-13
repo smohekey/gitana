@@ -68,6 +68,9 @@ struct Served {
 	/// the server answers `401 WWW-Authenticate: Basic` — the HTTP-credential oracle. `None` is the
 	/// default anonymous server.
 	basic_auth: Option<(String, String)>,
+	/// When `Some((name, value))`, every request must carry that exact header or the server answers
+	/// `400` — the `http.extraHeader` oracle, so a request only succeeds if the client sent the header.
+	require_header: Option<(String, String)>,
 }
 
 /// The `Git-Protocol` version the request asks for (git repeats the header on every request).
@@ -221,6 +224,26 @@ pub async fn serve_gitana(git_dir: PathBuf, hash: ServerHash) -> String {
 		reflog_committer: None,
 		force: true,
 		basic_auth: None,
+		require_header: None,
+	})
+	.await
+}
+
+/// Like [`serve_gitana`], but requiring every request to carry the exact header `name: value`, else the
+/// server answers `400`. The `http.extraHeader` oracle — a request succeeds only if the client sent it.
+pub async fn serve_gitana_require_header(
+	git_dir: PathBuf,
+	hash: ServerHash,
+	name: &str,
+	value: &str,
+) -> String {
+	serve(Served {
+		git_dir,
+		hash,
+		reflog_committer: None,
+		force: true,
+		basic_auth: None,
+		require_header: Some((name.to_owned(), value.to_owned())),
 	})
 	.await
 }
@@ -240,6 +263,7 @@ pub async fn serve_gitana_basic_auth(
 		reflog_committer: None,
 		force: true,
 		basic_auth: Some((user.to_owned(), pass.to_owned())),
+		require_header: None,
 	})
 	.await
 }
@@ -257,6 +281,7 @@ pub async fn serve_gitana_with_reflog(
 		reflog_committer: Some(committer),
 		force: true,
 		basic_auth: None,
+		require_header: None,
 	})
 	.await
 }
@@ -271,6 +296,7 @@ pub async fn serve_gitana_no_force(git_dir: PathBuf, hash: ServerHash) -> String
 		reflog_committer: None,
 		force: false,
 		basic_auth: None,
+		require_header: None,
 	})
 	.await
 }
@@ -283,10 +309,14 @@ async fn serve(state: Served) -> String {
 			base64_encode(format!("{user}:{pass}").as_bytes())
 		)
 	});
+	let required_header = state.require_header.clone();
 	let app = Router::new()
 		.route("/info/refs", get(info_refs))
 		.route("/git-upload-pack", post(upload_pack))
 		.route("/git-receive-pack", post(git_receive_pack))
+		.layer(axum::middleware::from_fn(move |req, next| {
+			require_header_gate(required_header.clone(), req, next)
+		}))
 		.layer(axum::middleware::from_fn(move |req, next| {
 			basic_auth_gate(expected_auth.clone(), req, next)
 		}))
@@ -297,6 +327,26 @@ async fn serve(state: Served) -> String {
 		axum::serve(listener, app).await.expect("serve");
 	});
 	format!("http://{addr}")
+}
+
+/// Reject a request lacking the exact `required` `(name, value)` header with `400` — so a request only
+/// gets through when the client sent it. `None` lets every request pass. The `http.extraHeader` oracle.
+async fn require_header_gate(
+	required: Option<(String, String)>,
+	req: axum::extract::Request,
+	next: axum::middleware::Next,
+) -> Response {
+	if let Some((name, value)) = required {
+		let presented = req.headers().get(&name).and_then(|v| v.to_str().ok());
+		if presented != Some(value.as_str()) {
+			return (
+				StatusCode::BAD_REQUEST,
+				format!("missing required header {name}: {value}"),
+			)
+				.into_response();
+		}
+	}
+	next.run(req).await
 }
 
 /// Reject a request lacking the `expected` `Authorization` header with `401 WWW-Authenticate: Basic`;

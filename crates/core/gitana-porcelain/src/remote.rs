@@ -549,6 +549,7 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	work: W,
 	deepen: &Deepen,
 	reflog: Option<CloneReflog<'_>>,
+	persist_url: Option<&str>,
 ) -> Result<()> {
 	repo.init().await?;
 
@@ -606,7 +607,14 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			repo.refs().update_ref(name, *oid, None, intent).await?;
 		}
 	}
-	origin.save(repo.objects().file_store()).await?;
+	// Persist the remote. `clone` passes the *original* URL (git records the pre-`insteadOf` argument, so
+	// a later rewrite-rule change still applies); otherwise the origin's own persisted URL is written.
+	let persisted = persist_url.map(str::to_owned);
+	let store = repo.objects().file_store();
+	match &persisted {
+		Some(url) => origin.save_as(store, url).await?,
+		None => origin.save(store).await?,
+	}
 
 	// Populate the working tree from HEAD (if the repo had any commits).
 	if let Some(commit) = repo.refs().resolve_head().await? {
