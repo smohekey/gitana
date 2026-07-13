@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Result, bail};
-use gitana_remote::CredentialRequest;
+use gitana_remote::{Credential, CredentialRequest};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -37,11 +37,38 @@ pub(crate) struct Helper {
 pub(crate) struct GetOutput {
 	pub username: Option<String>,
 	pub password: Option<String>,
+	/// A pre-encoded scheme the helper returned under the `authtype` capability — git's `authtype`. When
+	/// set together with [`credential`](Self::credential), the resolved credential is encoded
+	/// (Bearer/Digest/…) and username/password are not used for the header (but git still keeps them).
+	pub authtype: Option<String>,
+	/// The pre-encoded credential value paired with [`authtype`](Self::authtype) — git's `credential`.
+	pub credential: Option<String>,
+	/// The helper marked the credential short-lived (git's `ephemeral`) — do not persist it.
+	pub ephemeral: bool,
+	/// Opaque `state[]` the helper returned under the `state` capability, to echo back next round.
+	pub state: Vec<String>,
+	/// The helper expects another multistage round (git's `continue`) — the credential is a non-final step.
+	pub more: bool,
 	/// The helper asked us to stop consulting helpers entirely (git's `quit`/`terminate`).
 	pub quit: bool,
 	/// The helper returned a `url=`, which in git resets the credential *and clears the remaining helper
 	/// list* — so no later helper in the chain is consulted (the caller then prompts for any gap).
 	pub reset: bool,
+	/// Whether the helper echoed the `authtype` capability — gates honouring `authtype`/`credential`/
+	/// `ephemeral` (git only uses them when both sides advertised the capability).
+	pub caps_authtype: bool,
+	/// Whether the helper echoed the `state` capability — gates honouring `state[]`/`continue`.
+	pub caps_state: bool,
+}
+
+impl GetOutput {
+	/// Whether the helper supplied a complete pre-encoded credential (`authtype`+`credential`) under the
+	/// mutually-advertised `authtype` capability — git honours the encoded form only then. Any
+	/// username/password the helper also set ride the resolved credential too (git keeps every populated
+	/// attribute for `store`/`erase`).
+	pub fn has_encoded(&self) -> bool {
+		self.caps_authtype && self.authtype.is_some() && self.credential.is_some()
+	}
 }
 
 impl Helper {
@@ -58,28 +85,42 @@ impl Helper {
 		Self { command }
 	}
 
-	/// Run the helper's `get`, feeding it what is already known (`username`/`password` from the URL/config
-	/// or an earlier helper in the chain; `wwwauth` from the `401`), and return the resulting credential
-	/// state (starting from the fed-in username/password, mutated by the helper's output). A helper that
-	/// cannot be spawned leaves the state unchanged (git warns and moves on); but a malformed control
-	/// field in its output (a bad `quit` boolean or an unparseable `url=`) is fatal, as git aborts on it.
-	/// A helper's *output* is otherwise consumed even when it then exits non-zero, as git does.
+	/// Run the helper's `get`, feeding it the credential state known so far (`running` — the
+	/// username/password/`authtype`/`credential`/`state[]` accumulated by the URL/config and earlier
+	/// helpers, plus the `401`'s `wwwauth`), and return the resulting state (starting from `running`'s
+	/// credential fields and capabilities, mutated by the helper's output — git threads one mutable
+	/// credential through the chain). A helper that cannot be spawned leaves the state unchanged (git warns
+	/// and moves on); but a malformed control field (a bad `quit` boolean or an unparseable `url=`) is
+	/// fatal, as git aborts on it. A helper's *output* is otherwise consumed even when it exits non-zero.
 	pub(crate) async fn get(
 		&self,
 		request: &CredentialRequest,
-		username: Option<&str>,
-		password: Option<&str>,
+		running: &GetOutput,
 		use_http_path: bool,
 		cwd: &Path,
 	) -> Result<GetOutput> {
-		let input = request_lines(request, username, password, use_http_path, &request.wwwauth);
+		let input = get_request_lines(request, running, use_http_path);
+		// Seed from the running credential fields — the fresh `state[]` collected so far and `more` carry
+		// through the chain (git retains `continue` unless a later helper sets `continue=0`), while the
+		// per-invocation `quit`/`reset` start fresh. The helper's output then mutates this, so a field an
+		// earlier helper set survives.
 		let mut state = GetOutput {
-			username: username.map(str::to_owned),
-			password: password.map(str::to_owned),
-			quit: false,
-			reset: false,
+			username: running.username.clone(),
+			password: running.password.clone(),
+			authtype: running.authtype.clone(),
+			credential: running.credential.clone(),
+			ephemeral: running.ephemeral,
+			state: running.state.clone(),
+			more: running.more,
+			caps_authtype: running.caps_authtype,
+			caps_state: running.caps_state,
+			..GetOutput::default()
 		};
 		if let Some(output) = self.run("get", &input, cwd, true).await {
+			// git treats credential values (username/password/credential/state[]) as opaque bytes; gitana
+			// models them as UTF-8 `String`, so a non-UTF-8 value would be lossily decoded here. Deliberate,
+			// model-wide simplification — real helper values are ASCII/UTF-8 (Basic creds, Bearer tokens,
+			// base64 `state[]`). A byte-faithful model is a deferred follow-up (see docs/hlds/http-credentials).
 			apply_get_output(&String::from_utf8_lossy(&output), &mut state)?;
 		}
 		Ok(state)
@@ -90,12 +131,11 @@ impl Helper {
 	pub(crate) async fn store(
 		&self,
 		request: &CredentialRequest,
-		username: &str,
-		password: &str,
+		credential: &Credential,
 		use_http_path: bool,
 		cwd: &Path,
 	) {
-		let input = request_lines(request, Some(username), Some(password), use_http_path, &[]);
+		let input = credential_lines(request, credential, use_http_path);
 		let _ = self.run("store", &input, cwd, false).await;
 	}
 
@@ -103,12 +143,11 @@ impl Helper {
 	pub(crate) async fn erase(
 		&self,
 		request: &CredentialRequest,
-		username: &str,
-		password: &str,
+		credential: &Credential,
 		use_http_path: bool,
 		cwd: &Path,
 	) {
-		let input = request_lines(request, Some(username), Some(password), use_http_path, &[]);
+		let input = credential_lines(request, credential, use_http_path);
 		let _ = self.run("erase", &input, cwd, false).await;
 	}
 
@@ -162,44 +201,115 @@ impl Helper {
 	}
 }
 
-/// Build a helper request body: `key=value\n` lines terminated by a blank line, in git's field order
-/// (`credential.c` `credential_write`). `path` is emitted only under `use_http_path`; `username` and
-/// `password` only when known; each `wwwauth` challenge as its own `wwwauth[]` line. Built as raw bytes
-/// so a decoded path carrying a non-UTF-8 octet (`%FF` → `0xFF`) reaches the helper exactly as git
-/// sends it. A value carrying a newline would corrupt the protocol, so such a field is dropped (git
-/// aborts; dropping keeps the best-effort callbacks from failing an operation over a pathological URL).
-fn request_lines(
+/// Write a `key=value\n` helper-protocol line to `out`, unless `value` carries a newline (which would
+/// corrupt the protocol — git aborts; dropping keeps the best-effort callbacks from failing over a
+/// pathological URL). Raw bytes so a decoded path with a non-UTF-8 octet (`%FF` → `0xFF`) is sent
+/// exactly as git sends it.
+fn line(out: &mut Vec<u8>, key: &str, value: &[u8]) {
+	if !value.contains(&b'\n') {
+		out.extend_from_slice(key.as_bytes());
+		out.push(b'=');
+		out.extend_from_slice(value);
+		out.push(b'\n');
+	}
+}
+
+/// The `protocol`/`host`/`path` lines every request carries (`credential.c` `credential_write`). `path`
+/// is emitted only under `use_http_path`, fully decoded (git's `url_decode`): `a%20b` → `a b`, `a%2Fb`
+/// → `a/b`, a non-UTF-8 `%FF` → the raw byte, an encoded NUL kept literal so no line is truncated.
+fn location_lines(out: &mut Vec<u8>, request: &CredentialRequest, use_http_path: bool) {
+	line(out, "protocol", request.protocol.as_bytes());
+	line(out, "host", request.host.as_bytes());
+	if use_http_path && let Some(path) = &request.path {
+		line(out, "path", &gitana_remote::percent_decode_bytes(path));
+	}
+}
+
+/// Build a helper `get` request body — the capabilities gitana understands announced **first** (git
+/// requires a `capability[]` to precede any value depending on it), then the location, the credential
+/// fields known so far (`running`: any username/password or `authtype`/`credential` an earlier helper in
+/// the chain supplied — git threads one mutable credential through the chain), the `401`'s `wwwauth[]`
+/// challenges, and the running `state[]` (seeded from the prior multistage round). Terminated by a blank
+/// line.
+fn get_request_lines(
 	request: &CredentialRequest,
-	username: Option<&str>,
-	password: Option<&str>,
+	running: &GetOutput,
 	use_http_path: bool,
-	wwwauth: &[String],
 ) -> Vec<u8> {
 	let mut out = Vec::new();
-	let mut line = |key: &str, value: &[u8]| {
-		if !value.contains(&b'\n') {
-			out.extend_from_slice(key.as_bytes());
-			out.push(b'=');
-			out.extend_from_slice(value);
-			out.push(b'\n');
-		}
-	};
-	line("protocol", request.protocol.as_bytes());
-	line("host", request.host.as_bytes());
-	if use_http_path && let Some(path) = &request.path {
-		// A helper receives the fully-decoded path (git's `url_decode`): `a%20b` → `a b`, `a%2Fb` → `a/b`,
-		// a non-UTF-8 `%FF` → the raw byte `0xFF`. An encoded NUL stays literal (`%00`), so no `key=value`
-		// line is truncated and the credential is not mis-keyed onto a shorter path.
-		line("path", &gitana_remote::percent_decode_bytes(path));
+	line(&mut out, "capability[]", b"authtype");
+	line(&mut out, "capability[]", b"state");
+	location_lines(&mut out, request, use_http_path);
+	if let Some(username) = &running.username {
+		line(&mut out, "username", username.as_bytes());
 	}
-	if let Some(username) = username {
-		line("username", username.as_bytes());
+	if let Some(password) = &running.password {
+		line(&mut out, "password", password.as_bytes());
 	}
-	if let Some(password) = password {
-		line("password", password.as_bytes());
+	if let Some(authtype) = &running.authtype {
+		line(&mut out, "authtype", authtype.as_bytes());
 	}
-	for challenge in wwwauth {
-		line("wwwauth[]", challenge.as_bytes());
+	if let Some(credential) = &running.credential {
+		line(&mut out, "credential", credential.as_bytes());
+	}
+	// Forward an active `ephemeral` from an earlier helper's partial credential so a later helper sees it
+	// (git writes the running credential's fields).
+	if running.ephemeral {
+		line(&mut out, "ephemeral", b"1");
+	}
+	for challenge in &request.wwwauth {
+		line(&mut out, "wwwauth[]", challenge.as_bytes());
+	}
+	// Forward a running `continue` (git's `c->multistage`): `credential_write` emits `continue=1` under the
+	// state capability when an earlier helper in the chain returned a partial, non-final credential, so the
+	// next helper sees the same in-progress negotiation and finishes it rather than starting over. (git-
+	// credential(5) marks `continue` one-way helper→Git for the *value's* meaning — it is not surfaced to the
+	// caller — but git still threads it across the helper chain, exactly as it threads username/authtype/state.)
+	if running.more {
+		line(&mut out, "continue", b"1");
+	}
+	// git sends the *incoming* (prior round's) state unchanged to every helper — separate from the fresh
+	// state a round collects — so feed `request.state`, not the accumulator's collected `running.state`.
+	for state in &request.state {
+		line(&mut out, "state[]", state.as_bytes());
+	}
+	out.push(b'\n');
+	out
+}
+
+/// Build a helper `store`/`erase` request body for `credential`: the `authtype` capability, the
+/// location, and every populated credential attribute — `username`/`password` and/or
+/// `authtype`/`credential` (with `ephemeral` when set) — matching what git's `credential_write` hands a
+/// helper to persist or erase (git writes each field it has, so username/password ride an encoded
+/// credential too, keying an account-based helper). Terminated by a blank line.
+fn credential_lines(
+	request: &CredentialRequest,
+	credential: &Credential,
+	use_http_path: bool,
+) -> Vec<u8> {
+	let mut out = Vec::new();
+	line(&mut out, "capability[]", b"authtype");
+	line(&mut out, "capability[]", b"state");
+	location_lines(&mut out, request, use_http_path);
+	if let Some(username) = &credential.username {
+		line(&mut out, "username", username.as_bytes());
+	}
+	if let Some(password) = &credential.password {
+		line(&mut out, "password", password.as_bytes());
+	}
+	if let Some(authtype) = &credential.authtype {
+		line(&mut out, "authtype", authtype.as_bytes());
+	}
+	if let Some(value) = &credential.credential {
+		line(&mut out, "credential", value.as_bytes());
+	}
+	if credential.ephemeral {
+		line(&mut out, "ephemeral", b"1");
+	}
+	// Forward the final round's `state[]` (git hands it to `store`/`erase` so a stateful helper can persist
+	// or clean up the negotiated credential).
+	for state in &request.state {
+		line(&mut out, "state[]", state.as_bytes());
 	}
 	out.push(b'\n');
 	out
@@ -224,6 +334,30 @@ fn apply_get_output(output: &str, state: &mut GetOutput) -> Result<()> {
 		match key {
 			"username" => state.username = Some(value.to_owned()),
 			"password" => state.password = Some(value.to_owned()),
+			// The helper echoes the capabilities it supports; only under a mutually-advertised capability
+			// are its `authtype`/`credential`/`ephemeral` (authtype) and `state[]`/`continue` (state) honoured.
+			// A `url=` reset zeroes git's *initial* advertisement (`credential_from_url` → `credential_clear`
+			// → `credential_init`); a later `capability[]` echo sets only the helper-side bit, and git's
+			// `OP_RESPONSE` check needs both, so a capability re-advertised *after* a `url=` in the same
+			// response is never honoured — skip it once a reset has occurred.
+			"capability[]" if !state.reset => match value {
+				"authtype" => state.caps_authtype = true,
+				"state" => state.caps_state = true,
+				_ => {}
+			},
+			"authtype" => state.authtype = Some(value.to_owned()),
+			"credential" => state.credential = Some(value.to_owned()),
+			"ephemeral" => {
+				state.ephemeral = crate::git_config::parse_git_bool(value).ok_or_else(|| {
+					anyhow::anyhow!("credential helper returned a bad boolean 'ephemeral={value}'")
+				})?
+			}
+			"state[]" => state.state.push(value.to_owned()),
+			"continue" => {
+				state.more = crate::git_config::parse_git_bool(value).ok_or_else(|| {
+					anyhow::anyhow!("credential helper returned a bad boolean 'continue={value}'")
+				})?
+			}
 			// A helper may return a whole credential as a `url=…`; git's `credential_from_url` *clears* the
 			// entire credential state — repopulating username/password from the URL (a field the URL omits
 			// resets to absent), and resetting `quit` too, so a `quit=1` emitted *before* the `url=` no
@@ -234,6 +368,15 @@ fn apply_get_output(output: &str, state: &mut GetOutput) -> Result<()> {
 				(state.username, state.password) = url_userinfo(value)?;
 				state.quit = false;
 				state.reset = true;
+				// `credential_from_url` clears the *entire* credential, so a `url=` after any encoded /
+				// capability / ephemeral / state fields drops them too (a later `authtype=` could re-set them).
+				state.authtype = None;
+				state.credential = None;
+				state.ephemeral = false;
+				state.state.clear();
+				state.more = false;
+				state.caps_authtype = false;
+				state.caps_state = false;
 			}
 			// git treats a malformed `quit`/`terminate` boolean as a fatal config error.
 			"quit" => {
@@ -315,7 +458,13 @@ mod tests {
 			host: "example.com".to_owned(),
 			path: path.map(str::to_owned),
 			username: None,
+			carried_username: None,
 			wwwauth: vec!["Basic realm=\"x\"".to_owned()],
+			state: Vec::new(),
+			authtype: None,
+			ephemeral: false,
+			caps_authtype: false,
+			caps_state: false,
 		}
 	}
 
@@ -334,56 +483,114 @@ mod tests {
 		);
 	}
 
-	/// The request body as a UTF-8 string (the test inputs are ASCII).
-	fn request_text(
+	/// A request with `path` and an explicit `wwwauth`/`state` (the default `request()` carries a Basic
+	/// challenge and no state).
+	fn request_with(path: Option<&str>, wwwauth: &[&str], state: &[&str]) -> CredentialRequest {
+		CredentialRequest {
+			wwwauth: wwwauth.iter().map(|s| (*s).to_owned()).collect(),
+			state: state.iter().map(|s| (*s).to_owned()).collect(),
+			..request(path)
+		}
+	}
+
+	/// A `get` request body as a UTF-8 string (the test inputs are ASCII). Seeds the running credential
+	/// with `username`/`password` and the request's `state[]`.
+	fn get_text(
 		request: &CredentialRequest,
 		username: Option<&str>,
 		password: Option<&str>,
 		use_http_path: bool,
-		wwwauth: &[String],
 	) -> String {
-		String::from_utf8(request_lines(
-			request,
-			username,
-			password,
-			use_http_path,
-			wwwauth,
-		))
-		.unwrap()
+		let running = GetOutput {
+			username: username.map(str::to_owned),
+			password: password.map(str::to_owned),
+			state: request.state.clone(),
+			..GetOutput::default()
+		};
+		String::from_utf8(get_request_lines(request, &running, use_http_path)).unwrap()
 	}
 
 	#[test]
-	fn get_input_omits_path_unless_use_http_path_and_carries_wwwauth() {
-		let without = request_text(
-			&request(Some("acme/app.git")),
+	fn get_input_advertises_capabilities_and_carries_challenge_and_state() {
+		let without = get_text(
+			&request_with(Some("acme/app.git"), &["Basic realm=\"x\""], &["helper:s1"]),
 			Some("alice"),
 			None,
 			false,
-			&["Basic realm=\"x\"".to_owned()],
 		);
 		assert_eq!(
 			without,
-			"protocol=https\nhost=example.com\nusername=alice\nwwwauth[]=Basic realm=\"x\"\n\n"
+			"capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=example.com\n\
+			 username=alice\nwwwauth[]=Basic realm=\"x\"\nstate[]=helper:s1\n\n"
 		);
-		let with = request_text(
-			&request(Some("acme/app.git")),
+		let with = get_text(
+			&request_with(Some("acme/app.git"), &[], &[]),
 			Some("alice"),
 			None,
 			true,
-			&[],
 		);
 		assert_eq!(
 			with,
-			"protocol=https\nhost=example.com\npath=acme/app.git\nusername=alice\n\n"
+			"capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=example.com\n\
+			 path=acme/app.git\nusername=alice\n\n"
 		);
 	}
 
 	#[test]
-	fn store_input_includes_password() {
-		let input = request_text(&request(None), Some("alice"), Some("s3cr3t"), false, &[]);
+	fn get_input_forwards_running_continue_to_the_next_helper() {
+		// An earlier helper in the chain returned a partial, non-final credential (`continue=1` under the
+		// state capability). git's `credential_write` threads that `continue=1` to the next helper so it
+		// finishes the same negotiation rather than starting over. `ephemeral`/`continue` ride the running
+		// credential; `state[]` still comes from the incoming (prior round's) request state.
+		let running = GetOutput {
+			username: Some("alice".to_owned()),
+			ephemeral: true,
+			more: true,
+			state: vec!["helper:s1".to_owned()],
+			caps_authtype: true,
+			caps_state: true,
+			..GetOutput::default()
+		};
+		let request = request_with(None, &[], &["helper:s1"]);
+		let text = String::from_utf8(get_request_lines(&request, &running, false)).unwrap();
 		assert_eq!(
-			input,
-			"protocol=https\nhost=example.com\nusername=alice\npassword=s3cr3t\n\n"
+			text,
+			"capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=example.com\n\
+			 username=alice\nephemeral=1\ncontinue=1\nstate[]=helper:s1\n\n"
+		);
+	}
+
+	#[test]
+	fn store_input_includes_the_credential_attributes() {
+		// A Basic credential sends username/password; an encoded one sends authtype/credential (+ephemeral).
+		let basic = String::from_utf8(credential_lines(
+			&request(None),
+			&Credential::basic("alice".to_owned(), "s3cr3t".to_owned()),
+			false,
+		))
+		.unwrap();
+		assert_eq!(
+			basic,
+			"capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=example.com\nusername=alice\npassword=s3cr3t\n\n"
+		);
+		let encoded = String::from_utf8(credential_lines(
+			&request(None),
+			&Credential {
+				username: Some("alice".to_owned()),
+				authtype: Some("Bearer".to_owned()),
+				credential: Some("tok".to_owned()),
+				ephemeral: true,
+				..Credential::default()
+			},
+			false,
+		))
+		.unwrap();
+		// git keeps the resolved account name alongside the encoded credential, so `store`/`erase` carry
+		// `username` before `authtype`/`credential` (an account-keyed helper keys on it).
+		assert_eq!(
+			encoded,
+			"capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=example.com\nusername=alice\nauthtype=Bearer\ncredential=tok\n\
+			 ephemeral=1\n\n"
 		);
 	}
 
@@ -391,7 +598,7 @@ mod tests {
 	fn path_line_is_fully_decoded_but_preserves_encoded_nul() {
 		// A helper receives git's `url_decode`d path: `%20` → space, `%2F` → `/`, but `%00` stays literal
 		// so the `key=value` line is never truncated onto a shorter path.
-		let input = request_text(&request(Some("a%20b/c%2Fd/e%00f")), None, None, true, &[]);
+		let input = get_text(&request(Some("a%20b/c%2Fd/e%00f")), None, None, true);
 		assert!(
 			input.contains("path=a b/c/d/e%00f\n"),
 			"unexpected path line in: {input:?}"
@@ -402,11 +609,49 @@ mod tests {
 	fn path_line_preserves_a_raw_non_utf8_byte() {
 		// A `%FF` decodes to the raw byte `0xFF`, sent to the helper verbatim (not a UTF-8 replacement),
 		// so distinct paths stay distinct keys.
-		let input = request_lines(&request(Some("a%FFb")), None, None, true, &[]);
+		let input = get_request_lines(&request(Some("a%FFb")), &GetOutput::default(), true);
 		let needle = b"path=a\xffb\n";
 		assert!(
 			input.windows(needle.len()).any(|window| window == needle),
 			"raw 0xFF byte not preserved in: {input:?}"
+		);
+	}
+
+	#[test]
+	fn get_input_feeds_forward_a_running_encoded_field() {
+		// git threads one mutable credential: an `authtype` an earlier helper set is fed to the next.
+		let running = GetOutput {
+			authtype: Some("bearer".to_owned()),
+			credential: Some("tok".to_owned()),
+			..GetOutput::default()
+		};
+		let input = String::from_utf8(get_request_lines(&request(None), &running, false)).unwrap();
+		assert!(
+			input.contains("authtype=bearer\ncredential=tok\n"),
+			"running encoded fields not fed forward: {input:?}"
+		);
+	}
+
+	#[test]
+	fn url_reset_clears_encoded_and_state_fields() {
+		// git's `credential_from_url` clears the whole credential, so a `url=` after encoded/state fields
+		// drops them (only the URL's username survives here).
+		let mut state = GetOutput {
+			authtype: Some("bearer".to_owned()),
+			credential: Some("tok".to_owned()),
+			caps_authtype: true,
+			ephemeral: true,
+			state: vec!["s1".to_owned()],
+			more: true,
+			caps_state: true,
+			..GetOutput::default()
+		};
+		apply_get_output("url=https://alice@example.com\n", &mut state).unwrap();
+		assert_eq!(state.username.as_deref(), Some("alice"));
+		assert!(!state.has_encoded(), "encoded fields survived a url= reset");
+		assert!(
+			state.state.is_empty() && !state.more && !state.caps_authtype && !state.caps_state,
+			"state/capability fields survived a url= reset"
 		);
 	}
 
@@ -415,6 +660,30 @@ mod tests {
 		let mut state = GetOutput::default();
 		apply_get_output(output, &mut state).unwrap();
 		state
+	}
+
+	#[test]
+	fn a_capability_re_advertised_after_a_url_reset_is_not_honoured() {
+		// git's `url=` reset zeroes its initial capability advertisement, so a `capability[]` the helper
+		// re-emits afterwards sets only the helper-side bit — git's `OP_RESPONSE` needs both, so a following
+		// encoded credential / `state[]`+`continue` is ignored. The capability must not be re-enabled.
+		let out = parsed(
+			"url=https://example.com\ncapability[]=authtype\ncapability[]=state\n\
+			 authtype=bearer\ncredential=tok\nstate[]=s1\ncontinue=1\n",
+		);
+		assert!(
+			!out.caps_authtype,
+			"authtype capability re-enabled after url="
+		);
+		assert!(!out.caps_state, "state capability re-enabled after url=");
+		assert!(
+			!out.has_encoded(),
+			"encoded credential honoured after a url= reset"
+		);
+		// A capability advertised *before* the `url=` is likewise wiped by the reset (unchanged behaviour).
+		let before =
+			parsed("capability[]=authtype\nurl=https://example.com\nauthtype=bearer\ncredential=tok\n");
+		assert!(!before.has_encoded());
 	}
 
 	#[test]
@@ -487,10 +756,8 @@ mod tests {
 		// git's credential_from_url resets the credential: a prior password is cleared when the `url=`
 		// carries no password (only a username).
 		let mut state = GetOutput {
-			username: None,
 			password: Some("earlier".to_owned()),
-			quit: false,
-			reset: false,
+			..GetOutput::default()
 		};
 		apply_get_output("url=https://alice@example.com\n", &mut state).unwrap();
 		assert_eq!(state.username.as_deref(), Some("alice"));

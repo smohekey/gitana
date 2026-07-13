@@ -20,11 +20,40 @@ pub struct CredentialRequest {
 	/// matching `credential.<url>` (an encoded `%2F` is *not* a path separator), so the consumer decodes
 	/// as each use requires. An encoded NUL (`%00`) is preserved through both.
 	pub path: Option<String>,
-	/// A known username the credential must be for, if any.
+	/// A known username the credential must be for, if any (URL userinfo or `credential.username`). This is
+	/// the **resolution key**: a provider matches a username-scoped `credential.<user>@host` section on it
+	/// and settles which helpers/`useHttpPath` apply. git computes that selection once and never re-keys it
+	/// on a later round (its `credential_apply_config` `configured` latch), so this stays the *initial*
+	/// username across a multistage handshake — see [`carried_username`](Self::carried_username).
 	pub username: Option<String>,
+	/// The username a previous multistage round *learned* (git's retained `c->username`), to re-present to a
+	/// continuation helper and carry onto the resolved credential — kept **separate** from
+	/// [`username`](Self::username) so it feeds the helper's `get` and the final `store`/`erase` without
+	/// re-keying helper selection. `None` on the first round.
+	pub carried_username: Option<String>,
 	/// The server's `WWW-Authenticate` challenge values, one per header field, in order — empty unless
 	/// this request accompanies a `401` challenge being filled.
 	pub wwwauth: Vec<String>,
+	/// Opaque `state[]` values a helper returned on a previous round, echoed back so a multistage
+	/// authentication (git's `state` capability) can resume — empty on the first round. Each value is
+	/// prefixed by the helper that owns it; a helper ignores values that are not its own.
+	pub state: Vec<String>,
+	/// The authentication scheme (`authtype`) carried from a previous multistage round — `None` on the
+	/// first round or after a Basic round. git clears only the secret between rounds, retaining `authtype`,
+	/// so the next `fill` re-presents it to a continuation helper.
+	pub authtype: Option<String>,
+	/// The `ephemeral` flag carried from a previous multistage round — git likewise retains it across the
+	/// round, so a helper that completes the negotiation without re-stating `ephemeral` still yields an
+	/// ephemeral credential (not persisted). `false` on the first round.
+	pub ephemeral: bool,
+	/// Whether the `authtype` capability was negotiated in a previous round — git retains a capability's
+	/// helper-side bit across rounds, so a continuation helper's `authtype`/`credential` is honoured even
+	/// without re-advertising. Carried independently of [`state` cap](Self::caps_state): a round that
+	/// negotiated only `state` must not enable `authtype`. `false` on the first round.
+	pub caps_authtype: bool,
+	/// Whether the `state` capability was negotiated in a previous round — retained like
+	/// [`caps_authtype`](Self::caps_authtype). `false` on the first round.
+	pub caps_state: bool,
 }
 
 impl CredentialRequest {
@@ -52,7 +81,13 @@ impl CredentialRequest {
 			host: host.to_owned(),
 			path,
 			username,
+			carried_username: None,
 			wwwauth: Vec::new(),
+			state: Vec::new(),
+			authtype: None,
+			ephemeral: false,
+			caps_authtype: false,
+			caps_state: false,
 		};
 		// git rejects a credential whose (decoded) attributes contain a newline or carriage return (its
 		// `check_url_component`), since a `key=value\n` helper line cannot carry one — a decoded `%0A` in
@@ -82,11 +117,74 @@ impl CredentialRequest {
 		self.wwwauth = wwwauth;
 		self
 	}
+
+	/// Attach the `state[]` values a helper returned last round (git's `state` capability), returning
+	/// `self`, so the next [`fill`](crate::CredentialProvider::fill) resumes a multistage authentication.
+	pub fn with_state(mut self, state: Vec<String>) -> Self {
+		self.state = state;
+		self
+	}
+
+	/// Carry the previous multistage round's credential context — its `authtype` and `ephemeral` flag —
+	/// into the next [`fill`](crate::CredentialProvider::fill), mirroring git:
+	/// [`credential_clear_secrets`](https://github.com/git/git/blob/master/credential.c) drops only the
+	/// secret between rounds, retaining these attributes so a continuation helper resumes the same scheme
+	/// and the `ephemeral` marker is not lost when the completing helper omits it.
+	///
+	/// The resolution-key [`username`](Self::username) is deliberately *not* overridden with the round's
+	/// resolved value: git computes helper selection and `useHttpPath` exactly once (its
+	/// `credential_apply_config` `configured` latch), so a username a helper *learned* in round one must not
+	/// re-key config resolution and swap the helper chain mid-negotiation. The learned username instead
+	/// rides [`carried_username`](Self::carried_username) — re-presented to the continuation helper and
+	/// carried onto the final credential — while the original URL-userinfo hint holds resolution stable, as
+	/// git does.
+	///
+	/// `caps_authtype`/`caps_state` are the capabilities the previous round negotiated; git retains each
+	/// capability's helper-side bit across the round independently, so a continuation helper's
+	/// capability-gated fields are honoured without re-advertising. `username`/`authtype`/`ephemeral` are
+	/// read straight off the round's [`Credential`](crate::Credential) — git keeps each as its own field
+	/// and retains it across the round, so an `authtype` survives even when the round's credential was a
+	/// plain username/password. `state` is threaded separately (see [`with_state`](Self::with_state)).
+	pub fn with_credential_context(mut self, previous: &crate::Filled) -> Self {
+		self.carried_username = previous.credential.username.clone();
+		self.authtype = previous.credential.authtype.clone();
+		self.ephemeral = previous.credential.ephemeral;
+		self.caps_authtype = previous.caps_authtype;
+		self.caps_state = previous.caps_state;
+		self
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::{Credential, Filled};
+
+	#[test]
+	fn carries_authtype_from_a_basic_credential_round() {
+		// A multistage round can complete with a username/password credential yet still negotiate an
+		// `authtype` (git keeps it as its own field and retains it across the round). The flat credential
+		// holds `username`, `password`, and `authtype` together, so the carried context re-presents the
+		// scheme — else a continuation helper cannot resume the negotiation.
+		let previous = Filled {
+			credential: Credential {
+				username: Some("alice".to_owned()),
+				password: Some("pw".to_owned()),
+				authtype: Some("negotiate".to_owned()),
+				..Credential::default()
+			},
+			state: vec!["s1".to_owned()],
+			more: true,
+			caps_authtype: true,
+			caps_state: true,
+		};
+		let request = CredentialRequest::from_url("https://example.com/app.git", None)
+			.unwrap()
+			.with_credential_context(&previous);
+		assert_eq!(request.authtype.as_deref(), Some("negotiate"));
+		assert_eq!(request.carried_username.as_deref(), Some("alice"));
+		assert!(request.caps_authtype && request.caps_state);
+	}
 
 	#[test]
 	fn parses_protocol_host_and_path() {

@@ -17,7 +17,10 @@ use std::path::Path;
 
 use gitana_object::Sha256;
 use gitana_repository::{FileMode, TreeBuildEntry};
-use support::{ServerHash, gta_env, open, serve_gitana_basic_auth, unique_tmp};
+use support::{
+	ServerHash, gta_env, open, serve_gitana_basic_auth, serve_gitana_bearer_auth,
+	serve_gitana_multistage_auth, unique_tmp,
+};
 
 /// A fixed identity for the server-side seed commit (`Name <email> seconds ±hhmm`).
 const WHO: &str = "A U Thor <a@example.com> 0 +0000";
@@ -463,6 +466,115 @@ async fn helper_chain_feeds_a_learned_username_forward() {
 	assert!(
 		out.status.success(),
 		"helper-chain clone failed (username was not fed forward?): {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	assert!(checkout.join("hello.txt").exists(), "checkout missing file");
+}
+
+/// Write an executable helper that returns a Bearer token under git's `authtype` capability, so gta
+/// sends `Authorization: Bearer <token>` (unix only).
+#[cfg(unix)]
+fn write_bearer_helper(path: &Path, token: &str) {
+	use std::os::unix::fs::PermissionsExt;
+	let script = format!(
+		"#!/bin/sh\n\
+		 [ \"$1\" = get ] || exit 0\n\
+		 cat >/dev/null\n\
+		 printf 'capability[]=authtype\\nauthtype=bearer\\ncredential={token}\\n'\n"
+	);
+	std::fs::write(path, script).unwrap();
+	std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Write an executable *stateful* helper driving a two-round handshake: round 1 (no echoed `state[]`)
+/// returns `round1` with `continue=1` and a `state[]`; round 2 (seeing that state) returns `round2`
+/// (unix only). Proves gta echoes `state[]` and loops (git's `state`/`continue`).
+#[cfg(unix)]
+// Round one advertises the `authtype`/`state` capabilities and returns a first-stage token with
+// `state[]`+`continue`; round two (recognised by the echoed `state[]`) returns the finalizing token
+// *without* re-advertising the capabilities — git retains a helper's negotiated capabilities across a
+// multistage round (`credential_read` honours the returned fields unconditionally), so gta must honour the
+// round-two token even though the capability lines are absent.
+fn write_multistage_helper(path: &Path, round1: &str, round2: &str) {
+	use std::os::unix::fs::PermissionsExt;
+	let script = format!(
+		"#!/bin/sh\n\
+		 [ \"$1\" = get ] || exit 0\n\
+		 input=$(cat)\n\
+		 if printf '%s' \"$input\" | grep -q '^state\\[\\]=stage1$'; then\n\
+		 \tprintf 'authtype=bearer\\ncredential={round2}\\n'\n\
+		 else\n\
+		 \tprintf 'capability[]=authtype\\ncapability[]=state\\nauthtype=bearer\\ncredential={round1}\\nstate[]=stage1\\ncontinue=1\\n'\n\
+		 fi\n"
+	);
+	std::fs::write(path, script).unwrap();
+	std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A `credential.helper` that supplies a Bearer token authenticates a clone end to end: gta advertises
+/// the `authtype` capability, the helper returns `authtype=bearer`+`credential`, and gta sends
+/// `Authorization: Bearer <token>` — no username/password involved.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clone_authenticates_with_a_bearer_token_from_a_helper() {
+	let work = unique_tmp("auth-bearer");
+	let git_dir = work.join("srv.git");
+	seed(&git_dir).await;
+	let url = serve_gitana_bearer_auth(git_dir, ServerHash::Sha256, "tok.en").await;
+
+	let helper = work.join("bearer.sh");
+	write_bearer_helper(&helper, "tok.en");
+	let global = work.join("global.gitconfig");
+	std::fs::write(
+		&global,
+		format!("[credential]\n\thelper = {}\n", helper.display()),
+	)
+	.unwrap();
+
+	let checkout = work.join("c");
+	let out = gta_iso(
+		&["clone", &url, checkout.to_str().unwrap()],
+		&[("GIT_CONFIG_GLOBAL", global.to_str().unwrap())],
+	)
+	.await;
+	assert!(
+		out.status.success(),
+		"bearer clone failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	assert!(checkout.join("hello.txt").exists(), "checkout missing file");
+}
+
+/// A stateful helper drives git's multistage (`state`/`continue`) handshake end to end: gta sends the
+/// first-round token, the server answers a `401` continuation, gta re-invokes the helper echoing its
+/// `state[]`, and the second-round token succeeds.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clone_drives_a_multistage_handshake() {
+	let work = unique_tmp("auth-multistage");
+	let git_dir = work.join("srv.git");
+	seed(&git_dir).await;
+	let url =
+		serve_gitana_multistage_auth(git_dir, ServerHash::Sha256, "round-one", "round-two").await;
+
+	let helper = work.join("multistage.sh");
+	write_multistage_helper(&helper, "round-one", "round-two");
+	let global = work.join("global.gitconfig");
+	std::fs::write(
+		&global,
+		format!("[credential]\n\thelper = {}\n", helper.display()),
+	)
+	.unwrap();
+
+	let checkout = work.join("c");
+	let out = gta_iso(
+		&["clone", &url, checkout.to_str().unwrap()],
+		&[("GIT_CONFIG_GLOBAL", global.to_str().unwrap())],
+	)
+	.await;
+	assert!(
+		out.status.success(),
+		"multistage clone failed: {}",
 		String::from_utf8_lossy(&out.stderr)
 	);
 	assert!(checkout.join("hello.txt").exists(), "checkout missing file");

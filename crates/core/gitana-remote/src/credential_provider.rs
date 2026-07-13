@@ -4,7 +4,7 @@ use std::future::Future;
 
 use anyhow::Result;
 
-use crate::{Credential, CredentialRequest};
+use crate::{Credential, CredentialRequest, Filled};
 
 /// Resolves and records HTTP credentials the git way. Like [`Identity`]/[`Signer`] in
 /// `gitana-porcelain`, the engine *holds* this capability rather than reading netrc, invoking
@@ -20,11 +20,14 @@ use crate::{Credential, CredentialRequest};
 /// [`Identity`]: https://docs.rs/gitana-porcelain
 /// [`Signer`]: https://docs.rs/gitana-porcelain
 pub trait CredentialProvider {
-	/// Resolve a credential for `request`. `Ok(None)` means none is available — anonymous, no
-	/// credential configured, no tty to prompt on, or the user declined — and the caller proceeds
-	/// unauthenticated, letting the server's `401` stand as the error. `Err` is for a resolution that
-	/// genuinely failed (a helper crashed), which aborts the operation.
-	fn fill(&self, request: &CredentialRequest) -> impl Future<Output = Result<Option<Credential>>>;
+	/// Resolve a credential for `request` — one round of authentication. `Ok(Some(`[`Filled`]`))` carries
+	/// the credential to send plus git's multistage signals (the `state[]` to echo next round and whether
+	/// a further round is expected). `Ok(None)` means none is available — anonymous, no credential
+	/// configured, no tty to prompt on, or the user declined — and the caller proceeds unauthenticated,
+	/// letting the server's `401` stand as the error. `Err` is for a resolution that genuinely failed (a
+	/// helper crashed), which aborts the operation. `request.wwwauth`/`request.state` carry the current
+	/// challenge and any prior round's state, so a multistage scheme can resume.
+	fn fill(&self, request: &CredentialRequest) -> impl Future<Output = Result<Option<Filled>>>;
 
 	/// Record that `cred` (for `request`) was accepted by the server (git's `credential approve`) so a
 	/// helper may persist it. The `request` carries the protocol/host/path a helper keys its store on —

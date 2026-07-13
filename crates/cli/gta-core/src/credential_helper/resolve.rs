@@ -511,7 +511,13 @@ mod tests {
 			host: host.to_owned(),
 			path: path.map(str::to_owned),
 			username: username.map(str::to_owned),
+			carried_username: None,
 			wwwauth: Vec::new(),
+			state: Vec::new(),
+			authtype: None,
+			ephemeral: false,
+			caps_authtype: false,
+			caps_state: false,
 		}
 	}
 

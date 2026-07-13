@@ -6,7 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::HostCredentialProvider;
-use crate::gitana::repo::credentials::{Credential, CredentialRequest};
+use crate::gitana::repo::credentials::{Credential, CredentialRequest, Filled};
 
 /// A [`HostCredentialProvider`] backed by a file of `protocol://user:password@host` lines, in the shape
 /// of git's `credential-store` — the harness's working default, proving a genuine `fill` → `approve`
@@ -50,31 +50,58 @@ impl StoreFileCredentials {
 	}
 }
 
+/// The Basic username/password of `cred`, or `None` for a pre-encoded (Bearer/…) credential this
+/// plaintext store cannot represent — such a credential is simply not persisted here.
+fn basic_parts(cred: &Credential) -> Option<(&str, &str)> {
+	// The plaintext store keys a Basic username/password pair; an encoded credential (a pre-encoded
+	// `authtype`/`credential`, e.g. a Bearer token) has no plaintext pair to persist here, so skip it.
+	match (&cred.username, &cred.password, &cred.credential) {
+		(Some(username), Some(password), None) => Some((username, password)),
+		_ => None,
+	}
+}
+
 impl HostCredentialProvider for StoreFileCredentials {
-	fn fill(&self, request: &CredentialRequest) -> Option<Credential> {
+	fn fill(&self, request: &CredentialRequest) -> Option<Filled> {
 		self
 			.entries()
 			.into_iter()
 			.find(|entry| entry.matches(request))
-			.map(|entry| Credential {
-				username: entry.username,
-				password: entry.password,
+			.map(|entry| Filled {
+				// The store is Basic-only, and not multistage — a single non-ephemeral credential.
+				credential: Credential {
+					username: Some(entry.username),
+					password: Some(entry.password),
+					authtype: None,
+					credential: None,
+					ephemeral: false,
+				},
+				state: Vec::new(),
+				more: false,
+				caps_authtype: false,
+				caps_state: false,
 			})
 	}
 
 	fn approve(&self, request: &CredentialRequest, cred: &Credential) {
+		let Some((username, password)) = basic_parts(cred) else {
+			return;
+		};
 		let mut entries = self.entries();
 		// De-dupe and prepend, as git's store does: drop any prior entry with the same key and username,
 		// then insert the accepted one first so it wins the next `fill`. Other entries — including
 		// path-scoped ones for unrelated hosts — are carried through untouched.
-		entries.retain(|entry| !entry.keyed_as(request, &cred.username));
-		entries.insert(0, Entry::for_request(request, cred));
+		entries.retain(|entry| !entry.keyed_as(request, username));
+		entries.insert(0, Entry::for_request(request, username, password));
 		self.write(&entries);
 	}
 
 	fn reject(&self, request: &CredentialRequest, cred: &Credential) {
+		let Some((username, _)) = basic_parts(cred) else {
+			return;
+		};
 		let mut entries = self.entries();
-		entries.retain(|entry| !entry.keyed_as(request, &cred.username));
+		entries.retain(|entry| !entry.keyed_as(request, username));
 		self.write(&entries);
 	}
 }
@@ -113,12 +140,12 @@ struct Entry {
 impl Entry {
 	/// The entry `approve` records for `request` — keyed on its `protocol`/`host` (this provider writes
 	/// host-scoped keys, never a path).
-	fn for_request(request: &CredentialRequest, cred: &Credential) -> Self {
+	fn for_request(request: &CredentialRequest, username: &str, password: &str) -> Self {
 		Self {
 			protocol: request.protocol.clone(),
 			key: request.host.clone(),
-			username: cred.username.clone(),
-			password: cred.password.clone(),
+			username: username.to_owned(),
+			password: password.to_owned(),
 		}
 	}
 
@@ -227,15 +254,33 @@ mod tests {
 			host: host.to_owned(),
 			path: None,
 			username: None,
+			carried_username: None,
 			wwwauth: Vec::new(),
+			state: Vec::new(),
+			authtype: None,
+			ephemeral: false,
+			caps_authtype: false,
+			caps_state: false,
 		}
 	}
 
 	fn credential(username: &str, password: &str) -> Credential {
 		Credential {
-			username: username.to_owned(),
-			password: password.to_owned(),
+			username: Some(username.to_owned()),
+			password: Some(password.to_owned()),
+			authtype: None,
+			credential: None,
+			ephemeral: false,
 		}
+	}
+
+	/// The Basic username a `fill` resolved (the store is Basic-only).
+	fn filled_username(filled: &Filled) -> &str {
+		filled
+			.credential
+			.username
+			.as_deref()
+			.expect("store-file fill yields a Basic username")
 	}
 
 	#[test]
@@ -300,7 +345,7 @@ mod tests {
 		store.approve(&req, &credential("old", "1"));
 		store.approve(&req, &credential("new", "2"));
 		// No username hint → the most recently approved (prepended) entry answers.
-		assert_eq!(store.fill(&req).expect("filled").username, "new");
+		assert_eq!(filled_username(&store.fill(&req).expect("filled")), "new");
 		// Both persist (distinct usernames are not de-duped).
 		assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
 	}

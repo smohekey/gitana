@@ -41,15 +41,7 @@ impl HttpResponse {
 	/// realm="tenant, Basic admin"`) is not mistaken for a Basic offer. A scheme is the first token of a
 	/// segment; matching is case-insensitive, per RFC 7235.
 	pub fn offers_basic_auth(&self) -> bool {
-		self.www_authenticate.iter().any(|challenge| {
-			split_outside_quotes(challenge).into_iter().any(|segment| {
-				segment
-					.trim()
-					.split_whitespace()
-					.next()
-					.is_some_and(|token| token.eq_ignore_ascii_case("basic"))
-			})
-		})
+		challenge_offers(&self.www_authenticate, "basic")
 	}
 
 	/// Consume the response into its body when the status is 2xx, else the same error the transports
@@ -67,6 +59,22 @@ impl HttpResponse {
 			);
 		}
 	}
+}
+
+/// Whether any of the `WWW-Authenticate` `challenges` offers `scheme` (case-insensitive, per RFC 7235).
+/// A challenge may list several schemes (and auth-params) separated by commas; schemes are split on
+/// commas **outside** quoted strings, so a comma inside a quoted `realm` is not mistaken for a scheme.
+/// A scheme is the first token of a segment. `scheme` is given lower-case (e.g. `"basic"`, `"bearer"`).
+pub fn challenge_offers(challenges: &[String], scheme: &str) -> bool {
+	challenges.iter().any(|challenge| {
+		split_outside_quotes(challenge).into_iter().any(|segment| {
+			segment
+				.trim()
+				.split_whitespace()
+				.next()
+				.is_some_and(|token| token.eq_ignore_ascii_case(scheme))
+		})
+	})
 }
 
 /// Split `header` on commas that are **not** inside a double-quoted string (respecting `\`-escapes),

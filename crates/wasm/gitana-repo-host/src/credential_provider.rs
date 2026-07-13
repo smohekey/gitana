@@ -1,6 +1,6 @@
 //! The pluggable backend behind the host's imported `credentials` capability.
 
-use crate::gitana::repo::credentials::{Credential, CredentialRequest};
+use crate::gitana::repo::credentials::{Credential, CredentialRequest, Filled};
 
 /// Answers the guest's `credentials` import — the host side of git's HTTP credential flow. [`State`]
 /// holds one of these and forwards the WIT `fill`/`approve`/`reject` calls to it, so an embedder plugs
@@ -16,8 +16,9 @@ use crate::gitana::repo::credentials::{Credential, CredentialRequest};
 ///
 /// [`State`]: crate::State
 pub trait HostCredentialProvider: Send + Sync {
-	/// Resolve a credential for `request`, or `None` if the source has none to offer.
-	fn fill(&self, request: &CredentialRequest) -> Option<Credential>;
+	/// Resolve a credential for `request` — the credential to send plus git's multistage signals
+	/// ([`Filled`]) — or `None` if the source has none to offer.
+	fn fill(&self, request: &CredentialRequest) -> Option<Filled>;
 
 	/// Record that `cred` (for `request`) was accepted by the server, so the source may persist it.
 	fn approve(&self, request: &CredentialRequest, cred: &Credential);

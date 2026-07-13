@@ -9,5 +9,5 @@
 mod helper;
 mod resolve;
 
-pub(crate) use self::helper::Helper;
+pub(crate) use self::helper::{GetOutput, Helper};
 pub(crate) use self::resolve::{percent_encode_request_path, resolve};

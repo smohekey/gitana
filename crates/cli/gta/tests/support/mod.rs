@@ -71,6 +71,13 @@ struct Served {
 	/// When `Some((name, value))`, every request must carry that exact header or the server answers
 	/// `400` — the `http.extraHeader` oracle, so a request only succeeds if the client sent the header.
 	require_header: Option<(String, String)>,
+	/// When `Some(token)`, every request must carry `Authorization: Bearer <token>` or the server answers
+	/// `401 WWW-Authenticate: Bearer` — the Bearer (`authtype`) oracle.
+	bearer_auth: Option<String>,
+	/// When `Some((round1, round2))`, a two-round multistage oracle: `Bearer <round1>` gets a `401`
+	/// continuation (`WWW-Authenticate: Bearer continuation`), `Bearer <round2>` succeeds, anything else
+	/// gets the initial `401 WWW-Authenticate: Bearer`.
+	multistage_auth: Option<(String, String)>,
 }
 
 /// The `Git-Protocol` version the request asks for (git repeats the header on every request).
@@ -225,6 +232,8 @@ pub async fn serve_gitana(git_dir: PathBuf, hash: ServerHash) -> String {
 		force: true,
 		basic_auth: None,
 		require_header: None,
+		bearer_auth: None,
+		multistage_auth: None,
 	})
 	.await
 }
@@ -244,6 +253,8 @@ pub async fn serve_gitana_require_header(
 		force: true,
 		basic_auth: None,
 		require_header: Some((name.to_owned(), value.to_owned())),
+		bearer_auth: None,
+		multistage_auth: None,
 	})
 	.await
 }
@@ -264,6 +275,8 @@ pub async fn serve_gitana_basic_auth(
 		force: true,
 		basic_auth: Some((user.to_owned(), pass.to_owned())),
 		require_header: None,
+		bearer_auth: None,
+		multistage_auth: None,
 	})
 	.await
 }
@@ -282,6 +295,8 @@ pub async fn serve_gitana_with_reflog(
 		force: true,
 		basic_auth: None,
 		require_header: None,
+		bearer_auth: None,
+		multistage_auth: None,
 	})
 	.await
 }
@@ -297,6 +312,45 @@ pub async fn serve_gitana_no_force(git_dir: PathBuf, hash: ServerHash) -> String
 		force: false,
 		basic_auth: None,
 		require_header: None,
+		bearer_auth: None,
+		multistage_auth: None,
+	})
+	.await
+}
+
+/// Like [`serve_gitana`], but requiring every request to carry `Authorization: Bearer <token>`, else a
+/// `401 WWW-Authenticate: Bearer` — the Bearer (`authtype`) credential oracle.
+pub async fn serve_gitana_bearer_auth(git_dir: PathBuf, hash: ServerHash, token: &str) -> String {
+	serve(Served {
+		git_dir,
+		hash,
+		reflog_committer: None,
+		force: true,
+		basic_auth: None,
+		require_header: None,
+		bearer_auth: Some(token.to_owned()),
+		multistage_auth: None,
+	})
+	.await
+}
+
+/// Like [`serve_gitana`], but a two-round multistage oracle: `Bearer <round1>` gets a `401`
+/// continuation, `Bearer <round2>` succeeds — proving git's `state`/`continue` handshake end to end.
+pub async fn serve_gitana_multistage_auth(
+	git_dir: PathBuf,
+	hash: ServerHash,
+	round1: &str,
+	round2: &str,
+) -> String {
+	serve(Served {
+		git_dir,
+		hash,
+		reflog_committer: None,
+		force: true,
+		basic_auth: None,
+		require_header: None,
+		bearer_auth: None,
+		multistage_auth: Some((round1.to_owned(), round2.to_owned())),
 	})
 	.await
 }
@@ -310,12 +364,17 @@ async fn serve(state: Served) -> String {
 		)
 	});
 	let required_header = state.require_header.clone();
+	let bearer = state.bearer_auth.clone();
+	let multistage = state.multistage_auth.clone();
 	let app = Router::new()
 		.route("/info/refs", get(info_refs))
 		.route("/git-upload-pack", post(upload_pack))
 		.route("/git-receive-pack", post(git_receive_pack))
 		.layer(axum::middleware::from_fn(move |req, next| {
 			require_header_gate(required_header.clone(), req, next)
+		}))
+		.layer(axum::middleware::from_fn(move |req, next| {
+			token_auth_gate(bearer.clone(), multistage.clone(), req, next)
 		}))
 		.layer(axum::middleware::from_fn(move |req, next| {
 			basic_auth_gate(expected_auth.clone(), req, next)
@@ -344,6 +403,48 @@ async fn require_header_gate(
 				format!("missing required header {name}: {value}"),
 			)
 				.into_response();
+		}
+	}
+	next.run(req).await
+}
+
+/// The Bearer/`authtype` and multistage oracle. With `bearer`, a request must carry `Authorization:
+/// Bearer <token>` or gets `401 WWW-Authenticate: Bearer`. With `multistage`, a `Bearer <round1>` token
+/// gets a `401` continuation (`Bearer continuation`), a `Bearer <round2>` succeeds, and anything else
+/// gets the initial `401 Bearer` — a stateless two-round handshake. Both `None` lets every request pass.
+async fn token_auth_gate(
+	bearer: Option<String>,
+	multistage: Option<(String, String)>,
+	req: axum::extract::Request,
+	next: axum::middleware::Next,
+) -> Response {
+	// The presented Bearer token, comparing the scheme case-insensitively (RFC 7235): git relays the
+	// helper's `authtype` verbatim (often lower-case `bearer`), and a real server accepts either case.
+	let token = req
+		.headers()
+		.get("authorization")
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.split_once(' '))
+		.filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+		.map(|(_, token)| token.to_owned());
+	let challenge = |scheme: &str| {
+		(
+			StatusCode::UNAUTHORIZED,
+			[("WWW-Authenticate", scheme.to_owned())],
+			"authentication required",
+		)
+			.into_response()
+	};
+	if let Some(expected) = bearer
+		&& token.as_deref() != Some(expected.as_str())
+	{
+		return challenge("Bearer realm=\"gitana\"");
+	}
+	if let Some((round1, round2)) = multistage {
+		match token.as_deref() {
+			Some(t) if t == round2 => {}
+			Some(t) if t == round1 => return challenge("Bearer continuation"),
+			_ => return challenge("Bearer realm=\"gitana\""),
 		}
 	}
 	next.run(req).await

@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use gitana_config::GitConfig;
 use gitana_remote::{
-	AuthTransport, Credential, CredentialProvider, CredentialRequest, Origin, ReqwestTransport,
+	AuthTransport, Credential, CredentialProvider, CredentialRequest, Filled, Origin,
+	ReqwestTransport,
 };
 
 use crate::prompt::{self, Echo};
@@ -108,50 +109,121 @@ impl CliCredentialProvider {
 }
 
 impl CredentialProvider for CliCredentialProvider {
-	async fn fill(&self, request: &CredentialRequest) -> Result<Option<Credential>> {
+	async fn fill(&self, request: &CredentialRequest) -> Result<Option<Filled>> {
 		let askpass = self.askpass();
 		let config = credential_helper::resolve(&self.config, request)?;
 
-		// The username known before helpers run: the transport's hint (URL userinfo — git's
-		// `username_from_proto`, which config never overrides) wins, else the resolved `credential.username`.
-		let mut username = request.username.clone().or(config.username);
-		let mut password = None;
-
-		// The helper `get` chain, feeding forward what is known (and the `401`'s challenge) so a helper can
-		// supply the username, the password, or both. `get` returns the *resulting* credential state (it
-		// may also reset a field via a `url=` response). Matching git's order: adopt the returned state,
-		// stop as soon as both fields are known (success), and only *then* honour a `quit` — a helper that
-		// returns a complete credential alongside `quit=1` still succeeds; an incomplete one aborts, as
-		// git does (`die("credential helper ... told us to quit")`).
+		// The credential state threaded through the helper chain — git's single mutable credential. Seeded
+		// with the username known before helpers run (the transport's URL-userinfo hint — git's
+		// `username_from_proto`, which config never overrides — else the resolved `credential.username`) and
+		// the prior multistage round's context. Each helper is fed this and mutates it (adding a
+		// username/password, or an `authtype`/`credential`), so a field one helper sets survives to the next.
+		// `authtype`/`ephemeral` seed the *carried* context of a multistage round — git retains them across
+		// the round (only the secret is cleared), so a continuation helper receives the in-progress scheme and
+		// the `ephemeral` marker survives even if the completing helper does not restate it. (`state[]` rides
+		// the request, fed to every helper by `get_request_lines`, not the accumulator.)
+		//
+		// The username a prior round *learned* (`request.carried_username`, git's retained `c->username`) seeds
+		// the accumulator too — re-presented to the continuation helper and carried onto the final credential
+		// — taking precedence over the resolution hint. It is kept out of `resolve` above (which keys on the
+		// stable `request.username`) so a learned username never re-selects the helper chain mid-handshake.
+		//
+		// The capabilities a prior round negotiated (`request.caps_authtype`/`caps_state`) seed the
+		// accumulator. git retains each capability's helper-side bit across a multistage round independently —
+		// neither `credential_clear_secrets` nor `credential_fill` resets `capa_authtype`/`capa_state` — so a
+		// continuation helper's `authtype`/`credential` (authtype) and `state[]`/`continue` (state) are
+		// honoured even when it does not re-advertise the capability. Carried per-capability, not inferred from
+		// "a round continued": a round that negotiated only `state` must not enable `authtype`.
+		let mut acc = credential_helper::GetOutput {
+			username: request
+				.carried_username
+				.clone()
+				.or_else(|| request.username.clone())
+				.or(config.username),
+			authtype: request.authtype.clone(),
+			ephemeral: request.ephemeral,
+			caps_authtype: request.caps_authtype,
+			caps_state: request.caps_state,
+			..credential_helper::GetOutput::default()
+		};
+		// The helper `get` chain. Matching git's order: adopt the returned state, stop as soon as the
+		// credential is complete (a full encoded credential, or both username and password), and only *then*
+		// honour a `quit` — a helper that returns a complete credential alongside `quit=1` still succeeds; an
+		// incomplete one aborts, as git does.
 		let mut chain_reset = false;
 		for helper in &config.helpers {
-			let output = helper
-				.get(
-					request,
-					username.as_deref(),
-					password.as_deref(),
-					config.use_http_path,
-					&self.cwd,
-				)
+			acc = helper
+				.get(request, &acc, config.use_http_path, &self.cwd)
 				.await?;
-			username = output.username;
-			password = output.password;
 			// A helper's `url=` reset git's whole credential (including the helper list), so record it for
-			// the later `approve`/`reject` and stop consulting helpers — even if the reset credential is
-			// itself complete.
-			chain_reset |= output.reset;
-			if username.is_some() && password.is_some() {
+			// the later `approve`/`reject` and stop consulting helpers.
+			chain_reset |= acc.reset;
+			// Complete once a full encoded credential or both Basic fields are present.
+			if acc.has_encoded() || (acc.username.is_some() && acc.password.is_some()) {
 				break;
 			}
-			if output.quit {
+			if acc.quit {
 				bail!("credential helper told us to quit");
 			}
-			if output.reset {
+			if acc.reset {
 				// Fall through to prompting for whatever the reset left missing.
 				break;
 			}
 		}
 		*self.chain_reset.lock().expect("chain_reset not poisoned") = chain_reset;
+
+		// The multistage signals ride *any* credential (Basic or encoded), honoured only under the
+		// mutually-advertised `state` capability — so a helper cannot force a loop it did not opt into, and
+		// a stateful helper's `state[]`/`continue` survive even with a username/password credential.
+		let (state, more) = if acc.caps_state {
+			(acc.state.clone(), acc.more)
+		} else {
+			(Vec::new(), false)
+		};
+		// `ephemeral` is under the `authtype` capability and applies to *any* credential — a helper may
+		// mark a username/password short-lived too, so it must ride the Basic returns as well as the encoded
+		// one (else the transport would cache and pre-emptively reuse a value it was told not to persist).
+		let ephemeral = acc.caps_authtype && acc.ephemeral;
+		// The capabilities finally negotiated — carried onto the [`Filled`] so the transport re-presents them
+		// to the next round independently (a `url=` reset leaves both `false`, ending the multistage).
+		let caps_authtype = acc.caps_authtype;
+		let caps_state = acc.caps_state;
+		// The encoded fields (git's `authtype`/`credential`), honoured only under the mutually-advertised
+		// `authtype` capability. In git's flat credential these ride alongside any username/password (git keeps
+		// every populated field), so an `authtype` is retained even when this round's credential is Basic.
+		let (authtype, credential_value) = if acc.caps_authtype {
+			(acc.authtype.clone(), acc.credential.clone())
+		} else {
+			(None, None)
+		};
+		let username = acc.username;
+		let password = acc.password;
+		// A complete credential — a pre-encoded `authtype`+`credential`, or a full Basic pair — is returned
+		// without prompting, with any multistage signals.
+		let complete_encoded = authtype.is_some() && credential_value.is_some();
+		if complete_encoded || (username.is_some() && password.is_some()) {
+			return Ok(Some(Filled {
+				credential: Credential {
+					username,
+					password,
+					authtype,
+					credential: credential_value,
+					ephemeral,
+				},
+				state,
+				more,
+				caps_authtype,
+				caps_state,
+			}));
+		}
+		// About to prompt for a Basic username/password — but only when the challenge actually offers Basic.
+		// The transport withholds a Basic credential from a server that did not offer Basic (a Bearer/
+		// Negotiate-only challenge, or a `401` with *no* `WWW-Authenticate` at all), so prompting there would
+		// resolve a credential guaranteed to be discarded — decline instead and let the `401` stand.
+		// Helpers have already run above, so an encoded scheme is still resolved first.
+		if !gitana_remote::challenge_offers(&request.wwwauth, "basic") {
+			return Ok(None);
+		}
 
 		// The path git appends to a prompt's URL — only under `useHttpPath`, where the repository path is
 		// part of the credential's identity, so a prompt-aware broker keys on the exact URL git shows.
@@ -211,7 +283,21 @@ impl CredentialProvider for CliCredentialProvider {
 			}
 		};
 
-		Ok(Some(Credential { username, password }))
+		// A prompted Basic credential still carries any multistage signals — and the `ephemeral` marker, and
+		// any `authtype` a stateful helper left behind (git keeps its own field across the prompt).
+		Ok(Some(Filled {
+			credential: Credential {
+				username: Some(username),
+				password: Some(password),
+				authtype,
+				credential: credential_value,
+				ephemeral,
+			},
+			state,
+			more,
+			caps_authtype,
+			caps_state,
+		}))
 	}
 
 	async fn approve(&self, request: &CredentialRequest, cred: &Credential) -> Result<()> {
@@ -225,13 +311,7 @@ impl CredentialProvider for CliCredentialProvider {
 		let config = credential_helper::resolve(&self.config, request)?;
 		for helper in &config.helpers {
 			helper
-				.store(
-					request,
-					&cred.username,
-					&cred.password,
-					config.use_http_path,
-					&self.cwd,
-				)
+				.store(request, cred, config.use_http_path, &self.cwd)
 				.await;
 		}
 		Ok(())
@@ -246,13 +326,7 @@ impl CredentialProvider for CliCredentialProvider {
 		let config = credential_helper::resolve(&self.config, request)?;
 		for helper in &config.helpers {
 			helper
-				.erase(
-					request,
-					&cred.username,
-					&cred.password,
-					config.use_http_path,
-					&self.cwd,
-				)
+				.erase(request, cred, config.use_http_path, &self.cwd)
 				.await;
 		}
 		Ok(())

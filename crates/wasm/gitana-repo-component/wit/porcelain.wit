@@ -1,14 +1,16 @@
-package gitana:repo@0.8.0;
+package gitana:repo@0.9.0;
 
 /// HTTP credential resolution, granted by the host.
 ///
 /// The remote porcelain (`fetch`/`push`/`clone`) authenticates a Smart HTTP `401` the git way, but the
 /// component holds no ambient authority to read a netrc, run a credential helper, or prompt — so it
 /// *imports* this capability and the **host** answers it, mirroring the native
-/// `gitana-remote::CredentialProvider`. The component asks for a credential only when a server answers
-/// `401 WWW-Authenticate: Basic`, and reports the outcome so the host may persist or erase it. A host
-/// that has no credential to offer returns `none` from `fill`, and the `401` stands as the error —
-/// there is no error/abort channel, matching the capability's best-effort nature.
+/// `gitana-remote::CredentialProvider`. The component asks for a credential only when a server answers a
+/// `401`, and reports the outcome so the host may persist or erase it. A host that has no credential to
+/// offer returns `none` from `fill`, and the `401` stands as the error — there is no error/abort
+/// channel, matching the capability's best-effort nature. The credential is either a Basic
+/// username/password pair or a pre-encoded scheme (git's `authtype`/`credential` — Bearer/Digest/…), and
+/// `fill` returns the multistage-auth signals (`state`/`more`) git's `state` capability drives.
 interface credentials {
 	/// The context a credential is resolved for — git's credential attributes, carried across the
 	/// component boundary from the native `CredentialRequest`.
@@ -20,22 +22,58 @@ interface credentials {
 		/// The repository path with no leading slash (e.g. `acme/app.git`), percent-encoded as it
 		/// appeared in the URL; absent when the URL has none.
 		path: option<string>,
-		/// A known username the credential must be for, if any (URL userinfo or `credential.username`).
+		/// A known username the credential must be for, if any (URL userinfo or `credential.username`) — the
+		/// resolution key a provider matches a username-scoped section on; stable across multistage rounds.
 		username: option<string>,
+		/// The username a previous multistage round learned (git's retained `c->username`), re-presented to
+		/// a continuation helper without re-keying helper selection; absent on the first round.
+		carried-username: option<string>,
 		/// The server's `WWW-Authenticate` challenge values, one per header field, in order — empty
 		/// unless this request accompanies a `401` being filled.
 		wwwauth: list<string>,
+		/// Opaque `state[]` a previous round returned, echoed back to resume a multistage authentication —
+		/// empty on the first round.
+		state: list<string>,
+		/// The `authtype` carried from a previous multistage round (git retains it while clearing the
+		/// secret) — absent on the first round or after a Basic round.
+		authtype: option<string>,
+		/// The `ephemeral` flag carried from a previous multistage round — retained across the round so a
+		/// completing helper need not restate it; `false` on the first round.
+		ephemeral: bool,
+		/// Whether the `authtype` capability was negotiated in a previous round (git retains a capability's
+		/// helper-side bit across rounds independently) — `false` on the first round.
+		caps-authtype: bool,
+		/// Whether the `state` capability was negotiated in a previous round — `false` on the first round.
+		caps-state: bool,
 	}
 
-	/// A resolved username/password pair (the "password" may be a token).
+	/// A resolved credential, modelled as git's flat `struct credential`: `username`/`password` are the
+	/// Basic pair; `authtype`/`credential` (git ≥ 2.42) are a scheme name plus a pre-encoded value forming
+	/// `Authorization: <authtype> <credential>` (e.g. `Bearer <token>`). git keeps every populated field
+	/// (all ride `store`/`erase`); `ephemeral` marks a short-lived value a helper must not persist.
 	record credential {
-		username: string,
-		password: string,
+		username: option<string>,
+		password: option<string>,
+		authtype: option<string>,
+		credential: option<string>,
+		ephemeral: bool,
+	}
+
+	/// One round of a `fill`: the credential to send, the `state[]` to echo back next round, whether a
+	/// further multistage round is expected (git's `continue`), and which capabilities the helper negotiated
+	/// this round (`authtype`/`state`) — retained independently across a multistage round so a continuation
+	/// helper's capability-gated fields are honoured without re-advertising.
+	record filled {
+		credential: credential,
+		state: list<string>,
+		more: bool,
+		caps-authtype: bool,
+		caps-state: bool,
 	}
 
 	/// Resolve a credential for `request`. `none` means none is available (anonymous, none configured,
 	/// or the host declined) and the caller proceeds unauthenticated, letting the server's `401` stand.
-	fill: func(request: credential-request) -> option<credential>;
+	fill: func(request: credential-request) -> option<filled>;
 
 	/// Record that `cred` (for `request`) was accepted by the server, so the host may persist it
 	/// (git's `credential approve`). Best-effort — it never fails the operation it just authorised.

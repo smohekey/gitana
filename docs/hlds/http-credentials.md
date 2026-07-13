@@ -351,6 +351,38 @@ Each slice: its own worktree+branch, workspace green **including `wasm32-wasip2 
   known follow-up smell: the `http_headers` urlmatch duplicates the credential matcher's URL logic;
   they are candidates for a shared `urlmatch` module.
 
+- **Slice 4c — Bearer + full multistage credential auth (done).** git's `authtype`/`credential`
+  form (git ≥ 2.42) and the `state`/`continue` multistage loop, end to end: a helper (or wasm host)
+  may return a pre-encoded `authtype`+`credential` (Bearer/Negotiate/…) that gta relays as
+  `Authorization: <authtype> <credential>`, and a stateful helper drives git's `HTTP_REAUTH` loop
+  (`AuthTransport` re-fills with the fresh challenge, capped at `MAX_AUTH_ROUNDS`). `Credential` is
+  git's **flat** `struct credential` — `username`/`password`/`authtype`/`credential` (all optional) +
+  `ephemeral` — chosen (Scott 2026-07-14) over an `Authorization::{Basic, Encoded}` enum after the
+  enum's Basic-XOR-Encoded shape kept losing valid field combinations git permits (a username/password
+  credential that also retains an `authtype`; an encoded credential that keeps its account `username`
+  for `store`). The flat model is git-faithful by construction: the header is `<authtype> <credential>`
+  when a `credential` is present, else `Basic base64(user:pass)`; `store`/`erase` emit every populated
+  field. `Filled { credential, state, more, caps_authtype, caps_state }` carries one round's result.
+  Faithfulness pinned to git source across ~8 codex rounds — verified via `credential.c`/`http.c`, not
+  review assertions: `credential_read`
+  honours returned fields **unconditionally**; capabilities are retained per-capability across a
+  round (`credential_clear_secrets`/`credential_fill` reset neither) while only the secret is cleared;
+  helper selection/`useHttpPath` are latched once (`configured`), so a *learned* username rides a
+  separate `carried_username` and never re-keys selection; a helper `url=` reset zeroes the initial
+  capability advertisement, so a capability re-advertised afterward is not honoured; an accepted
+  `ephemeral` credential is still reused in-memory for the operation (git reuses `http_auth`), the
+  flag only suppressing helper *persistence*. WIT `credentials` gained the encoded/variant shapes +
+  the multistage carry fields (pkg → 0.9.0).
+
+  **Known limitation (deferred; Scott 2026-07-14).** Credential *values* — `username`, `password`,
+  `credential`, and `state[]` — are modelled as UTF-8 `String`, and helper output is read via
+  `String::from_utf8_lossy`. git treats them as opaque bytes (any octet but newline/NUL). In practice
+  every real value is ASCII/UTF-8 (Basic user/pass, Bearer/OAuth tokens, NTLM/Negotiate base64
+  `state[]`), so this does not bite; a byte-faithful model would be a *model-wide* change (all four
+  fields + the WIT `list<string>` → `list<list<u8>>`), deliberately deferred rather than bolted onto
+  `state[]` alone (which would leave a binary password just as lossy). Follow-up: a `Vec<u8>`-valued
+  credential model if a real helper ever emits non-UTF-8.
+
 ## Verification
 
 Add `serve_gitana_basic_auth(git_dir, hash, user, pass)` to `crates/cli/gta/tests/support/mod.rs`

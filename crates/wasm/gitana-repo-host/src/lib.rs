@@ -118,7 +118,7 @@ impl gitana::repo::credentials::Host for State {
 	async fn fill(
 		&mut self,
 		request: gitana::repo::credentials::CredentialRequest,
-	) -> Option<gitana::repo::credentials::Credential> {
+	) -> Option<gitana::repo::credentials::Filled> {
 		self
 			.credentials
 			.as_ref()
