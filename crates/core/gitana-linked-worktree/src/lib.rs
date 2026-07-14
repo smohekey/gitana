@@ -1,0 +1,57 @@
+//! Structured, in-process management of Git **linked worktrees** (`git worktree`), for a library
+//! consumer that must not spawn a command-line process.
+//!
+//! This crate re-expresses Gitana's linked-worktree admin lifecycle — which otherwise lives in the
+//! `gta` CLI — as capability-clean library functions returning **matchable** structured data: a
+//! repository is identified explicitly ([`RepositoryId`], anchored on the shared common dir, never
+//! inferred from a destination path); refusals and conflicts are observations returned inside `Ok` (a
+//! [`WorktreeClassification`]), while only genuine failures are [`LinkedWorktreeError`]; object ids
+//! cross the boundary as a runtime-tagged [`WorktreeObjectId`] so the caller stays format-agnostic
+//! across SHA-1 and SHA-256; identity paths are native `PathBuf` throughout; and nothing here writes to
+//! stdout/stderr or reads the process current directory.
+//!
+//! Slice 1 (this) is **read-only**: [`inspect`] one destination, [`classify`] its partial state,
+//! [`enumerate`] a repository's worktrees, and read a working tree's [`status`]. Creation, reconcilation,
+//! and removal land in later slices.
+//!
+//! The filesystem-capability mint uses `cap-std`, which does not build for `wasm32`; the reading
+//! functions ([`inspect`]/[`enumerate`]/[`status`]) are therefore `cfg(not(target_arch = "wasm32"))`,
+//! while the pure types and [`classify`] are available everywhere. A wasm consumer would inject
+//! capabilities instead — a later concern (the intended consumer is native).
+
+mod classify;
+mod enumerate;
+mod error;
+mod facts;
+mod inspect;
+mod object_id;
+mod query;
+mod repo_id;
+mod status;
+
+// The filesystem-reading helpers exist only to serve the native (cap-std) reading API, so they are
+// native-only — on wasm the crate exposes just the pure model + classification.
+#[cfg(not(target_arch = "wasm32"))]
+mod head;
+#[cfg(not(target_arch = "wasm32"))]
+mod pointers;
+
+pub use classify::{ProtectionReason, WorktreeClassification, classify};
+pub use enumerate::{WorktreeEntry, WorktreeListing, WorktreeRole};
+pub use error::{LinkedWorktreeError, PointerKind};
+pub use facts::{HeadKind, LockState};
+pub use inspect::{
+	CrossPointerHealth, DestinationKind, HeadFacts, IdentityConflict, Registration, RequestedBranch,
+	StartRelation, WorktreeInspection,
+};
+pub use object_id::WorktreeObjectId;
+pub use query::{BranchName, WorktreeQuery};
+pub use repo_id::RepositoryId;
+pub use status::WorktreeStatusReport;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use enumerate::enumerate;
+#[cfg(not(target_arch = "wasm32"))]
+pub use inspect::inspect;
+#[cfg(not(target_arch = "wasm32"))]
+pub use status::status;

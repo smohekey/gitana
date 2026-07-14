@@ -1676,6 +1676,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitana-linked-worktree"
+version = "0.1.0"
+dependencies = [
+ "cap-std 4.0.2",
+ "gitana-config",
+ "gitana-file-store",
+ "gitana-file-store-local",
+ "gitana-object",
+ "gitana-object-store",
+ "gitana-repository",
+ "gitana-repository-layout",
+ "gitana-worktree",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "gitana-object"
 version = "0.1.0"
 dependencies = [
