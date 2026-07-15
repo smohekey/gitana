@@ -13,6 +13,7 @@ workspace = true
 gitana-config.workspace = true
 gitana-file-store.workspace = true
 gitana-file-store-local.workspace = true
+gitana-identity.workspace = true
 gitana-object.workspace = true
 gitana-object-store.workspace = true
 gitana-repository.workspace = true

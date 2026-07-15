@@ -10,9 +10,11 @@
 //! across SHA-1 and SHA-256; identity paths are native `PathBuf` throughout; and nothing here writes to
 //! stdout/stderr or reads the process current directory.
 //!
-//! Slice 1 (this) is **read-only**: [`inspect`] one destination, [`classify`] its partial state,
-//! [`enumerate`] a repository's worktrees, and read a working tree's [`status`]. Creation, reconcilation,
-//! and removal land in later slices.
+//! The read surface is [`inspect`] one destination, [`classify`] its partial state, [`enumerate`] a
+//! repository's worktrees, and read a working tree's [`status`]. [`create`] establishes a worktree from an
+//! explicit [`CreateRequest`], reconciling against that classification — an idempotent no-op when it
+//! already exists exactly, completing an interrupted attempt, and refusing a conflict. Removal lands in a
+//! later slice.
 //!
 //! The filesystem-capability mint uses `cap-std`, which does not build for `wasm32`; the reading
 //! functions ([`inspect`]/[`enumerate`]/[`status`]) are therefore `cfg(not(target_arch = "wasm32"))`,
@@ -20,6 +22,7 @@
 //! capabilities instead — a later concern (the intended consumer is native).
 
 mod classify;
+mod create_error;
 mod enumerate;
 mod error;
 mod facts;
@@ -27,16 +30,20 @@ mod inspect;
 mod object_id;
 mod query;
 mod repo_id;
+mod request;
 mod status;
 
 // The filesystem-reading helpers exist only to serve the native (cap-std) reading API, so they are
 // native-only — on wasm the crate exposes just the pure model + classification.
+#[cfg(not(target_arch = "wasm32"))]
+mod create;
 #[cfg(not(target_arch = "wasm32"))]
 mod head;
 #[cfg(not(target_arch = "wasm32"))]
 mod pointers;
 
 pub use classify::{ProtectionReason, WorktreeClassification, classify};
+pub use create_error::CreateError;
 pub use enumerate::{WorktreeEntry, WorktreeListing, WorktreeRole};
 pub use error::{LinkedWorktreeError, PointerKind};
 pub use facts::{HeadKind, LockState};
@@ -47,8 +54,11 @@ pub use inspect::{
 pub use object_id::WorktreeObjectId;
 pub use query::{BranchName, WorktreeQuery};
 pub use repo_id::RepositoryId;
+pub use request::{CheckoutTarget, CreateRequest};
 pub use status::WorktreeStatusReport;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use create::create;
 #[cfg(not(target_arch = "wasm32"))]
 pub use enumerate::enumerate;
 #[cfg(not(target_arch = "wasm32"))]

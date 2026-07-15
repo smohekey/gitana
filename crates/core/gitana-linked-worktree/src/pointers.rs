@@ -467,7 +467,7 @@ pub(crate) const SYMREF_MAXDEPTH: usize = 5;
 /// (a HEAD naming an *invalid* ref is rejected, never reported as a healthy unborn branch) **and**
 /// preserves the security property — `..`, absolute paths, and `\` are refused, so `base.join(name)`
 /// cannot escape the repository.
-fn is_valid_refname(name: &str) -> bool {
+pub(crate) fn is_valid_refname(name: &str) -> bool {
 	if name.is_empty() || name == "@" {
 		return false;
 	}

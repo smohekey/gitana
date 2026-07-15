@@ -1683,6 +1683,7 @@ dependencies = [
  "gitana-config",
  "gitana-file-store",
  "gitana-file-store-local",
+ "gitana-identity",
  "gitana-object",
  "gitana-object-store",
  "gitana-repository",
