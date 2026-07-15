@@ -186,43 +186,63 @@ is the final hardening slice.
    admin-layout write, checkout materialization, injectable effective-config for reflog parity.
 3. **Remove + status-surface finalization** — identity-rechecked safe removal (refuse dirty/
    conflicted/locked/primary/mismatch; preserve branch + untracked), `Dirty` folded into classification.
+   Also absorbs the deferred **recoverable mid-checkout** item (classify the attributable partial + have
+   prune/remove clean the leftover files — see "Deferred to slice 3" below).
 4. **CLI rewire** — point `commands/worktree.rs` + `repo.rs` at the library; keep DWIM/force/
    `--porcelain`/suffix resolution on top. Behavior-preserving; existing git-parity tests stay green.
 5. **Concurrency + native-path hardening** — registration-level CAS, lost-race-as-conflict, full
-   `OsStr` identity paths, lock-file races.
+   `OsStr` identity paths, lock-file races. *(First installment landed: the round-4 create-hardening
+   tranche — F1 post-condition, F3 atomic pointers, F4 name sanitization. Remaining items — registration
+   CAS on create/remove, lock-file races, the broader `OsStr` boundary sweep — follow the remove slice.)*
 
-### Deferred (slice-5 hardening)
+### Slice-5 create hardening (DONE) and the one item deferred to slice 3
 
-The following were raised by the slice-2 create codex review (round 4) and deferred here as one coherent
-tranche — they are durability / native-path hardening that interacts (staging boundary, atomic publish,
-name sanitization, lost-race), which is exactly slice 5's scope. All four are verified against stock git.
+The slice-2 create codex review (round 4) raised four durability / native-path findings (all verified vs
+stock git). **Three landed in slice 5** — git-faithful name sanitization, post-condition validation, and
+pointer-publication hardening:
 
-- **Post-condition validation of the final inspection (`create`).** `create` returns the post-write
-  inspection unconditionally; a genuinely-inconsistent post-state (a concurrent registration/branch change,
-  or — until name sanitization lands — a line-terminator basename) is reported as `Ok`. Slice 5 re-runs
-  `decide` on the final inspection and returns success only when it yields `AlreadyThere`, mapping a
-  non-matching post-state to a lost-race conflict. (Cheap and self-contained, but belongs with the
-  lost-race work it guards.)
+- **Post-condition validation of the final inspection (`create`).** ✅ Slice 5. `create` re-runs `decide` on
+  the post-write inspection and returns success only when it re-decides to `AlreadyThere`; **any** other
+  outcome — `decide` wanting another write, or refusing (a concurrent branch divergence / re-appeared
+  conflict / removed destination) — is a single `CreateError::NotEstablished` lost-race error carrying the
+  observed state, never a preflight-style refusal or a false `Ok`.
+- **Pointer-publication hardening (`create`).** ✅ Slice 5. The admin `commondir`/`gitdir`/`HEAD`/
+  `ORIG_HEAD`/`logs/HEAD` are written to a temp sibling, `fsync`ed, then `rename`d into place (atomic and
+  universal, so a reader never sees a torn admin pointer and a crash leaves an absent — classifiable — file,
+  not a half-written one). The checkout `.git` gitfile is written with a plain exclusive `create_new`
+  (`O_CREAT | O_EXCL`) **exactly as git does** — no-clobber (a raced-in `.git`, even a symlink, is refused,
+  never followed/truncated) and portable to filesystems without hard-link support (FAT/exFAT, some SMB/NFS)
+  where a link/rename publish would fail though git succeeds. This matches git's own non-atomic gitfile
+  write; the residual "an interrupted create leaves an empty `.git`" window is git-parity, and the
+  gitfile-last ordering keeps it a `PartialRegistered`-class partial (the *recoverable-mid-checkout* item
+  below covers making such partials cleanly retryable).
+- **git-faithful worktree-name sanitization (`unique_admin_dir`).** ✅ Slice 5. The admin name is sanitized
+  from the destination basename's bytes exactly as git does (probed vs git 2.50.1): refname-invalid bytes
+  (control, space, DEL, `* : ? [ \ ^ ~`) → `-`, a leading `.` neutralised, a `..` run collapsed, an `@{`
+  sequence broken, a bare `@` → `-`, a trailing `.lock` stripped; valid multi-byte (≥ 0x80) sequences pass
+  through — while the admin `gitdir` still records the real (unsanitized) destination path. So the admin path
+  can never carry the newline/CR that would break the gitfile cross-pointers. **Non-UTF-8 handling is not yet
+  complete:** because the cross-pointers still serialize/parse via `Path::display()` / `read_to_string`, a
+  non-UTF-8 byte anywhere in the *resolved* destination or common-dir path is **rejected up front** (on the
+  write path, so an idempotent no-op is never falsely refused) rather than written lossily. Byte-clean
+  pointer I/O — the "full `OsStr` at every boundary" requirement — remains **deferred**.
+
+**Deferred to slice 3 (remove + prune):**
+
 - **Recoverable mid-checkout state (`create`).** git writes the checkout `.git` gitfile **first** (probed:
-  the gitfile exists with zero checkout files present), so a mid-checkout failure leaves a *registered,
-  dirty* worktree that `git checkout -f` / `worktree remove --force` recovers. gitana writes the gitfile
-  **last** (so an interrupted create is `PartialRegistered`, not a false complete — the round-1 durability
-  choice), which cleanly handles interrupted-*before*-checkout but leaves an interrupted-*mid*-checkout as
-  registration + partial files without `.git` → unattributable (`PresentCheckoutMissing`+`UnrelatedContent`
-  → `DestinationConflict`), blocking prune-and-retry. Slice 5 keeps gitfile-last but adds an in-admin
-  "checkout-in-progress" marker (or staging boundary) so a partial checkout is attributable to the
-  interrupted create and prune-and-retry can complete.
-- **Atomic no-clobber pointer publication (`create`).** The checkout `.git` gitfile and the admin
-  `gitdir`/`HEAD` are opened then written in two steps; a crash between leaves an empty/partial pointer that
-  inspection treats as a *malformed-pointer hard error* rather than a classifiable partial state. Slice 5
-  builds each pointer off-path and publishes it with an atomic, no-replace `link`/rename (preserving the
-  round-3 `O_EXCL` "refuse a raced-in `.git`" guarantee — `link` fails if the destination exists).
-- **git-faithful worktree-name sanitization (`unique_admin_dir`).** A valid `\n`/`\r`-ending destination
-  basename produces an admin path ending in the gitfile record delimiter, so the cross-pointers resolve to
-  a different admin dir and the worktree is inconsistent. git sanitizes the admin *name* (verified mapping:
-  `\t \r \n`, space, other control bytes, DEL, `:`, `~` → `-`; a trailing `.lock` is stripped; high/
-  non-ASCII bytes are kept) while the admin `gitdir` still records the real (unsanitized) destination path.
-  Slice 5 mirrors that mapping in `unique_admin_dir` (this is the "full `OsStr` at every boundary" item).
+  it exists with zero checkout files present), so a mid-checkout failure leaves a *registered, dirty*
+  worktree that `git checkout -f` / `worktree remove --force` recovers. gitana writes the gitfile **last**
+  (so an interrupted-*before*-checkout create is cleanly `PartialRegistered`, not a false complete — the
+  round-1 durability choice), but that leaves an interrupted-*mid*-checkout as registration + partial files
+  without `.git` → `PresentCheckoutMissing`+`UnrelatedContent` → `DestinationConflict`, blocking
+  prune-and-retry. Resolving this is **two halves**: (1) *classify* the attributable partial as recoverable
+  rather than a destination conflict — feasible via the reverse admin→destination lookup inspection already
+  does (`admin_dirs_for`), a precedence tweak in `decide`/`classify`; and (2) *clean* the attributable
+  leftover files so a retry can proceed — classification alone doesn't unblock retry (after prune the files
+  remain → still `UnrelatedContent`). Half (2) is the prune/remove path, and slice 3 already refines
+  classification (folding `Dirty` in), so both halves land there. Practical trigger is narrow — the concrete
+  case (a mode-160000 submodule gitlink sorting before a normal path) is the already-deferred
+  `gitana-worktree` gitlink-checkout gap; otherwise rare I/O failures.
 - **Submodule gitlinks in the initial checkout (slice-2 `create`).** When the start commit contains a
   mode `160000` gitlink, `WorkTree::checkout` (in `gitana-worktree`) tries to `read_blob` the submodule
   commit and fails; git instead creates the empty submodule directory and records the gitlink. This is a

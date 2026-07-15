@@ -33,6 +33,13 @@ pub enum CreateError {
 	#[error("invalid branch name: {0}")]
 	InvalidBranchName(String),
 
+	/// The write completed, but a post-write re-inspection shows the destination is *not* the requested
+	/// worktree — a concurrent registration/branch change (a lost race) mutated the state out from under the
+	/// create. Carries the observed post-state. (A create never reports success for a state it did not
+	/// establish.)
+	#[error("create did not establish the requested worktree (lost race)")]
+	NotEstablished(Box<WorktreeInspection>),
+
 	/// A hard failure while inspecting or writing (I/O, a malformed pointer, a repository/ref error).
 	#[error(transparent)]
 	Failed(#[from] LinkedWorktreeError),

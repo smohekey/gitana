@@ -693,6 +693,200 @@ async fn a_force_duplicated_branch_is_a_branch_use_conflict_not_idempotent() {
 }
 
 #[tokio::test]
+async fn sanitizes_a_pathological_basename_like_git() {
+	// A destination basename with a newline (which would break the gitfile record delimiter) plus `~`/`:`
+	// (refname-invalid): git sanitizes the *admin name* while keeping the real destination path. Assert we
+	// pick the same admin name as stock git, the name has no delimiter byte, and git accepts our worktree.
+	fn sole_admin(work: &std::path::Path) -> String {
+		let dir = work.join(".git/worktrees");
+		let mut names: Vec<String> = std::fs::read_dir(&dir)
+			.unwrap()
+			.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+			.collect();
+		assert_eq!(names.len(), 1, "exactly one admin dir");
+		names.pop().unwrap()
+	}
+
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-sanitize-{fmt}"));
+		let work_git = base.join("gitrepo");
+		let work_ours = base.join("ourrepo");
+		init_repo(&work_git, fmt);
+		init_repo(&work_ours, fmt);
+		commit_file(&work_git, "a.txt", "1\n", "init");
+		let head = commit_file(&work_ours, "a.txt", "1\n", "init");
+
+		// `\n` is valid UTF-8 (and a legal Unix path byte), so both sides use the exact same basename.
+		let bad = "wt\n~:x";
+		let git_side = base.join("gside");
+		let our_side = base.join("oside");
+		std::fs::create_dir_all(&git_side).unwrap();
+		std::fs::create_dir_all(&our_side).unwrap();
+		let dest_git = git_side.join(bad);
+		let dest_ours = our_side.join(bad);
+
+		// Oracle: stock git.
+		git(&[
+			"-C",
+			work_git.to_str().unwrap(),
+			"worktree",
+			"add",
+			dest_git.to_str().unwrap(),
+			"-b",
+			"feat",
+		]);
+		let admin_git = sole_admin(&work_git);
+
+		// Ours.
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+		create(
+			&req(&work_ours, &dest_ours, new_branch("feat", start)),
+			None,
+		)
+		.await
+		.unwrap();
+		let admin_ours = sole_admin(&work_ours);
+
+		assert_eq!(admin_ours, admin_git, "{fmt}: admin name matches git");
+		assert!(
+			!admin_ours.contains('\n') && !admin_ours.contains('\r'),
+			"{fmt}: admin name has no gitfile delimiter: {admin_ours:?}"
+		);
+		// git accepts our worktree: the cross-pointers resolve and HEAD is the requested branch/commit.
+		let dst = dest_ours.to_str().unwrap();
+		assert_eq!(git(&["-C", dst, "rev-parse", "HEAD"]).trim(), head);
+		assert_eq!(
+			git(&["-C", dst, "symbolic-ref", "HEAD"]).trim(),
+			"refs/heads/feat"
+		);
+		assert!(git(&["-C", dst, "status", "--porcelain"]).is_empty());
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn refuses_a_non_utf8_basename_without_writing() {
+	// The admin name is serialized into the cross-pointers via `display()` (and read back with
+	// `read_to_string`), which can't round-trip a non-UTF-8 basename yet — so it is refused *before* any
+	// branch/admin/checkout is written, not late with partial state.
+	use std::os::unix::ffi::OsStrExt;
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-nonutf8-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+		// `0xff` is not valid UTF-8, but is a legal Unix path byte.
+		let bad = std::ffi::OsStr::from_bytes(b"wt\xffx");
+		let dest = base.join(bad);
+		let err = create(&req(&work, &dest, new_branch("feature", start)), None)
+			.await
+			.unwrap_err();
+		assert!(matches!(err, CreateError::Failed(_)), "{fmt}: got {err:?}");
+		// Nothing was published: no branch ref, no admin entry.
+		let w = work.to_str().unwrap();
+		assert!(!git_ok(&[
+			"-C",
+			w,
+			"rev-parse",
+			"--verify",
+			"refs/heads/feature"
+		]));
+		assert!(
+			!work.join(".git/worktrees").exists()
+				|| std::fs::read_dir(work.join(".git/worktrees"))
+					.map(|mut d| d.next().is_none())
+					.unwrap_or(true),
+			"{fmt}: no admin dir written"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn refuses_a_non_utf8_parent_without_writing() {
+	// The whole destination path (not just its basename) is serialized into the admin `gitdir`, so a
+	// non-UTF-8 *parent* with a clean basename is also refused up front — never late with partial state.
+	use std::os::unix::ffi::OsStrExt;
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-nonutf8parent-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+		// A non-UTF-8 parent directory component, but a clean UTF-8 basename.
+		let parent = base.join(std::ffi::OsStr::from_bytes(b"p\xffdir"));
+		let dest = parent.join("wt");
+		let err = create(&req(&work, &dest, new_branch("feature", start)), None)
+			.await
+			.unwrap_err();
+		assert!(matches!(err, CreateError::Failed(_)), "{fmt}: got {err:?}");
+		let w = work.to_str().unwrap();
+		assert!(!git_ok(&[
+			"-C",
+			w,
+			"rev-parse",
+			"--verify",
+			"refs/heads/feature"
+		]));
+		assert!(
+			!work.join(".git/worktrees").exists()
+				|| std::fs::read_dir(work.join(".git/worktrees"))
+					.map(|mut d| d.next().is_none())
+					.unwrap_or(true),
+			"{fmt}: no admin dir written"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn refuses_a_utf8_alias_to_a_non_utf8_real_parent_without_writing() {
+	// The pointer files record the *resolved* destination, so a lexically-UTF-8 path through a symlink whose
+	// real parent is non-UTF-8 is refused too — validation resolves the path, not the lexical request.
+	use std::os::unix::ffi::OsStrExt;
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-alias-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+		// A real parent with a non-UTF-8 byte, and a UTF-8 symlink aliasing it. Some filesystems (macOS
+		// APFS/HFS+) reject a non-UTF-8 filename outright, so this aliased scenario can't exist there — skip.
+		let real = base.join(std::ffi::OsStr::from_bytes(b"real\xffdir"));
+		if std::fs::create_dir_all(&real).is_err() {
+			let _ = std::fs::remove_dir_all(&base);
+			continue;
+		}
+		let alias = base.join("alias");
+		symlink(&real, &alias).unwrap();
+		let dest = alias.join("wt");
+		assert!(dest.to_str().is_some(), "the lexical destination is UTF-8");
+
+		let err = create(&req(&work, &dest, new_branch("feature", start)), None)
+			.await
+			.unwrap_err();
+		assert!(matches!(err, CreateError::Failed(_)), "{fmt}: got {err:?}");
+		let w = work.to_str().unwrap();
+		assert!(!git_ok(&[
+			"-C",
+			w,
+			"rev-parse",
+			"--verify",
+			"refs/heads/feature"
+		]));
+		assert!(
+			!work.join(".git/worktrees").exists()
+				|| std::fs::read_dir(work.join(".git/worktrees"))
+					.map(|mut d| d.next().is_none())
+					.unwrap_or(true),
+			"{fmt}: no admin dir written"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
 async fn refuses_a_symlink_destination() {
 	for (fmt, kind) in formats() {
 		let base = unique_tmp(&format!("create-symlink-{fmt}"));

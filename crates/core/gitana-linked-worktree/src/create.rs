@@ -69,8 +69,18 @@ mod native {
 			}
 		}
 
-		// Re-inspect so the caller receives the resulting, now-established state.
-		Ok(inspect(&query).await?)
+		// Re-inspect *and re-decide*: success only when the now-established state actually **is** the
+		// requested worktree. A legitimate create always re-decides to `AlreadyThere` (the worktree it just
+		// wrote matches the request); **any** other post-write outcome — `decide` wanting another write, or
+		// `decide` refusing (a concurrent branch divergence, a re-appeared conflict, a removed destination) —
+		// means a race changed the state out from under us, so it is one `NotEstablished` lost-race error
+		// carrying the observed post-state, never a preflight-style refusal or a false success. (A genuine
+		// I/O failure during the re-inspect still propagates as `Failed` via `?`.)
+		let established = inspect(&query).await?;
+		match decide(&established, &request.target) {
+			Ok(Action::AlreadyThere) => Ok(established),
+			Ok(Action::Write { .. }) | Err(_) => Err(CreateError::NotEstablished(Box::new(established))),
+		}
 	}
 
 	/// Decide the create action from the inspection *against the requested target*, or refuse.
@@ -347,6 +357,18 @@ mod native {
 			None => None,
 		};
 
+		// Choose the admin directory and validate — **before any mutation** — that the two paths the pointer
+		// files will record are UTF-8: the admin `gitdir` serializes the *resolved* destination and the
+		// checkout `.git` serializes the *resolved* admin path, both via `Path::display()`, which can't
+		// round-trip a non-UTF-8 byte through the (not-yet-byte-clean) pointer I/O. We resolve the deepest
+		// existing ancestor (so a *symlinked* parent — the form actually written — is what's checked, not the
+		// lexical request) and this runs only on the write path, so an idempotent no-op is never falsely
+		// refused. (Byte-clean pointer I/O is the deferred "full OsStr at every boundary" work; a newline in
+		// the basename is valid UTF-8 and is sanitized, not rejected.)
+		let admin = unique_admin_dir(common, destination)?;
+		ensure_utf8_path(&resolved_for_pointers(destination))?;
+		ensure_utf8_path(&resolved_for_pointers(&admin))?;
+
 		// Create the branch through the transactional ref layer (CAS: it must not already exist).
 		if create_branch {
 			let refname = refname.expect("a NewBranch worktree implies a branch ref name");
@@ -371,7 +393,6 @@ mod native {
 		// worktree is non-bare even when the host repository is bare, so git logs its HEAD unless
 		// `core.logAllRefUpdates` is *explicitly* disabled (not the host's bare default of off).
 		let log_head = head_reflog_enabled(&config);
-		let admin = unique_admin_dir(common, destination)?;
 		let admin = write_admin_layout(&admin, destination, &head, start, &committer, log_head)?;
 
 		// Materialise the checkout (index + files) in the new worktree's namespace, *then* write the
@@ -428,10 +449,92 @@ mod native {
 		})
 	}
 
-	/// The admin directory for a new worktree named after the destination's basename, uniquified against
-	/// the existing `<common>/worktrees/*` (git appends `1`, `2`, … on collision).
+	/// The admin directory for a new worktree, named after the destination's basename — *sanitized* the way
+	/// git sanitizes it (see [`sanitize_worktree_name`]) and uniquified against the existing
+	/// `<common>/worktrees/*` (git appends `1`, `2`, … to the sanitized name on collision).
 	fn unique_admin_dir(common: &Path, destination: &Path) -> Result<PathBuf, LinkedWorktreeError> {
-		let base = destination
+		// Sanitizing valid UTF-8 keeps it valid UTF-8 — replacements are ASCII `-` and bytes ≥ 0x80 (the
+		// continuation bytes of any multi-byte char) are never touched.
+		let base = String::from_utf8(sanitize_worktree_name(
+			admin_base_name(destination)?.as_bytes(),
+		))
+		.expect("sanitizing valid UTF-8 yields valid UTF-8");
+		let worktrees = common.join("worktrees");
+		// A candidate is free only when *nothing* — not even a dangling symlink — sits at the path, so
+		// probe with non-following `symlink_metadata`: `Path::exists()` reports a broken symlink as absent
+		// and we would then pick an occupied name and fail `create_dir_all` *after* publishing the branch.
+		let occupied = |path: &Path| path.symlink_metadata().is_ok();
+		// git appends the numeric suffix to the *sanitized* name (digits are always refname-safe).
+		let candidate = |suffix: Option<u32>| -> PathBuf {
+			match suffix {
+				Some(n) => worktrees.join(format!("{base}{n}")),
+				None => worktrees.join(&base),
+			}
+		};
+		let first = candidate(None);
+		if !occupied(&first) {
+			return Ok(first);
+		}
+		for suffix in 1u32.. {
+			let c = candidate(Some(suffix));
+			if !occupied(&c) {
+				return Ok(c);
+			}
+		}
+		unreachable!("a free worktree admin name always exists")
+	}
+
+	/// The form of `path` the pointer files will actually record — what `write_admin_layout` gets from
+	/// `create_dir_all` + `canonicalize`. Built by walking components from the root and canonicalizing each
+	/// existing prefix eagerly, so a **symlinked** parent is resolved to its real target (exactly as the OS
+	/// resolves it), a `..` correctly pops the *resolved* location, and the still-absent tail (which can hold
+	/// no symlinks) is appended lexically. Used to UTF-8-check the *resolved* path, not the lexical request.
+	fn resolved_for_pointers(path: &Path) -> PathBuf {
+		use std::path::Component;
+		let mut resolved = PathBuf::new();
+		for component in path.components() {
+			match component {
+				Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+				Component::RootDir => resolved.push(Component::RootDir.as_os_str()),
+				Component::CurDir => {}
+				Component::ParentDir => {
+					resolved.pop();
+				}
+				Component::Normal(name) => {
+					resolved.push(name);
+					// Resolve while the prefix still exists, so a symlink becomes its real target; once we pass
+					// the deepest existing ancestor this fails and the (symlink-free) tail stays lexical.
+					if let Ok(canonical) = resolved.canonicalize() {
+						resolved = canonical;
+					}
+				}
+			}
+		}
+		resolved
+	}
+
+	/// Reject a path that carries a non-UTF-8 byte anywhere — it would serialize lossily through the
+	/// `Path::display()`-based cross-pointer I/O (see [`admin_base_name`]). A no-op for the UTF-8 paths that
+	/// are the overwhelming norm.
+	fn ensure_utf8_path(path: &Path) -> Result<(), LinkedWorktreeError> {
+		if path.to_str().is_some() {
+			Ok(())
+		} else {
+			Err(LinkedWorktreeError::io(
+				"non-UTF-8 path",
+				path,
+				std::io::Error::from(std::io::ErrorKind::InvalidInput),
+			))
+		}
+	}
+
+	/// The destination's basename as a UTF-8 string, or an error. A non-UTF-8 (or absent) basename is refused:
+	/// the basename becomes the admin directory name and is serialized into the cross-pointers via
+	/// `Path::display()` and read back with `read_to_string`, so a non-UTF-8 name can't round-trip losslessly
+	/// through that path yet (a byte-clean pointer path is the deferred "full OsStr at every boundary" work).
+	/// The common pathological case — a newline in the name — is valid UTF-8 and is sanitized, not rejected.
+	fn admin_base_name(destination: &Path) -> Result<&str, LinkedWorktreeError> {
+		destination
 			.file_name()
 			.and_then(|name| name.to_str())
 			.ok_or_else(|| {
@@ -440,22 +543,95 @@ mod native {
 					destination,
 					std::io::Error::from(std::io::ErrorKind::InvalidInput),
 				)
-			})?;
-		// A candidate is free only when *nothing* — not even a dangling symlink — sits at the path, so
-		// probe with non-following `symlink_metadata`: `Path::exists()` reports a broken symlink as absent
-		// and we would then pick an occupied name and fail `create_dir_all` *after* publishing the branch.
-		let occupied = |path: &Path| path.symlink_metadata().is_ok();
-		let worktrees = common.join("worktrees");
-		if !occupied(&worktrees.join(base)) {
-			return Ok(worktrees.join(base));
-		}
-		for suffix in 1u32.. {
-			let candidate = worktrees.join(format!("{base}{suffix}"));
-			if !occupied(&candidate) {
-				return Ok(candidate);
+			})
+	}
+
+	/// Sanitize a destination basename into a worktree admin-directory name, mirroring git (probed against
+	/// git 2.50.1). git reuses the admin name as a per-worktree ref namespace, so it must be a valid refname
+	/// *component*: a refname-invalid byte (a control byte, space, DEL, or one of `* : ? [ \ ^ ~`) becomes
+	/// `-`, a leading `.` is neutralised, a `..` run collapses to a single `.`, an `@{` sequence is broken, a
+	/// bare `@` becomes `-`, and a trailing `.lock` is stripped (repeatedly). Bytes ≥ `0x80` pass through
+	/// unchanged. This keeps the admin *path* free of the newline/CR that would otherwise break the gitfile
+	/// cross-pointers — while the admin `gitdir` still records the real (unsanitized) destination path.
+	fn sanitize_worktree_name(name: &[u8]) -> Vec<u8> {
+		let mut out = Vec::with_capacity(name.len());
+		for (i, &b) in name.iter().enumerate() {
+			let refname_bad = b < 0x20
+				|| b == 0x7f
+				|| matches!(b, b' ' | b'*' | b':' | b'?' | b'[' | b'\\' | b'^' | b'~');
+			if refname_bad {
+				out.push(b'-');
+			} else if b == b'.' {
+				if i == 0 {
+					out.push(b'-'); // a component may not start with '.'
+				} else if name[i - 1] != b'.' {
+					out.push(b'.'); // keep a single dot; a '..' run collapses (skip the repeat)
+				}
+			} else if b == b'{' && i > 0 && name[i - 1] == b'@' {
+				out.push(b'-'); // break the forbidden '@{' sequence
+			} else {
+				out.push(b);
 			}
 		}
-		unreachable!("a free worktree admin name always exists")
+		// A refname component may not be a bare `@` (git's HEAD shorthand) → `-`. Applied *before* the `.lock`
+		// strip so `@.lock` still becomes `@` (the strip leaves a bare `@`, which git accepts — probed), while
+		// a literal `@` basename becomes `-`.
+		if out == b"@" {
+			out = vec![b'-'];
+		}
+		// A refname component may not end in '.lock'; git strips it (and re-checks, so '.lock.lock' → '').
+		while out.ends_with(b".lock") {
+			out.truncate(out.len() - 5);
+		}
+		// A basename never sanitizes to empty in practice (a leading '.' becomes '-'); guard defensively so
+		// a pathological all-stripped name still yields a usable directory rather than the worktrees root.
+		if out.is_empty() {
+			out.push(b'-');
+		}
+		out
+	}
+
+	/// A unique temp sibling of `path` (`<name>.tmp.<pid>.<seq>`) for the write-then-rename dance. Unique per
+	/// process + call so two creates targeting the same directory never collide on the staging file.
+	fn temp_sibling(path: &Path) -> PathBuf {
+		use std::sync::atomic::{AtomicU64, Ordering};
+		static SEQ: AtomicU64 = AtomicU64::new(0);
+		let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+		let mut name = path
+			.file_name()
+			.map(|n| n.to_os_string())
+			.unwrap_or_default();
+		name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+		path.with_file_name(name)
+	}
+
+	/// Create `path` exclusively, write `contents`, and `fsync` — so the file's bytes are durable before it
+	/// is published. The caller then links/renames it into its final name.
+	fn write_and_sync(path: &Path, contents: &[u8]) -> Result<(), LinkedWorktreeError> {
+		use std::io::Write as _;
+		let mut file = std::fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(path)
+			.map_err(|e| LinkedWorktreeError::io("creating temp file", path, e))?;
+		file
+			.write_all(contents)
+			.map_err(|e| LinkedWorktreeError::io("writing temp file", path, e))?;
+		file
+			.sync_all()
+			.map_err(|e| LinkedWorktreeError::io("syncing temp file", path, e))
+	}
+
+	/// Publish `contents` at `path` atomically: fully write a temp sibling, then `rename` it onto `path`
+	/// (replacing) — a reader never observes a torn pointer, and a crash leaves the target absent (a
+	/// classifiable partial state) rather than a half-written file (a malformed-pointer hard error).
+	fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), LinkedWorktreeError> {
+		let tmp = temp_sibling(path);
+		write_and_sync(&tmp, contents)?;
+		std::fs::rename(&tmp, path).map_err(|e| {
+			let _ = std::fs::remove_file(&tmp);
+			LinkedWorktreeError::io("publishing admin file", path, e)
+		})
 	}
 
 	/// Write git's admin layout for the new worktree — the admin's `gitdir` back-pointer, `commondir`,
@@ -483,10 +659,7 @@ mod native {
 			.map_err(|e| LinkedWorktreeError::io("resolving checkout dir", destination, e))?;
 		let gitfile = destination.join(".git");
 
-		let write = |path: PathBuf, contents: String| {
-			std::fs::write(&path, contents)
-				.map_err(move |e| LinkedWorktreeError::io("writing admin file", path, e))
-		};
+		let write = |path: PathBuf, contents: String| write_file_atomic(&path, contents.as_bytes());
 		// `commondir` is relative (git writes `../..`): from `<common>/worktrees/<name>` up to `<common>`.
 		write(admin.join("commondir"), "../..\n".to_owned())?;
 		write(admin.join("gitdir"), format!("{}\n", gitfile.display()))?;
@@ -503,9 +676,13 @@ mod native {
 	/// Write the checkout's `.git` gitfile — **last**, after the checkout has materialised — so a partial
 	/// create (interrupted before this) reads as `PartialRegistered`, never a false "complete".
 	///
-	/// Created **exclusively and without following symlinks** (`O_CREAT|O_EXCL`): inspection already found
-	/// the destination free, so a `.git` present now was raced in after the check — refuse with a
-	/// destination conflict rather than truncating an unknown file or following a symlink into its target.
+	/// Created **exclusively and without following symlinks** (`O_CREAT | O_EXCL`, exactly as git writes it):
+	/// inspection already found the destination free, so a `.git` present now was raced in after the check —
+	/// refuse it as a destination conflict rather than truncating an unknown file or following a symlink into
+	/// its target. This is written *directly* (not via a temp + rename/link): the destination lives on an
+	/// arbitrary filesystem — including ones without hard-link support (FAT/exFAT, some SMB/NFS) where a
+	/// link-based publish would fail even though git succeeds — and an `O_EXCL` create is the portable
+	/// no-clobber primitive. It leaves no working-tree staging file to become untracked clutter.
 	fn write_checkout_gitfile(destination: &Path, admin: &Path) -> Result<(), CreateError> {
 		use std::io::Write as _;
 
@@ -553,8 +730,82 @@ mod native {
 		std::fs::create_dir_all(&logs)
 			.map_err(|e| LinkedWorktreeError::io("creating logs dir", &logs, e))?;
 		let head_log = logs.join("HEAD");
-		std::fs::write(&head_log, log)
-			.map_err(|e| LinkedWorktreeError::io("writing logs/HEAD", head_log, e))
+		write_file_atomic(&head_log, log.as_bytes())
+	}
+
+	#[cfg(all(test, unix))]
+	mod resolved_tests {
+		use super::resolved_for_pointers;
+
+		#[test]
+		fn resolves_symlinked_parents_and_dotdot() {
+			// `alias/missing/../wt` through a symlinked parent resolves to `<real>/wt` — the `..` pops the
+			// *resolved* location and the symlink is followed, exactly as `create_dir_all` + `canonicalize` do.
+			let tmp = tempfile::tempdir().unwrap();
+			let real = tmp.path().join("real");
+			std::fs::create_dir_all(&real).unwrap();
+			let alias = tmp.path().join("alias");
+			std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+			let dest = alias.join("missing").join("..").join("wt");
+			assert_eq!(
+				resolved_for_pointers(&dest),
+				real.canonicalize().unwrap().join("wt")
+			);
+		}
+	}
+
+	#[cfg(test)]
+	mod sanitize_tests {
+		use super::sanitize_worktree_name;
+
+		fn san(s: &[u8]) -> String {
+			String::from_utf8(sanitize_worktree_name(s)).unwrap()
+		}
+
+		#[test]
+		fn replaces_refname_invalid_bytes_with_dash() {
+			// Control bytes, space, DEL, and `* : ? [ \ ^ ~` are refname-invalid → `-` (probed vs git 2.50.1).
+			assert_eq!(san(b"wt\nx"), "wt-x");
+			assert_eq!(san(b"wt\rx"), "wt-x");
+			assert_eq!(san(b"wt\tx"), "wt-x");
+			assert_eq!(san(b"a b"), "a-b");
+			assert_eq!(san(b"a\x7fb"), "a-b");
+			assert_eq!(san(b"a*b"), "a-b");
+			assert_eq!(san(b"a:b"), "a-b");
+			assert_eq!(san(b"a?b"), "a-b");
+			assert_eq!(san(b"a[b"), "a-b");
+			assert_eq!(san(b"a\\b"), "a-b");
+			assert_eq!(san(b"a^b"), "a-b");
+			assert_eq!(san(b"a~b"), "a-b");
+		}
+
+		#[test]
+		fn keeps_refname_legal_punctuation_and_high_bytes() {
+			// `! " # $ % & ' ( ) + , . ; < = > @ ] _ \` { | }` and letters/digits/high bytes pass through.
+			assert_eq!(san(b"ok_name-1.2"), "ok_name-1.2");
+			assert_eq!(san(b"a@b"), "a@b");
+			assert_eq!(san(b"a{b"), "a{b"); // a lone `{` is fine; only `@{` is forbidden
+			assert_eq!(san("wPéQ".as_bytes()), "wPéQ");
+		}
+
+		#[test]
+		fn applies_refname_component_rules() {
+			assert_eq!(san(b".foo"), "-foo"); // a component may not start with '.'
+			assert_eq!(san(b"a..b"), "a.b"); // no '..'
+			assert_eq!(san(b"a...b"), "a.b"); // a run collapses
+			assert_eq!(san(b"foo."), "foo."); // a *trailing* dot is left as-is (git does)
+			assert_eq!(san(b"x@{y"), "x@-y"); // break the '@{' sequence
+			assert_eq!(san(b"@"), "-"); // a bare '@' (HEAD shorthand) -> '-'
+			assert_eq!(san(b"@@"), "@@"); // ...but only a *bare* '@'
+			assert_eq!(san(b"a@b"), "a@b"); // '@' mid-name is fine
+			assert_eq!(san(b"@.lock"), "@"); // '.lock' strip may leave a bare '@' — git accepts that
+			assert_eq!(san(b"x.lock"), "x"); // no trailing '.lock'
+			assert_eq!(san(b"x.lock.lock"), "x"); // stripped repeatedly
+			assert_eq!(san(b"x.LOCK"), "x.LOCK"); // case-sensitive
+			assert_eq!(san(b"x.locked"), "x.locked"); // only a whole trailing '.lock'
+			assert_eq!(san(b"x.git"), "x.git"); // '.git' is fine
+		}
 	}
 }
 
