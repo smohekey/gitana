@@ -815,6 +815,173 @@ fn honors_locked_and_prunable_worktree_state() {
 	std::fs::remove_dir_all(&base).ok();
 }
 
+/// `list` orders linked worktrees by **checkout path** (git's order), not by admin-directory name. When
+/// the two orders differ — a worktree under `zdir/` with admin name `aaa`, another under `adir/` with
+/// admin name `zzz` — git lists `adir/zzz` before `zdir/aaa`; gta must match, byte-for-byte, in both
+/// forms.
+#[test]
+fn list_orders_linked_worktrees_by_checkout_path() {
+	let base = unique_tmp("gta-wt-order");
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(base_s, &["init", "--object-format=sha1", repo_s], b"");
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+
+	// admin name `aaa` at path `zdir/aaa`, admin name `zzz` at path `adir/zzz` — admin-name order is the
+	// reverse of path order.
+	std::fs::create_dir_all(base.join("zdir")).unwrap();
+	std::fs::create_dir_all(base.join("adir")).unwrap();
+	gta(
+		repo_s,
+		&["worktree", "add", base.join("zdir/aaa").to_str().unwrap()],
+		b"",
+	);
+	gta(
+		repo_s,
+		&["worktree", "add", base.join("adir/zzz").to_str().unwrap()],
+		b"",
+	);
+
+	assert_eq!(
+		gta(repo_s, &["worktree", "list", "--porcelain"], b""),
+		git(repo_s, &["worktree", "list", "--porcelain"]),
+	);
+	assert_eq!(
+		gta(repo_s, &["worktree", "list"], b""),
+		git(repo_s, &["worktree", "list"]),
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// A malformed `core.ignorecase` aborts `worktree list` even when a valid higher-precedence value
+/// shadows it — git validates every occurrence of a startup `core.*` boolean, and gta matches.
+#[test]
+fn list_aborts_on_a_shadowed_malformed_ignorecase() {
+	let base = unique_tmp("gta-wt-badbool");
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(base_s, &["init", "--object-format=sha1", repo_s], b"");
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	// Local (winning) value is valid; a lower-precedence global value is malformed.
+	git(repo_s, &["config", "core.ignorecase", "true"]);
+	let global = base.join("bad.gitconfig");
+	std::fs::write(&global, "[core]\n\tignorecase = bogus\n").unwrap();
+
+	let run = |bin: &str| {
+		if bin == "gta" {
+			assert_cmd::Command::cargo_bin("gta")
+				.unwrap()
+				.args(["-C", repo_s, "worktree", "list"])
+				.env("GIT_CONFIG_GLOBAL", &global)
+				.output()
+				.unwrap()
+				.status
+				.success()
+		} else {
+			Command::new("git")
+				.args(["-C", repo_s, "worktree", "list"])
+				.env("GIT_CONFIG_GLOBAL", &global)
+				.output()
+				.unwrap()
+				.status
+				.success()
+		}
+	};
+	assert!(!run("gta"), "gta must abort on the shadowed malformed bool");
+	assert!(!run("git"), "probe: git also aborts");
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// Under `extensions.worktreeConfig`, the invoking worktree's `config.worktree` override of
+/// `core.ignorecase` changes *its* `worktree list` sort order. With the shared config case-sensitive
+/// (`Zroot/zzz` before `aroot/aaa`) and the worktree overriding to case-insensitive (`aroot/aaa` first),
+/// gta must match git byte-for-byte.
+#[test]
+fn list_order_honors_worktree_config_ignorecase_override() {
+	let base = unique_tmp("gta-wt-wtcfg");
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(base_s, &["init", "--object-format=sha1", repo_s], b"");
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	// Shared config: case-sensitive, and enable per-worktree config.
+	git(repo_s, &["config", "core.ignorecase", "false"]);
+	git(repo_s, &["config", "extensions.worktreeConfig", "true"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+
+	std::fs::create_dir_all(base.join("Zroot")).unwrap();
+	std::fs::create_dir_all(base.join("aroot")).unwrap();
+	gta(
+		repo_s,
+		&["worktree", "add", base.join("Zroot/zzz").to_str().unwrap()],
+		b"",
+	);
+	gta(
+		repo_s,
+		&["worktree", "add", base.join("aroot/aaa").to_str().unwrap()],
+		b"",
+	);
+
+	// The invoking (main) worktree overrides `core.ignorecase` to true in its `config.worktree` (the main
+	// worktree's per-worktree config lives at `<common>/config.worktree`), so git (and gta) order
+	// case-insensitively: `aroot/aaa` before `Zroot/zzz`.
+	std::fs::write(
+		repo.join(".git/config.worktree"),
+		"[core]\n\tignorecase = true\n",
+	)
+	.unwrap();
+
+	assert_eq!(
+		gta(repo_s, &["worktree", "list", "--porcelain"], b""),
+		git(repo_s, &["worktree", "list", "--porcelain"]),
+	);
+	assert_eq!(
+		gta(repo_s, &["worktree", "list"], b""),
+		git(repo_s, &["worktree", "list"]),
+	);
+
+	// Command-scope config (`-c` / `GIT_CONFIG_*`) outranks `config.worktree`: overriding `core.ignorecase`
+	// back to false via the environment restores case-sensitive order — gta must match git, proving the
+	// per-worktree layer sits *below* the command-scope layer, not above it.
+	let env = [
+		("GIT_CONFIG_COUNT", "1"),
+		("GIT_CONFIG_KEY_0", "core.ignorecase"),
+		("GIT_CONFIG_VALUE_0", "false"),
+	];
+	let gta_out = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", repo_s, "worktree", "list", "--porcelain"])
+		.envs(env)
+		.output()
+		.unwrap();
+	let git_out = Command::new("git")
+		.args(["-C", repo_s, "worktree", "list", "--porcelain"])
+		.envs(env)
+		.output()
+		.unwrap();
+	assert_eq!(
+		gta_out.stdout, git_out.stdout,
+		"command-scope beats config.worktree"
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
 #[test]
 fn locks_and_unlocks_worktrees_sha256() {
 	if !git_supports_sha256() {

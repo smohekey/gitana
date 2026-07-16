@@ -145,6 +145,27 @@ impl GitConfig {
 		}
 	}
 
+	/// Interpret the effective (highest-precedence) value as a git boolean, **validating every occurrence**
+	/// across all sources — not just the winning one. git reads its `core.*` startup booleans (e.g.
+	/// `core.ignorecase`, `core.bare`) eagerly and aborts on *any* malformed value, even one a
+	/// higher-precedence source shadows; this reproduces that. Use it for a boolean git parses at startup;
+	/// the lazy [`get_bool`](Self::get_bool) (validating only the winning value) matches git's on-demand
+	/// reads of a config it only consults when needed.
+	pub fn get_bool_validated(
+		&self,
+		section: &str,
+		subsection: Option<&str>,
+		name: &str,
+	) -> Result<Option<bool>, ConfigError> {
+		// Every value in read order (lowest precedence first): validate each, so a malformed shadowed value
+		// still errors, and keep the last (highest-precedence) as the effective result.
+		let mut effective = None;
+		for raw in self.get_all_raw(section, subsection, name) {
+			effective = Some(crate::source::interpret_bool(raw)?);
+		}
+		Ok(effective)
+	}
+
 	/// Interpret the effective (highest-precedence) value as a git integer. `None` if unset anywhere.
 	pub fn get_int(
 		&self,
@@ -313,6 +334,45 @@ mod tests {
 		// big: local (2k) overrides system; k-suffix interpreted.
 		assert_eq!(config.get_int("core", None, "big").unwrap(), Some(2048));
 		assert_eq!(config.get_bool("core", None, "missing").unwrap(), None);
+	}
+
+	#[test]
+	fn get_bool_validated_checks_every_source_not_just_the_winner() {
+		// A malformed *shadowed* (lower-precedence) value still aborts — git validates every occurrence of a
+		// startup `core.*` bool — while the lazy `get_bool` accepts it (it only parses the winning source).
+		let shadowed = layered(
+			"[core]\n\tignorecase = bogus\n", // system: malformed
+			"",
+			"[core]\n\tignorecase = true\n", // local: valid, wins
+		);
+		assert_eq!(
+			shadowed.get_bool("core", None, "ignorecase").unwrap(),
+			Some(true)
+		);
+		assert!(
+			shadowed
+				.get_bool_validated("core", None, "ignorecase")
+				.is_err()
+		);
+
+		// Every value valid: returns the winner (highest-precedence).
+		let ok = layered(
+			"[core]\n\tignorecase = false\n",
+			"",
+			"[core]\n\tignorecase = true\n",
+		);
+		assert_eq!(
+			ok.get_bool_validated("core", None, "ignorecase").unwrap(),
+			Some(true)
+		);
+
+		// Unset anywhere: None.
+		assert_eq!(
+			layered("", "", "")
+				.get_bool_validated("core", None, "ignorecase")
+				.unwrap(),
+			None
+		);
 	}
 
 	#[test]

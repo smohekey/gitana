@@ -85,6 +85,35 @@ pub async fn effective_config_at(dir: &Path) -> Result<GitConfig> {
 	Ok(config)
 }
 
+/// The effective configuration for the **invoking worktree**: the merged stack ([`effective_config_at`])
+/// with that worktree's `config.worktree` layered in when `extensions.worktreeConfig` is enabled. git's
+/// precedence is `system < global < local < config.worktree < command-scope` — the per-worktree file sits
+/// **below** the `-c`/`GIT_CONFIG_*` layer, not above it — so a worktree-scoped key like `core.ignorecase`
+/// is overridable per worktree yet still yields to a command-line `-c`. Every layer is validated: a
+/// malformed `extensions.worktreeConfig`, or an unreadable/unparseable `config.worktree`, is an error (git
+/// aborts on a bad config file); only an *absent* `config.worktree` is skipped. `common` holds the shared
+/// config (where `extensions.worktreeConfig` lives); `git_dir` is the invoking worktree's git dir.
+///
+/// Two **gitana-config-wide** limitations apply here as they do to every config read (they are deferred
+/// follow-ups, not specific to this function): `[include]` / `includeIf` directives are **not expanded**
+/// (a value set only via an include is missed), and a leading UTF-8 **BOM** is rejected by the parser
+/// though git accepts it. Both are exotic for a worktree-list sort and are tracked as gitana-config work.
+pub async fn effective_config_for_worktree(common: &Path, git_dir: &Path) -> Result<GitConfig> {
+	let mut config = read_file(&common.join("config")).await?;
+	// `extensions.worktreeConfig` is a repository-format extension: git honours it **only** from the
+	// repository-local config, ignoring any global/system setting. So read it now, while `config` is still
+	// just the local file — before the ambient layers are underlaid. A bad boolean aborts, as git does.
+	let worktree_config = config
+		.get_bool("extensions", None, "worktreeconfig")?
+		.unwrap_or(false);
+	config.underlay(global_and_system_sources().await?);
+	if worktree_config {
+		config.overlay(read_sources(vec![git_dir.join("config.worktree")]).await?);
+	}
+	config.overlay(env_config_source()?);
+	Ok(config)
+}
+
 /// Read a single config file that must exist — for an explicit `--global`/`--system` `--list`, which
 /// git fatals ("unable to read config file") on when the named scope's file is absent. A *keyed*
 /// scoped read, by contrast, treats a missing file as empty (see [`read_file`]).

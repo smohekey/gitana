@@ -537,7 +537,7 @@ fn synth_section(section: &str, subsection: Option<&str>) -> Section {
 	}
 }
 
-fn interpret_bool(value: Option<&str>) -> Result<bool, ConfigError> {
+pub(crate) fn interpret_bool(value: Option<&str>) -> Result<bool, ConfigError> {
 	match value {
 		None => Ok(true),
 		Some(v) => match v.to_ascii_lowercase().as_str() {

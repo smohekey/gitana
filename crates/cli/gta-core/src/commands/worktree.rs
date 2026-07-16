@@ -514,9 +514,12 @@ fn report_add<H: HashAlgorithm>(label: &Label, commit: Option<ObjectId<H>>) {
 
 async fn list(cwd: &Path, porcelain: bool) -> Result<()> {
 	let found = repo::discover(cwd).await?;
+	// The path-sort order honours the *invoking* worktree's effective `core.ignorecase` (see
+	// [`sort_ignorecase`]) — resolved here where the discovered layout still carries that worktree's git dir.
+	let ignorecase = sort_ignorecase(&found).await?;
 	let entries = match detect_algorithm(&found.common_dir)? {
-		HashKind::Sha1 => collect::<Sha1>(&found.common_dir).await?,
-		HashKind::Sha256 => collect::<Sha256>(&found.common_dir).await?,
+		HashKind::Sha1 => collect::<Sha1>(&found.common_dir, ignorecase).await?,
+		HashKind::Sha256 => collect::<Sha256>(&found.common_dir, ignorecase).await?,
 	};
 	if porcelain {
 		print!("{}", render_porcelain(&entries));
@@ -524,6 +527,23 @@ async fn list(cwd: &Path, porcelain: bool) -> Result<()> {
 		print!("{}", render_default(&entries));
 	}
 	Ok(())
+}
+
+/// The `core.ignorecase` that governs git's `worktree list` ordering, resolved for the **invoking**
+/// worktree through git's full precedence stack (`system < global < local < config.worktree <
+/// command-scope`, the per-worktree layer folded in when `extensions.worktreeConfig` is enabled — see
+/// [`crate::git_config::effective_config_for_worktree`]). Every layer is validated: a malformed
+/// `core.ignorecase` (or `extensions.worktreeConfig`, or `config.worktree`) aborts, as git does.
+async fn sort_ignorecase(found: &RepositoryLayout) -> Result<bool> {
+	let config =
+		crate::git_config::effective_config_for_worktree(&found.common_dir, &found.git_dir).await?;
+	// `core.ignorecase` is a startup `core.*` boolean, so git validates every occurrence and aborts on any
+	// malformed value — even one shadowed by a higher-precedence source. `get_bool_validated` mirrors that.
+	Ok(
+		config
+			.get_bool_validated("core", None, "ignorecase")?
+			.unwrap_or(false),
+	)
 }
 
 /// One row of `worktree list`: the checkout's path, its state, and its lock/prune attributes.
@@ -548,7 +568,7 @@ enum State {
 
 /// Gather the worktrees: the main worktree first (the bare repository itself when bare), then each
 /// linked worktree under `<common>/worktrees/*`, sorted by admin-directory name (git's order).
-async fn collect<H: HashAlgorithm>(common: &Path) -> Result<Vec<WorktreeInfo>> {
+async fn collect<H: HashAlgorithm>(common: &Path, ignorecase: bool) -> Result<Vec<WorktreeInfo>> {
 	let repo = repo::open_generic::<H>(common, common).await?;
 	let mut out = Vec::new();
 
@@ -572,13 +592,27 @@ async fn collect<H: HashAlgorithm>(common: &Path) -> Result<Vec<WorktreeInfo>> {
 		Err(_) => Vec::new(),
 	};
 	names.sort();
+	let mut linked = Vec::new();
 	for name in names {
 		let admin = common.join("worktrees").join(&name);
 		let work = repo::worktree_path_of(&admin);
 		if let Some(info) = info_for::<H>(&repo, &admin, &work).await? {
-			out.push(info);
+			linked.push(info);
 		}
 	}
+	// git orders linked worktrees by checkout *path* (not admin-directory name), comparing
+	// case-insensitively when the invoking worktree's `core.ignorecase` is set — typical on macOS/Windows.
+	// Sort the resolved rows that way so the listing matches git even when the admin-name order differs from
+	// the path order.
+	linked.sort_by(|a, b| {
+		let (pa, pb) = (a.path.to_string_lossy(), b.path.to_string_lossy());
+		if ignorecase {
+			pa.to_ascii_lowercase().cmp(&pb.to_ascii_lowercase())
+		} else {
+			pa.cmp(&pb)
+		}
+	});
+	out.extend(linked);
 	Ok(out)
 }
 

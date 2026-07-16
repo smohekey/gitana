@@ -157,9 +157,36 @@ pub(crate) fn admin_owned_by(common: &Path, admin: &Path) -> Result<bool, Linked
 	Ok(under_worktrees(common, admin) && admin_commondir_is(common, admin)?)
 }
 
+/// git's **prunable** test for a linked worktree (`should_prune_worktree`): the checkout `.git` file that
+/// `<admin>/gitdir` names no longer exists. git decides prunability from that pointer *target*'s existence
+/// alone — tested with `lstat`, so a **dangling-symlink** `.git` still counts as present — and it never
+/// reads or validates the checkout `.git`'s *contents*. So a checkout whose `.git` is foreign, broken, a
+/// directory, or a symlink is a *live* listing (not prunable) as long as *something* sits at that path;
+/// only a genuinely missing target is prunable. This is deliberately **weaker** than the identity check
+/// [`checkout_gitfile_names`] (which inspection/removal use): listing tolerates a hijacked `.git`, but a
+/// destructive operation must not. An empty `gitdir` pointer is git's "invalid gitdir file" → prunable.
+pub(crate) fn admin_checkout_missing(admin: &Path) -> Result<bool, LinkedWorktreeError> {
+	let gitdir = admin.join("gitdir");
+	let text = std::fs::read_to_string(&gitdir)
+		.map_err(|e| LinkedWorktreeError::io("reading admin gitdir", &gitdir, e))?;
+	let pointer = Path::new(strip_eol(&text));
+	if pointer.as_os_str().is_empty() {
+		return Ok(true);
+	}
+	let git_file = if pointer.is_absolute() {
+		pointer.to_path_buf()
+	} else {
+		admin.join(pointer)
+	};
+	// `lstat` (not `stat`): a `.git` that is a *dangling* symlink still exists to git, so is not prunable.
+	Ok(std::fs::symlink_metadata(&git_file).is_err())
+}
+
 /// Whether `checkout` is a valid linked-worktree checkout for `admin`: its `.git` is a **regular file**
-/// (a gitfile — a symlink is never followed) that names `admin`. This is the identity git uses to tell a
-/// live checkout from a directory that merely exists at the recorded path (git's "prunable" check). A
+/// (a gitfile — a symlink is never followed) that names `admin`. This is the strict *identity* check
+/// inspection and removal use to tell a live checkout of *this* admin from a directory that merely exists
+/// at the recorded path — **not** git's prunable/listing test, which is the weaker
+/// [`admin_checkout_missing`] above (git's `worktree list` never reads the checkout `.git`'s contents). A
 /// `.git` regular file that is malformed is a hard error (see [`gitfile_target`]).
 pub(crate) fn checkout_gitfile_names(
 	checkout: &Path,

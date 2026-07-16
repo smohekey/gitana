@@ -450,6 +450,87 @@ async fn identity_discovered_in_a_linked_worktree_survives_its_prune() {
 }
 
 #[tokio::test]
+async fn checkout_missing_is_gits_prunable_not_the_checkout_identity() {
+	// git's `worktree list` marks a worktree `prunable` only when the `<admin>/gitdir` pointer target no
+	// longer exists — it never reads the checkout `.git`'s *contents*. So a checkout whose `.git` is present
+	// but *foreign* (names a different admin) is still a live listing, while a checkout whose directory is
+	// gone is prunable. `checkout_missing` mirrors git, not the stricter identity check remove/inspect use.
+	for (fmt, _kind) in formats() {
+		// The tag must not contain the substring "prunable" — it ends up in every worktree path, which the
+		// marker cross-check below would otherwise match by accident.
+		let base = unique_tmp(&format!("enum-stale-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+
+		let foreign = base.join("wtforeign");
+		let gone = base.join("wtgone");
+		git(&[
+			"-C",
+			w,
+			"worktree",
+			"add",
+			"-b",
+			"f",
+			foreign.to_str().unwrap(),
+		]);
+		git(&[
+			"-C",
+			w,
+			"worktree",
+			"add",
+			"-b",
+			"g",
+			gone.to_str().unwrap(),
+		]);
+		// Hijack the foreign checkout's `.git` (present, but names a different admin) and delete the other.
+		std::fs::write(foreign.join(".git"), "gitdir: /nonexistent/admin\n").unwrap();
+		std::fs::remove_dir_all(&gone).unwrap();
+
+		let listing = enumerate(&rid_at(&work)).await.unwrap();
+		let missing = |branch: &str| {
+			listing
+				.entries
+				.iter()
+				.find(|e| e.branch.as_deref() == Some(branch))
+				.unwrap_or_else(|| panic!("{fmt}: {branch} not enumerated"))
+				.checkout_missing
+		};
+		assert!(
+			!missing("refs/heads/f"),
+			"{fmt}: a present-but-foreign .git is a live listing, not prunable"
+		);
+		assert!(
+			missing("refs/heads/g"),
+			"{fmt}: a deleted checkout is prunable"
+		);
+
+		// Cross-check the split against stock git's own `prunable` marker (matched as a whole porcelain
+		// line, so a path containing the word "prunable" can't false-positive).
+		let porcelain = git(&["-C", w, "worktree", "list", "--porcelain"]);
+		let block_is_prunable = |name: &str| {
+			porcelain
+				.split("\n\n")
+				.find(|b| b.lines().any(|l| l == format!("branch refs/heads/{name}")))
+				.unwrap_or("")
+				.lines()
+				.any(|l| l.starts_with("prunable "))
+		};
+		assert!(
+			!block_is_prunable("f"),
+			"{fmt}: git keeps the foreign checkout listed"
+		);
+		assert!(
+			block_is_prunable("g"),
+			"{fmt}: git marks the gone checkout prunable"
+		);
+
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
 async fn stray_gitdir_and_locked_in_the_main_git_do_not_affect_the_primary() {
 	// The primary git dir is not a linked admin: git ignores a stray `gitdir`/`locked` there. Enumeration
 	// must derive the primary path directly (not from the stray `gitdir`) and keep it unlocked.

@@ -61,7 +61,7 @@ mod native {
 	use crate::head::{read_head, read_lock_reason};
 	use crate::object_id::IntoWorktreeObjectId;
 	use crate::pointers::{
-		SYMREF_MAXDEPTH, canonical, checkout_gitfile_names, ignorecase, is_bare, linked_admin_dirs,
+		SYMREF_MAXDEPTH, admin_checkout_missing, canonical, ignorecase, is_bare, linked_admin_dirs,
 		main_worktree_path, resolve_ref_terminal, worktree_path_of,
 	};
 	use crate::repo_id::{detect_kind, open_store_raw};
@@ -118,8 +118,9 @@ mod native {
 		}
 
 		// Then each linked worktree under `<common>/worktrees/*` (a scan failure is an error).
-		// `checkout_missing` is judged by the checkout's `.git` gitfile identity — git's prunable check —
-		// not merely by the recorded path existing.
+		// `checkout_missing` is git's own prunable test (`admin_checkout_missing`): the `<admin>/gitdir`
+		// pointer target no longer exists. git lists (never prunes) a checkout whose `.git` is merely
+		// foreign/broken, so this must *not* use the stricter identity check inspection/removal rely on.
 		let mut linked = Vec::new();
 		for admin in linked_admin_dirs(common)? {
 			let path = canonical(&worktree_path_of(&admin)?);
@@ -128,7 +129,7 @@ mod native {
 				role: WorktreeRole::Linked {
 					admin_dir: admin.clone(),
 				},
-				checkout_missing: !checkout_gitfile_names(&path, &admin)?,
+				checkout_missing: admin_checkout_missing(&admin)?,
 				path,
 				head,
 				branch,
