@@ -49,6 +49,7 @@ async fn rm_rejects_unsafe_index_path() {
 		oid: blob,
 		stage: 0,
 		assume_valid: false,
+		skip_worktree: false,
 		path: format!("../{name}"),
 	});
 	wt.save_index(&index).await.unwrap();

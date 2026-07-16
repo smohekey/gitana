@@ -21,6 +21,7 @@ fn query_no_branch(
 		destination: dest.to_path_buf(),
 		expected_branch: None,
 		start: None,
+		with_status: false,
 	}
 }
 
@@ -36,6 +37,7 @@ fn query(
 		destination: dest.to_path_buf(),
 		expected_branch: Some(BranchName::new(branch)),
 		start: None,
+		with_status: false,
 	}
 }
 
@@ -52,6 +54,7 @@ fn query_with_start(
 		destination: dest.to_path_buf(),
 		expected_branch: Some(BranchName::new(branch)),
 		start: Some(start),
+		with_status: false,
 	}
 }
 
@@ -1890,6 +1893,7 @@ async fn a_relative_destination_is_rejected() {
 			destination: std::path::PathBuf::from("relative/wt"),
 			expected_branch: None,
 			start: None,
+			with_status: false,
 		};
 		assert!(
 			inspect(&q).await.is_err(),

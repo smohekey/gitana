@@ -142,6 +142,25 @@ pub fn encode_ewah(bitmap: &EwahBitmap) -> Vec<u8> {
 	out
 }
 
+/// Like [`decode_ewah`], but reject a header `bit_size` exceeding `max_bits` **before** allocating. The
+/// `bit_size` is caller-supplied data, and a single clean-run RLW can inflate a few input bytes into a
+/// `bit_size / 64`-word buffer (and a [`EwahBitmap::set_bits`] iteration proportional to `bit_size`) — up to
+/// ~512 MiB / billions of positions for a `u32::MAX` size. A caller that knows a real upper bound on the
+/// bitmap's logical size passes it here so a crafted header cannot force an outsized decode. For example, a
+/// split index's delete/replace bitmaps address positions in the *shared* index, so they cannot exceed its
+/// entry count.
+pub fn decode_ewah_bounded(
+	bytes: &[u8],
+	max_bits: u64,
+) -> Result<(EwahBitmap, usize), ObjectError> {
+	let head = bytes.get(0..8).ok_or(ObjectError::MalformedEwah)?;
+	let bit_size = u32::from_be_bytes(head[0..4].try_into().unwrap());
+	if bit_size as u64 > max_bits {
+		return Err(ObjectError::MalformedEwah);
+	}
+	decode_ewah(bytes)
+}
+
 /// Parse one EWAH stream from the front of `bytes`, returning the bitmap and how many bytes it
 /// consumed (so a caller can walk the several streams a `.bitmap` file concatenates). Fails with
 /// [`ObjectError::MalformedEwah`] on a truncated stream, an RLW that overruns the buffer, or a bit
@@ -367,5 +386,28 @@ mod tests {
 			decode_ewah(&bytes),
 			Err(ObjectError::MalformedEwah)
 		));
+	}
+
+	#[test]
+	fn decode_bounded_rejects_an_oversized_bit_size_before_allocating() {
+		// A tiny payload claiming a `u32::MAX` bit_size (a clean-zero run) would otherwise force a
+		// ~512 MiB decode; a caller-supplied bound smaller than the header's bit_size rejects it up front.
+		let mut bytes = Vec::new();
+		bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+		bytes.extend_from_slice(&1u32.to_be_bytes());
+		bytes.extend_from_slice(&(u64::MAX << 1).to_be_bytes()); // huge clean-zero run
+		bytes.extend_from_slice(&0u32.to_be_bytes());
+		assert!(matches!(
+			decode_ewah_bounded(&bytes, 1024),
+			Err(ObjectError::MalformedEwah)
+		));
+		// A well-formed bitmap within the bound still decodes: bit_size 64, one clean-zero word.
+		let mut ok = Vec::new();
+		ok.extend_from_slice(&64u32.to_be_bytes());
+		ok.extend_from_slice(&1u32.to_be_bytes());
+		ok.extend_from_slice(&(1u64 << 1).to_be_bytes()); // clean-zero run of one word
+		ok.extend_from_slice(&0u32.to_be_bytes());
+		let (bitmap, _) = decode_ewah_bounded(&ok, 1024).expect("within bound decodes");
+		assert_eq!(bitmap.set_bits().count(), 0);
 	}
 }

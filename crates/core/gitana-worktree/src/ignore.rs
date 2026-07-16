@@ -93,7 +93,13 @@ fn strip_dir<'a>(path: &'a str, dir: &str) -> Option<&'a str> {
 fn glob_match(pat: &[u8], text: &[u8]) -> bool {
 	match pat.first() {
 		None => text.is_empty(),
-		Some(b'*') if pat.get(1) == Some(&b'*') => {
+		// A `**` is the special path-spanning glob only as a whole path component — `**` at the end of the
+		// pattern (a trailing `/**`, matching everything under a prefix) or immediately followed by `/`
+		// (a leading `**/` or an internal `/**/`, spanning zero or more directories). git treats any *other*
+		// consecutive asterisks (e.g. `a/**b`) as regular single-`*` globs that do not cross a `/`; matching
+		// git here keeps an untracked file from being mis-reported as ignored. So the recursive arm requires
+		// the next byte to be absent or `/`; otherwise the first `*` falls through to the single-`*` arm below.
+		Some(b'*') if pat.get(1) == Some(&b'*') && matches!(pat.get(2), None | Some(&b'/')) => {
 			let after = match pat.get(2) {
 				Some(&b'/') => &pat[3..],
 				_ => &pat[2..],
@@ -180,6 +186,12 @@ mod tests {
 		assert!(glob_match(b"build/**", b"build/x/y"));
 		assert!(glob_match(b"a/**/b", b"a/x/y/b"));
 		assert!(glob_match(b"a/**/b", b"a/b"));
+		// `**` spans directories only as a whole path component. `a/**b` is *not* such a component, so git
+		// treats it as regular asterisks that do not cross '/': it matches `a/xb` but not `a/a/b` (verified
+		// against stock git, which reports `a/a/b` untracked). A mis-recursive match here would let removal
+		// delete an untracked file it believed ignored.
+		assert!(glob_match(b"a/**b", b"a/xb"));
+		assert!(!glob_match(b"a/**b", b"a/a/b"));
 		assert!(glob_match(b"file?", b"file1"));
 		assert!(glob_match(b"[abc].txt", b"b.txt"));
 		assert!(glob_match(b"[!abc].txt", b"d.txt"));

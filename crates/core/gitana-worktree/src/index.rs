@@ -1,7 +1,104 @@
-use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_object::{HashAlgorithm, ObjectId, decode_ewah_bounded};
 use gitana_repository::{FileMode, TreeBuildEntry};
 
 use crate::{IndexEntry, Stat, WorktreeError};
+
+/// The split-index `link` extension: the shared index id, plus the **raw** EWAH delete/replace bitmap bytes
+/// (delete then replace, concatenated) that transform the shared (base) index into the effective one. Used
+/// only by `load_index` (which can load the shared file), via [`merge_split_index`].
+///
+/// The bitmaps are kept **undecoded** here on purpose: their header `bit_size` is attacker-controlled and a
+/// tiny payload can inflate into a ~512 MiB decode, so they are decoded only in [`merge_split_index`], where
+/// the shared index's entry count gives a real bound to reject a crafted header (see `decode_ewah_bounded`).
+pub(crate) struct SplitIndexLink<H: HashAlgorithm> {
+	/// The shared index id — `<git-dir>/sharedindex.<hex>`. All-zero means "no shared index" (a base itself).
+	pub shared_oid: ObjectId<H>,
+	/// The delete bitmap followed by the replace bitmap, still EWAH-encoded (decoded, bounded, at merge time).
+	pub bitmaps_raw: Vec<u8>,
+}
+
+/// Whether `oid` is the all-zero id (the split-index sentinel for "no shared index file").
+pub(crate) fn is_null_oid<H: HashAlgorithm>(oid: &ObjectId<H>) -> bool {
+	oid.as_bytes().iter().all(|&b| b == 0)
+}
+
+/// Parse a split-index `link` extension payload: the shared index id followed by the delete then replace
+/// EWAH bitmaps. The bitmaps are retained **raw** (not decoded) — decoding is deferred to
+/// [`merge_split_index`], which knows the shared index's entry count and so can reject a crafted `bit_size`
+/// before allocating (see [`SplitIndexLink`]).
+fn parse_link_extension<H: HashAlgorithm>(
+	payload: &[u8],
+) -> Result<SplitIndexLink<H>, WorktreeError> {
+	let oid_len = H::RAW_LEN;
+	let raw = payload
+		.get(..oid_len)
+		.ok_or_else(|| WorktreeError::Malformed("link extension: short oid".to_owned()))?;
+	let shared_oid =
+		ObjectId::<H>::from_bytes(raw).map_err(|_| WorktreeError::Malformed("link oid".to_owned()))?;
+	Ok(SplitIndexLink {
+		shared_oid,
+		bitmaps_raw: payload[oid_len..].to_vec(),
+	})
+}
+
+/// Merge a shared (`base`) index and a split index using the `link` bitmaps, producing the effective index
+/// (git's split-index model). The split index's **first `popcount(replace)` entries** replace the shared
+/// entries at the replace bitmap's set positions (a replacement with an empty name keeps the shared name);
+/// the shared entries at the delete bitmap's set positions are removed; and the split index's remaining
+/// entries are additions. The result is re-sorted by `(path, stage)`.
+pub(crate) fn merge_split_index<H: HashAlgorithm>(
+	base: Index<H>,
+	split: Index<H>,
+	link: &SplitIndexLink<H>,
+) -> Result<Index<H>, WorktreeError> {
+	let mut base_entries = base.entries;
+	// Decode the delete/replace bitmaps now, bounded by the shared index's entry count: a valid position
+	// addresses an entry in `base`, so `bit_size` (highest set bit + 1) cannot exceed `base_entries.len()`.
+	// This rejects a crafted `link` extension whose tiny payload claims a `u32`-scale `bit_size` before it can
+	// force a ~512 MiB decode or a billions-of-positions `set_bits` walk.
+	let max_bits = base_entries.len() as u64;
+	let (delete_bits, consumed) = decode_ewah_bounded(&link.bitmaps_raw, max_bits)
+		.map_err(|_| WorktreeError::Malformed("link delete bitmap".to_owned()))?;
+	let (replace_bits, _) = decode_ewah_bounded(&link.bitmaps_raw[consumed..], max_bits)
+		.map_err(|_| WorktreeError::Malformed("link replace bitmap".to_owned()))?;
+	let replace_positions: Vec<u32> = replace_bits.set_bits().collect();
+	if split.entries.len() < replace_positions.len() {
+		return Err(WorktreeError::Malformed(
+			"split index: fewer entries than replacements".to_owned(),
+		));
+	}
+	// Replacements: the k-th replace bit (ascending) is filled by the k-th split entry.
+	for (k, &pos) in replace_positions.iter().enumerate() {
+		let base_entry = base_entries
+			.get(pos as usize)
+			.ok_or_else(|| WorktreeError::Malformed("split index: replace out of range".to_owned()))?;
+		let name = if split.entries[k].path.is_empty() {
+			base_entry.path.clone()
+		} else {
+			split.entries[k].path.clone()
+		};
+		base_entries[pos as usize] = IndexEntry {
+			path: name,
+			..split.entries[k].clone()
+		};
+	}
+	// Deletions: mark shared positions for removal (positions are unchanged by in-place replacement).
+	let mut deleted = vec![false; base_entries.len()];
+	for pos in delete_bits.set_bits() {
+		*deleted
+			.get_mut(pos as usize)
+			.ok_or_else(|| WorktreeError::Malformed("split index: delete out of range".to_owned()))? = true;
+	}
+	let mut entries: Vec<IndexEntry<H>> = base_entries
+		.into_iter()
+		.zip(deleted)
+		.filter_map(|(entry, dead)| (!dead).then_some(entry))
+		.collect();
+	// Additions: the split index's entries after the replacements.
+	entries.extend(split.entries.into_iter().skip(replace_positions.len()));
+	entries.sort_by(|a, b| key(a).cmp(&key(b)));
+	Ok(Index { entries })
+}
 
 const SIGNATURE: &[u8; 4] = b"DIRC";
 
@@ -101,6 +198,7 @@ impl<H: HashAlgorithm> Index<H> {
 					oid,
 					stage,
 					assume_valid: false,
+					skip_worktree: false,
 					path: path.to_owned(),
 				});
 			}
@@ -195,6 +293,15 @@ impl<H: HashAlgorithm> Index<H> {
 
 	/// Parse index bytes (DIRC v2–v4), verifying the trailing checksum.
 	pub fn parse(bytes: &[u8]) -> Result<Self, WorktreeError> {
+		Ok(Self::parse_with_link(bytes)?.0)
+	}
+
+	/// Parse index bytes, additionally returning the **split-index** `link` extension when present (its shared
+	/// index id and the delete/replace EWAH bitmaps). A caller with filesystem access (`load_index`) uses it to
+	/// load and merge the shared index; a plain `parse` ignores it.
+	pub(crate) fn parse_with_link(
+		bytes: &[u8],
+	) -> Result<(Self, Option<SplitIndexLink<H>>), WorktreeError> {
 		let checksum_len = H::RAW_LEN;
 		if bytes.len() < 12 + checksum_len || &bytes[0..4] != SIGNATURE {
 			return Err(WorktreeError::Malformed("bad signature".to_owned()));
@@ -239,11 +346,14 @@ impl<H: HashAlgorithm> Index<H> {
 			let flags = read_u16(bytes, &mut cursor)?;
 			let assume_valid = flags & 0x8000 != 0;
 			let stage = ((flags >> 12) & 0x3) as u8;
+			let mut skip_worktree = false;
 			if flags & 0x4000 != 0 {
 				if version < 3 {
 					return Err(WorktreeError::Malformed("extended flag in v2".to_owned()));
 				}
-				read_u16(bytes, &mut cursor)?; // extended flags (skip-worktree, intent-to-add)
+				// Extended flags (v3+): bit 0x4000 = skip-worktree (sparse), 0x2000 = intent-to-add.
+				let extended = read_u16(bytes, &mut cursor)?;
+				skip_worktree = extended & 0x4000 != 0;
 			}
 
 			let path_bytes = if version == 4 {
@@ -274,11 +384,33 @@ impl<H: HashAlgorithm> Index<H> {
 				oid,
 				stage,
 				assume_valid,
+				skip_worktree,
 				path,
 			});
 		}
 
-		Ok(Index { entries })
+		// Extensions follow the entries, up to the trailing checksum: each is a 4-byte signature, a 4-byte
+		// big-endian length, then the payload. We only interpret the split-index `link` extension; all others
+		// (cache-tree, resolve-undo, untracked-cache, fsmonitor, …) are skipped — they are hints git can
+		// recompute, so ignoring them yields a correct (if uncached) index.
+		let mut link = None;
+		while cursor + 8 <= body_end {
+			let sig: [u8; 4] = bytes[cursor..cursor + 4].try_into().unwrap();
+			let size = u32::from_be_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+			let payload_start = cursor + 8;
+			let payload_end = payload_start
+				.checked_add(size)
+				.filter(|&e| e <= body_end)
+				.ok_or_else(|| WorktreeError::Malformed("index extension size".to_owned()))?;
+			if &sig == b"link" {
+				link = Some(parse_link_extension::<H>(
+					&bytes[payload_start..payload_end],
+				)?);
+			}
+			cursor = payload_end;
+		}
+
+		Ok((Index { entries }, link))
 	}
 
 	/// Serialise to index version 4 (prefix-compressed paths) with an `H` trailer.
@@ -314,7 +446,15 @@ impl<H: HashAlgorithm> Index<H> {
 			if entry.assume_valid {
 				flags |= 0x8000;
 			}
+			// A skip-worktree entry needs the extended-flag bit set and a following extended-flags word, so the
+			// sparse marker round-trips (git would otherwise re-check the omitted path against the working tree).
+			if entry.skip_worktree {
+				flags |= 0x4000;
+			}
 			out.extend_from_slice(&flags.to_be_bytes());
+			if entry.skip_worktree {
+				out.extend_from_slice(&0x4000u16.to_be_bytes()); // extended flags: skip-worktree
+			}
 
 			let path = entry.path.as_bytes();
 			let common = common_prefix(prev, path);
@@ -422,6 +562,7 @@ mod tests {
 			oid: ObjectId::<Sha256>::compute(ObjectKind::Blob, content),
 			stage: 0,
 			assume_valid: false,
+			skip_worktree: false,
 			path: path.to_owned(),
 		}
 	}

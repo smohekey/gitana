@@ -99,6 +99,28 @@ mod native {
 				},
 			}));
 		}
+		// A **recoverable mid-checkout partial** (an owned registration whose checkout is gone **and the
+		// destination is absent or empty**, with no more-specific refusal): refuse as `PartialRegistered` — a
+		// prune-and-retry state — rather than letting an empty/absent partial read as a `DestinationConflict`.
+		// Mirrors `classify`'s recoverable read (same precedence: empty/absent destination, no identity
+		// conflict, and the requested branch not force-checked-out elsewhere — a branch-use conflict out-ranks
+		// it). A *non-empty* directory at the path is not verifiably this create's own content, so it falls
+		// through to the destination-content refusal below. Write-path side of the "recoverable mid-checkout".
+		if inspection.identity_conflict.is_none()
+			&& matches!(
+				inspection.destination_kind,
+				DestinationKind::Absent | DestinationKind::EmptyDir
+			) && let Registration::PresentCheckoutMissing { admin_dir } = &inspection.registration
+		{
+			if let Some(other) = requested_checked_out_elsewhere(&inspection.requested_branch) {
+				return Err(CreateError::Refused(C::BranchUseConflict {
+					other_checkout: other.to_path_buf(),
+				}));
+			}
+			return Err(CreateError::Refused(C::PartialRegistered {
+				admin_dir: admin_dir.clone(),
+			}));
+		}
 		if matches!(
 			inspection.destination_kind,
 			DestinationKind::OtherFsObject | DestinationKind::UnrelatedContent
@@ -137,13 +159,6 @@ mod native {
 			};
 		}
 
-		// A retained registration whose checkout is gone (git's prunable) — the caller prunes and retries;
-		// a create never silently repairs it.
-		if let Registration::PresentCheckoutMissing { admin_dir } = &inspection.registration {
-			return Err(CreateError::Refused(C::PartialRegistered {
-				admin_dir: admin_dir.clone(),
-			}));
-		}
 		// A checkout present but not registered (or an inconsistent one) is a partial-conflicting state.
 		if inspection.destination_kind == DestinationKind::LinkedWorktreeCheckout {
 			return Err(CreateError::Refused(C::PartialConflicting {
@@ -236,6 +251,9 @@ mod native {
 			destination: request.destination.clone(),
 			expected_branch,
 			start,
+			// Create decides from registration/destination/branch facts; a worktree's cleanliness never gates a
+			// create (it either reconciles an exact match or refuses a conflict), so skip the status scan.
+			with_status: false,
 		}
 	}
 

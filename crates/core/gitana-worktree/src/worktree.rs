@@ -110,10 +110,43 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 
 	/// Read and parse the index (`index`), or an empty index if it does not exist.
 	pub async fn load_index(&self) -> Result<Index<H>, WorktreeError> {
-		match self.files().read_path("index").await {
-			Ok(bytes) => Ok(Index::parse(&bytes)?),
-			Err(FileStoreError::NotFound) => Ok(Index::new()),
-			Err(error) => Err(error.into()),
+		let bytes = match self.files().read_path("index").await {
+			Ok(bytes) => bytes,
+			Err(FileStoreError::NotFound) => return Ok(Index::new()),
+			Err(error) => return Err(error.into()),
+		};
+		let (index, link) = Index::parse_with_link(&bytes)?;
+		match link {
+			// A split index: load the referenced shared (base) index and merge it in, so status/read see the
+			// effective index git would (an absent shared file is corruption, not an empty index).
+			Some(link) if !crate::index::is_null_oid(&link.shared_oid) => {
+				let shared = format!("sharedindex.{}", link.shared_oid.to_hex());
+				let shared_bytes = self
+					.files()
+					.read_path(&shared)
+					.await
+					.map_err(|error| match error {
+						FileStoreError::NotFound => {
+							WorktreeError::Malformed(format!("missing shared index {shared}"))
+						}
+						other => other.into(),
+					})?;
+				// Integrity: the shared index's trailing checksum must equal the link oid (git names the file by,
+				// and verifies, that checksum). `Index::parse` only validates the file against its *own* trailer,
+				// so without this a substituted/stale `sharedindex.*` could supply a different staging state and
+				// make a modified checkout look clean. The file's own trailer is its verified content hash.
+				let trailer = shared_bytes
+					.get(shared_bytes.len().saturating_sub(H::RAW_LEN)..)
+					.unwrap_or(&[]);
+				if trailer != link.shared_oid.as_bytes() {
+					return Err(WorktreeError::Malformed(format!(
+						"shared index {shared} checksum does not match link oid"
+					)));
+				}
+				let base = Index::parse(&shared_bytes)?;
+				crate::index::merge_split_index(base, index, &link)
+			}
+			_ => Ok(index),
 		}
 	}
 
@@ -276,6 +309,34 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		crate::status::compute(self).await
 	}
 
+	/// Stage-0 tracked paths present on disk whose content or mode diverges from the index, verified by
+	/// **always hashing** the working file rather than trusting the index stat cache. A removal-safety
+	/// re-verification that catches edits `status()` can miss (a stat-preserving/same-size rewrite, a
+	/// coarse-timestamp filesystem) and skip-worktree edits `status()` omits entirely. See
+	/// [`crate::status::diverged_tracked_content`].
+	pub async fn diverged_tracked_content_paths(&self) -> Result<Vec<String>, WorktreeError> {
+		crate::status::diverged_tracked_content(self).await
+	}
+
+	/// Whether the index carries any staged (index-vs-`HEAD`) or unmerged change, computed **without touching
+	/// the working tree** — valid even when the checkout is gone. Safe removal of a checkout-missing partial
+	/// uses this to refuse dropping an admin whose index holds staged/conflicted work. See
+	/// [`crate::status::has_staged_changes`].
+	pub async fn has_staged_changes(&self) -> Result<bool, WorktreeError> {
+		crate::status::has_staged_changes(self).await
+	}
+
+	/// Whether the index is a **sparse index** (`git sparse-checkout --cone --sparse-index`): it carries a
+	/// *sparse-directory entry* — a `040000` (tree) mode entry that stands in for a whole collapsed out-of-cone
+	/// directory instead of its individual blobs. gitana does not expand these, so `status()` would compare the
+	/// collapsed directory against the expanded HEAD tree and report spurious add/delete pairs. Callers that
+	/// must reason about the working tree (e.g. safe removal) use this to refuse honestly rather than trust that
+	/// bogus status. A normal index never contains a `040000` entry, so this is a reliable discriminator.
+	pub async fn is_sparse_index(&self) -> Result<bool, WorktreeError> {
+		let index = self.load_index().await?;
+		Ok(index.entries.iter().any(|e| e.mode & 0o170000 == 0o040000))
+	}
+
 	/// Content changes between the index and the working tree (`git diff`).
 	pub async fn diff_unstaged(&self) -> Result<Vec<crate::FileDiff>, WorktreeError> {
 		crate::diff::unstaged(self).await
@@ -383,6 +444,7 @@ fn entry<H: HashAlgorithm>(path: &str, mode: u32, oid: ObjectId<H>, meta: &Meta)
 		oid,
 		stage: 0,
 		assume_valid: false,
+		skip_worktree: false,
 		path: path.to_owned(),
 	}
 }

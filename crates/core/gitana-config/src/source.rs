@@ -172,8 +172,10 @@ impl GitConfigSource {
 			.collect()
 	}
 
-	/// Interpret the last value as a git boolean (`true/yes/on/1`, `false/no/off/0/""`,
-	/// or a bare name as true). `None` if the variable is unset.
+	/// Interpret the last value as a git boolean: `true/yes/on` (or a bare name) → true; `false/no/off/""` →
+	/// false; otherwise git's numeric grammar — any base-0 integer (`0x` hex, leading-`0` octal, else decimal,
+	/// with an optional `k`/`m`/`g` multiplier and sign), non-zero → true, zero → false. `None` if unset; an
+	/// error for a non-boolean, non-numeric value.
 	pub fn get_bool(
 		&self,
 		section: &str,
@@ -539,27 +541,63 @@ fn interpret_bool(value: Option<&str>) -> Result<bool, ConfigError> {
 	match value {
 		None => Ok(true),
 		Some(v) => match v.to_ascii_lowercase().as_str() {
-			"true" | "yes" | "on" | "1" => Ok(true),
-			"false" | "no" | "off" | "0" | "" => Ok(false),
-			_ => Err(ConfigError::NotBool(v.to_owned())),
+			"true" | "yes" | "on" => Ok(true),
+			"false" | "no" | "off" | "" => Ok(false),
+			// git's numeric booleans: any integer (with an optional `k`/`m`/`g` 1024-multiplier and sign) is a
+			// boolean — non-zero is true, zero is false (so `1`, `2`, `-1`, `1k` → true; `0`, `00`, `-0`, `0k`
+			// → false). git parses this with `git_parse_int` (a signed **32-bit** int), so a value outside the
+			// `i32` range (e.g. `2147483648`) is *not* a valid boolean, even though it is a valid integer.
+			_ => match interpret_int(v) {
+				Ok(n) if i32::try_from(n).is_ok() => Ok(n != 0),
+				_ => Err(ConfigError::NotBool(v.to_owned())),
+			},
 		},
 	}
 }
 
 fn interpret_int(value: &str) -> Result<i64, ConfigError> {
-	let trimmed = value.trim();
-	let (digits, scale) = match trimmed.chars().last() {
-		Some('k' | 'K') => (&trimmed[..trimmed.len() - 1], 1024),
-		Some('m' | 'M') => (&trimmed[..trimmed.len() - 1], 1024 * 1024),
-		Some('g' | 'G') => (&trimmed[..trimmed.len() - 1], 1024 * 1024 * 1024),
-		_ => (trimmed, 1),
+	// git parses this as `strtoimax` (base 0) followed by a *unit factor* on whatever immediately trails the
+	// digits. `strtoimax` skips only *leading* ASCII whitespace, and `get_unit_factor` rejects any residue after
+	// the number/suffix — so `0 k` (space before the multiplier) and a quoted trailing space (`"0 "`) are both
+	// invalid. We therefore strip only git-compatible **leading** ASCII whitespace (never the trailing side, so
+	// a significant quoted trailing space fails) and feed the stripped `digits` to `parse_c_integer` untrimmed
+	// (so an interior space fails too). A bare unquoted value's trailing whitespace is already removed upstream
+	// by the config parser; only a quoted one reaches here, and git rejects that.
+	let leading = value.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+	let (digits, scale) = match leading.chars().last() {
+		Some('k' | 'K') => (&leading[..leading.len() - 1], 1024),
+		Some('m' | 'M') => (&leading[..leading.len() - 1], 1024 * 1024),
+		Some('g' | 'G') => (&leading[..leading.len() - 1], 1024 * 1024 * 1024),
+		_ => (leading, 1),
 	};
-	digits
-		.trim()
-		.parse::<i64>()
-		.ok()
+	parse_c_integer(digits)
 		.and_then(|n| n.checked_mul(scale))
 		.ok_or_else(|| ConfigError::NotInt(value.to_owned()))
+}
+
+/// Parse an integer the way git does (C `strtoimax` with base 0): an optional sign, then base-0 auto-detect
+/// — `0x`/`0X` hex, a leading `0` octal, otherwise decimal. So `0x10` = 16, `010` = 8, `08` is an invalid
+/// octal (error), and `0`/`00`/`-0` = 0. `None` on any non-integer.
+fn parse_c_integer(s: &str) -> Option<i64> {
+	if s.is_empty() {
+		return None;
+	}
+	let (negative, rest) = match s.strip_prefix('-') {
+		Some(rest) => (true, rest),
+		None => (false, s.strip_prefix('+').unwrap_or(s)),
+	};
+	let (radix, digits) =
+		if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+			(16, hex)
+		} else if rest.len() > 1 && rest.starts_with('0') {
+			(8, &rest[1..])
+		} else {
+			(10, rest)
+		};
+	// Parse the magnitude *unsigned*, then apply the sign in `i128`, so `i64::MIN` (whose magnitude is one
+	// above `i64::MAX`) round-trips — e.g. `-9223372036854775808` / `-0x8000000000000000`.
+	let magnitude = u64::from_str_radix(digits, radix).ok()? as i128;
+	i64::try_from(if negative { -magnitude } else { magnitude }).ok()
 }
 
 fn quote_value(value: &str) -> String {
@@ -604,7 +642,10 @@ mod tests {
 	fn int_suffixes() {
 		assert_eq!(interpret_int("1").unwrap(), 1);
 		assert_eq!(interpret_int("1k").unwrap(), 1024);
-		assert_eq!(interpret_int(" 2M ").unwrap(), 2 * 1024 * 1024);
+		// Leading whitespace is git-compatible (strtoimax skips it); a trailing space is not (get_unit_factor
+		// rejects the residue), so the multiplier must directly abut the number.
+		assert_eq!(interpret_int(" 2M").unwrap(), 2 * 1024 * 1024);
+		assert!(interpret_int("2M ").is_err());
 		assert!(interpret_int("nope").is_err());
 	}
 
@@ -736,6 +777,103 @@ mod tests {
 				"\temail = a@example.com\n",
 			)
 		);
+	}
+
+	#[test]
+	fn get_bool_accepts_gits_numeric_boolean_grammar() {
+		let text = concat!(
+			"[core]\n",
+			"\tone = 1\n\ttwo = 2\n\tneg = -1\n\tkilo = 1k\n",
+			"\tzero = 0\n\tzerok = 0k\n\tdblzero = 00\n\tnegzero = -0\n",
+			"\ttrue = true\n\toff = off\n\tempty =\n\tbad = banana\n",
+		);
+		let config = GitConfigSource::parse(text).unwrap();
+		let b = |k: &str| config.get_bool("core", None, k);
+		// Non-zero numerics (incl. suffixed/negative) are true.
+		for k in ["one", "two", "neg", "kilo"] {
+			assert_eq!(b(k).unwrap(), Some(true), "{k} should be true");
+		}
+		// Zero spellings are false.
+		for k in ["zero", "zerok", "dblzero", "negzero", "off", "empty"] {
+			assert_eq!(b(k).unwrap(), Some(false), "{k} should be false");
+		}
+		assert_eq!(b("true").unwrap(), Some(true));
+		// A non-numeric, non-keyword value is still not a boolean.
+		assert!(b("bad").is_err(), "a non-boolean value must error");
+	}
+
+	#[test]
+	fn get_bool_uses_gits_base_0_integer_grammar() {
+		// git parses config integers with C base-0: 0x hex, leading-0 octal, else decimal.
+		let text = concat!(
+			"[core]\n",
+			"\thex0 = 0x0\n\thexff = 0xff\n\toct = 010\n\toctzero = 00\n\tbadoct = 08\n",
+		);
+		let config = GitConfigSource::parse(text).unwrap();
+		let b = |k: &str| config.get_bool("core", None, k);
+		assert_eq!(b("hex0").unwrap(), Some(false), "0x0 is zero → false");
+		assert_eq!(b("hexff").unwrap(), Some(true), "0xff is non-zero → true");
+		assert_eq!(b("oct").unwrap(), Some(true), "010 is octal 8 → true");
+		assert_eq!(b("octzero").unwrap(), Some(false), "00 is zero → false");
+		assert!(
+			b("badoct").is_err(),
+			"08 is an invalid octal, not a boolean"
+		);
+	}
+
+	#[test]
+	fn numeric_boolean_is_bounded_to_i32_but_int_keeps_i64_range() {
+		let text = concat!(
+			"[core]\n",
+			"\tbigbool = 2147483648\n", // 2^31 — a valid i64, but out of git's boolean int32 range
+			"\tmin = -9223372036854775808\n", // i64::MIN, decimal
+			"\thexmin = -0x8000000000000000\n",
+			"\tmax = 9223372036854775807\n", // i64::MAX
+		);
+		let config = GitConfigSource::parse(text).unwrap();
+		// A numeric boolean beyond i32 is not a boolean (git parses booleans as a signed 32-bit int).
+		assert!(config.get_bool("core", None, "bigbool").is_err());
+		// …but get_int keeps git's full signed-64 range, including i64::MIN (previously rejected by
+		// sign-stripping) via both decimal and hex spellings, and i64::MAX.
+		assert_eq!(config.get_int("core", None, "min").unwrap(), Some(i64::MIN));
+		assert_eq!(
+			config.get_int("core", None, "hexmin").unwrap(),
+			Some(i64::MIN)
+		);
+		assert_eq!(config.get_int("core", None, "max").unwrap(), Some(i64::MAX));
+	}
+
+	#[test]
+	fn integer_rejects_whitespace_before_a_multiplier_suffix() {
+		// git's `get_unit_factor` requires the multiplier to directly abut the number: `0 k` (a space between the
+		// digits and the `k`) is not a valid integer, so it is not a valid boolean either. This matters for
+		// fail-closed gates like `core.fileMode` — a spurious `false` there would let removal delete a modified
+		// checkout — so a space-before-multiplier value must error, not parse as zero/false.
+		let text = concat!(
+			"[core]\n",
+			"\tspaced = 0 k\n",
+			"\tspacedhi = 1 m\n",
+			"\ttrailing = \"0 \"\n", // quoted trailing space is significant — git rejects it, must not be false
+			"\tleading = \" 0\"\n",  // git's strtoimax skips leading whitespace — accepted as 0
+			"\tleadingpos = \" 5\"\n",
+			"\ttight = 1k\n", // the valid form still works
+		);
+		let config = GitConfigSource::parse(text).unwrap();
+		assert!(config.get_int("core", None, "spaced").is_err());
+		assert!(config.get_int("core", None, "spacedhi").is_err());
+		assert!(config.get_bool("core", None, "spaced").is_err());
+		// A quoted trailing space is NOT trimmed away — the value stays invalid (fail closed), never false.
+		assert!(config.get_int("core", None, "trailing").is_err());
+		assert!(config.get_bool("core", None, "trailing").is_err());
+		// Leading whitespace is git-compatible (strtoimax skips it).
+		assert_eq!(config.get_int("core", None, "leading").unwrap(), Some(0));
+		assert_eq!(
+			config.get_bool("core", None, "leading").unwrap(),
+			Some(false)
+		);
+		assert_eq!(config.get_int("core", None, "leadingpos").unwrap(), Some(5));
+		assert_eq!(config.get_int("core", None, "tight").unwrap(), Some(1024));
+		assert_eq!(config.get_bool("core", None, "tight").unwrap(), Some(true));
 	}
 
 	#[test]

@@ -36,6 +36,7 @@ where
 			oid,
 			stage: 0,
 			assume_valid: false,
+			skip_worktree: false,
 			path,
 		});
 	}

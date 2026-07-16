@@ -18,7 +18,53 @@ pub enum ProtectionReason {
 		/// The lock reason, `Some("")` when locked without one.
 		reason: Option<String>,
 	},
-	// A `Dirty(WorktreeStatusReport)` variant is added with the removal slice (it needs a status run).
+	/// The live checkout has staged, unstaged, untracked, conflicted, or missing changes — removing it would
+	/// discard user work. The full status report is carried so a caller can see exactly *why* (the report
+	/// distinguishes conflicted/staged/unstaged/untracked/missing). Only reported when a status was requested
+	/// (a removal decision); a pure inspection never runs a status and so never yields this.
+	Dirty(Box<crate::WorktreeStatusReport>),
+	/// The live checkout's working tree is *clean* in git's status sense but still holds **residual** files
+	/// with no index entry — untracked *or* ignored content (build artifacts, a stray `.env`). Safe removal
+	/// preserves it rather than recursively deleting (gitana's ignore matcher is not fully git-faithful, so a
+	/// non-tracked file is never deleted on faith). The offending paths (a capped sample, worktree-relative)
+	/// are carried so a caller knows what to clear before removal can proceed.
+	ResidualContent {
+		/// The residual (untracked/ignored) paths found, relative to the worktree, capped at a sample.
+		paths: Vec<String>,
+	},
+	/// The live checkout is *clean* in git's status sense, but a re-verification that **hashes** every present
+	/// tracked file (rather than trusting the index stat cache) found one whose content or mode diverges from the
+	/// index. `status` can miss this — a same-size / stat-preserving rewrite, an edit within a coarse-timestamp
+	/// filesystem's granularity — and it omits skip-worktree entries entirely. Either way removing the worktree
+	/// would discard the edit, so safe removal preserves it; the offending paths are carried so a caller knows
+	/// what to reconcile first.
+	ModifiedTrackedContent {
+		/// The present, content-diverged tracked paths, relative to the worktree.
+		paths: Vec<String>,
+	},
+	/// The live checkout uses a **sparse index** (`git sparse-checkout --sparse-index`), whose collapsed
+	/// `040000` sparse-directory entries gitana does not expand. A status computed over it reports spurious
+	/// add/delete pairs, so removal cannot establish cleanliness safely; it refuses honestly rather than acting
+	/// on that bogus status. This is a conservative *unsupported-state* refusal (no user data is necessarily at
+	/// risk) — expanding sparse indexes is a deferred follow-up.
+	SparseIndexUnsupported,
+	/// A commit anchored **only** by something inside the worktree's admin dir — a **detached** (or
+	/// per-worktree-symbolic) `HEAD`, or a `refs/worktree|bisect|rewritten/*` tip — is reachable from no
+	/// surviving shared ref (`refs/heads`, `refs/tags`, `refs/remotes`, …). Removing the worktree drops that
+	/// admin dir and would orphan the commit (later gc-able), so safe removal refuses, discharging the
+	/// commit-preservation contract. The caller can create a branch or tag at the commit first, then retry. The
+	/// orphaned commit is carried so a caller knows what to preserve.
+	UnreachableAnchoredCommit {
+		/// The commit that no surviving shared ref reaches.
+		commit: WorktreeObjectId,
+	},
+	/// A **checkout-missing partial** (its checkout directory is gone, but the registration is retained) whose
+	/// retained per-worktree index still holds **staged** (index-vs-`HEAD`) or **unmerged** work. Cleaning the
+	/// partial would drop the admin dir and that index, erasing the staged state and leaving its index-only
+	/// blobs unreferenced (gc-able). Safe removal refuses, so the caller can recover the staged work (or restore
+	/// the checkout) first — matching how a live checkout's staged changes are a [`Dirty`](ProtectionReason::Dirty)
+	/// refusal.
+	StagedContentInMissingCheckout,
 }
 
 /// The classified state of a requested linked worktree, in the requirements doc's vocabulary. Returned
@@ -86,7 +132,8 @@ pub enum WorktreeClassification {
 		/// The conflict detail.
 		detail: IdentityConflict,
 	},
-	/// The destination is protected (locked; dirty is added with the removal slice).
+	/// The destination is protected — locked, or a live checkout that is dirty/conflicted — so an automatic
+	/// effect (notably removal) is refused with the reason reported.
 	ProtectedWithReason {
 		/// Why it is protected.
 		reason: ProtectionReason,
@@ -99,6 +146,32 @@ pub enum WorktreeClassification {
 /// rewind/divergence here without any reachability walk.
 ///
 /// Precedence is most-specific-refusal-first, so the returned variant is the one a caller must act on.
+/// The [`StagedContentInMissingCheckout`](ProtectionReason::StagedContentInMissingCheckout) protection, if a
+/// checkout-missing partial's retained index holds staged/unmerged work. `None` outside a removal decision or
+/// for a live checkout. Shared by the two partial decision paths so both agree with `decide_remove`.
+fn partial_staged_protection(inspection: &WorktreeInspection) -> Option<WorktreeClassification> {
+	(inspection.partial_staged_changes == Some(true)).then_some(
+		WorktreeClassification::ProtectedWithReason {
+			reason: ProtectionReason::StagedContentInMissingCheckout,
+		},
+	)
+}
+
+/// The [`UnreachableAnchoredCommit`](ProtectionReason::UnreachableAnchoredCommit) protection, if removal would
+/// orphan a commit anchored only inside this worktree's admin dir (a detached/per-worktree-symbolic `HEAD`, or
+/// a `refs/worktree|bisect|rewritten/*` tip). `None` outside a removal decision (`unreachable_admin_anchor` is
+/// then `None`) or when every anchor is preserved — so create-time classification is never affected. Shared by
+/// the partial and live decision paths so both agree with `decide_remove`.
+fn unreachable_head_protection(inspection: &WorktreeInspection) -> Option<WorktreeClassification> {
+	inspection.unreachable_admin_anchor.as_ref().map(|commit| {
+		WorktreeClassification::ProtectedWithReason {
+			reason: ProtectionReason::UnreachableAnchoredCommit {
+				commit: commit.clone(),
+			},
+		}
+	})
+}
+
 pub fn classify(inspection: &WorktreeInspection) -> WorktreeClassification {
 	use WorktreeClassification as C;
 	let start = inspection.start.as_ref();
@@ -109,6 +182,42 @@ pub fn classify(inspection: &WorktreeInspection) -> WorktreeClassification {
 			reason: ProtectionReason::Locked {
 				reason: reason.clone(),
 			},
+		};
+	}
+
+	// 1a. A **recoverable mid-checkout partial**: an owned registration whose checkout is gone
+	//     (`PresentCheckoutMissing` — the admin's `commondir` names this repository and its `gitdir` records
+	//     this destination, git's own "prunable" attribution) **and the destination is absent or an empty
+	//     directory** (nothing unknown sits there). Report it as `PartialRegistered` — a recoverable state a
+	//     caller prunes-and-retries. The empty/absent gate matters: a *non-empty* directory at the recorded
+	//     path is not verifiably this worktree's own content (a reused path, or a git-created prunable), so it
+	//     is left to read as a `DestinationConflict` below rather than a false "recoverable". Also gated to no
+	//     *more-specific* refusal — an identity conflict, or the requested branch being force-checked-out in
+	//     another worktree (a `BranchUseConflict`; a retry stays blocked by that checkout, so "prune and retry"
+	//     would mislead). This is the read side of the deferred slice-2 "recoverable mid-checkout" item.
+	if inspection.identity_conflict.is_none()
+		&& matches!(
+			inspection.destination_kind,
+			DestinationKind::Absent | DestinationKind::EmptyDir
+		) && let Registration::PresentCheckoutMissing { admin_dir } = &inspection.registration
+	{
+		if let Some(other) = requested_checked_out_elsewhere(&inspection.requested_branch) {
+			return C::BranchUseConflict {
+				other_checkout: other.to_path_buf(),
+			};
+		}
+		// A checkout-missing partial still holds the admin's index and `HEAD`. Cleaning it (dropping the admin)
+		// would erase staged/unmerged index work, or orphan a detached / per-worktree-symbolic commit reachable
+		// from no shared ref — so refuse first, in the same order as `decide_remove` (staged, then reachability),
+		// rather than let "prune and retry" silently discard it.
+		if let Some(protection) = partial_staged_protection(inspection) {
+			return protection;
+		}
+		if let Some(protection) = unreachable_head_protection(inspection) {
+			return protection;
+		}
+		return C::PartialRegistered {
+			admin_dir: admin_dir.clone(),
 		};
 	}
 
@@ -131,19 +240,9 @@ pub fn classify(inspection: &WorktreeInspection) -> WorktreeClassification {
 
 	// 4. The requested branch is checked out at another destination — whether it exists or is unborn
 	//    (`worktree add --orphan`), both of which git refuses to check out a second time.
-	let checked_out_elsewhere = match &inspection.requested_branch {
-		RequestedBranch::Exists {
-			checked_out_elsewhere,
-			..
-		}
-		| RequestedBranch::Absent {
-			checked_out_elsewhere,
-		} => checked_out_elsewhere.as_ref(),
-		RequestedBranch::NotRequested => None,
-	};
-	if let Some(other) = checked_out_elsewhere {
+	if let Some(other) = requested_checked_out_elsewhere(&inspection.requested_branch) {
 		return C::BranchUseConflict {
-			other_checkout: other.clone(),
+			other_checkout: other.to_path_buf(),
 		};
 	}
 
@@ -158,6 +257,16 @@ pub fn classify(inspection: &WorktreeInspection) -> WorktreeClassification {
 
 	// 6. Registration retained, checkout gone.
 	if let Registration::PresentCheckoutMissing { admin_dir } = &inspection.registration {
+		// A checkout-missing partial still holds the admin's index and `HEAD`. Cleaning it (dropping the admin)
+		// would erase staged/unmerged index work, or orphan a detached / per-worktree-symbolic commit reachable
+		// from no shared ref — so refuse first, in the same order as `decide_remove` (staged, then reachability),
+		// rather than let "prune and retry" silently discard it.
+		if let Some(protection) = partial_staged_protection(inspection) {
+			return protection;
+		}
+		if let Some(protection) = unreachable_head_protection(inspection) {
+			return protection;
+		}
 		return C::PartialRegistered {
 			admin_dir: admin_dir.clone(),
 		};
@@ -174,6 +283,52 @@ pub fn classify(inspection: &WorktreeInspection) -> WorktreeClassification {
 		&& inspection.cross_pointers == CrossPointerHealth::Consistent
 		&& let Some(head) = &inspection.head
 	{
+		// A present, consistent, live checkout whose status was computed (a removal decision) may be protected.
+		// This mirrors `decide_remove` exactly, so `classify(inspect(...))` agrees with the removal outcome:
+		// **tracked-side** changes (staged/unstaged/conflicted/missing) → `Dirty`; otherwise any **residual**
+		// (untracked *or ignored*) content → `ResidualContent` with its paths. Both out-rank the
+		// exact/advanced/present readings below (the protection is the fact a cleanup caller acts on). A pure
+		// inspection carries no status/residual, so neither fires for it.
+		// A sparse index yields a bogus status (unexpanded `040000` entries → spurious add/delete pairs), so it
+		// out-ranks the status-derived gates below: refuse honestly rather than trust that status.
+		if inspection.sparse_index == Some(true) {
+			return C::ProtectedWithReason {
+				reason: ProtectionReason::SparseIndexUnsupported,
+			};
+		}
+		if let Some(status) = &inspection.status
+			&& status.has_tracked_changes()
+		{
+			return C::ProtectedWithReason {
+				reason: ProtectionReason::Dirty(Box::new(status.clone())),
+			};
+		}
+		// A present tracked file whose hash diverges from the index is a tracked-side edit `status` can miss
+		// (stat-cache/skip-worktree) — still data loss if deleted.
+		if let Some(paths) = &inspection.diverged_tracked_content
+			&& !paths.is_empty()
+		{
+			return C::ProtectedWithReason {
+				reason: ProtectionReason::ModifiedTrackedContent {
+					paths: paths.clone(),
+				},
+			};
+		}
+		if let Some(residual) = &inspection.residual_paths
+			&& !residual.is_empty()
+		{
+			return C::ProtectedWithReason {
+				reason: ProtectionReason::ResidualContent {
+					paths: residual.clone(),
+				},
+			};
+		}
+		// A clean checkout whose HEAD commit is reachable from no shared ref, and whose only anchor (a detached
+		// HEAD, or a per-worktree symbolic target) will not survive removal, would be orphaned — refuse, so the
+		// caller can branch/tag it first. (A HEAD symbolic to a surviving `refs/heads/*` branch is `Some(true)`.)
+		if let Some(protection) = unreachable_head_protection(inspection) {
+			return protection;
+		}
 		if let (Some(branch), Some(object)) = (&head.branch, &head.object) {
 			let complete = || C::CompleteIdempotent {
 				branch: branch.clone(),
@@ -245,6 +400,21 @@ pub fn classify(inspection: &WorktreeInspection) -> WorktreeClassification {
 	}
 }
 
+/// The checkout of *another* worktree that carries the requested branch (a branch-use conflict), if any —
+/// whether the branch exists or is an unborn orphan checked out elsewhere.
+fn requested_checked_out_elsewhere(requested: &RequestedBranch) -> Option<&std::path::Path> {
+	match requested {
+		RequestedBranch::Exists {
+			checked_out_elsewhere,
+			..
+		}
+		| RequestedBranch::Absent {
+			checked_out_elsewhere,
+		} => checked_out_elsewhere.as_deref(),
+		RequestedBranch::NotRequested => None,
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -272,6 +442,12 @@ mod tests {
 			start_relation: None,
 			lock: LockState::Unlocked,
 			identity_conflict: None,
+			status: None,
+			residual_paths: None,
+			diverged_tracked_content: None,
+			sparse_index: None,
+			unreachable_admin_anchor: None,
+			partial_staged_changes: None,
 		}
 	}
 

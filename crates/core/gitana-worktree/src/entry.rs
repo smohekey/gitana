@@ -33,6 +33,9 @@ pub struct IndexEntry<H: HashAlgorithm> {
 	pub stage: u8,
 	/// The assume-valid (`--assume-unchanged`) flag.
 	pub assume_valid: bool,
+	/// The skip-worktree flag (sparse checkout): git ignores the working tree for this path — an absent file
+	/// is not a deletion and a present one is not compared.
+	pub skip_worktree: bool,
 	/// The repository-relative path (forward slashes).
 	pub path: String,
 }

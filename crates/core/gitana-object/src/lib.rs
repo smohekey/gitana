@@ -38,7 +38,7 @@ pub use commit::{
 };
 pub use delta::apply_delta;
 pub use enumerate::{enumerate_objects, referenced_ids};
-pub use ewah::{EwahBitmap, decode_ewah, encode_ewah};
+pub use ewah::{EwahBitmap, decode_ewah, decode_ewah_bounded, encode_ewah};
 pub use hash_algorithm::{HashAlgorithm, HashKind};
 pub use id::ObjectId;
 pub use idx::{PackIndex, PackIndexEntry, decode_pack_index, encode_pack_index};

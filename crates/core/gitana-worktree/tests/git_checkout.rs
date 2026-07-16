@@ -504,6 +504,7 @@ async fn checkout_refuses_a_traversal_index_entry() {
 		oid: ObjectId::<Sha256>::from_hex(&head).unwrap(),
 		stage: 0,
 		assume_valid: false,
+		skip_worktree: false,
 		path: "../victim-checkout-traversal".to_owned(),
 	});
 	wt.save_index(&index).await.unwrap();
@@ -645,6 +646,7 @@ async fn checkout_refuses_removal_through_a_symlinked_ancestor() {
 		oid: ObjectId::<Sha256>::from_hex(&head).unwrap(),
 		stage: 0,
 		assume_valid: false,
+		skip_worktree: false,
 		path: "link/victim".to_owned(),
 	});
 	wt.save_index(&index).await.unwrap();

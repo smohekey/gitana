@@ -169,6 +169,49 @@ pub struct WorktreeInspection {
 	pub lock: LockState,
 	/// A start-independent identity conflict, if any.
 	pub identity_conflict: Option<IdentityConflict>,
+	/// The live checkout's working-tree status — populated only when the query set
+	/// [`with_status`](crate::WorktreeQuery::with_status) **and** the destination is a present,
+	/// cross-pointer-consistent linked-worktree checkout (a missing/partial/foreign checkout has no status to
+	/// compute). `None` otherwise. A status *failure* is a hard error from `inspect`, never a silent `None`
+	/// (which `classify` would read as clean).
+	pub status: Option<crate::WorktreeStatusReport>,
+	/// The live checkout's **residual** (untracked *or* ignored) working-tree paths — files on disk with no
+	/// index entry, from a matcher-independent scan (see
+	/// [`residual_untracked_paths`](crate::status)) — computed under the same condition as
+	/// [`status`](WorktreeInspection::status), capped at a sample. An empty `Some(vec)` means the working tree
+	/// is pristine (solely tracked files); a non-empty one is content safe removal must preserve (never
+	/// delete), the conservative gate that keeps a non-git-faithful `.gitignore` match from ever authorising
+	/// deletion of a git-untracked file. `None` when no status was requested / not a live checkout.
+	pub residual_paths: Option<Vec<String>>,
+	/// The live checkout's stage-0 tracked paths present on disk whose content or mode **diverges from the
+	/// index**, verified by hashing the working file rather than trusting the index stat cache. Catches edits
+	/// `status` can miss (a stat-preserving/same-size rewrite, a coarse-timestamp filesystem) and skip-worktree
+	/// edits `status` omits entirely. Computed under the same condition as [`status`](WorktreeInspection::status).
+	/// An empty `Some(vec)` means every present tracked file hashes equal to the index (reconstructable); a
+	/// non-empty one is tracked-file content safe removal must preserve. `None` when no status was requested /
+	/// not a live checkout.
+	pub diverged_tracked_content: Option<Vec<String>>,
+	/// Whether the live checkout uses a **sparse index** (`git sparse-checkout --sparse-index`) — its index
+	/// carries a collapsed `040000` sparse-directory entry gitana does not expand, so a status computed over it
+	/// reports spurious add/delete pairs. Computed under the same condition as
+	/// [`status`](WorktreeInspection::status). `Some(true)` lets a removal decision refuse *honestly* (a clear
+	/// "sparse-index unsupported" signal) instead of acting on that bogus status; `None` when no status was
+	/// requested / not a live checkout.
+	pub sparse_index: Option<bool>,
+	/// The first **admin-local anchored commit** that removal would orphan, or `None` if every such commit is
+	/// preserved. Removing a worktree deletes its admin dir and every reference living there — a detached (or
+	/// per-worktree-symbolic) `HEAD`, and the `refs/worktree|bisect|rewritten/*` tips — each of which uniquely
+	/// anchors its commit; a commit reachable from no *surviving* shared ref would be orphaned (later gc-able), so
+	/// `Some(commit)` makes a removal decision refuse. A HEAD anchored by a surviving `refs/heads/*` branch is not
+	/// at risk. `None` when no status was requested, there is no registered admin to remove, or every anchor is
+	/// reachable. Computed for a live checkout **and** a checkout-missing partial.
+	pub unreachable_admin_anchor: Option<WorktreeObjectId>,
+	/// For a **checkout-missing partial** (a `PresentCheckoutMissing` registration), whether its retained index
+	/// holds staged (index-vs-`HEAD`) or unmerged work. Cleaning the partial drops that index, so `Some(true)`
+	/// means a removal decision refuses (the staged state would be lost). Computed only for a partial under a
+	/// removal decision (`with_status`); a live checkout's staged changes are already reflected in
+	/// [`status`](WorktreeInspection::status). `None` otherwise.
+	pub partial_staged_changes: Option<bool>,
 }
 
 /// Classify what sits at `destination` without following a `.git` symlink or touching contents.
@@ -177,8 +220,12 @@ pub(crate) fn classify_destination(
 	destination: &std::path::Path,
 ) -> Result<DestinationKind, crate::LinkedWorktreeError> {
 	use crate::LinkedWorktreeError;
-	// `symlink_metadata` does not follow a symlink at the destination itself.
-	let meta = match std::fs::symlink_metadata(destination) {
+	// `symlink_metadata` does not follow a symlink at the destination itself — but a **trailing separator**
+	// (`.../wt-link/`) forces POSIX to resolve the leaf symlink, which would misclassify a symlinked destination
+	// as its target's directory (and a later canonical delete would then destroy the real target). Stat the
+	// trailing-separator-stripped leaf so a leaf symlink is always seen and classified `OtherFsObject`.
+	let leaf = destination.components().as_path();
+	let meta = match std::fs::symlink_metadata(leaf) {
 		Ok(meta) => meta,
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DestinationKind::Absent),
 		Err(e) => return Err(LinkedWorktreeError::io("stat destination", destination, e)),
@@ -466,6 +513,66 @@ mod native {
 				.map(|found| IdentityConflict::RegisteredToDifferentBranch { found })
 		};
 
+		// Working-tree status — computed only when the caller asked for it (a removal/cleanup decision) **and**
+		// the destination is a present, cross-pointer-consistent live checkout: a missing/partial checkout has
+		// no working tree to scan, and a foreign one must never be opened. A status *failure* propagates as a
+		// hard error (never a silent `None`, which `classify` would read as clean).
+		let statusable = query.with_status
+			&& matches!(registration, Registration::Present { .. })
+			&& cross_pointers == CrossPointerHealth::Consistent
+			&& destination_kind == DestinationKind::LinkedWorktreeCheckout;
+		let (status, residual_paths, diverged_tracked_content, sparse_index) = if statusable {
+			let admin = registered_admin
+				.as_ref()
+				.expect("a Present registration carries its admin dir");
+			// All computed for a removal decision: the three-way status (tracked-side cleanliness), a
+			// matcher-independent scan for residual untracked/ignored content (the conservative delete gate), a
+			// content re-verification of every present tracked file (hashing, not the stat cache — catches edits
+			// `status` can miss and skip-worktree edits it omits), and whether the index is a sparse index (whose
+			// collapsed directory entries make that status unreliable).
+			let status = crate::status::status_at(admin, common, destination).await?;
+			let residual = crate::status::residual_untracked_paths(admin, common, destination).await?;
+			let diverged =
+				crate::status::diverged_tracked_content_paths(admin, common, destination).await?;
+			let sparse = crate::status::is_sparse_index(admin, common, destination).await?;
+			(Some(status), Some(residual), Some(diverged), Some(sparse))
+		} else {
+			(None, None, None, None)
+		};
+
+		// Commit-preservation: for a removal decision (`with_status`) on any *registered* worktree — live **or**
+		// a checkout-missing partial, since both delete the admin dir — every commit anchored *only* by something
+		// inside that admin (a detached/per-worktree-symbolic `HEAD`, and the `refs/worktree|bisect|rewritten/*`
+		// tips) must be reachable from a surviving shared ref, else removal orphans it. `first_unreachable_admin_anchor`
+		// returns the first such orphaned commit (or `None`). The `HEAD` commit is handed to it **only** when its
+		// own anchor will not survive: a HEAD symbolic to a shared `refs/heads/*` branch keeps its commit reachable
+		// via that surviving branch, so it is not passed (but the per-worktree ref tips are always checked).
+		let unreachable_admin_anchor = if query.with_status
+			&& let Some(admin) = registered_admin.as_ref()
+		{
+			let head_at_risk = head.as_ref().and_then(|h| {
+				let anchored_by_shared_branch = h
+					.branch
+					.as_deref()
+					.is_some_and(|b| b.starts_with("refs/heads/"));
+				h.object.as_ref().filter(|_| !anchored_by_shared_branch)
+			});
+			crate::status::first_unreachable_admin_anchor(admin, common, head_at_risk).await?
+		} else {
+			None
+		};
+
+		// A checkout-missing partial keeps its per-worktree index; if that index has staged/unmerged work,
+		// cleaning the partial (dropping the admin) would erase it. Computed only for that case — a live
+		// checkout's staged changes are already covered by `status.has_tracked_changes()`.
+		let partial_staged_changes = if query.with_status
+			&& let Registration::PresentCheckoutMissing { admin_dir } = &registration
+		{
+			Some(crate::status::partial_has_staged_changes(admin_dir, common).await?)
+		} else {
+			None
+		};
+
 		Ok(WorktreeInspection {
 			destination: destination.clone(),
 			expected_branch: query.expected_branch.clone(),
@@ -480,6 +587,12 @@ mod native {
 			start_relation,
 			lock,
 			identity_conflict,
+			status,
+			residual_paths,
+			diverged_tracked_content,
+			sparse_index,
+			unreachable_admin_anchor,
+			partial_staged_changes,
 		})
 	}
 }

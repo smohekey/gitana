@@ -13,8 +13,10 @@
 //! The read surface is [`inspect`] one destination, [`classify`] its partial state, [`enumerate`] a
 //! repository's worktrees, and read a working tree's [`status`]. [`create`] establishes a worktree from an
 //! explicit [`CreateRequest`], reconciling against that classification — an idempotent no-op when it
-//! already exists exactly, completing an interrupted attempt, and refusing a conflict. Removal lands in a
-//! later slice.
+//! already exists exactly, completing an interrupted attempt, and refusing a conflict. [`remove`] is the
+//! mirror: a safe, force-free removal from an explicit [`RemoveRequest`] that refuses a dirty/conflicted,
+//! locked, primary, or identity-mismatched worktree, retains the branch and its commits, and is idempotent
+//! once the worktree is gone.
 //!
 //! The filesystem-capability mint uses `cap-std`, which does not build for `wasm32`; the reading
 //! functions ([`inspect`]/[`enumerate`]/[`status`]) are therefore `cfg(not(target_arch = "wasm32"))`,
@@ -29,6 +31,9 @@ mod facts;
 mod inspect;
 mod object_id;
 mod query;
+mod remove_error;
+mod remove_outcome;
+mod remove_request;
 mod repo_id;
 mod request;
 mod status;
@@ -41,6 +46,8 @@ mod create;
 mod head;
 #[cfg(not(target_arch = "wasm32"))]
 mod pointers;
+#[cfg(not(target_arch = "wasm32"))]
+mod remove;
 
 pub use classify::{ProtectionReason, WorktreeClassification, classify};
 pub use create_error::CreateError;
@@ -53,6 +60,9 @@ pub use inspect::{
 };
 pub use object_id::WorktreeObjectId;
 pub use query::{BranchName, WorktreeQuery};
+pub use remove_error::RemoveError;
+pub use remove_outcome::RemoveOutcome;
+pub use remove_request::RemoveRequest;
 pub use repo_id::RepositoryId;
 pub use request::{CheckoutTarget, CreateRequest};
 pub use status::WorktreeStatusReport;
@@ -63,5 +73,7 @@ pub use create::create;
 pub use enumerate::enumerate;
 #[cfg(not(target_arch = "wasm32"))]
 pub use inspect::inspect;
+#[cfg(not(target_arch = "wasm32"))]
+pub use remove::remove;
 #[cfg(not(target_arch = "wasm32"))]
 pub use status::status;

@@ -4,9 +4,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use gitana_file_store::FileStore;
+use gitana_file_store::{FileStore, FileStoreError};
 use gitana_file_store_local::WorkDirFs;
-use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_object::{HashAlgorithm, ObjectId, ObjectKind};
 
 use crate::fsmeta::{blob_of, effective_mode, join_rel, push_gitignore};
 use crate::ignore::{self, DirIgnore};
@@ -59,6 +59,12 @@ impl Status {
 pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
 ) -> Result<Status, WorktreeError> {
+	// `core.fileMode` (git's `trust_executable_bit`): when `false`, an executable-bit-only difference between
+	// the working tree and the index is *not* a modification. Resolved with git's worktree precedence — a
+	// per-worktree override in `config.worktree` (when `extensions.worktreeConfig` is set) wins over the common
+	// `config`; unset defaults to `true` (honour the bit). Getting this wrong toward "clean" would let removal
+	// delete a genuinely-modified checkout, so the default and the override both fail safe toward `true`.
+	let file_mode = worktree_file_mode(wt).await;
 	let index = wt.load_index().await?;
 	let index_map: HashMap<String, (String, ObjectId<H>)> = index
 		.entries
@@ -107,9 +113,15 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		}
 	}
 
-	// Working tree vs index (the Y column).
-	for entry in index.entries.iter().filter(|e| e.stage == 0) {
-		let code = worktree_change(wt.work(), entry, &entry.path)?;
+	// Working tree vs index (the Y column). A **skip-worktree** entry (sparse checkout) is not compared to the
+	// working tree at all — git ignores the working tree for it, so an omitted file is not a deletion and a
+	// present one is not a modification.
+	for entry in index
+		.entries
+		.iter()
+		.filter(|e| e.stage == 0 && !e.skip_worktree)
+	{
+		let code = worktree_change(wt.work(), entry, &entry.path, file_mode)?;
 		if code != ' ' {
 			at(&mut merged, &entry.path).worktree = code;
 		}
@@ -131,6 +143,169 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		changed: merged.into_values().collect(),
 		untracked,
 	})
+}
+
+/// The stage-0 tracked paths **present on disk whose content or mode diverges from the index**, verified by
+/// **always hashing the working file** — never the `stat_matches` fast path that [`compute`]/`status()` (and
+/// git) take. This is a **removal-only** re-verification: recursive removal must not delete a checkout on the
+/// strength of a stat-cache "clean", because that cache can hide a real edit — a same-size rewrite that
+/// preserves the cached stat fields, or any edit within a coarse-timestamp filesystem's granularity
+/// (FAT/exFAT) — and it also omits skip-worktree entries entirely (git ignores the working tree for them, so
+/// a `update-index --skip-worktree`d-then-edited file shows nothing in `status`). Hashing every present
+/// tracked file closes both holes.
+///
+/// An **absent** entry is never reported: a deleted non-sparse file is reliably caught by `status` (`lstat` →
+/// `D`, no stat cache involved), and an absent skip-worktree path is the ordinary sparse-checkout case. A
+/// present entry that hashes equal (and whose mode matches under the resolved `core.fileMode`) is
+/// reconstructable from the object store, so it too is omitted; only a genuinely diverged present file — the
+/// content at risk of loss — is returned.
+pub(crate) async fn diverged_tracked_content<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+) -> Result<Vec<String>, WorktreeError> {
+	let file_mode = worktree_file_mode(wt).await;
+	let index = wt.load_index().await?;
+	let mut out = Vec::new();
+	for entry in index.entries.iter().filter(|e| e.stage == 0) {
+		let Some(meta) = wt.work().lstat(&entry.path)? else {
+			continue; // absent — a deletion (status catches it) or an omitted sparse path; not content at risk
+		};
+		// Deliberately *no* `stat_matches` shortcut: hash the working file and compare oid + mode directly.
+		let diverged = match blob_of::<W, H>(wt.work(), &entry.path, &meta)? {
+			Some((oid, _))
+				if oid == entry.oid
+					&& modes_equivalent(effective_mode(&meta, entry.mode), entry.mode, file_mode) =>
+			{
+				// The working file matches the index — but it is only "reconstructable" (safe to delete) if the
+				// object store holds a *valid* copy. Existence alone is not enough: a present-but-corrupt loose
+				// object, or a pack naming an unreadable object, would leave the working file as the sole valid
+				// copy. Read the stored blob and confirm it hashes back to the indexed oid; a read failure or a
+				// hash mismatch means the checkout is not safe to delete, so treat it as diverged (preserve).
+				match wt.repository().read_blob(entry.oid).await {
+					Ok(bytes) => ObjectId::<H>::compute(ObjectKind::Blob, &bytes) != entry.oid,
+					Err(_) => true,
+				}
+			}
+			// Content or mode differs, or neither a regular file nor a symlink now sits at a tracked path (e.g. a
+			// directory replaced it) — a divergence from the tracked blob; not safe to delete blindly.
+			_ => true,
+		};
+		if diverged {
+			out.push(entry.path.clone());
+		}
+	}
+	Ok(out)
+}
+
+/// Whether the index carries any change relative to `HEAD` — a **staged** add/modify/delete, or an unmerged
+/// (conflicted) entry — computed from the index and the `HEAD` tree **without touching the working tree**. It
+/// is therefore valid even when the checkout is gone, the removal-safety check a checkout-missing partial
+/// needs: cleaning such a partial drops the admin dir (and its index), which would erase staged state and
+/// leave index-only blobs unreferenced (gc-able). An unborn `HEAD` (no commit) with a non-empty index counts
+/// as staged additions.
+///
+/// A **genuinely absent** index (no `index` file — e.g. `create` interrupted after `HEAD` was published but
+/// before the checkout materialised its index) is *not* staged work: there is nothing to lose, so this returns
+/// `false` (a recoverable partial). Only a *present* index that differs from `HEAD` is staged content — an
+/// absent index must not be conflated with a deliberately-empty one (which vs a non-empty `HEAD` would be a
+/// staged deletion of every tracked path).
+pub(crate) async fn has_staged_changes<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+) -> Result<bool, WorktreeError> {
+	// No index file at all → a recoverable partial with no staged state, not an all-paths staged deletion.
+	if !wt
+		.repository()
+		.objects()
+		.file_store()
+		.exists("index")
+		.await?
+	{
+		return Ok(false);
+	}
+	let index = wt.load_index().await?;
+	// Any unmerged (stage > 0) entry is conflicted work.
+	if index.entries.iter().any(|e| e.stage != 0) {
+		return Ok(true);
+	}
+	// Stage-0 index vs the HEAD tree: an added / removed / modified path is a staged change. Built the same way
+	// `compute`'s X column is, so the two agree.
+	let index_map: HashMap<String, (String, ObjectId<H>)> = index
+		.entries
+		.iter()
+		.filter(|e| e.stage == 0)
+		.map(|e| (e.path.clone(), (format!("{:o}", e.mode), e.oid)))
+		.collect();
+	Ok(index_map != head_entries(wt).await?)
+}
+
+/// The effective `core.fileMode` for this worktree, honouring git's worktree-config precedence: a
+/// per-worktree `config.worktree` override (only consulted when the common config sets
+/// `extensions.worktreeConfig`) wins over the common `config`; an unset value defaults to `true`.
+///
+/// This gates whether an exec-bit change is a *modification*, so resolving it wrongly toward `false` would
+/// let removal delete a checkout git considers modified. It therefore **fails closed to `true`** (honour the
+/// exec bit → refuse) whenever `false` cannot be established *simply and certainly*: an unreadable common
+/// config; an `include`/`includeIf` in the local config (which we do not process and which could override
+/// `core.fileMode`); an unparseable value; or a `config.worktree` that is present but unreadable / non-UTF-8
+/// / malformed. Only a genuinely-absent `config.worktree` (`NotFound`) falls back to the common value.
+async fn worktree_file_mode<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+) -> bool {
+	let Ok(common) = wt.repository().read_config().await else {
+		return true; // unreadable common config — cannot establish `false`, so honour the exec bit
+	};
+	// We do not process `include`/`includeIf`; either could set `core.fileMode` after the local value, so a
+	// local value cannot be trusted when includes are present — fail closed.
+	if config_has_includes(&common) {
+		return true;
+	}
+	let common_mode = common.get_bool("core", None, "filemode");
+	// `extensions.worktreeConfig` gates whether a per-worktree override is consulted. An **invalid** value is a
+	// config git errors on, so fail closed immediately rather than consult the override or fall back.
+	let worktree_config_enabled = match common.get_bool("extensions", None, "worktreeconfig") {
+		Ok(Some(enabled)) => enabled,
+		Ok(None) => false,
+		Err(_) => return true,
+	};
+	if worktree_config_enabled {
+		match wt
+			.repository()
+			.objects()
+			.file_store()
+			.read_path("config.worktree")
+			.await
+		{
+			Ok(bytes) => {
+				// Present but non-UTF-8 / malformed / with an unparseable value → fail closed (git errors here).
+				let Ok(text) = String::from_utf8(bytes) else {
+					return true;
+				};
+				let Ok(over) = gitana_config::GitConfig::parse(&text) else {
+					return true;
+				};
+				// The override file may itself include another that overrides `core.fileMode` — fail closed.
+				if config_has_includes(&over) {
+					return true;
+				}
+				match over.get_bool("core", None, "filemode") {
+					Ok(Some(mode)) => return mode, // explicit, parseable override wins
+					Err(_) => return true,         // present but unparseable → fail closed
+					Ok(None) => {}                 // no override key → fall through to the common value
+				}
+			}
+			Err(FileStoreError::NotFound) => {} // no override file — use the common value
+			Err(_) => return true,              // present but unreadable — fail closed
+		}
+	}
+	// The common value; absent (git's default) or unparseable both honour the exec bit.
+	common_mode.ok().flatten().unwrap_or(true)
+}
+
+/// Whether a config carries an `include` or `includeIf` directive. gitana does not process these, so any
+/// config value they might override cannot be trusted for a safety decision. A directive is detected even when
+/// *valueless* (`get_all_raw` keeps a bare `include.path`, which `get_all` drops) — git errors on that too.
+fn config_has_includes(config: &gitana_config::GitConfig) -> bool {
+	!config.get_all_raw("include", None, "path").is_empty()
+		|| !config.subsections("includeIf").is_empty()
 }
 
 /// git's `git status --porcelain` two-letter code for an unmerged path, from which of base (1),
@@ -224,6 +399,7 @@ fn worktree_change<W: WorkDirFs, H: HashAlgorithm>(
 	work: &W,
 	entry: &IndexEntry<H>,
 	path: &str,
+	file_mode: bool,
 ) -> Result<char, WorktreeError> {
 	let Some(meta) = work.lstat(path)? else {
 		return Ok('D');
@@ -232,10 +408,35 @@ fn worktree_change<W: WorkDirFs, H: HashAlgorithm>(
 		return Ok(' ');
 	}
 	match blob_of(work, path, &meta)? {
-		Some((oid, _)) if oid == entry.oid && effective_mode(&meta, entry.mode) == entry.mode => {
+		Some((oid, _))
+			if oid == entry.oid
+				&& modes_equivalent(effective_mode(&meta, entry.mode), entry.mode, file_mode) =>
+		{
 			Ok(' ')
 		}
 		_ => Ok('M'),
+	}
+}
+
+/// Whether a working-tree mode matches the indexed mode. With `file_mode` (`core.fileMode=true`) the modes
+/// must be identical; with `core.fileMode=false` an executable-bit-only difference is ignored — a regular
+/// file `100644` and `100755` are equivalent — while symlink (`120000`) and gitlink (`160000`) types still
+/// differ from a regular file.
+fn modes_equivalent(actual: u32, expected: u32, file_mode: bool) -> bool {
+	if file_mode {
+		actual == expected
+	} else {
+		regular_mode_class(actual) == regular_mode_class(expected)
+	}
+}
+
+/// Collapse a regular file's executable bit so `100644`/`100755` share a class; other git object types
+/// (symlink, gitlink, tree) keep their own type bits.
+fn regular_mode_class(mode: u32) -> u32 {
+	if mode & 0o170000 == 0o100000 {
+		0o100644
+	} else {
+		mode
 	}
 }
 
@@ -264,5 +465,139 @@ mod tests {
 		assert_eq!(code(true, false, false), ('D', 'D')); // both deleted
 		assert_eq!(code(false, true, false), ('A', 'U')); // added by us
 		assert_eq!(code(false, false, true), ('U', 'A')); // added by them
+	}
+
+	/// The removal-safety re-verification must hash the working file rather than trust the index stat cache: a
+	/// crafted entry whose cached stat exactly matches the on-disk file but whose oid does *not* match its
+	/// content is the stat-cache hole (a same-size/stat-preserving rewrite, or a coarse-timestamp filesystem).
+	/// `worktree_change` — the fast path `status()` and git take — reports it clean; `diverged_tracked_content`
+	/// must still catch it.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn diverged_tracked_content_hashes_past_a_matching_stat_cache() {
+		use std::sync::atomic::{AtomicU32, Ordering};
+
+		use cap_std::ambient_authority;
+		use cap_std::fs::Dir;
+		use gitana_file_store_local::{CapWorkDir, LocalFileStore};
+		use gitana_object_store::ObjectStore;
+		use gitana_repository::Repository;
+
+		use crate::IndexEntry;
+		use crate::fsmeta::{mode_of, stat_of};
+
+		static SEQ: AtomicU32 = AtomicU32::new(0);
+		let root = std::env::temp_dir().join(format!(
+			"gitana-diverged-{}-{}",
+			std::process::id(),
+			SEQ.fetch_add(1, Ordering::Relaxed)
+		));
+		let git_dir = root.join(".git");
+		std::fs::create_dir_all(&git_dir).unwrap();
+		// Same length before and after, so a stat cache that records the pre-edit size still "matches".
+		std::fs::write(root.join("a.txt"), b"AAAA").unwrap();
+
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap(),
+		)));
+		let wt = WorkTree::new(
+			repo,
+			CapWorkDir::from_dir(Dir::open_ambient_dir(&root, ambient_authority()).unwrap()),
+			&git_dir,
+		);
+
+		// Build an entry whose stat cache exactly matches the on-disk file, but whose oid is for *different*
+		// content — the state a stat-preserving rewrite leaves behind.
+		let meta = wt.work().lstat("a.txt").unwrap().expect("a.txt exists");
+		let entry = IndexEntry::<Sha256> {
+			stat: stat_of(&meta),
+			mode: mode_of(&meta),
+			oid: ObjectId::<Sha256>::compute(ObjectKind::Blob, b"BBBB"),
+			stage: 0,
+			assume_valid: false,
+			skip_worktree: false,
+			path: "a.txt".to_owned(),
+		};
+
+		// The fast path is fooled — stat matches, so it reports the file unchanged.
+		assert_eq!(
+			worktree_change(wt.work(), &entry, "a.txt", true).unwrap(),
+			' ',
+			"the stat-cache fast path reports the diverged file as clean (the hole)"
+		);
+
+		// The removal re-verification hashes the file and catches the divergence.
+		let mut index = Index::new();
+		index.entries.push(entry);
+		wt.save_index(&index).await.unwrap();
+		let diverged = diverged_tracked_content(&wt).await.unwrap();
+		assert_eq!(
+			diverged,
+			vec!["a.txt".to_owned()],
+			"content re-verification must hash past the stat cache"
+		);
+
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	/// A working file that hashes to its index oid is only reconstructable if that object is actually stored —
+	/// with the object store empty, the working file is the sole copy and must be flagged (not treated as safe
+	/// to delete).
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn diverged_tracked_content_flags_a_file_whose_object_is_missing() {
+		use std::sync::atomic::{AtomicU32, Ordering};
+
+		use cap_std::ambient_authority;
+		use cap_std::fs::Dir;
+		use gitana_file_store_local::{CapWorkDir, LocalFileStore};
+		use gitana_object_store::ObjectStore;
+		use gitana_repository::Repository;
+
+		use crate::IndexEntry;
+		use crate::fsmeta::{mode_of, stat_of};
+
+		static SEQ: AtomicU32 = AtomicU32::new(0);
+		let root = std::env::temp_dir().join(format!(
+			"gitana-missingobj-{}-{}",
+			std::process::id(),
+			SEQ.fetch_add(1, Ordering::Relaxed)
+		));
+		let git_dir = root.join(".git");
+		std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+		std::fs::write(root.join("a.txt"), b"AAAA").unwrap();
+
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap(),
+		)));
+		let wt = WorkTree::new(
+			repo,
+			CapWorkDir::from_dir(Dir::open_ambient_dir(&root, ambient_authority()).unwrap()),
+			&git_dir,
+		);
+
+		// The entry's oid *matches* the working file's content — but nothing was written to the object store.
+		let meta = wt.work().lstat("a.txt").unwrap().expect("a.txt exists");
+		let entry = IndexEntry::<Sha256> {
+			stat: stat_of(&meta),
+			mode: mode_of(&meta),
+			oid: ObjectId::<Sha256>::compute(ObjectKind::Blob, b"AAAA"),
+			stage: 0,
+			assume_valid: false,
+			skip_worktree: false,
+			path: "a.txt".to_owned(),
+		};
+		let mut index = Index::new();
+		index.entries.push(entry);
+		wt.save_index(&index).await.unwrap();
+
+		let diverged = diverged_tracked_content(&wt).await.unwrap();
+		assert_eq!(
+			diverged,
+			vec!["a.txt".to_owned()],
+			"a hash-matching file whose object is missing is the sole copy — must be flagged, not deletable"
+		);
+
+		let _ = std::fs::remove_dir_all(&root);
 	}
 }

@@ -1839,6 +1839,7 @@ name = "gitana-worktree"
 version = "0.1.0"
 dependencies = [
  "cap-std 4.0.2",
+ "gitana-config",
  "gitana-file-store",
  "gitana-file-store-local",
  "gitana-object",

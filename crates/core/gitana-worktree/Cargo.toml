@@ -10,6 +10,7 @@ version = "0.1.0"
 workspace = true
 
 [dependencies]
+gitana-config.workspace = true
 gitana-file-store.workspace = true
 gitana-file-store-local.workspace = true
 gitana-object.workspace = true

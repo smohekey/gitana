@@ -89,22 +89,39 @@ fn is_per_worktree(path: &str) -> bool {
 	if let Some(base) = path.strip_suffix(".lock") {
 		return is_per_worktree(base);
 	}
-	matches!(
-		path,
-		"HEAD"
-			| "ORIG_HEAD"
-			| "FETCH_HEAD"
-			| "MERGE_HEAD"
-			| "MERGE_MSG"
-			| "CHERRY_PICK_HEAD"
-			| "REVERT_HEAD"
-			| "COMMIT_EDITMSG"
-			| "index"
-	) || path == "logs/HEAD"
+	// A one-level **pseudoref** — `HEAD`, `ORIG_HEAD`, `FETCH_HEAD`, `MERGE_HEAD`, a custom `CUSTOM_REF`, … —
+	// is per-worktree, matching git's `is_pseudoref_syntax` (a top-level name of only uppercase letters, digits,
+	// and underscores). Enumerating just the well-known ones misroutes any other pseudoref (e.g. one a symbolic
+	// `HEAD` points at) to the shared common dir, where it is not found — so the value silently reads back as
+	// absent. `index`, `config.worktree`, `logs/HEAD`, `sharedindex.<oid>` are per-worktree too but are not
+	// pseudoref-shaped (lowercase / `.` / `/`), so they are matched explicitly.
+	if is_pseudoref(path) {
+		return true;
+	}
+	path == "index"
+		|| path == "config.worktree"
+		|| path == "logs/HEAD"
 		|| path.starts_with("REBASE_")
 		|| path.starts_with("refs/worktree/")
 		|| path.starts_with("refs/bisect/")
 		|| path.starts_with("refs/rewritten/")
+		// `sharedindex.<oid>` — a split index's shared base — lives beside the per-worktree `index` in the
+		// worktree's own git dir, and `config.worktree` holds a linked worktree's `extensions.worktreeConfig`
+		// overrides. Both are private to the checkout, not shared.
+		|| path.starts_with("sharedindex.")
+}
+
+/// Whether `path` is a git **pseudoref**: a top-level name of only ASCII **uppercase letters, `_`, and `-`** —
+/// git's `is_pseudoref_syntax` exactly (`isupper(c) || c == '_' || c == '-'`). Note this **excludes digits**,
+/// so `CUSTOM-REF` is a pseudoref (per-worktree) but `CUSTOM1` is not (shared) — matching git's own routing.
+/// Pseudorefs (`HEAD`, `ORIG_HEAD`, `MERGE_HEAD`, and any custom `SOME-REF`) live per-worktree, so they must
+/// resolve against the worktree's own git dir. `REBASE_*` state files also match this shape (correct — they
+/// are per-worktree too).
+fn is_pseudoref(path: &str) -> bool {
+	!path.is_empty()
+		&& path
+			.bytes()
+			.all(|b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
 }
 
 impl FileStore for WorktreeFileStore {
@@ -226,19 +243,33 @@ mod tests {
 			"refs/worktree/foo.lock",
 			"refs/bisect/bad",
 			"refs/rewritten/onto",
+			// Any one-level *pseudoref* is per-worktree — git's `is_pseudoref_syntax`: uppercase letters, `_`, and
+			// `-` (NOT digits). Not just the well-known ones: `AUTO_MERGE` (a real git pseudoref we don't
+			// enumerate), a custom `CUSTOM-REF` (note the hyphen), or one a symbolic-ref chain resolves through.
+			"AUTO_MERGE",
+			"CUSTOM_REF",
+			"CUSTOM-REF",
+			"CUSTOM-REF.lock",
+			"BISECT_EXPECTED_REV",
 		] {
 			assert!(is_per_worktree(path), "{path} should be per-worktree");
 		}
-		// Shared across linked worktrees → the common dir (including a shared ref's `.lock`).
+		// Shared across linked worktrees → the common dir (including a shared ref's `.lock`). A top-level name
+		// that is *not* pseudoref-shaped stays shared: lowercase / mixed-case, a `.`, or — matching git — a digit.
 		for path in [
 			"config",
 			"packed-refs",
 			"objects/aa/bbcc",
 			"refs/heads/main",
 			"refs/heads/main.lock",
+			"refs/heads/UPPER", // uppercase, but not top-level (under refs/) → shared
 			"refs/tags/v1",
 			"refs/remotes/origin/main",
 			"logs/refs/heads/main",
+			"Mixed_Case", // has lowercase → not a pseudoref
+			"gitk.cache", // lowercase + `.` → not a pseudoref
+			"CUSTOM1",    // git's grammar excludes digits → shared
+			"SHA256",     // digits → shared
 		] {
 			assert!(!is_per_worktree(path), "{path} should be shared");
 		}

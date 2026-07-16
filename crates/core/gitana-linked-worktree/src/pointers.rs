@@ -490,12 +490,24 @@ pub(crate) fn is_valid_refname(name: &str) -> bool {
 /// A ref that lives in the *per-worktree* namespace (read from the worktree git dir) rather than the
 /// shared common dir — git's per-worktree refs.
 fn is_per_worktree_ref(name: &str) -> bool {
-	// A one-level pseudoref (`HEAD`, `ORIG_HEAD`, a custom `CUSTOM_REF`) lives per-worktree, as do the
-	// `refs/{worktree,bisect,rewritten}/` namespaces; everything else is shared in the common dir.
-	!name.contains('/')
+	// A **pseudoref** (`HEAD`, `ORIG_HEAD`, a custom `CUSTOM-REF`) lives per-worktree, as do the
+	// `refs/{worktree,bisect,rewritten}/` namespaces; everything else is shared in the common dir. A pseudoref
+	// is git's `is_pseudoref_syntax`: a top-level name of only uppercase letters, `_`, and `-` — which **excludes
+	// digits** (so `CUSTOM1` is shared), matching git and the `WorktreeFileStore` routing that resolves the
+	// object.
+	is_pseudoref_name(name)
 		|| name.starts_with("refs/worktree/")
 		|| name.starts_with("refs/bisect/")
 		|| name.starts_with("refs/rewritten/")
+}
+
+/// git's `is_pseudoref_syntax`: a non-empty top-level name of only ASCII uppercase letters, `_`, and `-`
+/// (digits excluded). Must stay in lock-step with `gitana_file_store_local`'s equivalent routing predicate.
+fn is_pseudoref_name(name: &str) -> bool {
+	!name.is_empty()
+		&& name
+			.bytes()
+			.all(|b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
 }
 
 /// Follow a symbolic-ref chain from `start` to its terminal ref name (`refs/heads/alias` →
@@ -687,7 +699,12 @@ pub(crate) fn admin_dirs_for(
 
 /// Whether `path` is itself a symlink (its final component), without following it.
 pub(crate) fn is_leaf_symlink(path: &Path) -> bool {
-	std::fs::symlink_metadata(path)
+	// Strip trailing separators (and normalise `.`) via `components`: a trailing `/` — `.../wt-link/` — makes
+	// `symlink_metadata` *follow* the leaf symlink (POSIX trailing-slash semantics), hiding it and letting a
+	// later canonical delete resolve to, and destroy, the symlink's target. Stat the bare leaf so the symlink
+	// itself is seen (no-follow).
+	let leaf = path.components().as_path();
+	std::fs::symlink_metadata(leaf)
 		.map(|m| m.file_type().is_symlink())
 		.unwrap_or(false)
 }

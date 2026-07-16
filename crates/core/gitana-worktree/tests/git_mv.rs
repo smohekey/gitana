@@ -45,6 +45,7 @@ async fn mv_rejects_unsafe_index_source() {
 		oid: blob,
 		stage: 0,
 		assume_valid: false,
+		skip_worktree: false,
 		path: ".git/config".to_owned(),
 	});
 	wt.save_index(&index).await.unwrap();

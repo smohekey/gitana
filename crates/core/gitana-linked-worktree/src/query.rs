@@ -48,4 +48,11 @@ pub struct WorktreeQuery {
 	/// diverged** onto unrelated history (a conflict), rather than calling any differing object "advanced".
 	/// `None` means no start expectation (pure inspection).
 	pub start: Option<WorktreeObjectId>,
+	/// Whether inspection should also compute the working-tree **status** of a live checkout (the cost of a
+	/// full worktree scan), populating [`WorktreeInspection::status`](crate::WorktreeInspection::status) so
+	/// `classify` can report a dirty/conflicted worktree as `ProtectedWithReason::Dirty`. `false` (the
+	/// default for a pure inspection) skips the scan — status is only needed before a cleanup decision
+	/// (removal), so a plain `inspect` stays cheap. Only a present, cross-pointer-consistent live checkout is
+	/// statused; a missing/partial checkout has no status to compute.
+	pub with_status: bool,
 }

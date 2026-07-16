@@ -126,6 +126,7 @@ where
 							oid: *oid,
 							stage: 0,
 							assume_valid: false,
+							skip_worktree: false,
 							path: path.to_owned(),
 						});
 					}

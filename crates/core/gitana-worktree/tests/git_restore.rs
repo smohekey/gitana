@@ -567,6 +567,7 @@ async fn restore_rejects_unsafe_index_path() {
 		oid: blob,
 		stage: 0,
 		assume_valid: false,
+		skip_worktree: false,
 		path: escape_spec,
 	});
 	wt.save_index(&index).await.unwrap();
