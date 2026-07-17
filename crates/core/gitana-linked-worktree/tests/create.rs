@@ -8,8 +8,8 @@ use std::os::unix::fs::symlink;
 
 use common::*;
 use gitana_linked_worktree::{
-	BranchName, CheckoutTarget, CreateError, CreateRequest, Registration, WorktreeClassification,
-	WorktreeObjectId, create,
+	BranchName, CheckoutTarget, CreateError, CreateRequest, Registration, RemoveRequest,
+	RepositoryId, WorktreeClassification, WorktreeObjectId, create, remove,
 };
 
 fn req(work: &std::path::Path, dest: &std::path::Path, target: CheckoutTarget) -> CreateRequest {
@@ -765,123 +765,83 @@ async fn sanitizes_a_pathological_basename_like_git() {
 }
 
 #[tokio::test]
-async fn refuses_a_non_utf8_basename_without_writing() {
-	// The admin name is serialized into the cross-pointers via `display()` (and read back with
-	// `read_to_string`), which can't round-trip a non-UTF-8 basename yet — so it is refused *before* any
-	// branch/admin/checkout is written, not late with partial state.
+async fn accepts_a_non_utf8_destination_and_round_trips() {
+	// Requirement (docs/code-henge-linked-worktree-requirements.md): identity/operation paths are accepted
+	// as **native** paths without UTF-8 conversion. A non-UTF-8 destination is created; its cross-pointers
+	// round-trip **byte-clean** (an idempotent re-create reads them back, and stock git operates in the
+	// worktree); and it removes cleanly. A filesystem that rejects non-UTF-8 filenames (macOS APFS/HFS+)
+	// can't host the scenario — probe and skip there; the check runs for real on Linux/ext4.
 	use std::os::unix::ffi::OsStrExt;
 	for (fmt, kind) in formats() {
-		let base = unique_tmp(&format!("create-nonutf8-{fmt}"));
+		let base = unique_tmp(&format!("create-nonutf8-ok-{fmt}"));
 		let work = base.join("repo");
 		init_repo(&work, fmt);
 		let head = commit_file(&work, "a.txt", "1\n", "init");
 		let start = WorktreeObjectId::parse(kind, &head).unwrap();
-		// `0xff` is not valid UTF-8, but is a legal Unix path byte.
-		let bad = std::ffi::OsStr::from_bytes(b"wt\xffx");
-		let dest = base.join(bad);
-		let err = create(&req(&work, &dest, new_branch("feature", start)), None)
-			.await
-			.unwrap_err();
-		assert!(matches!(err, CreateError::Failed(_)), "{fmt}: got {err:?}");
-		// Nothing was published: no branch ref, no admin entry.
-		let w = work.to_str().unwrap();
-		assert!(!git_ok(&[
-			"-C",
-			w,
-			"rev-parse",
-			"--verify",
-			"refs/heads/feature"
-		]));
-		assert!(
-			!work.join(".git/worktrees").exists()
-				|| std::fs::read_dir(work.join(".git/worktrees"))
-					.map(|mut d| d.next().is_none())
-					.unwrap_or(true),
-			"{fmt}: no admin dir written"
-		);
-		let _ = std::fs::remove_dir_all(&base);
-	}
-}
-
-#[tokio::test]
-async fn refuses_a_non_utf8_parent_without_writing() {
-	// The whole destination path (not just its basename) is serialized into the admin `gitdir`, so a
-	// non-UTF-8 *parent* with a clean basename is also refused up front — never late with partial state.
-	use std::os::unix::ffi::OsStrExt;
-	for (fmt, kind) in formats() {
-		let base = unique_tmp(&format!("create-nonutf8parent-{fmt}"));
-		let work = base.join("repo");
-		init_repo(&work, fmt);
-		let head = commit_file(&work, "a.txt", "1\n", "init");
-		let start = WorktreeObjectId::parse(kind, &head).unwrap();
-		// A non-UTF-8 parent directory component, but a clean UTF-8 basename.
-		let parent = base.join(std::ffi::OsStr::from_bytes(b"p\xffdir"));
-		let dest = parent.join("wt");
-		let err = create(&req(&work, &dest, new_branch("feature", start)), None)
-			.await
-			.unwrap_err();
-		assert!(matches!(err, CreateError::Failed(_)), "{fmt}: got {err:?}");
-		let w = work.to_str().unwrap();
-		assert!(!git_ok(&[
-			"-C",
-			w,
-			"rev-parse",
-			"--verify",
-			"refs/heads/feature"
-		]));
-		assert!(
-			!work.join(".git/worktrees").exists()
-				|| std::fs::read_dir(work.join(".git/worktrees"))
-					.map(|mut d| d.next().is_none())
-					.unwrap_or(true),
-			"{fmt}: no admin dir written"
-		);
-		let _ = std::fs::remove_dir_all(&base);
-	}
-}
-
-#[tokio::test]
-async fn refuses_a_utf8_alias_to_a_non_utf8_real_parent_without_writing() {
-	// The pointer files record the *resolved* destination, so a lexically-UTF-8 path through a symlink whose
-	// real parent is non-UTF-8 is refused too — validation resolves the path, not the lexical request.
-	use std::os::unix::ffi::OsStrExt;
-	for (fmt, kind) in formats() {
-		let base = unique_tmp(&format!("create-alias-{fmt}"));
-		let work = base.join("repo");
-		init_repo(&work, fmt);
-		let head = commit_file(&work, "a.txt", "1\n", "init");
-		let start = WorktreeObjectId::parse(kind, &head).unwrap();
-		// A real parent with a non-UTF-8 byte, and a UTF-8 symlink aliasing it. Some filesystems (macOS
-		// APFS/HFS+) reject a non-UTF-8 filename outright, so this aliased scenario can't exist there — skip.
-		let real = base.join(std::ffi::OsStr::from_bytes(b"real\xffdir"));
-		if std::fs::create_dir_all(&real).is_err() {
+		// `0xff` is not valid UTF-8 but is a legal Unix path byte. Probe filesystem support and skip if the
+		// name can't be created at all.
+		let dest = base.join(std::ffi::OsStr::from_bytes(b"wt\xffx"));
+		if std::fs::create_dir(&dest).is_err() {
 			let _ = std::fs::remove_dir_all(&base);
 			continue;
 		}
-		let alias = base.join("alias");
-		symlink(&real, &alias).unwrap();
-		let dest = alias.join("wt");
-		assert!(dest.to_str().is_some(), "the lexical destination is UTF-8");
+		std::fs::remove_dir(&dest).unwrap(); // `create` materialises it itself
 
-		let err = create(&req(&work, &dest, new_branch("feature", start)), None)
-			.await
-			.unwrap_err();
-		assert!(matches!(err, CreateError::Failed(_)), "{fmt}: got {err:?}");
-		let w = work.to_str().unwrap();
-		assert!(!git_ok(&[
-			"-C",
-			w,
-			"rev-parse",
-			"--verify",
-			"refs/heads/feature"
-		]));
+		// Create is accepted (not refused on UTF-8 grounds) and reports the worktree present.
+		let inspection = create(
+			&req(&work, &dest, new_branch("feature", start.clone())),
+			None,
+		)
+		.await
+		.expect("non-UTF-8 destination accepted");
 		assert!(
-			!work.join(".git/worktrees").exists()
-				|| std::fs::read_dir(work.join(".git/worktrees"))
-					.map(|mut d| d.next().is_none())
-					.unwrap_or(true),
-			"{fmt}: no admin dir written"
+			matches!(inspection.registration, Registration::Present { .. }),
+			"{fmt}: created at the non-UTF-8 destination"
 		);
+
+		// The worktree is **rediscoverable** through the public identity API: discovery parses the non-UTF-8
+		// `.git` and `commondir` pointers byte-clean and resolves the shared common dir (identity is the
+		// common dir, so this equals the repository's own id).
+		let discovered = RepositoryId::discover(&dest)
+			.await
+			.expect("rediscovered from the non-UTF-8 linked worktree");
+		assert_eq!(
+			discovered,
+			rid_at(&work),
+			"{fmt}: discovery resolves the same repository identity"
+		);
+
+		// The pointer files round-trip byte-clean: a repeat create is the idempotent no-op — which reads the
+		// admin `gitdir` and the checkout `.git` back — and stock git can operate in the worktree, resolving
+		// its non-UTF-8 gitfile/admin path.
+		assert!(
+			create(&req(&work, &dest, new_branch("feature", start)), None)
+				.await
+				.is_ok(),
+			"{fmt}: idempotent re-create over the non-UTF-8 pointers"
+		);
+		let out = std::process::Command::new("git")
+			.arg("-C")
+			.arg(&dest)
+			.args(["rev-parse", "HEAD"])
+			.output()
+			.unwrap();
+		assert!(
+			out.status.success(),
+			"{fmt}: stock git operates in the gta-created non-UTF-8 worktree"
+		);
+		assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), head);
+
+		// And safe removal round-trips the same non-UTF-8 identity.
+		remove(&RemoveRequest {
+			repo: rid_at(&work),
+			destination: dest.clone(),
+			expected_branch: None,
+		})
+		.await
+		.expect("non-UTF-8 worktree removed");
+		assert!(!dest.exists(), "{fmt}: checkout gone after remove");
+
 		let _ = std::fs::remove_dir_all(&base);
 	}
 }

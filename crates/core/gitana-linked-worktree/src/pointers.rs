@@ -94,12 +94,15 @@ fn is_registration(common: &Path, admin: &Path) -> Result<bool, LinkedWorktreeEr
 /// the admin, so it is not owned by `common`); an unreadable file is an `Err`.
 fn admin_commondir_is(common: &Path, admin: &Path) -> Result<bool, LinkedWorktreeError> {
 	let commondir = admin.join("commondir");
-	match std::fs::read_to_string(&commondir) {
-		Ok(raw) if !strip_eol(&raw).is_empty() => Ok(canonical_eq(
-			&resolve_pointer(admin, strip_eol(&raw)),
-			common,
-		)),
-		Ok(_) => Ok(false),
+	match std::fs::read(&commondir) {
+		// A present pointer that parses to a path names the common dir when it resolves to `common`; an
+		// empty or (non-Unix) non-representable pointer is simply "not owned by `common`" (fail-closed).
+		Ok(bytes) => {
+			match path_from_bytes(strip_eol_bytes(&bytes)).filter(|p| !p.as_os_str().is_empty()) {
+				Some(pointer) => Ok(canonical_eq(&resolve_pointer(admin, &pointer), common)),
+				None => Ok(false),
+			}
+		}
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
 		Err(e) => Err(LinkedWorktreeError::io(
 			"reading admin commondir",
@@ -167,14 +170,17 @@ pub(crate) fn admin_owned_by(common: &Path, admin: &Path) -> Result<bool, Linked
 /// destructive operation must not. An empty `gitdir` pointer is git's "invalid gitdir file" → prunable.
 pub(crate) fn admin_checkout_missing(admin: &Path) -> Result<bool, LinkedWorktreeError> {
 	let gitdir = admin.join("gitdir");
-	let text = std::fs::read_to_string(&gitdir)
+	let bytes = std::fs::read(&gitdir)
 		.map_err(|e| LinkedWorktreeError::io("reading admin gitdir", &gitdir, e))?;
-	let pointer = Path::new(strip_eol(&text));
-	if pointer.as_os_str().is_empty() {
+	// An empty pointer is git's "invalid gitdir file" → prunable; a (non-Unix) non-representable pointer is
+	// likewise treated as prunable (fail-closed — it names no checkout this platform can resolve).
+	let Some(pointer) =
+		path_from_bytes(strip_eol_bytes(&bytes)).filter(|p| !p.as_os_str().is_empty())
+	else {
 		return Ok(true);
-	}
+	};
 	let git_file = if pointer.is_absolute() {
-		pointer.to_path_buf()
+		pointer
 	} else {
 		admin.join(pointer)
 	};
@@ -394,18 +400,20 @@ pub(crate) fn worktree_git_dirs(common_dir: &Path) -> Result<Vec<PathBuf>, Linke
 /// no parent directory) is a hard error — a fabricated path would mislead enumeration and inspection.
 pub(crate) fn worktree_path_of(git_dir: &Path) -> Result<PathBuf, LinkedWorktreeError> {
 	let gitdir = git_dir.join("gitdir");
-	match std::fs::read_to_string(&gitdir) {
-		Ok(text) => {
-			let pointer = Path::new(strip_eol(&text));
-			// An empty/parent-less pointer is malformed, not a main-worktree fallback.
-			if pointer.as_os_str().is_empty() {
+	match std::fs::read(&gitdir) {
+		Ok(bytes) => {
+			// An empty/parent-less pointer, or a (non-Unix) non-representable one, is malformed — not a
+			// main-worktree fallback.
+			let Some(pointer) =
+				path_from_bytes(strip_eol_bytes(&bytes)).filter(|p| !p.as_os_str().is_empty())
+			else {
 				return Err(LinkedWorktreeError::MalformedPointer {
 					kind: crate::error::PointerKind::AdminGitdir,
 					path: gitdir,
 				});
-			}
+			};
 			let git_file = if pointer.is_absolute() {
-				pointer.to_path_buf()
+				pointer
 			} else {
 				git_dir.join(pointer)
 			};
@@ -641,11 +649,67 @@ fn strip_eol(s: &str) -> &str {
 	s.trim_end_matches(['\n', '\r'])
 }
 
-/// A pointer string (already stripped of its line terminator via [`strip_eol`]) resolved against `base`
-/// when relative, else taken as-is (git records either form — relative under `worktree.useRelativePaths`).
-/// Significant whitespace in the path is preserved (not trimmed), matching git.
-fn resolve_pointer(base: &Path, pointer: &str) -> PathBuf {
-	let pointer = Path::new(pointer);
+/// Strip a trailing line terminator (`\n`/`\r`) from raw pointer-file bytes — the byte-level counterpart of
+/// [`strip_eol`], so a pointer path is parsed without a lossy UTF-8 round-trip.
+fn strip_eol_bytes(bytes: &[u8]) -> &[u8] {
+	let mut end = bytes.len();
+	while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
+		end -= 1;
+	}
+	&bytes[..end]
+}
+
+/// A path parsed from raw pointer-file bytes. **Byte-clean on Unix** (`OsStrExt::from_bytes`), so a
+/// non-UTF-8 identity path round-trips exactly (requirement: native paths accepted without UTF-8
+/// conversion). On non-Unix, where byte-clean (WTF-8) pointer I/O is a deferred follow-up, this **fails
+/// closed** — `None` for bytes that are not valid UTF-8 — rather than lossily map them to a *different*
+/// path (which could resolve to the wrong repository); the caller then treats `None` as malformed metadata.
+pub(crate) fn path_from_bytes(bytes: &[u8]) -> Option<PathBuf> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::ffi::OsStrExt;
+		Some(PathBuf::from(OsStr::from_bytes(bytes)))
+	}
+	#[cfg(not(unix))]
+	{
+		std::str::from_utf8(bytes).ok().map(PathBuf::from)
+	}
+}
+
+/// An `OsString` built from raw bytes for the **write** side (constructing the admin-directory name).
+/// Byte-clean on Unix; on non-Unix a lossy UTF-8 rendering — safe because `create`'s representability
+/// preflight rejects a non-UTF-8 *destination* there before anything is written, so a non-UTF-8 basename
+/// never actually reaches a write. (Reads use the fail-closed [`path_from_bytes`] instead.)
+pub(crate) fn os_string_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
+	#[cfg(unix)]
+	{
+		use std::os::unix::ffi::OsStrExt;
+		OsStr::from_bytes(bytes).to_os_string()
+	}
+	#[cfg(not(unix))]
+	{
+		std::ffi::OsString::from(String::from_utf8_lossy(bytes).into_owned())
+	}
+}
+
+/// The raw pointer-file bytes for a path — the inverse of [`path_from_bytes`], used to serialise the admin
+/// `gitdir` back-pointer and the checkout `.git` gitfile without losing a non-UTF-8 byte.
+pub(crate) fn path_to_bytes(path: &Path) -> Vec<u8> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::ffi::OsStrExt;
+		path.as_os_str().as_bytes().to_vec()
+	}
+	#[cfg(not(unix))]
+	{
+		path.to_string_lossy().into_owned().into_bytes()
+	}
+}
+
+/// A pointer path (already stripped of its line terminator) resolved against `base` when relative, else
+/// taken as-is (git records either form — relative under `worktree.useRelativePaths`). Significant
+/// whitespace in the path is preserved (not trimmed), matching git.
+fn resolve_pointer(base: &Path, pointer: &Path) -> PathBuf {
 	if pointer.is_absolute() {
 		pointer.to_path_buf()
 	} else {
@@ -674,28 +738,36 @@ pub(crate) fn gitfile_target(gitfile: &Path) -> Result<Option<PathBuf>, LinkedWo
 		kind: crate::error::PointerKind::GitFile,
 		path: gitfile.to_path_buf(),
 	};
-	let content = std::fs::read_to_string(gitfile)
-		.map_err(|e| LinkedWorktreeError::io("reading gitfile", gitfile, e))?;
+	let content =
+		std::fs::read(gitfile).map_err(|e| LinkedWorktreeError::io("reading gitfile", gitfile, e))?;
 	// git: require the `gitdir: ` prefix, then the path is *everything* after it with only the trailing
 	// line terminator removed — interior newlines and other whitespace are part of the path (git accepts a
 	// gitfile whose admin path legitimately contains a newline; verified). So the whole remainder is the
 	// path, not just the first line — extra data therefore makes the pointer *not match* the admin (an
-	// inconsistency), never silently the first line. Only a truly empty path is malformed.
-	let raw = strip_eol(content.strip_prefix("gitdir: ").ok_or_else(malformed)?);
+	// inconsistency), never silently the first line. Only a truly empty path is malformed. Parsed
+	// byte-clean, so a non-UTF-8 admin path round-trips.
+	let raw = strip_eol_bytes(
+		content
+			.strip_prefix(b"gitdir: ".as_slice())
+			.ok_or_else(malformed)?,
+	);
 	if raw.is_empty() {
 		return Err(malformed());
 	}
+	// A (non-Unix) non-representable pointer is malformed metadata, not a lossily-mapped different path.
+	let pointer = path_from_bytes(raw).ok_or_else(malformed)?;
 	Ok(Some(resolve_pointer(
 		gitfile.parent().ok_or_else(malformed)?,
-		raw,
+		&pointer,
 	)))
 }
 
 /// The `.git`-file path an admin directory's `gitdir` records (the checkout it claims), resolved to an
-/// absolute path. `None` when the `gitdir` file is unreadable.
+/// absolute path. `None` when the `gitdir` file is unreadable or (non-Unix) not representable.
 pub(crate) fn admin_gitdir_target(admin: &Path) -> Option<PathBuf> {
-	let raw = std::fs::read_to_string(admin.join("gitdir")).ok()?;
-	Some(resolve_pointer(admin, strip_eol(&raw)))
+	let bytes = std::fs::read(admin.join("gitdir")).ok()?;
+	let pointer = path_from_bytes(strip_eol_bytes(&bytes))?;
+	Some(resolve_pointer(admin, &pointer))
 }
 
 /// Every admin directory under `<common>/worktrees/*` whose recorded checkout is `target` — normally
@@ -734,4 +806,48 @@ pub(crate) fn is_leaf_symlink(path: &Path) -> bool {
 	std::fs::symlink_metadata(leaf)
 		.map(|m| m.file_type().is_symlink())
 		.unwrap_or(false)
+}
+
+#[cfg(all(test, unix))]
+mod byte_pointer_tests {
+	use super::{path_from_bytes, path_to_bytes, strip_eol_bytes};
+	use std::os::unix::ffi::OsStrExt;
+	use std::path::Path;
+
+	#[test]
+	fn path_bytes_round_trip_including_non_utf8() {
+		// A non-UTF-8 identity path survives serialize→parse exactly (no UTF-8 conversion), so a pointer
+		// file records and reads back the native path — the requirement byte-clean pointer I/O satisfies.
+		for raw in [
+			b"/tmp/wt".as_slice(),
+			b"/tmp/wt\xffx",       // lone 0xff — invalid UTF-8, legal Unix byte
+			b"/p\xff/q\xfer/.git", // multiple non-UTF-8 bytes across components
+			b"/tmp/has space/and\ttab",
+		] {
+			let path = Path::new(std::ffi::OsStr::from_bytes(raw));
+			assert_eq!(path_to_bytes(path), raw, "serialize preserves bytes");
+			// On Unix `path_from_bytes` is always `Some` (byte-clean).
+			assert_eq!(
+				path_from_bytes(raw).unwrap().as_os_str().as_bytes(),
+				raw,
+				"parse preserves bytes"
+			);
+			assert_eq!(
+				&path_from_bytes(&path_to_bytes(path)).unwrap(),
+				path,
+				"round-trip is identity"
+			);
+		}
+	}
+
+	#[test]
+	fn strip_eol_bytes_trims_only_trailing_terminators() {
+		assert_eq!(strip_eol_bytes(b"/tmp/wt\n"), b"/tmp/wt");
+		assert_eq!(strip_eol_bytes(b"/tmp/wt\r\n"), b"/tmp/wt");
+		assert_eq!(strip_eol_bytes(b"/tmp/wt"), b"/tmp/wt");
+		// An interior newline (a git-legal path byte) is preserved.
+		assert_eq!(strip_eol_bytes(b"/tmp/a\nb\n"), b"/tmp/a\nb");
+		// A trailing non-UTF-8 byte is not a terminator.
+		assert_eq!(strip_eol_bytes(b"/tmp/wt\xff"), b"/tmp/wt\xff");
+	}
 }

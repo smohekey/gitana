@@ -295,9 +295,11 @@ is the final hardening slice.
 4. **CLI rewire** — point `commands/worktree.rs` + `repo.rs` at the library; keep DWIM/force/
    `--porcelain`/suffix resolution on top. Behavior-preserving; existing git-parity tests stay green.
 5. **Concurrency + native-path hardening** — registration-level CAS, lost-race-as-conflict, full
-   `OsStr` identity paths, lock-file races. *(First installment landed: the round-4 create-hardening
-   tranche — F1 post-condition, F3 atomic pointers, F4 name sanitization. Remaining items — registration
-   CAS on create/remove, lock-file races, the broader `OsStr` boundary sweep — follow the remove slice.)*
+   `OsStr` identity paths, lock-file races. *(Installments landed: the round-4 create-hardening tranche —
+   F1 post-condition, F3 atomic pointers, F4 name sanitization; and the **native-path tranche** — byte-clean
+   Unix pointer I/O so non-UTF-8 identity paths are accepted and round-trip (see the create-hardening section
+   below). Remaining items — registration CAS on create/remove, lock-file races, and Windows WTF-8 pointer
+   I/O.)*
 
 ### Slice-5 create hardening (DONE) and the one item deferred to slice 3
 
@@ -325,11 +327,14 @@ pointer-publication hardening:
   (control, space, DEL, `* : ? [ \ ^ ~`) → `-`, a leading `.` neutralised, a `..` run collapsed, an `@{`
   sequence broken, a bare `@` → `-`, a trailing `.lock` stripped; valid multi-byte (≥ 0x80) sequences pass
   through — while the admin `gitdir` still records the real (unsanitized) destination path. So the admin path
-  can never carry the newline/CR that would break the gitfile cross-pointers. **Non-UTF-8 handling is not yet
-  complete:** because the cross-pointers still serialize/parse via `Path::display()` / `read_to_string`, a
-  non-UTF-8 byte anywhere in the *resolved* destination or common-dir path is **rejected up front** (on the
-  write path, so an idempotent no-op is never falsely refused) rather than written lossily. Byte-clean
-  pointer I/O — the "full `OsStr` at every boundary" requirement — remains **deferred**.
+  can never carry the newline/CR that would break the gitfile cross-pointers. **Non-UTF-8 paths are now
+  accepted (slice-5 native-path tranche):** the cross-pointers (`gitdir`, `commondir`, checkout `.git`) are
+  serialized and parsed **byte-clean** on Unix (`OsStrExt`, `pointers::path_to_bytes`/`path_from_bytes`), so a
+  non-UTF-8 identity path round-trips exactly — the up-front UTF-8 rejection is gone, and a create/inspect/remove
+  round-trips a non-UTF-8 destination (oracle-tested vs stock git on Linux/ext4; the test probes and skips on a
+  filesystem that rejects non-UTF-8 filenames, e.g. macOS APFS/HFS+). **Remaining follow-up:** byte-clean
+  pointer I/O on **non-Unix** (Windows WTF-8) still falls back to a lossy UTF-8 rendering — the current consumer
+  is Unix/macOS, so full Windows `OsStr` handling is deferred.
 
 **Resolved in slice 3 (was deferred from slice 2):**
 
@@ -470,11 +475,13 @@ pointer-publication hardening:
   The behavior is **safe** (a conservative refusal, never data loss) and matches how the CLI already refuses
   submodule worktrees; the real fix is git-faithful gitlink handling in `gitana-worktree`'s checkout/status
   (a cross-crate change the CLI's `worktree add`/`status` need too), so it stays deferred there.
-- **Discover-time git-faithful gitfile parsing.** `RepositoryId::discover` delegates `.git`-pointer
-  parsing to `gitana-repository-layout`, which takes the first line and trims — so a repository whose git
-  dir path ends in a space or contains a newline (both git-legal, and handled by `at_common_dir` +
-  inspection here) fails `discover`. Aligning the layout crate's parser with the full-body,
-  whitespace-preserving rules used in `pointers::gitfile_target` is a cross-crate follow-up.
+- **Discover-time git-faithful gitfile parsing (partly closed).** `RepositoryId::discover` delegates
+  `.git`/`commondir` parsing to `gitana-repository-layout`, which now reads them **byte-clean** (the
+  slice-5 native-path tranche), so a non-UTF-8 admin/common path is rediscoverable. It still **takes the
+  first line and trims**, so a repository whose git-dir path ends in a space or contains an interior
+  newline (both git-legal, and handled by `at_common_dir` + inspection here via the full-body,
+  whitespace-preserving `pointers::gitfile_target`) still fails `discover`. Aligning the layout crate's
+  parser with those full-body rules is the remaining cross-crate follow-up.
 - **Per-worktree pseudoref object resolution.** A HEAD chain terminating in a one-level pseudoref that
   *directly* holds an object id (`HEAD -> refs/heads/alias -> CUSTOM_REF`, `CUSTOM_REF` an admin-local
   OID) resolves the terminal *name* correctly, but the object read routes through

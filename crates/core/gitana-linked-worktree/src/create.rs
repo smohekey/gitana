@@ -10,6 +10,7 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
+	use std::ffi::OsStr;
 	use std::path::{Path, PathBuf};
 	use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -375,17 +376,15 @@ mod native {
 			None => None,
 		};
 
-		// Choose the admin directory and validate — **before any mutation** — that the two paths the pointer
-		// files will record are UTF-8: the admin `gitdir` serializes the *resolved* destination and the
-		// checkout `.git` serializes the *resolved* admin path, both via `Path::display()`, which can't
-		// round-trip a non-UTF-8 byte through the (not-yet-byte-clean) pointer I/O. We resolve the deepest
-		// existing ancestor (so a *symlinked* parent — the form actually written — is what's checked, not the
-		// lexical request) and this runs only on the write path, so an idempotent no-op is never falsely
-		// refused. (Byte-clean pointer I/O is the deferred "full OsStr at every boundary" work; a newline in
-		// the basename is valid UTF-8 and is sanitized, not rejected.)
+		// Choose the admin directory. The pointer files (admin `gitdir` → the checkout `.git`, checkout
+		// `.git` → the admin) are serialized **byte-clean** (see `pointers::path_to_bytes`), so a non-UTF-8
+		// identity path round-trips exactly — native paths are accepted without UTF-8 conversion, as required.
 		let admin = unique_admin_dir(common, destination)?;
-		ensure_utf8_path(&resolved_for_pointers(destination))?;
-		ensure_utf8_path(&resolved_for_pointers(&admin))?;
+		// On a platform without byte-clean pointer I/O (non-Unix), a non-representable path can't round-trip
+		// the pointers, so reject it **up front** — before the branch/admin/checkout are written — rather than
+		// mutate then fail the post-write inspection. A no-op on Unix (the pointers are byte-clean there).
+		ensure_representable_path(destination)?;
+		ensure_representable_path(&admin)?;
 
 		// Create the branch through the transactional ref layer (CAS: it must not already exist).
 		if create_branch {
@@ -471,23 +470,25 @@ mod native {
 	/// git sanitizes it (see [`sanitize_worktree_name`]) and uniquified against the existing
 	/// `<common>/worktrees/*` (git appends `1`, `2`, … to the sanitized name on collision).
 	fn unique_admin_dir(common: &Path, destination: &Path) -> Result<PathBuf, LinkedWorktreeError> {
-		// Sanitizing valid UTF-8 keeps it valid UTF-8 — replacements are ASCII `-` and bytes ≥ 0x80 (the
-		// continuation bytes of any multi-byte char) are never touched.
-		let base = String::from_utf8(sanitize_worktree_name(
-			admin_base_name(destination)?.as_bytes(),
-		))
-		.expect("sanitizing valid UTF-8 yields valid UTF-8");
+		// Sanitize the basename's bytes into a refname-safe admin name (git keeps bytes ≥ 0x80 — so a
+		// non-UTF-8 basename keeps its high bytes — and maps only refname-invalid ASCII); the admin `gitdir`
+		// still records the *real* (unsanitized) destination path, byte-clean.
+		let base = sanitize_worktree_name(&crate::pointers::path_to_bytes(Path::new(admin_base_name(
+			destination,
+		)?)));
 		let worktrees = common.join("worktrees");
 		// A candidate is free only when *nothing* — not even a dangling symlink — sits at the path, so
 		// probe with non-following `symlink_metadata`: `Path::exists()` reports a broken symlink as absent
 		// and we would then pick an occupied name and fail `create_dir_all` *after* publishing the branch.
 		let occupied = |path: &Path| path.symlink_metadata().is_ok();
-		// git appends the numeric suffix to the *sanitized* name (digits are always refname-safe).
+		// git appends the numeric suffix to the *sanitized* name (digits are always refname-safe). Build the
+		// name in bytes so a non-UTF-8 sanitized name is preserved.
 		let candidate = |suffix: Option<u32>| -> PathBuf {
-			match suffix {
-				Some(n) => worktrees.join(format!("{base}{n}")),
-				None => worktrees.join(&base),
+			let mut name = base.clone();
+			if let Some(n) = suffix {
+				name.extend_from_slice(n.to_string().as_bytes());
 			}
+			worktrees.join(crate::pointers::os_string_from_bytes(&name))
 		};
 		let first = candidate(None);
 		if !occupied(&first) {
@@ -502,11 +503,51 @@ mod native {
 		unreachable!("a free worktree admin name always exists")
 	}
 
-	/// The form of `path` the pointer files will actually record — what `write_admin_layout` gets from
-	/// `create_dir_all` + `canonicalize`. Built by walking components from the root and canonicalizing each
-	/// existing prefix eagerly, so a **symlinked** parent is resolved to its real target (exactly as the OS
-	/// resolves it), a `..` correctly pops the *resolved* location, and the still-absent tail (which can hold
-	/// no symlinks) is appended lexically. Used to UTF-8-check the *resolved* path, not the lexical request.
+	/// The destination's basename as a native `OsStr` — **no UTF-8 requirement** (it becomes the sanitized
+	/// admin directory name, and the pointer files record the real path byte-clean). An absent basename (a
+	/// path ending in `/` or `..`) is an error.
+	fn admin_base_name(destination: &Path) -> Result<&OsStr, LinkedWorktreeError> {
+		destination.file_name().ok_or_else(|| {
+			LinkedWorktreeError::io(
+				"deriving worktree name",
+				destination,
+				std::io::Error::from(std::io::ErrorKind::InvalidInput),
+			)
+		})
+	}
+
+	/// Ensure a path can round-trip the (byte-clean) pointer I/O before any state is written. On **Unix**
+	/// the pointers are byte-clean, so this is a no-op — a non-UTF-8 path is accepted. On **non-Unix**, where
+	/// `path_to_bytes` still falls back to a *lossy* UTF-8 rendering, a non-UTF-8 path would serialize to a
+	/// back-pointer that no longer identifies the destination; reject it here (before the branch/admin/
+	/// checkout are written) so `create` never mutates state it would then fail to establish. Windows WTF-8
+	/// pointer I/O is a deferred follow-up.
+	#[cfg(unix)]
+	fn ensure_representable_path(_path: &Path) -> Result<(), LinkedWorktreeError> {
+		Ok(())
+	}
+
+	#[cfg(not(unix))]
+	fn ensure_representable_path(path: &Path) -> Result<(), LinkedWorktreeError> {
+		// Check the **resolved** form the pointer files will actually record — a symlink/junction can resolve
+		// a UTF-8 lexical path to a non-representable one, which would then serialize lossily *after* the
+		// branch/admin/checkout are written. Rejecting it here keeps `create` side-effect-free on failure.
+		if resolved_for_pointers(path).to_str().is_some() {
+			Ok(())
+		} else {
+			Err(LinkedWorktreeError::io(
+				"non-UTF-8 path is unsupported on this platform (byte-clean pointer I/O is Unix-only)",
+				path,
+				std::io::Error::from(std::io::ErrorKind::InvalidInput),
+			))
+		}
+	}
+
+	/// The form of `path` the pointer files will actually record — its deepest existing ancestor
+	/// canonicalized (so a symlinked parent is resolved to its real target, exactly as `create_dir_all` +
+	/// `canonicalize` would), with the still-absent tail appended lexically. Used only by the non-Unix
+	/// representability preflight; on Unix the pointers are byte-clean so no such check is needed.
+	#[cfg(not(unix))]
 	fn resolved_for_pointers(path: &Path) -> PathBuf {
 		use std::path::Component;
 		let mut resolved = PathBuf::new();
@@ -520,8 +561,6 @@ mod native {
 				}
 				Component::Normal(name) => {
 					resolved.push(name);
-					// Resolve while the prefix still exists, so a symlink becomes its real target; once we pass
-					// the deepest existing ancestor this fails and the (symlink-free) tail stays lexical.
 					if let Ok(canonical) = resolved.canonicalize() {
 						resolved = canonical;
 					}
@@ -529,39 +568,6 @@ mod native {
 			}
 		}
 		resolved
-	}
-
-	/// Reject a path that carries a non-UTF-8 byte anywhere — it would serialize lossily through the
-	/// `Path::display()`-based cross-pointer I/O (see [`admin_base_name`]). A no-op for the UTF-8 paths that
-	/// are the overwhelming norm.
-	fn ensure_utf8_path(path: &Path) -> Result<(), LinkedWorktreeError> {
-		if path.to_str().is_some() {
-			Ok(())
-		} else {
-			Err(LinkedWorktreeError::io(
-				"non-UTF-8 path",
-				path,
-				std::io::Error::from(std::io::ErrorKind::InvalidInput),
-			))
-		}
-	}
-
-	/// The destination's basename as a UTF-8 string, or an error. A non-UTF-8 (or absent) basename is refused:
-	/// the basename becomes the admin directory name and is serialized into the cross-pointers via
-	/// `Path::display()` and read back with `read_to_string`, so a non-UTF-8 name can't round-trip losslessly
-	/// through that path yet (a byte-clean pointer path is the deferred "full OsStr at every boundary" work).
-	/// The common pathological case — a newline in the name — is valid UTF-8 and is sanitized, not rejected.
-	fn admin_base_name(destination: &Path) -> Result<&str, LinkedWorktreeError> {
-		destination
-			.file_name()
-			.and_then(|name| name.to_str())
-			.ok_or_else(|| {
-				LinkedWorktreeError::io(
-					"deriving worktree name",
-					destination,
-					std::io::Error::from(std::io::ErrorKind::InvalidInput),
-				)
-			})
 	}
 
 	/// Sanitize a destination basename into a worktree admin-directory name, mirroring git (probed against
@@ -680,7 +686,11 @@ mod native {
 		let write = |path: PathBuf, contents: String| write_file_atomic(&path, contents.as_bytes());
 		// `commondir` is relative (git writes `../..`): from `<common>/worktrees/<name>` up to `<common>`.
 		write(admin.join("commondir"), "../..\n".to_owned())?;
-		write(admin.join("gitdir"), format!("{}\n", gitfile.display()))?;
+		// `gitdir` records the checkout's real `.git` path, serialized **byte-clean** so a non-UTF-8
+		// destination round-trips exactly (`Path::display()` would lose a non-UTF-8 byte).
+		let mut gitdir_bytes = crate::pointers::path_to_bytes(&gitfile);
+		gitdir_bytes.push(b'\n');
+		write_file_atomic(&admin.join("gitdir"), &gitdir_bytes)?;
 		write(admin.join("HEAD"), head.render())?;
 		if let Some(start) = start {
 			write(admin.join("ORIG_HEAD"), format!("{start}\n"))?;
@@ -723,8 +733,12 @@ mod native {
 			}
 			Err(e) => return Err(LinkedWorktreeError::io("writing checkout .git", gitfile, e).into()),
 		};
+		// Byte-clean serialization of the admin path, so a non-UTF-8 admin path round-trips exactly.
+		let mut content = b"gitdir: ".to_vec();
+		content.extend_from_slice(&crate::pointers::path_to_bytes(admin));
+		content.push(b'\n');
 		file
-			.write_all(format!("gitdir: {}\n", admin.display()).as_bytes())
+			.write_all(&content)
 			.map_err(|e| LinkedWorktreeError::io("writing checkout .git", gitfile, e))?;
 		Ok(())
 	}
@@ -749,28 +763,6 @@ mod native {
 			.map_err(|e| LinkedWorktreeError::io("creating logs dir", &logs, e))?;
 		let head_log = logs.join("HEAD");
 		write_file_atomic(&head_log, log.as_bytes())
-	}
-
-	#[cfg(all(test, unix))]
-	mod resolved_tests {
-		use super::resolved_for_pointers;
-
-		#[test]
-		fn resolves_symlinked_parents_and_dotdot() {
-			// `alias/missing/../wt` through a symlinked parent resolves to `<real>/wt` — the `..` pops the
-			// *resolved* location and the symlink is followed, exactly as `create_dir_all` + `canonicalize` do.
-			let tmp = tempfile::tempdir().unwrap();
-			let real = tmp.path().join("real");
-			std::fs::create_dir_all(&real).unwrap();
-			let alias = tmp.path().join("alias");
-			std::os::unix::fs::symlink(&real, &alias).unwrap();
-
-			let dest = alias.join("missing").join("..").join("wt");
-			assert_eq!(
-				resolved_for_pointers(&dest),
-				real.canonicalize().unwrap().join("wt")
-			);
-		}
 	}
 
 	#[cfg(test)]

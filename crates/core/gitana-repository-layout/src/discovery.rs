@@ -154,34 +154,30 @@ fn classify(dir: &Path) -> Result<Option<RepositoryLayout>, DiscoveryError> {
 /// a single `gitdir: <path>` line; git writes an absolute path, but a relative one is resolved against
 /// the worktree directory (the `.git` file's parent).
 fn resolve_gitdir_file(git_file: &Path) -> Result<PathBuf, DiscoveryError> {
-	let content = match std::fs::read_to_string(git_file) {
-		Ok(content) => content,
-		// Not valid UTF-8: the pointer cannot be parsed — malformed, not merely unreadable.
-		Err(error) if error.kind() == ErrorKind::InvalidData => {
-			return Err(DiscoveryError::MalformedGitFile {
-				path: git_file.to_path_buf(),
-			});
-		}
-		Err(source) => {
-			return Err(DiscoveryError::UnreadableGitFile {
-				path: git_file.to_path_buf(),
-				source,
-			});
-		}
-	};
-	// `lines()` strips a trailing `\r`, so a CRLF pointer file parses; `trim` drops surrounding
-	// whitespace; an empty remainder is malformed.
-	let pointer = content
-		.lines()
-		.next()
-		.and_then(|line| line.strip_prefix("gitdir:"))
-		.map(str::trim)
+	// Read **bytes**, not a UTF-8 string: a linked worktree whose admin path is non-UTF-8 records a
+	// non-UTF-8 `gitdir:` pointer (native paths are accepted without UTF-8 conversion), so a lossy
+	// string read would wrongly reject it as malformed.
+	let content = std::fs::read(git_file).map_err(|source| DiscoveryError::UnreadableGitFile {
+		path: git_file.to_path_buf(),
+		source,
+	})?;
+	// The first line (dropping a trailing `\r`, so a CRLF pointer file parses), then the `gitdir:` prefix,
+	// then surrounding ASCII whitespace; an empty remainder is malformed.
+	let first_line = content.split(|&b| b == b'\n').next().unwrap_or_default();
+	let first_line = first_line.strip_suffix(b"\r").unwrap_or(first_line);
+	let pointer = first_line
+		.strip_prefix(b"gitdir:".as_slice())
+		.map(|path| path.trim_ascii())
 		.filter(|path| !path.is_empty())
 		.ok_or_else(|| DiscoveryError::MalformedGitFile {
 			path: git_file.to_path_buf(),
 		})?;
-	let raw = if Path::new(pointer).is_absolute() {
-		PathBuf::from(pointer)
+	// A (non-Unix) non-representable pointer is malformed, not a lossily-mapped different path.
+	let pointer = path_from_bytes(pointer).ok_or_else(|| DiscoveryError::MalformedGitFile {
+		path: git_file.to_path_buf(),
+	})?;
+	let raw = if pointer.is_absolute() {
+		pointer
 	} else {
 		git_file.parent().unwrap_or(Path::new(".")).join(pointer)
 	};
@@ -190,8 +186,8 @@ fn resolve_gitdir_file(git_file: &Path) -> Result<PathBuf, DiscoveryError> {
 
 fn common_dir_of_sync(git_dir: &Path) -> Result<PathBuf, DiscoveryError> {
 	let commondir = git_dir.join("commondir");
-	let text = match std::fs::read_to_string(&commondir) {
-		Ok(text) => text,
+	let bytes = match std::fs::read(&commondir) {
+		Ok(bytes) => bytes,
 		Err(error) if error.kind() == ErrorKind::NotFound => {
 			// A `read` NotFound is ambiguous: the file may be genuinely absent (a self-contained git
 			// directory shares nothing — its common dir is itself), or `commondir` may be a *dangling*
@@ -208,9 +204,6 @@ fn common_dir_of_sync(git_dir: &Path) -> Result<PathBuf, DiscoveryError> {
 				}),
 			};
 		}
-		Err(error) if error.kind() == ErrorKind::InvalidData => {
-			return Err(DiscoveryError::MalformedCommonDir { path: commondir });
-		}
 		Err(source) => {
 			return Err(DiscoveryError::UnreadableCommonDir {
 				path: commondir,
@@ -218,14 +211,36 @@ fn common_dir_of_sync(git_dir: &Path) -> Result<PathBuf, DiscoveryError> {
 			});
 		}
 	};
-	let pointer = text.trim();
+	// Parsed byte-clean (native paths accepted without UTF-8 conversion), so a non-UTF-8 common-dir
+	// pointer resolves rather than being rejected as malformed.
+	let pointer = bytes.trim_ascii();
 	if pointer.is_empty() {
 		return Err(DiscoveryError::MalformedCommonDir { path: commondir });
 	}
+	// A (non-Unix) non-representable pointer is malformed, not a lossily-mapped different path.
+	let pointer = path_from_bytes(pointer).ok_or_else(|| DiscoveryError::MalformedCommonDir {
+		path: commondir.clone(),
+	})?;
 	// `commondir` is typically `../..`, resolved against the git directory; canonicalize so every
 	// linked worktree of a repository yields the same common dir.
 	let common = git_dir.join(pointer);
 	canonicalize(&common).map_err(|source| common_dir_error(common, source))
+}
+
+/// A path parsed from raw pointer-file bytes. **Byte-clean on Unix** (`OsStrExt::from_bytes`), so a
+/// non-UTF-8 identity path round-trips exactly. On non-Unix, where byte-clean (WTF-8) parsing is a deferred
+/// follow-up, this **fails closed** — `None` for invalid UTF-8 — rather than lossily map the bytes to a
+/// *different* path that could resolve to the wrong repository; the caller then treats `None` as malformed.
+fn path_from_bytes(bytes: &[u8]) -> Option<PathBuf> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::ffi::OsStrExt;
+		Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+	}
+	#[cfg(not(unix))]
+	{
+		std::str::from_utf8(bytes).ok().map(PathBuf::from)
+	}
 }
 
 /// Whether `dir` is itself a git directory (as a bare repo is): it holds `HEAD`, `objects/`, and
