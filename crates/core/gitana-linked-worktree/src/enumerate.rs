@@ -54,6 +54,7 @@ mod native {
 
 	use std::path::Path;
 
+	use gitana_config::GitConfig;
 	use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 	use gitana_object_store::ObjectStore;
 	use gitana_repository::{HeadState, Repository};
@@ -65,24 +66,29 @@ mod native {
 		main_worktree_path, resolve_ref_terminal, worktree_path_of,
 	};
 	use crate::repo_id::{detect_kind, open_store_raw};
-	use crate::{LinkedWorktreeError, RepositoryId};
+	use crate::{LinkedWorktreeError, WorktreeContext};
 
-	/// Enumerate the worktrees of `repo`.
-	pub async fn enumerate(repo: &RepositoryId) -> Result<WorktreeListing, LinkedWorktreeError> {
-		let common = repo.common_dir();
+	/// Enumerate the worktrees of the repository `cx` names.
+	///
+	/// The listing order follows `core.ignorecase` as resolved by `cx` — the caller's merged config stack
+	/// when injected, else the repository-local config alone.
+	pub async fn enumerate(cx: &WorktreeContext) -> Result<WorktreeListing, LinkedWorktreeError> {
+		let common = cx.repo().common_dir();
 		// The initial store only detects the object format (shared state) — anchor it on the stable
 		// `common_dir`, not the identity's `git_dir` (which, discovered inside a linked worktree, names that
 		// checkout's admin and fails to open once the checkout is pruned). Each worktree's HEAD is then
 		// resolved through a store scoped to *that* worktree's git dir (see `head_facts`).
 		let store = open_store_raw(common, common)?;
+		let effective = cx.effective_config();
 		match detect_kind(&store).await? {
-			HashKind::Sha1 => enumerate_generic::<Sha1>(common).await,
-			HashKind::Sha256 => enumerate_generic::<Sha256>(common).await,
+			HashKind::Sha1 => enumerate_generic::<Sha1>(common, effective).await,
+			HashKind::Sha256 => enumerate_generic::<Sha256>(common, effective).await,
 		}
 	}
 
 	async fn enumerate_generic<H: HashAlgorithm>(
 		common: &Path,
+		effective: Option<&GitConfig>,
 	) -> Result<WorktreeListing, LinkedWorktreeError>
 	where
 		ObjectId<H>: IntoWorktreeObjectId,
@@ -139,7 +145,7 @@ mod native {
 		}
 		// git's `worktree list` orders linked worktrees by *checkout path*, not admin name — and compares
 		// case-insensitively when `core.ignorecase` is set (typical on macOS/Windows). Match both.
-		if ignorecase(common) {
+		if ignorecase(effective, common) {
 			linked.sort_by(|a, b| {
 				a.path
 					.to_string_lossy()

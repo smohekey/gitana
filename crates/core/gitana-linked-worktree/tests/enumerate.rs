@@ -4,7 +4,83 @@
 mod common;
 
 use common::*;
-use gitana_linked_worktree::{HeadKind, LockState, RepositoryId, WorktreeRole, enumerate};
+use gitana_linked_worktree::{
+	HeadKind, LockState, RepositoryId, WorktreeContext, WorktreeRole, enumerate,
+};
+
+/// The listing sort honours `core.ignorecase` from the **injected** config, overriding the
+/// repository-local value; a local-only context (the embedding default) reads `<common>/config` alone.
+///
+/// git resolves this key through its whole precedence stack, so a `core.ignorecase` set only in
+/// `~/.gitconfig` — the common case on macOS — is invisible to a library that reads the local file, and its
+/// sort silently disagrees with git's. Injection is what lets a git-faithful caller supply git's answer
+/// without the library ever reaching into `$HOME` itself.
+#[tokio::test]
+async fn enumerate_sort_honours_injected_ignorecase_over_local() {
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("enum-inject-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+
+		// `git init` writes `core.ignorecase=true` locally on a case-insensitive volume (macOS), so pin the
+		// local value **false**: the local-only and injected answers must genuinely differ for this to test
+		// anything. Without this the assertion would pass on macOS and fail on Linux for the wrong reason.
+		git(&["-C", w, "config", "core.ignorecase", "false"]);
+
+		// Two linked worktrees whose paths sort *differently* under the two comparisons: ASCII `B` (0x42)
+		// precedes `a` (0x61) byte-wise, but folded, `a` precedes `b`.
+		let upper = base.join("B-wt");
+		let lower = base.join("a-wt");
+		git(&[
+			"-C",
+			w,
+			"worktree",
+			"add",
+			"-b",
+			"b-br",
+			upper.to_str().unwrap(),
+		]);
+		git(&[
+			"-C",
+			w,
+			"worktree",
+			"add",
+			"-b",
+			"a-br",
+			lower.to_str().unwrap(),
+		]);
+
+		// The linked entries' basenames, in listing order (the primary is always first, so skip it).
+		let order = |listing: gitana_linked_worktree::WorktreeListing| -> Vec<String> {
+			listing
+				.entries
+				.iter()
+				.filter(|e| matches!(e.role, WorktreeRole::Linked { .. }))
+				.map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+				.collect()
+		};
+
+		// Local-only: `core.ignorecase=false` → case-sensitive, `B-wt` first.
+		let local_only = order(enumerate(&ctx_at(&work)).await.unwrap());
+		assert_eq!(
+			local_only,
+			vec!["B-wt".to_owned(), "a-wt".to_owned()],
+			"{fmt}: a local-only context honours the repository-local core.ignorecase=false"
+		);
+
+		// Injected `core.ignorecase=true` overrides the local `false` → case-insensitive, `a-wt` first.
+		let injected = gitana_config::GitConfig::parse("[core]\n\tignorecase = true\n").unwrap();
+		let cx = WorktreeContext::with_effective_config(rid_at(&work), injected);
+		let merged = order(enumerate(&cx).await.unwrap());
+		assert_eq!(
+			merged,
+			vec!["a-wt".to_owned(), "B-wt".to_owned()],
+			"{fmt}: the injected merged config decides the sort, overriding the local value"
+		);
+	}
+}
 
 #[tokio::test]
 async fn enumerates_primary_and_linked_worktrees_with_their_facts() {
@@ -54,7 +130,7 @@ async fn enumerates_primary_and_linked_worktrees_with_their_facts() {
 			locked.to_str().unwrap(),
 		]);
 
-		let listing = enumerate(&rid_at(&work)).await.unwrap();
+		let listing = enumerate(&ctx_at(&work)).await.unwrap();
 
 		// Primary first, not bare, on a symbolic branch.
 		assert!(matches!(
@@ -136,7 +212,7 @@ async fn enumerates_a_worktree_whose_head_is_a_symbolic_branch() {
 			porcelain.contains("branch refs/heads/feature"),
 			"git reports the terminal branch: {porcelain}"
 		);
-		let listing = enumerate(&rid_at(&work)).await.unwrap();
+		let listing = enumerate(&ctx_at(&work)).await.unwrap();
 		let entry = listing
 			.entries
 			.iter()
@@ -180,7 +256,7 @@ async fn a_legacy_symlink_head_is_reported_as_a_symbolic_branch() {
 			"git reports the symbolic branch for a symlink HEAD: {porcelain}"
 		);
 
-		let listing = enumerate(&rid_at(&work)).await.unwrap();
+		let listing = enumerate(&ctx_at(&work)).await.unwrap();
 		let primary = &listing.entries[0];
 		assert!(matches!(
 			primary.role,
@@ -237,7 +313,7 @@ async fn a_legacy_symlink_symref_branch_resolves_its_object() {
 			"git resolves the symlink symref: {porcelain}"
 		);
 
-		let listing = enumerate(&rid_at(&work)).await.unwrap();
+		let listing = enumerate(&ctx_at(&work)).await.unwrap();
 		let entry = listing
 			.entries
 			.iter()
@@ -268,7 +344,7 @@ async fn an_explicit_symlink_alias_to_git_is_normalized() {
 		std::os::unix::fs::symlink(work.join(".git"), &alias).unwrap();
 
 		let rid = RepositoryId::at_common_dir(alias).unwrap();
-		let listing = enumerate(&rid).await.unwrap();
+		let listing = enumerate(&WorktreeContext::new(rid)).await.unwrap();
 		assert!(
 			matches!(
 				listing.entries[0].role,
@@ -349,7 +425,7 @@ async fn a_symref_chain_through_a_one_level_pseudoref_resolves() {
 			"{fmt}: git resolves through the pseudoref"
 		);
 
-		let listing = enumerate(&rid_at(&work)).await.unwrap();
+		let listing = enumerate(&ctx_at(&work)).await.unwrap();
 		assert_eq!(
 			listing.entries[0].branch.as_deref(),
 			Some("refs/heads/feature"),
@@ -390,7 +466,7 @@ async fn a_symlinked_admin_gitdir_file_is_followed() {
 			"{fmt}: git follows the symlinked gitdir file"
 		);
 
-		let listing = enumerate(&rid_at(&work)).await.unwrap();
+		let listing = enumerate(&ctx_at(&work)).await.unwrap();
 		assert!(
 			listing
 				.entries
@@ -437,7 +513,7 @@ async fn identity_discovered_in_a_linked_worktree_survives_its_prune() {
 		);
 
 		// Enumeration via that identity still works — anchored on the surviving common dir.
-		let listing = enumerate(&from_wt).await.unwrap();
+		let listing = enumerate(&WorktreeContext::new(from_wt)).await.unwrap();
 		assert!(
 			matches!(
 				listing.entries[0].role,
@@ -488,7 +564,7 @@ async fn checkout_missing_is_gits_prunable_not_the_checkout_identity() {
 		std::fs::write(foreign.join(".git"), "gitdir: /nonexistent/admin\n").unwrap();
 		std::fs::remove_dir_all(&gone).unwrap();
 
-		let listing = enumerate(&rid_at(&work)).await.unwrap();
+		let listing = enumerate(&ctx_at(&work)).await.unwrap();
 		let missing = |branch: &str| {
 			listing
 				.entries
@@ -543,7 +619,7 @@ async fn stray_gitdir_and_locked_in_the_main_git_do_not_affect_the_primary() {
 		std::fs::write(work.join(".git/gitdir"), b"/bogus/checkout/.git\n").unwrap();
 		std::fs::write(work.join(".git/locked"), b"not really locked\n").unwrap();
 
-		let listing = enumerate(&rid_at(&work)).await.unwrap();
+		let listing = enumerate(&ctx_at(&work)).await.unwrap();
 		let primary = &listing.entries[0];
 		assert!(matches!(
 			primary.role,
@@ -591,7 +667,7 @@ async fn a_symlinked_worktrees_directory_is_not_followed() {
 		std::fs::write(external.join("wt/locked"), b"TOP SECRET").unwrap();
 
 		assert!(
-			enumerate(&rid_at(&work)).await.is_err(),
+			enumerate(&ctx_at(&work)).await.is_err(),
 			"{fmt}: a symlinked worktrees dir must be a hard error, never followed"
 		);
 		let _ = std::fs::remove_dir_all(&base);
@@ -637,7 +713,7 @@ async fn linked_worktrees_are_ordered_by_checkout_path() {
 			acase.to_str().unwrap(),
 		]);
 
-		let listing = enumerate(&rid_at(&work)).await.unwrap();
+		let listing = enumerate(&ctx_at(&work)).await.unwrap();
 		let linked: Vec<_> = listing
 			.entries
 			.iter()
@@ -699,7 +775,7 @@ async fn enumeration_does_not_dereference_a_symlinked_admin() {
 		std::os::unix::fs::symlink(&external, &admin).unwrap();
 		std::fs::write(external.join("locked"), b"TOP SECRET").unwrap();
 
-		let listing = enumerate(&rid_at(&work)).await.unwrap();
+		let listing = enumerate(&ctx_at(&work)).await.unwrap();
 		assert!(
 			listing.entries.iter().all(|e| e.lock
 				!= LockState::Locked {
@@ -741,7 +817,7 @@ async fn a_stray_non_directory_in_the_worktrees_dir_is_ignored() {
 		// Drop a stray non-directory entry alongside the real admin.
 		std::fs::write(work.join(".git/worktrees/.DS_Store"), b"junk").unwrap();
 
-		let listing = enumerate(&rid_at(&work)).await.unwrap();
+		let listing = enumerate(&ctx_at(&work)).await.unwrap();
 		assert!(
 			listing
 				.entries
@@ -782,7 +858,7 @@ async fn enumerates_a_bare_repository_hosting_linked_worktrees() {
 			"HEAD",
 		]);
 
-		let listing = enumerate(&rid_bare(&bare)).await.unwrap();
+		let listing = enumerate(&ctx_bare(&bare)).await.unwrap();
 		assert!(matches!(
 			listing.entries[0].role,
 			WorktreeRole::Primary { bare: true }
@@ -843,7 +919,7 @@ async fn bareness_without_core_bare_matches_git() {
 			"false",
 			"{fmt}: git treats an unset core.bare as non-bare"
 		);
-		let listing = enumerate(&rid_bare(&bare)).await.unwrap();
+		let listing = enumerate(&ctx_bare(&bare)).await.unwrap();
 		assert!(
 			matches!(
 				listing.entries[0].role,
@@ -880,8 +956,8 @@ async fn discovery_from_inside_a_linked_worktree_resolves_the_shared_common_dir(
 		assert_ne!(from_linked.git_dir(), from_linked.common_dir());
 
 		// Enumeration from that identity sees the same set as from the primary.
-		let from_main = enumerate(&rid_at(&work)).await.unwrap();
-		let from_wt = enumerate(&from_linked).await.unwrap();
+		let from_main = enumerate(&ctx_at(&work)).await.unwrap();
+		let from_wt = enumerate(&WorktreeContext::new(from_linked)).await.unwrap();
 		assert_eq!(from_main, from_wt);
 		let _ = std::fs::remove_dir_all(&base);
 	}

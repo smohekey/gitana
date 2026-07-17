@@ -14,6 +14,33 @@ Decisions already taken with Scott (do not relitigate): short HLD first; a **new
 pointed at the library in a later slice); **slice 1 is read-only** (inspection + enumeration + the
 structured types + the classification enum).
 
+**Amendment (the rewire premise, revised).** The extract-and-rewire decision above stands as the *goal*,
+but its first attempt (slice 4) **failed**, and the reason is now understood: the library was written
+strict throughout — never following symlinked admins/markers, local config only, force-free removal —
+which is right for Code Henge but **opposes git's permissive `worktree list`**, which follows those
+symlinks and reads the merged config. Pointing the CLI at the strict library produced six confirmed
+divergences from stock git, several *un-patchable at the CLI edge* because the primitive had already
+discarded the fact (a symlinked `locked` marker returned `Locked { reason: None }`; a symlinked admin was
+dropped from the listing entirely). The CLI cannot re-permissive what the layer beneath refused to observe.
+
+The fix is **not** to pick a winner between the two behaviours, nor to abandon one implementation. It is a
+layering correction, decided with Scott:
+
+- **Layer 0 — observation.** Primitives (`pointers`, `head`) return *facts*, never verdicts, and discard
+  nothing at read time. "This is a symlink, its target is X" is a fact; "therefore it is unlisted" is a
+  verdict.
+- **Layer 1 — policy.** Two named adapters map facts to verdicts: `Strict` (Code Henge's stance, today's
+  behaviour byte-for-byte) and `GitCompat` (what stock git actually does). The information-disclosure guard
+  — refusing to surface a symlinked marker's target contents as a public lock reason — *moves here* rather
+  than disappearing: `GitCompat` discloses because git does, `Strict` refuses as it does today.
+- **Layer 2 — operations**, parameterized by policy via [`WorktreeContext`](#the-context-the-ambient-inputs-an-operation-reads-through).
+
+Consequence: the CLI's 2,184-line stock-git oracle suite (`crates/cli/gta/tests/git_worktree.rs`) and the
+library's own strict suite both stay green, against **one** implementation. Neither is negotiable; together
+they pin both policies. The public API changes shape (Scott's call: a clean break, coordinated with Code
+Henge, whose pinned git rev is immutable and so is never broken by our merge — they take the new API when
+they choose to bump).
+
 ## Context
 
 Code Henge needs to create/inspect/reconcile/remove Git *linked worktrees* **in-process** — no CLI, no
@@ -85,7 +112,7 @@ pub enum WorktreeObjectId { Sha1(ObjectId<Sha1>), Sha256(ObjectId<Sha256>) }
 // kind() -> HashKind, to_hex() -> String, parse(kind, hex) -> Result<Self, _>
 ```
 
-### The FS mint moves in; the global-config merge does not
+### The FS mint moves in; the global-config *source* does not (config is injected)
 
 A crate-internal `open_store::<H>(git_dir, common_dir)` mints `cap-std` authority from **absolute**
 paths (`Dir::open_ambient_dir`, never changes CWD) and builds
@@ -97,6 +124,39 @@ effective-config* (default local-only) for `core.logAllRefUpdates` reflog parity
 decides whether the user's global config applies — matching "permit Code Henge to supply its own …
 policy." The crate is native-gated for the mint (Code Henge is a native consumer; wasm can inject
 capabilities later).
+
+**Generalized (unification slice 1).** The rule above is "the library must not *source* `$HOME`," not
+"the library must not *accept* config" — so the `create`-slice injection point is the pattern, not an
+exception. It now generalizes to a first-class [`WorktreeContext`](#the-context-the-ambient-inputs-an-operation-reads-through):
+`enumerate` no longer reads `<common>/config` itself for `core.ignorecase`, it reads what the context
+carries. That closes three of slice 4's six divergences on its own — a `core.ignorecase` set *globally*
+(the common case on macOS) was invisible to the library, so its sort order silently disagreed with git's.
+
+### The context — the ambient inputs an operation reads through
+
+`WorktreeContext` carries what an operation needs *besides* its request: which repository
+(`RepositoryId`), and whose config decides git-configurable behaviour. `WorktreeContext::new(repo)`
+honours the repository-local config alone (the embedding default); `with_effective_config(repo, cfg)`
+honours a caller-resolved merged stack.
+
+Identity stays a **separate type** from the context deliberately: `RepositoryId` answers *which*
+repository and is compared and echoed back on results, so folding config into it would make two contexts
+over one repository unequal. This mirrors the split already chosen in `gta-core` between `read_config()`
+(raw local) and `effective_config()` (merged) — overloading one accessor to mean both flattens a global
+layer into `.git/config` at the first write.
+
+**Validation is the caller's.** git rejects a malformed startup boolean when a *process* boots — even a
+shadowed occurrence — which is a property of git starting up, not of a library answering a query. A
+consumer wanting that abort validates while resolving its stack (the CLI does, with
+`GitConfig::get_bool_validated`); what reaches the context is already-good config.
+
+**`core.ignorecase` is not one decision.** It is read in two places with deliberately *opposite*
+treatments, and a future "unify config handling" pass must not merge them:
+- `enumerate` uses it as the listing **sort** key — cosmetic, follows git, so it takes the injected stack.
+- `status::residual_untracked_paths` deliberately **ignores** it and matches tracked paths byte-exactly:
+  `core.ignorecase` can be set on a case-sensitive volume, and per-directory (ext4/F2FS) folding defeats
+  any whole-tree probe, so folding could let a case-distinct untracked `FOO` pass as tracked `foo` **and be
+  deleted**. Cosmetic ordering may follow config; a deletion-safety test may not.
 
 ### Outcome vocabulary — refusals are `Ok`-data, failures are errors
 
@@ -300,8 +360,16 @@ is the final hardening slice.
    immediate-pre-destroy re-inspect (git doesn't take this lock). Oracle-tested with genuine OS-thread races
    (8-way concurrent create → exactly one registration; held-lock → `RegistrationLocked`; create-vs-remove →
    consistent state), SHA-1 + SHA-256.
-4. **CLI rewire** — point `commands/worktree.rs` + `repo.rs` at the library; keep DWIM/force/
-   `--porcelain`/suffix resolution on top. Behavior-preserving; existing git-parity tests stay green.
+4. **CLI rewire** — ❌ **premise failed as written; superseded by slices 6–9.** The plan was to point
+   `commands/worktree.rs` + `repo.rs` at the library, keeping DWIM/force/`--porcelain`/suffix resolution on
+   top. Eight codex rounds on the *cleanest* tranche (`list`) established it cannot work while the library is
+   uniformly strict: six confirmed divergences from stock git, several un-patchable at the CLI edge (see the
+   Amendment under *Status and Audience*). Only the `list` tranche merged — and **native**, not delegated
+   (`5adf879e`), carrying three genuine wins the attempt surfaced: git's checkout-path sort order (a latent
+   parity bug), `get_bool_validated` + `effective_config_for_worktree` config layering, and the standalone
+   `admin_checkout_missing` prunable fix (which benefits Code Henge directly). T2/T3/T4 were closed at the
+   time as "won't do" — correctly, *given a strict-only library*. Slices 6–9 remove that premise, and the
+   rewire goal returns.
 5. **Concurrency + native-path hardening** — registration-level CAS, lost-race-as-conflict, full
    `OsStr` identity paths, lock-file races. *(Installments landed: the round-4 create-hardening tranche —
    F1 post-condition, F3 atomic pointers, F4 name sanitization; the **native-path tranche** — byte-clean
@@ -309,6 +377,39 @@ is the final hardening slice.
    tranche** — the per-repository `RegistrationLock` on create/remove (see the create-hardening section
    below), closing the residual removal TOCTOU and the concurrent-create duplicate-registration race. Only
    remaining item — **Windows WTF-8 pointer I/O** (non-Unix currently fails closed on non-UTF-8).)*
+
+**Unification slices (6–9)** — one implementation behind two policies, retiring slice 4's failed premise.
+Each of 6–8 is independently safe: it leaves the library better-layered with Code Henge's behaviour
+unchanged, so stopping after any of them is a coherent end state. Only slice 9 spends parity risk, by which
+point the mechanism is proven.
+
+6. **Config injection** — ✅ **DONE (this slice).** `WorktreeContext { repo, effective }`; `enumerate` takes a
+   context instead of a bare `RepositoryId` and reads `core.ignorecase` from the injected stack, falling back
+   to repository-local when `None`. Generalizes the `create` slice's existing `Option<&GitConfig>` parameter.
+   Closes three of the six divergences. No behaviour change for a local-only caller — the library's existing
+   suite is the proof, and passes unmodified apart from the mechanical context wrapping.
+7. **Fact-lowering, then the policy adapters** — split in two on Scott's call, so the refactor and the
+   behaviour change are never in the same reviewable step:
+   - **7a — facts, no policy.** `pointers`/`head` return facts and discard nothing at read time
+     (`probe_lock_marker -> LockMarker::{Absent, Regular(bytes), Symlink{target}, Unreadable}`; admins
+     enumerated *tagged* as symlinked rather than dropped). Call sites immediately re-derive today's exact
+     verdicts inline. This is a **pure refactor with zero behaviour change**, so the existing suite proves it
+     outright — no new tests should be needed, and **any test that changes means the slice is wrong**. The
+     intermediate state (verdicts inline at call sites) is deliberately accepted for one slice: it buys a
+     provably-safe step before any policy exists to argue about.
+   - **7b — policy.** `Policy::{Strict, GitCompat}` joins the context; the inline verdicts from 7a move
+     behind it. `Strict` reproduces today's behaviour byte-for-byte. This is where the
+     information-disclosure guard **relocates rather than evaporates**: `Strict` still refuses to surface a
+     symlinked marker's target contents as a public lock reason; `GitCompat` discloses, because git does.
+     Note the guard's *enforcement* moves from the primitive (which currently cannot leak, because it never
+     reads) to the adapter (which now must choose not to) — the strict adapter becomes load-bearing in a way
+     the primitive was not, and that is the real risk this slice carries.
+8. **Removal policy** — force vs conservative-preserve through the same mechanism; `decide_remove`/`classify`
+   are already a decision path, so this is the natural seam. Note the residual-content scan's byte-exact
+   matching is a **safety** invariant, not a policy knob — `GitCompat` does not get to fold case there.
+9. **CLI rewire (retry)** — `list` first (the tranche we already understand), then `add`/`remove`, then the
+   `repo.rs` helpers. `crates/cli/gta/tests/git_worktree.rs` is the gate; the six known divergences each
+   become a test that fails before and passes after.
 
 ### Slice-5 create hardening (DONE) and the one item deferred to slice 3
 

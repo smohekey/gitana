@@ -363,8 +363,23 @@ pub(crate) fn is_bare(common_dir: &Path) -> Result<bool, LinkedWorktreeError> {
 }
 
 /// Whether `core.ignorecase` is set for the repository at `common_dir` — git compares worktree paths
-/// case-insensitively when it is (typical on macOS/Windows). Absent / unreadable / unparseable → `false`.
-pub(crate) fn ignorecase(common_dir: &Path) -> bool {
+/// case-insensitively when it is (typical on macOS/Windows).
+///
+/// `effective` is the caller's already-merged config stack (see [`crate::WorktreeContext`]); `None`
+/// falls back to the repository-local config alone. git resolves this key through its full precedence
+/// stack, so a consumer that wants git's answer injects the merged config — reading `<common>/config`
+/// here would miss a `core.ignorecase` set globally (the common case on macOS, where `git init` writes
+/// it locally but a user may also carry it in `~/.gitconfig`).
+///
+/// Absent / unreadable / unparseable → `false`. This key is **cosmetic** here: it selects the
+/// case-sensitivity of the worktree-listing *sort*, matching git's display order. It must never be
+/// reused to fold case in a *safety* comparison — see `status::residual_untracked_paths`, which
+/// deliberately matches tracked paths byte-exactly because a fold could let a case-distinct untracked
+/// file be deleted.
+pub(crate) fn ignorecase(effective: Option<&gitana_config::GitConfig>, common_dir: &Path) -> bool {
+	if let Some(config) = effective {
+		return matches!(config.get_bool("core", None, "ignorecase"), Ok(Some(true)));
+	}
 	let Ok(text) = std::fs::read_to_string(common_dir.join("config")) else {
 		return false;
 	};

@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use gitana_linked_worktree::RepositoryId;
+use gitana_linked_worktree::{RepositoryId, WorktreeContext};
 use gitana_object::HashKind;
 
 /// Run `git` with `args`, asserting success, returning stdout.
@@ -110,4 +110,14 @@ pub fn rid_at(work: &Path) -> RepositoryId {
 /// A `RepositoryId` anchored on a bare repo's git dir.
 pub fn rid_bare(git_dir: &Path) -> RepositoryId {
 	RepositoryId::at_common_dir(canonical(git_dir)).unwrap()
+}
+
+/// A local-config-only `WorktreeContext` over `<work>/.git` — the default an embedding consumer gets.
+pub fn ctx_at(work: &Path) -> WorktreeContext {
+	WorktreeContext::new(rid_at(work))
+}
+
+/// A local-config-only `WorktreeContext` over a bare repo's git dir.
+pub fn ctx_bare(git_dir: &Path) -> WorktreeContext {
+	WorktreeContext::new(rid_bare(git_dir))
 }

@@ -37,6 +37,7 @@ mod remove_request;
 mod repo_id;
 mod request;
 mod status;
+mod worktree_context;
 
 // The filesystem-reading helpers exist only to serve the native (cap-std) reading API, so they are
 // native-only — on wasm the crate exposes just the pure model + classification.
@@ -68,6 +69,7 @@ pub use remove_request::RemoveRequest;
 pub use repo_id::RepositoryId;
 pub use request::{CheckoutTarget, CreateRequest};
 pub use status::WorktreeStatusReport;
+pub use worktree_context::WorktreeContext;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use create::create;

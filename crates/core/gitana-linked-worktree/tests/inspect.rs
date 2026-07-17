@@ -1323,7 +1323,7 @@ async fn a_head_symlink_to_a_non_ref_target_is_a_hard_error() {
 
 		// Enumeration reads that HEAD and must surface a hard error, not a fabricated branch.
 		assert!(
-			gitana_linked_worktree::enumerate(&rid_at(&work))
+			gitana_linked_worktree::enumerate(&ctx_at(&work))
 				.await
 				.is_err(),
 			"{fmt}: a non-ref HEAD symlink must be a hard error"
@@ -1434,7 +1434,7 @@ async fn a_cyclic_symref_chain_is_a_hard_error() {
 		std::fs::write(work.join(".git/worktrees/wt/HEAD"), b"ref: refs/heads/a\n").unwrap();
 
 		assert!(
-			gitana_linked_worktree::enumerate(&rid_at(&work))
+			gitana_linked_worktree::enumerate(&ctx_at(&work))
 				.await
 				.is_err(),
 			"{fmt}: a cyclic symref chain must be a hard error"
@@ -1474,7 +1474,7 @@ async fn an_unborn_branch_whose_name_is_a_ref_directory_resolves() {
 			"{fmt}: refs/heads/foo must be a directory"
 		);
 
-		let listing = gitana_linked_worktree::enumerate(&rid_at(&work))
+		let listing = gitana_linked_worktree::enumerate(&ctx_at(&work))
 			.await
 			.unwrap();
 		let entry = listing
@@ -1516,7 +1516,7 @@ async fn a_head_symref_target_outside_refs_is_a_hard_error() {
 		);
 
 		assert!(
-			gitana_linked_worktree::enumerate(&rid_at(&work))
+			gitana_linked_worktree::enumerate(&ctx_at(&work))
 				.await
 				.is_err(),
 			"{fmt}: a non-refs/ symref target is a hard error"
@@ -1559,7 +1559,7 @@ async fn a_head_with_a_non_git_ref_separator_is_a_hard_error() {
 		);
 
 		assert!(
-			gitana_linked_worktree::enumerate(&rid_at(&work))
+			gitana_linked_worktree::enumerate(&ctx_at(&work))
 				.await
 				.is_err(),
 			"{fmt}: a non-git ref separator must be a hard error"
@@ -1600,7 +1600,7 @@ async fn a_git_invalid_symref_name_is_a_hard_error() {
 		.unwrap();
 
 		assert!(
-			gitana_linked_worktree::enumerate(&rid_at(&work))
+			gitana_linked_worktree::enumerate(&ctx_at(&work))
 				.await
 				.is_err(),
 			"{fmt}: a git-invalid symref name must be a hard error"
@@ -1646,7 +1646,7 @@ async fn a_symref_chain_at_gits_depth_limit_matches_git() {
 			"{fmt}: git rejects the over-deep chain"
 		);
 		assert!(
-			gitana_linked_worktree::enumerate(&rid_at(&work))
+			gitana_linked_worktree::enumerate(&ctx_at(&work))
 				.await
 				.is_err(),
 			"{fmt}: an over-deep symref chain is a hard error"
@@ -1659,7 +1659,7 @@ async fn a_symref_chain_at_gits_depth_limit_matches_git() {
 			"refs/heads/feature",
 			"{fmt}: git resolves the in-budget chain to feature"
 		);
-		let listing = gitana_linked_worktree::enumerate(&rid_at(&work))
+		let listing = gitana_linked_worktree::enumerate(&ctx_at(&work))
 			.await
 			.unwrap();
 		let entry = listing
