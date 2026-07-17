@@ -47,6 +47,8 @@ mod head;
 #[cfg(not(target_arch = "wasm32"))]
 mod pointers;
 #[cfg(not(target_arch = "wasm32"))]
+mod registration_lock;
+#[cfg(not(target_arch = "wasm32"))]
 mod remove;
 
 pub use classify::{ProtectionReason, WorktreeClassification, classify};

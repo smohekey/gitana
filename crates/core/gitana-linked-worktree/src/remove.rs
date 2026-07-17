@@ -28,6 +28,7 @@ mod native {
 		admin_dirs_for, is_bare, is_leaf_symlink, main_checkout_identifies_common,
 	};
 	use crate::query::WorktreeQuery;
+	use crate::registration_lock::RegistrationLock;
 	use crate::remove_error::RemoveError;
 	use crate::remove_outcome::RemoveOutcome;
 	use crate::remove_request::RemoveRequest;
@@ -69,6 +70,12 @@ mod native {
 		// `--separate-git-dir`/relocated-bare topology). Recursively deleting such a checkout would destroy the
 		// repo's refs and objects, so `decide_remove` refuses it outright, ahead of any content check.
 		let enclosed = common_dir_within(&request.destination, common);
+
+		// Serialize registration mutations for the repository so a lost race is a **conflict, not an
+		// overwrite**: hold the per-repository lock across the whole decision→re-verify→destroy section, so a
+		// concurrent create/repair/re-registration cannot slip in during the residual TOCTOU window between
+		// the pre-destroy re-inspect and the delete. Released on any return (and on cancellation).
+		let _lock = RegistrationLock::acquire(common).await?;
 
 		// Lock-first even under *corrupted administration*: read the lock file **directly** — no HEAD/index
 		// parse — before any inspection, so a locked worktree with a malformed `HEAD` (or a broken referenced

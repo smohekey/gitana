@@ -92,6 +92,14 @@ pub enum LinkedWorktreeError {
 	/// `core.bare` held a value that is not a valid git boolean.
 	#[error("invalid boolean for core.bare in {}", .0.display())]
 	InvalidCoreBare(PathBuf),
+
+	/// The per-repository worktree-registration lock (`<common>/worktrees.lock`) is held by another
+	/// worktree create/remove and did not free within the brief retry window — a **lost race, reported as
+	/// a retryable conflict** rather than overwriting the concurrent operation. A leftover lock from a
+	/// crashed process surfaces the same way (gitana does not auto-break it, matching its ref locks); it is
+	/// cleared by removing the file. Carries the lock path.
+	#[error("worktree registration is locked by another operation: {}", .0.display())]
+	RegistrationLocked(PathBuf),
 }
 
 impl LinkedWorktreeError {

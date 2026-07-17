@@ -28,6 +28,7 @@ mod native {
 	use crate::object_id::IntoWorktreeObjectId;
 	use crate::pointers::is_valid_refname;
 	use crate::query::WorktreeQuery;
+	use crate::registration_lock::RegistrationLock;
 	use crate::repo_id::{detect_kind, open_store_raw, open_work_dir};
 	use crate::request::{CheckoutTarget, CreateRequest};
 	use crate::{LinkedWorktreeError, WorktreeClassification, WorktreeInspection, WorktreeObjectId};
@@ -54,6 +55,12 @@ mod native {
 			return Err(LinkedWorktreeError::RelativePath(request.destination.clone()).into());
 		}
 		validate_target_name(&request.target)?;
+
+		// Serialize registration mutations for the repository so a lost race is a **conflict, not an
+		// overwrite**: hold the per-repository lock across the whole inspect→decide→write→re-decide section,
+		// so a concurrent create/remove cannot pick the same admin name and clobber, nor slip a registration
+		// in between the write and the post-condition re-decide. Released on any return (and on cancellation).
+		let _lock = RegistrationLock::acquire(request.repo.common_dir()).await?;
 
 		let query = request_query(request);
 		let inspection = inspect(&query).await?;

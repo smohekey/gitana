@@ -285,21 +285,30 @@ is the final hardening slice.
    (`Incomplete`), and locked-with-broken-index/HEAD (lock-first) cases, plus `gitana-worktree` matcher and
    path-normalisation unit tests.
 
-   **Deferred to slice 5 (per the concurrency plan below), not a slice-3 regression:** a residual registration
+   **Closed in the slice-5 registration-CAS tranche (was a slice-3 deferral):** the residual registration
    **TOCTOU** — between the mandatory pre-destroy re-inspect and the `remove_dir_all`, a concurrent
-   `git worktree repair`/re-registration is not held off by a lock, so the delete could still overwrite a
-   racing winner. Slice 3's promise is the immediate-pre-destroy re-verify (which catches every race up to that
-   check) plus classifiability-on-retry; git's own `worktree remove` shares this residual non-atomicity.
-   Closing the window fully needs the **registration-level lock/CAS** that slice 5 ("Concurrency + native-path
-   hardening — registration-level CAS, lost-race-as-conflict, lock-file races") is scoped to add.
+   `create`/`repair`/re-registration was not held off by a lock, so the delete could overwrite a racing
+   winner. Now both `create` and `remove` hold a **per-repository registration lock**
+   (`<common>/worktrees.lock`, a `RegistrationLock` guard) across the whole inspect→decide→mutate→re-verify
+   section, so a lost race is a **conflict, not an overwrite**: a concurrent create can no longer pick the
+   same admin name and clobber (nor leave a duplicate/orphan admin), and the remove window is closed. The
+   lock mirrors the file store's `LockFileGuard` — `create_new` (`O_EXCL`), 50 × 10 ms retry, then a
+   structured `LinkedWorktreeError::RegistrationLocked` (retryable), removed on `Drop` (cancellation-safe);
+   no stale-lock auto-break (a crash-leftover errors until removed, as gitana treats a stale `<ref>.lock`).
+   It **exceeds git's own guarantee** — git's `worktree add`/`remove` share the non-atomicity — so it
+   serializes **gitana-vs-gitana**; a concurrent **stock-git** change is still *detected* by the
+   immediate-pre-destroy re-inspect (git doesn't take this lock). Oracle-tested with genuine OS-thread races
+   (8-way concurrent create → exactly one registration; held-lock → `RegistrationLocked`; create-vs-remove →
+   consistent state), SHA-1 + SHA-256.
 4. **CLI rewire** — point `commands/worktree.rs` + `repo.rs` at the library; keep DWIM/force/
    `--porcelain`/suffix resolution on top. Behavior-preserving; existing git-parity tests stay green.
 5. **Concurrency + native-path hardening** — registration-level CAS, lost-race-as-conflict, full
    `OsStr` identity paths, lock-file races. *(Installments landed: the round-4 create-hardening tranche —
-   F1 post-condition, F3 atomic pointers, F4 name sanitization; and the **native-path tranche** — byte-clean
-   Unix pointer I/O so non-UTF-8 identity paths are accepted and round-trip (see the create-hardening section
-   below). Remaining items — registration CAS on create/remove, lock-file races, and Windows WTF-8 pointer
-   I/O.)*
+   F1 post-condition, F3 atomic pointers, F4 name sanitization; the **native-path tranche** — byte-clean
+   Unix pointer I/O so non-UTF-8 identity paths are accepted and round-trip; and the **registration-CAS
+   tranche** — the per-repository `RegistrationLock` on create/remove (see the create-hardening section
+   below), closing the residual removal TOCTOU and the concurrent-create duplicate-registration race. Only
+   remaining item — **Windows WTF-8 pointer I/O** (non-Unix currently fails closed on non-UTF-8).)*
 
 ### Slice-5 create hardening (DONE) and the one item deferred to slice 3
 

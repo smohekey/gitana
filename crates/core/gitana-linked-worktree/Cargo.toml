@@ -27,6 +27,11 @@ thiserror.workspace = true
 # available everywhere. A wasm consumer would inject capabilities instead (a later slice).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cap-std.workspace = true
+# The registration lock's contended-retry backoff offloads its sleep with `spawn_blocking` and awaits it,
+# so the reactor stays free and a lock *holder* can make progress while a *waiter* backs off (a plain
+# `thread::sleep` would stall a same-runtime holder). Native-only: the crate already requires a tokio
+# runtime transitively via the file store's own `spawn_blocking`.
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tempfile.workspace = true
