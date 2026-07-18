@@ -64,9 +64,9 @@ impl WorktreeFileStore {
 	/// the common store otherwise.
 	fn store(&self, path: &str) -> &LocalFileStore {
 		if is_per_worktree(path) {
-			&*self.worktree
+			&self.worktree
 		} else {
-			&*self.common
+			&self.common
 		}
 	}
 }
