@@ -63,19 +63,22 @@ pub enum DeleteOutcome {
 /// Path-addressed byte storage for one repository's git files.
 ///
 /// Paths are git-relative (`HEAD`, `refs/heads/main`, `objects/aa/bb...`).
-pub trait FileStore {
+pub trait FileStore: Send + Sync {
 	/// Read the bytes stored at `path` within `repo`.
-	fn read_path(&self, path: &str) -> impl Future<Output = Result<Vec<u8>>>;
+	fn read_path(&self, path: &str) -> impl Future<Output = Result<Vec<u8>>> + Send;
 
 	/// Read the bytes at `path` together with their current [`Version`].
-	fn read_path_versioned(&self, path: &str) -> impl Future<Output = Result<(Vec<u8>, Version)>>;
+	fn read_path_versioned(
+		&self,
+		path: &str,
+	) -> impl Future<Output = Result<(Vec<u8>, Version)>> + Send;
 
 	/// Write `bytes` at `path`, failing (without overwriting) if a value exists.
 	fn write_path_if_absent(
 		&self,
 		path: &str,
 		bytes: &[u8],
-	) -> impl Future<Output = Result<WriteOutcome>>;
+	) -> impl Future<Output = Result<WriteOutcome>> + Send;
 
 	/// Conditionally write `bytes` at `path`, returning the new [`Version`].
 	///
@@ -86,7 +89,7 @@ pub trait FileStore {
 		path: &str,
 		bytes: &[u8],
 		expected: Option<&Version>,
-	) -> impl Future<Output = Result<Version>>;
+	) -> impl Future<Output = Result<Version>> + Send;
 
 	/// Atomically replace the value at `path` with `bytes` (creating it if absent), via a
 	/// write-to-temp-then-rename so a reader never sees a partial value.
@@ -96,14 +99,15 @@ pub trait FileStore {
 	/// This lets a caller that itself holds a lock named `<path>.lock` — as the working tree does
 	/// for the index — replace `path` without deadlocking against the store's own compare-and-set
 	/// lock, which would otherwise contend for that same name.
-	fn write_path_replace(&self, path: &str, bytes: &[u8]) -> impl Future<Output = Result<()>>;
+	fn write_path_replace(&self, path: &str, bytes: &[u8])
+	-> impl Future<Output = Result<()>> + Send;
 
 	/// Delete the value at `path`. `expected == Some(v)` requires a version match.
 	fn delete_path(
 		&self,
 		path: &str,
 		expected: Option<&Version>,
-	) -> impl Future<Output = Result<DeleteOutcome>>;
+	) -> impl Future<Output = Result<DeleteOutcome>> + Send;
 
 	/// Delete the value at `path` unconditionally, taking **no** internal `<path>.lock`.
 	///
@@ -112,7 +116,7 @@ pub trait FileStore {
 	/// mid-commit) can remove `path` without deadlocking against the store's own compare-and-set lock.
 	/// A caller that needs the version check, or does not hold an external lock, uses
 	/// [`Self::delete_path`] instead.
-	fn delete_path_unlocked(&self, path: &str) -> impl Future<Output = Result<DeleteOutcome>>;
+	fn delete_path_unlocked(&self, path: &str) -> impl Future<Output = Result<DeleteOutcome>> + Send;
 
 	/// Remove the directory at `path` if it is empty.
 	///
@@ -120,10 +124,10 @@ pub trait FileStore {
 	/// stale `refs/heads/foo/` cannot block a later `refs/heads/foo`). Errors if `path` is not an empty
 	/// directory (a non-empty directory, a value, or absent), which a best-effort pruner treats as
 	/// "stop here". A backend without a directory concept always errors.
-	fn remove_dir(&self, path: &str) -> impl Future<Output = Result<()>>;
+	fn remove_dir(&self, path: &str) -> impl Future<Output = Result<()>> + Send;
 
 	/// Whether a value exists at `path` within `repo`.
-	fn exists(&self, path: &str) -> impl Future<Output = Result<bool>>;
+	fn exists(&self, path: &str) -> impl Future<Output = Result<bool>> + Send;
 
 	/// Whether `path` is a directory (as opposed to a value or absent).
 	///
@@ -131,17 +135,17 @@ pub trait FileStore {
 	/// transaction checking that `refs/heads/foo` (or its reflog `logs/refs/heads/foo`) is not a
 	/// directory left by a nested ref. A backend without a directory concept (an in-memory map) always
 	/// returns `false`.
-	fn is_dir(&self, path: &str) -> impl Future<Output = Result<bool>>;
+	fn is_dir(&self, path: &str) -> impl Future<Output = Result<bool>> + Send;
 
 	/// The byte length of the value at `path`. [`FileStoreError::NotFound`] if it is absent.
-	fn size(&self, path: &str) -> impl Future<Output = Result<u64>>;
+	fn size(&self, path: &str) -> impl Future<Output = Result<u64>> + Send;
 
 	/// List repository-relative paths within `repo` that begin with `prefix`.
 	///
 	/// `prefix` is treated as a directory boundary at its last `/`: the directory
 	/// it names is listed and entries are filtered by the trailing name fragment.
 	/// Not recursive — sufficient for flat collections like `objects/pack/`.
-	fn list_prefix(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>>;
+	fn list_prefix(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> + Send;
 
 	/// Read `length` bytes starting at `offset` within the value at `path`.
 	///
@@ -152,10 +156,10 @@ pub trait FileStore {
 		path: &str,
 		offset: u64,
 		length: u64,
-	) -> impl Future<Output = Result<Vec<u8>>>;
+	) -> impl Future<Output = Result<Vec<u8>>> + Send;
 
 	/// Open the value at `path` as a streaming reader (no whole-value buffering).
-	fn read_path_stream(&self, path: &str) -> impl Future<Output = Result<ByteReader>>;
+	fn read_path_stream(&self, path: &str) -> impl Future<Output = Result<ByteReader>> + Send;
 
 	/// Stream `reader` into `path` if absent, failing once more than `max_len`
 	/// bytes have been read ([`FileStoreError::TooLarge`]). The value is never
@@ -165,5 +169,5 @@ pub trait FileStore {
 		path: &str,
 		reader: ByteReader,
 		max_len: u64,
-	) -> impl Future<Output = Result<WriteOutcome>>;
+	) -> impl Future<Output = Result<WriteOutcome>> + Send;
 }

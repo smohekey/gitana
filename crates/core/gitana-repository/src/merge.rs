@@ -42,8 +42,9 @@ pub(crate) async fn merge_trees<H: HashAlgorithm>(
 
 /// Boxed recursive future for [`merge_tree`]: the merged subtree id (`None` if empty) and the
 /// conflicted paths relative to that subtree.
-type MergeTreeFuture<'a, H> =
-	Pin<Box<dyn Future<Output = Result<(Option<ObjectId<H>>, Vec<String>), RepositoryError>> + 'a>>;
+type MergeTreeFuture<'a, H> = Pin<
+	Box<dyn Future<Output = Result<(Option<ObjectId<H>>, Vec<String>), RepositoryError>> + Send + 'a>,
+>;
 
 /// How an entry of a given name appears on one side of the merge.
 enum Side<'a, H: HashAlgorithm> {

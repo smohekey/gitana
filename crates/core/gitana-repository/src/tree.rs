@@ -26,7 +26,7 @@ fn walk_tree<'a, F: FileStore, H: HashAlgorithm>(
 	tree: ObjectId<H>,
 	prefix: String,
 	out: &'a mut Vec<FlatEntry<H>>,
-) -> Pin<Box<dyn Future<Output = Result<(), RepositoryError>> + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<(), RepositoryError>> + Send + 'a>> {
 	Box::pin(async move {
 		let (kind, payload) = objects.read_object(&tree).await?;
 		if kind != ObjectKind::Tree {
@@ -102,7 +102,7 @@ pub(crate) async fn build_tree<F: FileStore, H: HashAlgorithm>(
 fn write_node<'a, F: FileStore, H: HashAlgorithm>(
 	objects: &'a ObjectStore<F, H>,
 	node: Node<H>,
-) -> Pin<Box<dyn Future<Output = Result<ObjectId<H>, RepositoryError>> + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<ObjectId<H>, RepositoryError>> + Send + 'a>> {
 	Box::pin(async move {
 		let mut entries: Vec<TreeEntry<H>> = Vec::new();
 		for (name, mode, id) in node.files {

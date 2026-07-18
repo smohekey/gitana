@@ -8,7 +8,7 @@ use std::hash::Hash;
 /// algorithm's width, name, and digest. Repositories are single-algorithm, so a
 /// concrete `H` is chosen at the crate boundary and threaded through the object model.
 pub trait HashAlgorithm:
-	Clone + Copy + PartialEq + Eq + Hash + PartialOrd + Ord + Debug + 'static
+	Clone + Copy + PartialEq + Eq + Hash + PartialOrd + Ord + Debug + Send + Sync + 'static
 {
 	/// The exact raw-digest storage for this algorithm: `[u8; 20]` for SHA-1, `[u8; 32]`
 	/// for SHA-256. [`crate::ObjectId`] holds one of these, so an id is exactly as wide
@@ -22,7 +22,9 @@ pub trait HashAlgorithm:
 		+ Hash
 		+ PartialOrd
 		+ Ord
-		+ Debug;
+		+ Debug
+		+ Send
+		+ Sync;
 
 	/// The git `extensions.objectformat` name (`"sha1"` / `"sha256"`).
 	const NAME: &'static str;
