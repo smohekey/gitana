@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
+use gitana_linked_worktree::{
+	LockState, RepositoryId, WorktreeContext, WorktreeEntry, WorktreeRole,
+};
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 use gitana_repository::{HeadState, ReflogIntent, Repository};
 use gitana_worktree::WorkTree;
@@ -514,36 +517,42 @@ fn report_add<H: HashAlgorithm>(label: &Label, commit: Option<ObjectId<H>>) {
 
 async fn list(cwd: &Path, porcelain: bool) -> Result<()> {
 	let found = repo::discover(cwd).await?;
-	// The path-sort order honours the *invoking* worktree's effective `core.ignorecase` (see
-	// [`sort_ignorecase`]) — resolved here where the discovered layout still carries that worktree's git dir.
-	let ignorecase = sort_ignorecase(&found).await?;
-	let entries = match detect_algorithm(&found.common_dir)? {
-		HashKind::Sha1 => collect::<Sha1>(&found.common_dir, ignorecase).await?,
-		HashKind::Sha256 => collect::<Sha256>(&found.common_dir, ignorecase).await?,
-	};
+	// Resolve the *invoking* worktree's effective config (git's full precedence stack) here, where the
+	// discovered layout still carries that worktree's git dir. The library honours the injected
+	// `core.ignorecase` for its listing order (git sorts linked worktrees by checkout path, case-folded
+	// when `core.ignorecase` is set — typical on macOS/Windows).
+	let effective =
+		crate::git_config::effective_config_for_worktree(&found.common_dir, &found.git_dir).await?;
+	// `core.ignorecase` is a startup `core.*` boolean: git validates every occurrence and aborts on any
+	// malformed value — even one shadowed by a higher-precedence source. The library trusts its injected
+	// config (validation is a property of a git process booting, not of a library answering a query), so
+	// keep git's abort here at the CLI edge, as `list` has always done.
+	effective.get_bool_validated("core", None, "ignorecase")?;
+
+	// Delegating to the library closes a symlink disclosure class the native collector inherited from git:
+	// git follows a symlinked `worktrees/` container, a symlinked admin leaf, and a symlinked `locked`
+	// marker — printing the marker target's contents as the lock reason. The library never reads through
+	// those links, so this listing diverges from git by *skipping* a worktree reached only via a symlinked
+	// container/leaf, and by *withholding* a symlinked lock reason (see `tests/git_worktree.rs`).
+	let cx = WorktreeContext::with_effective_config(
+		RepositoryId::at_common_dir(found.common_dir.clone())?,
+		effective,
+	);
+	let listing = gitana_linked_worktree::enumerate(&cx).await?;
+	// The library reports no object for an unborn HEAD; `kind` renders its all-zeros placeholder at the
+	// repository's hash width.
+	let kind = detect_algorithm(&found.common_dir)?;
+	let entries: Vec<WorktreeInfo> = listing
+		.entries
+		.into_iter()
+		.map(|entry| info_from_entry(entry, kind))
+		.collect();
 	if porcelain {
 		print!("{}", render_porcelain(&entries));
 	} else {
 		print!("{}", render_default(&entries));
 	}
 	Ok(())
-}
-
-/// The `core.ignorecase` that governs git's `worktree list` ordering, resolved for the **invoking**
-/// worktree through git's full precedence stack (`system < global < local < config.worktree <
-/// command-scope`, the per-worktree layer folded in when `extensions.worktreeConfig` is enabled — see
-/// [`crate::git_config::effective_config_for_worktree`]). Every layer is validated: a malformed
-/// `core.ignorecase` (or `extensions.worktreeConfig`, or `config.worktree`) aborts, as git does.
-async fn sort_ignorecase(found: &RepositoryLayout) -> Result<bool> {
-	let config =
-		crate::git_config::effective_config_for_worktree(&found.common_dir, &found.git_dir).await?;
-	// `core.ignorecase` is a startup `core.*` boolean, so git validates every occurrence and aborts on any
-	// malformed value — even one shadowed by a higher-precedence source. `get_bool_validated` mirrors that.
-	Ok(
-		config
-			.get_bool_validated("core", None, "ignorecase")?
-			.unwrap_or(false),
-	)
 }
 
 /// One row of `worktree list`: the checkout's path, its state, and its lock/prune attributes.
@@ -566,97 +575,37 @@ enum State {
 	},
 }
 
-/// Gather the worktrees: the main worktree first (the bare repository itself when bare), then each
-/// linked worktree under `<common>/worktrees/*`, sorted by admin-directory name (git's order).
-async fn collect<H: HashAlgorithm>(common: &Path, ignorecase: bool) -> Result<Vec<WorktreeInfo>> {
-	let repo = repo::open_generic::<H>(common, common).await?;
-	let mut out = Vec::new();
-
-	if repo::is_bare(common) {
-		out.push(WorktreeInfo {
-			path: canonical(common),
-			state: State::Bare,
-			locked: None,
-			prunable: None,
-		});
-	} else if let Some(info) = info_for::<H>(&repo, common, &repo::worktree_path_of(common)).await? {
-		out.push(info);
-	}
-
-	let mut names: Vec<String> = match std::fs::read_dir(common.join("worktrees")) {
-		Ok(entries) => entries
-			.flatten()
-			.filter(|entry| entry.path().join("HEAD").is_file())
-			.filter_map(|entry| entry.file_name().into_string().ok())
-			.collect(),
-		Err(_) => Vec::new(),
+/// Map a library [`WorktreeEntry`] onto the row [`render_default`]/[`render_porcelain`] emit. `kind` is
+/// the repository's hash algorithm, used only to render the all-zeros `HEAD` of an unborn branch at the
+/// right width (the library reports no object for it). git derives a row's state from its resolved object
+/// and branch: a detached HEAD has an object but no branch, an unborn one a branch but no object.
+fn info_from_entry(entry: WorktreeEntry, kind: HashKind) -> WorktreeInfo {
+	let locked = match entry.lock {
+		LockState::Unlocked => None,
+		// A symlinked `locked` marker resolves to `Locked { reason: None }` — the library withholds the
+		// target's contents rather than disclosing them as git does — so render it as a reasonless lock.
+		LockState::Locked { reason } => Some(reason.unwrap_or_default()),
 	};
-	names.sort();
-	let mut linked = Vec::new();
-	for name in names {
-		let admin = common.join("worktrees").join(&name);
-		let work = repo::worktree_path_of(&admin);
-		if let Some(info) = info_for::<H>(&repo, &admin, &work).await? {
-			linked.push(info);
-		}
-	}
-	// git orders linked worktrees by checkout *path* (not admin-directory name), comparing
-	// case-insensitively when the invoking worktree's `core.ignorecase` is set — typical on macOS/Windows.
-	// Sort the resolved rows that way so the listing matches git even when the admin-name order differs from
-	// the path order.
-	linked.sort_by(|a, b| {
-		let (pa, pb) = (a.path.to_string_lossy(), b.path.to_string_lossy());
-		if ignorecase {
-			pa.to_ascii_lowercase().cmp(&pb.to_ascii_lowercase())
-		} else {
-			pa.cmp(&pb)
-		}
-	});
-	out.extend(linked);
-	Ok(out)
-}
-
-/// Build a [`WorktreeInfo`] from a worktree's git directory (`git_dir`, holding its `HEAD`) and
-/// working-tree path. Returns `None` only when the `HEAD` file is absent. An unborn branch (its ref
-/// resolves to nothing yet) is kept, with an all-zeros `HEAD` — as git lists it.
-async fn info_for<H: HashAlgorithm>(
-	repo: &Repository<Backend, H>,
-	git_dir: &Path,
-	work: &Path,
-) -> Result<Option<WorktreeInfo>> {
-	let Some(head) = read_head::<H>(git_dir)? else {
-		return Ok(None);
-	};
-	let path = canonical(work);
-	let state = match head {
-		HeadState::Symbolic(refname) => {
-			let head = match repo.refs().resolve(&refname).await? {
-				Some(commit) => commit.to_hex(),
-				None => zero_hex::<H>(),
-			};
-			State::Checkout {
-				head,
-				branch: Some(refname),
-			}
-		}
-		HeadState::Detached(commit) => State::Checkout {
-			head: commit.to_hex(),
-			branch: None,
+	let state = match entry.role {
+		WorktreeRole::Primary { bare: true } => State::Bare,
+		_ => State::Checkout {
+			head: entry
+				.object
+				.map(|object| object.to_hex())
+				.unwrap_or_else(|| zero_hex(kind)),
+			branch: entry.branch,
 		},
 	};
-	// A worktree the user locked (a `locked` file in its git dir); a stale worktree whose checkout has
-	// been deleted is prunable, as git reports.
-	let locked = read_lock_reason(git_dir);
-	// A stale worktree is prunable — unless it is locked, since the lock protects it (git then reports
-	// only `locked`, not `prunable`).
-	let prunable = (!work.exists() && locked.is_none())
+	// A stale worktree (its checkout gone) is prunable — unless it is locked, since the lock protects it
+	// (git then reports only `locked`, not `prunable`).
+	let prunable = (entry.checkout_missing && locked.is_none())
 		.then(|| "gitdir file points to non-existent location".to_owned());
-	Ok(Some(WorktreeInfo {
-		path,
+	WorktreeInfo {
+		path: entry.path,
 		state,
 		locked,
 		prunable,
-	}))
+	}
 }
 
 /// The lock reason for a worktree whose git directory holds a `locked` file — `Some("")` when locked
@@ -668,20 +617,14 @@ fn read_lock_reason(git_dir: &Path) -> Option<String> {
 	}
 }
 
-/// Parse `<git_dir>/HEAD`, or `None` if it is absent.
-fn read_head<H: HashAlgorithm>(git_dir: &Path) -> Result<Option<HeadState<H>>> {
-	match std::fs::read(git_dir.join("HEAD")) {
-		Ok(bytes) => Ok(Some(
-			HeadState::parse(&bytes).map_err(|error| anyhow!("{error}"))?,
-		)),
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-		Err(error) => Err(anyhow!("reading {}/HEAD: {error}", git_dir.display())),
-	}
-}
-
-/// The all-zeros object-id hex for `H` (`2 * RAW_LEN` zeros), git's placeholder for an unborn `HEAD`.
-fn zero_hex<H: HashAlgorithm>() -> String {
-	"0".repeat(H::RAW_LEN * 2)
+/// The all-zeros object-id hex for the repository's hash algorithm (`2 * RAW_LEN` zeros), git's
+/// placeholder for an unborn `HEAD`.
+fn zero_hex(kind: HashKind) -> String {
+	let raw_len = match kind {
+		HashKind::Sha1 => Sha1::RAW_LEN,
+		HashKind::Sha256 => Sha256::RAW_LEN,
+	};
+	"0".repeat(raw_len * 2)
 }
 
 /// `git worktree list` default form: `<path>  <short-oid> <marker>`, path column padded to align; a

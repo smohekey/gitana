@@ -9,43 +9,70 @@ use std::path::{Path, PathBuf};
 
 use crate::LinkedWorktreeError;
 
-/// The admin directories under `<common>/worktrees/` (every entry). A *missing* `worktrees` directory
-/// is `Ok(empty)` — the repository simply has no linked worktrees — but a directory that exists yet
-/// cannot be scanned is an error, never silently "no worktrees" (which would let a conflicting
-/// registration go unseen).
+/// The raw admin entries directly under `<common>/worktrees/` (every child, no symlink policy applied).
+/// A *missing* `worktrees` directory is `Ok(empty)` — the repository simply has no linked worktrees — but
+/// a directory that exists yet cannot be scanned is an error. The caller has already decided what a
+/// **symlinked** `worktrees/` means (see [`read_worktree_admins`] vs [`list_worktree_admins`]); this only
+/// reads the directory's children.
+fn read_worktree_admin_entries(dir: &Path) -> Result<Vec<PathBuf>, LinkedWorktreeError> {
+	match std::fs::read_dir(dir) {
+		Ok(entries) => {
+			let mut admins = Vec::new();
+			for entry in entries {
+				let entry = entry.map_err(|e| LinkedWorktreeError::io("reading worktrees dir", dir, e))?;
+				admins.push(entry.path());
+			}
+			Ok(admins)
+		}
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+		Err(e) => Err(LinkedWorktreeError::io("reading worktrees dir", dir, e)),
+	}
+}
+
+/// The admin directories under `<common>/worktrees/` for **conflict detection** (create/remove) and
+/// **branch-use** — every entry, *failing closed* on a symlinked `worktrees/` container.
+///
+/// A **symlinked** `worktrees` directory is never followed: its children would appear as ordinary admins,
+/// and dereferencing them would read an *external* directory's `HEAD`/`gitdir`/`locked`. For these
+/// callers, silently returning "no worktrees" would be unsafe — a conflicting registration behind the
+/// link would go unseen, and a create/remove could then clobber or mis-target it — so the symlinked
+/// container is surfaced as malformed (fail closed), never quietly empty.
+///
+/// **A deliberate divergence from git** (decided with Scott; see the symlink section of
+/// `docs/hlds/linked-worktree-library.md`). Probed: git follows a symlinked `worktrees/` and lists what is
+/// inside it, including an admin outside the repository — and the worry above is not hypothetical, a
+/// regular `locked` behind such a redirect is printed verbatim (`locked VICTIM SECRET LOCK REASON`) even
+/// though the attacker planted only the symlink.
+///
+/// **Enumeration takes the softer stance** — see [`list_worktree_admins`]: a listing has no conflict to
+/// miss, so it *skips* the symlinked container (listing only the honest worktrees) rather than erroring,
+/// matching how a symlinked admin *leaf* is skipped.
 fn read_worktree_admins(common: &Path) -> Result<Vec<PathBuf>, LinkedWorktreeError> {
 	let dir = common.join("worktrees");
-	// A **symlinked** `worktrees` directory is never followed: its children would appear as ordinary admins,
-	// and enumeration/branch-use would then dereference an *external* directory's `HEAD`/`gitdir`/`locked`
-	// (a listing could leak an external lock reason). Surface it as malformed — fail closed — rather than
-	// silently leaking or missing conflicts.
-	//
-	// **A deliberate divergence from git, kept on purpose** (decided with Scott; see the symlink section of
-	// `docs/hlds/linked-worktree-library.md`). Probed: git follows a symlinked `worktrees/` and lists what is
-	// inside it, including an admin outside the repository — and the worry above is not hypothetical, a
-	// regular `locked` behind such a redirect is printed verbatim (`locked VICTIM SECRET LOCK REASON`) even
-	// though the attacker planted only the symlink. There is no safe way to be faithful here: for an admin
-	// behind a redirect the listed path comes from its `gitdir`, the reason from its `locked`, HEAD/branch
-	// from its `HEAD` — *every* field git reports is read from behind the link, so "follow for structure,
-	// withhold the secret" has nothing left to report. Refusing is the whole answer.
 	if is_leaf_symlink(&dir) {
 		return Err(LinkedWorktreeError::MalformedPointer {
 			kind: crate::error::PointerKind::AdminGitdir,
 			path: dir,
 		});
 	}
-	match std::fs::read_dir(&dir) {
-		Ok(entries) => {
-			let mut admins = Vec::new();
-			for entry in entries {
-				let entry = entry.map_err(|e| LinkedWorktreeError::io("reading worktrees dir", &dir, e))?;
-				admins.push(entry.path());
-			}
-			Ok(admins)
-		}
-		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-		Err(e) => Err(LinkedWorktreeError::io("reading worktrees dir", &dir, e)),
+	read_worktree_admin_entries(&dir)
+}
+
+/// The admin directories under `<common>/worktrees/` for **enumeration** — every entry, *skipping* a
+/// symlinked `worktrees/` container (never following it).
+///
+/// A listing publishes every field it reads from an admin, so it must not read one from behind a
+/// redirect — but unlike conflict detection it has nothing to *miss* by skipping, so a symlinked container
+/// yields no linked worktrees (the listing shows only the main worktree) rather than an error. This mirrors
+/// how [`linked_admin_dirs`] drops a symlinked admin *leaf*: same taint, same skip, consistent outcome —
+/// where the fail-closed [`read_worktree_admins`] would abort. The children are otherwise unfiltered here;
+/// [`linked_admin_dirs`] applies the per-leaf symlink/membership test on top.
+fn list_worktree_admins(common: &Path) -> Result<Vec<PathBuf>, LinkedWorktreeError> {
+	let dir = common.join("worktrees");
+	if is_leaf_symlink(&dir) {
+		return Ok(Vec::new());
 	}
+	read_worktree_admin_entries(&dir)
 }
 
 /// Whether `admin` is an entry git would **list** as a worktree of the repository under `<common>/
@@ -136,7 +163,10 @@ fn admin_commondir_is(common: &Path, admin: &Path) -> Result<bool, LinkedWorktre
 /// do not treat them as interchangeable.
 pub(crate) fn linked_admin_dirs(common: &Path) -> Result<Vec<PathBuf>, LinkedWorktreeError> {
 	let mut admins = Vec::new();
-	for admin in read_worktree_admins(common)? {
+	// Enumeration *skips* a symlinked `worktrees/` container (`list_worktree_admins`), listing only the
+	// honest worktrees — consistent with the per-leaf skip below, and unlike the fail-closed
+	// `read_worktree_admins` create/remove use.
+	for admin in list_worktree_admins(common)? {
 		// Enumeration reads *full* per-worktree state (HEAD/object/lock/path), so it lists only **physical**
 		// admins — a **symlinked** admin (which branch-use may follow for the ref *name* alone) must not have
 		// its external HEAD/lock dereferenced here (that would leak or fabricate listing data). A

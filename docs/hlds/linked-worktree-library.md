@@ -439,9 +439,17 @@ library needed an opt-out, but because its diagnosis was **inverted** — see th
 git is uniformly permissive about symlinks in the admin area. **This crate is not uniformly strict** — that
 framing is wrong, and would misdirect the (unprobed) add/remove rewire.
 
-**The `worktrees/` directory is refused outright**, full stop: `read_worktree_admins` errors before any
-admin is inspected, so nothing below it — enumeration *or* branch-use — ever runs. That is the one
-unconditional refusal.
+**The `worktrees/` container is handled per consumer** — the one place a symlinked container is *not*
+treated uniformly:
+
+- **enumeration skips it** (`list_worktree_admins`): a symlinked `worktrees/` yields no linked worktrees,
+  so a listing shows only the main worktree, never reading through the redirect. A listing has nothing to
+  *miss* by skipping, so it does not error — the same softer stance as the symlinked admin *leaf* below.
+- **conflict detection and branch-use refuse it** (`read_worktree_admins` → `MalformedPointer`): a
+  create/remove that silently saw "no worktrees" behind the link could clobber or mis-target a
+  registration hidden there, so nothing below the symlinked container ever runs for those callers.
+
+Both share one directory read (`read_worktree_admin_entries`); only the symlinked-container policy differs.
 
 **For a symlinked admin *leaf*, the crate discriminates by what gets published:**
 
@@ -454,7 +462,8 @@ So, scoped to leaves: **follow a redirect to learn a name; never dereference one
 
 | fixture | git | this crate |
 |---|---|---|
-| symlinked `worktrees/` dir | follows; lists what is inside, including an external admin | **refuses** (`MalformedPointer`) — everything below it is unreachable, branch-use included |
+| symlinked `worktrees/` dir — **enumeration** | follows; lists what is inside, including an external admin | **skips** (`list_worktree_admins`) — lists only the main worktree; nothing behind the link is read |
+| symlinked `worktrees/` dir — **conflict/branch-use** | follows; lists/derefs what is inside | **refuses** (`read_worktree_admins` → `MalformedPointer`) — a registration hidden behind the link must not be missed |
 | symlinked admin leaf — **enumeration** | follows; emits the worktree (resolved object when the admin's relative `commondir` `../..` resolves through the link; **null object** when it escapes outside `.git`) | **omits** — listing reads full per-worktree state (path from `gitdir`, reason from `locked`, HEAD), all of it from behind the link |
 | symlinked admin leaf — **branch-use** | follows; refuses another checkout of its branch | **follows too** — `worktree_git_dirs` uses `is_listed_admin` *without* the leaf-symlink filter, resolving HEAD to a ref name checked against our refs (`a_symlinked_admin_still_occupies_its_branch`). Dropping it would silently permit a double checkout git forbids. Success path publishes nothing; **but a malformed HEAD leaks via the error** — see below. |
 | symlinked `locked` marker | follows; **prints the target file's contents** as the reason | `Locked { reason: None }` |

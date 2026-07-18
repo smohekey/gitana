@@ -24,6 +24,7 @@ gitana-file-store-local = { path = "crates/core/gitana-file-store-local" }
 gitana-file-store-memory = { path = "crates/core/gitana-file-store-memory" }
 gitana-git-http = { path = "crates/core/gitana-git-http" }
 gitana-identity = { path = "crates/core/gitana-identity" }
+gitana-linked-worktree = { path = "crates/core/gitana-linked-worktree" }
 gitana-object = { path = "crates/core/gitana-object" }
 gitana-object-store = { path = "crates/core/gitana-object-store" }
 gitana-porcelain = { path = "crates/core/gitana-porcelain", default-features = false }

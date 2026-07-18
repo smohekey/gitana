@@ -689,7 +689,6 @@ fn remove_refuses_a_checkout_with_a_missing_gitfile() {
 #[test]
 fn handles_relative_gitdir_worktrees() {
 	let base = unique_tmp("gta-wt-rel");
-	let base_s = base.to_str().unwrap();
 	let repo = base.join("repo");
 	let repo_s = repo.to_str().unwrap();
 
@@ -977,6 +976,202 @@ fn list_order_honors_worktree_config_ignorecase_override() {
 	assert_eq!(
 		gta_out.stdout, git_out.stdout,
 		"command-scope beats config.worktree"
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+// ---------------------------------------------------------------------------
+// symlink disclosure hardening (unification slice 9)
+//
+// `gta worktree list` delegates to the `gitana-linked-worktree` library, which refuses to *follow*
+// symlinks inside `.git` that stock git follows — closing a file-disclosure class the native collector
+// inherited from git (git's `read_dir`/`is_file`/`read_to_string` all follow links, so a listing became a
+// file-read primitive for anyone who can write inside `.git`). `.git` write access already implies code
+// execution via hooks, so this is defence-in-depth, not a high-severity hole — but there is no reason to
+// reproduce it. These three fixtures pin the divergence **by field**: gta matches git structurally on an
+// honest repo (every other test in this file), and diverges only where following a planted symlink would
+// betray a secret. **Each divergence below is deliberate — do NOT "fix" it back into parity with git; that
+// reintroduces the leak.**
+// ---------------------------------------------------------------------------
+
+/// Fixture A — a symlinked `<common>/worktrees/` container. git follows it and lists whatever admin dirs
+/// sit behind the redirect (their `HEAD`/`gitdir`/`locked` all read from an external location a listing
+/// would then publish). gta **skips** the symlinked container: it lists only the honest main worktree,
+/// never reading through the link — the same softer stance the library takes for a symlinked admin leaf
+/// (fixture B). (Create/remove keep the stricter fail-closed refusal, since a registration hidden behind
+/// the link must not be silently missed — but a listing has nothing to miss.)
+#[cfg(unix)]
+#[test]
+fn list_skips_a_symlinked_worktrees_container() {
+	let base = unique_tmp("gta-wt-symlink-container");
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(base_s, &["init", "--object-format=sha1", repo_s], b"");
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+	gta(
+		repo_s,
+		&["worktree", "add", base.join("wt").to_str().unwrap()],
+		b"",
+	);
+
+	// Redirect the whole `worktrees/` directory through a symlink to a relocated copy.
+	let worktrees = repo.join(".git/worktrees");
+	std::fs::rename(&worktrees, repo.join(".git/worktrees.real")).unwrap();
+	std::os::unix::fs::symlink("worktrees.real", &worktrees).unwrap();
+
+	let wt_path = real(&base.join("wt"));
+	// Probe: git follows the redirect and lists the worktree behind it.
+	let git_out = git(repo_s, &["worktree", "list", "--porcelain"]);
+	assert!(
+		git_out.contains(&wt_path),
+		"probe: git follows a symlinked worktrees/ and lists the worktree behind it:\n{git_out}"
+	);
+
+	// gta succeeds but omits the behind-the-link worktree — it lists only the honest main worktree.
+	let gta_out = gta(repo_s, &["worktree", "list", "--porcelain"], b"");
+	assert!(
+		gta_out.contains(&real(&repo)),
+		"gta still lists the main worktree:\n{gta_out}"
+	);
+	assert!(
+		!gta_out.contains(&wt_path),
+		"gta must not list a worktree reached only through a symlinked worktrees/:\n{gta_out}"
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// Fixture B — a single admin entry that is a symlink to a directory elsewhere. git follows the leaf and
+/// lists the worktree behind it (reading its `HEAD`/`branch`/`gitdir` from outside `<common>/worktrees/`);
+/// gta filters symlinked admin leaves out of the enumeration — a listing publishes every field it reads,
+/// so it must not read one from behind a redirect. Both agree on the honest worktrees; gta simply omits
+/// the symlinked one, with no error.
+#[cfg(unix)]
+#[test]
+fn list_omits_a_symlinked_admin_leaf() {
+	let base = unique_tmp("gta-wt-symlink-leaf");
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(base_s, &["init", "--object-format=sha1", repo_s], b"");
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+	gta(
+		repo_s,
+		&["worktree", "add", base.join("wt").to_str().unwrap()],
+		b"",
+	);
+
+	// Move the admin dir out of `worktrees/` and symlink it back under the same name: the leaf is now a
+	// symlink to a real admin directory sitting outside `worktrees/`.
+	let name = std::fs::read_dir(repo.join(".git/worktrees"))
+		.unwrap()
+		.next()
+		.unwrap()
+		.unwrap()
+		.file_name()
+		.into_string()
+		.unwrap();
+	let admin = repo.join(".git/worktrees").join(&name);
+	let elsewhere = repo.join(".git").join(format!("{name}-elsewhere"));
+	std::fs::rename(&admin, &elsewhere).unwrap();
+	std::os::unix::fs::symlink(format!("../{name}-elsewhere"), &admin).unwrap();
+
+	let wt_path = real(&base.join("wt"));
+	// Probe: git follows the leaf and lists the worktree behind it.
+	let git_out = git(repo_s, &["worktree", "list", "--porcelain"]);
+	assert!(
+		git_out.contains(&wt_path),
+		"probe: git follows a symlinked admin leaf:\n{git_out}"
+	);
+
+	// gta lists the main worktree but omits the symlinked leaf — no error, just a narrower listing.
+	let gta_out = gta(repo_s, &["worktree", "list", "--porcelain"], b"");
+	assert!(
+		gta_out.contains(&real(&repo)),
+		"gta still lists the main worktree:\n{gta_out}"
+	);
+	assert!(
+		!gta_out.contains(&wt_path),
+		"gta must not list a worktree reached through a symlinked admin leaf:\n{gta_out}"
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// Fixture C — an honest linked worktree whose `<admin>/locked` marker is a symlink to a secret file.
+/// This is the disclosure the hardening is *named* for: git reads through the link and prints the target
+/// file's contents as the lock reason (`locked <file contents>`), turning a read-only listing into a
+/// file-disclosure primitive. gta lists the worktree identically — same path, HEAD, branch, and it *is*
+/// reported locked — but **withholds the reason**, emitting a bare `locked`. The structural fields match
+/// git; only the secret is withheld. **Do not "fix" gta to print the reason here — that is the leak.**
+#[cfg(unix)]
+#[test]
+fn list_withholds_a_symlinked_lock_reason() {
+	let base = unique_tmp("gta-wt-symlink-lock");
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(base_s, &["init", "--object-format=sha1", repo_s], b"");
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+	gta(
+		repo_s,
+		&["worktree", "add", base.join("wt").to_str().unwrap()],
+		b"",
+	);
+
+	// Point the worktree's `locked` marker at a secret file outside the repo.
+	let secret = base.join("secret.txt");
+	std::fs::write(&secret, "TOP SECRET LOCK REASON\n").unwrap();
+	let name = std::fs::read_dir(repo.join(".git/worktrees"))
+		.unwrap()
+		.next()
+		.unwrap()
+		.unwrap()
+		.file_name()
+		.into_string()
+		.unwrap();
+	let marker = repo.join(".git/worktrees").join(&name).join("locked");
+	std::os::unix::fs::symlink(&secret, &marker).unwrap();
+
+	let git_out = git(repo_s, &["worktree", "list", "--porcelain"]);
+	let gta_out = gta(repo_s, &["worktree", "list", "--porcelain"], b"");
+
+	// Probe: git discloses the secret file's contents as the lock reason.
+	assert!(
+		git_out.contains("locked TOP SECRET LOCK REASON"),
+		"probe: git reads through the symlinked marker and prints the secret:\n{git_out}"
+	);
+
+	// Structural parity: gta lists the same worktree and reports it locked...
+	assert!(
+		gta_out.contains(&real(&base.join("wt"))),
+		"gta lists the worktree:\n{gta_out}"
+	);
+	assert!(
+		gta_out.contains("\nlocked\n"),
+		"gta reports the worktree locked, reasonless:\n{gta_out}"
+	);
+	// ...but withholds the reason — the secret never appears.
+	assert!(
+		!gta_out.contains("TOP SECRET"),
+		"gta must not disclose the symlinked marker's contents:\n{gta_out}"
 	);
 
 	std::fs::remove_dir_all(&base).ok();

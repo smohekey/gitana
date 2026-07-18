@@ -640,9 +640,12 @@ async fn stray_gitdir_and_locked_in_the_main_git_do_not_affect_the_primary() {
 }
 
 #[tokio::test]
-async fn a_symlinked_worktrees_directory_is_not_followed() {
+async fn a_symlinked_worktrees_directory_is_skipped_not_followed() {
 	// A symlinked `<common>/worktrees` would make every external child look like an ordinary admin, so
-	// enumeration would dereference external `HEAD`/`locked`. It is fail-closed: a hard error, no leak.
+	// following it would dereference external `HEAD`/`locked` and publish it. Enumeration **skips** the
+	// symlinked container — listing only the honest main worktree — rather than reading through it. It does
+	// not error (a listing has no conflict to miss), consistent with how a symlinked admin *leaf* is
+	// skipped; create/remove keep the stricter fail-closed refusal (see `create.rs`/`remove.rs`).
 	for (fmt, _kind) in formats() {
 		let base = unique_tmp(&format!("symlink-worktrees-{fmt}"));
 		let work = base.join("repo");
@@ -666,9 +669,26 @@ async fn a_symlinked_worktrees_directory_is_not_followed() {
 		std::os::unix::fs::symlink(&external, &worktrees).unwrap();
 		std::fs::write(external.join("wt/locked"), b"TOP SECRET").unwrap();
 
+		let listing = enumerate(&ctx_at(&work))
+			.await
+			.expect("enumeration skips a symlinked worktrees dir, it does not error");
+		// Only the main worktree — nothing behind the redirect is listed.
+		assert_eq!(
+			listing.entries.len(),
+			1,
+			"{fmt}: only the main worktree is listed; the symlinked container yields no linked worktrees"
+		);
 		assert!(
-			enumerate(&ctx_at(&work)).await.is_err(),
-			"{fmt}: a symlinked worktrees dir must be a hard error, never followed"
+			matches!(listing.entries[0].role, WorktreeRole::Primary { .. }),
+			"{fmt}: the single entry is the primary worktree"
+		);
+		// The planted secret is never dereferenced.
+		assert!(
+			listing
+				.entries
+				.iter()
+				.all(|e| !matches!(&e.lock, LockState::Locked { reason: Some(r) } if r.contains("SECRET"))),
+			"{fmt}: no external lock reason is disclosed"
 		);
 		let _ = std::fs::remove_dir_all(&base);
 	}

@@ -1893,6 +1893,7 @@ dependencies = [
  "gitana-file-store-memory",
  "gitana-git-http",
  "gitana-identity",
+ "gitana-linked-worktree",
  "gitana-object",
  "gitana-object-store",
  "gitana-porcelain",
