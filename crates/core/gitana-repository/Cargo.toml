@@ -15,7 +15,6 @@ gitana-diff.workspace = true
 gitana-file-store.workspace = true
 gitana-object.workspace = true
 gitana-object-store.workspace = true
-gitana-trust.workspace = true
 thiserror.workspace = true
 
 # Native ref-lock backoff sleeps on the blocking pool (`spawn_blocking`); wasm is single-process and

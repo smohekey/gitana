@@ -10,13 +10,27 @@ use gitana_file_store::FileStore;
 use gitana_git_http::{Deepen, parse_advertisement};
 use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit};
 use gitana_remote::{HttpTransport, Origin};
-use gitana_repository::{FileMode, ReflogIntent, Repository, TreeBuildEntry};
+use gitana_repository::{FileMode, ReflogIntent, Repository, RepositoryError, TreeBuildEntry};
 use gitana_trust::{
-	AuditEvent, KeyId, Policy, TRUST_DOCUMENT_PATH, TrustDocument, TrustRoot, TrustedKey,
-	fold_trust_root, verify_candidate_trust_update, verify_candidate_trust_update_anchored,
+	AuditEvent, KeyId, ObjectSource, Policy, TRUST_DOCUMENT_PATH, TrustDocument, TrustRoot,
+	TrustedKey, fold_trust_root, verify_candidate_trust_update,
+	verify_candidate_trust_update_anchored,
 };
 
 use crate::{Identity, Signer};
+
+/// Adapts a repository's object store to the trust [`ObjectSource`] trait. `gitana-trust` deliberately
+/// does **not** depend on `gitana-repository` (its trait is storage-agnostic, so it stays a pure,
+/// in-memory-testable library), so the `Repository → ObjectSource` bridge lives here, at the consumer.
+struct RepoObjects<'a, F, H: HashAlgorithm>(&'a Repository<F, H>);
+
+impl<F: FileStore, H: HashAlgorithm> ObjectSource<H> for RepoObjects<'_, F, H> {
+	type Error = RepositoryError;
+
+	async fn read_object(&self, id: &ObjectId<H>) -> Result<(ObjectKind, Vec<u8>), RepositoryError> {
+		Ok(self.0.objects().read_object(id).await?)
+	}
+}
 
 /// The ref holding a repository's trust state. Its commit chain is the authorization chain.
 pub const TRUST_REF: &str = "refs/gitana/trust";
@@ -68,7 +82,7 @@ pub async fn trust_init<F: FileStore, H: HashAlgorithm>(
 	// Prove the chain before moving the ref: the bootstrap must be self-signed by a key in its own
 	// root. If the signing key is not the one we enrolled, this refuses and the ref stays unset. The
 	// anchored fold also surfaces the key that actually signed, for the audit event.
-	let folded = verify_candidate_trust_update_anchored(repo, None, tip).await?;
+	let folded = verify_candidate_trust_update_anchored(&RepoObjects(repo), None, tip).await?;
 
 	// The trust ref lives outside git's logged namespaces, so the move opts out and this writes the
 	// `trust:` reflog explicitly (as it has since the trust subsystem landed).
@@ -98,7 +112,7 @@ pub async fn trust_list<F: FileStore, H: HashAlgorithm>(
 ) -> Result<Option<TrustRoot>> {
 	match repo.refs().resolve(TRUST_REF).await? {
 		None => Ok(None),
-		Some(tip) => Ok(Some(fold_trust_root(repo, tip).await?)),
+		Some(tip) => Ok(Some(fold_trust_root(&RepoObjects(repo), tip).await?)),
 	}
 }
 
@@ -185,7 +199,8 @@ pub async fn trust_sync<F: FileStore, H: HashAlgorithm>(
 	// Prove the remote root before adopting it: it must fold cleanly and (when local trust exists)
 	// fast-forward the local tip. A divergent chain fails here and the ref stays put. Surface the
 	// chain's anchor so a bootstrap adoption can pin it.
-	let folded = verify_candidate_trust_update_anchored(repo, local_tip, remote_tip).await?;
+	let folded =
+		verify_candidate_trust_update_anchored(&RepoObjects(repo), local_tip, remote_tip).await?;
 
 	// A first-use bootstrap (no local trust) is faith-based: folding proves internal consistency but
 	// not that the anchor is the right key. Defer to `confirm` before adopting. A fast-forward is
@@ -413,7 +428,7 @@ async fn trust_update<F: FileStore, H: HashAlgorithm>(
 	.await?;
 	// Prove the new chain (signed by a key the *previous* root trusts, and a fast-forward of it)
 	// before the ref moves — the same check receive-pack makes.
-	verify_candidate_trust_update(repo, Some(old_tip), new_tip).await?;
+	verify_candidate_trust_update(&RepoObjects(repo), Some(old_tip), new_tip).await?;
 	repo
 		.refs()
 		.update_ref(TRUST_REF, new_tip, Some(old_tip), ReflogIntent::Skip)

@@ -183,7 +183,7 @@ pub async fn verify_push_with_ledger<F: FileStore, H: HashAlgorithm, L: NonceLed
 	// Fold the current root (if any). Its policy governs the non-trust protected refs; a trust ref
 	// that exists but cannot be folded fails the whole push closed.
 	let root = match current_tip {
-		Some(tip) => match fold_trust_root(repo, tip).await {
+		Some(tip) => match fold_trust_root(&RepoObjects(repo), tip).await {
 			Ok(root) => Some(root),
 			Err(error) => {
 				return Ok(TrustVerdict::Reject {
@@ -506,6 +506,19 @@ async fn verify_protected_tip<F: FileStore, H: HashAlgorithm>(
 	Ok(None)
 }
 
+/// Adapts a repository's object store to the trust [`ObjectSource`] trait. `gitana-trust` deliberately
+/// does **not** depend on `gitana-repository` (its trait is storage-agnostic, so it stays a pure,
+/// in-memory-testable library), so the `Repository → ObjectSource` bridge lives here, at the consumer.
+struct RepoObjects<'a, F, H: HashAlgorithm>(&'a Repository<F, H>);
+
+impl<F: FileStore, H: HashAlgorithm> ObjectSource<H> for RepoObjects<'_, F, H> {
+	type Error = RepositoryError;
+
+	async fn read_object(&self, id: &ObjectId<H>) -> Result<(ObjectKind, Vec<u8>), RepositoryError> {
+		Ok(self.0.objects().read_object(id).await?)
+	}
+}
+
 /// An [`ObjectSource`] over the pushed-but-unwritten objects, falling back to the store — the
 /// quarantine trust folding reads so a candidate trust commit (not yet stored) resolves.
 struct Quarantine<'a, F, H: HashAlgorithm> {
@@ -520,6 +533,6 @@ impl<F: FileStore, H: HashAlgorithm> ObjectSource<H> for Quarantine<'_, F, H> {
 		if let Some(object) = self.pushed.get(id) {
 			return Ok(object.clone());
 		}
-		<Repository<F, H> as ObjectSource<H>>::read_object(self.repo, id).await
+		Ok(self.repo.objects().read_object(id).await?)
 	}
 }
