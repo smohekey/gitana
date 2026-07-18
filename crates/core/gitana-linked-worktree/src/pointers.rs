@@ -19,6 +19,15 @@ fn read_worktree_admins(common: &Path) -> Result<Vec<PathBuf>, LinkedWorktreeErr
 	// and enumeration/branch-use would then dereference an *external* directory's `HEAD`/`gitdir`/`locked`
 	// (a listing could leak an external lock reason). Surface it as malformed — fail closed — rather than
 	// silently leaking or missing conflicts.
+	//
+	// **A deliberate divergence from git, kept on purpose** (decided with Scott; see the symlink section of
+	// `docs/hlds/linked-worktree-library.md`). Probed: git follows a symlinked `worktrees/` and lists what is
+	// inside it, including an admin outside the repository — and the worry above is not hypothetical, a
+	// regular `locked` behind such a redirect is printed verbatim (`locked VICTIM SECRET LOCK REASON`) even
+	// though the attacker planted only the symlink. There is no safe way to be faithful here: for an admin
+	// behind a redirect the listed path comes from its `gitdir`, the reason from its `locked`, HEAD/branch
+	// from its `HEAD` — *every* field git reports is read from behind the link, so "follow for structure,
+	// withhold the secret" has nothing left to report. Refusing is the whole answer.
 	if is_leaf_symlink(&dir) {
 		return Err(LinkedWorktreeError::MalformedPointer {
 			kind: crate::error::PointerKind::AdminGitdir,
@@ -41,8 +50,11 @@ fn read_worktree_admins(common: &Path) -> Result<Vec<PathBuf>, LinkedWorktreeErr
 
 /// Whether `admin` is an entry git would **list** as a worktree of the repository under `<common>/
 /// worktrees/`: it resolves to a *directory* and carries a `gitdir` back-pointer that is a regular file.
-/// A **symlinked** admin is *followed* — git lists it and treats its branch as checked out, so branch-use
-/// and enumeration must too (only the ref *name* is read; no content is exposed). A stray non-directory (a
+/// A **symlinked** admin is *followed* here — git lists it and treats its branch as checked out, so
+/// **branch-use** must too (`worktree_git_dirs`, which reads only the ref *name*; no content is exposed).
+/// **Enumeration does not** — [`linked_admin_dirs`] filters symlinked leaves out on top of this test,
+/// because a listing publishes every field it reads from the admin. This predicate is git's membership
+/// question alone; each caller decides what to do with a symlinked answer. A stray non-directory (a
 /// `.DS_Store`, a leftover lock) is ignored; an incomplete admin (no `gitdir`) is not yet a worktree; a
 /// `gitdir` that is a directory / unreadable is corruption (`Err`), never silently skipped.
 ///
@@ -112,10 +124,16 @@ fn admin_commondir_is(common: &Path, admin: &Path) -> Result<bool, LinkedWorktre
 	}
 }
 
-/// The linked-worktree admin directories git would list under `<common>/worktrees/`, admin-name sorted
-/// (git's enumeration order). Uses git's worktree-list membership (`is_listed_admin`), *not* `commondir`
-/// ownership — git's `worktree list` includes a `commondir`-mismatched or symlinked admin, so enumeration
-/// does too. A scan failure, or a malformed existing `gitdir`, is an error.
+/// The linked-worktree admin directories **this crate enumerates** under `<common>/worktrees/`, admin-name
+/// sorted (git's enumeration order). Membership is git's worktree-list test (`is_listed_admin`), *not*
+/// `commondir` ownership — a `commondir`-mismatched but **physical** admin is listed, as git does. A scan
+/// failure, or a malformed existing `gitdir`, is an error.
+///
+/// **This is git's list minus symlinked leaves — deliberately narrower than git.** git follows a symlinked
+/// admin and emits it; enumeration must not, because it publishes *everything* it reads from that admin
+/// (see the filter below). Branch-use is the opposite case and does follow them (`worktree_git_dirs`), so
+/// "git's list membership" (`is_listed_admin`) and "what this function returns" are **not** the same set —
+/// do not treat them as interchangeable.
 pub(crate) fn linked_admin_dirs(common: &Path) -> Result<Vec<PathBuf>, LinkedWorktreeError> {
 	let mut admins = Vec::new();
 	for admin in read_worktree_admins(common)? {
@@ -124,6 +142,16 @@ pub(crate) fn linked_admin_dirs(common: &Path) -> Result<Vec<PathBuf>, LinkedWor
 		// its external HEAD/lock dereferenced here (that would leak or fabricate listing data). A
 		// `commondir`-mismatched but *physical* admin is still listed: it is physically within our
 		// `worktrees/`, and git lists it.
+		//
+		// **git does list a symlinked admin leaf — probed, twice.** (Resolved object when the admin's relative
+		// `commondir` `../..` still resolves through the link; a null object when the link escapes outside
+		// `.git`, which is what an earlier probe misread as "git omits these".) So dropping it is a deliberate
+		// divergence, kept for the same reason as the `worktrees/` case above: there is no untainted field to
+		// report for an admin behind a redirect.
+		//
+		// The `&&` short-circuit is load-bearing: `is_listed_admin` can `Err` on a malformed `gitdir` and is
+		// never reached for a symlinked admin, so evaluating both unconditionally would turn today's silent
+		// skip into an enumeration-aborting error.
 		if !is_leaf_symlink(&admin) && is_listed_admin(&admin)? {
 			admins.push(admin);
 		}
@@ -560,20 +588,93 @@ fn is_pseudoref_name(name: &str) -> bool {
 			.all(|b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
 }
 
+/// Where the `start` name being resolved came from — decides how a malformed/too-deep chain is reported,
+/// so the failure names the right thing and never echoes on-disk content.
+#[derive(Clone, Copy)]
+pub(crate) enum RefSource<'a> {
+	/// The chain roots at a worktree's `HEAD` file. A malformation is a [`MalformedPointer`] naming that
+	/// `<git_dir>/HEAD` — never the offending target *name* (which for a followed symlinked admin is content
+	/// read from behind the redirect: probed as `malformed HEAD pointer at TOP_SECRET_LEAKED`).
+	///
+	/// [`MalformedPointer`]: LinkedWorktreeError::MalformedPointer
+	Head,
+	/// The chain roots at a **caller-supplied** requested branch (short name). Only a malformation of the
+	/// *initial* argument is an [`InvalidRequestedBranch`] — a bad argument, never blamed on the healthy
+	/// `HEAD`, and the name being the caller's own discloses nothing. A malformation *after* a symref hop is
+	/// on-disk corruption in a repository ref file (a valid branch whose symref target is broken/cyclic),
+	/// reported as a [`MalformedPointer`] of kind [`Ref`](crate::error::PointerKind::Ref) naming the branch's
+	/// root ref file — not the caller and not a read target name.
+	///
+	/// [`InvalidRequestedBranch`]: LinkedWorktreeError::InvalidRequestedBranch
+	/// [`MalformedPointer`]: LinkedWorktreeError::MalformedPointer
+	RequestedBranch(&'a str),
+}
+
 /// Follow a symbolic-ref chain from `start` to its terminal ref name (`refs/heads/alias` →
 /// `refs/heads/feature`), routing each hop to the per-worktree git dir or the shared common dir as git
 /// does. `max_hops` is the remaining ref-read budget (git's `SYMREF_MAXDEPTH` minus any hop already spent
 /// by the caller reading `HEAD`): exceeding it is a cyclic/too-deep chain, which git rejects — surfaced as
 /// malformed rather than an arbitrary mid-chain name. An unreadable hop is an error, not a silent stop.
+///
+/// `source` decides how a malformation is reported (see [`RefSource`]): the error **never** carries the
+/// offending ref *name*, only the resolved-from HEAD file or the caller's own branch argument. Rendering
+/// the name would echo file content — and when `git_dir` is a followed symlinked admin, that content is
+/// read from behind the redirect.
 pub(crate) fn resolve_ref_terminal(
 	common: &Path,
 	git_dir: &Path,
 	start: &str,
+	source: RefSource<'_>,
 	max_hops: usize,
 ) -> Result<String, LinkedWorktreeError> {
-	let malformed = |name: String| LinkedWorktreeError::MalformedPointer {
-		kind: crate::error::PointerKind::Head,
-		path: PathBuf::from(name),
+	// The branch's root ref file, for a `RequestedBranch` corruption *after* the first hop — the chain the
+	// caller asked to resolve, named by its own (caller-supplied) branch ref, never a read target name.
+	let branch_root = || {
+		if is_per_worktree_ref(start) {
+			git_dir
+		} else {
+			common
+		}
+		.join(start)
+	};
+	// The safe path to attribute a failure to, for a source whose `name` is untrusted content — the HEAD
+	// file, or (for a requested branch) the caller's own branch ref. Never a `base.join(name)` that embeds a
+	// name read from a possibly-symlinked admin.
+	let safe_root = || match source {
+		RefSource::Head => git_dir.join("HEAD"),
+		RefSource::RequestedBranch(_) => branch_root(),
+	};
+	// `first` distinguishes a bad *initial* value (the caller's argument, or `HEAD`'s target) from on-disk
+	// corruption discovered after following a symref hop.
+	let malformed = |first: bool| match source {
+		RefSource::Head => LinkedWorktreeError::MalformedPointer {
+			kind: crate::error::PointerKind::Head,
+			path: git_dir.join("HEAD"),
+		},
+		RefSource::RequestedBranch(name) if first => {
+			LinkedWorktreeError::InvalidRequestedBranch(name.to_owned())
+		}
+		RefSource::RequestedBranch(_) => LinkedWorktreeError::MalformedPointer {
+			kind: crate::error::PointerKind::Ref,
+			path: branch_root(),
+		},
+	};
+	// A ref-read *I/O* failure must not render `base.join(&name)` either: `name` is content read from disk
+	// (always, for a `Head` root; after the first hop, for a branch) — for a followed symlinked admin, from
+	// behind the redirect. A syntactically-valid-but-unopenable target (e.g. a component over `NAME_MAX`)
+	// would otherwise leak through the `Io` path (probed). Rebind such an error's path to the safe root; the
+	// caller's *own* first branch read stays as-is (its path is the caller's argument, not disclosure).
+	let redact_read = |e: LinkedWorktreeError, first_hop: bool| match e {
+		LinkedWorktreeError::Io {
+			context,
+			source: io,
+			..
+		} if !(matches!(source, RefSource::RequestedBranch(_)) && first_hop) => LinkedWorktreeError::Io {
+			context,
+			source: io,
+			path: safe_root(),
+		},
+		other => other,
 	};
 	let mut name = start.to_owned();
 	let mut first = true;
@@ -583,23 +684,24 @@ pub(crate) fn resolve_ref_terminal(
 		// terminal (`HEAD -> refs/heads/alias -> CUSTOM_REF`, verified), so the `refs/` requirement applies
 		// only to the first name. Every hop must obey `check-ref-format` (which also blocks escaping the repo).
 		if (first && !name.starts_with("refs/")) || !is_valid_refname(&name) {
-			return Err(malformed(name));
+			return Err(malformed(first));
 		}
+		let first_hop = first;
 		first = false;
 		let base = if is_per_worktree_ref(&name) {
 			git_dir
 		} else {
 			common
 		};
-		match read_ref_symref(&base.join(&name))? {
+		match read_ref_symref(&base.join(&name)).map_err(|e| redact_read(e, first_hop))? {
 			Some(next) => name = next,
 			None => return Ok(name),
 		}
 	}
 	// Budget exhausted without reaching a direct ref — a cyclic or pathologically deep symbolic-ref chain,
-	// which git rejects ("too many levels of symbolic references"). Surface it as malformed rather than
-	// returning an arbitrary mid-chain name that later reads as a spurious unborn/terminal ref.
-	Err(malformed(name))
+	// which git rejects ("too many levels of symbolic references"). It is always on-disk (a cycle needs ref
+	// files), so `first` is `false`. Surface it as malformed rather than an arbitrary mid-chain name.
+	Err(malformed(false))
 }
 
 /// The *terminal* branch ref a worktree's `HEAD` resolves to (following the symbolic-ref chain), or
@@ -611,7 +713,14 @@ fn resolve_head_branch(
 ) -> Result<Option<String>, LinkedWorktreeError> {
 	match read_ref_symref(&git_dir.join("HEAD"))? {
 		// `HEAD` itself consumed one hop of git's budget, so the chain from its target has `MAXDEPTH - 1` left.
-		Some(target) => resolve_ref_terminal(common, git_dir, &target, SYMREF_MAXDEPTH - 1).map(Some),
+		Some(target) => resolve_ref_terminal(
+			common,
+			git_dir,
+			&target,
+			RefSource::Head,
+			SYMREF_MAXDEPTH - 1,
+		)
+		.map(Some),
 		None => Ok(None), // detached or no HEAD — not on a branch
 	}
 }

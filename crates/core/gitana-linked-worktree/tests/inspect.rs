@@ -781,6 +781,235 @@ async fn a_symlinked_admin_still_occupies_its_branch() {
 }
 
 #[tokio::test]
+async fn a_malformed_head_behind_a_symlinked_admin_is_not_disclosed() {
+	// Branch-use follows a symlinked admin and resolves its HEAD. A **malformed** HEAD behind that redirect
+	// must NOT have its contents surfaced in the error: `resolve_ref_terminal` reports the HEAD *file path*,
+	// never the parsed ref name. Same confused-deputy family as a symlinked lock marker — an admin symlinked
+	// to an external directory would otherwise leak a line of a file there through the error message.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("symlink-head-leak-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		let wt = base.join("wt");
+		git(&[
+			"-C",
+			w,
+			"worktree",
+			"add",
+			"-b",
+			"feat",
+			wt.to_str().unwrap(),
+		]);
+
+		// Relocate the admin outside `.git`, symlink it back, and plant a malformed HEAD carrying a secret.
+		let admin = work.join(".git/worktrees/wt");
+		let external = base.join("external-admin");
+		std::fs::rename(&admin, &external).unwrap();
+		symlink(&external, &admin).unwrap();
+		std::fs::write(external.join("HEAD"), b"ref: TOP_SECRET_LEAKED\n").unwrap();
+
+		// Branch-use over the symlinked admin hits the malformed HEAD. Whether it surfaces as an `Err` or is
+		// absorbed, the secret must never appear in any rendered diagnostic.
+		let result = inspect(&query(rid_at(&work), &base.join("dest"), "feat")).await;
+		let rendered = match &result {
+			Err(e) => format!("{e}"),
+			Ok(insp) => format!("{insp:?}"),
+		};
+		assert!(
+			!rendered.contains("TOP_SECRET_LEAKED"),
+			"{fmt}: a malformed HEAD behind a symlinked admin leaked its contents: {rendered}"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn an_invalid_requested_branch_is_not_blamed_on_head() {
+	// A malformed *requested branch* (a caller argument) must surface as `InvalidRequestedBranch`, never as
+	// a `MalformedPointer` blaming the repository's healthy `HEAD` — the branch is caller-supplied, so
+	// resolving it is a distinct job from resolving a worktree's HEAD chain.
+	use gitana_linked_worktree::LinkedWorktreeError;
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("bad-req-branch-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		// A branch name with a space is not a valid ref (`refs/heads/bad name` fails check-ref-format), yet
+		// HEAD is perfectly healthy.
+		let err = inspect(&query(rid_at(&work), &base.join("dest"), "bad name"))
+			.await
+			.expect_err(&format!("{fmt}: an invalid requested branch must error"));
+		assert!(
+			matches!(&err, LinkedWorktreeError::InvalidRequestedBranch(name) if name == "bad name"),
+			"{fmt}: expected InvalidRequestedBranch(\"bad name\"), got {err:?}"
+		);
+		let rendered = format!("{err}");
+		assert!(
+			!rendered.contains("HEAD"),
+			"{fmt}: a bad requested branch must not be blamed on HEAD: {rendered}"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn an_unreadable_head_target_behind_a_symlinked_admin_is_not_disclosed() {
+	// The no-disclosure contract must hold on the *I/O* path too, not only the malformed-refname path: a
+	// HEAD target that is a syntactically valid ref name but cannot be opened (a component over NAME_MAX →
+	// ENAMETOOLONG) must not surface `base.join(name)` — which, behind a symlinked admin, embeds a line read
+	// from behind the redirect.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("head-io-leak-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		let wt = base.join("wt");
+		git(&[
+			"-C",
+			w,
+			"worktree",
+			"add",
+			"-b",
+			"feat",
+			wt.to_str().unwrap(),
+		]);
+
+		let admin = work.join(".git/worktrees/wt");
+		let external = base.join("external-admin");
+		std::fs::rename(&admin, &external).unwrap();
+		symlink(&external, &admin).unwrap();
+		// Valid ref chars, but a component far over NAME_MAX so the ref-file open fails with ENAMETOOLONG.
+		let secret = format!("SECRET_{}", "z".repeat(300));
+		std::fs::write(external.join("HEAD"), format!("ref: refs/heads/{secret}\n")).unwrap();
+
+		let result = inspect(&query(rid_at(&work), &base.join("dest"), "feat")).await;
+		let rendered = match &result {
+			Err(e) => format!("{e}"),
+			Ok(insp) => format!("{insp:?}"),
+		};
+		assert!(
+			!rendered.contains("SECRET_"),
+			"{fmt}: an unreadable HEAD target behind a symlinked admin leaked via the I/O error: {rendered}"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn a_valid_branch_with_a_corrupt_symref_is_repo_corruption_not_caller_error() {
+	// A requested branch that is a *valid name* but whose on-disk symref chain is broken is REPOSITORY
+	// corruption, not a bad caller argument: it must surface as `MalformedPointer` (kind `Ref`) naming the
+	// branch ref file, never `InvalidRequestedBranch` (which would wrongly accuse the caller) and never the
+	// corrupt target's contents.
+	use gitana_linked_worktree::{LinkedWorktreeError, PointerKind};
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("corrupt-symref-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		// `alias` is a real, validly-named branch that is a symbolic ref — but its target is corrupt (an
+		// invalid ref name). The caller's `alias` is fine; the fault is on disk.
+		git(&[
+			"-C",
+			w,
+			"symbolic-ref",
+			"refs/heads/alias",
+			"refs/heads/main",
+		]);
+		// The target carries a space — an *invalid* ref name (check-ref-format rejects it), so the chain is
+		// genuinely broken rather than merely pointing at an absent-but-valid ref that would resolve cleanly.
+		std::fs::write(
+			work.join(".git/refs/heads/alias"),
+			b"ref: refs/heads/SECRET LEAK\n",
+		)
+		.unwrap();
+
+		let err = inspect(&query(rid_at(&work), &base.join("dest"), "alias"))
+			.await
+			.expect_err(&format!("{fmt}: a corrupt symref chain must error"));
+		assert!(
+			matches!(
+				&err,
+				LinkedWorktreeError::MalformedPointer {
+					kind: PointerKind::Ref,
+					..
+				}
+			),
+			"{fmt}: expected MalformedPointer(Ref) for on-disk corruption, got {err:?}"
+		);
+		let rendered = format!("{err}");
+		assert!(
+			!rendered.contains("SECRET LEAK"),
+			"{fmt}: the corrupt symref target's contents leaked: {rendered}"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn a_corrupt_requested_branch_that_is_checked_out_is_classified_by_the_branch() {
+	// Compound case: the requested branch is a corrupt symref AND is currently checked out somewhere. The
+	// occupancy scan would peel the occupying worktree's HEAD onto the same corrupt chain and report a
+	// `Head` malformation — but the requester asked about the *branch*, so classification must be `Ref`
+	// rooted at the branch, resolved before the scan runs. (Neither is a leak; this pins the classification.)
+	use gitana_linked_worktree::{LinkedWorktreeError, PointerKind};
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("corrupt-checked-out-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		// `alias` is a symbolic ref; check a worktree out on it, then corrupt alias's target (space = invalid).
+		git(&[
+			"-C",
+			w,
+			"symbolic-ref",
+			"refs/heads/alias",
+			"refs/heads/main",
+		]);
+		let wt = base.join("wt");
+		git(&["-C", w, "worktree", "add", wt.to_str().unwrap(), "alias"]);
+		let admin_name = std::fs::read_dir(work.join(".git/worktrees"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.file_name();
+		std::fs::write(
+			work.join(".git/worktrees").join(&admin_name).join("HEAD"),
+			b"ref: refs/heads/alias\n",
+		)
+		.unwrap();
+		std::fs::write(
+			work.join(".git/refs/heads/alias"),
+			b"ref: refs/heads/BAD NAME\n",
+		)
+		.unwrap();
+
+		let err = inspect(&query(rid_at(&work), &base.join("dest"), "alias"))
+			.await
+			.expect_err(&format!(
+				"{fmt}: a corrupt checked-out requested branch must error"
+			));
+		assert!(
+			matches!(
+				&err,
+				LinkedWorktreeError::MalformedPointer {
+					kind: PointerKind::Ref,
+					..
+				}
+			),
+			"{fmt}: expected the branch-rooted Ref classification, got {err:?}"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
 async fn an_admin_whose_commondir_points_elsewhere_is_not_our_registration() {
 	// git treats `<admin>/commondir` as authoritative: it names the shared repository the worktree belongs
 	// to. An admin under *our* `worktrees/` whose `commondir` is retargeted at another repository is that

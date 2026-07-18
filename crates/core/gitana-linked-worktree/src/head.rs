@@ -57,6 +57,15 @@ pub(crate) fn read_head<H: HashAlgorithm>(
 /// (if any) as the file's contents. Only a genuine *absence* of the file is `Unlocked`; a file that
 /// exists but cannot be read or decoded is kept `Locked` (with an unavailable reason), so a lock is
 /// never silently dropped — the protective state is preserved even when the reason is unreadable.
+///
+/// **This deliberately diverges from git, and the divergence is the point** (decided with Scott; see the
+/// symlink section of `docs/hlds/linked-worktree-library.md`). Probed: point `<admin>/locked` at any file
+/// and `git worktree list --porcelain` prints *that file's contents* as the reason — literally
+/// `locked SUPER SECRET FILE CONTENTS`. git reads through the link, so anyone who can write inside `.git`
+/// turns a read-only-looking listing into a file-disclosure primitive. `gta`'s own native `list` inherited
+/// this (verified against the built binary) by mirroring git; this crate does not, and is the behaviour
+/// `gta` should adopt. Not a high-severity hole — `.git` write access already implies code execution via
+/// hooks — but there is no reason to reproduce it.
 pub(crate) fn read_lock_reason(git_dir: &Path) -> LockState {
 	let marker = git_dir.join("locked");
 	// A `symlink_metadata` probe distinguishes a genuinely *absent* marker from one that exists but is

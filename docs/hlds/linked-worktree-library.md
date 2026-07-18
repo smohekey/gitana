@@ -14,32 +14,47 @@ Decisions already taken with Scott (do not relitigate): short HLD first; a **new
 pointed at the library in a later slice); **slice 1 is read-only** (inspection + enumeration + the
 structured types + the classification enum).
 
-**Amendment (the rewire premise, revised).** The extract-and-rewire decision above stands as the *goal*,
-but its first attempt (slice 4) **failed**, and the reason is now understood: the library was written
-strict throughout — never following symlinked admins/markers, local config only, force-free removal —
-which is right for Code Henge but **opposes git's permissive `worktree list`**, which follows those
-symlinks and reads the merged config. Pointing the CLI at the strict library produced six confirmed
-divergences from stock git, several *un-patchable at the CLI edge* because the primitive had already
-discarded the fact (a symlinked `locked` marker returned `Locked { reason: None }`; a symlinked admin was
-dropped from the listing entirely). The CLI cannot re-permissive what the layer beneath refused to observe.
+**Amendment (the rewire premise — slice 4's diagnosis was wrong).** The extract-and-rewire goal above
+stands. Its first attempt (slice 4) failed, and was recorded as: *the library is Code-Henge-strict, the CLI
+needs git-permissive, so the two cannot share code.* **That diagnosis does not survive probing**, and the
+correction is the most important thing in this document.
 
-The fix is **not** to pick a winner between the two behaviours, nor to abandon one implementation. It is a
-layering correction, decided with Scott:
+Of the six divergences slice 4 found, three were **config** (the library sourced `<common>/config` itself
+and so never saw a global `core.ignorecase`) — closed by slice 6's injection. One was a genuine **library
+bug** (a prunable test stricter than git's) — fixed standalone in `5adf879e`. One is **config validation**,
+which lives CLI-side by design. The remainder were symlink handling — and there the library was simply
+**right**:
 
-- **Layer 0 — observation.** Primitives (`pointers`, `head`) return *facts*, never verdicts, and discard
-  nothing at read time. "This is a symlink, its target is X" is a fact; "therefore it is unlisted" is a
-  verdict.
-- **Layer 1 — policy.** Two named adapters map facts to verdicts: `Strict` (Code Henge's stance, today's
-  behaviour byte-for-byte) and `GitCompat` (what stock git actually does). The information-disclosure guard
-  — refusing to surface a symlinked marker's target contents as a public lock reason — *moves here* rather
-  than disappearing: `GitCompat` discloses because git does, `Strict` refuses as it does today.
-- **Layer 2 — operations**, parameterized by policy via [`WorktreeContext`](#the-context-the-ambient-inputs-an-operation-reads-through).
+- git follows a symlinked `worktrees/`, a symlinked admin leaf, and a symlinked `locked` marker, and prints
+  the marker target's contents as the lock reason (all probed against stock git).
+- That is a **confused deputy**, not a contract: plant a symlink, and a read-only-looking listing becomes a
+  file-disclosure primitive.
+- **`gta` inherited it**, by faithfully mirroring git — verified against the built binary.
+
+So the premise was inverted. git's permissiveness was treated as a requirement the library had to
+accommodate; it is a defect the library already avoids. The two consumers do not want opposite things —
+**the CLI is wrong**. Scott's call: **there is no symlink policy axis.** The library's stance is correct for
+both; the divergences are ones `gta` should adopt, and pointing `gta` at the library *fixes* them.
+
+An attempt was made to build the axis anyway (slice 7a: lower primitives to facts; 7b: `Strict`/`GitCompat`
+adapters over them). 7a was written and proved zero-behaviour-change, then **reverted** once the axis died —
+with no policy to consume them the fact types were speculative flexibility. What killed the design was
+discovering there is no coherent middle position: for an admin behind a redirect, the listed path comes from
+its `gitdir`, the reason from its `locked`, HEAD/branch from its `HEAD`, so *every* field git reports is read
+from behind the link. "Follow for structure, withhold the secret" has nothing left to report. See **The
+symlink stance** below for the probed evidence, and slice 7 for the post-mortem.
+
+The layering lesson still holds, narrowly: a primitive that bakes in a verdict and discards the fact leaves
+callers unable to choose. It just turned out that here, nobody needed to choose.
 
 Consequence: the CLI's 2,184-line stock-git oracle suite (`crates/cli/gta/tests/git_worktree.rs`) and the
-library's own strict suite both stay green, against **one** implementation. Neither is negotiable; together
-they pin both policies. The public API changes shape (Scott's call: a clean break, coordinated with Code
-Henge, whose pinned git rev is immutable and so is never broken by our merge — they take the new API when
-they choose to bump).
+library's own suite both stay green against **one** implementation — with the symlink cases asserting a
+**deliberate divergence** from git rather than parity (see *The symlink stance*). The **library** suite
+already covers all three fixtures (`enumerate.rs`, `inspect.rs`); it is the **CLI oracle** suite
+(`git_worktree.rs`) that has no symlink coverage at all today and must gain it, since it is `gta`'s
+behaviour that changes. The public API changes shape (Scott's call: a clean break,
+coordinated with Code Henge, whose pinned git rev is immutable and so is never broken by our merge — they
+take the new API when they choose to bump).
 
 ## Context
 
@@ -360,16 +375,18 @@ is the final hardening slice.
    immediate-pre-destroy re-inspect (git doesn't take this lock). Oracle-tested with genuine OS-thread races
    (8-way concurrent create → exactly one registration; held-lock → `RegistrationLocked`; create-vs-remove →
    consistent state), SHA-1 + SHA-256.
-4. **CLI rewire** — ❌ **premise failed as written; superseded by slices 6–9.** The plan was to point
-   `commands/worktree.rs` + `repo.rs` at the library, keeping DWIM/force/`--porcelain`/suffix resolution on
-   top. Eight codex rounds on the *cleanest* tranche (`list`) established it cannot work while the library is
-   uniformly strict: six confirmed divergences from stock git, several un-patchable at the CLI edge (see the
-   Amendment under *Status and Audience*). Only the `list` tranche merged — and **native**, not delegated
-   (`5adf879e`), carrying three genuine wins the attempt surfaced: git's checkout-path sort order (a latent
-   parity bug), `get_bool_validated` + `effective_config_for_worktree` config layering, and the standalone
-   `admin_checkout_missing` prunable fix (which benefits Code Henge directly). T2/T3/T4 were closed at the
-   time as "won't do" — correctly, *given a strict-only library*. Slices 6–9 remove that premise, and the
-   rewire goal returns.
+4. **CLI rewire** — ❌ **abandoned at the time; its diagnosis was wrong (see the Amendment under *Status and
+   Audience*).** The plan was to point `commands/worktree.rs` + `repo.rs` at the library, keeping
+   DWIM/force/`--porcelain`/suffix resolution on top. Eight codex rounds on the *cleanest* tranche (`list`)
+   produced six confirmed divergences from stock git, several un-patchable at the CLI edge, and the
+   conclusion recorded was "the library is strict, the CLI needs permissive". **That conclusion was
+   inverted**: three divergences were config (the library sourced its own — closed by slice 6), one was a
+   real library bug (prunable — fixed in this slice), one is CLI-side validation, and the symlink ones were
+   the library being *right* about a git confused deputy `gta` had inherited. Only the `list` tranche merged
+   — and **native**, not delegated (`5adf879e`), carrying three genuine wins the attempt surfaced: git's
+   checkout-path sort order (a latent parity bug), `get_bool_validated` + `effective_config_for_worktree`
+   config layering, and the standalone `admin_checkout_missing` prunable fix (which benefits Code Henge
+   directly). T2/T3/T4 were closed as "won't do" on the inverted premise; **reopened**.
 5. **Concurrency + native-path hardening** — registration-level CAS, lost-race-as-conflict, full
    `OsStr` identity paths, lock-file races. *(Installments landed: the round-4 create-hardening tranche —
    F1 post-condition, F3 atomic pointers, F4 name sanitization; the **native-path tranche** — byte-clean
@@ -378,38 +395,152 @@ is the final hardening slice.
    below), closing the residual removal TOCTOU and the concurrent-create duplicate-registration race. Only
    remaining item — **Windows WTF-8 pointer I/O** (non-Unix currently fails closed on non-UTF-8).)*
 
-**Unification slices (6–9)** — one implementation behind two policies, retiring slice 4's failed premise.
-Each of 6–8 is independently safe: it leaves the library better-layered with Code Henge's behaviour
-unchanged, so stopping after any of them is a coherent end state. Only slice 9 spends parity risk, by which
-point the mechanism is proven.
+**Unification slices (6–9)** — **one implementation, one behaviour.** Originally planned as "one
+implementation behind two policies"; the symlink policy axis was investigated and **abandoned** (slice 7),
+leaving removal conservatism as the only candidate axis. Slice 4's premise is retired not because the
+library needed an opt-out, but because its diagnosis was **inverted** — see the Amendment above.
 
 6. **Config injection** — ✅ **DONE (this slice).** `WorktreeContext { repo, effective }`; `enumerate` takes a
    context instead of a bare `RepositoryId` and reads `core.ignorecase` from the injected stack, falling back
    to repository-local when `None`. Generalizes the `create` slice's existing `Option<&GitConfig>` parameter.
    Closes three of the six divergences. No behaviour change for a local-only caller — the library's existing
    suite is the proof, and passes unmodified apart from the mechanical context wrapping.
-7. **Fact-lowering, then the policy adapters** — split in two on Scott's call, so the refactor and the
-   behaviour change are never in the same reviewable step:
-   - **7a — facts, no policy.** `pointers`/`head` return facts and discard nothing at read time
-     (`probe_lock_marker -> LockMarker::{Absent, Regular(bytes), Symlink{target}, Unreadable}`; admins
-     enumerated *tagged* as symlinked rather than dropped). Call sites immediately re-derive today's exact
-     verdicts inline. This is a **pure refactor with zero behaviour change**, so the existing suite proves it
-     outright — no new tests should be needed, and **any test that changes means the slice is wrong**. The
-     intermediate state (verdicts inline at call sites) is deliberately accepted for one slice: it buys a
-     provably-safe step before any policy exists to argue about.
-   - **7b — policy.** `Policy::{Strict, GitCompat}` joins the context; the inline verdicts from 7a move
-     behind it. `Strict` reproduces today's behaviour byte-for-byte. This is where the
-     information-disclosure guard **relocates rather than evaporates**: `Strict` still refuses to surface a
-     symlinked marker's target contents as a public lock reason; `GitCompat` discloses, because git does.
-     Note the guard's *enforcement* moves from the primitive (which currently cannot leak, because it never
-     reads) to the adapter (which now must choose not to) — the strict adapter becomes load-bearing in a way
-     the primitive was not, and that is the real risk this slice carries.
-8. **Removal policy** — force vs conservative-preserve through the same mechanism; `decide_remove`/`classify`
-   are already a decision path, so this is the natural seam. Note the residual-content scan's byte-exact
-   matching is a **safety** invariant, not a policy knob — `GitCompat` does not get to fold case there.
-9. **CLI rewire (retry)** — `list` first (the tranche we already understand), then `add`/`remove`, then the
-   `repo.rs` helpers. `crates/cli/gta/tests/git_worktree.rs` is the gate; the six known divergences each
-   become a test that fails before and passes after.
+7. **Symlink policy — ❌ ABANDONED; there is no symlink axis.** Planned as 7a (lower primitives to facts)
+   then 7b (`Policy::{Strict, GitCompat}` deciding them). 7a was written, proved zero-behaviour-change, and
+   was then **reverted**: with no policy to consume them, the fact types (`LockMarker`, `WorktreesDir`,
+   `AdminEntry`) had no reader, and their `Symlink { target }` payloads were speculative flexibility of
+   exactly the kind this project forbids. The probed findings they were built to serve are kept, as comments
+   at each refusal and in the section below.
+
+   **Why the axis died — the premise was inverted.** The plan assumed git's permissiveness was a *contract*
+   `gta` must honour, so the library's strictness needed an opt-out. Probing showed git's permissiveness here
+   is a **confused deputy**, and that for an admin behind a redirect *every* field git reports (path from its
+   `gitdir`, reason from its `locked`, HEAD/branch from its `HEAD`) is read from behind the link — so "follow
+   for structure, withhold the secret" describes nothing. There is no coherent middle. Scott's call: **the
+   library's stance is simply correct, for both consumers; the divergences are ones `gta` should adopt.**
+8. **Removal policy** — force vs conservative-preserve; `decide_remove`/`classify` are already a decision
+   path. Unchanged by the above, and now the *only* candidate policy axis. Note the residual-content scan's
+   byte-exact matching is a **safety** invariant, not a knob.
+9. **CLI rewire (retry) — now UNBLOCKED for `list`, and a hardening fix rather than a risk.** Slice 4
+   concluded the rewire failed because "the library is strict, the CLI needs git-permissive". That was a
+   **misdiagnosis**: three divergences were config (closed by slice 6's injection), one was a real library bug
+   (prunable, fixed standalone in `5adf879e`), validation is CLI-side by design, and the symlink ones were the
+   library being *right*. `gta`'s native `list` follows symlinked `worktrees/` dirs (`read_dir`), symlinked
+   admin leaves (`is_file`), and reads lock reasons straight through a symlink (`read_to_string`) — **verified
+   against the built binary: `gta worktree list --porcelain` prints an arbitrary file's contents**, identical
+   to git. Delegating `list` to the library therefore *fixes* that. Gate: `crates/cli/gta/tests/git_worktree.rs`,
+   with the symlink cases asserting the deliberate divergence and carrying the reason.
+
+   **Scope honesty:** all of the above concerns `list`. `add`/`remove` were never delegated, so their
+   divergences are **unknown**, not resolved — establish them by probe before assuming the same conclusion.
+
+### The symlink stance — probed, deliberately not git's, and NOT uniform
+
+git is uniformly permissive about symlinks in the admin area. **This crate is not uniformly strict** — that
+framing is wrong, and would misdirect the (unprobed) add/remove rewire.
+
+**The `worktrees/` directory is refused outright**, full stop: `read_worktree_admins` errors before any
+admin is inspected, so nothing below it — enumeration *or* branch-use — ever runs. That is the one
+unconditional refusal.
+
+**For a symlinked admin *leaf*, the crate discriminates by what gets published:**
+
+- a **ref name** is low-information and checkable against our own refs — safe to learn from a followed
+  leaf, and *required* for correctness, since git refuses another checkout of that branch and so must we;
+- **arbitrary file contents** echoed verbatim to the user (a lock reason, or a path read out of `gitdir`) —
+  never.
+
+So, scoped to leaves: **follow a redirect to learn a name; never dereference one to publish content.**
+
+| fixture | git | this crate |
+|---|---|---|
+| symlinked `worktrees/` dir | follows; lists what is inside, including an external admin | **refuses** (`MalformedPointer`) — everything below it is unreachable, branch-use included |
+| symlinked admin leaf — **enumeration** | follows; emits the worktree (resolved object when the admin's relative `commondir` `../..` resolves through the link; **null object** when it escapes outside `.git`) | **omits** — listing reads full per-worktree state (path from `gitdir`, reason from `locked`, HEAD), all of it from behind the link |
+| symlinked admin leaf — **branch-use** | follows; refuses another checkout of its branch | **follows too** — `worktree_git_dirs` uses `is_listed_admin` *without* the leaf-symlink filter, resolving HEAD to a ref name checked against our refs (`a_symlinked_admin_still_occupies_its_branch`). Dropping it would silently permit a double checkout git forbids. Success path publishes nothing; **but a malformed HEAD leaks via the error** — see below. |
+| symlinked `locked` marker | follows; **prints the target file's contents** as the reason | `Locked { reason: None }` |
+
+Why enumeration cannot follow what branch-use can: for an admin behind a redirect, *every* field a listing
+reports is read from behind the link — the path from its `gitdir`, the reason from its `locked`,
+HEAD/branch from its `HEAD`. There is no untainted subset to be faithful about, which is exactly why a
+"follow for structure, withhold the secret" policy was abandoned. Branch-use is safer because on its
+**success** path it publishes nothing from the admin — it resolves the HEAD to a ref *name*, checks that
+name against *our* refs, and returns a bool.
+
+**But "publishes nothing" is not absolute, and an earlier draft that claimed it was is wrong (probed).**
+When a followed symlinked admin has a **malformed** `HEAD` (e.g. `ref: TOP_SECRET_LEAKED`),
+`resolve_ref_terminal` builds `MalformedPointer { path: PathBuf::from(name) }`, whose `Display` renders the
+parsed target — so the error carries a line of a file from behind the redirect. Verified against the built
+crate: `malformed HEAD pointer at TOP_SECRET_LEAKED`. This is the **same confused-deputy family** as the
+lock reason, low-severity for the same reason (needs `.git` write access), but it is a real leak in the
+**shipped** library, reachable through branch-use — not only enumeration. It was also a plain bug: the
+`path` field is documented as *the pointer file's path*, and `resolve_ref_terminal` stored the parsed
+*content* there — and, for its **requested-branch** callers, conflated a bad caller argument with on-disk
+`HEAD` corruption.
+
+**Fixed on this branch** (its own commits) via a `RefSource` discriminator that decides how a malformed
+chain is reported, and — critically — *where in the chain* it failed:
+- a `Head` root → `MalformedPointer` at the resolved-from `HEAD` file (never the parsed name);
+- a `RequestedBranch` root, **initial argument** invalid → new **`InvalidRequestedBranch(name)`** (a bad
+  caller argument; the name is the caller's own, so no disclosure, and a healthy `HEAD` is never blamed);
+- a `RequestedBranch` root, corruption **after a symref hop** (a valid branch whose on-disk symref chain is
+  broken/cyclic) → `MalformedPointer` of new kind **`Ref`** naming the branch's root ref file. This is
+  repository corruption, not caller error, and must not be attributed to the caller.
+
+The no-disclosure contract holds on the **I/O path** too, not only the malformed-refname check: a
+syntactically valid but unopenable target (a component over `NAME_MAX` → `ENAMETOOLONG`) would otherwise
+leak through the `Io` error's rendered `base.join(name)` (probed). Ref-read failures for an untrusted
+source are rebound to the safe root path (the `HEAD` file, or the caller's own branch ref); a
+requested-branch caller's *own first* read stays as-is (its path is the caller's argument, not disclosure).
+
+Four regression tests, each verified fail-without-fix by neutering:
+`a_malformed_head_behind_a_symlinked_admin_is_not_disclosed` (no content leak, malformed path),
+`an_unreadable_head_target_behind_a_symlinked_admin_is_not_disclosed` (no leak, I/O path),
+`an_invalid_requested_branch_is_not_blamed_on_head` (bad argument), and
+`a_valid_branch_with_a_corrupt_symref_is_repo_corruption_not_caller_error` (on-disk corruption, right kind,
+no target leak).
+
+Related, and already tested: `a_symlinked_admin_conflict_does_not_leak_its_gitdir` — branch-use reports the
+conflict at the admin's **own owned location**, never at the location its `gitdir` names, because that would
+publish the redirect's contents.
+
+#### Disclosure surface — the complete accounting (a deliberate sweep, not whack-a-mole)
+
+The leaks above were found one codex round at a time, each fix revealing the next adjacent hole — a sign
+the real question is *systemic*: **what is the complete set of code paths that read a file inside a
+followed symlinked admin, and for each, can that content reach an error message or a published field?** The
+crate was swept end-to-end against that question. The result is bounded and now closed:
+
+- **Only two functions ever follow a symlinked admin.** `worktree_git_dirs` (branch-use membership,
+  `is_listed_admin` without the leaf-symlink filter) and its *sole* consumer `branch_checkout_location`.
+  Every other admin iterator refuses symlinks: `linked_admin_dirs` (enumeration) filters leaf symlinks;
+  `admin_dirs_for` (feeds `remove`) admits only `is_registration` admins, which require **physical**
+  (`!is_symlink`) ownership.
+- **From a symlinked admin, the only content read is via `resolve_head_branch`** — `<admin>/HEAD` (a
+  structural path in any error) then the symref chain (now fully redacted, malformed *and* I/O paths).
+  `branch_checkout_location` explicitly does **not** dereference a symlinked admin's `gitdir`/path
+  (`is_leaf_symlink(&candidate) → candidate.clone()`), reporting the conflict at the admin's own location.
+- **Published-content fields are structurally out of reach for a symlinked admin.** The lock reason
+  (`read_lock_reason`) is read only by enumeration (symlink-filtered), inspection (physical `head_dir`), and
+  `remove` (physical registration) — never a followed symlink. The checkout path (`worktree_path_of`, which
+  dereferences `gitdir`) is likewise never called on a followed symlink.
+- **Every error construction in the crate renders a *structural* path** — a fixed filename joined to a known
+  dir (`admin.join("gitdir")`, `git_dir.join("HEAD")`), or an identity path — **never file contents.** The
+  sole content-derived exception was `read_ref_symref`'s `base.join(name)`, redacted at its only
+  content-derived call site.
+
+Conclusion: after the fixes on this branch, **no path remains by which content read from behind a followed
+symlinked admin reaches a diagnostic or a published field.** Should a future change add a new symlinked-admin
+reader or render a read value in an error, this accounting is the checklist it must re-satisfy.
+
+**Severity of git's behaviour: LOW.** It needs write access inside `.git`, and anyone with that can drop a
+`post-checkout` hook and get code execution — strictly worse. Presumably why upstream does not treat it as
+a bug. Not an incident; just something with no reason to reproduce.
+
+**`gta` currently reproduces it** — `read_dir` follows a symlinked `worktrees/`, `is_file` follows a
+symlinked leaf, `read_to_string` follows a symlinked marker. Verified against the built binary:
+`gta worktree list --porcelain` printed `locked SUPER SECRET FILE CONTENTS`, identical to git. **Do not
+"restore parity" here.** A reader who finds `gta` differing from git on these fixtures is looking at the
+fix, not the bug.
 
 ### Slice-5 create hardening (DONE) and the one item deferred to slice 3
 

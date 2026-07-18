@@ -62,8 +62,8 @@ mod native {
 	use crate::head::{read_head, read_lock_reason};
 	use crate::object_id::IntoWorktreeObjectId;
 	use crate::pointers::{
-		SYMREF_MAXDEPTH, admin_checkout_missing, canonical, ignorecase, is_bare, linked_admin_dirs,
-		main_worktree_path, resolve_ref_terminal, worktree_path_of,
+		RefSource, SYMREF_MAXDEPTH, admin_checkout_missing, canonical, ignorecase, is_bare,
+		linked_admin_dirs, main_worktree_path, resolve_ref_terminal, worktree_path_of,
 	};
 	use crate::repo_id::{detect_kind, open_store_raw};
 	use crate::{LinkedWorktreeError, WorktreeContext};
@@ -176,7 +176,13 @@ mod native {
 				// feature). Resolve the object through this worktree's own store; `resolve_symbolic` follows
 				// the same chain.
 				// `refname` is `HEAD`'s target (`HEAD` already read), so one hop of git's budget is spent.
-				let terminal = resolve_ref_terminal(common, git_dir, &refname, SYMREF_MAXDEPTH - 1)?;
+				let terminal = resolve_ref_terminal(
+					common,
+					git_dir,
+					&refname,
+					RefSource::Head,
+					SYMREF_MAXDEPTH - 1,
+				)?;
 				let repo = Repository::<_, H>::new(ObjectStore::new(open_store_raw(git_dir, common)?));
 				// Resolve through the *terminal* ref: a legacy *symlink* symref is symbolic to git, but the
 				// filesystem backend following the link relative to `refs/heads` would miss the object.

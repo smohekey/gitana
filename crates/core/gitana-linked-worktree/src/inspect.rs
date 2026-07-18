@@ -279,8 +279,9 @@ mod native {
 	use crate::head::{read_head, read_lock_reason};
 	use crate::object_id::IntoWorktreeObjectId;
 	use crate::pointers::{
-		SYMREF_MAXDEPTH, admin_dirs_for, admin_gitdir_target, admin_owned_by, branch_checkout_location,
-		canonical_eq, checkout_gitfile_names, gitfile_target, resolve_ref_terminal,
+		RefSource, SYMREF_MAXDEPTH, admin_dirs_for, admin_gitdir_target, admin_owned_by,
+		branch_checkout_location, canonical_eq, checkout_gitfile_names, gitfile_target,
+		resolve_ref_terminal,
 	};
 	use crate::query::WorktreeQuery;
 	use crate::repo_id::{detect_kind, open_store_raw};
@@ -402,7 +403,8 @@ mod native {
 					// dir, so a per-worktree ref target is read from the right namespace; `resolve_symbolic`
 					// follows the same chain to the object.
 					// `refname` is `HEAD`'s target (`HEAD` already read here), so one hop of git's budget is spent.
-					let terminal = resolve_ref_terminal(common, dir, &refname, SYMREF_MAXDEPTH - 1)?;
+					let terminal =
+						resolve_ref_terminal(common, dir, &refname, RefSource::Head, SYMREF_MAXDEPTH - 1)?;
 					let store = Repository::<_, H>::new(ObjectStore::new(open_store_raw(dir, common)?));
 					// Resolve the object through the *terminal* ref, not the original `HEAD` target: a legacy
 					// *symlink* symref (`refs/heads/alias -> refs/heads/feature`) is symbolic to git, but the
@@ -434,17 +436,29 @@ mod native {
 			None => RequestedBranch::NotRequested,
 			Some(branch) => {
 				let refname = branch.refname();
-				// Scan for another worktree on this branch *regardless of whether the ref exists* — an
+				// Resolve the requested branch's *terminal* ref FIRST — before the occupancy scan below — a
+				// legacy *symlink* symref (`refs/heads/alias -> refs/heads/feature`) is symbolic to git, but
+				// the file-store backend following it filesystem-relative from `refs/heads` would miss it and
+				// wrongly report Absent. A direct ref (not reached via `HEAD`) gets the full symref budget; a
+				// malformed *requested* name is a bad argument (`InvalidRequestedBranch`), and a *valid* branch
+				// whose on-disk symref chain is corrupt is `MalformedPointer` of kind `Ref` rooted at the
+				// branch — **neither blamed on `HEAD`**. This must run before `branch_checkout_location`: if the
+				// requested branch is *also* checked out, that scan would otherwise peel the occupying
+				// worktree's `HEAD` onto the same corrupt chain and surface it as a `Head` malformation first,
+				// hiding the branch-rooted classification the requester actually wants.
+				let terminal = resolve_ref_terminal(
+					common,
+					common,
+					&refname,
+					RefSource::RequestedBranch(branch.short()),
+					SYMREF_MAXDEPTH,
+				)?;
+				// Then scan for another worktree on this branch *regardless of whether the ref exists* — an
 				// unborn branch (`worktree add --orphan`) is checked out with no ref, and creating it would
 				// collide, so an occupied unborn branch is a conflict too. Skip *this* destination (a
 				// `worktree add --force` duplicate is still a conflict). The scan compares the *raw* (unpeeled)
 				// ref name, as git's shared-symref test does.
 				let elsewhere = branch_checkout_location(common, &refname, Some(destination))?;
-				// Resolve the object through the branch's *terminal* ref — a legacy *symlink* symref
-				// (`refs/heads/alias -> refs/heads/feature`) is symbolic to git, but the file-store backend
-				// following it filesystem-relative from `refs/heads` would miss it and wrongly report Absent.
-				// A direct ref (not reached via `HEAD`) gets the full symref budget.
-				let terminal = resolve_ref_terminal(common, common, &refname, SYMREF_MAXDEPTH)?;
 				match repo.refs().resolve_symbolic(&terminal).await? {
 					None => RequestedBranch::Absent {
 						checked_out_elsewhere: elsewhere,
@@ -491,8 +505,13 @@ mod native {
 		let registered_to_different_branch = match (&query.expected_branch, registered) {
 			(Some(expected), true) => {
 				// A *direct* ref (the requested branch, not reached via `HEAD`) — the full symref budget applies.
-				let expected_terminal =
-					resolve_ref_terminal(common, common, &expected.refname(), SYMREF_MAXDEPTH)?;
+				let expected_terminal = resolve_ref_terminal(
+					common,
+					common,
+					&expected.refname(),
+					RefSource::RequestedBranch(expected.short()),
+					SYMREF_MAXDEPTH,
+				)?;
 				let worktree_terminal = head.as_ref().and_then(|h| h.branch.clone());
 				(worktree_terminal.as_deref() != Some(expected_terminal.as_str()))
 					.then_some(worktree_terminal)

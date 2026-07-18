@@ -14,6 +14,10 @@ pub enum PointerKind {
 	AdminGitdir,
 	/// A `HEAD` file that is not valid UTF-8 / not a parseable ref-or-oid.
 	Head,
+	/// A `refs/…` symbolic-ref file whose chain does not resolve (an invalid target, or a cycle). Distinct
+	/// from [`Head`](PointerKind::Head): the corruption is in a repository ref file reached *from* a valid
+	/// starting point, not in the `HEAD` that rooted the walk.
+	Ref,
 }
 
 impl PointerKind {
@@ -22,6 +26,7 @@ impl PointerKind {
 			PointerKind::GitFile => ".git gitfile",
 			PointerKind::AdminGitdir => "admin gitdir",
 			PointerKind::Head => "HEAD",
+			PointerKind::Ref => "ref",
 		}
 	}
 }
@@ -60,6 +65,15 @@ pub enum LinkedWorktreeError {
 		/// The pointer file's path.
 		path: PathBuf,
 	},
+
+	/// A **caller-supplied** requested branch **name** is not a valid ref name. This is a bad *argument* —
+	/// distinct from a [`MalformedPointer`], which covers on-disk corruption. The distinction is precise:
+	/// only the *initial* name being invalid is this error; a *valid* branch whose on-disk symbolic-ref
+	/// chain is broken or cyclic is repository corruption, reported as `MalformedPointer` of kind
+	/// [`Ref`](PointerKind::Ref) — never blamed on the caller, and never on the repository's healthy `HEAD`.
+	/// The name is echoed because the caller supplied it; no on-disk content is disclosed.
+	#[error("invalid requested branch: {0}")]
+	InvalidRequestedBranch(String),
 
 	/// A repository-engine operation failed (ref resolution, HEAD parse, config read, ...).
 	#[error(transparent)]
