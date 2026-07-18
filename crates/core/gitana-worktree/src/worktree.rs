@@ -190,9 +190,10 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// Release a held index lock (from [`Self::lock_index`]) without writing, removing `index.lock`.
 	/// Use when an operation fails after locking but before [`Self::commit_index`], so it does not
 	/// leave a stale lock behind.
-	pub(crate) async fn release_index_lock(&self, lock: IndexLock) {
+	pub(crate) async fn release_index_lock(&self, _lock: IndexLock) {
+		// `IndexLock` is a zero-sized capability token (no `Drop`); consuming it by value is what enforces
+		// "hold the lock to release it". The on-disk lock is removed by deleting `index.lock`.
 		let _ = self.files().delete_path("index.lock", None).await;
-		drop(lock);
 	}
 
 	/// Stage `pathspecs`, interpreted relative to `prefix` (a `/`-joined work-tree-relative

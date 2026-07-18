@@ -822,10 +822,10 @@ where
 				continue;
 			}
 			// Already covered by a previously OR'd closure — nothing more to add or walk.
-			if let Some(position) = midx.bitmap_position(&id) {
-				if result.get(position) {
-					continue;
-				}
+			if let Some(position) = midx.bitmap_position(&id)
+				&& result.get(position)
+			{
+				continue;
 			}
 			// A bitmapped commit's entire reachable closure is its reachability bitmap — OR it in and do
 			// not descend (it already accounts for its trees, blobs, and ancestors).

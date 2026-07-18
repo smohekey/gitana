@@ -424,10 +424,8 @@ fn url_userinfo(url: &str) -> Result<(Option<String>, Option<String>)> {
 	if has_control(protocol)
 		|| has_control(&decode(host))
 		|| has_control(&decode(&rest[authority_end..]))
-		|| username.as_deref().is_some_and(|user| has_control(user))
-		|| password
-			.as_deref()
-			.is_some_and(|password| has_control(password))
+		|| username.as_deref().is_some_and(has_control)
+		|| password.as_deref().is_some_and(has_control)
 	{
 		bail!("credential helper returned a url with a control character '{redacted}'");
 	}

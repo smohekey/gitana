@@ -207,8 +207,7 @@ pub fn verify_pgpsig(
 	for key in keys {
 		let Some(cert) = key.pgp() else { continue };
 		let issued_by = |fingerprint: &pgp::types::Fingerprint, key_id: &pgp::types::KeyId| {
-			issuer_fingerprints.iter().any(|f| *f == fingerprint)
-				|| issuer_key_ids.iter().any(|k| *k == key_id)
+			issuer_fingerprints.contains(&fingerprint) || issuer_key_ids.contains(&key_id)
 		};
 		if issued_by(&cert.fingerprint(), &cert.legacy_key_id()) {
 			matched_issuer = true;

@@ -69,7 +69,6 @@ pub fn challenge_offers(challenges: &[String], scheme: &str) -> bool {
 	challenges.iter().any(|challenge| {
 		split_outside_quotes(challenge).into_iter().any(|segment| {
 			segment
-				.trim()
 				.split_whitespace()
 				.next()
 				.is_some_and(|token| token.eq_ignore_ascii_case(scheme))

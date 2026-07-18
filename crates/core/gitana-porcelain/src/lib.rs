@@ -184,11 +184,7 @@ pub(crate) mod test_support {
 			open_dir(&git_dir),
 		)));
 		repo.init().await.unwrap();
-		let wt = WorkTree::new(
-			repo,
-			CapWorkDir::from_dir(open_dir(dir.path().to_path_buf())),
-			git_dir,
-		);
+		let wt = WorkTree::new(repo, CapWorkDir::from_dir(open_dir(dir.path())), git_dir);
 		(dir, wt)
 	}
 

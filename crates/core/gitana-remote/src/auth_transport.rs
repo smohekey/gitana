@@ -189,13 +189,19 @@ impl<C: HttpClient, P: CredentialProvider> AuthTransport<C, P> {
 		// Basic — gitana never sends Basic the server did not ask for. On its own `401`, **adopt that
 		// response** so the subsequent provider fill sees the server's *latest* challenge (a new realm, or
 		// a switch away from Basic), matching git's re-read of `WWW-Authenticate` on each rejection.
-		if response.offers_basic_auth()
-			&& let Some(url_credential) = self
-				.url_credential
-				.lock()
-				.expect("cache not poisoned")
-				.take()
-		{
+		// Take the URL-userinfo credential out from under its lock *before* any `.await` — the guard is a
+		// `std::sync::Mutex`, which must never be held across an await point.
+		let url_credential = response
+			.offers_basic_auth()
+			.then(|| {
+				self
+					.url_credential
+					.lock()
+					.expect("cache not poisoned")
+					.take()
+			})
+			.flatten();
+		if let Some(url_credential) = url_credential {
 			let retry = self.send(&request, &auth_headers(&url_credential)).await?;
 			if retry.status == 401 {
 				self.note_rejected(&url_credential, &[]).await;

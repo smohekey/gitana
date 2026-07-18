@@ -556,7 +556,7 @@ mod tests {
 		// The base is not carried: a self-contained decode cannot resolve the REF delta.
 		assert!(matches!(
 			decode_pack::<Sha256>(&thin),
-			Err(crate::ObjectError::UnresolvedDeltaBase { .. })
+			Err(crate::ObjectError::UnresolvedDeltaBase)
 		));
 
 		// Completing against the external base yields the original object, byte-for-byte.
@@ -595,9 +595,9 @@ mod tests {
 		bases.insert(base.id, (base.kind, base.data.clone()));
 		let mut decoded =
 			crate::decode_pack_with_bases::<Sha256>(&thin, &bases).expect("complete thin");
-		decoded.sort_by(|x, y| x.data.len().cmp(&y.data.len()));
+		decoded.sort_by_key(|o| o.data.len());
 		let mut expected = objects;
-		expected.sort_by(|x, y| x.data.len().cmp(&y.data.len()));
+		expected.sort_by_key(|o| o.data.len());
 		assert_eq!(decoded, expected);
 	}
 

@@ -99,10 +99,7 @@ pub(crate) async fn compute_shallow<H: HashAlgorithm>(
 		for &parent in &commit.parents {
 			// A parent is followed only while the depth budget allows it, and it passes the since /
 			// deepen-not filters and exists — otherwise this commit sits at the shallow boundary.
-			let within_budget = match budget {
-				Some(0) => false,
-				_ => true,
-			};
+			let within_budget = !matches!(budget, Some(0));
 			if within_budget
 				&& parent_within_since(repo, parent, deepen.since).await?
 				&& !excluded.contains(&parent)

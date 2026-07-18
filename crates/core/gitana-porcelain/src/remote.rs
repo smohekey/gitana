@@ -541,6 +541,7 @@ pub async fn pull_upstream<F: FileStore, H: HashAlgorithm>(
 /// `reflog` supplies the committer and verbatim source URL for the `clone: from <url>` entries git
 /// records on `HEAD` and the checked-out branch; `None` (the in-component clone, with no configured
 /// identity) writes no reflog.
+#[allow(clippy::too_many_arguments)]
 pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	repo: Repository<F, H>,
@@ -635,6 +636,7 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 ///
 /// `include_tag` requests reachable annotated tags for a shallow fetch (git's `include-tag`); a caller
 /// disabling tags (`--no-tags`) passes `false`.
+#[allow(clippy::too_many_arguments)]
 async fn download<F: FileStore, H: HashAlgorithm>(
 	transport: &impl HttpTransport,
 	repo: &Repository<F, H>,

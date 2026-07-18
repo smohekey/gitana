@@ -1014,6 +1014,7 @@ where
 	/// `old` to `new`, when `core.logAllRefUpdates` gating permits. When `name` is a branch that
 	/// `HEAD` symbolically points at, git also mirrors the entry into `HEAD`'s reflog — the "split
 	/// HEAD update" — so this cascades there too (each subject to its own gating).
+	#[allow(clippy::too_many_arguments)]
 	async fn log_ref_update(
 		&self,
 		name: &str,

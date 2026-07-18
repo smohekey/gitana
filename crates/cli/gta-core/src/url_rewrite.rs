@@ -48,6 +48,9 @@ pub fn fetch_origin(config: &GitConfig, remote: &str) -> Result<Origin> {
 	Origin::parse(&rewrite_fetch_url(config, url)?)
 }
 
+/// A URL rewriter: applies git's `insteadOf`/`pushInsteadOf` rules to one remote URL.
+type UrlRewrite = fn(&GitConfig, &str) -> Result<String>;
+
 /// Resolve the push-direction [`Origin`] for `remote`, matching git's push-URL selection: the
 /// `remote.<remote>.pushurl`s (with `insteadOf` rewriting) if any, else the `remote.<remote>.url`s with
 /// `pushInsteadOf` (falling back to `insteadOf`).
@@ -59,12 +62,11 @@ pub fn push_origin(config: &GitConfig, remote: &str) -> Result<Origin> {
 	let pushurls = remote_urls(config, remote, "pushurl")?;
 	// A pushurl is rewritten with `insteadOf`; a fetch url falling through is rewritten with
 	// `pushInsteadOf`. Both honour git's empty-value reset via `remote_urls`.
-	let (destinations, rewrite): (Vec<&str>, fn(&GitConfig, &str) -> Result<String>) =
-		if pushurls.is_empty() {
-			(remote_urls(config, remote, "url")?, rewrite_push_url)
-		} else {
-			(pushurls, rewrite_fetch_url)
-		};
+	let (destinations, rewrite): (Vec<&str>, UrlRewrite) = if pushurls.is_empty() {
+		(remote_urls(config, remote, "url")?, rewrite_push_url)
+	} else {
+		(pushurls, rewrite_fetch_url)
+	};
 	match destinations.as_slice() {
 		[] => bail!("no remote.{remote}.url configured"),
 		[one] => Origin::parse(&rewrite(config, one)?),
