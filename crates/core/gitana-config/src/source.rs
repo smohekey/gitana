@@ -1,6 +1,14 @@
+use std::future::Future;
 use std::ops::Range;
+use std::path::Path;
+use std::pin::Pin;
 
-use crate::{ConfigError, parser};
+use crate::{
+	ConfigError, IncludeContext, IncludeResolver, condition_matches, parser, resolve_include_path,
+};
+
+/// git's maximum include nesting depth; exceeding it is fatal (and breaks any cycle).
+const MAX_INCLUDE_DEPTH: usize = 10;
 
 /// One structural piece of a config file, retaining its exact source text so the file round-trips
 /// and edits stay surgical. Concatenating every element's raw text reproduces the source verbatim.
@@ -22,6 +30,48 @@ impl Element {
 			Element::Section(section) => &mut section.raw,
 			Element::Variable(variable) => &mut variable.raw,
 		}
+	}
+
+	/// The element's retained raw source text.
+	fn raw(&self) -> &str {
+		match self {
+			Element::Filler(raw) => raw,
+			Element::Section(section) => &section.raw,
+			Element::Variable(variable) => &variable.raw,
+		}
+	}
+}
+
+/// Where an [`Element`] came from: parsed directly from this file, or spliced in from an included
+/// file. Reads see both; writes and serialization touch only `Own` elements — git never flattens an
+/// included file's content into the including file, and a write must land only in the target file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ElementOrigin {
+	/// Parsed directly from this file's own text.
+	Own,
+	/// Spliced in by include expansion; read-only, never written back or serialized.
+	Included,
+}
+
+/// An [`Element`] tagged with its [`ElementOrigin`], as stored in a [`GitConfigSource`].
+#[derive(Debug, Clone)]
+pub(crate) struct Entry {
+	element: Element,
+	origin: ElementOrigin,
+}
+
+impl Entry {
+	/// A directly-parsed (own) entry.
+	fn own(element: Element) -> Self {
+		Self {
+			element,
+			origin: ElementOrigin::Own,
+		}
+	}
+
+	/// Whether this entry is `Own` (visible to writes and serialization).
+	fn is_own(&self) -> bool {
+		self.origin == ElementOrigin::Own
 	}
 }
 
@@ -54,13 +104,13 @@ pub(crate) struct Variable {
 
 /// A single parsed git configuration file: an ordered list of elements with case-correct,
 /// multi-value-aware lookups. Writes are surgical — they preserve comments and the surrounding
-/// layout. Includes / `includeIf` are not handled.
+/// layout. [`include`](Self::expand_includes) / `includeIf` directives are expanded on request.
 ///
 /// This models exactly one file (`.git/config`, `~/.gitconfig`, `/etc/gitconfig`, …). To resolve a
 /// value across git's precedence stack of several such files, layer them in a [`GitConfig`](crate::GitConfig).
 #[derive(Debug, Clone, Default)]
 pub struct GitConfigSource {
-	elements: Vec<Element>,
+	elements: Vec<Entry>,
 }
 
 /// Two configs are equal when they carry the same ordered variables (section, subsection, name,
@@ -85,15 +135,149 @@ impl GitConfigSource {
 	}
 
 	pub(crate) fn from_elements(elements: Vec<Element>) -> Self {
-		Self { elements }
+		Self {
+			elements: elements.into_iter().map(Entry::own).collect(),
+		}
 	}
 
-	/// Every variable element, in file order.
+	/// Expand `[include]` / `[includeIf]` directives in place, splicing each included file's
+	/// (already-expanded) contents *immediately after* the directive so ordering and last-value-wins
+	/// are preserved — exactly as git does while parsing. The directive line stays queryable as an
+	/// ordinary `include.path` / `includeif.*.path` key (git keeps it), and the spliced-in content is
+	/// tagged [`ElementOrigin::Included`] so it is visible to reads but ignored by writes and
+	/// serialization (a write must not flatten another file's content into this one).
+	///
+	/// `dir` is the including file's directory, used to resolve relative include paths and `./`
+	/// gitdir patterns; `ctx` supplies `$HOME`/gitdir for path and condition resolution; `resolver`
+	/// performs the reads (returning `None` for an absent file, which is silently skipped).
+	///
+	/// Errors: a bare `path` on a directive that would be read ([`ConfigError::IncludeMissingValue`]);
+	/// a `~/` path with no `$HOME`, or an unsupported `~user/`, on a matched directive
+	/// ([`ConfigError::IncludeTildeNoHome`] / [`ConfigError::IncludeUserTildeUnsupported`]); or nesting
+	/// past git's depth of 10 ([`ConfigError::IncludeDepthExceeded`], which also breaks a cycle).
+	///
+	/// # Expand-vs-mutate contract
+	///
+	/// Mutating an `include`/`includeif` directive on an already-expanded source (`set`/`unset`/…) does
+	/// **not** re-run the include, so the previously spliced [`ElementOrigin::Included`] entries linger
+	/// as stale reads until the next expansion. The intended consumer design avoids this: the *writable*
+	/// source stays raw (unexpanded) and reads use separate expanded copies — so a caller must not both
+	/// expand and mutate include directives on the same source. This method is idempotent, so
+	/// re-calling it after an include change is the supported way to refresh.
+	pub async fn expand_includes<R: IncludeResolver>(
+		&mut self,
+		dir: &Path,
+		ctx: &IncludeContext<'_>,
+		resolver: &R,
+	) -> Result<(), ConfigError> {
+		// Idempotent: drop any content spliced in by a previous expansion before re-expanding, so a
+		// second call neither duplicates an unchanged include nor lets a stale value outlive a changed
+		// one. Only own elements survive to be (re-)expanded.
+		self.elements.retain(Entry::is_own);
+		self.expand_includes_at_depth(dir, ctx, resolver, 0).await
+	}
+
+	/// The depth-tracking core of [`expand_includes`](Self::expand_includes). Returns a boxed `Send`
+	/// future so the async body can recurse (an `async fn` cannot name its own future to recurse) and
+	/// so the whole chain stays `Send`, matching the crate's Send-futures convention.
+	fn expand_includes_at_depth<'a, R: IncludeResolver>(
+		&'a mut self,
+		dir: &'a Path,
+		ctx: &'a IncludeContext<'a>,
+		resolver: &'a R,
+		depth: usize,
+	) -> Pin<Box<dyn Future<Output = Result<(), ConfigError>> + Send + 'a>> {
+		Box::pin(async move {
+			let mut i = 0;
+			while i < self.elements.len() {
+				// Only own directives are expandable: content spliced in from a nested include was
+				// already expanded in its own pass, and must never be re-read here.
+				if !self.elements[i].is_own() {
+					i += 1;
+					continue;
+				}
+				let Some((value, condition)) = include_directive(&self.elements[i].element) else {
+					i += 1;
+					continue;
+				};
+
+				// The directive itself stays in place (git keeps `include.path` / `includeif.*.path`
+				// queryable as an ordinary key while ALSO expanding), so every skip path just advances
+				// past it; only a matched directive splices the included content immediately after it.
+
+				// git reads the path only when an `includeIf` condition matches.
+				if let Some(condition) = &condition
+					&& !condition_matches(condition, dir, ctx)
+				{
+					i += 1;
+					continue;
+				}
+				// The directive will be read: a bare `path` with no value is fatal, as in git.
+				let Some(value) = value else {
+					return Err(ConfigError::IncludeMissingValue);
+				};
+				// A matched directive whose path needs `~/` but has no `$HOME`, or an unsupported
+				// `~user/`, is fatal in git — distinct from an absent file, which is skipped.
+				let resolved = resolve_include_path(&value, dir, ctx.home)?;
+				// git's access check precedes its depth check: an absent target is silently skipped
+				// (no depth error), and only a target that actually READS triggers the depth cap.
+				let Some(text) = resolver.read(&resolved).await? else {
+					i += 1;
+					continue;
+				};
+				if depth + 1 > MAX_INCLUDE_DEPTH {
+					return Err(ConfigError::IncludeDepthExceeded);
+				}
+
+				// Expand the included file (relative to *its own* directory) before splicing, so nested
+				// includes land inline at the right positions.
+				let mut included = GitConfigSource::parse(&text)?;
+				let included_dir = resolved.parent().map(Path::to_path_buf).unwrap_or_default();
+				included
+					.expand_includes_at_depth(&included_dir, ctx, resolver, depth + 1)
+					.await?;
+
+				// Everything from the included file is non-own from this file's perspective, so reads
+				// see it but writes/serialization ignore it (git keeps the directive on disk, never the
+				// flattened content). Because included elements are never rendered, no line-boundary
+				// fix-up is needed at the seam — `render` emits only own elements, which stay contiguous.
+				let mut spliced = included.elements;
+				for entry in &mut spliced {
+					entry.origin = ElementOrigin::Included;
+				}
+				let count = spliced.len();
+				// Splice the included content AFTER the directive (at `i + 1`), leaving the directive at
+				// `i` in place and queryable.
+				self.elements.splice(i + 1..i + 1, spliced);
+				i += 1 + count;
+			}
+			Ok(())
+		})
+	}
+
+	/// Every variable element, in file order. Reads see all elements — own **and** included — so a
+	/// value set only through an `[include]` resolves like git.
 	fn variables(&self) -> impl Iterator<Item = &Variable> {
-		self.elements.iter().filter_map(|e| match e {
+		self.elements.iter().filter_map(|e| match &e.element {
 			Element::Variable(v) => Some(v),
 			_ => None,
 		})
+	}
+
+	/// Every *own* variable element with its index, in file order — the write-side view (included
+	/// elements are read-only and never edited or removed). All mutators (`set`/`unset`/`replace_all`/
+	/// `add`/`remove_subsection`/`rename_subsection`) funnel through this own-only view; per the
+	/// expand-vs-mutate contract on [`expand_includes`](Self::expand_includes), mutating an include
+	/// directive on an expanded source leaves its spliced content stale until a re-expand.
+	fn own_variables(&self) -> impl Iterator<Item = (usize, &Variable)> {
+		self
+			.elements
+			.iter()
+			.enumerate()
+			.filter_map(|(i, e)| match &e.element {
+				Element::Variable(v) if e.is_own() => Some((i, v)),
+				_ => None,
+			})
 	}
 
 	/// Logical projection of each variable, for equality.
@@ -282,7 +466,7 @@ impl GitConfigSource {
 		name: &str,
 		value: &str,
 	) {
-		if let Element::Variable(v) = &mut self.elements[idx] {
+		if let Element::Variable(v) = &mut self.elements[idx].element {
 			match v.value_span.clone() {
 				Some(span) => {
 					let quoted = quote_value(value);
@@ -303,9 +487,13 @@ impl GitConfigSource {
 		let section = section.to_ascii_lowercase();
 		let name = name.to_ascii_lowercase();
 		let before = self.elements.len();
-		self.elements.retain(|e| match e {
+		// Remove only own matches; an included value stays (a write never edits another file).
+		self.elements.retain(|e| match &e.element {
 			Element::Variable(v) => {
-				!(v.section == section && v.name == name && v.subsection.as_deref() == subsection)
+				!(e.is_own()
+					&& v.section == section
+					&& v.name == name
+					&& v.subsection.as_deref() == subsection)
 			}
 			_ => true,
 		});
@@ -318,10 +506,13 @@ impl GitConfigSource {
 	pub fn remove_subsection(&mut self, section: &str, subsection: &str) -> bool {
 		let section = section.to_ascii_lowercase();
 		let before = self.elements.len();
-		self.elements.retain(|e| match e {
-			Element::Section(s) => !(s.section == section && s.subsection.as_deref() == Some(subsection)),
+		// Own elements only: an included subsection is read-only and stays put.
+		self.elements.retain(|e| match &e.element {
+			Element::Section(s) => {
+				!(e.is_own() && s.section == section && s.subsection.as_deref() == Some(subsection))
+			}
 			Element::Variable(v) => {
-				!(v.section == section && v.subsection.as_deref() == Some(subsection))
+				!(e.is_own() && v.section == section && v.subsection.as_deref() == Some(subsection))
 			}
 			Element::Filler(_) => true,
 		});
@@ -335,8 +526,12 @@ impl GitConfigSource {
 	pub fn rename_subsection(&mut self, section: &str, old: &str, new: &str) -> bool {
 		let section = section.to_ascii_lowercase();
 		let mut renamed = false;
-		for element in &mut self.elements {
-			match element {
+		// Rename own elements only; included ones are read-only.
+		for entry in &mut self.elements {
+			if !entry.is_own() {
+				continue;
+			}
+			match &mut entry.element {
 				Element::Section(s) if s.section == section && s.subsection.as_deref() == Some(old) => {
 					*s = synth_section(&section, Some(new));
 					renamed = true;
@@ -413,73 +608,78 @@ impl GitConfigSource {
 		})
 	}
 
-	/// Serialise back to git config text by concatenating each element's retained raw text. For an
-	/// unmodified config this reproduces the source byte-for-byte.
+	/// Serialise back to git config text by concatenating each **own** element's retained raw text
+	/// (included content is never written back — git keeps the `[include]` directive on disk, not the
+	/// flattened target). For an unmodified, un-expanded config this reproduces the source byte-for-byte.
 	pub fn render(&self) -> String {
 		let mut out = String::new();
-		for element in &self.elements {
-			match element {
-				Element::Filler(raw) => out.push_str(raw),
-				Element::Section(section) => out.push_str(&section.raw),
-				Element::Variable(variable) => out.push_str(&variable.raw),
+		for entry in &self.elements {
+			if entry.is_own() {
+				out.push_str(entry.element.raw());
 			}
 		}
 		out
 	}
 
-	/// Indices of variable elements matching `(section, subsection, name)`, in file order.
+	/// Indices of **own** variable elements matching `(section, subsection, name)`, in file order.
+	/// Writes edit own elements only, so an included occurrence is never overwritten in place.
 	fn matching_indices<'a>(
 		&'a self,
 		section: &'a str,
 		subsection: Option<&'a str>,
 		name: &'a str,
 	) -> impl Iterator<Item = usize> + 'a {
-		self.elements.iter().enumerate().filter_map(move |(i, e)| {
-			matches!(e, Element::Variable(v)
-				if v.section == section && v.name == name && v.subsection.as_deref() == subsection)
-			.then_some(i)
+		self.own_variables().filter_map(move |(i, v)| {
+			(v.section == section && v.name == name && v.subsection.as_deref() == subsection).then_some(i)
 		})
 	}
 
-	/// Insert a variable element into the last matching section block (after its final variable, or
-	/// directly after the header if it has none), synthesising the section at end of file when it
-	/// does not yet exist.
+	/// Insert a variable element into the last matching **own** section block (after its final
+	/// variable, or directly after the header if it has none), synthesising the section at end of
+	/// file when it does not yet exist. Included sections are ignored — a write never targets them.
 	fn insert_variable(&mut self, section: &str, subsection: Option<&str>, var: Variable) {
 		let header = self.elements.iter().rposition(|e| {
-			matches!(e, Element::Section(s)
-				if s.section == section && s.subsection.as_deref() == subsection)
+			e.is_own()
+				&& matches!(&e.element, Element::Section(s)
+					if s.section == section && s.subsection.as_deref() == subsection)
 		});
 		match header {
 			Some(header) => {
-				// Walk the block to its last variable, stopping at the next section header.
+				// Walk the block to its last own variable, stopping at the next own section header.
 				let mut insert_at = header + 1;
 				for (offset, e) in self.elements[header + 1..].iter().enumerate() {
-					match e {
-						Element::Section(_) => break,
-						Element::Variable(_) => insert_at = header + 1 + offset + 1,
-						Element::Filler(_) => {}
+					match &e.element {
+						Element::Section(_) if e.is_own() => break,
+						Element::Variable(_) if e.is_own() => insert_at = header + 1 + offset + 1,
+						_ => {}
 					}
 				}
 				// Without this, a final line lacking a newline would glue onto the inserted one.
 				self.ensure_trailing_newline(insert_at);
-				self.elements.insert(insert_at, Element::Variable(var));
+				self
+					.elements
+					.insert(insert_at, Entry::own(Element::Variable(var)));
 			}
 			None => {
 				// Likewise, separate a synthesised section from a file with no trailing newline.
 				self.ensure_trailing_newline(self.elements.len());
 				self
 					.elements
-					.push(Element::Section(synth_section(section, subsection)));
-				self.elements.push(Element::Variable(var));
+					.push(Entry::own(Element::Section(synth_section(
+						section, subsection,
+					))));
+				self.elements.push(Entry::own(Element::Variable(var)));
 			}
 		}
 	}
 
-	/// Ensure the element immediately before index `at` ends with a newline, so a line inserted at
-	/// `at` starts on its own line. No-op when inserting at the very start.
+	/// Ensure the last **own** element before index `at` ends with a newline, so a line inserted at
+	/// `at` starts on its own line. Walks back past any `Included` entries — `render` drops those, so a
+	/// newline added to one would vanish and glue the new line onto the last rendered (own) line. No-op
+	/// when there is no own element before `at`.
 	fn ensure_trailing_newline(&mut self, at: usize) {
-		if let Some(prev) = at.checked_sub(1).and_then(|i| self.elements.get_mut(i)) {
-			let raw = prev.raw_mut();
+		if let Some(idx) = self.elements[..at].iter().rposition(Entry::is_own) {
+			let raw = self.elements[idx].element.raw_mut();
 			if !raw.is_empty() && !raw.ends_with('\n') {
 				raw.push('\n');
 			}
@@ -513,6 +713,28 @@ fn synth_bare_variable(section: &str, subsection: Option<&str>, name: &str) -> V
 		value: None,
 		raw: format!("\t{name}\n"),
 		value_span: None,
+	}
+}
+
+/// Recognise an include directive: `[include] path` (unconditional, condition `None`) or
+/// `[includeIf "<cond>"] path` (conditional, condition `Some(cond)`). Returns the directive's path
+/// value — `None` for a bare `path` with no value, so the caller can reproduce git's fatal
+/// "missing value" only when the directive would actually be read. Returns `None` for any other
+/// element. Section names are already lower-cased by the parser, so the match is case-correct.
+///
+/// An unconditional `[include]` must carry **no** subsection: `[include "profile"] path` is the
+/// ordinary key `include.profile.path`, which git does not read (only bare `[include]` is special).
+fn include_directive(element: &Element) -> Option<(Option<String>, Option<String>)> {
+	let Element::Variable(v) = element else {
+		return None;
+	};
+	if v.name != "path" {
+		return None;
+	}
+	match (v.section.as_str(), v.subsection.as_deref()) {
+		("include", None) => Some((v.value.clone(), None)),
+		("includeif", Some(condition)) => Some((v.value.clone(), Some(condition.to_owned()))),
+		_ => None,
 	}
 }
 
