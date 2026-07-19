@@ -176,7 +176,15 @@ mod native {
 
 		// A free destination: decide from the target's branch intent.
 		match target {
-			CheckoutTarget::NewBranch { name, .. } => match &inspection.requested_branch {
+			CheckoutTarget::NewBranch {
+				name, force_reset, ..
+			} => match &inspection.requested_branch {
+				// git `-B`: reset an existing branch to `start` and check it out. A branch checked out in
+				// *another* worktree was already refused above (`BranchUseConflict`), as git refuses `-B` on
+				// one in use; the reset itself happens in `write_worktree`.
+				RequestedBranch::Exists { .. } if *force_reset => Ok(Action::Write {
+					create_branch: true,
+				}),
 				// Strict `git -b`: the branch must not already exist. Adopting an existing ref (even at the
 				// requested start) is unsafe — it cannot be told apart from a branch a user created
 				// independently. An interrupted `-b` is completed via `ExistingBranch`; a fully-present
@@ -246,7 +254,7 @@ mod native {
 	/// branch tip), so no ancestry relation is requested for it.
 	fn request_query(request: &CreateRequest) -> WorktreeQuery {
 		let (expected_branch, start) = match &request.target {
-			CheckoutTarget::NewBranch { name, start } => (Some(name.clone()), Some(start.clone())),
+			CheckoutTarget::NewBranch { name, start, .. } => (Some(name.clone()), Some(start.clone())),
 			CheckoutTarget::ExistingBranch {
 				name,
 				expected_start,
@@ -324,7 +332,7 @@ mod native {
 		// and the branch ref name when this is a branch worktree.
 		let (head, start, refname): (HeadState<H>, Option<ObjectId<H>>, Option<String>) =
 			match &request.target {
-				CheckoutTarget::NewBranch { name, start } => {
+				CheckoutTarget::NewBranch { name, start, .. } => {
 					let start = to_object_id::<H>(start)?;
 					(
 						HeadState::Symbolic(name.refname()),
@@ -393,16 +401,60 @@ mod native {
 		ensure_representable_path(destination)?;
 		ensure_representable_path(&admin)?;
 
-		// Create the branch through the transactional ref layer (CAS: it must not already exist).
+		// Create the branch through the transactional ref layer. Strict `-b` requires the ref be absent
+		// (`expected: None`, git's create CAS). git `-B` (`force_reset`) resets an existing *direct* branch:
+		// it compare-and-swaps against the branch's current tip — never a blind clobber — and logs `Reset to`
+		// rather than `Created from` (matching git). For `-B` on an *absent* branch the tip resolves to
+		// `None`, so it degrades to an ordinary create.
 		if create_branch {
 			let refname = refname.expect("a NewBranch worktree implies a branch ref name");
 			let start = start.expect("a NewBranch worktree implies a start commit");
-			let message = format!("branch: Created from {}", start.to_hex());
+			let force_reset = matches!(
+				&request.target,
+				CheckoutTarget::NewBranch {
+					force_reset: true,
+					..
+				}
+			);
+			let expected = if force_reset {
+				// git `-B` on a *symbolic-ref* branch (a `ref:`-content symref, or a `refs/`-target symlink)
+				// derefs to its terminal, resetting that and writing both reflogs under a chain-wide lock, with
+				// git's arcane legacy-symlink rules. That whole surface is deferred by decision, so `-B` is
+				// refused on **any** branch whose loose ref file is a `ref:` symref *or* a filesystem symlink.
+				// The `ref:` check is on the raw bytes so every git-valid spelling is caught (`ref: x`,
+				// `ref:x`, `ref:\tx`); a *packed* ref is never a symref, so an absent loose file is a direct
+				// ref. This slightly over-refuses vs git — a symlink to a *bare* sibling (`alias -> feature`)
+				// is a git *direct* ref it would reset (see `a_symlink_direct_ref_branch_is_its_own_occupied_branch`)
+				// — but that legacy form is vanishingly rare, and refusing it is safe; a direct branch (the
+				// universal case) resets normally. Reset the terminal branch directly instead.
+				let ref_path = common.join(&refname);
+				let symlinked = std::fs::symlink_metadata(&ref_path)
+					.map(|meta| meta.file_type().is_symlink())
+					.unwrap_or(false);
+				let ref_symref = !symlinked
+					&& std::fs::read(&ref_path)
+						.map(|bytes| bytes.starts_with(b"ref:"))
+						.unwrap_or(false);
+				if symlinked || ref_symref {
+					return Err(CreateError::UnsupportedSymbolicBranchReset(refname));
+				}
+				repo
+					.refs()
+					.resolve_symbolic(&refname)
+					.await
+					.map_err(LinkedWorktreeError::Repository)?
+			} else {
+				None
+			};
+			let message = match expected {
+				Some(_) => format!("branch: Reset to {}", start.to_hex()),
+				None => format!("branch: Created from {}", start.to_hex()),
+			};
 			repo
 				.refs()
 				.transact(&[RefOp {
 					name: refname,
-					expected: None,
+					expected,
 					new: Some(start),
 					reflog: ReflogIntent::Log {
 						committer: &committer,

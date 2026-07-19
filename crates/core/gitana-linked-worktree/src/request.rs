@@ -17,12 +17,21 @@ use crate::{RepositoryId, WorktreeObjectId};
 pub enum CheckoutTarget {
 	/// Create branch `name` at `start` and check it out (git `worktree add -b`). The branch **must not
 	/// already exist** — unless it sits at `start` with no worktree yet (an interrupted create), which is
-	/// finished. A branch that exists at a *different* commit is a conflict (never silently reset).
+	/// finished. A branch that exists at a *different* commit is a conflict (never silently reset) — unless
+	/// `force_reset` is set (git `-B`), which resets an existing branch to `start` and checks it out.
 	NewBranch {
 		/// The short branch name (`refs/heads/<name>`).
 		name: BranchName,
 		/// The commit the new branch is created at.
 		start: WorktreeObjectId,
+		/// git `-B`: when the branch already exists, **reset** it to `start` (a compare-and-reset against
+		/// its current tip, never a blind clobber) and check it out, rather than refusing it as
+		/// [`CreateError::BranchExists`](crate::CreateError::BranchExists). `false` (the default) keeps strict
+		/// `-b` semantics — an existing branch is a conflict. A branch checked out in *another* worktree is
+		/// still refused either way (git refuses `-B` on an in-use branch too). A **symbolic-ref** branch
+		/// (rare) is refused with [`CreateError::UnsupportedSymbolicBranchReset`](crate::CreateError::UnsupportedSymbolicBranchReset)
+		/// rather than dereferenced — reset its terminal branch directly.
+		force_reset: bool,
 	},
 	/// Check out the **existing** branch `name` at its current tip (git `worktree add <branch>`). The
 	/// branch must already exist; it is never created here. When `expected_start` is set — for reconciling

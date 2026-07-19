@@ -36,6 +36,15 @@ fn new_branch(name: &str, start: WorktreeObjectId) -> CheckoutTarget {
 	CheckoutTarget::NewBranch {
 		name: BranchName::new(name),
 		start,
+		force_reset: false,
+	}
+}
+
+fn reset_branch(name: &str, start: WorktreeObjectId) -> CheckoutTarget {
+	CheckoutTarget::NewBranch {
+		name: BranchName::new(name),
+		start,
+		force_reset: true,
 	}
 }
 
@@ -266,6 +275,149 @@ async fn new_branch_is_strict_when_the_branch_exists() {
 			matches!(err, CreateError::BranchExists(ref n) if n == "feature"),
 			"{fmt}: NewBranch is strict, got {err:?}"
 		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_reset_moves_an_existing_branch() {
+	// git `-B`: where plain `-b` refuses an existing branch (above), `force_reset` resets it to `start` and
+	// checks it out. Verified by stock git operating in the result, plus git's `Reset to` reflog wording.
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("newbranch-reset-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let first = commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		// `feature` sits at the first commit; a second commit advances `main` past it.
+		git(&["-C", w, "branch", "feature", &first]);
+		let second = commit_file(&work, "a.txt", "2\n", "second");
+		assert_ne!(first, second);
+
+		let wt = base.join("wt");
+		let wts = wt.to_str().unwrap();
+		let start = WorktreeObjectId::parse(kind, &second).unwrap();
+		let insp = create(&req(&work, &wt, reset_branch("feature", start)), None)
+			.await
+			.unwrap();
+		assert!(matches!(insp.registration, Registration::Present { .. }));
+
+		// The branch was reset to the second commit and checked out on it — git agrees, and the checkout is clean.
+		assert_eq!(git(&["-C", w, "rev-parse", "feature"]).trim(), second);
+		assert_eq!(
+			git(&["-C", wts, "rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+			"feature"
+		);
+		assert_eq!(git(&["-C", wts, "rev-parse", "HEAD"]).trim(), second);
+		assert!(git(&["-C", wts, "status", "--porcelain"]).is_empty());
+		// The reflog records git's `-B` wording (`Reset to`), not `Created from`.
+		let reflog = std::fs::read_to_string(work.join(".git/logs/refs/heads/feature")).unwrap();
+		assert!(
+			reflog.contains("branch: Reset to"),
+			"{fmt}: expected a `Reset to` reflog line, got: {reflog}"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_reset_refuses_a_symbolic_branch() {
+	// git `-B alias` where `alias -> feature` derefs to the terminal (resetting it, dual reflogs, chain
+	// locking) — a pathological case (a branch is ~never a symref). The library refuses it cleanly rather
+	// than half-handling the deref, and mutates nothing.
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("newbranch-symref-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let first = commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		git(&["-C", w, "branch", "feature", &first]);
+		git(&[
+			"-C",
+			w,
+			"symbolic-ref",
+			"refs/heads/alias",
+			"refs/heads/feature",
+		]);
+		let second = commit_file(&work, "a.txt", "2\n", "second");
+
+		let wt = base.join("wt");
+		let start = WorktreeObjectId::parse(kind, &second).unwrap();
+		let err = create(&req(&work, &wt, reset_branch("alias", start)), None)
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(err, CreateError::UnsupportedSymbolicBranchReset(ref n) if n == "refs/heads/alias"),
+			"{fmt}: expected a symbolic-ref refusal, got {err:?}"
+		);
+		// Nothing was mutated: `feature` is untouched and no worktree was registered.
+		assert_eq!(git(&["-C", w, "rev-parse", "feature"]).trim(), first);
+		assert!(!wt.exists(), "{fmt}: no checkout should have been created");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_reset_refuses_a_no_space_symref_branch() {
+	// git accepts `ref:refs/heads/x` (no space after the colon) as a symref; the refusal checks the raw
+	// `ref:` prefix so every git-valid spelling yields the matchable `UnsupportedSymbolicBranchReset`, not a
+	// `Failed` error from the transaction layer.
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("newbranch-nospace-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let first = commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		git(&["-C", w, "branch", "feature", &first]);
+		std::fs::write(
+			work.join(".git/refs/heads/alias"),
+			"ref:refs/heads/feature\n",
+		)
+		.unwrap();
+		let second = commit_file(&work, "a.txt", "2\n", "second");
+
+		let wt = base.join("wt");
+		let start = WorktreeObjectId::parse(kind, &second).unwrap();
+		let err = create(&req(&work, &wt, reset_branch("alias", start)), None)
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(err, CreateError::UnsupportedSymbolicBranchReset(ref n) if n == "refs/heads/alias"),
+			"{fmt}: a no-space `ref:` symref must yield the matchable refusal, got {err:?}"
+		);
+		assert_eq!(git(&["-C", w, "rev-parse", "feature"]).trim(), first);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_reset_refuses_a_symlinked_branch() {
+	// A branch whose ref file is a filesystem *symlink* is refused too (`read_symbolic` follows the link
+	// and would miss it, so the refusal also checks for a symlinked ref file). This deliberately
+	// over-refuses vs git — a symlink to a *bare* sibling like `feature` is a git *direct* ref it would
+	// reset — but that legacy form is vanishingly rare, and refusing it defers the whole legacy-symlink-ref
+	// surface safely.
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("newbranch-symlink-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let first = commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		git(&["-C", w, "branch", "feature", &first]);
+		// `refs/heads/alias` as a filesystem symlink to the loose `feature` ref (git's legacy symref).
+		symlink("feature", work.join(".git/refs/heads/alias")).unwrap();
+		let second = commit_file(&work, "a.txt", "2\n", "second");
+
+		let wt = base.join("wt");
+		let start = WorktreeObjectId::parse(kind, &second).unwrap();
+		let err = create(&req(&work, &wt, reset_branch("alias", start)), None)
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(err, CreateError::UnsupportedSymbolicBranchReset(ref n) if n == "refs/heads/alias"),
+			"{fmt}: expected a symbolic-ref refusal for a legacy symlink, got {err:?}"
+		);
+		assert_eq!(git(&["-C", w, "rev-parse", "feature"]).trim(), first);
 		let _ = std::fs::remove_dir_all(&base);
 	}
 }

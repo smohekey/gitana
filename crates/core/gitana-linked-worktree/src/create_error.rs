@@ -33,6 +33,15 @@ pub enum CreateError {
 	#[error("invalid branch name: {0}")]
 	InvalidBranchName(String),
 
+	/// A `NewBranch` with `force_reset` (git `-B`) targeted a branch whose ref is a `ref:`-content symref or
+	/// a filesystem **symlink**. git derefs a symbolic-ref branch to its terminal (resetting that, dual
+	/// reflogs, chain locking, under its arcane legacy-symlink rules); that whole surface is deferred here
+	/// rather than half-handled, so it is refused. This slightly over-refuses vs git (a symlink to a *bare*
+	/// sibling name is a git direct ref it would reset), but that legacy form is vanishingly rare. Reset the
+	/// terminal branch directly instead; a *direct* branch (the universal case) resets normally.
+	#[error("cannot force-reset a symbolic-ref (or symlinked) branch: {0}")]
+	UnsupportedSymbolicBranchReset(String),
+
 	/// The write completed, but a post-write re-inspection shows the destination is *not* the requested
 	/// worktree — a concurrent registration/branch change (a lost race) mutated the state out from under the
 	/// create. Carries the observed post-state. (A create never reports success for a state it did not
