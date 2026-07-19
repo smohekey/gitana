@@ -88,6 +88,11 @@ mod native {
 		let common = request.repo.common_dir();
 		let query = remove_query(request, true);
 
+		// `GitCompat { force: 0 }` gets git force-0 parity on the residual gate: an *ignored-only* worktree is
+		// removable (git deletes it), while a real dirty/untracked one still refuses. `Conservative` passes
+		// `false`, so its decision is unchanged. Only the ignored-only residual axis is relaxed.
+		let relax = matches!(request.policy, RemovePolicy::GitCompat { force: 0 });
+
 		// A static path fact (unchanged across the re-check): whether the destination *encloses* the
 		// repository's own git storage (its common dir lives inside the checkout — a supported
 		// `--separate-git-dir`/relocated-bare topology). Recursively deleting such a checkout would destroy the
@@ -125,6 +130,7 @@ mod native {
 			&preflight,
 			is_primary_worktree(&preflight, common)?,
 			enclosed.as_deref(),
+			relax,
 		) {
 			Ok(RemoveAction::AlreadyAbsent) => {
 				return Ok(RemoveOutcome::AlreadyAbsent {
@@ -140,6 +146,7 @@ mod native {
 			&inspection,
 			is_primary_worktree(&inspection, common)?,
 			enclosed.as_deref(),
+			relax,
 		)?;
 
 		let admin = match &action {
@@ -160,6 +167,7 @@ mod native {
 			&recheck,
 			is_primary_worktree(&recheck, common)?,
 			enclosed.as_deref(),
+			relax,
 		) {
 			Ok(action_again) if action_again == action => {}
 			Ok(RemoveAction::AlreadyAbsent) => {
@@ -235,10 +243,18 @@ mod native {
 	/// Decide the removal action from the inspection, or refuse. Precedence is most-specific-refusal-first:
 	/// primary, then locked, then an identity/integrity conflict, then a recoverable partial, then a live
 	/// clean checkout, then a foreign checkout, then already-absent / unrelated content.
+	///
+	/// `relax_ignored_residual` is set **only** for `GitCompat { force: 0 }` (git force-0 parity): it relaxes
+	/// the residual-content gate to tolerate an *ignored-only* worktree (see that gate), matching stock
+	/// `git worktree remove` with no `-f`, which deletes an ignored-only checkout. `Conservative` passes
+	/// `false`, so its decision is byte-identical to before — every residual (untracked *or* ignored) still
+	/// refuses. It relaxes **only** that axis; the sparse/diverged/staged/unreachable-anchor refusals are
+	/// unaffected.
 	fn decide_remove(
 		inspection: &WorktreeInspection,
 		is_primary: bool,
 		enclosed_common: Option<&Path>,
+		relax_ignored_residual: bool,
 	) -> Result<RemoveAction, RemoveError> {
 		use WorktreeClassification as C;
 
@@ -360,14 +376,37 @@ mod native {
 			// removal preserves it. The offending paths are reported so a caller knows what to clear. (A
 			// genuinely untracked file also fails `is_clean` above; this additionally catches the residue an
 			// unreliable ignore match would otherwise hide, and reports ignored content the status omits.)
+			//
+			// **GitCompat{0} exception (git force-0 parity):** stock `git worktree remove` (no `-f`) deletes an
+			// *ignored-only* worktree but keeps a real dirty/untracked one. When `relax_ignored_residual` is set
+			// (only `GitCompat { force: 0 }`) **and** the working-tree status reports **no untracked path**, every
+			// residual file is git-ignored, so we fall through and remove — matching git. `Conservative`
+			// (`relax=false`) still refuses. A real untracked file (`status.has_untracked()`) always refuses, at
+			// every policy — the matcher-independent scan still guards a non-git-faithful ignore false-positive
+			// whenever status sees an untracked path.
+			//
+			// **Accepted limitation (destructive):** the ignored-only branch trusts this crate's ignore matcher
+			// (`gitana-worktree::ignore`) to decide deletion — if that matcher *over-matches* git (classifying a
+			// git-*untracked* file as ignored on syntax it does not implement git-faithfully), force-0 removal
+			// could delete a file git would preserve. This is deliberate: `GitCompat` is git's CLI surface, and
+			// this is exactly the trust the native `gta worktree remove` already placed in the same matcher, so it
+			// is git/native parity rather than a new hazard. `Conservative` (Code Henge) never takes this branch,
+			// so its matcher-independent guarantee is intact. A git-faithful matcher would remove the caveat.
 			if let Some(residual) = &inspection.residual_paths
 				&& !residual.is_empty()
 			{
-				return Err(RemoveError::Refused(C::ProtectedWithReason {
-					reason: ProtectionReason::ResidualContent {
-						paths: residual.clone(),
-					},
-				}));
+				let ignored_only = relax_ignored_residual
+					&& inspection
+						.status
+						.as_ref()
+						.is_some_and(|s| !s.has_untracked());
+				if !ignored_only {
+					return Err(RemoveError::Refused(C::ProtectedWithReason {
+						reason: ProtectionReason::ResidualContent {
+							paths: residual.clone(),
+						},
+					}));
+				}
 			}
 			// A clean checkout that anchors a commit only inside its admin dir — a detached/per-worktree-symbolic
 			// HEAD, or a `refs/worktree|bisect|rewritten/*` tip — reachable from no surviving shared ref would

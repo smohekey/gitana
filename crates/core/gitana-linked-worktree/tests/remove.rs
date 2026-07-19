@@ -2136,30 +2136,63 @@ async fn a_locked_worktree_needs_double_force() {
 }
 
 #[tokio::test]
-async fn git_compat_force_zero_refuses_residual_but_one_force_removes() {
-	// The force-0 **safety divergence**: git's plain `worktree remove` deletes a worktree whose only residue
-	// is git-*ignored* content (build artifacts), but authorising that would need a git-faithful ignore
-	// matcher the crate deliberately lacks — its residual scan is matcher-independent, so it never deletes a
-	// non-tracked file on a possibly-wrong match. So `GitCompat { force: 0 }` still refuses residual
-	// (ignored *or* untracked) content (diverging from git on the safe side); a single `-f` removes it.
+async fn git_compat_force_zero_removes_an_ignored_only_worktree() {
+	// git force-0 parity (probed, git 2.50.1): plain `git worktree remove` (no `-f`) **deletes** a worktree
+	// whose only residue is git-*ignored* content (build artifacts). `GitCompat { force: 0 }` matches — its
+	// residual gate is relaxed for ignored-only (status shows no untracked path), so the worktree is removed.
 	for (fmt, _kind) in formats() {
 		let base = unique_tmp(&format!("remove-force0-ignored-{fmt}"));
 		let work = base.join("repo");
 		init_repo(&work, fmt);
-		std::fs::write(work.join(".gitignore"), "*.log\nbuild/\n").unwrap();
+		std::fs::write(work.join(".gitignore"), "target/\n").unwrap();
 		let w = work.to_str().unwrap();
 		git(&["-C", w, "add", ".gitignore"]);
 		git(&["-C", w, "commit", "-q", "-m", "init"]);
 		let wt = base.join("wt");
 		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
-		std::fs::write(wt.join("run.log"), "noise\n").unwrap();
-		std::fs::create_dir(wt.join("build")).unwrap();
-		std::fs::write(wt.join("build/out.o"), "obj\n").unwrap();
+		std::fs::create_dir(wt.join("target")).unwrap();
+		std::fs::write(wt.join("target/out.o"), "obj\n").unwrap();
 		// git considers it clean (ignored files omitted) — plain `git worktree remove` would delete it.
 		assert!(git(&["-C", wt.to_str().unwrap(), "status", "--porcelain"]).is_empty());
 
-		// GitCompat force 0 refuses it (the safe divergence), naming the residual paths — it does not trust
-		// the ignore matcher to authorise a delete.
+		let out = remove(&force_req(&work, &wt, Some("feature"), 0))
+			.await
+			.unwrap();
+		assert!(
+			matches!(out, RemoveOutcome::Removed { .. }),
+			"{fmt}: GitCompat{{0}} removes an ignored-only worktree, got {out:?}"
+		);
+		assert!(!wt.exists(), "{fmt}: the ignored-only worktree was removed");
+		// The branch and its commit survive (removal never deletes a ref).
+		assert!(git_ok(&[
+			"-C",
+			w,
+			"rev-parse",
+			"--verify",
+			"refs/heads/feature"
+		]));
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn git_compat_force_zero_refuses_a_real_untracked_worktree() {
+	// git force-0 keeps a worktree with a **real untracked** file ("modified or untracked"). `GitCompat { 0 }`
+	// matches: the relax applies to ignored-only residue, so a genuinely untracked file (status shows it) still
+	// refuses — the residual gate is not relaxed when `status.has_untracked()`.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force0-untracked-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		std::fs::write(wt.join("untracked.txt"), "x\n").unwrap();
+		// Oracle: git sees it untracked and refuses without --force.
+		assert!(
+			git(&["-C", wt.to_str().unwrap(), "status", "--porcelain"]).contains("?? untracked.txt")
+		);
+
 		let err = remove(&force_req(&work, &wt, Some("feature"), 0))
 			.await
 			.unwrap_err();
@@ -2170,16 +2203,48 @@ async fn git_compat_force_zero_refuses_residual_but_one_force_removes() {
 					reason: ProtectionReason::ResidualContent { .. }
 				})
 			),
-			"{fmt}: force 0 refuses residual content, got {err:?}"
+			"{fmt}: GitCompat{{0}} refuses a real untracked worktree, got {err:?}"
 		);
-		assert!(wt.exists());
+		assert!(wt.exists(), "{fmt}: the untracked worktree is preserved");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
 
-		// A single `-f` removes it, deleting the ignored residue with the checkout.
-		let out = remove(&force_req(&work, &wt, Some("feature"), 1))
+#[tokio::test]
+async fn conservative_still_refuses_an_ignored_only_worktree() {
+	// The Code-Henge stance is unchanged (relax=false): `Conservative` refuses even an ignored-only worktree —
+	// gitana's ignore matcher is not fully git-faithful, so it never deletes a non-tracked file on faith. Only
+	// `GitCompat { 0 }` relaxes this (git force-0 parity); this guards that `Conservative` is byte-unchanged.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-cons-ignored-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		std::fs::write(work.join(".gitignore"), "target/\n").unwrap();
+		let w = work.to_str().unwrap();
+		git(&["-C", w, "add", ".gitignore"]);
+		git(&["-C", w, "commit", "-q", "-m", "init"]);
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		std::fs::create_dir(wt.join("target")).unwrap();
+		std::fs::write(wt.join("target/out.o"), "obj\n").unwrap();
+		assert!(git(&["-C", wt.to_str().unwrap(), "status", "--porcelain"]).is_empty());
+
+		let err = remove(&rreq(&work, &wt, Some("feature")))
 			.await
-			.unwrap();
-		assert!(matches!(out, RemoveOutcome::Removed { .. }));
-		assert!(!wt.exists(), "{fmt}: `-f` removes an ignored-only worktree");
+			.unwrap_err();
+		assert!(
+			matches!(
+				err,
+				RemoveError::Refused(WorktreeClassification::ProtectedWithReason {
+					reason: ProtectionReason::ResidualContent { .. }
+				})
+			),
+			"{fmt}: Conservative still refuses ignored-only residue, got {err:?}"
+		);
+		assert!(
+			wt.exists(),
+			"{fmt}: the ignored-only worktree is preserved under Conservative"
+		);
 		let _ = std::fs::remove_dir_all(&base);
 	}
 }

@@ -14,9 +14,11 @@
 /// refused, not deleted. The repository **format** is also validated before any destructive action (object
 /// format, `repositoryformatversion`, and git's abort on an unknown `extensions.*`), so a repo gitana does not
 /// fully understand is never force-mutated. `force >= 2` additionally removes a locked worktree. Identity,
-/// primary, and enclosure are never overridden. `force 0` behaves as [`Conservative`](RemovePolicy::Conservative)
-/// (its content gates still apply; the residual-content refusal is a deliberate, safe divergence from git,
-/// which deletes ignored-only build artifacts).
+/// primary, and enclosure are never overridden. `force 0` takes the conservative path but with git force-0
+/// parity on the residual axis: it tolerates an *ignored-only* worktree (status shows no untracked path),
+/// deleting it as stock `git worktree remove` (no `-f`) does, while a real dirty/untracked worktree still
+/// refuses. `Conservative` itself keeps the stricter Code-Henge stance — it refuses even ignored-only residue
+/// (a deliberate, safe divergence from git, since gitana's ignore matcher is not fully git-faithful).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RemovePolicy {
 	/// Refuse every unsafe state and preserve residual content — the safe, force-free default (Code Henge).

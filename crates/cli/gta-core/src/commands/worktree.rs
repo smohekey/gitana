@@ -10,7 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use gitana_linked_worktree::{
-	LockState, RepositoryId, WorktreeContext, WorktreeEntry, WorktreeRole,
+	LockState, ProtectionReason, RemoveError, RemoveOutcome, RemovePolicy, RemoveRequest,
+	RepositoryId, WorktreeClassification, WorktreeContext, WorktreeEntry, WorktreeRole,
 };
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 use gitana_repository::{HeadState, ReflogIntent, Repository};
@@ -708,85 +709,95 @@ fn render_porcelain(entries: &[WorktreeInfo]) -> String {
 async fn remove(cwd: &Path, path: &Path, force: u8) -> Result<()> {
 	let found = repo::discover(cwd).await?;
 	let common = &found.common_dir;
-	// Resolve by git's rules (exact path, then a unique name/id suffix). The checkout may already be
-	// gone (deleted or moved) — git still cleans up such a stale entry — so `find_worktree` matches on
-	// the recorded path without requiring it to exist.
+	// Resolve by git's rules (exact path, then a unique name/id suffix) — kept CLI-side (the DWIM the library
+	// does not do). The checkout may already be gone (deleted or moved) — git still cleans up such a stale
+	// entry — so `find_worktree` matches on the recorded path without requiring it to exist.
 	let (admin, target) = match find_worktree(common, cwd, path) {
 		Some(WorktreeRef::Main { .. }) => bail!("'{}' is a main working tree", path.display()),
 		Some(WorktreeRef::Linked { admin, path }) => (admin, path),
 		None => bail!("'{}' is not a working tree", path.display()),
 	};
 
-	// A locked worktree is protected: git requires two `-f` to remove it (one is not enough).
-	if let Some(reason) = read_lock_reason(&admin)
-		&& force < 2
-	{
-		if reason.is_empty() {
-			bail!("cannot remove a locked working tree");
-		}
-		bail!("cannot remove a locked working tree, lock reason: {reason}");
-	}
-
-	// If the checkout is still present, it must genuinely belong to this admin entry before we delete
-	// it — its `.git` file must point back here. git refuses (even with `--force`) when the gitfile is
-	// gone or foreign, so an unrelated directory left at the recorded path is never destroyed. A wholly
-	// absent checkout is a stale entry: nothing to validate, just drop the registration.
-	if target.exists() {
-		let gitfile = target.join(".git");
-		if !gitfile.is_file() {
-			bail!(
-				"validation failed, cannot remove working tree: '{}' does not exist",
-				gitfile.display()
-			);
-		}
-		if !checkout_points_to(&gitfile, &admin) {
-			bail!(
-				"validation failed, cannot remove working tree: '{}' does not point to this worktree",
-				gitfile.display()
-			);
-		}
-	}
-
-	// gitana has no submodule support; git refuses to remove a worktree holding an initialized submodule
-	// (deleting it would orphan the submodule's git data), so gitana refuses too rather than corrupt a
-	// git-created one. Unlike `move`, a single `--force` overrides this for `remove`, matching git.
+	// Submodule guard stays CLI-side: the library has no submodule concept, and git refuses (without `--force`)
+	// to remove a worktree holding an initialized submodule (deleting it would orphan the submodule's git data).
+	// A single `--force` overrides it, matching git.
 	if force < 1 && target.exists() && worktree_has_submodule(&admin, &target) {
 		bail!("working trees containing submodules cannot be moved or removed");
 	}
 
-	// A still-present dirty checkout needs one `-f`; a stale one has nothing to check.
-	if force < 1 && target.exists() {
-		let dirty = match detect_algorithm(common)? {
-			HashKind::Sha1 => is_dirty::<Sha1>(common, &admin, &target).await?,
-			HashKind::Sha256 => is_dirty::<Sha256>(common, &admin, &target).await?,
-		};
-		if dirty {
-			bail!(
-				"'{}' contains modified or untracked files, use --force to delete it",
-				path.display()
-			);
-		}
+	// Delegate the removal to the library (`GitCompat` = git's repeatable-`-f` semantics): it owns the
+	// lock / dirty / structural-validation / stale-registration-cleanup decisions and the destructive effect
+	// (with a pre-delete re-verify). The CLI maps the structured outcome to git's messages.
+	let request = RemoveRequest {
+		repo: RepositoryId::at_common_dir(common.clone())?,
+		destination: target.clone(),
+		expected_branch: None,
+		policy: RemovePolicy::GitCompat { force },
+	};
+	use ProtectionReason as P;
+	use WorktreeClassification as C;
+	match gitana_linked_worktree::remove(&request).await {
+		// Removed, or already gone (idempotent) — git prints nothing on a successful remove.
+		Ok(RemoveOutcome::Removed { .. } | RemoveOutcome::AlreadyAbsent { .. }) => Ok(()),
+		// A locked worktree needs a second `-f`; carry git's lock-reason message when one is recorded.
+		Err(RemoveError::Refused(C::ProtectedWithReason {
+			reason: P::Locked { reason },
+		})) => match reason {
+			Some(r) if !r.is_empty() => {
+				bail!("cannot remove a locked working tree, lock reason: {r}")
+			}
+			_ => bail!("cannot remove a locked working tree"),
+		},
+		// Any modified/untracked/ignored/staged residue (without enough force) is git's "modified or untracked".
+		Err(RemoveError::Refused(C::ProtectedWithReason {
+			reason:
+				P::Dirty(_)
+				| P::ResidualContent { .. }
+				| P::ModifiedTrackedContent { .. }
+				| P::StagedContentInMissingCheckout,
+		})) => bail!(
+			"'{}' contains modified or untracked files, use --force to delete it",
+			path.display()
+		),
+		// A broken/foreign/reused checkout or a registration conflict is git's structural "validation failed".
+		Err(RemoveError::Refused(
+			C::DestinationConflict { .. } | C::IdentityConflict { .. } | C::PartialConflicting { .. },
+		)) => bail!(
+			"validation failed, cannot remove working tree: '{}' is not a valid working tree",
+			target.join(".git").display()
+		),
+		// A sparse-index checkout gitana cannot safely status (conservative-stricter than git force-0 by design).
+		Err(RemoveError::Refused(C::ProtectedWithReason {
+			reason: P::SparseIndexUnsupported,
+		})) => bail!(
+			"'{}' uses a sparse-checkout index gitana cannot remove; remove it with git",
+			path.display()
+		),
+		// Removing would orphan a commit anchored only in the admin dir (conservative-stricter than git).
+		Err(RemoveError::Refused(C::ProtectedWithReason {
+			reason: P::UnreachableAnchoredCommit { commit },
+		})) => bail!(
+			"refusing to remove '{}': it would orphan commit {}; create a branch or tag at it first",
+			path.display(),
+			commit.to_hex()
+		),
+		// Defensive: `find_worktree` catches the main worktree first, but honour a library primary refusal too.
+		Err(RemoveError::IsPrimaryWorktree(_)) => bail!("'{}' is a main working tree", path.display()),
+		Err(RemoveError::EnclosesRepository(p)) => bail!(
+			"cannot remove a worktree enclosing the repository ({})",
+			p.display()
+		),
+		Err(RemoveError::Incomplete(_)) => bail!(
+			"remove did not complete; re-inspect '{}' and re-run",
+			path.display()
+		),
+		Err(RemoveError::Failed(e)) => Err(e.into()),
+		// Any other refusal classification (not expected from a remove) maps to git's validation message.
+		Err(RemoveError::Refused(_)) => bail!(
+			"validation failed, cannot remove working tree: '{}' is not a valid working tree",
+			target.join(".git").display()
+		),
 	}
-
-	// Remove the checkout (if it still exists), then the admin directory, so a failure part-way leaves
-	// a registered (repairable) worktree rather than an orphaned admin directory.
-	if target.exists() {
-		std::fs::remove_dir_all(&target)
-			.map_err(|error| anyhow!("removing {}: {error}", target.display()))?;
-	}
-	std::fs::remove_dir_all(&admin)
-		.map_err(|error| anyhow!("removing {}: {error}", admin.display()))?;
-	Ok(())
-}
-
-/// Whether the worktree checked out at `target` (per-worktree files under `admin`) has staged,
-/// unstaged, or untracked changes — anything git counts as "modified or untracked".
-async fn is_dirty<H: HashAlgorithm>(common: &Path, admin: &Path, target: &Path) -> Result<bool> {
-	let repo = repo::open_generic::<H>(admin, common).await?;
-	let work: WorkDir = repo::open_work_dir(target)?;
-	let worktree = WorkTree::new(repo, work, admin.to_path_buf());
-	let status = worktree.status().await?;
-	Ok(!status.changed.is_empty() || !status.untracked.is_empty())
 }
 
 /// The admin directory under `<common>/worktrees/*` whose checkout is `target`, or `None` if no

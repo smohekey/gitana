@@ -2204,6 +2204,58 @@ fn worktree_list_matches_git_for_a_separate_git_dir() {
 	std::fs::remove_dir_all(&base).ok();
 }
 
+/// Force-0 parity with git (probed, git 2.50.1): `gta worktree remove` (no `-f`) **deletes** a worktree whose
+/// only residue is git-*ignored* content, but **keeps** one with a real untracked file ("modified or
+/// untracked"). This locks the CLI rewire onto the library's `GitCompat{0}` ignored-only tolerance.
+#[test]
+fn remove_force0_deletes_ignored_only_but_keeps_real_untracked() {
+	let base = unique_tmp("gta-wt-force0-ignored");
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(base_s, &["init", "--object-format=sha1", repo_s], b"");
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+
+	// (a) A worktree whose only residue is ignored `target/` content — removed with no `--force`.
+	let ign = base.join("ign");
+	let ign_s = ign.to_str().unwrap();
+	gta(repo_s, &["worktree", "add", ign_s], b"");
+	std::fs::create_dir(ign.join("target")).unwrap();
+	std::fs::write(ign.join("target/out.o"), "obj\n").unwrap();
+	// git agrees the worktree is clean (ignored files omitted).
+	assert_eq!(git(ign_s, &["status", "--porcelain"]), "");
+	gta(repo_s, &["worktree", "remove", ign_s], b"");
+	assert!(
+		!ign.exists(),
+		"ignored-only worktree removed without --force"
+	);
+	// The registration is gone and git no longer lists that checkout (path-precise — the base tag itself
+	// contains the substring "ign", so match on the admin dir and the recorded path, not a loose "ign").
+	assert!(!repo.join(".git/worktrees/ign").exists());
+	assert!(!git(repo_s, &["worktree", "list", "--porcelain"]).contains(ign_s));
+
+	// (b) A sibling worktree with a real untracked file — refused ("modified or untracked"), preserved.
+	let dirty = base.join("dirty");
+	let dirty_s = dirty.to_str().unwrap();
+	gta(repo_s, &["worktree", "add", dirty_s], b"");
+	std::fs::write(dirty.join("untracked.txt"), "x\n").unwrap();
+	assert!(
+		gta_fail(repo_s, &["worktree", "remove", dirty_s]).contains("modified or untracked"),
+		"a real untracked worktree must be refused without --force"
+	);
+	assert!(
+		dirty.exists(),
+		"real-untracked worktree preserved without --force"
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
 /// The leading path column of each `worktree list` line.
 fn worktree_paths(listing: &str) -> Vec<String> {
 	listing
