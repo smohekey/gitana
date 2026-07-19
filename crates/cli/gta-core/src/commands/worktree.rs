@@ -10,17 +10,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use gitana_linked_worktree::{
-	LockState, ProtectionReason, RemoveError, RemoveOutcome, RemovePolicy, RemoveRequest,
-	RepositoryId, WorktreeClassification, WorktreeContext, WorktreeEntry, WorktreeRole,
+	BranchName, CheckoutTarget, CreateError, CreateRequest, LockState, ProtectionReason, RemoveError,
+	RemoveOutcome, RemovePolicy, RemoveRequest, RepositoryId, WorktreeClassification,
+	WorktreeContext, WorktreeEntry, WorktreeObjectId, WorktreeRole,
 };
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
-use gitana_repository::{HeadState, ReflogIntent, Repository};
-use gitana_worktree::WorkTree;
+use gitana_porcelain::Identity;
+use gitana_repository::Repository;
 
+use crate::Backend;
 use crate::dispatch::detect_algorithm;
-use crate::identity::signature_or_default;
-use crate::repo::{self, RepositoryLayout};
-use crate::{Backend, WorkDir};
+use crate::identity::CliIdentity;
+use crate::repo;
 
 /// A `gta worktree` operation.
 pub enum Action {
@@ -120,139 +121,85 @@ async fn add(
 	detach: bool,
 ) -> Result<()> {
 	let found = repo::discover(cwd).await?;
+	let common = &found.common_dir;
 	let target = absolute(cwd, path);
-	// git refuses an existing, non-empty destination (an empty directory is fine).
+
+	// Two cheap pre-checks kept CLI-side to preserve git's precedence (the destination is checked *before*
+	// the checkout target is resolved) and its exact messages. Delegating flips that order — a name/commit
+	// error would otherwise precede the library's destination check — so keep these here:
+	//   - git refuses an existing, non-empty destination (an empty directory is fine);
+	//   - a path already registered under `.git/worktrees` (even one whose checkout was deleted) must not be
+	//     re-added, or the repository ends up with two admin entries for one path.
 	if target.exists() && dir_non_empty(&target)? {
 		bail!("'{}' already exists", path.display());
 	}
-	// A path already registered under `.git/worktrees` — even one whose checkout was deleted — must not
-	// be re-added, or the repository ends up with two admin entries for one path. git refuses this;
-	// clear it first with `worktree remove`.
-	if admin_dir_for(&found.common_dir, &canonical(&target)).is_some() {
+	if admin_dir_for(common, &canonical(&target)).is_some() {
 		bail!(
 			"'{}' is a missing but already registered worktree",
 			path.display()
 		);
 	}
-	match detect_algorithm(&found.common_dir)? {
+
+	// DWIM resolution stays CLI-side (git's `worktree add` mode inference): resolve the start point + checkout
+	// mode against the current repository (its refs/objects are shared with the new worktree), producing the
+	// explicit `CheckoutTarget` the library takes plus a `Label` for the "Preparing worktree" line. The
+	// env-aware committer (honouring `GIT_COMMITTER_*`, incl. `DATE`) is resolved here too, the same way
+	// clone/fetch/pull do — the library records it on every reflog line it writes.
+	let (checkout_target, label, committer) = match detect_algorithm(common)? {
 		HashKind::Sha1 => {
-			add_generic::<Sha1>(&found, &target, commit_ish, branch, force_branch, detach).await
-		}
-		HashKind::Sha256 => {
-			add_generic::<Sha256>(&found, &target, commit_ish, branch, force_branch, detach).await
-		}
-	}
-}
-
-async fn add_generic<H: HashAlgorithm>(
-	found: &RepositoryLayout,
-	target: &Path,
-	commit_ish: Option<&str>,
-	branch: Option<&str>,
-	force_branch: bool,
-	detach: bool,
-) -> Result<()> {
-	let common = &found.common_dir;
-	// Resolve the start point and the checkout mode against the *current* repository (its refs and
-	// objects are shared with the new worktree, so either repo resolves them identically).
-	let repo = repo::open_generic::<H>(&found.git_dir, common).await?;
-	let plan = plan_checkout::<H>(&repo, target, commit_ish, branch, force_branch, detach).await?;
-
-	// The admin directory name is the destination's basename, uniquified against existing worktrees
-	// (git appends a numeric suffix on collision).
-	let base = target
-		.file_name()
-		.and_then(|name| name.to_str())
-		.ok_or_else(|| anyhow!("invalid worktree path: '{}'", target.display()))?;
-	let admin = unique_admin_dir(common, base);
-
-	// A *born* branch's ref is shared across the repository's worktrees, so git forbids checking one
-	// out in two at once. Refuse before writing anything. (The new worktree does not exist yet, so no
-	// exclusion is needed — every existing worktree is a real conflict, including the current one.) An
-	// unborn branch (an orphan plan, `commit` = None) has no ref to race on, so git allows a second
-	// worktree to point `HEAD` at it — skip the guard there.
-	if plan.commit.is_some()
-		&& let HeadState::Symbolic(refname) = &plan.head
-		&& let Some(other) = repo::branch_checkout_location(common, refname, None)
-	{
-		bail!(
-			"'{}' is already checked out at '{}'",
-			refname.strip_prefix("refs/heads/").unwrap_or(refname),
-			other.display()
-		);
-	}
-
-	// The committer credited in the new branch's and the new worktree's reflogs (a default identity
-	// when unconfigured, as git does for reflog-only writes).
-	let committer = signature_or_default(&repo, "COMMITTER").await?;
-
-	// Create the branch first (a shared ref), then materialise the admin directory and checkout. A
-	// `create` is only ever paired with a concrete commit (never an orphan).
-	if let Some((refname, expected)) = &plan.create {
-		let commit = plan
-			.commit
-			.expect("a branch to create implies a start commit");
-		// git reflogs the start point as the user named it (default `HEAD`), and says `Reset to` rather
-		// than `Created from` when `-B` resets a branch that already existed (`expected` is `Some`).
-		let start = commit_ish.unwrap_or("HEAD");
-		let verb = if expected.is_some() {
-			"Reset to"
-		} else {
-			"Created from"
-		};
-		let message = format!("branch: {verb} {start}");
-		repo
-			.refs()
-			.update_ref(
-				refname,
-				commit,
-				*expected,
-				ReflogIntent::Log {
-					committer: &committer,
-					message: &message,
-				},
+			let repo = repo::open_generic::<Sha1>(&found.git_dir, common).await?;
+			let (target, label) = plan_checkout::<Sha1>(
+				&repo,
+				&target,
+				commit_ish,
+				branch,
+				force_branch,
+				detach,
+				HashKind::Sha1,
 			)
 			.await?;
+			let committer = CliIdentity::new(&repo).committer_or_default().await?;
+			(target, label, committer)
+		}
+		HashKind::Sha256 => {
+			let repo = repo::open_generic::<Sha256>(&found.git_dir, common).await?;
+			let (target, label) = plan_checkout::<Sha256>(
+				&repo,
+				&target,
+				commit_ish,
+				branch,
+				force_branch,
+				detach,
+				HashKind::Sha256,
+			)
+			.await?;
+			let committer = CliIdentity::new(&repo).committer_or_default().await?;
+			(target, label, committer)
+		}
+	};
+
+	// Delegate all remaining validation + the writes to the library. The effective config supplies
+	// `core.logAllRefUpdates` gating (git's full precedence stack), as `list` injects it; `committer` carries
+	// the env-aware identity, and `reflog_start` the user's start-point spelling for a new branch's reflog
+	// message (git records the token as named — `branch: Created from HEAD` — not the resolved hash).
+	let effective = crate::git_config::effective_config_for_worktree(common, &found.git_dir).await?;
+	let reflog_start = matches!(checkout_target, CheckoutTarget::NewBranch { .. })
+		.then(|| commit_ish.unwrap_or("HEAD").to_owned());
+	let request = CreateRequest {
+		repo: RepositoryId::at_common_dir(common.clone())?,
+		destination: target.clone(),
+		target: checkout_target.clone(),
+		committer: Some(committer),
+		reflog_start,
+	};
+	match gitana_linked_worktree::create(&request, Some(&effective)).await {
+		// Created, or already exactly present (idempotent) — emit git's "Preparing worktree …" line.
+		Ok(_) => {
+			report_add(&label, &checkout_target);
+			Ok(())
+		}
+		Err(error) => map_create_error(error, path, &checkout_target),
 	}
-
-	// git only seeds the new worktree's per-worktree `logs/HEAD` when reflogs are enabled
-	// (`core.logAllRefUpdates` — off for a bare repo or when explicitly disabled).
-	let log_head = repo.refs().creates_reflog_for("HEAD").await?;
-	let admin = write_admin_layout(
-		&admin,
-		target,
-		&plan.head,
-		plan.commit,
-		&committer,
-		log_head,
-	)?;
-
-	// Open the new worktree (per-worktree files under `admin`, shared files under `common`) and
-	// materialise the checkout. An orphan worktree has no commit, so it is left empty (as git does).
-	if let Some(commit) = plan.commit {
-		let new_repo = repo::open_generic::<H>(&admin, common).await?;
-		let work: WorkDir = repo::open_work_dir(target)?;
-		let worktree = WorkTree::new(new_repo, work, admin.clone());
-		let tree = worktree.repository().commit_tree(commit).await?;
-		worktree.checkout(tree, false).await?;
-	}
-
-	report_add(&plan.label, plan.commit);
-	Ok(())
-}
-
-/// The checkout the `add` will perform, decided from the DWIM rules before any state is written.
-struct Plan<H: HashAlgorithm> {
-	/// `HEAD` to write in the new worktree: a branch (symbolic) or a detached commit.
-	head: HeadState<H>,
-	/// The commit to check out (the tree source, and the recorded `ORIG_HEAD`), or `None` for an orphan
-	/// worktree — a new unborn branch in a repository with no commits yet, checked out empty.
-	commit: Option<ObjectId<H>>,
-	/// A branch ref to create/reset before the checkout, with its expected current value for the CAS.
-	/// Always `None` for an orphan (its branch is unborn, so there is no commit to point a ref at).
-	create: Option<(String, Option<ObjectId<H>>)>,
-	/// How to describe the checkout in the "Preparing worktree" line.
-	label: Label,
 }
 
 /// The kind of checkout, for the human-facing `add` message.
@@ -265,12 +212,16 @@ enum Label {
 	Detached,
 }
 
-/// Decide the checkout mode from git's DWIM rules:
+/// Decide the checkout mode from git's DWIM rules, producing the explicit [`CheckoutTarget`] the library
+/// takes plus a [`Label`] for the report:
 /// - `--detach` → detached `HEAD` at `commit_ish` (default `HEAD`);
-/// - `-b`/`-B <name>` → create (or, with `-B`, reset) branch `<name>` at `commit_ish` and check it out;
+/// - `-b`/`-B <name>` → create (or, with `-B` via `force_reset`, reset) branch `<name>` at `commit_ish` —
+///   or, in a repo with no commits, orphan it (an unborn branch, empty checkout);
 /// - a `commit_ish` that names a local branch → check that branch out; any other → detached `HEAD`;
-/// - no `commit_ish` → a new branch named after the destination's basename, or, if it already exists,
-///   that branch checked out.
+/// - no `commit_ish` → the basename branch: checked out if it exists, orphaned in an empty repo, else created.
+///
+/// The branch-exists / branch-in-use / destination checks are the library `create`'s (mapped by the caller);
+/// only the DWIM shape and the name/commit-ish resolution (`validate_branch_name`, `resolve_commit`) are here.
 async fn plan_checkout<H: HashAlgorithm>(
 	repo: &Repository<Backend, H>,
 	target: &Path,
@@ -278,65 +229,78 @@ async fn plan_checkout<H: HashAlgorithm>(
 	branch: Option<&str>,
 	force_branch: bool,
 	detach: bool,
-) -> Result<Plan<H>> {
+	kind: HashKind,
+) -> Result<(CheckoutTarget, Label)> {
 	if detach {
 		// A detached HEAD needs a concrete commit: an unborn HEAD errors here, as git does.
 		let commit = resolve_commit(repo, commit_ish.unwrap_or("HEAD")).await?;
-		return Ok(Plan {
-			head: HeadState::Detached(commit),
-			commit: Some(commit),
-			create: None,
-			label: Label::Detached,
-		});
+		return Ok((
+			CheckoutTarget::Detached {
+				start: wt_oid(kind, commit),
+			},
+			Label::Detached,
+		));
 	}
 
 	if let Some(name) = branch {
 		validate_branch_name(name)?;
-		let refname = format!("refs/heads/{name}");
-		let existing = repo.refs().resolve(&refname).await?;
-		if existing.is_some() && !force_branch {
+		// Strict `-b <name>` where the branch already **exists** refuses "already exists" *before* any
+		// use-conflict check — git reports the existence first, even if the branch is also checked out
+		// elsewhere. (Only `-B`/`force_branch` proceeds, letting the library refuse an in-use branch as a
+		// `BranchUseConflict`; `-B` on a free existing branch resets it.) The library's `decide` checks
+		// occupancy before existence, so this precedence is restored CLI-side, matching the old native path.
+		if !force_branch
+			&& repo
+				.refs()
+				.resolve(&format!("refs/heads/{name}"))
+				.await?
+				.is_some()
+		{
 			bail!("a branch named '{name}' already exists");
 		}
 		// With no explicit start point in a repository that has no commits at all, git infers an orphan:
 		// the new branch is unborn, so there is no commit to check out or point the ref at.
 		if commit_ish.is_none() && is_empty_repo(repo).await? {
-			return Ok(Plan {
-				head: HeadState::Symbolic(refname),
-				commit: None,
-				create: None,
-				label: Label::NewBranch(name.to_owned()),
-			});
+			return Ok((
+				CheckoutTarget::Orphan {
+					name: BranchName::new(name),
+				},
+				Label::NewBranch(name.to_owned()),
+			));
 		}
 		// Otherwise a start point is required: an unborn HEAD in a non-empty repo errors here, as git
-		// does (it does not silently orphan onto an existing branch).
+		// does (it does not silently orphan onto an existing branch). `-B` sets `force_reset`.
 		let commit = resolve_commit(repo, commit_ish.unwrap_or("HEAD")).await?;
-		return Ok(Plan {
-			head: HeadState::Symbolic(refname.clone()),
-			commit: Some(commit),
-			create: Some((refname, existing)),
-			label: Label::NewBranch(name.to_owned()),
-		});
+		return Ok((
+			CheckoutTarget::NewBranch {
+				name: BranchName::new(name),
+				start: wt_oid(kind, commit),
+				force_reset: force_branch,
+			},
+			Label::NewBranch(name.to_owned()),
+		));
 	}
 
 	match commit_ish {
 		// An explicit start point: check out a branch by that name, otherwise detach at the commit.
 		Some(spec) => {
 			let refname = format!("refs/heads/{spec}");
-			if let Some(commit) = repo.refs().resolve(&refname).await? {
-				Ok(Plan {
-					head: HeadState::Symbolic(refname),
-					commit: Some(commit),
-					create: None,
-					label: Label::CheckoutBranch(spec.to_owned()),
-				})
+			if repo.refs().resolve(&refname).await?.is_some() {
+				Ok((
+					CheckoutTarget::ExistingBranch {
+						name: BranchName::new(spec),
+						expected_start: None,
+					},
+					Label::CheckoutBranch(spec.to_owned()),
+				))
 			} else {
 				let commit = resolve_commit(repo, spec).await?;
-				Ok(Plan {
-					head: HeadState::Detached(commit),
-					commit: Some(commit),
-					create: None,
-					label: Label::Detached,
-				})
+				Ok((
+					CheckoutTarget::Detached {
+						start: wt_oid(kind, commit),
+					},
+					Label::Detached,
+				))
 			}
 		}
 		// No start point: DWIM a branch named after the destination's basename.
@@ -347,33 +311,42 @@ async fn plan_checkout<H: HashAlgorithm>(
 				.ok_or_else(|| anyhow!("invalid worktree path: '{}'", target.display()))?;
 			validate_branch_name(name)?;
 			let refname = format!("refs/heads/{name}");
-			match repo.refs().resolve(&refname).await? {
-				Some(commit) => Ok(Plan {
-					head: HeadState::Symbolic(refname),
-					commit: Some(commit),
-					create: None,
-					label: Label::CheckoutBranch(name.to_owned()),
-				}),
-				// The branch does not exist: create it at HEAD, or — in a repo with no commits at all —
-				// orphan it (a new unborn branch, empty checkout).
-				None if is_empty_repo(repo).await? => Ok(Plan {
-					head: HeadState::Symbolic(refname),
-					commit: None,
-					create: None,
-					label: Label::NewBranch(name.to_owned()),
-				}),
-				None => {
-					let commit = resolve_commit(repo, "HEAD").await?;
-					Ok(Plan {
-						head: HeadState::Symbolic(refname.clone()),
-						commit: Some(commit),
-						create: Some((refname, None)),
-						label: Label::NewBranch(name.to_owned()),
-					})
-				}
+			if repo.refs().resolve(&refname).await?.is_some() {
+				Ok((
+					CheckoutTarget::ExistingBranch {
+						name: BranchName::new(name),
+						expected_start: None,
+					},
+					Label::CheckoutBranch(name.to_owned()),
+				))
+			} else if is_empty_repo(repo).await? {
+				// A repo with no commits at all: orphan the new unborn branch (empty checkout).
+				Ok((
+					CheckoutTarget::Orphan {
+						name: BranchName::new(name),
+					},
+					Label::NewBranch(name.to_owned()),
+				))
+			} else {
+				let commit = resolve_commit(repo, "HEAD").await?;
+				Ok((
+					CheckoutTarget::NewBranch {
+						name: BranchName::new(name),
+						start: wt_oid(kind, commit),
+						force_reset: false,
+					},
+					Label::NewBranch(name.to_owned()),
+				))
 			}
 		}
 	}
+}
+
+/// Tag a resolved `ObjectId<H>` with its runtime hash kind for the library boundary — a resolved id is
+/// always valid hex for its own kind, so the parse cannot fail.
+fn wt_oid<H: HashAlgorithm>(kind: HashKind, id: ObjectId<H>) -> WorktreeObjectId {
+	WorktreeObjectId::parse(kind, &id.to_hex())
+		.expect("a resolved object id is valid hex for its own kind")
 }
 
 /// Resolve `spec` to a commit, peeling an (annotated) tag to the commit it names, as git accepts any
@@ -422,93 +395,79 @@ fn validate_branch_name(name: &str) -> Result<()> {
 	Ok(())
 }
 
-/// Write the admin directory (`<common>/worktrees/<name>/`) and the checkout's `.git` file, and
-/// return the canonicalised admin directory. Mirrors `git worktree add`'s on-disk layout: `HEAD`,
-/// `ORIG_HEAD`, `commondir` (→ the shared `.git`), and `gitdir` (→ the checkout's `.git` file). The
-/// `index` and `logs/HEAD` are created by the subsequent checkout.
-fn write_admin_layout<H: HashAlgorithm>(
-	admin: &Path,
-	target: &Path,
-	head: &HeadState<H>,
-	commit: Option<ObjectId<H>>,
-	committer: &str,
-	log_head: bool,
-) -> Result<PathBuf> {
-	std::fs::create_dir_all(admin)
-		.map_err(|error| anyhow!("creating {}: {error}", admin.display()))?;
-	std::fs::create_dir_all(target)
-		.map_err(|error| anyhow!("creating {}: {error}", target.display()))?;
-
-	// Absolute paths for the cross-pointers, so each side resolves regardless of the caller's cwd.
-	let admin = admin
-		.canonicalize()
-		.map_err(|error| anyhow!("resolving {}: {error}", admin.display()))?;
-	let target = target
-		.canonicalize()
-		.map_err(|error| anyhow!("resolving {}: {error}", target.display()))?;
-	let git_file = target.join(".git");
-
-	// `commondir` is relative (git writes `../..`): from `<common>/worktrees/<name>` up to `<common>`.
-	std::fs::write(admin.join("commondir"), "../..\n")?;
-	std::fs::write(admin.join("gitdir"), format!("{}\n", git_file.display()))?;
-	std::fs::write(admin.join("HEAD"), head.render())?;
-	// An orphan worktree has no start commit, so — like git — it gets no `ORIG_HEAD`.
-	if let Some(commit) = commit {
-		std::fs::write(admin.join("ORIG_HEAD"), format!("{commit}\n"))?;
-		if log_head {
-			write_worktree_head_reflog(&admin, head, commit, committer)?;
-		}
-	}
-	std::fs::write(&git_file, format!("gitdir: {}\n", admin.display()))?;
-	Ok(admin)
-}
-
-/// Write the new worktree's per-worktree `logs/HEAD`, matching git's `worktree add`: a creation line
-/// (`0…0 <commit> <committer>` with no message), then — only when `HEAD` is a branch, not a detached
-/// commit — a `<commit> <commit> <committer>\treset: moving to HEAD` line.
-fn write_worktree_head_reflog<H: HashAlgorithm>(
-	admin: &Path,
-	head: &HeadState<H>,
-	commit: ObjectId<H>,
-	committer: &str,
-) -> Result<()> {
-	let zero = "0".repeat(H::RAW_LEN * 2);
-	let oid = commit.to_hex();
-	let mut log = format!("{zero} {oid} {committer}\n");
-	if matches!(head, HeadState::Symbolic(_)) {
-		log.push_str(&format!("{oid} {oid} {committer}\treset: moving to HEAD\n"));
-	}
-	let logs = admin.join("logs");
-	std::fs::create_dir_all(&logs)
-		.map_err(|error| anyhow!("creating {}: {error}", logs.display()))?;
-	std::fs::write(logs.join("HEAD"), log)?;
-	Ok(())
-}
-
-/// The admin directory for a new worktree named after `base`, uniquified against the existing
-/// `<common>/worktrees/*` (git appends `1`, `2`, … on collision).
-fn unique_admin_dir(common: &Path, base: &str) -> PathBuf {
-	let worktrees = common.join("worktrees");
-	if !worktrees.join(base).exists() {
-		return worktrees.join(base);
-	}
-	for suffix in 1u32.. {
-		let candidate = worktrees.join(format!("{base}{suffix}"));
-		if !candidate.exists() {
-			return candidate;
-		}
-	}
-	unreachable!("a free worktree admin name always exists")
-}
-
-fn report_add<H: HashAlgorithm>(label: &Label, commit: Option<ObjectId<H>>) {
+/// Emit git's `Preparing worktree …` stderr line for a successful add, from the resolved
+/// [`CheckoutTarget`] (for the detached-HEAD short id).
+fn report_add(label: &Label, target: &CheckoutTarget) {
 	match label {
 		Label::NewBranch(name) => eprintln!("Preparing worktree (new branch '{name}')"),
 		Label::CheckoutBranch(name) => eprintln!("Preparing worktree (checking out '{name}')"),
 		Label::Detached => {
-			let commit = commit.expect("a detached HEAD has a commit");
-			eprintln!("Preparing worktree (detached HEAD {})", short(commit));
+			let hex = match target {
+				CheckoutTarget::Detached { start } => start.to_hex(),
+				_ => unreachable!("a Detached label always pairs with a Detached checkout target"),
+			};
+			eprintln!(
+				"Preparing worktree (detached HEAD {})",
+				&hex[..7.min(hex.len())]
+			);
 		}
+	}
+}
+
+/// The short branch name a checkout target carries (`None` for a detached target) — used to name the
+/// branch in a `BranchUseConflict` refusal message.
+fn target_branch_short(target: &CheckoutTarget) -> Option<&str> {
+	match target {
+		CheckoutTarget::NewBranch { name, .. }
+		| CheckoutTarget::ExistingBranch { name, .. }
+		| CheckoutTarget::Orphan { name } => Some(name.short()),
+		CheckoutTarget::Detached { .. } => None,
+	}
+}
+
+/// Map a library [`CreateError`] onto git's `worktree add` messages (the oracle pins several substrings).
+fn map_create_error(error: CreateError, path: &Path, target: &CheckoutTarget) -> Result<()> {
+	use WorktreeClassification as C;
+	match error {
+		// A non-empty/foreign destination already occupies the path (git: "already exists").
+		CreateError::Refused(C::DestinationConflict { .. })
+		| CreateError::ExistingWorktreeMismatch(_) => bail!("'{}' already exists", path.display()),
+		// The checkout is gone but the registration remains — a stale, still-registered path.
+		CreateError::Refused(C::PartialRegistered { .. }) => bail!(
+			"'{}' is a missing but already registered worktree",
+			path.display()
+		),
+		// The requested branch is checked out in another worktree — git refuses a second checkout.
+		CreateError::Refused(C::BranchUseConflict { other_checkout }) => bail!(
+			"'{}' is already checked out at '{}'",
+			target_branch_short(target).unwrap_or("HEAD"),
+			other_checkout.display()
+		),
+		// A strict `-b` (or orphan) whose branch already exists.
+		CreateError::BranchExists(name) => bail!("a branch named '{name}' already exists"),
+		// An `ExistingBranch` whose ref vanished (a race) — git says "invalid reference".
+		CreateError::BranchNotFound(name) => bail!("invalid reference: {name}"),
+		// Defensive: `plan_checkout`'s `validate_branch_name` catches this first.
+		CreateError::InvalidBranchName(name) => bail!("'{name}' is not a valid branch name"),
+		CreateError::UnsupportedSymbolicBranchReset(name) => {
+			bail!("cannot reset symbolic-ref branch '{name}'; reset its terminal branch directly")
+		}
+		// A checkout present but unregistered / cross-pointer-inconsistent occupies the destination.
+		CreateError::Refused(C::PartialConflicting { .. } | C::IdentityConflict { .. }) => {
+			bail!(
+				"'{}' contains a conflicting worktree checkout",
+				path.display()
+			)
+		}
+		CreateError::Refused(C::ProtectedWithReason {
+			reason: ProtectionReason::Locked { .. },
+		}) => bail!("destination worktree is locked"),
+		CreateError::NotEstablished(_) => {
+			bail!("worktree add did not complete; re-inspect and re-run")
+		}
+		CreateError::Failed(error) => Err(error.into()),
+		// Any other refusal classification (not expected from a create) — a clear catch-all.
+		CreateError::Refused(_) => bail!("cannot add a worktree at '{}'", path.display()),
 	}
 }
 
@@ -1581,9 +1540,4 @@ fn canonical(path: &Path) -> PathBuf {
 /// Compare two paths by their canonical form.
 fn canonical_eq(a: &Path, b: &Path) -> bool {
 	canonical(a) == canonical(b)
-}
-
-fn short<H: HashAlgorithm>(id: ObjectId<H>) -> String {
-	let hex = id.to_hex();
-	hex[..7.min(hex.len())].to_owned()
 }

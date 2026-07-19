@@ -120,7 +120,7 @@ mod native {
 				DestinationKind::Absent | DestinationKind::EmptyDir
 			) && let Registration::PresentCheckoutMissing { admin_dir } = &inspection.registration
 		{
-			if let Some(other) = requested_checked_out_elsewhere(&inspection.requested_branch) {
+			if let Some(other) = use_conflict_checkout(inspection, target) {
 				return Err(CreateError::Refused(C::BranchUseConflict {
 					other_checkout: other.to_path_buf(),
 				}));
@@ -145,8 +145,9 @@ mod native {
 
 		// The branch the target names is checked out in *another* worktree — git refuses a second checkout.
 		// Checked before the idempotent return, so a branch force-duplicated across worktrees is surfaced
-		// rather than silently reported as already-present.
-		if let Some(other) = requested_checked_out_elsewhere(&inspection.requested_branch) {
+		// rather than silently reported as already-present. An `Orphan` target is exempt (git allows orphan
+		// coexistence on an unborn name); an existing born branch is instead refused below as `BranchExists`.
+		if let Some(other) = use_conflict_checkout(inspection, target) {
 			return Err(CreateError::Refused(C::BranchUseConflict {
 				other_checkout: other.to_path_buf(),
 			}));
@@ -273,7 +274,11 @@ mod native {
 		}
 	}
 
-	/// The other-worktree checkout of the requested branch, if any (a branch-use conflict).
+	/// The other-worktree checkout of the requested branch, if any — whether the branch is born or an unborn
+	/// orphan checked out elsewhere. git refuses a second worktree on a name another worktree already checks
+	/// out; that applies to a born ref **and** to an unborn `HEAD` naming the same ref. The one case git allows
+	/// — a second **orphan** on the same unborn name — is handled by [`use_conflict_checkout`], which exempts an
+	/// `Orphan` target rather than weakening this axis (so a born-branch create still conflicts, as git does).
 	fn requested_checked_out_elsewhere(requested: &RequestedBranch) -> Option<&Path> {
 		match requested {
 			RequestedBranch::Exists {
@@ -285,6 +290,23 @@ mod native {
 			} => checked_out_elsewhere.as_deref(),
 			RequestedBranch::NotRequested => None,
 		}
+	}
+
+	/// The other-worktree checkout that blocks *this create* as a branch-use conflict, honouring git's one
+	/// exception. A branch checked out elsewhere is normally a conflict (see [`requested_checked_out_elsewhere`]),
+	/// but an **`Orphan` target never conflicts on this axis**: git allows two orphan worktrees to share an
+	/// unborn branch name (probed 2.50.1 — `--orphan -b <name>` succeeds even when `<name>` is unborn-checked-out
+	/// in another worktree, while a born `-b <name>` in the same state is refused "already used by worktree"). An
+	/// existing *born* branch is still refused for an orphan, but as [`CreateError::BranchExists`] in the target
+	/// match below — not here.
+	fn use_conflict_checkout<'a>(
+		inspection: &'a WorktreeInspection,
+		target: &CheckoutTarget,
+	) -> Option<&'a Path> {
+		if matches!(target, CheckoutTarget::Orphan { .. }) {
+			return None;
+		}
+		requested_checked_out_elsewhere(&inspection.requested_branch)
 	}
 
 	/// Validate a branch/orphan target's name with git's `check-ref-format --branch` rules: a valid
@@ -326,7 +348,13 @@ mod native {
 			.effective_config()
 			.await
 			.map_err(LinkedWorktreeError::Repository)?;
-		let committer = committer_line(&config);
+		// The committer recorded on every reflog line this create writes (the branch-creation reflog and the
+		// worktree `logs/HEAD` seed). A caller may supply a preformatted line (git identity environment); the
+		// Code-Henge default resolves it from the effective config + the current time.
+		let committer = request
+			.committer
+			.clone()
+			.unwrap_or_else(|| committer_line(&config));
 
 		// The `HEAD` to write, the start commit (the checkout source + `ORIG_HEAD`, `None` for an orphan),
 		// and the branch ref name when this is a branch worktree.
@@ -446,10 +474,19 @@ mod native {
 			} else {
 				None
 			};
-			let message = match expected {
-				Some(_) => format!("branch: Reset to {}", start.to_hex()),
-				None => format!("branch: Created from {}", start.to_hex()),
+			// git records the start point as the user *named* it (`branch: Created from HEAD`, `Reset to main`),
+			// not the resolved hash — a caller supplies that token via `reflog_start`; the Code-Henge default
+			// records the start commit's hex. The verb still reflects whether the branch already existed.
+			let verb = if expected.is_some() {
+				"Reset to"
+			} else {
+				"Created from"
 			};
+			let start_token = request
+				.reflog_start
+				.clone()
+				.unwrap_or_else(|| start.to_hex());
+			let message = format!("branch: {verb} {start_token}");
 			repo
 				.refs()
 				.transact(&[RefOp {

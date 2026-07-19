@@ -67,4 +67,15 @@ pub struct CreateRequest {
 	pub destination: PathBuf,
 	/// What the new worktree checks out.
 	pub target: CheckoutTarget,
+	/// A preformatted git committer line (`Name <email> <unix-seconds> ±hhmm`) recorded on **every** reflog
+	/// line the create writes — the branch-creation reflog (for a [`NewBranch`](CheckoutTarget::NewBranch))
+	/// and the new worktree's `logs/HEAD` seed. `None` (the Code-Henge default) resolves the committer from the
+	/// effective config + the current time, unchanged. A CLI front end passes `Some` to honour the process
+	/// identity environment (`GIT_COMMITTER_NAME`/`EMAIL`/`DATE`).
+	pub committer: Option<String>,
+	/// The user's start-point spelling for a [`NewBranch`](CheckoutTarget::NewBranch)'s branch-creation reflog
+	/// message — git records the token as named (`branch: Created from HEAD`, `Reset to main`), not the
+	/// resolved hash. `None` (the Code-Henge default) records the start commit's hex, unchanged. Ignored for
+	/// non-`NewBranch` targets (they write no branch-creation reflog).
+	pub reflog_start: Option<String>,
 }

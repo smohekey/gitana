@@ -17,6 +17,8 @@ fn req(work: &std::path::Path, dest: &std::path::Path, target: CheckoutTarget) -
 		repo: rid_at(work),
 		destination: dest.to_path_buf(),
 		target,
+		committer: None,
+		reflog_start: None,
 	}
 }
 
@@ -29,6 +31,8 @@ fn req_bare(
 		repo: rid_bare(bare),
 		destination: dest.to_path_buf(),
 		target,
+		committer: None,
+		reflog_start: None,
 	}
 }
 
@@ -82,6 +86,56 @@ async fn creates_a_new_branch_worktree_that_git_accepts() {
 		assert!(
 			git(&["-C", w, "worktree", "list", "--porcelain"]).contains("branch refs/heads/feature")
 		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn records_the_supplied_committer_and_start_token_in_reflogs() {
+	// The caller-supplied `committer` is recorded on BOTH the branch-creation reflog and the new worktree's
+	// `logs/HEAD` seed; the caller-supplied `reflog_start` token is used verbatim in the branch reflog message
+	// (`branch: Created from HEAD`), never the resolved hash. (The `None` defaults — config/now committer and
+	// the hash token — are covered by the other create tests.)
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-committer-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+
+		let committer = "Tester <t@e> 1700000000 +0000";
+		let request = CreateRequest {
+			repo: rid_at(&work),
+			destination: wt.clone(),
+			target: new_branch("feature", start),
+			committer: Some(committer.to_owned()),
+			reflog_start: Some("HEAD".to_owned()),
+		};
+		create(&request, None).await.unwrap();
+
+		// The branch-creation reflog records the supplied committer and the start TOKEN (`HEAD`), not the hash.
+		let branch_reflog = std::fs::read_to_string(work.join(".git/logs/refs/heads/feature")).unwrap();
+		assert!(
+			branch_reflog.contains(committer),
+			"{fmt}: branch reflog must record the supplied committer, got: {branch_reflog}"
+		);
+		assert!(
+			branch_reflog.contains("branch: Created from HEAD"),
+			"{fmt}: branch reflog message must use the start token, got: {branch_reflog}"
+		);
+		assert!(
+			!branch_reflog.contains(&format!("Created from {head}")),
+			"{fmt}: branch reflog message must not embed the resolved hash, got: {branch_reflog}"
+		);
+
+		// The new worktree's per-worktree `logs/HEAD` seed records the same supplied committer.
+		let head_reflog = std::fs::read_to_string(work.join(".git/worktrees/wt/logs/HEAD")).unwrap();
+		assert!(
+			head_reflog.contains(committer),
+			"{fmt}: worktree logs/HEAD must record the supplied committer, got: {head_reflog}"
+		);
+
 		let _ = std::fs::remove_dir_all(&base);
 	}
 }
@@ -528,6 +582,73 @@ async fn refuses_a_branch_checked_out_elsewhere() {
 	}
 }
 
+/// An **unborn** branch checked out in another worktree conflicts for a *born-branch* create but not for an
+/// *orphan* create — git's exact rule (probed 2.50.1): a born `-b <name>` reusing an unborn-elsewhere name is
+/// refused "already used by worktree", while a second `--orphan -b <name>` on that name coexists. Guards
+/// against over-broadening the use-conflict axis to blanket-allow every unborn-elsewhere create.
+#[tokio::test]
+async fn an_unborn_branch_elsewhere_blocks_a_born_create_but_not_an_orphan() {
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-unborn-elsewhere-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		// An orphan worktree holds `orph` as an unborn branch (HEAD names `refs/heads/orph`, no ref yet).
+		// `--orphan` needs a reasonably modern git; skip rather than fail if unavailable.
+		let orph_wt = base.join("orph");
+		if !git_ok(&[
+			"-C",
+			w,
+			"worktree",
+			"add",
+			"--orphan",
+			"-b",
+			"orph",
+			orph_wt.to_str().unwrap(),
+		]) {
+			let _ = std::fs::remove_dir_all(&base);
+			continue;
+		}
+		assert!(
+			!git_ok(&["-C", w, "rev-parse", "--verify", "refs/heads/orph"]),
+			"{fmt}: `orph` must be unborn"
+		);
+
+		// A born create (`-b orph`) reusing that unborn name is a use-conflict — the born branch would
+		// collide with the orphan worktree's unborn HEAD.
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+		let born_err = create(
+			&req(&work, &base.join("born"), new_branch("orph", start)),
+			None,
+		)
+		.await
+		.unwrap_err();
+		assert!(
+			matches!(
+				born_err,
+				CreateError::Refused(WorktreeClassification::BranchUseConflict { .. })
+			),
+			"{fmt}: a born create reusing an unborn-elsewhere name must conflict, got {born_err:?}"
+		);
+
+		// A second orphan on the same unborn name is allowed — two orphans coexist.
+		create(
+			&req(
+				&work,
+				&base.join("orph2"),
+				CheckoutTarget::Orphan {
+					name: BranchName::new("orph"),
+				},
+			),
+			None,
+		)
+		.await
+		.unwrap();
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
 #[tokio::test]
 async fn refuses_an_occupied_destination() {
 	for (fmt, kind) in formats() {
@@ -662,6 +783,8 @@ async fn refuses_a_relative_destination() {
 		repo: rid_at(&work),
 		destination: std::path::PathBuf::from("relative/wt"),
 		target: new_branch("feature", start),
+		committer: None,
+		reflog_start: None,
 	};
 	assert!(create(&request, None).await.is_err());
 	let _ = std::fs::remove_dir_all(&base);

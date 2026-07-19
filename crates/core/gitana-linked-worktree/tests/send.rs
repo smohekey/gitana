@@ -29,6 +29,8 @@ fn public_op_futures_are_send() {
 		target: CheckoutTarget::Orphan {
 			name: BranchName::new("wt"),
 		},
+		committer: None,
+		reflog_start: None,
 	};
 	let remove_request = RemoveRequest {
 		repo: repo.clone(),

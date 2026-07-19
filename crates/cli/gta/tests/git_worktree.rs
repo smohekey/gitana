@@ -2256,6 +2256,147 @@ fn remove_force0_deletes_ignored_only_but_keeps_real_untracked() {
 	std::fs::remove_dir_all(&base).ok();
 }
 
+/// Hardened write (slice 3): `gta worktree add` **fails closed** on a symlinked `<common>/worktrees/`
+/// container rather than registering a worktree behind the redirect. The library never reads or writes
+/// through that link, where stock git (and the old native writer) would follow it. A deliberate no-follow
+/// divergence mirroring the slice-9 list hardening — **do NOT "fix" it back into parity with git.**
+#[cfg(unix)]
+#[test]
+fn add_fails_closed_on_a_symlinked_worktrees_container() {
+	let base = unique_tmp("gta-wt-add-symlink-container");
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(base_s, &["init", "--object-format=sha1", repo_s], b"");
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+	// A first worktree so `worktrees/` exists, then redirect the whole container through a symlink.
+	gta(
+		repo_s,
+		&["worktree", "add", base.join("wt").to_str().unwrap()],
+		b"",
+	);
+	let worktrees = repo.join(".git/worktrees");
+	std::fs::rename(&worktrees, repo.join(".git/worktrees.real")).unwrap();
+	std::os::unix::fs::symlink("worktrees.real", &worktrees).unwrap();
+
+	// Probe: stock git follows the redirect and registers a new worktree behind it.
+	git(
+		repo_s,
+		&["worktree", "add", base.join("probe").to_str().unwrap()],
+	);
+	assert!(
+		repo.join(".git/worktrees.real/probe").exists(),
+		"probe: git follows a symlinked worktrees/ and registers behind it"
+	);
+
+	// gta refuses: the library fails closed on the symlinked container, writing nothing behind the link.
+	let wt2 = base.join("wt2");
+	let _ = gta_fail(repo_s, &["worktree", "add", wt2.to_str().unwrap()]);
+	assert!(
+		!repo.join(".git/worktrees.real/wt2").exists(),
+		"gta must not register a worktree behind a symlinked worktrees/ container"
+	);
+	assert!(!wt2.exists(), "gta wrote no checkout for the refused add");
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// Reflog fidelity + strict `-b` precedence (git 2.50.1): (a) `add -b <name> <p> <start>` records
+/// `branch: Created from <start-token>` (the user's spelling, not the resolved hash); (b) `GIT_COMMITTER_*`
+/// identity is recorded in the new branch's reflog; (c) `-b <existing>` errors "already exists" *before* any
+/// use-conflict, while `-B <existing>` on an in-use branch is a use-conflict.
+#[test]
+fn add_reflog_fidelity_and_strict_b_precedence() {
+	let base = unique_tmp("gta-wt-reflog");
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(base_s, &["init", "--object-format=sha1", repo_s], b"");
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+	let main_branch = git(repo_s, &["symbolic-ref", "--short", "HEAD"])
+		.trim()
+		.to_owned();
+	let head_hash = git(repo_s, &["rev-parse", "HEAD"]).trim().to_owned();
+
+	// (a) `-b feat <p> <start>`: the branch reflog message records the start TOKEN, not the resolved hash.
+	let p1 = base.join("wt1");
+	gta(
+		repo_s,
+		&[
+			"worktree",
+			"add",
+			"-b",
+			"feat",
+			p1.to_str().unwrap(),
+			&main_branch,
+		],
+		b"",
+	);
+	let feat_reflog = std::fs::read_to_string(repo.join(".git/logs/refs/heads/feat")).unwrap();
+	assert!(
+		feat_reflog.contains(&format!("branch: Created from {main_branch}")),
+		"branch reflog must record the start token, got: {feat_reflog}"
+	);
+	assert!(
+		!feat_reflog.contains(&format!("Created from {head_hash}")),
+		"branch reflog message must not embed the resolved hash, got: {feat_reflog}"
+	);
+
+	// (b) With `GIT_COMMITTER_NAME`/`EMAIL` set, the new branch's reflog records that identity.
+	let p2 = base.join("wt2");
+	let out = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", repo_s, "worktree", "add", "-b", "feat2"])
+		.arg(p2.to_str().unwrap())
+		.env("GIT_COMMITTER_NAME", "Zaphod")
+		.env("GIT_COMMITTER_EMAIL", "z@beeblebrox")
+		.output()
+		.expect("run gta");
+	assert!(
+		out.status.success(),
+		"gta add failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	let feat2_reflog = std::fs::read_to_string(repo.join(".git/logs/refs/heads/feat2")).unwrap();
+	assert!(
+		feat2_reflog.contains("Zaphod <z@beeblebrox>"),
+		"branch reflog must record the GIT_COMMITTER_* identity, got: {feat2_reflog}"
+	);
+
+	// (c) Strict `-b <existing>` errors "already exists" before any use-conflict (the main branch is checked
+	//     out in the main worktree, yet existence wins); `-B <existing>` on an in-use branch is a use-conflict.
+	let p3 = base.join("wt3");
+	assert!(
+		gta_fail(
+			repo_s,
+			&["worktree", "add", "-b", &main_branch, p3.to_str().unwrap()]
+		)
+		.contains(&format!("a branch named '{main_branch}' already exists")),
+		"strict -b on an existing branch must report existence first"
+	);
+	let p4 = base.join("wt4");
+	assert!(
+		gta_fail(
+			repo_s,
+			&["worktree", "add", "-B", &main_branch, p4.to_str().unwrap()]
+		)
+		.contains("already checked out"),
+		"-B on an in-use branch must be a use-conflict"
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
 /// The leading path column of each `worktree list` line.
 fn worktree_paths(listing: &str) -> Vec<String> {
 	listing

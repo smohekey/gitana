@@ -20,6 +20,8 @@ fn create_req(repo: RepositoryId, dest: &std::path::Path, target: CheckoutTarget
 		repo,
 		destination: dest.to_path_buf(),
 		target,
+		committer: None,
+		reflog_start: None,
 	}
 }
 
