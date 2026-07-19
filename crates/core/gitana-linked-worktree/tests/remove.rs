@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use gitana_linked_worktree::{
 	BranchName, DestinationKind, IdentityConflict, ProtectionReason, RemoveError, RemoveOutcome,
-	RemoveRequest, WorktreeClassification, WorktreeQuery, classify, inspect, remove,
+	RemovePolicy, RemoveRequest, WorktreeClassification, WorktreeQuery, classify, inspect, remove,
 };
 
 fn rreq(work: &std::path::Path, dest: &std::path::Path, branch: Option<&str>) -> RemoveRequest {
@@ -15,6 +15,7 @@ fn rreq(work: &std::path::Path, dest: &std::path::Path, branch: Option<&str>) ->
 		repo: rid_at(work),
 		destination: dest.to_path_buf(),
 		expected_branch: branch.map(BranchName::new),
+		policy: RemovePolicy::Conservative,
 	}
 }
 
@@ -1246,6 +1247,7 @@ async fn removing_from_a_bare_repository() {
 			repo: rid_bare(&bare),
 			destination: wt.clone(),
 			expected_branch: Some(BranchName::new("topic")),
+			policy: RemovePolicy::Conservative,
 		})
 		.await
 		.unwrap();
@@ -1994,6 +1996,7 @@ async fn a_worktree_enclosing_the_common_dir_is_never_recursively_deleted() {
 			repo: rid_bare(&common),
 			destination: dest.clone(),
 			expected_branch: Some(BranchName::new("feature")),
+			policy: RemovePolicy::Conservative,
 		};
 		let err = remove(&req).await.unwrap_err();
 		assert!(
@@ -2010,6 +2013,819 @@ async fn a_worktree_enclosing_the_common_dir_is_never_recursively_deleted() {
 			git(&["-C", c, "rev-parse", "feature"]).trim().len(),
 			if fmt == "sha1" { 40 } else { 64 }
 		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GitCompat force policy — git's `worktree remove -f` / `-f -f`
+// ---------------------------------------------------------------------------
+
+fn force_req(
+	work: &std::path::Path,
+	dest: &std::path::Path,
+	branch: Option<&str>,
+	force: u8,
+) -> RemoveRequest {
+	RemoveRequest {
+		repo: rid_at(work),
+		destination: dest.to_path_buf(),
+		expected_branch: branch.map(BranchName::new),
+		policy: RemovePolicy::GitCompat { force },
+	}
+}
+
+#[tokio::test]
+async fn force_removes_a_dirty_worktree() {
+	// `git worktree remove -f` deletes a worktree with modified tracked files, which Conservative refuses.
+	// GitCompat{force:1} overrides the Dirty gate; the branch is still retained (removal never deletes a ref).
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-dirty-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		std::fs::write(wt.join("a.txt"), "changed\n").unwrap();
+
+		// Conservative refuses (as git does without --force).
+		assert!(remove(&rreq(&work, &wt, Some("feature"))).await.is_err());
+		// GitCompat force 1 removes it, like `git worktree remove -f`.
+		let out = remove(&force_req(&work, &wt, Some("feature"), 1))
+			.await
+			.unwrap();
+		assert!(matches!(out, RemoveOutcome::Removed { .. }));
+		assert!(!wt.exists(), "{fmt}: the dirty worktree was removed");
+		assert!(git_ok(&[
+			"-C",
+			w,
+			"rev-parse",
+			"--verify",
+			"refs/heads/feature"
+		]));
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_removes_an_untracked_worktree() {
+	// A worktree with genuinely untracked (non-ignored) files: Conservative refuses (ResidualContent), a
+	// single `-f` removes it (deleting the untracked file with the checkout).
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-untracked-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		std::fs::write(wt.join("untracked.txt"), "x\n").unwrap();
+
+		assert!(remove(&rreq(&work, &wt, None)).await.is_err());
+		let out = remove(&force_req(&work, &wt, None, 1)).await.unwrap();
+		assert!(matches!(out, RemoveOutcome::Removed { .. }));
+		assert!(!wt.exists(), "{fmt}: worktree + untracked file removed");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn a_locked_worktree_needs_double_force() {
+	// git: a single `-f` does NOT remove a locked worktree; `-f -f` does. GitCompat{force:1} still refuses
+	// Locked, force 2 removes it.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-locked-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		git(&[
+			"-C",
+			w,
+			"worktree",
+			"lock",
+			"--reason",
+			"busy",
+			wt.to_str().unwrap(),
+		]);
+
+		// One `-f` still refuses the lock.
+		let err = remove(&force_req(&work, &wt, Some("feature"), 1))
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(
+				err,
+				RemoveError::Refused(WorktreeClassification::ProtectedWithReason {
+					reason: ProtectionReason::Locked { .. }
+				})
+			),
+			"{fmt}: one -f must still refuse a lock, got {err:?}"
+		);
+		assert!(wt.exists());
+		// `-f -f` removes it.
+		let out = remove(&force_req(&work, &wt, Some("feature"), 2))
+			.await
+			.unwrap();
+		assert!(matches!(out, RemoveOutcome::Removed { .. }));
+		assert!(!wt.exists(), "{fmt}: -f -f removes a locked worktree");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn git_compat_force_zero_refuses_residual_but_one_force_removes() {
+	// The force-0 **safety divergence**: git's plain `worktree remove` deletes a worktree whose only residue
+	// is git-*ignored* content (build artifacts), but authorising that would need a git-faithful ignore
+	// matcher the crate deliberately lacks — its residual scan is matcher-independent, so it never deletes a
+	// non-tracked file on a possibly-wrong match. So `GitCompat { force: 0 }` still refuses residual
+	// (ignored *or* untracked) content (diverging from git on the safe side); a single `-f` removes it.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force0-ignored-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		std::fs::write(work.join(".gitignore"), "*.log\nbuild/\n").unwrap();
+		let w = work.to_str().unwrap();
+		git(&["-C", w, "add", ".gitignore"]);
+		git(&["-C", w, "commit", "-q", "-m", "init"]);
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		std::fs::write(wt.join("run.log"), "noise\n").unwrap();
+		std::fs::create_dir(wt.join("build")).unwrap();
+		std::fs::write(wt.join("build/out.o"), "obj\n").unwrap();
+		// git considers it clean (ignored files omitted) — plain `git worktree remove` would delete it.
+		assert!(git(&["-C", wt.to_str().unwrap(), "status", "--porcelain"]).is_empty());
+
+		// GitCompat force 0 refuses it (the safe divergence), naming the residual paths — it does not trust
+		// the ignore matcher to authorise a delete.
+		let err = remove(&force_req(&work, &wt, Some("feature"), 0))
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(
+				err,
+				RemoveError::Refused(WorktreeClassification::ProtectedWithReason {
+					reason: ProtectionReason::ResidualContent { .. }
+				})
+			),
+			"{fmt}: force 0 refuses residual content, got {err:?}"
+		);
+		assert!(wt.exists());
+
+		// A single `-f` removes it, deleting the ignored residue with the checkout.
+		let out = remove(&force_req(&work, &wt, Some("feature"), 1))
+			.await
+			.unwrap();
+		assert!(matches!(out, RemoveOutcome::Removed { .. }));
+		assert!(!wt.exists(), "{fmt}: `-f` removes an ignored-only worktree");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn double_force_still_refuses_a_branch_identity_mismatch() {
+	// Force never overrides **identity**: `-f -f` on a locked worktree pinned to the WRONG `expected_branch`
+	// is an IdentityConflict, not a delete. (`decide_remove` checks the lock before the identity conflict, so
+	// the forced override must re-assert identity — else a mis-pinned `-f -f` would delete the wrong worktree.)
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-identity-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		git(&[
+			"-C",
+			w,
+			"worktree",
+			"lock",
+			"--reason",
+			"busy",
+			wt.to_str().unwrap(),
+		]);
+
+		// The worktree is on `feature`, but the request pins `wrong`. Even `-f -f` must refuse and not delete.
+		let err = remove(&force_req(&work, &wt, Some("wrong"), 2))
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(
+				err,
+				RemoveError::Refused(WorktreeClassification::IdentityConflict { .. })
+			),
+			"{fmt}: a mis-pinned -f -f must be an identity conflict, got {err:?}"
+		);
+		assert!(wt.exists(), "{fmt}: the mis-pinned worktree must survive");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn double_force_refuses_a_nonempty_reused_partial_destination() {
+	// A locked checkout-missing partial whose path was reused for unrelated content: even `-f -f` (overriding
+	// the lock) must not delete it. The forced path validates `.git` structure — a *present* directory whose
+	// checkout `.git` is gone fails that validation, so the removal refuses (a `DestinationConflict`) rather
+	// than deleting the reused content.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-partial-reused-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		git(&[
+			"-C",
+			w,
+			"worktree",
+			"lock",
+			"--reason",
+			"busy",
+			wt.to_str().unwrap(),
+		]);
+		// Make it a checkout-missing partial (drop the checkout's `.git` + files), then reuse the path for
+		// unrelated non-empty content.
+		std::fs::remove_file(wt.join(".git")).unwrap();
+		std::fs::remove_file(wt.join("a.txt")).unwrap();
+		std::fs::write(wt.join("unrelated.txt"), "keep me\n").unwrap();
+
+		let err = remove(&force_req(&work, &wt, Some("feature"), 2))
+			.await
+			.unwrap_err();
+		// The overridden lock does not mask the real refusal: the reused non-empty destination surfaces as a
+		// DestinationConflict, not the already-overridden lock.
+		assert!(
+			matches!(
+				err,
+				RemoveError::Refused(WorktreeClassification::DestinationConflict { .. })
+			),
+			"{fmt}: -f -f on a non-empty reused partial must surface DestinationConflict, got {err:?}"
+		);
+		assert!(
+			wt.join("unrelated.txt").exists(),
+			"{fmt}: reused non-empty content must not be deleted"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_cleans_an_absent_partial_with_an_unreadable_index() {
+	// A git-faithful forced removal never reads a checkout-missing partial's retained index (git orphans any
+	// staged work at every force level), so a malformed index does not fail it: with the checkout directory
+	// **absent**, a single `-f` drops the stale admin (`CleanPartial`) where a `Conservative` remove would
+	// `Failed` reading that unreadable index for its staged-work check.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-partial-badindex-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		// The admin dir `<common>/worktrees/<name>`; corrupt its retained index.
+		let admin = std::fs::read_dir(work.join(".git/worktrees"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.path();
+		std::fs::write(admin.join("index"), b"not a valid git index").unwrap();
+		// Make it a checkout-missing partial with a genuinely **absent** destination (the whole checkout dir is
+		// gone, not merely emptied) — the forced path cleans the stale admin; a *present* empty-dir partial would
+		// instead refuse (see `force_refuses_a_present_empty_dir_partial`).
+		std::fs::remove_dir_all(&wt).unwrap();
+		assert!(!wt.exists());
+
+		// Conservative reads the index for its staged-work check and fails on the corruption.
+		assert!(
+			remove(&rreq(&work, &wt, Some("feature"))).await.is_err(),
+			"{fmt}: Conservative fails on the unreadable index"
+		);
+		// GitCompat force 1 does not read it — it cleans the stale admin, as `git worktree remove` would.
+		let out = remove(&force_req(&work, &wt, Some("feature"), 1))
+			.await
+			.unwrap();
+		assert!(
+			matches!(out, RemoveOutcome::Removed { .. }),
+			"{fmt}: {out:?}"
+		);
+		assert!(
+			!admin.exists(),
+			"{fmt}: the stale admin registration is cleaned"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_refuses_a_present_empty_dir_partial() {
+	// git's forced validation is structural: a *present* directory (even an empty one) that no longer carries a
+	// valid `.git` gitfile is a validation refusal, not a forced delete — "present ⇒ must contain a valid
+	// `.git`". A checkout-missing partial whose directory still exists (emptied, not removed) must therefore
+	// refuse under `-f`, preserving whatever now sits at the path, unlike an ABSENT partial which is cleaned.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-partial-emptydir-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		// Emptied but still present: drop the checkout's `.git` and its files, leaving an empty directory.
+		std::fs::remove_file(wt.join(".git")).unwrap();
+		std::fs::remove_file(wt.join("a.txt")).unwrap();
+		assert!(wt.is_dir() && std::fs::read_dir(&wt).unwrap().next().is_none());
+
+		// Even a second force refuses — the present (empty) directory has no valid `.git` to validate.
+		let err = remove(&force_req(&work, &wt, Some("feature"), 2))
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(
+				err,
+				RemoveError::Refused(WorktreeClassification::DestinationConflict { .. })
+			),
+			"{fmt}: a present empty-dir partial must refuse under force, got {err:?}"
+		);
+		assert!(wt.exists(), "{fmt}: the present directory is preserved");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_refuses_a_worktree_with_a_missing_admin_head() {
+	// git's forced-remove HEAD gate (probed, git 2.50.1) requires HEAD to EXIST as a file: a linked worktree
+	// whose `<admin>/HEAD` was deleted is rejected even under `-f -f`, not force-removed. The lean forced path
+	// must refuse it too (its `admin_head_valid` gate is false when HEAD is absent).
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-nohead-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		let admin = std::fs::read_dir(work.join(".git/worktrees"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.path();
+		std::fs::remove_file(admin.join("HEAD")).unwrap();
+
+		// Oracle: stock git refuses even with two forces.
+		assert!(
+			!git_ok(&[
+				"-C",
+				w,
+				"worktree",
+				"remove",
+				"--force",
+				"--force",
+				wt.to_str().unwrap(),
+			]),
+			"{fmt}: probe — git refuses a missing-admin-HEAD worktree even with --force --force"
+		);
+		// `None` expected-branch so the refusal is the HEAD-existence gate, not an identity mismatch.
+		let out = remove(&force_req(&work, &wt, None, 2)).await;
+		assert!(
+			out.is_err(),
+			"{fmt}: a missing admin HEAD must not be force-deleted, got {out:?}"
+		);
+		assert!(wt.exists(), "{fmt}: the broken checkout must survive");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_removes_a_live_worktree_with_a_corrupt_index() {
+	// `git worktree remove -f` skips the cleanliness scan, so a *live* checkout with a corrupt per-worktree
+	// index is removed (git does the same). GitCompat force 1 does too — its status-free inspection never
+	// reads the index — where a Conservative remove reads it and fails. Integrity (a readable HEAD) is still
+	// validated; this checkout has one.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-badindex-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		// Corrupt the live checkout's per-worktree index (in the admin dir), leaving the checkout otherwise
+		// valid (its `.git` gitfile and admin `HEAD` intact).
+		let admin = std::fs::read_dir(work.join(".git/worktrees"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.path();
+		std::fs::write(admin.join("index"), b"not a valid git index").unwrap();
+
+		// Conservative reads the index for its status scan and fails.
+		assert!(
+			remove(&rreq(&work, &wt, Some("feature"))).await.is_err(),
+			"{fmt}: Conservative fails on the corrupt index"
+		);
+		// GitCompat force 1 removes it (status-free — never reads the index), as `git worktree remove -f` does.
+		let out = remove(&force_req(&work, &wt, Some("feature"), 1))
+			.await
+			.unwrap();
+		assert!(
+			matches!(out, RemoveOutcome::Removed { .. }),
+			"{fmt}: {out:?}"
+		);
+		assert!(
+			!wt.exists(),
+			"{fmt}: the corrupt-index worktree was force-removed"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_removes_a_worktree_with_a_legacy_symlink_head() {
+	// A legacy symbolic-ref HEAD — a filesystem symlink `<admin>/HEAD -> <a ref file>` — resolves to a file, so
+	// git's forced-remove HEAD gate (HEAD exists && is a file; `std::fs::metadata` follows the symlink) accepts
+	// it and the worktree is force-removed.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-symlinkhead-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		let admin = std::fs::read_dir(work.join(".git/worktrees"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.path();
+		// Replace the content HEAD with a legacy symlink to a real ref file (the shared branch ref lives in the
+		// common dir, so the link is absolute — `metadata` follows it to that file and sees a valid file HEAD).
+		std::fs::remove_file(admin.join("HEAD")).unwrap();
+		std::os::unix::fs::symlink(work.join(".git/refs/heads/feature"), admin.join("HEAD")).unwrap();
+
+		let out = remove(&force_req(&work, &wt, None, 1)).await.unwrap();
+		assert!(
+			matches!(out, RemoveOutcome::Removed { .. }),
+			"{fmt}: {out:?}"
+		);
+		assert!(
+			!wt.exists(),
+			"{fmt}: a worktree with a legacy symlink HEAD is force-removed"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_refuses_a_worktree_with_a_directory_admin_head() {
+	// git's forced-remove HEAD gate (probed, git 2.50.1) is "HEAD exists && is a file". A `<admin>/HEAD` that is
+	// a *directory* is not a file, so git refuses even under `-f -f`; the lean forced path refuses too.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-dirhead-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		let admin = std::fs::read_dir(work.join(".git/worktrees"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.path();
+		// Replace the HEAD file with a directory.
+		std::fs::remove_file(admin.join("HEAD")).unwrap();
+		std::fs::create_dir(admin.join("HEAD")).unwrap();
+
+		// `None` expected-branch so the refusal is the HEAD-existence gate, not identity.
+		let out = remove(&force_req(&work, &wt, None, 2)).await;
+		assert!(
+			out.is_err(),
+			"{fmt}: a directory admin HEAD must not be force-deleted, got {out:?}"
+		);
+		assert!(wt.exists(), "{fmt}: the checkout is preserved");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_removes_a_worktree_with_a_garbage_admin_head() {
+	// Probe (git 2.50.1): git's forced-remove HEAD gate validates HEAD *existence*, NOT content — a present but
+	// garbage `<admin>/HEAD` (neither a `ref:`, a symref, nor an object id) is still removed by
+	// `git worktree remove -f -f`. The lean forced path matches: HEAD is a present file → valid-for-removal,
+	// with no branch to retain (the garbage names none).
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-garbagehead-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		let admin = std::fs::read_dir(work.join(".git/worktrees"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.path();
+		// A garbage HEAD: not `ref:`, not a hex object id — but a present file. git removes it under -f -f.
+		std::fs::write(admin.join("HEAD"), b"not a valid head\n").unwrap();
+
+		let out = remove(&force_req(&work, &wt, None, 1)).await.unwrap();
+		assert!(
+			matches!(
+				out,
+				RemoveOutcome::Removed {
+					retained_branch: None,
+					..
+				}
+			),
+			"{fmt}: a present garbage HEAD is removed with no branch retained, got {out:?}"
+		);
+		assert!(!wt.exists(), "{fmt}: the worktree was force-removed");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_cleans_an_absent_partial_with_a_missing_head() {
+	// Bug-3 regression: when the destination is genuinely **absent** there is no checkout to validate, so git
+	// drops the stale registration regardless of whether `<admin>/HEAD` still exists. The forced path must clean
+	// such a partial (not refuse), else a missing-HEAD registration whose checkout is gone becomes uncleanable.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-absent-nohead-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		let admin = std::fs::read_dir(work.join(".git/worktrees"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.path();
+		std::fs::remove_file(admin.join("HEAD")).unwrap();
+		std::fs::remove_dir_all(&wt).unwrap(); // genuinely absent destination
+		assert!(!wt.exists());
+
+		// `None` expected-branch — a missing HEAD carries no branch, so a pin would (correctly) be a mismatch.
+		let out = remove(&force_req(&work, &wt, None, 1)).await.unwrap();
+		assert!(
+			matches!(out, RemoveOutcome::Removed { .. }),
+			"{fmt}: {out:?}"
+		);
+		assert!(
+			!admin.exists(),
+			"{fmt}: the stale admin registration is cleaned even with a missing HEAD"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_removing_an_unborn_branch_worktree_retains_no_branch() {
+	// Bug-4 regression: a worktree whose HEAD names `refs/heads/ghost` while no such ref exists (an unborn
+	// branch) must report `retained_branch: None` — removal never creates the ref, and reporting a nonexistent
+	// branch violates `RemoveOutcome`'s contract. The forced path confirms the shared ref exists first.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-unborn-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		let admin = std::fs::read_dir(work.join(".git/worktrees"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.path();
+		// A valid symbolic HEAD naming a branch that does not exist (unborn).
+		std::fs::write(admin.join("HEAD"), "ref: refs/heads/ghost\n").unwrap();
+		assert!(!git_ok(&[
+			"-C",
+			work.to_str().unwrap(),
+			"rev-parse",
+			"--verify",
+			"refs/heads/ghost"
+		]));
+
+		let out = remove(&force_req(&work, &wt, None, 1)).await.unwrap();
+		assert!(
+			matches!(
+				out,
+				RemoveOutcome::Removed {
+					retained_branch: None,
+					..
+				}
+			),
+			"{fmt}: an unborn branch must not be reported as retained, got {out:?}"
+		);
+		assert!(!wt.exists());
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_refuses_a_worktree_whose_admin_gitdir_points_at_a_different_file() {
+	// Bug-1 regression: `admin_dirs_for` matches on the admin `gitdir` target's *parent*, so an admin whose
+	// `gitdir` names a DIFFERENT filename under the destination still resolves — yet that is a cross-pointer
+	// disagreement git rejects "not a working tree". The forced structural check requires BOTH directions (the
+	// checkout `.git` names the admin AND the admin `gitdir` resolves to exactly `<destination>/.git`), so it
+	// refuses rather than force-deleting an inconsistent worktree.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-backptr-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		let admin = std::fs::read_dir(work.join(".git/worktrees"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.path();
+		// Repoint the admin's `gitdir` back-pointer at a *different* filename under the destination — same parent
+		// (so `admin_dirs_for` still resolves it), but no longer `<wt>/.git`. The checkout's `.git` still names
+		// the admin, so only the admin->checkout direction is now wrong.
+		std::fs::write(admin.join("gitdir"), format!("{}/other\n", wt.display())).unwrap();
+
+		// `None` expected-branch so the structural (not identity) refusal is exercised.
+		let err = remove(&force_req(&work, &wt, None, 2)).await.unwrap_err();
+		assert!(
+			matches!(
+				err,
+				RemoveError::Refused(WorktreeClassification::DestinationConflict { .. })
+			),
+			"{fmt}: an inconsistent admin back-pointer must refuse under force, got {err:?}"
+		);
+		assert!(wt.exists(), "{fmt}: the checkout is preserved");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_removes_a_whitespace_padded_detached_head() {
+	// Probe (git 2.50.1): git's forced-remove HEAD gate validates HEAD *existence*, not content — a space/tab-
+	// padded detached `<admin>/HEAD` is still a present file, so `git worktree remove -f -f` removes it. The lean
+	// forced path matches: it is valid-for-removal, and the padded id names no branch, so nothing is retained.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-paddedhead-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["--detach"], &[&head]);
+		let admin = std::fs::read_dir(work.join(".git/worktrees"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.path();
+		// A real object id, padded with spaces — a present file HEAD git still force-removes.
+		std::fs::write(admin.join("HEAD"), format!("  {head}  \n")).unwrap();
+
+		let out = remove(&force_req(&work, &wt, None, 2)).await.unwrap();
+		assert!(
+			matches!(
+				out,
+				RemoveOutcome::Removed {
+					retained_branch: None,
+					..
+				}
+			),
+			"{fmt}: a whitespace-padded detached HEAD is force-removed, got {out:?}"
+		);
+		assert!(!wt.exists(), "{fmt}: the worktree was force-removed");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_resolves_a_symbolic_head_alias_for_identity_and_retained_branch() {
+	// Bug-3 regression: identity and retained-branch reporting must resolve the HEAD symref chain to its
+	// TERMINAL ref (`HEAD -> refs/heads/alias -> refs/heads/feature`), matching the conservative path — a
+	// direct-only compare would both mis-refuse a `feature` pin and report `refs/heads/alias` as retained.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-alias-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		let admin = std::fs::read_dir(work.join(".git/worktrees"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.path();
+		// `refs/heads/alias` is a symbolic ref to `refs/heads/feature`; HEAD is symbolic to the alias.
+		std::fs::write(
+			work.join(".git/refs/heads/alias"),
+			"ref: refs/heads/feature\n",
+		)
+		.unwrap();
+		std::fs::write(admin.join("HEAD"), "ref: refs/heads/alias\n").unwrap();
+
+		// Pinning `feature` must MATCH via the terminal (not mis-refuse on the direct `alias`), and the retained
+		// branch is reported as the terminal `refs/heads/feature`, not the alias.
+		let out = remove(&force_req(&work, &wt, Some("feature"), 1))
+			.await
+			.unwrap();
+		assert!(
+			matches!(
+				&out,
+				RemoveOutcome::Removed { retained_branch, .. }
+					if retained_branch.as_deref() == Some("refs/heads/feature")
+			),
+			"{fmt}: expected Removed retaining the terminal refs/heads/feature, got {out:?}"
+		);
+		assert!(!wt.exists());
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_does_not_retain_a_branch_that_is_only_a_ref_namespace_directory() {
+	// Bug-4 regression: `<common>/refs/heads/foo` can be a DIRECTORY (because `refs/heads/foo/bar` exists), which
+	// means `foo` itself is unborn. Existence must require a loose ref FILE (or a packed-refs entry), not any
+	// filesystem object, so an unborn `refs/heads/foo` is reported `retained_branch: None`.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-refdir-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		let admin = std::fs::read_dir(work.join(".git/worktrees"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.path();
+		// Make `refs/heads/foo` a directory (a namespace) via a child ref, and point HEAD at the unborn `foo`.
+		std::fs::create_dir_all(work.join(".git/refs/heads/foo")).unwrap();
+		std::fs::write(work.join(".git/refs/heads/foo/bar"), format!("{head}\n")).unwrap();
+		std::fs::write(admin.join("HEAD"), "ref: refs/heads/foo\n").unwrap();
+
+		let out = remove(&force_req(&work, &wt, None, 1)).await.unwrap();
+		assert!(
+			matches!(
+				out,
+				RemoveOutcome::Removed {
+					retained_branch: None,
+					..
+				}
+			),
+			"{fmt}: a ref-namespace directory must not count as an existing branch, got {out:?}"
+		);
+		assert!(!wt.exists());
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn force_refuses_a_worktree_with_an_unknown_repository_extension() {
+	// Probe (git 2.50.1): an unknown `extensions.*` at repositoryformatversion >= 1 makes `git worktree remove
+	// -f -f` ABORT (exit 128), keeping the worktree — git will not operate on a repo format it does not fully
+	// understand. The forced path validates repository format before any destructive action (requirements
+	// 257-258), so it refuses too and deletes nothing.
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-force-ext-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		// Bump the format to version 1 (so extensions are read) and add an unknown extension.
+		git(&["-C", w, "config", "core.repositoryformatversion", "1"]);
+		git(&["-C", w, "config", "extensions.fooBar", "baz"]);
+
+		// Oracle: stock git aborts even with two forces.
+		assert!(
+			!git_ok(&[
+				"-C",
+				w,
+				"worktree",
+				"remove",
+				"--force",
+				"--force",
+				wt.to_str().unwrap(),
+			]),
+			"{fmt}: probe — git aborts a forced remove on an unknown repository extension"
+		);
+
+		let out = remove(&force_req(&work, &wt, Some("feature"), 2)).await;
+		assert!(
+			out.is_err(),
+			"{fmt}: an unknown repository extension must refuse forced removal, got {out:?}"
+		);
+		assert!(wt.exists(), "{fmt}: the worktree is preserved");
 		let _ = std::fs::remove_dir_all(&base);
 	}
 }

@@ -7,8 +7,8 @@ mod common;
 
 use common::*;
 use gitana_linked_worktree::{
-	CheckoutTarget, CreateError, CreateRequest, LinkedWorktreeError, RemoveRequest, RepositoryId,
-	WorktreeObjectId, create, remove,
+	CheckoutTarget, CreateError, CreateRequest, LinkedWorktreeError, RemovePolicy, RemoveRequest,
+	RepositoryId, WorktreeObjectId, create, remove,
 };
 
 fn detached(start: WorktreeObjectId) -> CheckoutTarget {
@@ -221,6 +221,7 @@ async fn concurrent_create_and_remove_reach_a_consistent_state() {
 					repo,
 					destination: dest,
 					expected_branch: None,
+					policy: RemovePolicy::Conservative,
 				}))
 			})
 		};

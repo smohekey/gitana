@@ -9,8 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use gitana_linked_worktree::{
-	BranchName, CheckoutTarget, CreateRequest, RemoveRequest, RepositoryId, WorktreeContext,
-	WorktreeQuery, create, enumerate, inspect, remove, status,
+	BranchName, CheckoutTarget, CreateRequest, RemovePolicy, RemoveRequest, RepositoryId,
+	WorktreeContext, WorktreeQuery, create, enumerate, inspect, remove, status,
 };
 
 fn assert_send<T: Send>(_: &T) {}
@@ -34,6 +34,7 @@ fn public_op_futures_are_send() {
 		repo: repo.clone(),
 		destination: destination.clone(),
 		expected_branch: None,
+		policy: RemovePolicy::Conservative,
 	};
 	let query = WorktreeQuery {
 		repo: repo.clone(),

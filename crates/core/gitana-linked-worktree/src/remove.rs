@@ -20,19 +20,23 @@ mod native {
 	use std::path::Path;
 
 	use crate::facts::{HeadKind, LockState};
-	use crate::head::read_lock_reason;
+	use crate::head::{read_lock_reason, structural_head_branch};
 	use crate::inspect::{
-		CrossPointerHealth, DestinationKind, Registration, WorktreeInspection, inspect,
+		CrossPointerHealth, DestinationKind, IdentityConflict, Registration, WorktreeInspection,
+		inspect,
 	};
 	use crate::pointers::{
-		admin_dirs_for, is_bare, is_leaf_symlink, main_checkout_identifies_common,
+		RefSource, SYMREF_MAXDEPTH, admin_dirs_for, admin_gitdir_target, canonical_eq,
+		checkout_gitfile_names, is_bare, is_leaf_symlink, main_checkout_identifies_common,
+		resolve_ref_terminal,
 	};
 	use crate::query::WorktreeQuery;
 	use crate::registration_lock::RegistrationLock;
 	use crate::remove_error::RemoveError;
 	use crate::remove_outcome::RemoveOutcome;
 	use crate::remove_request::RemoveRequest;
-	use crate::{LinkedWorktreeError, ProtectionReason, WorktreeClassification};
+	use crate::repo_id::{detect_kind, open_store_raw};
+	use crate::{LinkedWorktreeError, ProtectionReason, RemovePolicy, WorktreeClassification};
 
 	/// What a removal should do, decided from the inspection.
 	#[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,12 +57,31 @@ mod native {
 		},
 	}
 
-	/// Remove the linked worktree described by `request`, reconciling against its current state.
+	/// Remove the linked worktree described by `request`, dispatching on its [`RemovePolicy`].
+	///
+	/// [`Conservative`](RemovePolicy::Conservative) — and `GitCompat { force: 0 }` — take the safe, force-free
+	/// [`remove_conservative`] path; [`GitCompat`](RemovePolicy::GitCompat) with `force >= 1` takes the
+	/// git-faithful forced [`remove_git_forced`] path (git's `worktree remove -f` / `-f -f`).
 	///
 	/// Returns [`RemoveOutcome::Removed`] on success (retaining the branch and its commits) or
 	/// [`RemoveOutcome::AlreadyAbsent`] when the exact worktree is already gone (idempotent). Every
 	/// refusal/failure is a [`RemoveError`].
 	pub async fn remove(request: &RemoveRequest) -> Result<RemoveOutcome, RemoveError> {
+		match request.policy {
+			RemovePolicy::GitCompat { force } if force >= 1 => remove_git_forced(request, force).await,
+			// `Conservative` or `GitCompat { force: 0 }` — the safe, force-free path.
+			_ => remove_conservative(request).await,
+		}
+	}
+
+	/// The safe, force-free removal (the [`Conservative`](RemovePolicy::Conservative) path, and
+	/// `GitCompat { force: 0 }`) — reconciling against the read-only inspection so a repeat is idempotent and
+	/// every unsafe state is refused rather than acted on.
+	///
+	/// Returns [`RemoveOutcome::Removed`] on success (retaining the branch and its commits) or
+	/// [`RemoveOutcome::AlreadyAbsent`] when the exact worktree is already gone (idempotent). Every
+	/// refusal/failure is a [`RemoveError`].
+	async fn remove_conservative(request: &RemoveRequest) -> Result<RemoveOutcome, RemoveError> {
 		if !request.destination.is_absolute() {
 			return Err(LinkedWorktreeError::RelativePath(request.destination.clone()).into());
 		}
@@ -530,6 +553,411 @@ mod native {
 				None => return None,
 			}
 		}
+	}
+
+	// ---------------------------------------------------------------------------
+	// The git-faithful FORCE path — git's `worktree remove -f` / `-f -f`.
+	//
+	// `git worktree remove -f` skips the *cleanliness* check (it deletes a dirty/untracked/ignored checkout)
+	// but still validates `.git` **structure**; a second `-f` additionally removes a *locked* worktree.
+	// Identity, primary, and enclosure are never overridden. This path is a LEAN structural inspection
+	// composing the pointer primitives directly — it never calls `inspect()` (the rich, status-bearing path)
+	// and never opens the object store or reads an index, matching git, which under force validates the `.git`
+	// structure but not the working-tree content.
+	// ---------------------------------------------------------------------------
+
+	/// The owned registration for the destination, or the absence/duplication of one.
+	enum ForcedAdmin {
+		/// No registration under `<common>/worktrees/*` names this destination.
+		None,
+		/// Exactly one owned registration names this destination.
+		Unique(std::path::PathBuf),
+		/// More than one registration names it — corruption, never force-removed (an identity conflict).
+		Duplicate(Vec<std::path::PathBuf>),
+	}
+
+	/// What sits at the destination, by a no-follow stat that **never opens the directory** (unlike
+	/// [`classify_destination`](crate::inspect), which reads the first entry to tell empty from non-empty — a
+	/// distinction the forced path does not need, since a *present* directory must carry a valid `.git` either
+	/// way).
+	#[derive(Clone, Copy, PartialEq, Eq)]
+	enum ForcedDest {
+		/// Nothing exists at the path.
+		Absent,
+		/// A directory (empty or not — a present checkout must carry a valid `.git` regardless).
+		Directory,
+		/// A file, symlink, or other non-directory — never a worktree.
+		Other,
+	}
+
+	/// The lean structural facts a forced removal decides from — composed from the pointer primitives directly;
+	/// no rich inspection, no object store, no index read.
+	struct GitForcedFacts {
+		/// The destination (echoed for the refusal/outcome paths).
+		destination: std::path::PathBuf,
+		/// The registration resolution for the destination.
+		admin: ForcedAdmin,
+		/// What sits at the destination on disk (no-follow).
+		dest: ForcedDest,
+		/// Whether a *present directory*'s `.git` is a regular-file gitfile naming the unique admin — git's
+		/// structural `.git`↔admin validity. `false` for a non-directory, no unique admin, or a broken pointer.
+		structural_valid: bool,
+		/// Whether the unique admin's `HEAD` **exists and is a file** — git's real forced-remove HEAD gate (probed,
+		/// git 2.50.1), which validates HEAD *existence*, not content. `std::fs::metadata` follows symlinks, so a
+		/// legacy symlink HEAD resolving to a ref file is a valid file; a missing/dangling/directory HEAD is not.
+		/// `false` without a unique admin. Required for a *present-directory* forced delete; an **absent**
+		/// destination is cleaned regardless (there is no checkout to validate).
+		admin_head_valid: bool,
+		/// The unique admin's lock state (`Unlocked` without a unique admin).
+		lock: LockState,
+		/// Whether the destination is the repository's primary/main worktree (never removed, at any force).
+		is_primary: bool,
+		/// The repository's common dir if it lies *inside* the destination (deleting it would destroy the repo).
+		enclosed: Option<std::path::PathBuf>,
+		/// The unique admin's HEAD **terminal** branch ref (`refs/...`) — the direct HEAD branch resolved
+		/// structurally through the symref chain (`refs/heads/alias -> refs/heads/feature`), matching what the
+		/// rich `inspect`/conservative path reports. Used for the `expected_branch` identity pin and the
+		/// retained-branch report. `None` when detached, structurally invalid, or the chain is corrupt/cyclic
+		/// (unresolvable) — an unresolvable pin is then an identity conflict, and retained reporting degrades to
+		/// `None`. Resolution reads only ref files (no object store), and never follows a HEAD symlink to an
+		/// external file. Structural HEAD *validity* is judged on the **direct** HEAD (see `admin_head_valid`),
+		/// independent of this — a valid direct symbolic HEAD whose chain is broken still validates.
+		head_terminal: Option<String>,
+		/// The caller's pinned branch as a full ref (`refs/heads/<name>`), if any.
+		expected_refname: Option<String>,
+	}
+
+	/// Whether the shared branch ref `refname` (`refs/heads/...`) **actually exists** — a lightweight,
+	/// no-object-store filesystem check: a loose ref file `<common>/<refname>`, or an entry in
+	/// `<common>/packed-refs`. Used so an **unborn** branch (HEAD names it, but no ref exists yet) is not
+	/// misreported as retained, honouring [`RemoveOutcome`]'s contract. `refname` is a caller-validated
+	/// (`is_valid_refname`) `refs/heads/*`, so `<common>/<refname>` cannot escape the repository.
+	fn shared_branch_exists(common: &Path, refname: &str) -> bool {
+		// A **file** loose ref is the branch. `std::fs::metadata` FOLLOWS symlinks, so a legacy *symlinked* loose
+		// ref (resolving to a real ref file) correctly counts as existing, while a *directory* at
+		// `<common>/<refname>` — a ref namespace (`refs/heads/foo` is a directory because `refs/heads/foo/bar`
+		// exists), so `foo` itself is unborn — does not (`is_file()` is false). A dangling symlink also fails
+		// (`metadata` errors), degrading to "not retained" — the conservative bias.
+		if std::fs::metadata(common.join(refname))
+			.map(|m| m.is_file())
+			.unwrap_or(false)
+		{
+			return true;
+		}
+		match std::fs::read_to_string(common.join("packed-refs")) {
+			Ok(text) => text.lines().any(|line| {
+				// `packed-refs`: `<oid> <refname>` per line, `#`-comment header and `^<peel>` lines skipped.
+				let line = line.trim_start();
+				!(line.starts_with('#') || line.starts_with('^'))
+					&& line.split_once(' ').map(|(_, name)| name.trim()) == Some(refname)
+			}),
+			Err(_) => false,
+		}
+	}
+
+	/// Reject a repository whose common `config` declares an **unknown repository extension** — git reads
+	/// `extensions.*` only at `repositoryformatversion >= 1` and aborts on any it does not recognize, so a
+	/// forced destructive op on such a repo would risk a format gitana does not fully understand (requirements
+	/// 257-258). `objectformat` (validated by `detect_kind`) plus the extensions that do not change how gitana
+	/// must read this repo for a *structural* removal are honoured; anything else refuses. Config-only — reads
+	/// no object store. A missing/unparseable config is left to `detect_kind`'s `UnsupportedObjectFormat`.
+	fn reject_unknown_extensions(common: &Path) -> Result<(), RemoveError> {
+		// git tolerates these at v1 without special handling of the object/ref layout a structural remove touches.
+		const KNOWN: &[&str] = &[
+			"objectformat",
+			"worktreeconfig",
+			"relativeworktrees",
+			"noop",
+		];
+		let Ok(text) = std::fs::read_to_string(common.join("config")) else {
+			return Ok(());
+		};
+		let Ok(config) = gitana_config::GitConfig::parse(&text) else {
+			return Ok(());
+		};
+		// Extensions are read only at repositoryformatversion >= 1 (git ignores them at version 0).
+		let version = config
+			.get_int("core", None, "repositoryformatversion")
+			.ok()
+			.flatten()
+			.unwrap_or(0);
+		if version < 1 {
+			return Ok(());
+		}
+		for (key, _) in config.entries() {
+			// A dotted key `extensions.<name>` (git's extensions carry no subsection, so a further dot is not one).
+			if let Some(name) = key.strip_prefix("extensions.")
+				&& !name.contains('.')
+				&& !KNOWN.contains(&name.to_ascii_lowercase().as_str())
+			{
+				return Err(
+					LinkedWorktreeError::UnsupportedObjectFormat(format!(
+						"unknown repository extension: extensions.{name}"
+					))
+					.into(),
+				);
+			}
+		}
+		Ok(())
+	}
+
+	/// A lean structural inspection for the forced path — composes the pointer primitives, never calling
+	/// `inspect()` and never opening the object store. Classifies the destination with a no-follow stat and
+	/// resolves the owned registration, its structural validity, admin-`HEAD` existence, lock, and direct HEAD.
+	fn inspect_git_forced(request: &RemoveRequest) -> Result<GitForcedFacts, RemoveError> {
+		let common = request.repo.common_dir();
+		let destination = &request.destination;
+
+		// Destination kind — no-follow, and *without* opening the directory. A trailing-separator leaf symlink
+		// (`.../wt-link/`) is stripped via `components` so it is seen (POSIX would otherwise follow it), matching
+		// the no-follow boundary elsewhere.
+		let leaf = destination.components().as_path();
+		let dest = match std::fs::symlink_metadata(leaf) {
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => ForcedDest::Absent,
+			Err(e) => return Err(LinkedWorktreeError::io("stat destination", destination, e).into()),
+			Ok(meta) if meta.is_dir() => ForcedDest::Directory,
+			Ok(_) => ForcedDest::Other,
+		};
+
+		// The owned registration(s) naming this destination (already `commondir`-owned and gitdir-back-pointing).
+		let admin = match admin_dirs_for(common, destination)?.as_slice() {
+			[] => ForcedAdmin::None,
+			[only] => ForcedAdmin::Unique(only.clone()),
+			many => ForcedAdmin::Duplicate(many.to_vec()),
+		};
+
+		// Structural `.git`↔admin validity, admin-`HEAD` existence, lock, and the HEAD terminal branch — only a
+		// unique registration has these. `.git`-validity requires **both** cross-pointer directions, mirroring the
+		// rich `inspect`'s `CrossPointerHealth::Consistent`: the checkout's `.git` names the admin
+		// (`checkout_gitfile_names`), **and** the admin's `gitdir` back-pointer resolves to exactly
+		// `<destination>/.git` (`admin_gitdir_target` + `canonical_eq`). `admin_dirs_for` matches only on the
+		// gitdir target's *parent*, so an admin whose `gitdir` names a *different* filename under the destination
+		// still resolves here yet is a cross-pointer disagreement git rejects "not a working tree" — the back
+		// check catches it.
+		//
+		// The admin-`HEAD` gate is git's REAL forced-remove behaviour (probed, git 2.50.1): HEAD must simply
+		// **exist and be a file** — git does *not* validate its content grammar (an empty/garbage/padded/symref
+		// HEAD is still removed). `std::fs::metadata` *follows* symlinks, so a legacy symlink HEAD resolving to a
+		// ref file counts as a valid file, while a missing/dangling/directory HEAD does not. `structural_head_branch`
+		// is used ONLY to *name* the branch for identity + retained reporting — never as the validity gate — so a
+		// garbage/empty HEAD is valid-for-removal and simply yields no branch to retain.
+		let (structural_valid, admin_head_valid, lock, head_terminal) = match &admin {
+			ForcedAdmin::Unique(a) => {
+				let gitfile = destination.join(".git");
+				let back_consistent =
+					admin_gitdir_target(a).is_some_and(|back| canonical_eq(&back, &gitfile));
+				let structural = dest == ForcedDest::Directory
+					&& checkout_gitfile_names(destination, a)?
+					&& back_consistent;
+				let admin_head_valid = std::fs::metadata(a.join("HEAD"))
+					.map(|m| m.is_file())
+					.unwrap_or(false);
+				// Name the branch (identity + retained) from the direct HEAD, resolved to its terminal ref (follow
+				// `refs/heads/alias -> feature`), as the conservative path reports. `HEAD` already consumed one hop,
+				// so budget `SYMREF_MAXDEPTH - 1`; a corrupt/cyclic chain → `Err` → `None` (graceful degrade). This
+				// is independent of `admin_head_valid`: a content-invalid HEAD is still removable, just unnamed.
+				let head_terminal = structural_head_branch(a).flatten().and_then(|direct| {
+					resolve_ref_terminal(common, a, &direct, RefSource::Head, SYMREF_MAXDEPTH - 1).ok()
+				});
+				(
+					structural,
+					admin_head_valid,
+					read_lock_reason(a),
+					head_terminal,
+				)
+			}
+			ForcedAdmin::None | ForcedAdmin::Duplicate(_) => (false, false, LockState::Unlocked, None),
+		};
+
+		// Primary identity — judged from the checkout itself (never a registration): only a present *directory*
+		// can be the primary, and never a bare repo. Restricting to a directory also avoids an `ENOTDIR` probe of
+		// `<file>/.git` for a non-directory destination.
+		let is_primary = dest == ForcedDest::Directory
+			&& !is_bare(common)?
+			&& main_checkout_identifies_common(destination, common)?;
+
+		let enclosed = common_dir_within(destination, common);
+
+		Ok(GitForcedFacts {
+			destination: destination.clone(),
+			admin,
+			dest,
+			structural_valid,
+			admin_head_valid,
+			lock,
+			is_primary,
+			enclosed,
+			head_terminal,
+			expected_refname: request.expected_branch.as_ref().map(|b| b.refname()),
+		})
+	}
+
+	/// Decide the forced removal action from the lean facts, or refuse. Precedence: the **never-overridden**
+	/// gates first (primary, enclosure, then identity — a duplicate registration or an `expected_branch`
+	/// mismatch), then the lock (the only second-force gate), then the structural validation of the destination.
+	fn decide_git_forced(facts: &GitForcedFacts, force: u8) -> Result<RemoveAction, RemoveError> {
+		use WorktreeClassification as C;
+
+		// 0. The primary worktree is never removed — at any force.
+		if facts.is_primary {
+			return Err(RemoveError::IsPrimaryWorktree(facts.destination.clone()));
+		}
+		// 0a. The destination encloses the repository's git storage — deleting it would destroy the repo.
+		if let Some(common) = &facts.enclosed {
+			return Err(RemoveError::EnclosesRepository(common.clone()));
+		}
+		// 1. Identity is never overridden. A duplicate registration is corruption; a pinned `expected_branch`
+		//    that the destination's HEAD does not carry is a mismatch — compared against the **terminal** branch
+		//    (following `refs/heads/alias -> feature`), matching the conservative path. A corrupt/cyclic chain
+		//    resolves to `None`, so an unresolvable pin is a conflict (never delete the wrong worktree). The CLI
+		//    passes `expected_branch: None`, so this is inert there.
+		if let ForcedAdmin::Duplicate(admins) = &facts.admin {
+			return Err(RemoveError::Refused(C::IdentityConflict {
+				detail: IdentityConflict::DuplicateRegistration {
+					admins: admins.clone(),
+				},
+			}));
+		}
+		if facts.expected_refname.is_some()
+			&& matches!(facts.admin, ForcedAdmin::Unique(_))
+			&& facts.head_terminal != facts.expected_refname
+		{
+			return Err(RemoveError::Refused(C::IdentityConflict {
+				detail: IdentityConflict::RegisteredToDifferentBranch {
+					found: facts.head_terminal.clone(),
+				},
+			}));
+		}
+
+		let admin = match &facts.admin {
+			ForcedAdmin::Unique(a) => a.clone(),
+			// Nothing of ours is registered here: an absent destination is already-absent (idempotent); anything
+			// present is not this repository's worktree to force-remove.
+			ForcedAdmin::None => {
+				return match facts.dest {
+					ForcedDest::Absent => Ok(RemoveAction::AlreadyAbsent),
+					ForcedDest::Directory => Err(RemoveError::Refused(C::DestinationConflict {
+						kind: DestinationKind::UnrelatedContent,
+					})),
+					ForcedDest::Other => Err(RemoveError::Refused(C::DestinationConflict {
+						kind: DestinationKind::OtherFsObject,
+					})),
+				};
+			}
+			ForcedAdmin::Duplicate(_) => unreachable!("a duplicate registration is handled above"),
+		};
+
+		// 2. A locked worktree needs a second force — the only second-force gate (no masking recursion needed).
+		if force < 2
+			&& let LockState::Locked { reason } = &facts.lock
+		{
+			return Err(RemoveError::Refused(C::ProtectedWithReason {
+				reason: ProtectionReason::Locked {
+					reason: reason.clone(),
+				},
+			}));
+		}
+
+		// 3. Structural validation of the registered destination — force does not skip it.
+		match facts.dest {
+			// A present checkout must carry a valid `.git` naming the admin **and** an existing (file) admin
+			// `HEAD`. A present directory whose `.git` is gone, or whose admin `HEAD` is missing or a directory,
+			// is a validation refusal — git's "validation failed" — never a forced delete. An *empty* directory is
+			// likewise present, so it too must carry a valid `.git`, and refuses.
+			ForcedDest::Directory => {
+				if facts.structural_valid && facts.admin_head_valid {
+					Ok(RemoveAction::RemoveFull { admin })
+				} else {
+					Err(RemoveError::Refused(C::DestinationConflict {
+						kind: DestinationKind::UnrelatedContent,
+					}))
+				}
+			}
+			// A registered checkout whose directory is **gone** is a recoverable partial — drop the stale admin
+			// (git's prunable). There is no checkout to validate, so git removes the registration regardless of
+			// whether `<admin>/HEAD` still exists; the identity/duplicate/lock guards above already applied.
+			ForcedDest::Absent => Ok(RemoveAction::CleanPartial { admin }),
+			// A file/symlink now sits at a registered path — not a worktree; never deleted through it.
+			ForcedDest::Other => Err(RemoveError::Refused(C::DestinationConflict {
+				kind: DestinationKind::OtherFsObject,
+			})),
+		}
+	}
+
+	/// The git-faithful forced removal (`git worktree remove -f` / `-f -f`). Acquires the per-repository
+	/// registration lock, decides from the lean structural facts, **re-inspects and re-decides immediately
+	/// before the destructive effect** (a lost race is a conflict, not an overwrite), then reuses the shared
+	/// [`perform_remove`] destroyer. Never opens the object store or reads an index.
+	async fn remove_git_forced(
+		request: &RemoveRequest,
+		force: u8,
+	) -> Result<RemoveOutcome, RemoveError> {
+		if !request.destination.is_absolute() {
+			return Err(LinkedWorktreeError::RelativePath(request.destination.clone()).into());
+		}
+		let common = request.repo.common_dir();
+
+		// Serialize registration mutations for the repository (as the conservative path does), held across the
+		// decision → re-verify → destroy section so a concurrent create/repair cannot slip into the TOCTOU window.
+		let _lock = RegistrationLock::acquire(common).await?;
+
+		// Validate the repository **format** before any destructive action — the conservative path gets this for
+		// free from `inspect` opening the repo, but the lean forced path skips `inspect`, so it must do the same
+		// config-only check here (never opening the object store). `detect_kind` is the exact primitive the
+		// conservative `inspect` path uses (object format + `repositoryformatversion`), returning the same
+		// `UnsupportedObjectFormat` refusal; `reject_unknown_extensions` adds git's abort on an unknown
+		// `extensions.*`. A repo gitana does not fully understand is never force-mutated (requirements 257-258),
+		// matching stock `git worktree remove -f -f`, which aborts too. Nothing is deleted on a format refusal.
+		detect_kind(&open_store_raw(common, common)?).await?;
+		reject_unknown_extensions(common)?;
+
+		// Decide from the current state, failing fast on a refusal before the destructive re-check.
+		let action = decide_git_forced(&inspect_git_forced(request)?, force)?;
+		if let RemoveAction::AlreadyAbsent = action {
+			return Ok(RemoveOutcome::AlreadyAbsent {
+				destination: request.destination.clone(),
+			});
+		}
+
+		// Re-inspect + re-decide **immediately before** the destructive effect and require the **same** action
+		// (its admin identity included — `RemoveAction` derives `PartialEq`). A state that changed between the two
+		// looks — a destination removed-and-recreated into a *different* removable shape, or a re-appeared
+		// conflict — must not be deleted: report the idempotent no-op if it is now gone, else a re-inspectable
+		// `Incomplete`, never delete a target that changed. This mirrors `remove_conservative`'s re-verify.
+		let recheck = inspect_git_forced(request)?;
+		let admin = match decide_git_forced(&recheck, force) {
+			Ok(again) if again == action => match &action {
+				RemoveAction::RemoveFull { admin } | RemoveAction::CleanPartial { admin } => admin.clone(),
+				RemoveAction::AlreadyAbsent => unreachable!("AlreadyAbsent returned above"),
+			},
+			Ok(RemoveAction::AlreadyAbsent) => {
+				return Ok(RemoveOutcome::AlreadyAbsent {
+					destination: request.destination.clone(),
+				});
+			}
+			Ok(_) => {
+				let post = inspect(&remove_query(request, false)).await?;
+				return Err(RemoveError::Incomplete(Box::new(post)));
+			}
+			Err(e) => return Err(e),
+		};
+
+		// The retained branch, from the HEAD **terminal** branch (removal never deletes a ref regardless): only a
+		// `refs/heads/*` terminal that **actually exists** as a shared loose/packed ref is retained — an unborn
+		// branch (HEAD names it, but no ref exists yet), a corrupt/cyclic chain (terminal `None`), or a detached
+		// HEAD is reported as `None`, per `RemoveOutcome`'s contract. A per-worktree ref lives inside the removed
+		// admin, so it is never a `refs/heads/*` here.
+		let retained_branch = recheck
+			.head_terminal
+			.as_deref()
+			.filter(|b| b.starts_with("refs/heads/") && crate::pointers::is_valid_refname(b))
+			.filter(|b| shared_branch_exists(common, b))
+			.map(str::to_owned);
+		perform_remove(request, &action, &admin).await?;
+		Ok(RemoveOutcome::Removed {
+			destination: request.destination.clone(),
+			retained_branch,
+		})
 	}
 }
 

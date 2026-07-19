@@ -8,8 +8,8 @@ use std::os::unix::fs::symlink;
 
 use common::*;
 use gitana_linked_worktree::{
-	BranchName, CheckoutTarget, CreateError, CreateRequest, Registration, RemoveRequest,
-	RepositoryId, WorktreeClassification, WorktreeObjectId, create, remove,
+	BranchName, CheckoutTarget, CreateError, CreateRequest, Registration, RemovePolicy,
+	RemoveRequest, RepositoryId, WorktreeClassification, WorktreeObjectId, create, remove,
 };
 
 fn req(work: &std::path::Path, dest: &std::path::Path, target: CheckoutTarget) -> CreateRequest {
@@ -989,6 +989,7 @@ async fn accepts_a_non_utf8_destination_and_round_trips() {
 			repo: rid_at(&work),
 			destination: dest.clone(),
 			expected_branch: None,
+			policy: RemovePolicy::Conservative,
 		})
 		.await
 		.expect("non-UTF-8 worktree removed");
