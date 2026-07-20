@@ -26,11 +26,25 @@ value set only via an include was invisible to every config read (notably per-di
     - `**` matches any number of path components (including none); `*` matches within a component.
     - An exact gitdir path *with* a trailing slash does **not** match the gitdir itself (the appended `**`
       needs trailing content) — users point at the parent dir.
-  - `onbranch:<pat>` — matched against the **short current branch** name (no `refs/heads/`), same wildmatch
-    + trailing-`/`→`**` rule as gitdir. **No match when detached or bare** (no current branch).
-  - `hasconfig:<var-glob>:<value-glob>` (e.g. `hasconfig:remote.*.url:https://example.com/**`) — matches
-    when a variable whose full name matches `<var-glob>` has a value matching `<value-glob>`, evaluated
-    against **the configuration parsed so far** (lower-precedence layers + earlier-in-traversal content).
+  - `onbranch:<pat>` — matched against the **short current branch** name (no `refs/heads/`) with git's
+    `WM_PATHNAME` wildmatch. Preprocessing is **only** the trailing-`/`→`**` rule — unlike gitdir it does
+    **not** prepend `**/` (probed 2.50.1: `onbranch:foo` does *not* match branch `feature/foo`, while
+    `feature/*`, `feature/**`, `feature/`, and the exact `feature/foo` all match). Matching is
+    case-sensitive. The branch is read straight off a **symbolic HEAD**, so it is present for an unborn
+    branch and a **bare repo** too (probed: a bare repo with `HEAD -> refs/heads/main` matches
+    `onbranch:main`); `None` — hence never-matching — is reserved for a **detached** HEAD.
+  - `hasconfig:remote.*.url:<value-glob>` — **the only `hasconfig` form git implements** (corrected against
+    the original design's general `<var-glob>:<value-glob>` — 2.50.1 probes show git recognises *only* the
+    literal prefix `hasconfig:remote.*.url:`; `hasconfig:some.key:…`, `remote.?.url:…`, `remote.*.URL:…`, and
+    `remote.*.pushurl:…` all fall through to "unknown conditional → false"). It matches when *any*
+    `remote.<name>.url` (a subsection is required; bare `[remote] url` is not collected) anywhere in the
+    **whole effective config** has a value matching `<value-glob>` under a plain anchored `WM_PATHNAME`
+    wildmatch (case-sensitive; `github.com/*` does not span the path, `github.com/**` does). "Whole config"
+    is **not** "config so far": probed URLs set *after* the directive, in a *different layer* (global vs
+    local), and by an *earlier include* all match — git resolves this with a separate pre-scan of the entire
+    config for remote URLs. A file pulled in (directly or indirectly) by such a directive **may not itself
+    set a `remote.<name>.url`** — git fatals (`remote URLs cannot be configured in file directly or
+    indirectly included by includeIf.hasconfig:remote.*.url`), even when the condition does not match.
 
 ## Architecture
 
@@ -45,10 +59,11 @@ pub trait IncludeResolver {
 }
 
 pub struct IncludeContext<'a> {
-    pub home: Option<&'a Path>,        // $HOME, for ~/ expansion (None => ~/ include is skipped)
-    pub gitdir: Option<&'a Path>,      // real absolute gitdir, for gitdir: (None => gitdir: never matches)
-    pub branch: Option<&'a str>,       // short current branch, for onbranch: (None => onbranch: never matches)
-    // hasconfig: is evaluated against the config-so-far the driver threads in (see slice 2).
+    pub home: Option<&'a Path>,          // $HOME, for ~/ expansion (None => ~/ include is skipped)
+    pub gitdir: Option<&'a Path>,        // real absolute gitdir, for gitdir: (None => gitdir: never matches)
+    pub branch: Option<&'a str>,         // short current branch, for onbranch: (None => never matches)
+    pub remote_urls: Option<&'a [&'a str]>, // every remote.<name>.url across the whole effective config,
+                                         // for hasconfig:remote.*.url: (driver-collected; None/empty => never matches)
 }
 
 impl GitConfigSource {
@@ -64,7 +79,11 @@ impl GitConfigSource {
 - The crate owns: directive detection (`section == "include" | "includeif"`, `name == "path"`), condition
   matching (gitdir/onbranch/hasconfig wildmatch), path resolution, recursion + depth-10 fatal, and the inline
   element splice (replace the directive `Element::Variable` with the expanded included file's elements).
-- The driver owns: the actual reads, and supplying `home`/`gitdir`/`branch`/config-so-far.
+- The driver owns: the actual reads, and supplying `home`/`gitdir`/`branch`/`remote_urls`. Because
+  `hasconfig` spans the whole config, only the driver (which sees every layer) can collect the remote URLs;
+  the engine merely wildmatches the condition's value-glob against the supplied list. The paradox guard's
+  no-match arm (git fatals there too) likewise needs the driver's forced pre-scan — the engine covers only
+  the matched arm it actually walks.
 
 Consumers and where the driver lives:
 - **gta-core** (`git_config.rs`): the ambient-file reader (`read_sources`/`read_file`) — the choke point
@@ -77,26 +96,46 @@ Consumers and where the driver lives:
 1. **Engine core — `include` + `includeIf gitdir`.** `IncludeResolver` + `IncludeContext`, inline splice,
    path resolution (`~/`/relative/absolute), gitdir wildmatch, depth-10 fatal, missing-file skip. Pure unit
    tests against the probed cases. No consumer wiring.
-2. **Engine — `onbranch` + `hasconfig`.** Branch in the context; hasconfig against a threaded config-so-far;
-   wildmatch shared with gitdir.
-3. **gta-core wiring.** Filesystem resolver, thread gitdir + branch into the config-load path, shared
-   `expand_tilde`. Oracle tests vs stock git (per-directory identity, onbranch, hasconfig).
+2. **Engine — `onbranch` + `hasconfig`.** Branch matched against `ctx.branch` (trailing-`/`→`**` only, no
+   `**/` prefix); `hasconfig:remote.*.url:` recognised as a literal prefix and its value-glob wildmatched
+   against the driver-supplied `ctx.remote_urls`; the paradox guard (a hasconfig-included file setting a
+   `remote.<name>.url` is fatal) enforced on the matched path. The cross-layer URL collection and the
+   no-match arm of the guard are slice 3.
+3. **gta-core wiring.** Filesystem resolver, thread gitdir + branch into the config-load path, collect
+   `remote.*.url` across all layers (git's pre-scan, forbidding remote URLs inside hasconfig-included files)
+   into `ctx.remote_urls`, shared `expand_tilde`. Oracle tests vs stock git (per-directory identity,
+   onbranch, hasconfig).
 4. **wasm component wiring.** Resolver over the `FileStore` capability; component tests.
 
 ## Wildmatch note
 
-git's `gitdir:`/`onbranch:` use its `wildmatch` with `WM_PATHNAME` (`*` stops at `/`, `**` crosses `/`).
-gitana has no wildmatch yet; slice 1 introduces a small internal matcher covering `*`, `**`, `?`, bracket
-expressions (`[a-z]`, sets, `[!…]`/`[^…]` negation, and POSIX `[[:class:]]`), and literal segments, with the
-trailing-`/`→`**` and no-slash→`**/` preprocessing. It is an O(tokens × text) dynamic program (not recursive
-backtracking, which is exponential on adversarial patterns), and config-internal (not the `.gitignore` matcher
-in `gitana-worktree`, which has different anchoring rules). An unterminated `[` makes the whole pattern
-non-matching, matching git's abort behaviour.
+git's `gitdir:`/`onbranch:`/`hasconfig:` use its `wildmatch` with `WM_PATHNAME` (`*` stops at `/`, `**`
+crosses `/`). gitana has no wildmatch yet; slice 1 introduces a small internal matcher covering `*`, `**`,
+`?`, bracket expressions (`[a-z]`, sets, `[!…]`/`[^…]` negation, and POSIX `[[:class:]]`), and literal
+segments, with the trailing-`/`→`**` and (gitdir-only) no-slash→`**/` preprocessing. It is an O(tokens × text)
+dynamic program (not recursive backtracking, which is exponential on adversarial patterns) kept to **O(text)
+space** (rolling rows, so a large `hasconfig` glob/URL cannot exhaust memory; no length cap — git matches long
+patterns), and config-internal (not the `.gitignore` matcher in `gitana-worktree`, which has different
+anchoring rules).
+
+Malformed-construct handling matches git's `wildmatch` byte-for-byte (verified against 2.50.1 source +
+probes): an **unterminated `[`**, a **terminated-but-unknown POSIX class** (`[[:bogus:]]`), and a **trailing
+backslash** each abort the whole match (`WM_ABORT_ALL` → matches nothing); but a `[:` with **no `:]`
+terminator** is *not* malformed — the `[` is an ordinary set member (`[[:abc]` = the set `{[ : a b c}`). A
+**descending range** matches only its low endpoint (`[b-a]` matches `b`), because git reads that endpoint as a
+literal member before it sees the `-`.
 
 ## Deferred
 
 Known git-fidelity gaps left for later slices, each with a code note at its site:
 
+- **`hasconfig` URL-paradox vs. a later *syntax error* in the same included file.** git parses config
+  incrementally, so a forbidden `remote.<name>.url` in a hasconfig-included file fatals with the paradox
+  error even when a *syntax error* follows it later in the file. gitana parses each included file
+  atomically before the positional guard walks it, so a URL lexically preceding a syntax error surfaces
+  the parse error instead (both still fail closed — only the message differs). The positional guard is
+  faithful for a later *include* (that is exercised); matching git for a later *parse error* would need an
+  incremental parser, which is disproportionate for this exotic broken-config case. (P3, probed 2.50.1.)
 - **`./` canonicalization through `..`/symlinks (slice-3 driver responsibility).** `includeIf "gitdir:./…"`
   in a config file reached via a `..`-relative or symlinked path is matched against the **lexical** parent of
   the including file, which can differ from its realpath. git resolves the including file to a real path first.

@@ -31,4 +31,14 @@ pub enum ConfigError {
 	/// here rather than silently mis-resolve it as a relative path.
 	#[error("unsupported '~user/' in include path")]
 	IncludeUserTildeUnsupported,
+	/// A file pulled in (directly or indirectly) by an `includeIf "hasconfig:remote.*.url:…"`
+	/// directive sets a `remote.<name>.url`. git forbids this — the condition is evaluated by scanning
+	/// the config for remote URLs, so a URL introduced *by* such an include would be a paradox — and
+	/// fatals with the message reproduced here. The engine enforces this on the *matched* path; the
+	/// no-match path (git also fatals there, via its forced pre-scan) is completed by the cross-layer
+	/// driver in slice 3.
+	#[error(
+		"remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url"
+	)]
+	HasconfigIncludeSetsRemoteUrl,
 }

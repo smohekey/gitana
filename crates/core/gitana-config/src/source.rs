@@ -4,7 +4,8 @@ use std::path::Path;
 use std::pin::Pin;
 
 use crate::{
-	ConfigError, IncludeContext, IncludeResolver, condition_matches, parser, resolve_include_path,
+	ConfigError, IncludeContext, IncludeResolver, condition_matches, is_hasconfig_remote_url, parser,
+	resolve_include_path,
 };
 
 /// git's maximum include nesting depth; exceeding it is fatal (and breaks any cycle).
@@ -174,18 +175,33 @@ impl GitConfigSource {
 		// second call neither duplicates an unchanged include nor lets a stale value outlive a changed
 		// one. Only own elements survive to be (re-)expanded.
 		self.elements.retain(Entry::is_own);
-		self.expand_includes_at_depth(dir, ctx, resolver, 0).await
+		self
+			.expand_includes_at_depth(dir, ctx, resolver, 0, false)
+			.await
 	}
 
 	/// The depth-tracking core of [`expand_includes`](Self::expand_includes). Returns a boxed `Send`
 	/// future so the async body can recurse (an `async fn` cannot name its own future to recurse) and
 	/// so the whole chain stays `Send`, matching the crate's Send-futures convention.
+	///
+	/// `forbid_remote_url` is set once a `hasconfig:remote.*.url:` directive has been matched, and
+	/// propagates to every file it pulls in (directly or via nested plain includes): inside such a
+	/// subtree, encountering a `remote.<name>.url` is git's paradox and fatals. The check runs *at the
+	/// element's position* during traversal (not as a post-hoc scan), so — matching git's linear read —
+	/// a forbidden URL fatals before any later *include* in the same file is read.
+	///
+	/// One residual gap (deferred): git parses incrementally, so a forbidden URL also fatals before a
+	/// later *syntax error* in the same file. Here the whole included file is parsed atomically before
+	/// the positional walk, so a URL lexically preceding a syntax error surfaces the parse error instead
+	/// of the paradox. Both still fail closed; only the error differs. A faithful fix needs an
+	/// incremental parser (disproportionate for this exotic case). See the HLD's Deferred section.
 	fn expand_includes_at_depth<'a, R: IncludeResolver>(
 		&'a mut self,
 		dir: &'a Path,
 		ctx: &'a IncludeContext<'a>,
 		resolver: &'a R,
 		depth: usize,
+		forbid_remote_url: bool,
 	) -> Pin<Box<dyn Future<Output = Result<(), ConfigError>> + Send + 'a>> {
 		Box::pin(async move {
 			let mut i = 0;
@@ -195,6 +211,11 @@ impl GitConfigSource {
 				if !self.elements[i].is_own() {
 					i += 1;
 					continue;
+				}
+				// Inside a hasconfig-included subtree, a `remote.<name>.url` here is fatal — checked in
+				// file order so it fires before any later include, as git's linear read does.
+				if forbid_remote_url && element_is_remote_subsection_url(&self.elements[i].element) {
+					return Err(ConfigError::HasconfigIncludeSetsRemoteUrl);
 				}
 				let Some((value, condition)) = include_directive(&self.elements[i].element) else {
 					i += 1;
@@ -230,11 +251,18 @@ impl GitConfigSource {
 				}
 
 				// Expand the included file (relative to *its own* directory) before splicing, so nested
-				// includes land inline at the right positions.
+				// includes land inline at the right positions. A `hasconfig:remote.*.url:` match arms the
+				// paradox guard for this include's whole subtree; an ordinary or already-forbidden include
+				// simply propagates the flag it inherited. The guard fires *within* that recursion, at the
+				// position of an offending URL — so on the matched path the engine walks it matches git's
+				// linear read. (git also fatals on the no-match path via its forced pre-scan; that arm is
+				// the cross-layer driver's, slice 3.)
+				let child_forbid =
+					forbid_remote_url || condition.as_deref().is_some_and(is_hasconfig_remote_url);
 				let mut included = GitConfigSource::parse(&text)?;
 				let included_dir = resolved.parent().map(Path::to_path_buf).unwrap_or_default();
 				included
-					.expand_includes_at_depth(&included_dir, ctx, resolver, depth + 1)
+					.expand_includes_at_depth(&included_dir, ctx, resolver, depth + 1, child_forbid)
 					.await?;
 
 				// Everything from the included file is non-own from this file's perspective, so reads
@@ -736,6 +764,16 @@ fn include_directive(element: &Element) -> Option<(Option<String>, Option<String
 		("includeif", Some(condition)) => Some((v.value.clone(), Some(condition.to_owned()))),
 		_ => None,
 	}
+}
+
+/// Whether `element` is a `remote.<subsection>.url` variable — the shape git's `hasconfig` collects
+/// and, inside a hasconfig-included file, forbids. A subsection is required: a bare `remote.url` does
+/// not count, matching git's `remote.<name>.url` key parse. Section/name are already lower-cased.
+fn element_is_remote_subsection_url(element: &Element) -> bool {
+	matches!(
+		element,
+		Element::Variable(v) if v.section == "remote" && v.subsection.is_some() && v.name == "url"
+	)
 }
 
 /// Format a `section[.subsection].name` dotted key for diagnostics.

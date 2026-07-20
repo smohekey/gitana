@@ -7,9 +7,10 @@
 //! [`IncludeResolver`], and the values needed to evaluate conditions (`$HOME`, the real gitdir, the
 //! current branch) are supplied through an [`IncludeContext`].
 //!
-//! Slice 1 implements `[include]` (unconditional) and `includeIf "gitdir:"`/`"gitdir/i:"` only;
-//! `onbranch:` and `hasconfig:` are slice 2 and, until then, evaluate as non-matching (like any
-//! condition git does not recognise).
+//! Conditions recognised: `gitdir:`/`gitdir/i:` (against the real gitdir), `onbranch:` (against the
+//! short current branch), and `hasconfig:remote.*.url:` (against the remote URLs the driver supplies
+//! in [`IncludeContext::remote_urls`]). Every other condition evaluates as non-matching, mirroring
+//! git, which treats an unrecognised conditional as false.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -41,9 +42,19 @@ pub struct IncludeContext<'a> {
 	/// The real (driver-resolved, absolute) gitdir, matched by `gitdir:`/`gitdir/i:` conditions.
 	/// `None` makes every `gitdir:` condition non-matching.
 	pub gitdir: Option<&'a Path>,
-	/// The short current branch name (no `refs/heads/`), used by `onbranch:` — **slice 2**. Present
-	/// now so the slice-2 addition needs no API revision; unused by slice 1's `gitdir`-only matching.
+	/// The short branch name of a **symbolic** `HEAD` (its `refs/heads/<name>` target, sans prefix),
+	/// matched by `onbranch:`. git reads it straight off HEAD's symref, so it is present whenever HEAD
+	/// is symbolic — **including an unborn branch and a bare repository** (probed 2.50.1: a bare repo
+	/// with `HEAD -> refs/heads/main` matches `onbranch:main`). `None` is only a **detached** (or
+	/// otherwise unresolvable) HEAD, which makes every `onbranch:` condition non-matching, as in git.
 	pub branch: Option<&'a str>,
+	/// Every `remote.<name>.url` value across the *whole* effective config — all precedence layers and
+	/// all includes, both before and after the directive — matched by `hasconfig:remote.*.url:`. This
+	/// is not "config so far": git resolves the condition by scanning the entire config for remote
+	/// URLs (a separate pre-scan pass), so the *driver*, which alone sees every layer, collects the
+	/// list; the engine only wildmatches the condition's value-glob against it. `None` or empty makes
+	/// every `hasconfig:` condition non-matching.
+	pub remote_urls: Option<&'a [&'a str]>,
 }
 
 /// Resolve a *matched* `include.path` / `includeif.path` value to a filesystem path.
@@ -84,19 +95,72 @@ pub(crate) fn resolve_include_path(
 }
 
 /// Evaluate an `includeIf` condition string (the header's subsection, verbatim), e.g.
-/// `gitdir:~/work/` or `gitdir/i:...`. Returns whether the include should be applied.
+/// `gitdir:~/work/`, `onbranch:feature/*`, or `hasconfig:remote.*.url:https://host/**`. Returns
+/// whether the include should be applied.
 ///
-/// Slice 1 recognises only `gitdir:` (case-sensitive) and `gitdir/i:` (case-insensitive match);
-/// every other condition — including `onbranch:`/`hasconfig:`, which are slice 2 — is non-matching,
-/// mirroring git, which treats an unrecognised conditional as false.
+/// Recognised conditions: `gitdir:` (case-sensitive), `gitdir/i:` (case-insensitive) against the real
+/// gitdir; `onbranch:` against the short current branch; and — matching git, which special-cases only
+/// this one form — the *literal* prefix `hasconfig:remote.*.url:` against the driver-supplied remote
+/// URLs. Every other condition (including a general `hasconfig:<var>:<value>`, which git does **not**
+/// implement) is non-matching, mirroring git's treatment of an unrecognised conditional as false.
 pub(crate) fn condition_matches(condition: &str, dir: &Path, ctx: &IncludeContext<'_>) -> bool {
 	if let Some(pattern) = condition.strip_prefix("gitdir:") {
 		gitdir_matches(pattern, dir, ctx, false)
 	} else if let Some(pattern) = condition.strip_prefix("gitdir/i:") {
 		gitdir_matches(pattern, dir, ctx, true)
+	} else if let Some(pattern) = condition.strip_prefix("onbranch:") {
+		onbranch_matches(pattern, ctx)
+	} else if let Some(glob) = condition.strip_prefix(HASCONFIG_REMOTE_URL_PREFIX) {
+		hasconfig_remote_url_matches(glob, ctx)
 	} else {
 		false
 	}
+}
+
+/// The one `hasconfig:` form git implements: `remote.*.url` is hardcoded, matched as a *literal*
+/// prefix (not a general `<var-glob>`), and everything after it is the value-glob applied to the
+/// config's remote URLs. A `hasconfig:some.other.key:…` or a wildcarded var (`remote.?.url:`) is
+/// therefore unrecognised and non-matching, exactly as in git.
+const HASCONFIG_REMOTE_URL_PREFIX: &str = "hasconfig:remote.*.url:";
+
+/// Whether an `includeIf "hasconfig:remote.*.url:…"` directive is what `condition` is, so the caller
+/// can enforce git's paradox guard (a file it includes may not itself set a remote URL).
+pub(crate) fn is_hasconfig_remote_url(condition: &str) -> bool {
+	condition.starts_with(HASCONFIG_REMOTE_URL_PREFIX)
+}
+
+/// Match an `onbranch:<pat>` condition against `ctx.branch` (the short current branch).
+///
+/// git's `onbranch` preprocessing is *only* the trailing-`/`→`**` rule (unlike `gitdir`, it does
+/// **not** prepend `**/`, so `onbranch:foo` does not match branch `feature/foo`); the result is a
+/// case-sensitive `WM_PATHNAME` wildmatch. A `None` branch (a detached HEAD) never matches.
+fn onbranch_matches(pattern: &str, ctx: &IncludeContext<'_>) -> bool {
+	let Some(branch) = ctx.branch else {
+		return false;
+	};
+	let pattern = append_trailing_starstar(pattern.to_owned());
+	wildmatch(pattern.as_bytes(), branch.as_bytes(), false)
+}
+
+/// Match a `hasconfig:remote.*.url:<glob>` condition: true when *any* remote URL the driver supplied
+/// matches `glob` under a plain, anchored, case-sensitive `WM_PATHNAME` wildmatch (git applies no
+/// prefix/suffix preprocessing to this value-glob). An absent or empty URL list never matches.
+fn hasconfig_remote_url_matches(glob: &str, ctx: &IncludeContext<'_>) -> bool {
+	let Some(urls) = ctx.remote_urls else {
+		return false;
+	};
+	urls
+		.iter()
+		.any(|url| wildmatch(glob.as_bytes(), url.as_bytes(), false))
+}
+
+/// git's trailing-directory rule shared by `gitdir:` and `onbranch:`: a pattern ending in `/` gains a
+/// `**`, so pointing at a parent directory (or a branch namespace) matches everything under it.
+fn append_trailing_starstar(mut pattern: String) -> String {
+	if pattern.ends_with('/') {
+		pattern.push_str("**");
+	}
+	pattern
 }
 
 /// Match a `gitdir[/i]:` pattern against `ctx.gitdir`.
@@ -168,9 +232,7 @@ fn prepare_gitdir_pattern(
 	}
 
 	// A trailing `/` appends `**`, so pointing at a parent directory matches everything under it.
-	if pattern.ends_with('/') {
-		pattern.push_str("**");
-	}
+	let pattern = append_trailing_starstar(pattern);
 
 	Some((pattern, prefix))
 }
@@ -182,13 +244,74 @@ fn prepare_gitdir_pattern(
 /// or a `/` on each side) matches any number of segments, including none; `[...]` is a bracket
 /// expression (ranges `a-z`, sets, and `[!…]`/`[^…]` negation) matching one non-`/` byte; a
 /// backslash escapes the next byte to a literal; every other byte is literal. `icase` folds ASCII
-/// case. Anchored at both ends (the whole `text` must be consumed).
+/// case. Anchored at both ends (the whole `text` must be consumed). A malformed construct — an
+/// unterminated `[`, a terminated-but-unknown POSIX class `[[:bogus:]]`, or a trailing backslash —
+/// aborts the whole match (git's `WM_ABORT_ALL`), so the pattern matches nothing. (A `[:` with no
+/// `:]` terminator is *not* malformed: git, and [`parse_class`], treat the `[` as an ordinary set
+/// member — see [`tokenize`]/[`parse_class`].)
 ///
-/// Implemented as an **O(tokens × text) dynamic program** (not recursive backtracking), so a
-/// pathological pattern like `*a*a…b` against a non-matching text stays linear-ish rather than
-/// exploding exponentially — a config-load DoS if left recursive.
+/// The stars are the only source of non-determinism: every other token matches exactly one byte, so
+/// the pattern's leading run (before the first star) and trailing run (after the last star) are
+/// anchored to the text's ends and matched in **linear lockstep**. Only the between-stars middle needs
+/// the dynamic program. This keeps the common case — a star-free pattern, or one star surrounded by
+/// literals (e.g. a `hasconfig` URL glob) — **O(text)**, matching git, while an adversarial *multi*-star
+/// middle (`*a*a…b`) stays **polynomial** (git's own `wildmatch` is exponential there). No length cap is
+/// imposed: git matches long patterns, and capping would reject inputs git accepts.
 fn wildmatch(pattern: &[u8], text: &[u8], icase: bool) -> bool {
 	let tokens = tokenize(pattern);
+	let n = text.len();
+
+	// Anchor the leading non-star run to the front. Each such token consumes exactly one byte.
+	let first_star = tokens.iter().position(is_star).unwrap_or(tokens.len());
+	let mut lo = 0;
+	for token in &tokens[..first_star] {
+		if lo >= n || !match_one(token, text[lo], icase) {
+			return false;
+		}
+		lo += 1;
+	}
+	// No stars: the pattern is fully anchored, so the text must be exactly consumed.
+	if first_star == tokens.len() {
+		return lo == n;
+	}
+
+	// Anchor the trailing non-star run to the back (there is at least one star, so this run is disjoint
+	// from the leading one in the pattern; a shortfall of text is caught by the `hi <= lo` guard).
+	let last_star = tokens.iter().rposition(is_star).unwrap();
+	let mut hi = n;
+	for token in tokens[last_star + 1..].iter().rev() {
+		if hi <= lo || !match_one(token, text[hi - 1], icase) {
+			return false;
+		}
+		hi -= 1;
+	}
+
+	// Only the middle (first star through last star, inclusive) is non-deterministic.
+	dp_match(&tokens[first_star..=last_star], &text[lo..hi], icase)
+}
+
+/// Whether `token` is a `*`/`**` (the only tokens that match a variable-length run).
+fn is_star(token: &Token) -> bool {
+	matches!(token, Token::Star(_))
+}
+
+/// Whether a single, exactly-one-byte token (`Literal`/`?`/`[...]`) matches `byte`. A `Token::Star`
+/// must not be passed here; a `Token::NeverMatch` never matches (git's `WM_ABORT_ALL`).
+fn match_one(token: &Token, byte: u8, icase: bool) -> bool {
+	match token {
+		Token::NeverMatch => false,
+		Token::Literal(b) => byte_eq(byte, *b, icase),
+		Token::Any => byte != b'/',
+		Token::Class(class) => byte != b'/' && class.matches(byte, icase),
+		Token::Star(_) => unreachable!("match_one is only called on single-byte tokens"),
+	}
+}
+
+/// Anchored `WM_PATHNAME` match of a token slice that begins and ends with a `*`/`**`, over bytes, as
+/// an **O(tokens × text) dynamic program** (not recursive backtracking, which is exponential on an
+/// adversarial `*a*a…b`). Only the previous DP row is kept, so space is **O(text)** — a large
+/// attacker-controlled glob/URL cannot exhaust memory with a full matrix.
+fn dp_match(tokens: &[Token], text: &[u8], icase: bool) -> bool {
 	let k = tokens.len();
 	let n = text.len();
 
@@ -203,35 +326,39 @@ fn wildmatch(pattern: &[u8], text: &[u8], icase: bool) -> bool {
 		};
 	}
 
-	// dp[i][j] = does tokens[i..] match text[j..].
-	let mut dp = vec![vec![false; n + 1]; k + 1];
-	for (j, cell) in dp[k].iter_mut().enumerate() {
-		*cell = j == n;
-	}
+	// `dp[i][j]` = does `tokens[i..]` match `text[j..]`. Row `i` reads only row `i + 1` and its own
+	// already-computed columns (`j` descends), so two rolling rows suffice: `next` holds row `i + 1`,
+	// `cur` the row `i` being filled. The base row `i == k` (no tokens left) matches only the empty
+	// tail: `dp[k][j] = (j == n)`.
+	let mut next: Vec<bool> = (0..=n).map(|j| j == n).collect();
+	let mut cur = vec![false; n + 1];
 	for i in (0..k).rev() {
 		for j in (0..=n).rev() {
-			dp[i][j] = match &tokens[i] {
-				// A malformed (unterminated) `[` makes the whole pattern unsatisfiable, as in git.
+			cur[j] = match &tokens[i] {
+				// A malformed construct makes the whole pattern unsatisfiable, as git's WM_ABORT_ALL.
 				Token::NeverMatch => false,
-				Token::Literal(b) => j < n && byte_eq(text[j], *b, icase) && dp[i + 1][j + 1],
-				Token::Any => j < n && text[j] != b'/' && dp[i + 1][j + 1],
+				Token::Literal(b) => j < n && byte_eq(text[j], *b, icase) && next[j + 1],
+				Token::Any => j < n && text[j] != b'/' && next[j + 1],
 				Token::Class(class) => {
-					j < n && text[j] != b'/' && class.matches(text[j], icase) && dp[i + 1][j + 1]
+					j < n && text[j] != b'/' && class.matches(text[j], icase) && next[j + 1]
 				}
 				// A single `*` matches empty, or one more non-`/` byte within the same segment.
-				Token::Star(StarKind::Single) => dp[i + 1][j] || (j < n && text[j] != b'/' && dp[i][j + 1]),
+				Token::Star(StarKind::Single) => next[j] || (j < n && text[j] != b'/' && cur[j + 1]),
 				// A trailing `**` matches any remainder, crossing `/`.
-				Token::Star(StarKind::Trailing) => dp[i + 1][j] || (j < n && dp[i][j + 1]),
+				Token::Star(StarKind::Trailing) => next[j] || (j < n && cur[j + 1]),
 				// A `**/` matches zero or more *complete* path components: either nothing (resume at
 				// this boundary), or up to and including the next `/` then recurse at that boundary.
 				Token::Star(StarKind::Segment) => {
 					let s = next_slash[j];
-					dp[i + 1][j] || (s < n && (dp[i + 1][s + 1] || dp[i][s + 1]))
+					next[j] || (s < n && (next[s + 1] || cur[s + 1]))
 				}
 			};
 		}
+		// Row `i` becomes row `i + 1` for the next (lower) token index.
+		std::mem::swap(&mut next, &mut cur);
 	}
-	dp[0][0]
+	// The final swap left row `0` in `next`.
+	next[0]
 }
 
 /// How a collapsed `*`/`**` run matches (see [`wildmatch`]).
@@ -331,7 +458,11 @@ impl Class {
 	fn matches(&self, c: u8, icase: bool) -> bool {
 		let hit = self.items.iter().any(|item| match *item {
 			ClassItem::Char(b) => byte_eq(c, b, icase),
-			ClassItem::Range(lo, hi) => in_range(c, lo, hi, icase),
+			// git reads a range's low endpoint as an ordinary member *before* it sees the `-`, so `lo`
+			// matches as a literal in addition to the `lo..=hi` span. This only shows for a descending
+			// range (`[b-a]` matches `b`), where the span is empty; for an ascending range `lo` is
+			// already in the span.
+			ClassItem::Range(lo, hi) => byte_eq(c, lo, icase) || in_range(c, lo, hi, icase),
 			ClassItem::Posix(class) => class.matches(c, icase),
 		});
 		hit != self.negated
@@ -383,9 +514,16 @@ fn tokenize(pattern: &[u8]) -> Vec<Token> {
 					break;
 				}
 			},
-			b'\\' if i + 1 < pattern.len() => {
-				tokens.push(Token::Literal(pattern[i + 1]));
-				i += 2;
+			b'\\' => {
+				if i + 1 < pattern.len() {
+					tokens.push(Token::Literal(pattern[i + 1]));
+					i += 2;
+				} else {
+					// A trailing backslash (nothing to escape) aborts the whole match, as git's
+					// wildmatch does (`WM_ABORT_ALL`) rather than matching a literal `\`.
+					tokens.push(Token::NeverMatch);
+					break;
+				}
 			}
 			other => {
 				tokens.push(Token::Literal(other));
@@ -397,7 +535,9 @@ fn tokenize(pattern: &[u8]) -> Vec<Token> {
 }
 
 /// Parse a `[...]` class beginning at `start` (`pattern[start] == b'['`), returning the class and
-/// the index just past the closing `]`, or `None` if unterminated.
+/// the index just past the closing `]`, or `None` if the class is malformed (unterminated, or a bad
+/// POSIX `[:...` — git aborts the whole match in both cases, which the caller renders as a
+/// [`Token::NeverMatch`]).
 fn parse_class(pattern: &[u8], start: usize) -> Option<(Class, usize)> {
 	let mut i = start + 1;
 	let mut negated = false;
@@ -413,16 +553,34 @@ fn parse_class(pattern: &[u8], start: usize) -> Option<(Class, usize)> {
 			return Some((Class { negated, items }, i + 1));
 		}
 		first = false;
-		// A POSIX class `[:name:]` is a single item (its inner `]` does not close the outer class).
+		// A `[:name:]` POSIX class. git recognises it only when the run from `[:` to the next `]` is
+		// terminated `…:]` (the `]` immediately preceded by `:`) with a non-empty name; it then aborts
+		// the whole match on an unknown name (git's `WM_ABORT_ALL`). Otherwise the `[` is just an
+		// ordinary set member and parsing continues from the `:` — so e.g. `[[:abc]` is the set
+		// `{[ : a b c}`, matching a literal `[`, `:`, `a`, `b`, or `c`. (Mirrors git's `dowild`.)
 		if pattern[i] == b'[' && pattern.get(i + 1) == Some(&b':') {
-			if let Some(colon) = find_posix_end(pattern, i + 2)
-				&& let Some(class) = PosixClass::from_name(&pattern[i + 2..colon])
-			{
-				items.push(ClassItem::Posix(class));
-				i = colon + 2; // skip past the closing `:]`
-				continue;
+			let name_start = i + 2;
+			let mut close = name_start;
+			while close < pattern.len() && pattern[close] != b']' {
+				close += 1;
 			}
-			// An unterminated or unknown `[:...` is a literal `[` member, as a safe fallback.
+			if close >= pattern.len() {
+				// No `]` at all: the whole bracket is unterminated, which git aborts.
+				return None;
+			}
+			if close > name_start && pattern[close - 1] == b':' {
+				// Terminated `[:name:]`: a known name is the class; an unknown one aborts the match.
+				let name = &pattern[name_start..close - 1];
+				match PosixClass::from_name(name) {
+					Some(class) => {
+						items.push(ClassItem::Posix(class));
+						i = close + 1; // skip past the closing `]`
+						continue;
+					}
+					None => return None,
+				}
+			}
+			// Not a `…:]` terminator: treat the `[` as an ordinary member and resume from the `:`.
 			items.push(ClassItem::Char(b'['));
 			i += 1;
 			continue;
@@ -449,19 +607,6 @@ fn parse_class(pattern: &[u8], start: usize) -> Option<(Class, usize)> {
 			items.push(ClassItem::Char(lo));
 			i = after_lo;
 		}
-	}
-	None
-}
-
-/// Find the `:` of a `[:name:]` POSIX class terminator (`:]`) starting the scan at `from`, returning
-/// the index of that `:`, or `None` if there is no `:]` before the pattern ends.
-fn find_posix_end(pattern: &[u8], from: usize) -> Option<usize> {
-	let mut j = from;
-	while j + 1 < pattern.len() {
-		if pattern[j] == b':' && pattern[j + 1] == b']' {
-			return Some(j);
-		}
-		j += 1;
 	}
 	None
 }
@@ -535,6 +680,7 @@ mod tests {
 			home,
 			gitdir,
 			branch: None,
+			remote_urls: None,
 		}
 	}
 
@@ -957,6 +1103,288 @@ mod tests {
 		assert!(!gm("/repos/repo[", "/repos/repo[/.git", false));
 	}
 
+	// --- onbranch matching ---
+
+	/// Evaluate `onbranch:<pattern>` against `branch` through the full condition dispatch.
+	fn onbranch(pattern: &str, branch: Option<&str>) -> bool {
+		let c = IncludeContext {
+			home: None,
+			gitdir: None,
+			branch,
+			remote_urls: None,
+		};
+		condition_matches(&format!("onbranch:{pattern}"), Path::new("/etc"), &c)
+	}
+
+	#[test]
+	fn onbranch_matches_short_branch_with_pathname_wildmatch() {
+		let b = Some("feature/foo");
+		// Exact, single-`*` (stops at `/`), `**` (crosses `/`) all match.
+		assert!(onbranch("feature/foo", b));
+		assert!(onbranch("feature/*", b));
+		assert!(onbranch("feature/**", b));
+		// Trailing `/` appends `**`, so the namespace matches everything beneath it.
+		assert!(onbranch("feature/", b));
+		// Unlike gitdir, onbranch does NOT prepend `**/`: a bare segment does not match a deeper branch.
+		assert!(!onbranch("foo", b));
+		// A non-matching pattern, and a single `*` that would have to cross `/`.
+		assert!(!onbranch("other", b));
+		assert!(!onbranch("*", b));
+		// Matching is case-sensitive (branch names are).
+		assert!(!onbranch("Feature/foo", b));
+	}
+
+	#[test]
+	fn onbranch_never_matches_without_a_branch() {
+		// A detached HEAD or bare repo supplies no branch, so every onbranch condition is false.
+		assert!(!onbranch("main", None));
+		assert!(!onbranch("*", None));
+	}
+
+	#[test]
+	fn onbranch_applies_include_through_expand() {
+		let resolver = MapResolver::default().with("/etc/branch.cfg", "[user]\n\temail = onbr\n");
+		let source = "[includeIf \"onbranch:feature/*\"]\n\tpath = branch.cfg\n";
+		let on = IncludeContext {
+			home: None,
+			gitdir: None,
+			branch: Some("feature/x"),
+			remote_urls: None,
+		};
+		let mut config = GitConfigSource::parse(source).unwrap();
+		block_on(config.expand_includes(Path::new("/etc"), &on, &resolver)).unwrap();
+		assert_eq!(config.get_string("user", None, "email"), Some("onbr"));
+
+		// A non-matching branch does not apply it.
+		let off = IncludeContext {
+			branch: Some("main"),
+			..on
+		};
+		let mut config = GitConfigSource::parse(source).unwrap();
+		block_on(config.expand_includes(Path::new("/etc"), &off, &resolver)).unwrap();
+		assert!(config.get_string("user", None, "email").is_none());
+	}
+
+	// --- hasconfig:remote.*.url matching ---
+
+	/// Evaluate `hasconfig:remote.*.url:<glob>` against `urls` through the full condition dispatch.
+	fn hasconfig(glob: &str, urls: Option<&[&str]>) -> bool {
+		let c = IncludeContext {
+			home: None,
+			gitdir: None,
+			branch: None,
+			remote_urls: urls,
+		};
+		condition_matches(
+			&format!("hasconfig:remote.*.url:{glob}"),
+			Path::new("/etc"),
+			&c,
+		)
+	}
+
+	#[test]
+	fn hasconfig_matches_any_url_with_anchored_pathname_wildmatch() {
+		let urls: &[&str] = &[
+			"git@example:other.git",
+			"https://github.com/example/repo.git",
+		];
+		// `**` crosses `/`, so the value-glob matches the whole URL.
+		assert!(hasconfig("https://github.com/**", Some(urls)));
+		// A single `*` stops at `/`, so it cannot span the URL's path — no match (git's WM_PATHNAME).
+		assert!(!hasconfig("https://github.com/*", Some(urls)));
+		// The glob is anchored (whole-string): a bare host without the trailing `**` does not match.
+		assert!(!hasconfig("https://github.com/", Some(urls)));
+		// Case-sensitive value matching.
+		assert!(!hasconfig("https://GITHUB.com/**", Some(urls)));
+		// No URL matches this host at all.
+		assert!(!hasconfig("https://gitlab.com/**", Some(urls)));
+	}
+
+	#[test]
+	fn hasconfig_never_matches_without_urls() {
+		assert!(!hasconfig("https://github.com/**", None));
+		assert!(!hasconfig("https://github.com/**", Some(&[])));
+	}
+
+	#[test]
+	fn hasconfig_only_the_literal_remote_url_form_is_recognised() {
+		// git special-cases exactly `hasconfig:remote.*.url:`; a wildcarded or differently-cased var
+		// glob, or a general `hasconfig:<var>:<value>`, is an unrecognised conditional → false.
+		let urls: &[&str] = &["https://github.com/example/repo.git"];
+		let c = IncludeContext {
+			home: None,
+			gitdir: None,
+			branch: None,
+			remote_urls: Some(urls),
+		};
+		let m = |cond: &str| condition_matches(cond, Path::new("/etc"), &c);
+		assert!(m("hasconfig:remote.*.url:https://github.com/**"));
+		assert!(!m("hasconfig:remote.?.url:https://github.com/**"));
+		assert!(!m("hasconfig:remote.*.URL:https://github.com/**"));
+		assert!(!m("hasconfig:some.key:https://github.com/**"));
+		assert!(!m("hasconfig:remote.*.pushurl:https://github.com/**"));
+	}
+
+	#[test]
+	fn hasconfig_applies_include_through_expand() {
+		let urls: &[&str] = &["https://github.com/example/repo.git"];
+		let resolver = MapResolver::default().with("/etc/id.cfg", "[user]\n\temail = ghid\n");
+		let source = "[includeIf \"hasconfig:remote.*.url:https://github.com/**\"]\n\tpath = id.cfg\n";
+		let c = IncludeContext {
+			home: None,
+			gitdir: None,
+			branch: None,
+			remote_urls: Some(urls),
+		};
+		let mut config = GitConfigSource::parse(source).unwrap();
+		block_on(config.expand_includes(Path::new("/etc"), &c, &resolver)).unwrap();
+		assert_eq!(config.get_string("user", None, "email"), Some("ghid"));
+	}
+
+	#[test]
+	fn hasconfig_included_file_setting_a_remote_url_is_fatal() {
+		// git forbids a hasconfig-included file from setting a `remote.<name>.url` (it would circularly
+		// feed the condition). The engine enforces this on the matched path.
+		let urls: &[&str] = &["https://github.com/example/repo.git"];
+		let resolver = MapResolver::default().with(
+			"/etc/id.cfg",
+			"[remote \"sneaky\"]\n\turl = https://elsewhere/x.git\n[user]\n\temail = ghid\n",
+		);
+		let source = "[includeIf \"hasconfig:remote.*.url:https://github.com/**\"]\n\tpath = id.cfg\n";
+		let c = IncludeContext {
+			home: None,
+			gitdir: None,
+			branch: None,
+			remote_urls: Some(urls),
+		};
+		let mut config = GitConfigSource::parse(source).unwrap();
+		let err = block_on(config.expand_includes(Path::new("/etc"), &c, &resolver)).unwrap_err();
+		assert!(
+			matches!(err, ConfigError::HasconfigIncludeSetsRemoteUrl),
+			"{err:?}"
+		);
+	}
+
+	#[test]
+	fn hasconfig_included_file_forbidden_url_is_indirect_too() {
+		// A file the hasconfig include pulls in via a plain `[include]` may not set a remote url either
+		// (git: "directly or indirectly"). The recursive expansion folds the nested url in, so the guard
+		// catches it.
+		let urls: &[&str] = &["https://github.com/example/repo.git"];
+		let resolver = MapResolver::default()
+			.with(
+				"/etc/wrapper.cfg",
+				"[include]\n\tpath = deep.cfg\n[user]\n\temail = ghid\n",
+			)
+			.with(
+				"/etc/deep.cfg",
+				"[remote \"deep\"]\n\turl = https://deep/z.git\n",
+			);
+		let source =
+			"[includeIf \"hasconfig:remote.*.url:https://github.com/**\"]\n\tpath = wrapper.cfg\n";
+		let c = IncludeContext {
+			home: None,
+			gitdir: None,
+			branch: None,
+			remote_urls: Some(urls),
+		};
+		let mut config = GitConfigSource::parse(source).unwrap();
+		let err = block_on(config.expand_includes(Path::new("/etc"), &c, &resolver)).unwrap_err();
+		assert!(
+			matches!(err, ConfigError::HasconfigIncludeSetsRemoteUrl),
+			"{err:?}"
+		);
+	}
+
+	#[test]
+	fn hasconfig_included_bare_remote_url_is_allowed() {
+		// A bare `remote.url` (no subsection) is not a `remote.<name>.url`, so git neither collects nor
+		// forbids it — the include applies without error.
+		let urls: &[&str] = &["https://github.com/example/repo.git"];
+		let resolver = MapResolver::default().with(
+			"/etc/id.cfg",
+			"[remote]\n\turl = https://bare/x.git\n[user]\n\temail = ghid\n",
+		);
+		let source = "[includeIf \"hasconfig:remote.*.url:https://github.com/**\"]\n\tpath = id.cfg\n";
+		let c = IncludeContext {
+			home: None,
+			gitdir: None,
+			branch: None,
+			remote_urls: Some(urls),
+		};
+		let mut config = GitConfigSource::parse(source).unwrap();
+		block_on(config.expand_includes(Path::new("/etc"), &c, &resolver)).unwrap();
+		assert_eq!(config.get_string("user", None, "email"), Some("ghid"));
+	}
+
+	#[test]
+	fn plain_include_setting_a_remote_url_is_not_forbidden() {
+		// The paradox guard is specific to hasconfig includes; an ordinary `[include]` may carry remote
+		// urls freely (indeed that is how git's hasconfig sees urls introduced by earlier includes).
+		let resolver = MapResolver::default().with(
+			"/etc/urls.cfg",
+			"[remote \"origin\"]\n\turl = https://github.com/x.git\n",
+		);
+		let source = "[include]\n\tpath = urls.cfg\n";
+		let config = expand(source, "/etc", &ctx(None, None), &resolver);
+		assert_eq!(
+			config.get_string("remote", Some("origin"), "url"),
+			Some("https://github.com/x.git")
+		);
+	}
+
+	#[test]
+	fn hasconfig_url_guard_fires_before_a_later_bad_include() {
+		// A hasconfig target sets a `remote.<name>.url` and *then* has a bare (valueless) include. git
+		// reads top-to-bottom, so the URL paradox fatals before the bad include is reached — probed:
+		// git errors with the remote-URL message, not `missing value`. The positional guard matches
+		// this; a post-hoc scan would surface `IncludeMissingValue` from expanding the later include.
+		let urls: &[&str] = &["https://github.com/example/repo.git"];
+		let resolver = MapResolver::default().with(
+			"/etc/id.cfg",
+			"[remote \"sneaky\"]\n\turl = https://elsewhere/x.git\n[include]\n\tpath\n",
+		);
+		let source = "[includeIf \"hasconfig:remote.*.url:https://github.com/**\"]\n\tpath = id.cfg\n";
+		let c = IncludeContext {
+			home: None,
+			gitdir: None,
+			branch: None,
+			remote_urls: Some(urls),
+		};
+		let mut config = GitConfigSource::parse(source).unwrap();
+		let err = block_on(config.expand_includes(Path::new("/etc"), &c, &resolver)).unwrap_err();
+		assert!(
+			matches!(err, ConfigError::HasconfigIncludeSetsRemoteUrl),
+			"{err:?}"
+		);
+	}
+
+	#[test]
+	fn malformed_condition_patterns_never_match() {
+		// git aborts the whole wildmatch (`WM_ABORT_ALL`) on a *terminated-but-unknown* POSIX class or a
+		// trailing backslash, so such an `onbranch:`/`hasconfig:` pattern matches nothing — even text a
+		// literal reading of the construct would match (branch `b]`, url `a\`).
+		assert!(!onbranch("[[:bogus:]]", Some("b]")));
+		assert!(!hasconfig("[[:bogus:]]", Some(&["b]"])));
+		assert!(!hasconfig("a\\", Some(&["a\\"])));
+		// A well-formed class still matches, so the abort is scoped to the malformed case.
+		assert!(onbranch("[[:digit:]]", Some("7")));
+	}
+
+	#[test]
+	fn bracket_edge_cases_match_git() {
+		// A `[:` with no `:]` terminator is NOT malformed: git treats `[` as an ordinary set member, so
+		// `[[:abc]` is the set `{[ : a b c}` and matches branch `a` (probed against git 2.50.1).
+		assert!(onbranch("[[:abc]", Some("a")));
+		assert!(!onbranch("[[:abc]", Some("z")));
+		// A descending range matches its low endpoint (git reads it as a literal before the `-`): `[b-a]`
+		// matches `b`, but not `a` (the empty span) — probed.
+		assert!(onbranch("[b-a]", Some("b")));
+		assert!(!onbranch("[b-a]", Some("a")));
+		// An ascending range is unchanged.
+		assert!(onbranch("[a-c]", Some("b")));
+	}
+
 	// --- wildmatch unit tests ---
 
 	#[test]
@@ -1045,12 +1473,63 @@ mod tests {
 	}
 
 	#[test]
+	fn wildmatch_aborts_on_malformed_constructs() {
+		// git's wildmatch returns `WM_ABORT_ALL` for a trailing backslash or a terminated-but-unknown
+		// POSIX class, making the whole pattern match nothing — even text a literal reading would match.
+		// (This also corrects the shared matcher for `gitdir:`, which routes through the same code.)
+		// Trailing backslash: `a\` must not match `a\` (which a literal-backslash reading would).
+		assert!(!wildmatch(b"a\\", b"a\\", false));
+		assert!(!wildmatch(b"*\\", b"x\\", false));
+		// Terminated-but-unknown POSIX class `[[:bogus:]]` aborts: must not match `b]`.
+		assert!(!wildmatch(b"[[:bogus:]]", b"b]", false));
+		// An escaped interior byte is still a literal (only a *trailing* backslash aborts).
+		assert!(wildmatch(b"a\\bc", b"abc", false));
+	}
+
+	#[test]
+	fn wildmatch_bracket_edge_cases_match_git() {
+		let m = |p: &[u8], t: &[u8]| wildmatch(p, t, false);
+		// `[:` with no `:]` terminator is an ordinary set, `[` included as a literal member. So
+		// `[[:abc]` = `{[ : a b c}` — matches each of those one-byte texts, nothing else.
+		assert!(m(b"[[:abc]", b"["));
+		assert!(m(b"[[:abc]", b":"));
+		assert!(m(b"[[:abc]", b"a"));
+		assert!(m(b"[[:abc]", b"c"));
+		assert!(!m(b"[[:abc]", b"z"));
+		// A descending range matches only its low endpoint (tested as a literal before the `-`).
+		assert!(m(b"[b-a]", b"b"));
+		assert!(!m(b"[b-a]", b"a"));
+		assert!(!m(b"[b-a]", b"c"));
+		// An ascending range spans as usual, and its endpoints match.
+		assert!(m(b"[a-c]", b"a"));
+		assert!(m(b"[a-c]", b"b"));
+		assert!(m(b"[a-c]", b"c"));
+		assert!(!m(b"[a-c]", b"d"));
+	}
+
+	#[test]
 	fn wildmatch_is_not_exponential_on_pathological_patterns() {
 		// `*a` × 28 followed by `b`, against a long text with no `b`: a recursive backtracker is
 		// exponential here (a config-load DoS); the DP stays fast. Just assert it returns (quickly).
 		let pattern = "*a".repeat(28) + "b";
 		let text = "a".repeat(4096);
 		assert!(!wildmatch(pattern.as_bytes(), text.as_bytes(), false));
+	}
+
+	#[test]
+	fn wildmatch_large_literal_inputs_stay_linear() {
+		// A `hasconfig` glob and URL are attacker-controlled config values. A full O(tokens × text) DP
+		// took seconds on a ~20 KiB literal pair (a config-load hang); anchoring the star-free / literal
+		// runs keeps these linear, so this returns instantly rather than doing ~n² work.
+		let lit = "a".repeat(20_000);
+		assert!(wildmatch(lit.as_bytes(), lit.as_bytes(), false));
+		let longer = format!("{lit}b");
+		assert!(!wildmatch(lit.as_bytes(), longer.as_bytes(), false));
+		// One star between long literal runs is linear too (both runs anchor to the text's ends).
+		let glob = format!("{lit}*{lit}");
+		let url = format!("{lit}MIDDLE{lit}");
+		assert!(wildmatch(glob.as_bytes(), url.as_bytes(), false));
+		assert!(!wildmatch(glob.as_bytes(), lit.as_bytes(), false));
 	}
 
 	/// Drive `future` to completion on a fresh current-thread runtime — the resolver's `read` is the
