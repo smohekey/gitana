@@ -214,7 +214,7 @@ async fn read_repo_config<H: HashAlgorithm>(
 	if local_only {
 		Ok(repo.read_config().await?)
 	} else {
-		git_config::effective_config(repo).await
+		Ok(repo.effective_config().await?)
 	}
 }
 

@@ -34,6 +34,6 @@ mod source;
 pub use self::config::GitConfig;
 pub use self::error::ConfigError;
 pub use self::include::{IncludeContext, IncludeResolver};
-pub use self::source::GitConfigSource;
+pub use self::source::{GitConfigSource, RemoteUrlScan};
 
 pub(crate) use self::include::{condition_matches, is_hasconfig_remote_url, resolve_include_path};

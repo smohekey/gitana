@@ -43,7 +43,7 @@ pub async fn signature<H: HashAlgorithm>(
 	repo: &Repository<Backend, H>,
 	role: &str,
 ) -> Result<String> {
-	let config = crate::git_config::effective_config(repo).await?;
+	let config = repo.effective_config().await?;
 	gitana_identity::signature(
 		role,
 		env_override(role, "NAME"),
@@ -61,7 +61,7 @@ pub async fn signature_or_default<H: HashAlgorithm>(
 	repo: &Repository<Backend, H>,
 	role: &str,
 ) -> Result<String> {
-	let config = crate::git_config::effective_config(repo).await?;
+	let config = repo.effective_config().await?;
 	Ok(gitana_identity::signature_or_default(
 		env_override(role, "NAME"),
 		env_override(role, "EMAIL"),

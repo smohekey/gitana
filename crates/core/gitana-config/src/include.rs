@@ -15,7 +15,8 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
-/// Reads the text of an include target, or `Ok(None)` if it is absent.
+/// Reads the text of an include target **and its canonical (symlink-resolved) path**, or `Ok(None)` if
+/// it is absent.
 ///
 /// An absent include is silently skipped (git does not error on a missing `include.path`), which is
 /// why "absent" is modelled as `Ok(None)` rather than an error. The read is async so both a native
@@ -23,12 +24,20 @@ use std::path::{Path, PathBuf};
 /// an API change; the crate itself performs no I/O. The future is `Send` (the desugared form
 /// matching this crate's `FileStore` convention), and the trait is `Send + Sync` (like `FileStore`),
 /// so an expansion — which holds `&resolver` across the read await — stays `Send` and spawnable.
+///
+/// The returned **canonical path** is how the engine reproduces git's split treatment of a config
+/// file's directory: git resolves a relative `include.path` against the file's *lexical* directory (the
+/// path it was reached through, symlink and all), but a `gitdir:./` condition against the file's *real*
+/// directory. The engine derives the lexical directory from the path it asked to read and the real
+/// directory from this returned canonical path, so a resolver must canonicalize (resolve symlinks and
+/// `..`) the path it actually read. A resolver over a store with no symlink notion may return the
+/// requested path unchanged.
 pub trait IncludeResolver: Send + Sync {
-	/// Return the file's text, or `None` if it does not exist.
+	/// Return the file's text paired with its canonical path, or `None` if it does not exist.
 	fn read(
 		&self,
 		path: &Path,
-	) -> impl Future<Output = Result<Option<String>, crate::ConfigError>> + Send;
+	) -> impl Future<Output = Result<Option<(String, PathBuf)>, crate::ConfigError>> + Send;
 }
 
 /// The ambient facts an [`IncludeResolver`]-driven expansion needs to resolve paths and evaluate
@@ -42,6 +51,13 @@ pub struct IncludeContext<'a> {
 	/// The real (driver-resolved, absolute) gitdir, matched by `gitdir:`/`gitdir/i:` conditions.
 	/// `None` makes every `gitdir:` condition non-matching.
 	pub gitdir: Option<&'a Path>,
+	/// git's **second** gitdir candidate: the absolute, symlink-*preserving* spelling of the gitdir git
+	/// forms from the `$PWD` it honours (its `strbuf_add_absolute_path` fallback). git matches a
+	/// `gitdir:` condition against `gitdir` (the realpath) **and** this; either matching applies the
+	/// include, so a condition spelled with a symlinked path still matches when the repo was reached
+	/// through that symlink. `None` when there is no distinct symlink spelling (it would equal
+	/// `gitdir`); the driver derives it from `$PWD`, which alone carries the spelling.
+	pub gitdir_absolute: Option<&'a Path>,
 	/// The short branch name of a **symbolic** `HEAD` (its `refs/heads/<name>` target, sans prefix),
 	/// matched by `onbranch:`. git reads it straight off HEAD's symref, so it is present whenever HEAD
 	/// is symbolic — **including an unborn branch and a bare repository** (probed 2.50.1: a bare repo
@@ -69,6 +85,7 @@ pub(crate) fn resolve_include_path(
 	value: &str,
 	dir: &Path,
 	home: Option<&Path>,
+	fileless: bool,
 ) -> Result<PathBuf, crate::ConfigError> {
 	if value == "~" {
 		// A bare `~` is `$HOME` itself (git expands it before the `~user` interpretation).
@@ -88,6 +105,11 @@ pub(crate) fn resolve_include_path(
 		let path = Path::new(value);
 		if path.is_absolute() {
 			Ok(path.to_path_buf())
+		} else if fileless {
+			// Command-scope config (`-c` / `GIT_CONFIG_*`) has no containing file to resolve a relative
+			// include against; git makes this fatal. (`~`/`~/` above are home-based, not relative, so they
+			// are allowed from command scope, as in git.)
+			Err(crate::ConfigError::IncludeRelativeFromCommandScope)
 		} else {
 			Ok(dir.join(path))
 		}
@@ -103,11 +125,24 @@ pub(crate) fn resolve_include_path(
 /// this one form — the *literal* prefix `hasconfig:remote.*.url:` against the driver-supplied remote
 /// URLs. Every other condition (including a general `hasconfig:<var>:<value>`, which git does **not**
 /// implement) is non-matching, mirroring git's treatment of an unrecognised conditional as false.
-pub(crate) fn condition_matches(condition: &str, dir: &Path, ctx: &IncludeContext<'_>) -> bool {
+///
+/// `real_dir` is the including file's **real** (symlink-resolved) directory, used only by a `gitdir:./`
+/// pattern (git realpaths the config file for that condition); the other conditions ignore it.
+///
+/// `fileless` marks a **command-scope** source (`-c` / `GIT_CONFIG_*`), which has no containing file. A
+/// `gitdir:./` condition then has nothing to resolve against; git prints a non-fatal warning and treats
+/// the condition as unmatched, so this returns `false` for it (`real_dir` is ignored). The other
+/// conditions are unaffected.
+pub(crate) fn condition_matches(
+	condition: &str,
+	real_dir: &Path,
+	ctx: &IncludeContext<'_>,
+	fileless: bool,
+) -> bool {
 	if let Some(pattern) = condition.strip_prefix("gitdir:") {
-		gitdir_matches(pattern, dir, ctx, false)
+		gitdir_matches(pattern, real_dir, ctx, false, fileless)
 	} else if let Some(pattern) = condition.strip_prefix("gitdir/i:") {
-		gitdir_matches(pattern, dir, ctx, true)
+		gitdir_matches(pattern, real_dir, ctx, true, fileless)
 	} else if let Some(pattern) = condition.strip_prefix("onbranch:") {
 		onbranch_matches(pattern, ctx)
 	} else if let Some(glob) = condition.strip_prefix(HASCONFIG_REMOTE_URL_PREFIX) {
@@ -168,20 +203,33 @@ fn append_trailing_starstar(mut pattern: String) -> String {
 /// gitdir matching assumes git's slash-form (`/`-separated) paths, as the Unix/wasm drivers supply.
 /// Windows path normalization (backslash separators, verbatim `\\?\` prefixes) is a deferred
 /// follow-up.
-fn gitdir_matches(pattern: &str, dir: &Path, ctx: &IncludeContext<'_>, icase: bool) -> bool {
-	let Some(gitdir) = ctx.gitdir else {
+fn gitdir_matches(
+	pattern: &str,
+	dir: &Path,
+	ctx: &IncludeContext<'_>,
+	icase: bool,
+	fileless: bool,
+) -> bool {
+	let Some((pattern, prefix)) = prepare_gitdir_pattern(pattern, dir, ctx.home, fileless) else {
 		return false;
 	};
-	let Some((pattern, prefix)) = prepare_gitdir_pattern(pattern, dir, ctx.home) else {
-		return false;
-	};
+	// git prepares the pattern once and matches it against each gitdir candidate in turn (its `again:`
+	// loop), applying the include if *either* matches: `ctx.gitdir` is realpath(git_dir), and
+	// `ctx.gitdir_absolute` is the symlink-preserving `$PWD`-honoured spelling (absent when it would be
+	// identical). Only the text swaps between candidates; the prepared pattern (and its literal prefix)
+	// is shared.
+	[ctx.gitdir, ctx.gitdir_absolute]
+		.into_iter()
+		.flatten()
+		.any(|gitdir| gitdir_text_matches(pattern.as_bytes(), prefix, gitdir, icase))
+}
 
+/// Match a prepared gitdir pattern against one gitdir candidate's text: the interpolated `./<dir>`
+/// prefix (length `prefix`) is matched literally — so a wildcard within it cannot cross a `/` — and the
+/// wildmatch runs only on the remainder.
+fn gitdir_text_matches(pattern: &[u8], prefix: usize, gitdir: &Path, icase: bool) -> bool {
 	let text = path_to_string(gitdir);
-	let pattern = pattern.as_bytes();
 	let text = text.as_bytes();
-
-	// git matches the interpolated `./<dir>` prefix literally (so a wildcard within it cannot cross
-	// a `/`), running the wildmatch only on the remainder.
 	if prefix > 0 && (text.len() < prefix || !bytes_eq(&pattern[..prefix], &text[..prefix], icase)) {
 		return false;
 	}
@@ -195,6 +243,7 @@ fn prepare_gitdir_pattern(
 	pattern: &str,
 	dir: &Path,
 	home: Option<&Path>,
+	fileless: bool,
 ) -> Option<(String, usize)> {
 	let mut prefix = 0;
 
@@ -215,10 +264,18 @@ fn prepare_gitdir_pattern(
 	};
 
 	if let Some(rest) = pattern.strip_prefix("./") {
-		// `./` is relative to the including file's directory; that directory is matched literally.
-		// NOTE (deferred, slice 3): `dir` is used lexically here — a file reached via a `..`/symlinked
-		// path can have a lexical parent that differs from its realpath, which git resolves. The pure
-		// crate cannot realpath (no fs), so the driver must pass a canonicalized including-file dir.
+		// A `./` condition needs the including file's directory. Command-scope config has no file, so
+		// git prints `relative config include conditionals must come from files` and treats it as
+		// unmatched (non-fatal) — reproduced here as a non-match (`None`) rather than mis-anchoring it at
+		// the filesystem root, which would let it match unrelated repositories.
+		if fileless {
+			return None;
+		}
+		// `./` is relative to the including file's **real** (symlink-resolved) directory, matched
+		// literally — git realpaths the config file for this condition. `dir` here is that real
+		// directory: the driver canonicalizes the top-level config file's parent, and for a nested
+		// include the engine takes it from the resolver's returned canonical path. (Relative
+		// `include.path`s, by contrast, resolve against the *lexical* directory — see `expand_includes`.)
 		let mut base = path_to_string(dir);
 		if !base.ends_with('/') {
 			base.push('/');
@@ -654,7 +711,7 @@ mod tests {
 	use std::collections::HashMap;
 
 	use super::*;
-	use crate::{ConfigError, GitConfigSource};
+	use crate::{ConfigError, GitConfigSource, RemoteUrlScan};
 
 	/// An in-memory [`IncludeResolver`] backed by a path→text map; an unmapped path reads as absent.
 	#[derive(Default)]
@@ -670,8 +727,14 @@ mod tests {
 	}
 
 	impl IncludeResolver for MapResolver {
-		async fn read(&self, path: &Path) -> Result<Option<String>, ConfigError> {
-			Ok(self.files.get(path).cloned())
+		async fn read(&self, path: &Path) -> Result<Option<(String, PathBuf)>, ConfigError> {
+			// No symlinks in the in-memory map, so the canonical path is the requested path.
+			Ok(
+				self
+					.files
+					.get(path)
+					.map(|text| (text.clone(), path.to_path_buf())),
+			)
 		}
 	}
 
@@ -679,6 +742,7 @@ mod tests {
 		IncludeContext {
 			home,
 			gitdir,
+			gitdir_absolute: None,
 			branch: None,
 			remote_urls: None,
 		}
@@ -694,8 +758,19 @@ mod tests {
 		resolver: &MapResolver,
 	) -> GitConfigSource {
 		let mut config = GitConfigSource::parse(source).unwrap();
-		block_on(config.expand_includes(Path::new(dir), ctx, resolver)).unwrap();
+		block_on(config.expand_includes(Path::new(dir), Path::new(dir), ctx, resolver)).unwrap();
 		config
+	}
+
+	/// Parse `source` and run git's remote-URL pre-scan from `dir`, returning the [`RemoteUrlScan`].
+	fn scan(
+		source: &str,
+		dir: &str,
+		ctx: &IncludeContext<'_>,
+		resolver: &MapResolver,
+	) -> RemoteUrlScan {
+		let config = GitConfigSource::parse(source).unwrap();
+		block_on(config.scan_remote_urls(Path::new(dir), Path::new(dir), ctx, resolver)).unwrap()
 	}
 
 	// --- expand_includes: ordering, path resolution, recursion, missing files ---
@@ -749,8 +824,13 @@ mod tests {
 		// distinct from an absent target file (which is skipped).
 		let resolver = MapResolver::default().with("/home/me/x.cfg", "[core]\n\tx = 1\n");
 		let mut config = GitConfigSource::parse("[include]\n\tpath = ~/x.cfg\n").unwrap();
-		let err =
-			block_on(config.expand_includes(Path::new("/etc"), &ctx(None, None), &resolver)).unwrap_err();
+		let err = block_on(config.expand_includes(
+			Path::new("/etc"),
+			Path::new("/etc"),
+			&ctx(None, None),
+			&resolver,
+		))
+		.unwrap_err();
 		assert!(matches!(err, ConfigError::IncludeTildeNoHome), "{err:?}");
 	}
 
@@ -760,8 +840,13 @@ mod tests {
 		// as a relative path.
 		let resolver = MapResolver::default();
 		let mut config = GitConfigSource::parse("[include]\n\tpath = ~alice/x.cfg\n").unwrap();
-		let err =
-			block_on(config.expand_includes(Path::new("/etc"), &ctx(None, None), &resolver)).unwrap_err();
+		let err = block_on(config.expand_includes(
+			Path::new("/etc"),
+			Path::new("/etc"),
+			&ctx(None, None),
+			&resolver,
+		))
+		.unwrap_err();
 		assert!(
 			matches!(err, ConfigError::IncludeUserTildeUnsupported),
 			"{err:?}"
@@ -794,7 +879,13 @@ mod tests {
 		let resolver = MapResolver::default().with("/etc/inc.cfg", "[user]\n\temail = incl@x\n");
 		let source = "[user]\n\tname = me\n[include]\n\tpath = inc.cfg\n";
 		let mut config = GitConfigSource::parse(source).unwrap();
-		block_on(config.expand_includes(Path::new("/etc"), &ctx(None, None), &resolver)).unwrap();
+		block_on(config.expand_includes(
+			Path::new("/etc"),
+			Path::new("/etc"),
+			&ctx(None, None),
+			&resolver,
+		))
+		.unwrap();
 		// Reads see the included value...
 		assert_eq!(config.get_string("user", None, "email"), Some("incl@x"));
 		// ...but render() emits only the own content: the directive stays, the included body does not.
@@ -812,7 +903,13 @@ mod tests {
 		let resolver = MapResolver::default().with("/etc/inc.cfg", "[user]\n\temail = incl@x\n");
 		let source = "[user]\n\tname = me\n[include]\n\tpath = inc.cfg\n";
 		let mut config = GitConfigSource::parse(source).unwrap();
-		block_on(config.expand_includes(Path::new("/etc"), &ctx(None, None), &resolver)).unwrap();
+		block_on(config.expand_includes(
+			Path::new("/etc"),
+			Path::new("/etc"),
+			&ctx(None, None),
+			&resolver,
+		))
+		.unwrap();
 
 		// `set` of a key that lives only in the include inserts a NEW own line into the own section; it
 		// never edits the included occurrence, so render carries the own value and not the included one.
@@ -842,7 +939,13 @@ mod tests {
 		let resolver = MapResolver::default().with("/etc/inc.cfg", "[user]\n\temail = incl@x\n");
 		let source = "[core]\n\tbare = false\n[include]\n\tpath = inc.cfg";
 		let mut config = GitConfigSource::parse(source).unwrap();
-		block_on(config.expand_includes(Path::new("/etc"), &ctx(None, None), &resolver)).unwrap();
+		block_on(config.expand_includes(
+			Path::new("/etc"),
+			Path::new("/etc"),
+			&ctx(None, None),
+			&resolver,
+		))
+		.unwrap();
 
 		config.set("new", None, "key", "v").unwrap();
 		let rendered = config.render();
@@ -864,14 +967,32 @@ mod tests {
 		let resolver = MapResolver::default().with("/etc/inc.cfg", "[core]\n\tk = one\n");
 		let source = "[include]\n\tpath = inc.cfg\n";
 		let mut config = GitConfigSource::parse(source).unwrap();
-		block_on(config.expand_includes(Path::new("/etc"), &ctx(None, None), &resolver)).unwrap();
+		block_on(config.expand_includes(
+			Path::new("/etc"),
+			Path::new("/etc"),
+			&ctx(None, None),
+			&resolver,
+		))
+		.unwrap();
 		// Re-expanding must not duplicate the included values (the prior Included entries are dropped).
-		block_on(config.expand_includes(Path::new("/etc"), &ctx(None, None), &resolver)).unwrap();
+		block_on(config.expand_includes(
+			Path::new("/etc"),
+			Path::new("/etc"),
+			&ctx(None, None),
+			&resolver,
+		))
+		.unwrap();
 		assert_eq!(config.get_all("core", None, "k"), vec!["one"]);
 
 		// A changed target, re-expanded, replaces the old value — no stale value survives to win.
 		let changed = MapResolver::default().with("/etc/inc.cfg", "[core]\n\tk = two\n");
-		block_on(config.expand_includes(Path::new("/etc"), &ctx(None, None), &changed)).unwrap();
+		block_on(config.expand_includes(
+			Path::new("/etc"),
+			Path::new("/etc"),
+			&ctx(None, None),
+			&changed,
+		))
+		.unwrap();
 		assert_eq!(config.get_all("core", None, "k"), vec!["two"]);
 		assert_eq!(config.get_string("core", None, "k"), Some("two"));
 	}
@@ -930,7 +1051,7 @@ mod tests {
 		let resolver = MapResolver::default();
 		let mut config = GitConfigSource::new();
 		let context = ctx(None, None);
-		assert_send(config.expand_includes(Path::new("/etc"), &context, &resolver));
+		assert_send(config.expand_includes(Path::new("/etc"), Path::new("/etc"), &context, &resolver));
 	}
 
 	#[test]
@@ -939,8 +1060,13 @@ mod tests {
 		// An unconditional `[include] path` with no value is always processed, so it errors (git:
 		// `missing value for 'include.path'`).
 		let mut config = GitConfigSource::parse("[include]\n\tpath\n").unwrap();
-		let err =
-			block_on(config.expand_includes(Path::new("/etc"), &ctx(None, None), &resolver)).unwrap_err();
+		let err = block_on(config.expand_includes(
+			Path::new("/etc"),
+			Path::new("/etc"),
+			&ctx(None, None),
+			&resolver,
+		))
+		.unwrap_err();
 		assert!(matches!(err, ConfigError::IncludeMissingValue), "{err:?}");
 
 		// A valueless `includeIf` whose condition does NOT match is never read — so no error (git
@@ -981,8 +1107,13 @@ mod tests {
 			);
 		}
 		let mut config = GitConfigSource::parse("[include]\n\tpath = c1.cfg\n").unwrap();
-		let err =
-			block_on(config.expand_includes(Path::new("/etc"), &ctx(None, None), &resolver)).unwrap_err();
+		let err = block_on(config.expand_includes(
+			Path::new("/etc"),
+			Path::new("/etc"),
+			&ctx(None, None),
+			&resolver,
+		))
+		.unwrap_err();
 		assert!(matches!(err, ConfigError::IncludeDepthExceeded), "{err:?}");
 	}
 
@@ -1001,7 +1132,13 @@ mod tests {
 			resolver = resolver.with(&format!("/etc/c{i}.cfg"), &text);
 		}
 		let mut config = GitConfigSource::parse("[include]\n\tpath = c1.cfg\n").unwrap();
-		block_on(config.expand_includes(Path::new("/etc"), &ctx(None, None), &resolver)).unwrap();
+		block_on(config.expand_includes(
+			Path::new("/etc"),
+			Path::new("/etc"),
+			&ctx(None, None),
+			&resolver,
+		))
+		.unwrap();
 		assert_eq!(config.get_string("core", None, "reached"), Some("10"));
 	}
 
@@ -1009,8 +1146,13 @@ mod tests {
 	fn self_referential_cycle_hits_the_depth_cap() {
 		let resolver = MapResolver::default().with("/etc/loop.cfg", "[include]\n\tpath = loop.cfg\n");
 		let mut config = GitConfigSource::parse("[include]\n\tpath = loop.cfg\n").unwrap();
-		let err =
-			block_on(config.expand_includes(Path::new("/etc"), &ctx(None, None), &resolver)).unwrap_err();
+		let err = block_on(config.expand_includes(
+			Path::new("/etc"),
+			Path::new("/etc"),
+			&ctx(None, None),
+			&resolver,
+		))
+		.unwrap_err();
 		assert!(matches!(err, ConfigError::IncludeDepthExceeded), "{err:?}");
 	}
 
@@ -1052,7 +1194,7 @@ mod tests {
 	fn gm(pattern: &str, gitdir: &str, icase: bool) -> bool {
 		let gitdir = PathBuf::from(gitdir);
 		let c = ctx(Some(Path::new("/home/me")), Some(gitdir.as_path()));
-		gitdir_matches(pattern, Path::new("/etc/inc"), &c, icase)
+		gitdir_matches(pattern, Path::new("/etc/inc"), &c, icase, false)
 	}
 
 	#[test]
@@ -1110,10 +1252,11 @@ mod tests {
 		let c = IncludeContext {
 			home: None,
 			gitdir: None,
+			gitdir_absolute: None,
 			branch,
 			remote_urls: None,
 		};
-		condition_matches(&format!("onbranch:{pattern}"), Path::new("/etc"), &c)
+		condition_matches(&format!("onbranch:{pattern}"), Path::new("/etc"), &c, false)
 	}
 
 	#[test]
@@ -1148,11 +1291,12 @@ mod tests {
 		let on = IncludeContext {
 			home: None,
 			gitdir: None,
+			gitdir_absolute: None,
 			branch: Some("feature/x"),
 			remote_urls: None,
 		};
 		let mut config = GitConfigSource::parse(source).unwrap();
-		block_on(config.expand_includes(Path::new("/etc"), &on, &resolver)).unwrap();
+		block_on(config.expand_includes(Path::new("/etc"), Path::new("/etc"), &on, &resolver)).unwrap();
 		assert_eq!(config.get_string("user", None, "email"), Some("onbr"));
 
 		// A non-matching branch does not apply it.
@@ -1161,7 +1305,8 @@ mod tests {
 			..on
 		};
 		let mut config = GitConfigSource::parse(source).unwrap();
-		block_on(config.expand_includes(Path::new("/etc"), &off, &resolver)).unwrap();
+		block_on(config.expand_includes(Path::new("/etc"), Path::new("/etc"), &off, &resolver))
+			.unwrap();
 		assert!(config.get_string("user", None, "email").is_none());
 	}
 
@@ -1172,6 +1317,7 @@ mod tests {
 		let c = IncludeContext {
 			home: None,
 			gitdir: None,
+			gitdir_absolute: None,
 			branch: None,
 			remote_urls: urls,
 		};
@@ -1179,6 +1325,7 @@ mod tests {
 			&format!("hasconfig:remote.*.url:{glob}"),
 			Path::new("/etc"),
 			&c,
+			false,
 		)
 	}
 
@@ -1214,10 +1361,11 @@ mod tests {
 		let c = IncludeContext {
 			home: None,
 			gitdir: None,
+			gitdir_absolute: None,
 			branch: None,
 			remote_urls: Some(urls),
 		};
-		let m = |cond: &str| condition_matches(cond, Path::new("/etc"), &c);
+		let m = |cond: &str| condition_matches(cond, Path::new("/etc"), &c, false);
 		assert!(m("hasconfig:remote.*.url:https://github.com/**"));
 		assert!(!m("hasconfig:remote.?.url:https://github.com/**"));
 		assert!(!m("hasconfig:remote.*.URL:https://github.com/**"));
@@ -1233,18 +1381,184 @@ mod tests {
 		let c = IncludeContext {
 			home: None,
 			gitdir: None,
+			gitdir_absolute: None,
 			branch: None,
 			remote_urls: Some(urls),
 		};
 		let mut config = GitConfigSource::parse(source).unwrap();
-		block_on(config.expand_includes(Path::new("/etc"), &c, &resolver)).unwrap();
+		block_on(config.expand_includes(Path::new("/etc"), Path::new("/etc"), &c, &resolver)).unwrap();
 		assert_eq!(config.get_string("user", None, "email"), Some("ghid"));
 	}
 
+	// --- scan_remote_urls: git's whole-config remote-URL pre-scan ---
+
 	#[test]
-	fn hasconfig_included_file_setting_a_remote_url_is_fatal() {
-		// git forbids a hasconfig-included file from setting a `remote.<name>.url` (it would circularly
-		// feed the condition). The engine enforces this on the matched path.
+	fn scan_collects_top_level_and_plain_include_urls_only() {
+		// URLs are collected from the top level and plain `[include]`s; a `hasconfig` directive is
+		// detected as the trigger; nothing is forbidden without a matched includeIf.
+		let resolver = MapResolver::default().with(
+			"/etc/plain.cfg",
+			"[remote \"plain\"]\n\turl = https://plain.example/r.git\n",
+		);
+		let source = concat!(
+			"[remote \"top\"]\n\turl = https://top.example/r.git\n",
+			"[include]\n\tpath = plain.cfg\n",
+			"[includeIf \"hasconfig:remote.*.url:https://top.example/**\"]\n\tpath = missing.cfg\n",
+		);
+		let s = scan(source, "/etc", &ctx(None, None), &resolver);
+		assert_eq!(
+			s.urls,
+			vec![
+				"https://top.example/r.git".to_owned(),
+				"https://plain.example/r.git".to_owned()
+			]
+		);
+		assert!(s.has_hasconfig);
+		assert!(!s.forbidden_url);
+	}
+
+	#[test]
+	fn scan_does_not_collect_urls_reachable_only_through_a_matched_includeif() {
+		// A matched `includeIf` subtree's `remote.<name>.url` is the paradox, never a collected URL —
+		// so it does not appear in `urls`, and `forbidden_url` is set instead.
+		let gitdir = PathBuf::from("/home/me/work/.git");
+		let resolver = MapResolver::default().with(
+			"/etc/work.cfg",
+			"[remote \"w\"]\n\turl = https://work.example/r.git\n",
+		);
+		let source = "[includeIf \"gitdir:/home/me/work/\"]\n\tpath = work.cfg\n";
+		let s = scan(
+			source,
+			"/etc",
+			&ctx(None, Some(gitdir.as_path())),
+			&resolver,
+		);
+		assert!(s.urls.is_empty());
+		assert!(s.forbidden_url);
+		// No hasconfig directive here, so the driver's `has_hasconfig && forbidden_url` gate would NOT
+		// fatal — a matched gitdir include carrying a URL is fine when no hasconfig exists (git-probed).
+		assert!(!s.has_hasconfig);
+	}
+
+	#[test]
+	fn scan_forbids_urls_in_matched_gitdir_and_onbranch_subtrees() {
+		// git's forced-true pre-scan forbids remote URLs in ANY matched includeIf subtree, not just
+		// hasconfig ones (probed 2.50.1). A non-matching one is skipped, so its URL is neither collected
+		// nor forbidden.
+		let gitdir = PathBuf::from("/home/me/work/.git");
+		let resolver = MapResolver::default().with(
+			"/etc/u.cfg",
+			"[remote \"x\"]\n\turl = https://x.example/r.git\n",
+		);
+
+		let matched = scan(
+			"[includeIf \"gitdir:/home/me/work/\"]\n\tpath = u.cfg\n",
+			"/etc",
+			&ctx(None, Some(gitdir.as_path())),
+			&resolver,
+		);
+		assert!(matched.forbidden_url && matched.urls.is_empty());
+
+		let unmatched = scan(
+			"[includeIf \"gitdir:/other/\"]\n\tpath = u.cfg\n",
+			"/etc",
+			&ctx(None, Some(gitdir.as_path())),
+			&resolver,
+		);
+		assert!(!unmatched.forbidden_url && unmatched.urls.is_empty());
+
+		let on = IncludeContext {
+			home: None,
+			gitdir: None,
+			gitdir_absolute: None,
+			branch: Some("main"),
+			remote_urls: None,
+		};
+		let onbranch = scan(
+			"[includeIf \"onbranch:main\"]\n\tpath = u.cfg\n",
+			"/etc",
+			&on,
+			&resolver,
+		);
+		assert!(onbranch.forbidden_url && onbranch.urls.is_empty());
+	}
+
+	#[test]
+	fn scan_forbid_propagates_into_nested_plain_includes() {
+		// Once inside a matched includeIf subtree, a plain `[include]` it pulls in is forbidden too
+		// (git: "directly or indirectly"), so its `remote.<name>.url` trips the paradox flag.
+		let resolver = MapResolver::default()
+			.with("/etc/wrapper.cfg", "[include]\n\tpath = deep.cfg\n")
+			.with(
+				"/etc/deep.cfg",
+				"[remote \"deep\"]\n\turl = https://deep.example/z.git\n",
+			);
+		let source = "[includeIf \"hasconfig:remote.*.url:https://any/**\"]\n\tpath = wrapper.cfg\n";
+		let s = scan(source, "/etc", &ctx(None, None), &resolver);
+		assert!(s.forbidden_url);
+		assert!(s.has_hasconfig);
+	}
+
+	#[test]
+	fn scan_bare_remote_url_is_neither_collected_nor_forbidden() {
+		// A bare `[remote] url` (no subsection) is not a `remote.<name>.url`, so git neither collects it
+		// nor forbids it inside a matched subtree.
+		let resolver = MapResolver::default().with(
+			"/etc/id.cfg",
+			"[remote]\n\turl = https://bare.example/x.git\n",
+		);
+		let source = "[includeIf \"hasconfig:remote.*.url:https://any/**\"]\n\tpath = id.cfg\n";
+		let s = scan(source, "/etc", &ctx(None, None), &resolver);
+		assert!(s.urls.is_empty());
+		assert!(!s.forbidden_url);
+		assert!(s.has_hasconfig);
+	}
+
+	#[test]
+	fn scan_detects_hasconfig_directive_even_with_a_non_path_key() {
+		// git evaluates the condition (triggering the pre-scan) before checking the key is `path`, so a
+		// stray non-`path` hasconfig key still sets the trigger (probed 2.50.1).
+		let resolver = MapResolver::default();
+		let source = "[includeIf \"hasconfig:remote.*.url:https://any/**\"]\n\tnotpath = bar\n";
+		let s = scan(source, "/etc", &ctx(None, None), &resolver);
+		assert!(s.has_hasconfig);
+		assert!(!s.forbidden_url);
+	}
+
+	#[test]
+	fn scan_records_forbidden_url_before_a_later_valueless_include() {
+		// A matched subtree sets a `remote.<name>.url` then has a valueless `[include] path`. git's
+		// linear pre-scan fatals on the URL before the bad include; the scan records `forbidden_url` and
+		// skips the unreadable valueless include (the driver then fatals). Both fail closed.
+		let resolver = MapResolver::default().with(
+			"/etc/id.cfg",
+			"[remote \"sneaky\"]\n\turl = https://elsewhere.example/x.git\n[include]\n\tpath\n",
+		);
+		let source = "[includeIf \"hasconfig:remote.*.url:https://any/**\"]\n\tpath = id.cfg\n";
+		let s = scan(source, "/etc", &ctx(None, None), &resolver);
+		assert!(s.forbidden_url);
+		assert!(s.has_hasconfig);
+	}
+
+	#[test]
+	fn scan_hits_the_depth_cap_on_a_cycle() {
+		// The forced-true scan follows includes and enforces git's depth-10 cap (breaking a cycle).
+		let resolver = MapResolver::default().with("/etc/loop.cfg", "[include]\n\tpath = loop.cfg\n");
+		let config = GitConfigSource::parse("[include]\n\tpath = loop.cfg\n").unwrap();
+		let err = block_on(config.scan_remote_urls(
+			Path::new("/etc"),
+			Path::new("/etc"),
+			&ctx(None, None),
+			&resolver,
+		))
+		.unwrap_err();
+		assert!(matches!(err, ConfigError::IncludeDepthExceeded), "{err:?}");
+	}
+
+	#[test]
+	fn expand_no_longer_enforces_the_paradox_itself() {
+		// The paradox is the pre-scan's job now: `expand_includes` given a matched hasconfig include that
+		// sets a remote URL simply expands it (the driver runs the scan first and would have fatalled).
 		let urls: &[&str] = &["https://github.com/example/repo.git"];
 		let resolver = MapResolver::default().with(
 			"/etc/id.cfg",
@@ -1254,73 +1568,19 @@ mod tests {
 		let c = IncludeContext {
 			home: None,
 			gitdir: None,
+			gitdir_absolute: None,
 			branch: None,
 			remote_urls: Some(urls),
 		};
 		let mut config = GitConfigSource::parse(source).unwrap();
-		let err = block_on(config.expand_includes(Path::new("/etc"), &c, &resolver)).unwrap_err();
-		assert!(
-			matches!(err, ConfigError::HasconfigIncludeSetsRemoteUrl),
-			"{err:?}"
-		);
-	}
-
-	#[test]
-	fn hasconfig_included_file_forbidden_url_is_indirect_too() {
-		// A file the hasconfig include pulls in via a plain `[include]` may not set a remote url either
-		// (git: "directly or indirectly"). The recursive expansion folds the nested url in, so the guard
-		// catches it.
-		let urls: &[&str] = &["https://github.com/example/repo.git"];
-		let resolver = MapResolver::default()
-			.with(
-				"/etc/wrapper.cfg",
-				"[include]\n\tpath = deep.cfg\n[user]\n\temail = ghid\n",
-			)
-			.with(
-				"/etc/deep.cfg",
-				"[remote \"deep\"]\n\turl = https://deep/z.git\n",
-			);
-		let source =
-			"[includeIf \"hasconfig:remote.*.url:https://github.com/**\"]\n\tpath = wrapper.cfg\n";
-		let c = IncludeContext {
-			home: None,
-			gitdir: None,
-			branch: None,
-			remote_urls: Some(urls),
-		};
-		let mut config = GitConfigSource::parse(source).unwrap();
-		let err = block_on(config.expand_includes(Path::new("/etc"), &c, &resolver)).unwrap_err();
-		assert!(
-			matches!(err, ConfigError::HasconfigIncludeSetsRemoteUrl),
-			"{err:?}"
-		);
-	}
-
-	#[test]
-	fn hasconfig_included_bare_remote_url_is_allowed() {
-		// A bare `remote.url` (no subsection) is not a `remote.<name>.url`, so git neither collects nor
-		// forbids it — the include applies without error.
-		let urls: &[&str] = &["https://github.com/example/repo.git"];
-		let resolver = MapResolver::default().with(
-			"/etc/id.cfg",
-			"[remote]\n\turl = https://bare/x.git\n[user]\n\temail = ghid\n",
-		);
-		let source = "[includeIf \"hasconfig:remote.*.url:https://github.com/**\"]\n\tpath = id.cfg\n";
-		let c = IncludeContext {
-			home: None,
-			gitdir: None,
-			branch: None,
-			remote_urls: Some(urls),
-		};
-		let mut config = GitConfigSource::parse(source).unwrap();
-		block_on(config.expand_includes(Path::new("/etc"), &c, &resolver)).unwrap();
+		block_on(config.expand_includes(Path::new("/etc"), Path::new("/etc"), &c, &resolver)).unwrap();
 		assert_eq!(config.get_string("user", None, "email"), Some("ghid"));
 	}
 
 	#[test]
-	fn plain_include_setting_a_remote_url_is_not_forbidden() {
-		// The paradox guard is specific to hasconfig includes; an ordinary `[include]` may carry remote
-		// urls freely (indeed that is how git's hasconfig sees urls introduced by earlier includes).
+	fn plain_include_setting_a_remote_url_is_collected_not_forbidden() {
+		// An ordinary `[include]` may carry remote urls freely — that is how git's hasconfig sees urls
+		// introduced by earlier includes. Reads see the url, and the scan collects it.
 		let resolver = MapResolver::default().with(
 			"/etc/urls.cfg",
 			"[remote \"origin\"]\n\turl = https://github.com/x.git\n",
@@ -1331,32 +1591,9 @@ mod tests {
 			config.get_string("remote", Some("origin"), "url"),
 			Some("https://github.com/x.git")
 		);
-	}
-
-	#[test]
-	fn hasconfig_url_guard_fires_before_a_later_bad_include() {
-		// A hasconfig target sets a `remote.<name>.url` and *then* has a bare (valueless) include. git
-		// reads top-to-bottom, so the URL paradox fatals before the bad include is reached — probed:
-		// git errors with the remote-URL message, not `missing value`. The positional guard matches
-		// this; a post-hoc scan would surface `IncludeMissingValue` from expanding the later include.
-		let urls: &[&str] = &["https://github.com/example/repo.git"];
-		let resolver = MapResolver::default().with(
-			"/etc/id.cfg",
-			"[remote \"sneaky\"]\n\turl = https://elsewhere/x.git\n[include]\n\tpath\n",
-		);
-		let source = "[includeIf \"hasconfig:remote.*.url:https://github.com/**\"]\n\tpath = id.cfg\n";
-		let c = IncludeContext {
-			home: None,
-			gitdir: None,
-			branch: None,
-			remote_urls: Some(urls),
-		};
-		let mut config = GitConfigSource::parse(source).unwrap();
-		let err = block_on(config.expand_includes(Path::new("/etc"), &c, &resolver)).unwrap_err();
-		assert!(
-			matches!(err, ConfigError::HasconfigIncludeSetsRemoteUrl),
-			"{err:?}"
-		);
+		let s = scan(source, "/etc", &ctx(None, None), &resolver);
+		assert_eq!(s.urls, vec!["https://github.com/x.git".to_owned()]);
+		assert!(!s.forbidden_url && !s.has_hasconfig);
 	}
 
 	#[test]
@@ -1530,6 +1767,120 @@ mod tests {
 		let url = format!("{lit}MIDDLE{lit}");
 		assert!(wildmatch(glob.as_bytes(), url.as_bytes(), false));
 		assert!(!wildmatch(glob.as_bytes(), lit.as_bytes(), false));
+	}
+
+	#[test]
+	fn gitdir_matches_either_the_realpath_or_the_absolute_candidate() {
+		// git matches a `gitdir:` condition against realpath(git_dir) AND the `$PWD`-honoured absolute
+		// (symlink-preserving) spelling; a pattern matching EITHER applies the include.
+		let real = PathBuf::from("/real/repo/.git");
+		let logical = PathBuf::from("/link/repo/.git");
+		let both = IncludeContext {
+			home: None,
+			gitdir: Some(real.as_path()),
+			gitdir_absolute: Some(logical.as_path()),
+			branch: None,
+			remote_urls: None,
+		};
+		let etc = Path::new("/etc");
+		// Via the realpath candidate...
+		assert!(condition_matches("gitdir:/real/repo/", etc, &both, false));
+		// ...and via the absolute (symlink-spelled) candidate.
+		assert!(condition_matches("gitdir:/link/repo/", etc, &both, false));
+		// A path matching neither candidate does not.
+		assert!(!condition_matches("gitdir:/other/repo/", etc, &both, false));
+		// With no absolute candidate, only the realpath matches (the symlink spelling does not).
+		let realpath_only = IncludeContext {
+			home: None,
+			gitdir: Some(real.as_path()),
+			gitdir_absolute: None,
+			branch: None,
+			remote_urls: None,
+		};
+		assert!(condition_matches(
+			"gitdir:/real/repo/",
+			etc,
+			&realpath_only,
+			false
+		));
+		assert!(!condition_matches(
+			"gitdir:/link/repo/",
+			etc,
+			&realpath_only,
+			false
+		));
+	}
+
+	// --- command-scope (fileless) expansion: -c / GIT_CONFIG_* has no containing file ---
+
+	#[test]
+	fn command_scope_expands_an_absolute_include() {
+		// git still expands an absolute `include.path` given in command-scope config, so this does too.
+		let resolver = MapResolver::default().with("/abs/inc.cfg", "[user]\n\temail = c@x\n");
+		let mut config = GitConfigSource::parse("[include]\n\tpath = /abs/inc.cfg\n").unwrap();
+		block_on(config.expand_includes_command_scope(&ctx(None, None), &resolver)).unwrap();
+		assert_eq!(config.get_string("user", None, "email"), Some("c@x"));
+	}
+
+	#[test]
+	fn command_scope_expands_a_tilde_include() {
+		// A `~/` path is home-based, not relative, so command scope allows it (as git does).
+		let resolver = MapResolver::default().with("/home/me/inc.cfg", "[user]\n\temail = t@x\n");
+		let mut config = GitConfigSource::parse("[include]\n\tpath = ~/inc.cfg\n").unwrap();
+		block_on(
+			config.expand_includes_command_scope(&ctx(Some(Path::new("/home/me")), None), &resolver),
+		)
+		.unwrap();
+		assert_eq!(config.get_string("user", None, "email"), Some("t@x"));
+	}
+
+	#[test]
+	fn command_scope_relative_include_is_fatal() {
+		// A relative `include.path` has no containing file to resolve against; git makes this fatal, and
+		// so must the engine — never silently resolving it against some ambient directory.
+		let resolver = MapResolver::default().with("inc.cfg", "[user]\n\temail = nope@x\n");
+		let mut config = GitConfigSource::parse("[include]\n\tpath = inc.cfg\n").unwrap();
+		let err =
+			block_on(config.expand_includes_command_scope(&ctx(None, None), &resolver)).unwrap_err();
+		assert!(
+			matches!(err, ConfigError::IncludeRelativeFromCommandScope),
+			"{err:?}"
+		);
+	}
+
+	#[test]
+	fn command_scope_dot_gitdir_condition_does_not_match() {
+		// `gitdir:./` needs the including file's directory; command scope has none, so git treats the
+		// condition as unmatched (non-fatal). The engine returns non-matching rather than anchoring the
+		// pattern at the filesystem root (which would match unrelated repositories).
+		let resolver = MapResolver::default().with("/abs/id.cfg", "[user]\n\temail = dot@x\n");
+		let gitdir = PathBuf::from("/repo/.git");
+		let source = "[includeIf \"gitdir:./\"]\n\tpath = /abs/id.cfg\n";
+		let mut config = GitConfigSource::parse(source).unwrap();
+		block_on(config.expand_includes_command_scope(&ctx(None, Some(gitdir.as_path())), &resolver))
+			.unwrap();
+		assert!(config.get_string("user", None, "email").is_none());
+	}
+
+	#[test]
+	fn command_scope_scan_collects_urls_but_rejects_relative_includes() {
+		// The pre-scan collects a command-scope `remote.<name>.url` (so it can satisfy a file-level
+		// `hasconfig`) while applying the same fileless rules: an absolute include is followed, a relative
+		// one is fatal.
+		let resolver = MapResolver::default();
+		let source = "[remote \"o\"]\n\turl = https://h/r.git\n";
+		let config = GitConfigSource::parse(source).unwrap();
+		let scan =
+			block_on(config.scan_remote_urls_command_scope(&ctx(None, None), &resolver)).unwrap();
+		assert_eq!(scan.urls, vec!["https://h/r.git".to_owned()]);
+
+		let config = GitConfigSource::parse("[include]\n\tpath = rel.cfg\n").unwrap();
+		let err =
+			block_on(config.scan_remote_urls_command_scope(&ctx(None, None), &resolver)).unwrap_err();
+		assert!(
+			matches!(err, ConfigError::IncludeRelativeFromCommandScope),
+			"{err:?}"
+		);
 	}
 
 	/// Drive `future` to completion on a fresh current-thread runtime — the resolver's `read` is the

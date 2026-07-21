@@ -4,22 +4,25 @@
 //! a capability scoped to the git directory and cannot reach the user's `~/.gitconfig` or the system
 //! `/etc/gitconfig`. Layering those in is a frontend concern (ambient path I/O), so it lives here.
 //!
-//! [`effective_config`] assembles git's full precedence stack — system, then global (XDG then
+//! [`effective_config_at`] assembles git's full precedence stack — system, then global (XDG then
 //! `~/.gitconfig`, or a single `$GIT_CONFIG_GLOBAL`), then repo-local — into one layered
 //! [`GitConfig`]. Reads resolve across every layer (git's last-writer-wins); writes stay directed at
 //! the repository-local file. The [`ConfigScope`] helpers resolve the single file `gta config
 //! --global` / `--system` read and write, honouring the same `GIT_CONFIG_*` environment git does.
+//!
+//! These **merged** reads also expand git's `[include]` / `includeIf` directives (each layer's
+//! includes spliced in at their position), threading the real gitdir and current branch through so
+//! `includeIf "gitdir:"` / `"onbranch:"` / `"hasconfig:remote.*.url:"` resolve as git's do — including
+//! git's whole-config remote-URL pre-scan and its paradox guard ([`expand_layers`]). An explicitly
+//! *scoped* single-file read (`gta config --global`/`--system`/`--local`) does **not** expand
+//! includes, matching git.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
-use gitana_config::{GitConfig, GitConfigSource};
-use gitana_object::HashAlgorithm;
-use gitana_repository::Repository;
+use gitana_config::{ConfigError, GitConfig, GitConfigSource, IncludeContext, IncludeResolver};
 use tokio::io::AsyncWriteExt;
-
-use crate::Backend;
 
 tokio::task_local! {
 	/// The directory the command operates in (the `-C` directory, else the process cwd), established
@@ -54,35 +57,32 @@ pub enum ConfigScope {
 	System,
 }
 
-/// The effective configuration: the repository-local config underlaid with the global and system
-/// files, in git's precedence order (system < global < local). Reads see every layer; writes and
-/// [`GitConfig::render`] stay on the local file. A repo whose local config is unreadable (e.g. a
-/// clone resolving its committer before the config exists) still resolves identity from the global
-/// and system layers. A global/system file that exists but is malformed or unreadable is an error,
-/// as git aborts on a bad config file.
-pub async fn effective_config<H: HashAlgorithm>(
-	repo: &Repository<Backend, H>,
-) -> Result<GitConfig> {
-	let mut config = repo
-		.read_config()
-		.await
-		.unwrap_or_else(|_| GitConfig::new());
-	config.underlay(global_and_system_sources().await?);
-	config.overlay(env_config_source()?);
-	Ok(config)
-}
-
-/// The effective configuration keyed on a git/common directory path rather than an open
-/// [`Repository`] — for the remote commands, which resolve credentials (and build the transport)
-/// before opening the repo (or, for `fetch`/`push`, before the hash algorithm the repo is generic
-/// over is even known). Reads the local `<dir>/config` and underlays global/system, then overlays the
-/// `-c`/`GIT_CONFIG_*` command-line entries, exactly like [`effective_config`]. A missing local
-/// config resolves from the global/system layers alone.
-pub async fn effective_config_at(dir: &Path) -> Result<GitConfig> {
-	let mut config = read_file(&dir.join("config")).await?;
-	config.underlay(global_and_system_sources().await?);
-	config.overlay(env_config_source()?);
-	Ok(config)
+/// The merged configuration for the repository whose per-worktree git directory is `git_dir` and whose
+/// shared files live under `common`: the local `<common>/config` underlaid with the global and system
+/// files in git's precedence order (system < global < local), with `[include]`/`includeIf` expanded,
+/// then the `-c`/`GIT_CONFIG_*` command-line entries overlaid. Reads see every layer; writes and
+/// [`GitConfig::render`] stay on the local file. `git_dir`'s real path and `HEAD` branch drive
+/// `includeIf "gitdir:"`/`"onbranch:"` (the two are the same path for a non-linked repo). A repo whose
+/// local config does not exist yet (a fresh `init`/`clone`) still resolves from the global and system
+/// layers; a global/system/local file that exists but is malformed or unreadable is an error, as git
+/// aborts on a bad config file.
+///
+/// This is the single merged-config assembler: [`open_generic`](crate::repo::open_generic) installs its
+/// result on the repository, and the remote commands (which resolve credentials before opening the repo)
+/// call it directly with the discovered layout's `git_dir`/`common_dir`.
+pub async fn effective_config_at(git_dir: &Path, common: &Path) -> Result<GitConfig> {
+	let gitdir = canonical_gitdir(git_dir).await;
+	let gitdir_absolute = logical_gitdir(&gitdir).await;
+	let branch = head_branch(git_dir).await;
+	let mut base = global_and_system_layers().await?;
+	base.push(local_layer(common).await?);
+	assemble_merged(
+		base,
+		Some(&gitdir),
+		gitdir_absolute.as_deref(),
+		branch.as_deref(),
+	)
+	.await
 }
 
 /// The effective configuration for the **invoking worktree**: the merged stack ([`effective_config_at`])
@@ -94,24 +94,36 @@ pub async fn effective_config_at(dir: &Path) -> Result<GitConfig> {
 /// aborts on a bad config file); only an *absent* `config.worktree` is skipped. `common` holds the shared
 /// config (where `extensions.worktreeConfig` lives); `git_dir` is the invoking worktree's git dir.
 ///
-/// Two **gitana-config-wide** limitations apply here as they do to every config read (they are deferred
-/// follow-ups, not specific to this function): `[include]` / `includeIf` directives are **not expanded**
-/// (a value set only via an include is missed), and a leading UTF-8 **BOM** is rejected by the parser
-/// though git accepts it. Both are exotic for a worktree-list sort and are tracked as gitana-config work.
+/// `[include]`/`includeIf` directives are expanded across all layers (including `config.worktree`), as in
+/// [`effective_config_at`]. The result is used read-only (the worktree-list sort), so the writable-source
+/// choice is immaterial; a leading UTF-8 **BOM** is still rejected by the parser, a tracked gitana-config
+/// gap. `extensions.worktreeConfig` itself is read from the *unexpanded* local file, as git reads it.
 pub async fn effective_config_for_worktree(common: &Path, git_dir: &Path) -> Result<GitConfig> {
-	let mut config = read_file(&common.join("config")).await?;
+	let gitdir = canonical_gitdir(git_dir).await;
+	let branch = head_branch(git_dir).await;
+	let local = local_layer(common).await?;
 	// `extensions.worktreeConfig` is a repository-format extension: git honours it **only** from the
-	// repository-local config, ignoring any global/system setting. So read it now, while `config` is still
-	// just the local file — before the ambient layers are underlaid. A bad boolean aborts, as git does.
-	let worktree_config = config
+	// repository-local config, ignoring any global/system setting, and reads it from the file directly
+	// (before includes). A bad boolean aborts, as git does.
+	let worktree_config = local
+		.source
 		.get_bool("extensions", None, "worktreeconfig")?
 		.unwrap_or(false);
-	config.underlay(global_and_system_sources().await?);
-	if worktree_config {
-		config.overlay(read_sources(vec![git_dir.join("config.worktree")]).await?);
+	let mut base = global_and_system_layers().await?;
+	base.push(local);
+	if worktree_config
+		&& let Some(worktree_layer) = read_layer(&git_dir.join("config.worktree")).await?
+	{
+		base.push(worktree_layer);
 	}
-	config.overlay(env_config_source()?);
-	Ok(config)
+	let gitdir_absolute = logical_gitdir(&gitdir).await;
+	assemble_merged(
+		base,
+		Some(&gitdir),
+		gitdir_absolute.as_deref(),
+		branch.as_deref(),
+	)
+	.await
 }
 
 /// Read a single config file that must exist — for an explicit `--global`/`--system` `--list`, which
@@ -140,11 +152,11 @@ pub fn ensure_count_valid() -> Result<()> {
 
 /// The ambient effective config — the global and system layers with no repository — for an unscoped
 /// read run outside a repository. Stock `git config <key>` resolves from this stack when there is no
-/// repo; only an unscoped *write* requires one.
+/// repo; only an unscoped *write* requires one. `[include]`/`includeIf` directives are expanded; with
+/// no repository, `gitdir:`/`onbranch:` conditions never match, but `hasconfig:remote.*.url:` can still
+/// match a global/system remote URL.
 pub async fn ambient_effective() -> Result<GitConfig> {
-	let mut config = GitConfig::from_sources_or_empty(global_and_system_sources().await?);
-	config.overlay(env_config_source()?);
-	Ok(config)
+	assemble_merged(global_and_system_layers().await?, None, None, None).await
 }
 
 /// The single file an explicit `gta config --global` / `--system` operation reads and writes (git
@@ -240,39 +252,301 @@ async fn resolve_symlink(path: &Path) -> PathBuf {
 	current
 }
 
-/// The system and global sources beneath the repository config, in read order (lowest precedence
+/// One config file as an expandable layer: its parsed source plus the two directories git resolves its
+/// includes against — the **lexical** parent (the path it was reached through, for a relative
+/// `include.path`) and the **real** symlink-resolved parent (for a `gitdir:./` condition). They differ
+/// only when the file is reached via a symlink; git treats the two cases differently, so both are kept.
+///
+/// `fileless` marks the command-scope (`-c` / `GIT_CONFIG_*`) layer, which has no containing file: its
+/// includes are expanded through the engine's command-scope entry points (a relative `include.path` is
+/// then fatal and a `gitdir:./` condition never matches, as in git), and `dir`/`real_dir` are unused.
+struct ConfigLayer {
+	source: GitConfigSource,
+	dir: PathBuf,
+	real_dir: PathBuf,
+	fileless: bool,
+}
+
+/// Drop the per-layer directories once expansion is done, yielding the sources in read order.
+fn sources_of(layers: Vec<ConfigLayer>) -> Vec<GitConfigSource> {
+	layers.into_iter().map(|layer| layer.source).collect()
+}
+
+/// Assemble a merged [`GitConfig`] from ordered `base` layers (lowest → highest precedence, the last
+/// being the writable local file) plus the command-scope (`-c` / `GIT_CONFIG_*`) entries — expanding
+/// `[include]`/`includeIf` across **all** of them, command-scope included. git reads `-c` config as
+/// part of the same sequence, so a `-c include.path=<abs>` is expanded and a `-c remote.<n>.url` feeds
+/// a file-level `hasconfig` condition and the paradox pre-scan; this threads the command-scope source
+/// through `expand_layers` for that, then overlays it so it wins on reads while writes still target the
+/// writable base. `gitdir`/`branch` drive `gitdir:`/`onbranch:` (`None` outside a repository).
+async fn assemble_merged(
+	mut base: Vec<ConfigLayer>,
+	gitdir: Option<&Path>,
+	gitdir_absolute: Option<&Path>,
+	branch: Option<&str>,
+) -> Result<GitConfig> {
+	let base_len = base.len();
+	if let Some(env) = env_config_source()? {
+		// Command-scope config has no containing file. It is expanded through the engine's command-scope
+		// entry points (see `expand_layers`), so — matching git — an absolute `-c include.path` expands,
+		// a relative one is fatal, and a `gitdir:./` condition never matches.
+		base.push(ConfigLayer {
+			source: env,
+			dir: PathBuf::new(),
+			real_dir: PathBuf::new(),
+			fileless: true,
+		});
+	}
+	expand_layers(&mut base, gitdir, gitdir_absolute, branch).await?;
+	let mut sources = sources_of(base);
+	// Peel the command-scope source(s) back off the top so they overlay (highest precedence for reads)
+	// while `from_sources_or_empty` keeps the writable source on the base's last layer (the local file).
+	let env_sources = sources.split_off(base_len);
+	let mut config = GitConfig::from_sources_or_empty(sources);
+	config.overlay(env_sources);
+	Ok(config)
+}
+
+/// The system and global layers beneath the repository config, in read order (lowest precedence
 /// first): system, then the global file(s). The system layer is suppressed here — the merged read —
 /// when `$GIT_CONFIG_NOSYSTEM` is set; an explicit `--system` scope still targets the file (see
 /// [`system_path`]), matching git.
-async fn global_and_system_sources() -> Result<Vec<GitConfigSource>> {
+async fn global_and_system_layers() -> Result<Vec<ConfigLayer>> {
 	let mut paths = Vec::new();
 	if !env_bool("GIT_CONFIG_NOSYSTEM")? {
 		paths.push(system_path());
 	}
 	paths.extend(global_paths());
-	read_sources(paths).await
-}
-
-/// Parse each file at `paths` into a source, in order. An absent file is skipped; a file that exists
-/// but cannot be read or parsed is an error — git aborts on a bad config, so a lower-precedence one
-/// must not be silently ignored.
-async fn read_sources(paths: Vec<PathBuf>) -> Result<Vec<GitConfigSource>> {
-	let mut sources = Vec::new();
+	let mut layers = Vec::new();
 	for path in paths {
-		match tokio::fs::read(&path).await {
-			Ok(bytes) => {
-				let text =
-					std::str::from_utf8(&bytes).map_err(|_| anyhow!("{} is not UTF-8", path.display()))?;
-				let source = GitConfigSource::parse(text)
-					.map_err(|error| anyhow!("parsing {}: {error}", path.display()))?;
-				sources.push(source);
-			}
-			// An absent file simply contributes nothing to the stack.
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-			Err(error) => return Err(anyhow!("reading {}: {error}", path.display())),
+		if let Some(layer) = read_layer(&path).await? {
+			layers.push(layer);
 		}
 	}
-	Ok(sources)
+	Ok(layers)
+}
+
+/// The repository-local layer (`<common>/config`). An absent file yields an empty writable source
+/// anchored at `common` — matching git, which resolves from the ambient layers when `.git/config` does
+/// not exist yet. A present-but-malformed file is an error (via [`read_layer`]).
+async fn local_layer(common: &Path) -> Result<ConfigLayer> {
+	Ok(
+		read_layer(&common.join("config"))
+			.await?
+			.unwrap_or_else(|| ConfigLayer {
+				source: GitConfigSource::new(),
+				dir: common.to_path_buf(),
+				real_dir: common.to_path_buf(),
+				fileless: false,
+			}),
+	)
+}
+
+/// Parse one config file into a [`ConfigLayer`], or `None` if it is absent. A file that exists but
+/// cannot be read or parsed is an error — git aborts on a bad config, so a lower-precedence one must
+/// not be silently ignored.
+async fn read_layer(path: &Path) -> Result<Option<ConfigLayer>> {
+	match tokio::fs::read(path).await {
+		Ok(bytes) => {
+			let text =
+				std::str::from_utf8(&bytes).map_err(|_| anyhow!("{} is not UTF-8", path.display()))?;
+			let source = GitConfigSource::parse(text)
+				.map_err(|error| anyhow!("parsing {}: {error}", path.display()))?;
+			Ok(Some(ConfigLayer {
+				source,
+				// Lexical parent — the path git reached the file through — for relative `include.path`.
+				dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+				// Real (symlink-resolved) parent for `gitdir:./`, as git realpaths the config file.
+				real_dir: canonical_dir(path).await,
+				fileless: false,
+			}))
+		}
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+		Err(error) => Err(anyhow!("reading {}: {error}", path.display())),
+	}
+}
+
+/// The real (symlink-resolved) parent directory of a config file, for `gitdir:./` matching — git
+/// realpaths the config file before taking its directory. Falls back to the lexical parent if
+/// canonicalization fails.
+async fn canonical_dir(path: &Path) -> PathBuf {
+	let canonical = tokio::fs::canonicalize(path)
+		.await
+		.unwrap_or_else(|_| path.to_path_buf());
+	canonical
+		.parent()
+		.map(Path::to_path_buf)
+		.unwrap_or_default()
+}
+
+/// The real (symlink-resolved, absolute) git directory for `includeIf "gitdir:"`/`"onbranch:"`
+/// matching. git realpaths `$GIT_DIR`; discovery already canonicalizes, but resolve again defensively.
+async fn canonical_gitdir(git_dir: &Path) -> PathBuf {
+	tokio::fs::canonicalize(git_dir)
+		.await
+		.unwrap_or_else(|_| git_dir.to_path_buf())
+}
+
+/// git's **second** `gitdir:`-condition candidate: the git directory spelled through the
+/// symlink-preserving `$PWD` git honours (its `strbuf_add_absolute_path(git_dir)` fallback), or `None`
+/// when there is no distinct spelling. git matches a `gitdir:` condition against `realpath(git_dir)`
+/// *and* this, so a condition written with a symlinked path still matches a repository reached through
+/// that symlink.
+///
+/// git honours `$PWD` as the logical working directory only when it resolves to the real one, and it
+/// carries the symlink spelling into `opts->git_dir` only for a repository entered **at its root** —
+/// where git's relative `opts->git_dir` is `".git"` (ordinary) or `"."` (bare). Its
+/// `strbuf_add_absolute_path` fallback is then that relative name joined onto the honoured cwd. From a
+/// subdirectory git `chdir`s up during discovery and records the realpath, so no distinct spelling
+/// exists (probed vs git 2.50.1: a symlink-spelled `gitdir:` condition matches from the repo root — and
+/// for a bare root, e.g. `gitdir:/link.git/` — but not from a subdirectory).
+///
+/// This reproduces that: `$PWD` must be set, absolute, carry a symlink of its own, and canonicalize to
+/// the command's working directory (the `-C` dir, else the process cwd). The candidate is `$PWD` joined
+/// with the gitdir *relative to that cwd* — `".git"` for an ordinary root, `"."` for a bare root (its
+/// gitdir *is* the cwd; git's unnormalised `getcwd + "/."`), and no relation (so `None`) from a
+/// subdirectory, a linked worktree, or a symlinked `.git`, where the spelling is not `$PWD`-derived. The
+/// final `canonicalize` check means any mis-derivation degrades to canonical-only — never a spurious
+/// match.
+async fn logical_gitdir(canonical_git_dir: &Path) -> Option<PathBuf> {
+	let pwd = PathBuf::from(std::env::var_os("PWD")?);
+	if !pwd.is_absolute() {
+		return None;
+	}
+	let effective_cwd = command_cwd().or_else(|| std::env::current_dir().ok())?;
+	let cwd_real = tokio::fs::canonicalize(&effective_cwd).await.ok()?;
+	let pwd_real = tokio::fs::canonicalize(&pwd).await.ok()?;
+	// `$PWD` must name the real working directory (git's honouring rule) and carry a symlink of its own.
+	if pwd_real != cwd_real || pwd == pwd_real {
+		return None;
+	}
+	// The gitdir relative to the honoured cwd, matching git's relative `opts->git_dir`: `.git` for an
+	// ordinary root, empty (→ `.`, git's `getcwd + "/."`) for a bare root, and unrelated (→ `None`) from
+	// a subdirectory or a gitdir not under the cwd (linked worktree / symlinked `.git`).
+	let relative = canonical_git_dir.strip_prefix(&cwd_real).ok()?;
+	let candidate = if relative.as_os_str().is_empty() {
+		pwd.join(".")
+	} else {
+		pwd.join(relative)
+	};
+	// Safety net: offer it only if it is genuinely a distinct symlink spelling of the same gitdir.
+	if candidate == canonical_git_dir
+		|| tokio::fs::canonicalize(&candidate).await.ok()? != canonical_git_dir
+	{
+		return None;
+	}
+	Some(candidate)
+}
+
+/// The short current-branch name for `includeIf "onbranch:"` — the target of a **symbolic** `HEAD`
+/// under `refs/heads/`, with the prefix stripped (so it is present for an unborn branch and a bare
+/// repo, and `None` only for a detached HEAD or a HEAD outside `refs/heads/`, matching git).
+async fn head_branch(git_dir: &Path) -> Option<String> {
+	let head = tokio::fs::read_to_string(git_dir.join("HEAD")).await.ok()?;
+	let target = head.strip_prefix("ref:")?.trim();
+	target
+		.strip_prefix("refs/heads/")
+		.map(std::borrow::ToOwned::to_owned)
+}
+
+/// A [`tokio::fs`]-backed [`IncludeResolver`], the native driver for git-config include expansion. An
+/// absent target reads as `None` (git silently skips it); a present-but-unreadable or non-UTF-8 target
+/// is an error, as git aborts on a bad included file.
+struct FsIncludeResolver;
+
+impl IncludeResolver for FsIncludeResolver {
+	async fn read(&self, path: &Path) -> Result<Option<(String, PathBuf)>, ConfigError> {
+		match tokio::fs::read(path).await {
+			Ok(bytes) => {
+				let text = String::from_utf8(bytes)
+					.map_err(|_| ConfigError::Parse(format!("{} is not UTF-8", path.display())))?;
+				// Report the file's real path so the engine matches a nested `gitdir:./` against its real
+				// directory (git realpaths each included file for that condition). If canonicalization fails
+				// — it should not, the file was just read — fall back to the requested path.
+				let canonical = tokio::fs::canonicalize(path)
+					.await
+					.unwrap_or_else(|_| path.to_path_buf());
+				Ok(Some((text, canonical)))
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+			Err(error) => Err(ConfigError::Parse(format!(
+				"reading include {}: {error}",
+				path.display()
+			))),
+		}
+	}
+}
+
+/// Expand `[include]`/`includeIf` across all `layers` in place, reproducing git's whole-config
+/// handling. First runs git's remote-URL pre-scan ([`GitConfigSource::scan_remote_urls`]) over every
+/// layer, combining the results: the collected `remote.<name>.url` values feed `hasconfig` matching,
+/// and if any layer reached a `hasconfig` directive **and** any layer's matched-`includeIf` subtree set
+/// a remote URL, that is git's paradox — fatal across the whole config. Then expands each layer with the
+/// collected URLs so `hasconfig` resolves against every layer, as git does. `gitdir`/`branch` are the
+/// repository facts for `gitdir:`/`onbranch:` (`None` outside a repository).
+async fn expand_layers(
+	layers: &mut [ConfigLayer],
+	gitdir: Option<&Path>,
+	gitdir_absolute: Option<&Path>,
+	branch: Option<&str>,
+) -> Result<()> {
+	let home = home_dir();
+	let resolver = FsIncludeResolver;
+	// Pre-scan: hasconfig is forced true inside the scan, so it consults no remote URLs itself.
+	let prescan_ctx = IncludeContext {
+		home: home.as_deref(),
+		gitdir,
+		gitdir_absolute,
+		branch,
+		remote_urls: None,
+	};
+	let mut urls: Vec<String> = Vec::new();
+	let mut has_hasconfig = false;
+	let mut forbidden_url = false;
+	for layer in layers.iter() {
+		let scan = if layer.fileless {
+			layer
+				.source
+				.scan_remote_urls_command_scope(&prescan_ctx, &resolver)
+				.await
+		} else {
+			layer
+				.source
+				.scan_remote_urls(&layer.dir, &layer.real_dir, &prescan_ctx, &resolver)
+				.await
+		}
+		.map_err(|error| anyhow!("reading git config includes: {error}"))?;
+		urls.extend(scan.urls);
+		has_hasconfig |= scan.has_hasconfig;
+		forbidden_url |= scan.forbidden_url;
+	}
+	// git fatals on the paradox only when a `hasconfig` directive exists to trigger the pre-scan.
+	if has_hasconfig && forbidden_url {
+		return Err(anyhow!("{}", ConfigError::HasconfigIncludeSetsRemoteUrl));
+	}
+	let url_refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+	let ctx = IncludeContext {
+		home: home.as_deref(),
+		gitdir,
+		gitdir_absolute,
+		branch,
+		remote_urls: Some(url_refs.as_slice()),
+	};
+	for layer in layers.iter_mut() {
+		if layer.fileless {
+			layer
+				.source
+				.expand_includes_command_scope(&ctx, &resolver)
+				.await
+		} else {
+			layer
+				.source
+				.expand_includes(&layer.dir, &layer.real_dir, &ctx, &resolver)
+				.await
+		}
+		.map_err(|error| anyhow!("expanding git config includes: {error}"))?;
+	}
+	Ok(())
 }
 
 /// Config entries passed through the environment: `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>` /
@@ -301,9 +575,11 @@ fn env_config_source() -> Result<Option<GitConfigSource>> {
 		let value = std::env::var(format!("GIT_CONFIG_VALUE_{n}"))
 			.map_err(|_| anyhow!("missing GIT_CONFIG_VALUE_{n}"))?;
 		let (section, subsection, name) = parse_env_key(&key)?;
-		// `add` (not `set`) so repeated `-c` of a multi-valued key accumulate, last-wins for a
-		// single-valued lookup — matching git's handling of `-c`.
-		source.add(section, subsection, name, Some(&value));
+		// `append` (not `add`) preserves strict command-line order: each entry becomes its own block, so
+		// an `include.path` interleaved with repeats of a key expands at its true position and git's
+		// last-entry-wins holds. `add` would group a repeat back into an earlier section, moving it past
+		// the include. Multi-valued accumulation and single-value last-wins are preserved either way.
+		source.append(section, subsection, name, Some(&value));
 	}
 	Ok(Some(source))
 }
@@ -339,7 +615,7 @@ fn parse_env_key(key: &str) -> Result<(&str, Option<&str>, &str)> {
 
 /// The system config file: `$GIT_CONFIG_SYSTEM` or the built-in `/etc/gitconfig`. This is
 /// unconditional — `$GIT_CONFIG_NOSYSTEM` only drops the system layer from the *merged* read
-/// ([`global_and_system_sources`]); an explicitly named `--system` scope still reads/writes it, as
+/// ([`global_and_system_layers`]); an explicitly named `--system` scope still reads/writes it, as
 /// git does.
 fn system_path() -> PathBuf {
 	env_override_path("GIT_CONFIG_SYSTEM").unwrap_or_else(|| PathBuf::from("/etc/gitconfig"))

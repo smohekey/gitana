@@ -67,7 +67,7 @@ pub async fn run(
 	let found = repo::discover(cwd).await?;
 	// git's push-URL selection: `remote.origin.pushurl` (with `insteadOf`) if set, else
 	// `remote.origin.url` with `pushInsteadOf` (falling back to `insteadOf`) — over the merged config.
-	let config = git_config::effective_config_at(&found.common_dir).await?;
+	let config = git_config::effective_config_at(&found.git_dir, &found.common_dir).await?;
 	let origin = url_rewrite::push_origin(&config, "origin")?;
 	// A relative askpass resolves against the worktree root, as git runs it from there (bare: git dir).
 	let askpass_cwd = found

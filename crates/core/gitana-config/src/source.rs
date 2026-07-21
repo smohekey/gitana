@@ -11,6 +11,22 @@ use crate::{
 /// git's maximum include nesting depth; exceeding it is fatal (and breaks any cycle).
 const MAX_INCLUDE_DEPTH: usize = 10;
 
+/// The two directories git resolves a config file's includes against (see
+/// [`GitConfigSource::expand_includes`]): the **lexical** parent (for a relative `include.path`) and the
+/// **real** symlink-resolved parent (for a `gitdir:./` condition). They differ only when the file is
+/// reached via a symlink; bundling them keeps the recursion helpers' signatures small.
+///
+/// `fileless` marks a **command-scope** source (`-c` / `GIT_CONFIG_*`), which has no containing file: a
+/// relative `include.path` is then fatal and a `gitdir:./` condition does not match, as in git (see
+/// [`GitConfigSource::expand_includes_command_scope`]). It is always `false` for an included file (which
+/// necessarily has a path) and for an ordinary on-disk config layer.
+#[derive(Clone, Copy)]
+struct IncludeDirs<'a> {
+	lexical: &'a Path,
+	real: &'a Path,
+	fileless: bool,
+}
+
 /// One structural piece of a config file, retaining its exact source text so the file round-trips
 /// and edits stay surgical. Concatenating every element's raw text reproduces the source verbatim.
 #[derive(Debug, Clone)]
@@ -103,6 +119,24 @@ pub(crate) struct Variable {
 	pub value_span: Option<Range<usize>>,
 }
 
+/// The result of git's remote-URL pre-scan ([`GitConfigSource::scan_remote_urls`]). A driver runs the
+/// scan per layer and combines the results across the whole config, because git resolves `hasconfig`
+/// (both its URL set and its paradox guard) against every precedence layer at once.
+#[derive(Debug, Default, Clone)]
+pub struct RemoteUrlScan {
+	/// Every `remote.<name>.url` value reachable through the top level and plain `[include]`s — the
+	/// regions a real read collects from. URLs reachable only through an `includeIf` are never here
+	/// (they are the paradox instead). These feed `IncludeContext::remote_urls` for the real expansion.
+	pub urls: Vec<String>,
+	/// Whether any `hasconfig:remote.*.url:` directive was reached. This is git's trigger: the pre-scan
+	/// (and hence the paradox guard) only takes effect when a `hasconfig` condition exists to evaluate.
+	pub has_hasconfig: bool,
+	/// Whether a *matched* `includeIf` subtree set a `remote.<name>.url` (git's `forbid_remote_url`).
+	/// Recorded rather than fatalled here so the driver can combine it with `has_hasconfig` from any
+	/// layer: the config is rejected exactly when both hold.
+	pub forbidden_url: bool,
+}
+
 /// A single parsed git configuration file: an ordered list of elements with case-correct,
 /// multi-value-aware lookups. Writes are surgical — they preserve comments and the surrounding
 /// layout. [`include`](Self::expand_includes) / `includeIf` directives are expanded on request.
@@ -148,9 +182,13 @@ impl GitConfigSource {
 	/// tagged [`ElementOrigin::Included`] so it is visible to reads but ignored by writes and
 	/// serialization (a write must not flatten another file's content into this one).
 	///
-	/// `dir` is the including file's directory, used to resolve relative include paths and `./`
-	/// gitdir patterns; `ctx` supplies `$HOME`/gitdir for path and condition resolution; `resolver`
-	/// performs the reads (returning `None` for an absent file, which is silently skipped).
+	/// `dir` is the including file's **lexical** directory (the path it was reached through), used to
+	/// resolve a relative `include.path`; `real_dir` is its **real** (symlink-resolved) directory, used
+	/// by a `gitdir:./` condition. git resolves the two differently — a relative include against the
+	/// file's lexical dir, a `./` condition against its realpath — so a config reached via a symlink
+	/// resolves each the way git does. `ctx` supplies `$HOME`/gitdir/branch; `resolver` performs the
+	/// reads (returning `None` for an absent file, which is silently skipped) and reports each read
+	/// file's canonical path so nested includes get the same split treatment.
 	///
 	/// Errors: a bare `path` on a directive that would be read ([`ConfigError::IncludeMissingValue`]);
 	/// a `~/` path with no `$HOME`, or an unsupported `~user/`, on a matched directive
@@ -168,6 +206,7 @@ impl GitConfigSource {
 	pub async fn expand_includes<R: IncludeResolver>(
 		&mut self,
 		dir: &Path,
+		real_dir: &Path,
 		ctx: &IncludeContext<'_>,
 		resolver: &R,
 	) -> Result<(), ConfigError> {
@@ -175,33 +214,50 @@ impl GitConfigSource {
 		// second call neither duplicates an unchanged include nor lets a stale value outlive a changed
 		// one. Only own elements survive to be (re-)expanded.
 		self.elements.retain(Entry::is_own);
-		self
-			.expand_includes_at_depth(dir, ctx, resolver, 0, false)
-			.await
+		let dirs = IncludeDirs {
+			lexical: dir,
+			real: real_dir,
+			fileless: false,
+		};
+		self.expand_includes_at_depth(dirs, ctx, resolver, 0).await
+	}
+
+	/// Expand includes in a **command-scope** source — `-c` / `GIT_CONFIG_*` config, which git reads as
+	/// part of the same include-aware sequence but which has no containing file. git still expands an
+	/// absolute (or `~`-based) `include.path` here, so this does too; but a *relative* `include.path` is
+	/// fatal ([`ConfigError::IncludeRelativeFromCommandScope`]) and a `gitdir:./` condition simply does
+	/// not match — both matching git, which has no file to resolve either against. Otherwise identical to
+	/// [`expand_includes`](Self::expand_includes) (idempotent, same depth cap, same origin tagging).
+	pub async fn expand_includes_command_scope<R: IncludeResolver>(
+		&mut self,
+		ctx: &IncludeContext<'_>,
+		resolver: &R,
+	) -> Result<(), ConfigError> {
+		self.elements.retain(Entry::is_own);
+		let empty = Path::new("");
+		let dirs = IncludeDirs {
+			lexical: empty,
+			real: empty,
+			fileless: true,
+		};
+		self.expand_includes_at_depth(dirs, ctx, resolver, 0).await
 	}
 
 	/// The depth-tracking core of [`expand_includes`](Self::expand_includes). Returns a boxed `Send`
 	/// future so the async body can recurse (an `async fn` cannot name its own future to recurse) and
 	/// so the whole chain stays `Send`, matching the crate's Send-futures convention.
 	///
-	/// `forbid_remote_url` is set once a `hasconfig:remote.*.url:` directive has been matched, and
-	/// propagates to every file it pulls in (directly or via nested plain includes): inside such a
-	/// subtree, encountering a `remote.<name>.url` is git's paradox and fatals. The check runs *at the
-	/// element's position* during traversal (not as a post-hoc scan), so — matching git's linear read —
-	/// a forbidden URL fatals before any later *include* in the same file is read.
-	///
-	/// One residual gap (deferred): git parses incrementally, so a forbidden URL also fatals before a
-	/// later *syntax error* in the same file. Here the whole included file is parsed atomically before
-	/// the positional walk, so a URL lexically preceding a syntax error surfaces the parse error instead
-	/// of the paradox. Both still fail closed; only the error differs. A faithful fix needs an
-	/// incremental parser (disproportionate for this exotic case). See the HLD's Deferred section.
+	/// This pass no longer enforces git's `hasconfig` URL-paradox guard: that is the pre-scan's job
+	/// ([`scan_remote_urls`](Self::scan_remote_urls)), which git runs *before* the real read whenever a
+	/// `hasconfig` condition is reached, and which alone sees every layer (the guard is whole-config).
+	/// A driver therefore runs `scan_remote_urls` first — it supplies `ctx.remote_urls` *and* fatals on
+	/// the paradox — so by the time this expansion runs, a paradoxical config has already been rejected.
 	fn expand_includes_at_depth<'a, R: IncludeResolver>(
 		&'a mut self,
-		dir: &'a Path,
+		dirs: IncludeDirs<'a>,
 		ctx: &'a IncludeContext<'a>,
 		resolver: &'a R,
 		depth: usize,
-		forbid_remote_url: bool,
 	) -> Pin<Box<dyn Future<Output = Result<(), ConfigError>> + Send + 'a>> {
 		Box::pin(async move {
 			let mut i = 0;
@@ -212,11 +268,6 @@ impl GitConfigSource {
 					i += 1;
 					continue;
 				}
-				// Inside a hasconfig-included subtree, a `remote.<name>.url` here is fatal — checked in
-				// file order so it fires before any later include, as git's linear read does.
-				if forbid_remote_url && element_is_remote_subsection_url(&self.elements[i].element) {
-					return Err(ConfigError::HasconfigIncludeSetsRemoteUrl);
-				}
 				let Some((value, condition)) = include_directive(&self.elements[i].element) else {
 					i += 1;
 					continue;
@@ -226,9 +277,10 @@ impl GitConfigSource {
 				// queryable as an ordinary key while ALSO expanding), so every skip path just advances
 				// past it; only a matched directive splices the included content immediately after it.
 
-				// git reads the path only when an `includeIf` condition matches.
+				// git reads the path only when an `includeIf` condition matches. `gitdir:./` in the
+				// condition resolves against the file's real directory (or never matches in command scope).
 				if let Some(condition) = &condition
-					&& !condition_matches(condition, dir, ctx)
+					&& !condition_matches(condition, dirs.real, ctx, dirs.fileless)
 				{
 					i += 1;
 					continue;
@@ -238,11 +290,12 @@ impl GitConfigSource {
 					return Err(ConfigError::IncludeMissingValue);
 				};
 				// A matched directive whose path needs `~/` but has no `$HOME`, or an unsupported
-				// `~user/`, is fatal in git — distinct from an absent file, which is skipped.
-				let resolved = resolve_include_path(&value, dir, ctx.home)?;
+				// `~user/`, is fatal in git — distinct from an absent file, which is skipped. A relative
+				// path resolves against the *lexical* directory, as git does (or is fatal in command scope).
+				let resolved = resolve_include_path(&value, dirs.lexical, ctx.home, dirs.fileless)?;
 				// git's access check precedes its depth check: an absent target is silently skipped
 				// (no depth error), and only a target that actually READS triggers the depth cap.
-				let Some(text) = resolver.read(&resolved).await? else {
+				let Some((text, canonical)) = resolver.read(&resolved).await? else {
 					i += 1;
 					continue;
 				};
@@ -250,19 +303,25 @@ impl GitConfigSource {
 					return Err(ConfigError::IncludeDepthExceeded);
 				}
 
-				// Expand the included file (relative to *its own* directory) before splicing, so nested
-				// includes land inline at the right positions. A `hasconfig:remote.*.url:` match arms the
-				// paradox guard for this include's whole subtree; an ordinary or already-forbidden include
-				// simply propagates the flag it inherited. The guard fires *within* that recursion, at the
-				// position of an offending URL — so on the matched path the engine walks it matches git's
-				// linear read. (git also fatals on the no-match path via its forced pre-scan; that arm is
-				// the cross-layer driver's, slice 3.)
-				let child_forbid =
-					forbid_remote_url || condition.as_deref().is_some_and(is_hasconfig_remote_url);
+				// Expand the included file before splicing, so nested includes land inline at the right
+				// positions. Its relative includes resolve against its own *lexical* dir (the path we
+				// reached it through), its `./` conditions against its *real* dir (from the canonical path
+				// the resolver reported) — git's split treatment, one level down.
 				let mut included = GitConfigSource::parse(&text)?;
 				let included_dir = resolved.parent().map(Path::to_path_buf).unwrap_or_default();
+				let included_real_dir = canonical
+					.parent()
+					.map(Path::to_path_buf)
+					.unwrap_or_default();
+				// The included file has a path, so its own includes are never fileless (even when the
+				// including source was command-scope: only an absolute path could have been read here).
+				let included_dirs = IncludeDirs {
+					lexical: &included_dir,
+					real: &included_real_dir,
+					fileless: false,
+				};
 				included
-					.expand_includes_at_depth(&included_dir, ctx, resolver, depth + 1, child_forbid)
+					.expand_includes_at_depth(included_dirs, ctx, resolver, depth + 1)
 					.await?;
 
 				// Everything from the included file is non-own from this file's perspective, so reads
@@ -278,6 +337,169 @@ impl GitConfigSource {
 				// `i` in place and queryable.
 				self.elements.splice(i + 1..i + 1, spliced);
 				i += 1 + count;
+			}
+			Ok(())
+		})
+	}
+
+	/// git's remote-URL pre-scan (`populate_remote_urls`), the companion to
+	/// [`expand_includes`](Self::expand_includes). git runs it — over the *whole* config — the first
+	/// time a `hasconfig:remote.*.url:` condition is reached during a read, both to learn which remote
+	/// URLs exist (so the condition can be evaluated) and to enforce the paradox guard. It reads all
+	/// config with `hasconfig` conditions **forced true** (`unconditional_remote_url`), so:
+	///
+	/// - **URLs** ([`RemoteUrlScan::urls`]) are collected from the top level and any plain `[include]`
+	///   subtree — the regions a real read would collect from — but never from an `includeIf` subtree.
+	/// - Entering *any matched* `includeIf` subtree (a real-matching `gitdir:`/`onbranch:`, or a
+	///   forced-true `hasconfig:`) arms git's `forbid_remote_url`: a `remote.<name>.url` anywhere inside
+	///   is the paradox. This is recorded in [`RemoteUrlScan::forbidden_url`] rather than fatalled
+	///   immediately, because the *trigger* ([`RemoteUrlScan::has_hasconfig`], set when any `hasconfig`
+	///   directive is reached) may live in a **different layer**; only the driver, seeing every layer,
+	///   knows whether a `hasconfig` exists at all, and so combines the per-layer scans and fatals with
+	///   [`ConfigError::HasconfigIncludeSetsRemoteUrl`] exactly when `has_hasconfig && forbidden_url`.
+	///
+	/// Because `hasconfig` is forced true here, this scan never consults `ctx.remote_urls` (it uses only
+	/// `home`/`gitdir`/`branch`). It does not mutate `self`; it parses included files on the fly.
+	///
+	/// Deferred divergence: a valueless (`path` with no value) include reached *only* via the forced-true
+	/// arm — i.e. inside a `hasconfig` subtree that would not really match — is skipped here rather than
+	/// fatalling `missing value`, as git's forced pre-scan would. The real read reports it on a genuinely
+	/// matched path; the gap is a `hasconfig`-subtree-only, already-broken-config edge (HLD Deferred).
+	pub async fn scan_remote_urls<R: IncludeResolver>(
+		&self,
+		dir: &Path,
+		real_dir: &Path,
+		ctx: &IncludeContext<'_>,
+		resolver: &R,
+	) -> Result<RemoteUrlScan, ConfigError> {
+		let mut scan = RemoteUrlScan::default();
+		let dirs = IncludeDirs {
+			lexical: dir,
+			real: real_dir,
+			fileless: false,
+		};
+		self
+			.scan_remote_urls_at_depth(dirs, ctx, resolver, 0, false, &mut scan)
+			.await?;
+		Ok(scan)
+	}
+
+	/// [`scan_remote_urls`](Self::scan_remote_urls) for a **command-scope** source (`-c` / `GIT_CONFIG_*`).
+	/// git includes command-scope `remote.<name>.url` in the same pre-scan, so a URL set only via `-c` can
+	/// satisfy a file-level `hasconfig` condition (and is subject to the same paradox guard). The
+	/// command-scope source has no file, so — as in [`expand_includes_command_scope`](Self::expand_includes_command_scope)
+	/// — a relative `include.path` is fatal and a `gitdir:./` condition does not match.
+	pub async fn scan_remote_urls_command_scope<R: IncludeResolver>(
+		&self,
+		ctx: &IncludeContext<'_>,
+		resolver: &R,
+	) -> Result<RemoteUrlScan, ConfigError> {
+		let mut scan = RemoteUrlScan::default();
+		let empty = Path::new("");
+		let dirs = IncludeDirs {
+			lexical: empty,
+			real: empty,
+			fileless: true,
+		};
+		self
+			.scan_remote_urls_at_depth(dirs, ctx, resolver, 0, false, &mut scan)
+			.await?;
+		Ok(scan)
+	}
+
+	/// The depth-tracking core of [`scan_remote_urls`](Self::scan_remote_urls). Boxed-`Send` for the same
+	/// reason as [`expand_includes_at_depth`](Self::expand_includes_at_depth) — an `async fn` cannot name
+	/// its own future to recurse. `forbidden` is set once inside a matched `includeIf` subtree (and
+	/// propagates through nested plain includes), so a `remote.<name>.url` there is recorded as the
+	/// paradox rather than collected.
+	fn scan_remote_urls_at_depth<'a, R: IncludeResolver>(
+		&'a self,
+		dirs: IncludeDirs<'a>,
+		ctx: &'a IncludeContext<'a>,
+		resolver: &'a R,
+		depth: usize,
+		forbidden: bool,
+		scan: &'a mut RemoteUrlScan,
+	) -> Pin<Box<dyn Future<Output = Result<(), ConfigError>> + Send + 'a>> {
+		Box::pin(async move {
+			for entry in &self.elements {
+				let element = &entry.element;
+				// A `remote.<name>.url` is the paradox inside a matched-includeIf subtree, else a
+				// collectable URL. git forbids on the *key* (so a valueless one still trips it) but only
+				// a value can be matched against a `hasconfig` glob, so only a value is collected.
+				if element_is_remote_subsection_url(element) {
+					if forbidden {
+						scan.forbidden_url = true;
+					} else if let Element::Variable(v) = element
+						&& let Some(value) = &v.value
+					{
+						scan.urls.push(value.clone());
+					}
+					continue;
+				}
+				// Reaching any `hasconfig:remote.*.url:` directive (regardless of its key, per git's
+				// evaluate-before-key-check order) is what triggers the whole pre-scan.
+				if element_is_hasconfig_includeif(element) {
+					scan.has_hasconfig = true;
+				}
+				let Some((value, condition)) = include_directive(element) else {
+					continue;
+				};
+				// Decide whether to descend, and whether the subtree forbids remote URLs. A plain
+				// `[include]` inherits the parent's state; a `hasconfig:` is forced true (and arms the
+				// forbid); a `gitdir:`/`onbranch:` is evaluated by its real condition and, if it matches,
+				// arms the forbid.
+				let child_forbidden = match &condition {
+					None => forbidden,
+					Some(cond) if is_hasconfig_remote_url(cond) => true,
+					Some(cond) => {
+						// `gitdir:./` resolves against the file's real directory (or never matches in command
+						// scope), as git does.
+						if !condition_matches(cond, dirs.real, ctx, dirs.fileless) {
+							continue;
+						}
+						true
+					}
+				};
+				// A matched directive with no path value can't be read (see the deferred divergence on
+				// `scan_remote_urls`); skip it here — the real expand pass reports `missing value` on a
+				// genuinely matched path.
+				let Some(value) = value else {
+					continue;
+				};
+				// A relative `include.path` resolves against the *lexical* dir; nested `./` conditions use
+				// the *real* dir taken from the resolver's canonical path — git's split treatment. A relative
+				// path in command scope is fatal (as in `expand_includes`).
+				let resolved = resolve_include_path(&value, dirs.lexical, ctx.home, dirs.fileless)?;
+				// Access check precedes the depth check, matching `expand_includes` (and git).
+				let Some((text, canonical)) = resolver.read(&resolved).await? else {
+					continue;
+				};
+				if depth + 1 > MAX_INCLUDE_DEPTH {
+					return Err(ConfigError::IncludeDepthExceeded);
+				}
+				let included = GitConfigSource::parse(&text)?;
+				let included_dir = resolved.parent().map(Path::to_path_buf).unwrap_or_default();
+				let included_real_dir = canonical
+					.parent()
+					.map(Path::to_path_buf)
+					.unwrap_or_default();
+				// A read included file has a path, so its nested includes are never fileless.
+				let included_dirs = IncludeDirs {
+					lexical: &included_dir,
+					real: &included_real_dir,
+					fileless: false,
+				};
+				included
+					.scan_remote_urls_at_depth(
+						included_dirs,
+						ctx,
+						resolver,
+						depth + 1,
+						child_forbidden,
+						scan,
+					)
+					.await?;
 			}
 			Ok(())
 		})
@@ -611,6 +833,37 @@ impl GitConfigSource {
 			.collect()
 	}
 
+	/// Append a variable as its **own** section block at the very end, preserving strict insertion
+	/// order — unlike [`add`](Self::add), which groups a repeat into the last matching section. This is
+	/// how command-scope config (`-c` / `GIT_CONFIG_*`) must be built: git reads those entries as a
+	/// linear stream, so an `include.path` interleaved with repeats of a key
+	/// (`-c x.v=a -c include.path=… -c x.v=b`) must keep that order — a grouped representation would move
+	/// the include past a later same-section key and let it win when git's last entry (`b`) should. Each
+	/// entry gets a fresh `[section]` header; the rendered text is more verbose but is never written to
+	/// disk (command-scope config has no file), and `get`/`get_all` order is exactly the insertion order.
+	pub fn append(
+		&mut self,
+		section: &str,
+		subsection: Option<&str>,
+		name: &str,
+		value: Option<&str>,
+	) {
+		let section_lc = section.to_ascii_lowercase();
+		let name_lc = name.to_ascii_lowercase();
+		let var = match value {
+			Some(value) => synth_variable(&section_lc, subsection, &name_lc, value),
+			None => synth_bare_variable(&section_lc, subsection, &name_lc),
+		};
+		self.ensure_trailing_newline(self.elements.len());
+		self
+			.elements
+			.push(Entry::own(Element::Section(synth_section(
+				&section_lc,
+				subsection,
+			))));
+		self.elements.push(Entry::own(Element::Variable(var)));
+	}
+
 	/// Append a value (for multi-valued variables); a `None` value is boolean-true. Never replaces
 	/// an existing value: the new line is inserted into the (last) matching section, creating the
 	/// section at end of file if it does not exist.
@@ -773,6 +1026,18 @@ fn element_is_remote_subsection_url(element: &Element) -> bool {
 	matches!(
 		element,
 		Element::Variable(v) if v.section == "remote" && v.subsection.is_some() && v.name == "url"
+	)
+}
+
+/// Whether `element` is an `includeIf "hasconfig:remote.*.url:…"` variable — of any key, not only
+/// `path`. git evaluates the condition (triggering the remote-URL pre-scan) before it checks the key
+/// is `path`, so even a stray `[includeIf "hasconfig:…"] other = x` triggers it. Section is lower-cased.
+fn element_is_hasconfig_includeif(element: &Element) -> bool {
+	matches!(
+		element,
+		Element::Variable(v)
+			if v.section == "includeif"
+				&& v.subsection.as_deref().is_some_and(is_hasconfig_remote_url)
 	)
 }
 
@@ -1177,6 +1442,38 @@ mod tests {
 			config.render(),
 			"[remote \"o\"]\n\tfetch = one   # keep me\n\tfetch = two\n"
 		);
+	}
+
+	#[test]
+	fn append_preserves_strict_insertion_order_unlike_add() {
+		// `add` groups a repeat back into the earlier `[x]` block; `append` keeps each entry as its own
+		// block in insertion order — what command-scope config needs so an interleaved directive stays put.
+		let mut added = GitConfigSource::new();
+		added.add("x", None, "v", Some("a"));
+		added.add("y", None, "w", Some("mid"));
+		added.add("x", None, "v", Some("b"));
+		// `add` reorders: the second `x.v` joins the first, so `y.w` ends up last in file order.
+		assert_eq!(
+			added.entries().map(|(k, _)| k).collect::<Vec<_>>(),
+			["x.v", "x.v", "y.w"]
+		);
+
+		let mut appended = GitConfigSource::new();
+		appended.append("x", None, "v", Some("a"));
+		appended.append("y", None, "w", Some("mid"));
+		appended.append("x", None, "v", Some("b"));
+		// `append` keeps command-line order: a, mid, b.
+		assert_eq!(
+			appended.entries().collect::<Vec<_>>(),
+			[
+				("x.v".to_owned(), Some("a")),
+				("y.w".to_owned(), Some("mid")),
+				("x.v".to_owned(), Some("b")),
+			]
+		);
+		// Multi-value and last-wins are still correct across the ungrouped blocks.
+		assert_eq!(appended.get_all("x", None, "v"), vec!["a", "b"]);
+		assert_eq!(appended.get_string("x", None, "v"), Some("b"));
 	}
 
 	#[test]

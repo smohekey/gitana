@@ -81,7 +81,7 @@ impl CliSigner {
 		signing_key: Option<PathBuf>,
 		cwd: &Path,
 	) -> Result<Self> {
-		let config = repo.read_config().await.ok();
+		let config = repo.effective_config().await.ok();
 		let program = config
 			.as_ref()
 			.and_then(|config| config.get_string("gpg", Some("ssh"), "program"))
@@ -178,7 +178,7 @@ impl GpgSigner {
 		repo: &Repository<Backend, H>,
 		signing_key: Option<PathBuf>,
 	) -> Result<Self> {
-		let config = repo.read_config().await.ok();
+		let config = repo.effective_config().await.ok();
 		// git prefers the per-format `gpg.openpgp.program`, falling back to the legacy `gpg.program`.
 		let program = config
 			.as_ref()
@@ -261,7 +261,7 @@ impl<'a, H: HashAlgorithm> LazyCliSigner<'a, H> {
 	/// OpenPGP (git's default). Any other format is refused. Called once, the first time a commit is
 	/// actually signed — deferring the config read and key load off the no-commit paths.
 	async fn resolve(&self) -> Result<ResolvedSigner> {
-		let config = self.repo.read_config().await?;
+		let config = self.repo.effective_config().await?;
 		let format = config.get_string("gpg", None, "format").map(str::to_owned);
 		match format.as_deref() {
 			Some("ssh") => Ok(ResolvedSigner::Ssh(
@@ -321,7 +321,7 @@ async fn config_requests_gpgsign<H: HashAlgorithm>(
 	repo: &Repository<Backend, H>,
 	section: &str,
 ) -> Result<bool> {
-	let config = repo.read_config().await?;
+	let config = repo.effective_config().await?;
 	Ok(config.get_bool(section, None, "gpgsign")?.unwrap_or(false))
 }
 

@@ -20,7 +20,7 @@ use crate::{git_config, repo, transport_for, url_rewrite};
 pub async fn run(cwd: &Path) -> Result<()> {
 	let found = repo::discover(cwd).await?;
 	// The origin URL is `remote.origin.url` with `url.*.insteadOf` applied, read from the merged config.
-	let config = git_config::effective_config_at(&found.common_dir).await?;
+	let config = git_config::effective_config_at(&found.git_dir, &found.common_dir).await?;
 	let origin = url_rewrite::fetch_origin(&config, "origin")?;
 	// A relative askpass resolves against the worktree root, as git runs it from there (bare: git dir).
 	let askpass_cwd = found

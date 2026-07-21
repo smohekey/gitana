@@ -48,7 +48,7 @@ pub async fn open_generic<H: HashAlgorithm>(
 	let git = Dir::open_ambient_dir(git_dir, ambient_authority())
 		.map_err(|error| anyhow!("opening {}: {error}", git_dir.display()))?;
 	let mut repo = Repository::new(ObjectStore::new(WorktreeFileStore::new(common, git)));
-	repo.set_effective_config(crate::git_config::effective_config(&repo).await?);
+	repo.set_effective_config(crate::git_config::effective_config_at(git_dir, common_dir).await?);
 	Ok(repo)
 }
 

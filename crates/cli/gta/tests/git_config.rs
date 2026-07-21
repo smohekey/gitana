@@ -1301,6 +1301,790 @@ fn global_objectformat_does_not_change_repo_format() {
 	std::fs::remove_dir_all(&home).ok();
 }
 
+// --- include / includeIf expansion (slice 3), cross-checked against stock git ---
+
+/// The canonical (symlink-resolved) git directory of the repo at `work`, for building a `gitdir:`
+/// pattern that matches — git resolves the gitdir to a real path but leaves the pattern literal, and
+/// the macOS temp dir (`/var/...` → `/private/var/...`) otherwise breaks the match.
+fn canonical_git_dir(work: &std::path::Path) -> PathBuf {
+	std::fs::canonicalize(work).unwrap().join(".git")
+}
+
+#[test]
+fn includeif_gitdir_gives_a_per_directory_identity() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-inc-gitdir");
+	let w = work.to_str().unwrap();
+	let gdir = unique_tmp("gta-inc-gitdir-cfg");
+	let id = gdir.join("work-id.cfg");
+	std::fs::write(&id, "[user]\n\temail = dir@example.com\n").unwrap();
+	// The gitdir pattern points at the repo's *parent* directory (trailing `/` → `**`), so the repo's
+	// gitdir beneath it matches. The include target is absolute, so no HOME is needed.
+	let parent = canonical_git_dir(&work);
+	let parent = parent.parent().unwrap();
+	let global = gdir.join("gitconfig");
+	std::fs::write(
+		&global,
+		format!(
+			"[includeIf \"gitdir:{}/\"]\n\tpath = {}\n",
+			parent.display(),
+			id.display()
+		),
+	)
+	.unwrap();
+	let env = [
+		("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+
+	// The identity set only via the includeIf'd file resolves — for gta and for stock git alike.
+	assert_eq!(
+		ok_stdout(gta_env(w, &["config", "user.email"], &env)).trim(),
+		"dir@example.com"
+	);
+	assert_eq!(
+		ok_stdout(git_env(w, &["config", "user.email"], &env)).trim(),
+		"dir@example.com"
+	);
+
+	// A gitdir condition that does not cover this repo does not apply — both agree it is unset.
+	let global2 = gdir.join("gitconfig2");
+	std::fs::write(
+		&global2,
+		format!(
+			"[includeIf \"gitdir:/nowhere/near/here/\"]\n\tpath = {}\n",
+			id.display()
+		),
+	)
+	.unwrap();
+	let env2 = [
+		("GIT_CONFIG_GLOBAL", global2.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	assert!(
+		!gta_env(w, &["config", "user.email"], &env2)
+			.status
+			.success()
+	);
+	assert!(
+		!git_env(w, &["config", "user.email"], &env2)
+			.status
+			.success()
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&gdir).ok();
+}
+
+#[test]
+fn plain_include_expands_in_the_global_file() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-inc-plain");
+	let w = work.to_str().unwrap();
+	let gdir = unique_tmp("gta-inc-plain-cfg");
+	let inc = gdir.join("inc.cfg");
+	std::fs::write(&inc, "[user]\n\tname = Included Name\n").unwrap();
+	let global = gdir.join("gitconfig");
+	std::fs::write(&global, format!("[include]\n\tpath = {}\n", inc.display())).unwrap();
+	let env = [
+		("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	assert_eq!(
+		ok_stdout(gta_env(w, &["config", "user.name"], &env)).trim(),
+		"Included Name"
+	);
+	assert_eq!(
+		ok_stdout(git_env(w, &["config", "user.name"], &env)).trim(),
+		"Included Name"
+	);
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&gdir).ok();
+}
+
+#[test]
+fn includeif_onbranch_matches_the_symbolic_head() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-inc-onbranch");
+	let w = work.to_str().unwrap();
+	// Point HEAD at a namespaced branch (unborn is fine — onbranch reads the symref).
+	std::fs::write(work.join(".git/HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+	let gdir = unique_tmp("gta-inc-onbranch-cfg");
+	let id = gdir.join("branch-id.cfg");
+	std::fs::write(&id, "[user]\n\temail = branch@example.com\n").unwrap();
+	let global = gdir.join("gitconfig");
+	std::fs::write(
+		&global,
+		format!(
+			"[includeIf \"onbranch:feature/*\"]\n\tpath = {}\n",
+			id.display()
+		),
+	)
+	.unwrap();
+	let env = [
+		("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	assert_eq!(
+		ok_stdout(gta_env(w, &["config", "user.email"], &env)).trim(),
+		"branch@example.com"
+	);
+	assert_eq!(
+		ok_stdout(git_env(w, &["config", "user.email"], &env)).trim(),
+		"branch@example.com"
+	);
+
+	// On a branch outside the namespace, it does not apply — both agree.
+	std::fs::write(work.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+	assert!(!gta_env(w, &["config", "user.email"], &env).status.success());
+	assert!(!git_env(w, &["config", "user.email"], &env).status.success());
+
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&gdir).ok();
+}
+
+#[test]
+fn includeif_hasconfig_matches_a_remote_url() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-inc-hasconfig");
+	let w = work.to_str().unwrap();
+	let gdir = unique_tmp("gta-inc-hasconfig-cfg");
+	let id = gdir.join("hc-id.cfg");
+	std::fs::write(&id, "[user]\n\temail = hc@example.com\n").unwrap();
+	let global = gdir.join("gitconfig");
+	// A top-level remote URL (allowed, collected) makes the hasconfig condition match.
+	std::fs::write(
+		&global,
+		format!(
+			"[remote \"o\"]\n\turl = https://ex.example/r.git\n[includeIf \"hasconfig:remote.*.url:https://ex.example/**\"]\n\tpath = {}\n",
+			id.display()
+		),
+	)
+	.unwrap();
+	let env = [
+		("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	assert_eq!(
+		ok_stdout(gta_env(w, &["config", "user.email"], &env)).trim(),
+		"hc@example.com"
+	);
+	assert_eq!(
+		ok_stdout(git_env(w, &["config", "user.email"], &env)).trim(),
+		"hc@example.com"
+	);
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&gdir).ok();
+}
+
+#[test]
+fn hasconfig_included_file_setting_a_remote_url_is_fatal() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-inc-paradox");
+	let w = work.to_str().unwrap();
+	let gdir = unique_tmp("gta-inc-paradox-cfg");
+	let sets_url = gdir.join("sets-url.cfg");
+	std::fs::write(
+		&sets_url,
+		"[remote \"x\"]\n\turl = https://inside.example/r.git\n",
+	)
+	.unwrap();
+	let global = gdir.join("gitconfig");
+	// The condition does not match, but git still fatals: a hasconfig-included file may not set a URL.
+	std::fs::write(
+		&global,
+		format!(
+			"[includeIf \"hasconfig:remote.*.url:https://no-match.example/**\"]\n\tpath = {}\n",
+			sets_url.display()
+		),
+	)
+	.unwrap();
+	let env = [
+		("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	// Both gta and stock git fail closed on the paradox (no-match arm).
+	assert!(!gta_env(w, &["config", "user.email"], &env).status.success());
+	assert!(!git_env(w, &["config", "user.email"], &env).status.success());
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&gdir).ok();
+}
+
+#[test]
+fn matched_gitdir_subtree_url_is_forbidden_only_with_a_hasconfig_present() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-inc-gitdir-url");
+	let w = work.to_str().unwrap();
+	let gdir = unique_tmp("gta-inc-gitdir-url-cfg");
+	let sets_url = gdir.join("sets-url.cfg");
+	std::fs::write(
+		&sets_url,
+		"[remote \"x\"]\n\turl = https://viadir.example/r.git\n",
+	)
+	.unwrap();
+	let parent = canonical_git_dir(&work);
+	let parent = parent.parent().unwrap();
+	let gitdir_include = format!(
+		"[includeIf \"gitdir:{}/\"]\n\tpath = {}\n",
+		parent.display(),
+		sets_url.display()
+	);
+
+	// Without any hasconfig directive, a matched gitdir include may carry a remote URL — both succeed.
+	let allowed = gdir.join("allowed.cfg");
+	std::fs::write(&allowed, &gitdir_include).unwrap();
+	let env_ok = [
+		("GIT_CONFIG_GLOBAL", allowed.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	assert_eq!(
+		ok_stdout(gta_env(w, &["config", "remote.x.url"], &env_ok)).trim(),
+		"https://viadir.example/r.git"
+	);
+	assert_eq!(
+		ok_stdout(git_env(w, &["config", "remote.x.url"], &env_ok)).trim(),
+		"https://viadir.example/r.git"
+	);
+
+	// Add a hasconfig directive (which triggers git's forced pre-scan): now the URL inside the matched
+	// gitdir subtree is the paradox, and both fail — even though the hasconfig condition itself matches
+	// nothing.
+	let forbidden = gdir.join("forbidden.cfg");
+	std::fs::write(
+		&forbidden,
+		format!(
+			"{gitdir_include}[includeIf \"hasconfig:remote.*.url:https://no-match.example/**\"]\n\tpath = {}\n",
+			sets_url.display()
+		),
+	)
+	.unwrap();
+	let env_bad = [
+		("GIT_CONFIG_GLOBAL", forbidden.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	assert!(
+		!gta_env(w, &["config", "remote.x.url"], &env_bad)
+			.status
+			.success()
+	);
+	assert!(
+		!git_env(w, &["config", "remote.x.url"], &env_bad)
+			.status
+			.success()
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&gdir).ok();
+}
+
+#[test]
+fn command_scope_include_path_is_expanded() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-inc-c-include");
+	let w = work.to_str().unwrap();
+	let gdir = unique_tmp("gta-inc-c-include-cfg");
+	let inc = gdir.join("c-inc.cfg");
+	std::fs::write(&inc, "[user]\n\temail = via-c-include@example.com\n").unwrap();
+	// Command-scope config (`-c`), supplied via GIT_CONFIG_COUNT — git expands an `include.path` given
+	// this way, and so must gta.
+	let env = [
+		("GIT_CONFIG_NOSYSTEM", "1"),
+		("GIT_CONFIG_COUNT", "1"),
+		("GIT_CONFIG_KEY_0", "include.path"),
+		("GIT_CONFIG_VALUE_0", inc.to_str().unwrap()),
+	];
+	assert_eq!(
+		ok_stdout(gta_env(w, &["config", "user.email"], &env)).trim(),
+		"via-c-include@example.com"
+	);
+	assert_eq!(
+		ok_stdout(git_env(w, &["config", "user.email"], &env)).trim(),
+		"via-c-include@example.com"
+	);
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&gdir).ok();
+}
+
+#[test]
+fn command_scope_remote_url_activates_a_file_hasconfig() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-inc-c-hasconfig");
+	let w = work.to_str().unwrap();
+	let gdir = unique_tmp("gta-inc-c-hasconfig-cfg");
+	let id = gdir.join("hc-id.cfg");
+	std::fs::write(&id, "[user]\n\temail = c-hc@example.com\n").unwrap();
+	let global = gdir.join("gitconfig");
+	std::fs::write(
+		&global,
+		format!(
+			"[includeIf \"hasconfig:remote.*.url:https://viac.example/**\"]\n\tpath = {}\n",
+			id.display()
+		),
+	)
+	.unwrap();
+	// The remote URL comes only from command-scope config, yet it must still satisfy the file-level
+	// hasconfig condition — git collects command-scope URLs in its pre-scan, and so must gta.
+	let env = [
+		("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+		("GIT_CONFIG_COUNT", "1"),
+		("GIT_CONFIG_KEY_0", "remote.o.url"),
+		("GIT_CONFIG_VALUE_0", "https://viac.example/r.git"),
+	];
+	assert_eq!(
+		ok_stdout(gta_env(w, &["config", "user.email"], &env)).trim(),
+		"c-hc@example.com"
+	);
+	assert_eq!(
+		ok_stdout(git_env(w, &["config", "user.email"], &env)).trim(),
+		"c-hc@example.com"
+	);
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&gdir).ok();
+}
+
+#[test]
+fn symlinked_config_splits_relative_include_from_dot_gitdir() {
+	if !git_supports_sha256() {
+		return;
+	}
+	use std::os::unix::fs::symlink;
+	// A config file reached via a symlink: git resolves a relative `include.path` against the symlink's
+	// (lexical) directory, but a `gitdir:./` condition against the target's (real) directory. gta must
+	// split the two the same way.
+	let root = unique_tmp("gta-inc-symlink");
+	let real = root.join("real");
+	let link = root.join("link");
+	std::fs::create_dir_all(&real).unwrap();
+	std::fs::create_dir_all(&link).unwrap();
+	// A repo whose gitdir lives under the REAL dir, so `gitdir:./repo/` (resolved against the real dir)
+	// matches it.
+	let repo = real.join("repo");
+	std::fs::create_dir_all(&repo).unwrap();
+	gta(repo.to_str().unwrap(), &["init"], b"");
+
+	// The relative include target exists under BOTH dirs with distinguishable values; git reads the one
+	// in the LEXICAL (symlink) dir.
+	std::fs::write(link.join("rel.cfg"), "[user]\n\tname = LEXICAL\n").unwrap();
+	std::fs::write(real.join("rel.cfg"), "[user]\n\tname = REAL\n").unwrap();
+	// The `./`-matched include sets an email, proving the condition resolved against the real dir.
+	std::fs::write(
+		real.join("dot-id.cfg"),
+		"[user]\n\temail = dot-matched@example.com\n",
+	)
+	.unwrap();
+	std::fs::write(
+		real.join("config"),
+		format!(
+			"[include]\n\tpath = rel.cfg\n[includeIf \"gitdir:./repo/\"]\n\tpath = {}\n",
+			real.join("dot-id.cfg").display()
+		),
+	)
+	.unwrap();
+	symlink(real.join("config"), link.join("config")).unwrap();
+
+	let link_config = link.join("config");
+	let env = [
+		("GIT_CONFIG_GLOBAL", link_config.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	let r = repo.to_str().unwrap();
+	// Relative include resolved against the lexical (symlink) dir...
+	assert_eq!(
+		ok_stdout(gta_env(r, &["config", "user.name"], &env)).trim(),
+		"LEXICAL"
+	);
+	assert_eq!(
+		ok_stdout(git_env(r, &["config", "user.name"], &env)).trim(),
+		"LEXICAL"
+	);
+	// ...while the `gitdir:./` condition resolved against the real dir.
+	assert_eq!(
+		ok_stdout(gta_env(r, &["config", "user.email"], &env)).trim(),
+		"dot-matched@example.com"
+	);
+	assert_eq!(
+		ok_stdout(git_env(r, &["config", "user.email"], &env)).trim(),
+		"dot-matched@example.com"
+	);
+
+	std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn command_scope_include_preserves_entry_order() {
+	if !git_supports_sha256() {
+		return;
+	}
+	// git reads `-c` / `GIT_CONFIG_*` entries as a linear stream, so an `include.path` interleaved with
+	// repeats of a key must keep its position: the include contributes between the two `x.v` entries, and
+	// the last entry (`after`) wins. A section-grouped representation would move the include past the
+	// later `x.v` and let it win — the bug this guards against.
+	let work = init("gta-c-order");
+	let w = work.to_str().unwrap();
+	let cfgdir = unique_tmp("gta-c-order-inc");
+	let inc = cfgdir.join("i.cfg");
+	std::fs::write(&inc, "[x]\n\tv = FROM-INCLUDE\n").unwrap();
+	let env = [
+		("GIT_CONFIG_NOSYSTEM", "1"),
+		("GIT_CONFIG_COUNT", "3"),
+		("GIT_CONFIG_KEY_0", "x.v"),
+		("GIT_CONFIG_VALUE_0", "before"),
+		("GIT_CONFIG_KEY_1", "include.path"),
+		("GIT_CONFIG_VALUE_1", inc.to_str().unwrap()),
+		("GIT_CONFIG_KEY_2", "x.v"),
+		("GIT_CONFIG_VALUE_2", "after"),
+	];
+	// Single-value lookup: the last entry wins over the interleaved include.
+	assert_eq!(
+		ok_stdout(gta_env(w, &["config", "x.v"], &env)).trim(),
+		"after"
+	);
+	assert_eq!(
+		ok_stdout(git_env(w, &["config", "x.v"], &env)).trim(),
+		"after"
+	);
+	// `--get-all`: the include sits between the two command-line values, exactly as git orders them.
+	let gta_all = ok_stdout(gta_env(w, &["config", "--get-all", "x.v"], &env));
+	let git_all = ok_stdout(git_env(w, &["config", "--get-all", "x.v"], &env));
+	assert_eq!(gta_all, git_all);
+	assert_eq!(
+		gta_all.split_whitespace().collect::<Vec<_>>(),
+		["before", "FROM-INCLUDE", "after"]
+	);
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&cfgdir).ok();
+}
+
+#[test]
+fn command_scope_relative_include_is_rejected_like_git() {
+	if !git_supports_sha256() {
+		return;
+	}
+	// Command-scope config has no containing file, so git makes a *relative* `include.path` fatal
+	// ("relative config includes must come from files"). gta must refuse it too — never silently
+	// resolving it against the process working directory, even when such a file exists there.
+	let work = init("gta-c-relinc");
+	let w = work.to_str().unwrap();
+	std::fs::write(
+		work.join("rel.cfg"),
+		"[user]\n\temail = SHOULD-NOT-BE-READ@example.com\n",
+	)
+	.unwrap();
+	let env = [
+		("GIT_CONFIG_NOSYSTEM", "1"),
+		("GIT_CONFIG_COUNT", "1"),
+		("GIT_CONFIG_KEY_0", "include.path"),
+		("GIT_CONFIG_VALUE_0", "rel.cfg"),
+	];
+	assert!(
+		!gta_env(w, &["config", "user.email"], &env).status.success(),
+		"gta resolved a relative command-scope include instead of rejecting it"
+	);
+	assert!(!git_env(w, &["config", "user.email"], &env).status.success());
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn command_scope_dot_gitdir_condition_never_matches() {
+	if !git_supports_sha256() {
+		return;
+	}
+	// A `gitdir:./` condition in command-scope config has no file to resolve against; git prints a
+	// non-fatal warning and treats it as unmatched. gta agrees (returning non-matching rather than
+	// rooting the pattern at `/`, which would match unrelated repositories): the include is skipped and
+	// `user.email` stays unset, so the read exits non-zero — as git's does.
+	let work = init("gta-c-dotgitdir");
+	let w = work.to_str().unwrap();
+	let cfgdir = unique_tmp("gta-c-dotgitdir-inc");
+	let inc = cfgdir.join("id.cfg");
+	std::fs::write(&inc, "[user]\n\temail = DOT@example.com\n").unwrap();
+	let env = [
+		("GIT_CONFIG_NOSYSTEM", "1"),
+		("GIT_CONFIG_COUNT", "1"),
+		("GIT_CONFIG_KEY_0", "includeIf.gitdir:./.path"),
+		("GIT_CONFIG_VALUE_0", inc.to_str().unwrap()),
+	];
+	assert!(
+		!gta_env(w, &["config", "user.email"], &env).status.success(),
+		"gta matched a `gitdir:./` condition in command-scope config"
+	);
+	assert!(!git_env(w, &["config", "user.email"], &env).status.success());
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&cfgdir).ok();
+}
+
+#[test]
+fn signing_switch_from_included_config_refuses_the_commit_like_git() {
+	if !git_supports_sha256() {
+		return;
+	}
+	// `commit.gpgSign` / `gpg.format` / `user.signingkey` set only in an *included* file of the global
+	// config must reach signing, not just `gta config`. Here the key is missing, so a signing attempt
+	// fails and the commit is refused — matching git. Before signing read the merged (include-expanded)
+	// config, gta read only the local `.git/config`, saw no `gpgSign`, and silently wrote an UNSIGNED
+	// commit. Separate gta and git repositories share the same global config; both must refuse.
+	let cfgdir = unique_tmp("gta-sign-include-cfg");
+	let missing_key = cfgdir.join("nope.key");
+	let inc = cfgdir.join("sign.cfg");
+	std::fs::write(
+		&inc,
+		format!(
+			"[commit]\n\tgpgSign = true\n[gpg]\n\tformat = ssh\n[user]\n\tsigningkey = {}\n",
+			missing_key.display()
+		),
+	)
+	.unwrap();
+	let global = cfgdir.join("gitconfig");
+	std::fs::write(&global, format!("[include]\n\tpath = {}\n", inc.display())).unwrap();
+	let home = cfgdir.join("home");
+	std::fs::create_dir_all(&home).unwrap();
+
+	let env = [
+		("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+		("HOME", home.to_str().unwrap()),
+		("GIT_AUTHOR_NAME", "A U Thor"),
+		("GIT_AUTHOR_EMAIL", "a@example.com"),
+		("GIT_COMMITTER_NAME", "A U Thor"),
+		("GIT_COMMITTER_EMAIL", "a@example.com"),
+	];
+
+	// gta side.
+	let gwork = init("gta-sign-include-gta");
+	let gw = gwork.to_str().unwrap();
+	std::fs::write(gwork.join("f.txt"), "hi\n").unwrap();
+	assert!(gta_env(gw, &["add", "f.txt"], &env).status.success());
+	assert!(
+		!gta_env(gw, &["commit", "-m", "t"], &env).status.success(),
+		"gta wrote a commit despite include-configured signing with a missing key"
+	);
+	assert!(
+		!gta_env(gw, &["rev-parse", "--verify", "HEAD"], &env)
+			.status
+			.success(),
+		"gta left a commit behind after a failed signed commit"
+	);
+
+	// git oracle side (same global config).
+	let hwork = unique_tmp("gta-sign-include-git");
+	let hw = hwork.to_str().unwrap();
+	Command::new("git")
+		.args(["init", "--object-format=sha256", hw])
+		.output()
+		.expect("git init");
+	std::fs::write(hwork.join("f.txt"), "hi\n").unwrap();
+	assert!(git_env(hw, &["add", "f.txt"], &env).status.success());
+	assert!(
+		!git_env(hw, &["commit", "-m", "t"], &env).status.success(),
+		"git unexpectedly committed with a missing signing key"
+	);
+	assert!(
+		!git_env(hw, &["rev-parse", "--verify", "HEAD"], &env)
+			.status
+			.success()
+	);
+
+	std::fs::remove_dir_all(&gwork).ok();
+	std::fs::remove_dir_all(&hwork).ok();
+	std::fs::remove_dir_all(&cfgdir).ok();
+}
+
+#[test]
+fn symlinked_gitdir_condition_matches_via_pwd_like_git() {
+	if !git_supports_sha256() {
+		return;
+	}
+	use std::os::unix::fs::symlink;
+	// git matches a `gitdir:` condition against realpath(git_dir) AND the `$PWD`-honoured symlink
+	// spelling, so a condition written with a symlinked path matches a repo entered through that symlink
+	// at its root — but not from a subdirectory (git records the realpath after walking up). gta must
+	// agree in every cell. The base is canonicalized because the temp dir may itself sit under a symlink
+	// (e.g. macOS `/var` -> `/private/var`), which would otherwise contaminate the spelling.
+	let base = std::fs::canonicalize(unique_tmp("gta-gitdir-symlink")).unwrap();
+	let real = base.join("real");
+	std::fs::create_dir_all(real.join("repo")).unwrap();
+	let repo = real.join("repo");
+	gta(repo.to_str().unwrap(), &["init"], b"");
+	std::fs::create_dir_all(repo.join("sub")).unwrap();
+	let link = base.join("link");
+	symlink(&real, &link).unwrap();
+	let id = base.join("id.cfg");
+	std::fs::write(&id, "[user]\n\temail = via-symlinked-gitdir@example.com\n").unwrap();
+	let global = base.join("gitconfig");
+	let home = base.join("home");
+	std::fs::create_dir_all(&home).unwrap();
+
+	// Write the `gitdir:` condition, then run `<bin> config user.email` from `cwd` with `$PWD=pwd` and an
+	// isolated environment. Returns trimmed stdout ("" when the include did not apply).
+	let cell = |git: bool, cond: &str, cwd: &std::path::Path, pwd: &std::path::Path| -> String {
+		std::fs::write(
+			&global,
+			format!("[includeIf \"gitdir:{cond}\"]\n\tpath = {}\n", id.display()),
+		)
+		.unwrap();
+		let out = if git {
+			let mut cmd = Command::new("git");
+			cmd.args(["config", "user.email"]).current_dir(cwd);
+			for var in ISOLATION_ENV {
+				cmd.env_remove(var);
+			}
+			cmd
+				.env("PWD", pwd)
+				.env("GIT_CONFIG_GLOBAL", &global)
+				.env("GIT_CONFIG_NOSYSTEM", "1")
+				.env("HOME", &home)
+				.output()
+				.expect("run git")
+		} else {
+			let mut cmd = assert_cmd::Command::cargo_bin("gta").unwrap();
+			cmd.args(["config", "user.email"]).current_dir(cwd);
+			for var in ISOLATION_ENV {
+				cmd.env_remove(var);
+			}
+			cmd
+				.env("PWD", pwd)
+				.env("GIT_CONFIG_GLOBAL", &global)
+				.env("GIT_CONFIG_NOSYSTEM", "1")
+				.env("HOME", &home)
+				.output()
+				.expect("run gta")
+		};
+		String::from_utf8_lossy(&out.stdout).trim().to_owned()
+	};
+
+	let link_repo = link.join("repo");
+	let link_sub = link_repo.join("sub");
+	let real_repo = real.join("repo");
+	let symlink_cond = format!("{}/.git", link_repo.display());
+	let canonical_cond = format!("{}/.git", real_repo.display());
+	let matched = "via-symlinked-gitdir@example.com";
+
+	// Cases (each asserted to match stock git, and to the expected side of the divergence):
+	// 1. Root, symlink-spelled condition, `$PWD` carrying the symlink → matches.
+	assert_eq!(cell(false, &symlink_cond, &link_repo, &link_repo), matched);
+	assert_eq!(cell(true, &symlink_cond, &link_repo, &link_repo), matched);
+	// 2. Root, canonical condition, symlink `$PWD` → matches (the realpath candidate).
+	assert_eq!(
+		cell(false, &canonical_cond, &link_repo, &link_repo),
+		matched
+	);
+	assert_eq!(cell(true, &canonical_cond, &link_repo, &link_repo), matched);
+	// 3. Root, symlink condition, but `$PWD` canonical (no symlink to honour) → no match.
+	assert_eq!(cell(false, &symlink_cond, &link_repo, &real_repo), "");
+	assert_eq!(cell(true, &symlink_cond, &link_repo, &real_repo), "");
+	// 4. Subdirectory, symlink condition → no match (git records the realpath after walking up).
+	assert_eq!(cell(false, &symlink_cond, &link_sub, &link_sub), "");
+	assert_eq!(cell(true, &symlink_cond, &link_sub, &link_sub), "");
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn symlinked_bare_gitdir_condition_matches_via_pwd_like_git() {
+	if !git_supports_sha256() {
+		return;
+	}
+	use std::os::unix::fs::symlink;
+	// A **bare** repository entered through a symlink at its own root: git's relative `opts->git_dir` is
+	// `"."`, so its second `gitdir:` candidate is `$PWD + "/."`. A symlink-spelled condition with a
+	// trailing slash (`gitdir:/link.git/` → `.../link.git/**`) therefore matches, while the bare exact
+	// form does not (git records the realpath as its first candidate). gta must reproduce every cell.
+	let base = std::fs::canonicalize(unique_tmp("gta-bare-gitdir-symlink")).unwrap();
+	let real = base.join("real");
+	std::fs::create_dir_all(&real).unwrap();
+	let bare = real.join("bare.git");
+	// stock git creates the bare repo; both tools then read the same on-disk repository.
+	assert!(
+		Command::new("git")
+			.args([
+				"init",
+				"--bare",
+				"--object-format=sha256",
+				bare.to_str().unwrap()
+			])
+			.output()
+			.expect("git init --bare")
+			.status
+			.success()
+	);
+	let link = base.join("link");
+	symlink(&real, &link).unwrap();
+	let id = base.join("id.cfg");
+	std::fs::write(&id, "[user]\n\temail = via-bare-symlink@example.com\n").unwrap();
+	let global = base.join("gitconfig");
+	let home = base.join("home");
+	std::fs::create_dir_all(&home).unwrap();
+
+	let cell = |git: bool, cond: &str| -> String {
+		std::fs::write(
+			&global,
+			format!("[includeIf \"gitdir:{cond}\"]\n\tpath = {}\n", id.display()),
+		)
+		.unwrap();
+		let link_bare = link.join("bare.git");
+		let out = if git {
+			let mut cmd = Command::new("git");
+			cmd.args(["config", "user.email"]).current_dir(&link_bare);
+			for var in ISOLATION_ENV {
+				cmd.env_remove(var);
+			}
+			cmd
+				.env("PWD", &link_bare)
+				.env("GIT_CONFIG_GLOBAL", &global)
+				.env("GIT_CONFIG_NOSYSTEM", "1")
+				.env("HOME", &home)
+				.output()
+				.expect("run git")
+		} else {
+			let mut cmd = assert_cmd::Command::cargo_bin("gta").unwrap();
+			cmd.args(["config", "user.email"]).current_dir(&link_bare);
+			for var in ISOLATION_ENV {
+				cmd.env_remove(var);
+			}
+			cmd
+				.env("PWD", &link_bare)
+				.env("GIT_CONFIG_GLOBAL", &global)
+				.env("GIT_CONFIG_NOSYSTEM", "1")
+				.env("HOME", &home)
+				.output()
+				.expect("run gta")
+		};
+		String::from_utf8_lossy(&out.stdout).trim().to_owned()
+	};
+
+	let link_bare = link.join("bare.git");
+	let real_bare = real.join("bare.git");
+	let matched = "via-bare-symlink@example.com";
+	// Symlink-spelled, trailing slash → matches (`$PWD/.` is under `link.git/`).
+	assert_eq!(cell(false, &format!("{}/", link_bare.display())), matched);
+	assert_eq!(cell(true, &format!("{}/", link_bare.display())), matched);
+	// Symlink-spelled, no slash → no match (the bare exact form is not the realpath candidate).
+	assert_eq!(cell(false, &link_bare.display().to_string()), "");
+	assert_eq!(cell(true, &link_bare.display().to_string()), "");
+	// Canonical, no slash → matches the realpath candidate.
+	assert_eq!(cell(false, &real_bare.display().to_string()), matched);
+	assert_eq!(cell(true, &real_bare.display().to_string()), matched);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
 /// The environment an isolated config test clears before applying its own, so a resolved identity or
 /// value comes only from the config files under test — never from the runner's identity env or its
 /// real `~/.gitconfig` / system config. Tests re-supply exactly what they want (`HOME`,
