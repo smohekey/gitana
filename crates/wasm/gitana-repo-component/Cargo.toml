@@ -18,6 +18,9 @@ crate-type = ["cdylib"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 anyhow.workspace = true
+# gitana-config expands `[include]`/`includeIf` when the component installs the repository's effective
+# config (over a `FileStore`-backed resolver). It is I/O-free and wasm-pure (only dep `thiserror`).
+gitana-config.workspace = true
 gitana-file-store.workspace = true
 gitana-file-store-local.workspace = true
 gitana-object.workspace = true

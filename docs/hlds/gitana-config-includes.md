@@ -150,8 +150,48 @@ Consumers and where the driver lives:
    installed. Oracle test: `commit.gpgSign`+`gpg.format`+`user.signingkey` delivered via an `[include]` in
    global config with a missing key makes both gta and git refuse the commit. (This closes a *pre-existing*
    local-only-signing gap the includes work widened; it is not specific to includes.)
-4. **wasm component wiring.** Resolver over the `FileStore` capability; component tests. (The wasm driver must
-   run `scan_remote_urls` before `expand_includes`, exactly as gta-core does, since the paradox lives there.)
+4. **wasm component wiring — DONE.** A `FileStoreIncludeResolver` over the component's `FileStore` capability
+   (`gitana-repo-component`, `ops/include_resolver.rs`), resolving include targets *relative to the store root*
+   (the path-less descriptor) with git's **filesystem** semantics as far as the capability allows: an absolute
+   path escapes → skipped; a `..` is admitted only when the accumulated prefix is an existing directory
+   (probed by `is_dir`), so a `..` through a **missing or non-directory** prefix — or one climbing above the
+   root — skips the include exactly as git skips the resulting `ENOENT`/`ENOTDIR` (probed 2.50.1: `missing/../x`
+   is skipped, `sub/../x` with `sub` present is read); a **directory** target aborts (git fatals `Is a
+   directory`) while any other read failure skips. (Residual: git resolves a *symlinked* prefix through the
+   link, which the path-less store cannot — no `realpath` — so a `..` after a symlink is the one divergence;
+   realistic include paths do not use it.) Config and its relative includes are read from the **common** store
+   (`WorktreeFileStore::common()`, added this slice) — git resolves them against the common dir, so routing an
+   include named like a per-worktree file (`config.worktree`, `HEAD`, …) through the per-path routing would
+   send it to the wrong directory; only HEAD (for `onbranch:`) is read per-worktree.
+
+   Config is expanded **once at open** — pre-scan (`scan_remote_urls`) *before* `expand_includes`, as gta-core
+   does — and installed via `set_effective_config`, so **every** consumer honours includes: `pack.packSizeLimit`
+   (`repack`), `remote.origin.fetch`/`tagOpt` (`fetch`, via `gitana_porcelain`), and `core.logAllRefUpdates`
+   (ref writes) all read the installed effective config. `read-config` stays the **raw** file (git's plumbing
+   contract, host-parsed). `init` installs too (it is idempotent and may reopen a repo that already has
+   includes). A structurally bad include (cycle/paradox/directory/`~`-no-home) aborts the *open*; a bad *value*
+   surfaces at its consumer (a malformed `pack.packSizeLimit` fails `repack`). `onbranch:` resolves from HEAD;
+   `hasconfig:remote.*.url:` from the local pre-scan.
+
+   Inherent capability limits (documented divergences): **`gitdir:` conditions never match** (no gitdir path in
+   a descriptor); there is no global/system/`-c` layer or `$PWD` (so no `gitdir_absolute` candidate); a
+   `~`/`~user` include is **fatal** (no `$HOME`; engine `IncludeTildeNoHome`), exactly as git with `HOME` unset
+   (probed 2.50.1). And, where the `FileStore` — designed for git's object/ref storage — cannot express git's
+   config-file *syscall* semantics: (a) config is a **snapshot at open** (a handle reads config once, like a
+   git process; a `config`/HEAD change after open needs a reopen); (b) a real **access failure** (`EACCES`,
+   symlink loop) *skips* rather than fatals, because the store folds it into the same `Backend` error as the
+   `ENOTDIR` that git *does* skip — the store hides the distinction; (c) a **trailing-`/`/`.`** terminal
+   (`x/`, `.`) is normalised rather than carrying git's must-be-a-directory requirement; (d) a **symref chain**
+   `HEAD → a → b` matches on the first target for `onbranch:`, not the chain's end. These are exotic and bounded
+   by the capability model; each is a deliberate limit, not silent breakage. Separately, the component does not
+   layer `<git-dir>/config.worktree` under `extensions.worktreeConfig` — a **pre-existing** gap (it never had a
+   worktree-config layer, before or after this slice), so its includes are out of scope here; adding the
+   worktree layer is a distinct feature, not an include-expansion fix. An empty/`.`/`sub/..` include value —
+   which resolves to the config directory — **does** abort as a directory target, matching git.
+
+   9 host e2e tests (included `packSizeLimit` reaching `repack`; `onbranch` via HEAD; cycle/paradox/directory
+   aborting open; `..` through a missing prefix skipped and an in-root `..` resolved; linked-worktree includes
+   from the common dir; benign relative include).
 
 ## Wildmatch note
 
@@ -191,7 +231,7 @@ Known git-fidelity gaps left for later slices, each with a code note at its site
   but a `gitdir:./` condition against its **real** (symlink-resolved) directory. The engine threads both: the
   driver passes the lexical parent and the realpath'd parent of each layer's file, and `IncludeResolver::read`
   returns each included file's canonical path so nested includes get the same split. (The wasm driver, slice 4,
-  must likewise return a canonical path from its `FileStore` resolver.)
+  returns the requested path unchanged — its `FileStore` has no symlink notion, so lexical and real coincide.)
 - **`gitdir:` matched against BOTH the realpath and the `$PWD`-honoured spelling — RESOLVED in slice 3.** git's
   `include_by_gitdir` matches a `gitdir:` condition against `realpath(git_dir)` **and**, if that fails,
   `strbuf_add_absolute_path(git_dir)` — the absolute, symlink-*preserving* spelling git forms from the `$PWD`
@@ -205,8 +245,9 @@ Known git-fidelity gaps left for later slices, each with a code note at its site
   git records the realpath after walking up; and never under `-C`/unset/canonical `$PWD`). A final
   `canonicalize` check means a mis-derivation degrades to canonical-only, never a spurious match. *Niche
   remainders (canonical-only, safe):* a linked worktree or a symlinked `.git` — git's abspath spelling for
-  those is not `$PWD`-derived; oracle-tested that gta does not over-match. (The wasm driver, slice 4, has no
-  ambient `$PWD` and stays canonical-only.)
+  those is not `$PWD`-derived; oracle-tested that gta does not over-match. (The wasm component, slice 4, has no
+  ambient `$PWD` — and no gitdir path at all — so its `gitdir:` conditions never match, an inherent capability
+  limit.)
 - **Command-scope (`-c` / `GIT_CONFIG_*`) participates in include processing — handled in slice 3.** git reads
   command-line config as part of the sequence, so a `-c include.path=<abs>` is expanded and a `-c
   remote.<n>.url` feeds a file-level `hasconfig` and the paradox pre-scan; the driver threads the command-scope

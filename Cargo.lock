@@ -1762,6 +1762,7 @@ name = "gitana-repo-component"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "gitana-config",
  "gitana-file-store",
  "gitana-file-store-local",
  "gitana-object",

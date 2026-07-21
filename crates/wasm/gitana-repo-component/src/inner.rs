@@ -90,30 +90,40 @@ impl Inner {
 			LocalFileStore::from_descriptor(git_dir),
 		);
 		let work = DescriptorWorkDir::from_descriptor(work_dir);
-		// The `git_dir` path a `WorkTree` carries is inert here — the crate routes the index and all
-		// git-dir files through the `FileStore`, so a placeholder suffices; the two match arms are
-		// mutually exclusive, so moving `store`/`work` in each is fine.
 		Ok(match Self::detect(&store)? {
-			HashKind::Sha1 => Self::Sha1(Held::Worktree(WorkTree::new(
-				Repository::new(ObjectStore::new(store)),
-				work,
-				"",
-			))),
-			HashKind::Sha256 => Self::Sha256(Held::Worktree(WorkTree::new(
-				Repository::new(ObjectStore::new(store)),
-				work,
-				"",
-			))),
+			HashKind::Sha1 => Self::Sha1(Self::worktree_held::<Sha1>(store, work)?),
+			HashKind::Sha256 => Self::Sha256(Self::worktree_held::<Sha256>(store, work)?),
 		})
+	}
+
+	/// Build a working-tree [`Held`] for one `H`: construct the repository, install its
+	/// include-expanded effective config (see [`ops::install_effective_config`]), then wrap it with the
+	/// work-dir capability.
+	fn worktree_held<H: HashAlgorithm>(
+		store: WorktreeFileStore,
+		work: DescriptorWorkDir,
+	) -> Result<Held<H>, RepoError> {
+		let mut repo = Repository::new(ObjectStore::new(store));
+		block_on(ops::install_effective_config(&mut repo))?;
+		Ok(Held::Worktree(WorkTree::new(repo, work, "")))
 	}
 
 	/// Detect the object format from `config` *through the store* (which reads it from
 	/// the common dir) and open a plumbing-only repository as the matching `H`.
 	fn plumbing(store: WorktreeFileStore) -> Result<Self, RepoError> {
 		Ok(match Self::detect(&store)? {
-			HashKind::Sha1 => Self::Sha1(Held::Plumbing(Repository::new(ObjectStore::new(store)))),
-			HashKind::Sha256 => Self::Sha256(Held::Plumbing(Repository::new(ObjectStore::new(store)))),
+			HashKind::Sha1 => Self::Sha1(Self::plumbing_held::<Sha1>(store)?),
+			HashKind::Sha256 => Self::Sha256(Self::plumbing_held::<Sha256>(store)?),
 		})
+	}
+
+	/// Build a plumbing-only [`Held`] for one `H`: construct the repository and install its
+	/// include-expanded effective config, so config-consuming plumbing (e.g. `repack`'s
+	/// `pack.packSizeLimit`) honours included values.
+	fn plumbing_held<H: HashAlgorithm>(store: WorktreeFileStore) -> Result<Held<H>, RepoError> {
+		let mut repo = Repository::new(ObjectStore::new(store));
+		block_on(ops::install_effective_config(&mut repo))?;
+		Ok(Held::Plumbing(repo))
 	}
 
 	/// Read the repository's object format from its `config`.
@@ -132,12 +142,20 @@ impl Inner {
 		let store = LocalFileStore::from_descriptor(git_dir);
 		block_on(ops::init_layout(&store))?;
 		let store = WorktreeFileStore::single(store);
-		let inner = match kind {
-			HashKind::Sha1 => Self::Sha1(Held::Plumbing(Repository::new(ObjectStore::new(store)))),
-			HashKind::Sha256 => Self::Sha256(Held::Plumbing(Repository::new(ObjectStore::new(store)))),
-		};
-		dispatch!(&inner, held => block_on(ops::init_repo(held.repository())))?;
-		Ok(inner)
+		Ok(match kind {
+			HashKind::Sha1 => Self::Sha1(Self::init_held::<Sha1>(store)?),
+			HashKind::Sha256 => Self::Sha256(Self::init_held::<Sha256>(store)?),
+		})
+	}
+
+	/// Write the fresh-repo metadata for one `H` (idempotent), then install the include-expanded
+	/// effective config. `init` is idempotent and may reopen an *existing* same-format repository whose
+	/// config already carries `[include]`/`includeIf`, so it installs too, matching `open`.
+	fn init_held<H: HashAlgorithm>(store: WorktreeFileStore) -> Result<Held<H>, RepoError> {
+		let mut repo = Repository::new(ObjectStore::new(store));
+		block_on(ops::init_repo(&repo))?;
+		block_on(ops::install_effective_config(&mut repo))?;
+		Ok(Held::Plumbing(repo))
 	}
 
 	/// Clone the Smart HTTP remote at `url` into the freshly-granted `git_dir`/`work_dir`

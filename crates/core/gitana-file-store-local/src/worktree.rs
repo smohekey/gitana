@@ -60,6 +60,15 @@ impl WorktreeFileStore {
 		)
 	}
 
+	/// The shared **common** store — where `config`, `objects`, and shared refs live (for an ordinary
+	/// repository it is the single store; for a linked worktree it is the main `.git`). git resolves the
+	/// repository config and its relative `[include]` targets against this directory, so a consumer that
+	/// reads config must read them here rather than through the per-path routing, which would send an
+	/// include named like a per-worktree file (`config.worktree`, `HEAD`, …) to the wrong store.
+	pub fn common(&self) -> &LocalFileStore {
+		self.common.as_ref()
+	}
+
 	/// The underlying store that owns `path`: the per-worktree store for git's per-worktree files,
 	/// the common store otherwise.
 	fn store(&self, path: &str) -> &LocalFileStore {
