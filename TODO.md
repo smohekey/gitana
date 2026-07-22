@@ -12,6 +12,21 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [x] Add `show` for common commit/object display.
 - [x] Add `config` read/write support for local repository configuration.
 - [x] Make `config` writes preserve comments and layout. The config crate now retains each element's raw text and a value byte-span, so `set` edits the value in place and `add`/`unset` touch only their own line; comments and layout survive.
+- [x] Resolve config across git's full precedence stack and scope `gta config --local`/`--global`/`--system`.
+  `gitana-config` split into a single-file `GitConfigSource` + a layered `GitConfig` (system → global → local,
+  plus `-c` / `GIT_CONFIG_COUNT` command-line entries on top); an unscoped read resolves the whole stack
+  (and works outside a repository), an unscoped write lands in the local file, and writes are atomic through a
+  `.lock` (following symlinks, preserving mode). Author/committer identity — and every reflog line — resolves
+  `user.name` / `user.email` across the same stack, honoured even by `clone` (which resolves its committer
+  before a local config exists); core-crate consumers (`remote.*`, `pack.packSizeLimit`,
+  `core.logAllRefUpdates`) read the merged stack. `6bc1670d`, `5e2abe40`.
+- [x] Expand git's `[include]` / `includeIf` directives in every config read (`gitdir` / `onbranch` /
+  `hasconfig:remote.*.url:`). A wasm-pure engine splices included content inline at the directive (last-value
+  wins) over a caller-supplied async resolver, with a byte-faithful `WM_PATHNAME` wildmatch; the gta-core
+  driver expands across the merged stack (a whole-config remote-URL pre-scan + git's paradox guard, the
+  `$PWD`-honoured `gitdir:` symlink candidate, and the lexical-vs-real include-dir split); the wasm component
+  resolves includes over its `FileStore` capability, including `config.worktree` under
+  `extensions.worktreeConfig`. `8c7e71ed`, `43bb58af`, `c952d2df`, `50f75833`, `1d457631`.
 - [x] Keep `gta` and `gta-mcp` command surfaces in lockstep as each command lands. Enforced by a `surface_parity` test that compares a normalized spec of both clap command trees — recursively, including root/global args, and per argument its required-ness, action (arity), allowed values, defaults, and groups — whitelisting only the intended positional-vs-named presentation and the mcp-only serving flags.
 
 ## Merge And History Editing
@@ -64,8 +79,15 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   `ObjectStore::write_reachability_bitmap` writes the reverse-index-carrying MIDX + `.bitmap`,
   and `gta gc` calls it over the ref tips. Oracle-tested: stock `git multi-pack-index verify`
   and `git rev-list --test-bitmap` accept what gitana writes, and our reader reproduces
-  `git rev-list --objects`. Not yet consumed by gitana's own reachability queries (fetch
-  negotiation, `rev-list`) — that acceleration is future work.
+  `git rev-list --objects`. (Consuming these bitmaps for gitana's own reachability queries is the next item.)
+- [x] Consume the reachability bitmaps for gitana's own queries. The pack builder enumerates a fetch/push as
+  `closure(wants) \ closure(haves)` over the bitmap (git's fill-in — a bitmapped commit contributes its whole
+  closure at once), so the have side is never read for a non-shallow fetch; fetch negotiation
+  (`ok_to_give_up`) and `is_ancestor` (behind `merge`/`rebase`/`merge-base`) answer from a commit-only
+  reachability set; and `prune`/`gc` liveness takes the same bitmap fast path (falling back to a graph walk
+  when shallow or un-bitmapped). Ordered `rev-list`/`log` still walk the graph — bitmaps give no ordering.
+  `fbc60499` (pack builder), `56601d93` (ancestry), `975538c6` (prune/gc liveness); perf follow-ups
+  `38454a0d`, `59a651ba`.
 - [x] Resolve abbreviated object IDs across packed objects, not only loose objects. `rev-parse`
   of a short id now resolves loose *and* packed objects: a new `ObjectStore::find_by_prefix` unions
   the targeted `objects/<aa>/` loose fan-out with a binary-searched range over the multi-pack-index
@@ -75,7 +97,27 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 
 ## Remote And Protocol Parity
 
-- [ ] Add HTTP authentication hooks compatible with ordinary Git credential flows.
+- [x] Add HTTP authentication hooks compatible with ordinary Git credential flows. Git's full credential
+  flow: a `401 WWW-Authenticate: Basic`/`Bearer` retry with credentials resolved in git's order — URL
+  userinfo (password kept out of the saved `remote.origin.url`), `credential.username`, credential
+  *helpers* (`credential.helper` and per-URL, over git's `get`/`store`/`erase` protocol, with
+  `credential.<url>` matching and `credential.useHttpPath`), then a prompt (`GIT_ASKPASS` → `core.askPass`
+  → `SSH_ASKPASS` → the terminal, honouring `GIT_TERMINAL_PROMPT=0`). Multi-stage Basic→Bearer negotiation;
+  a working credential cached for the whole operation. `07175c4a` (Basic core), `f3e10efd` (helpers),
+  `f066956e` (Bearer/multistage). The wasm component authenticates a `401` with a host-answered credential
+  over a `credentials` WIT import (`faf88da0`). *Deferred:* cross-host redirect auth (a cross-host redirect
+  fails closed rather than leaking a credential).
+- [x] Rewrite remote URLs and carry extra headers, matching git. `url.<base>.insteadOf` (longest-prefix
+  wins) rewrites `clone`/`fetch`/`pull`/`push` URLs before use; a push additionally honours
+  `pushInsteadOf` and `remote.<name>.pushurl`; every request carries the `http.extraHeader` values
+  configured for the remote, resolved with git's URL-match specificity (`git remote -v` shows the same
+  rewriting). Shared `gta-core` `url_rewrite` / `http_headers` (`8561a903`).
+- [x] Add shallow / `--depth` history over Smart HTTP, matching git. `clone --depth N` / `--shallow-since`
+  / `--shallow-exclude` truncate history and record `.git/shallow`; `fetch` extends it with `--depth` /
+  `--deepen` / `--shallow-since` / `--shallow-exclude` / `--unshallow`; ancestry walks (`log`, `rev-list`,
+  `merge-base`, `rev-parse`) and `prune`/`gc` stop at the boundary, and `gc` skips the reachability bitmap
+  when shallow. `0a4465f2` (client clone), `e696d560` (server deepen), `52d476f5` (client deepen +
+  shallow-aware prune/gc).
 - [ ] Add SSH remote support.
 - [x] Add `remote` command support for listing, adding, removing, and editing remotes. `gta remote`
   lists the configured remotes (`-v` adds fetch/push URLs); `add <name> <url>` writes the
@@ -118,6 +160,18 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [x] Add stock `git push` interoperability tests against a small HTTP harness. Covered by the same
   harnesses (push/receive-pack, both directions); `real_git_push_signed.rs` adds a real
   `git push --signed` oracle.
+
+## Refs, Reflogs, and Transactions
+
+- [x] Write reflogs for ref updates, matching git. `update_ref` / `set_symbolic` bake a reflog line into
+  every mover — branch/switch/update-ref/symbolic-ref/worktree, commit/merge/reset, clone/fetch tracking
+  refs, and receive-pack push — gated by `core.logAllRefUpdates`, with git's `update_local_ref` parity and a
+  server-supplied committer/message for pushes. `b06dd01c`, `a135128c`, `2fceffd3`, `e653eb66` (push),
+  `66fb2ec8` (wasm component).
+- [x] Make ref updates transactional (git's ref-lock model). `RefStore::transact` + `RefOp` with a dual
+  directory/file preflight, `.lock` per-worktree routing, empty-directory pruning, and a HEAD-lock
+  re-confirm. Opt-in `--atomic` push (server advertises the capability; one transaction applies all refs
+  or none; `gta push --atomic`); git's default stays per-ref. `c4fdb7c3` (transact), `26304be6` (atomic).
 
 ## Signing And Integrity
 
@@ -214,6 +268,13 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   `move` and `remove` refuse a worktree with an initialized submodule (git parity: `move` unconditionally,
   `remove` overridable by `--force`), and `worktree.useRelativePaths` pointers are preserved across
   move/repair. Oracle-tested against stock git (sha1 + sha256, incl. relative-paths + submodule cases).
+- [x] Extract linked-worktree inspect/create/remove into a reusable `gitana-linked-worktree` library and
+  rewire `gta worktree add`/`remove`/`list` onto it — one implementation, with the bespoke native write
+  paths deleted. The library is safe-by-default (conservative removal, force-free, structured outcomes) with
+  an opt-in git-compatible force the CLI selects; the rewire also *hardened* symlink handling — the native
+  paths followed a symlinked `worktrees/` / admin leaf / `locked` marker and could disclose the marker
+  target's file contents as a lock reason, where the library refuses/omits. `9e0c56c6`/`8bd8444c`/`9c397c86`
+  (library), `ee73090f` (`list`), `2df1b6b4` (`add`), `a238f3c6`/`22bd8322` (`remove` + opt-in force).
 
 ## User Experience
 
