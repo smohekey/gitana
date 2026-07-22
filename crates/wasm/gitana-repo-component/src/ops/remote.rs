@@ -12,7 +12,7 @@ use gitana_file_store_local::{DescriptorWorkDir, WorktreeFileStore};
 use gitana_object::HashAlgorithm;
 use gitana_object_store::ObjectStore;
 use gitana_porcelain::Deepen;
-use gitana_remote::{AuthTransport, Origin};
+use gitana_remote::{AuthTransport, HttpConnection, Origin, UPLOAD_PACK_REQUEST};
 use gitana_repository::Repository;
 
 use super::WasiCredentialProvider;
@@ -190,18 +190,24 @@ pub(crate) async fn clone<H: HashAlgorithm>(
 	advertisement: &[u8],
 ) -> Result<(), RepoError> {
 	let repo: Repository<WorktreeFileStore, H> = Repository::new(ObjectStore::new(store));
-	// The component does not expose shallow clone yet, so it always requests full history.
-	gitana_porcelain::clone(
+	// Drive the porcelain clone over the connection seam: the caller already fetched the advertisement,
+	// and each pack exchange is a stateless `POST` through the same `wasi:http` transport.
+	let mut connection = HttpConnection::new(
 		transport,
+		origin.upload_pack(),
+		UPLOAD_PACK_REQUEST,
+		advertisement.to_vec(),
+	);
+	// The component does not expose shallow clone yet, so it always requests full history. No `insteadOf`
+	// rewriting here, so the origin's own persisted URL is the one recorded; and no committer identity
+	// through the component's descriptors, so clone writes no reflog.
+	gitana_porcelain::clone(
+		&mut connection,
 		repo,
-		origin,
-		advertisement,
 		work,
 		&Deepen::default(),
-		// No committer identity through the component's descriptors, so clone writes no reflog here.
 		None,
-		// No `insteadOf` rewriting in the component, so the origin's own URL is the one to persist.
-		None,
+		&origin.persisted_url(),
 	)
 	.await
 	.map_err(remote_error)

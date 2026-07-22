@@ -88,8 +88,12 @@ Major gaps:
   but switching to a detached commit is not yet supported.
 - Trust signing produces and verifies both SSHSIG and OpenPGP signatures (git's `gpg.format`), but
   not yet OpenPGP's other forms (e.g. X.509/`gpgsm`). Trust-root updates are SSHSIG-only.
-- Remote transport currently supports HTTP(S) Smart HTTP remotes. Other Git URL
-  schemes, such as SSH remotes, are not implemented.
+- Remote transport supports HTTP(S) Smart HTTP remotes, plus **`gta clone` over
+  SSH** (`ssh://[user@]host[:port]/path`, the `git+ssh://` / `ssh+git://` aliases,
+  and the scp-like `[user@]host:path`). Like git, gitana drives the user's `ssh`
+  binary (honouring `GIT_SSH_COMMAND`) rather than linking an SSH stack, so it is
+  native-only for now. SSH `fetch`/`push` and the wasm component's SSH path are not
+  yet implemented. Other URL schemes (`git://`, `file://`) are unsupported.
 - Object storage now uses pack `.idx` and a multi-pack-index for lookup. `gta repack`
   consolidates into size-bounded packs (honoring `pack.packSizeLimit`); `gta gc` prunes,
   repacks *incrementally* (git's geometric strategy — keeping the large packs, as does
@@ -166,7 +170,11 @@ Implemented command groups:
   `remove`, `rename`, `set-url`). `fetch` honours the configured `remote.origin.fetch` refspecs —
   wildcard, exact, force (`+`), and negative (`^`) — mapping advertised refs to tracking refs and
   enforcing fast-forward for non-forced refspecs. A refspec that would write a branch checked out in
-  any worktree — the current one or a linked one — is refused, as git does.
+  any worktree — the current one or a linked one — is refused, as git does. `clone` also speaks the
+  SSH transport (`ssh://`, `git+ssh://` / `ssh+git://`, and scp-like `[user@]host:path`), running the
+  user's `ssh` binary (git's `GIT_SSH_COMMAND`, `~/.ssh/config`, agent, known-hosts) to invoke
+  `git-upload-pack` on the remote — a dash-leading host/path is refused (git's CVE-2017-1000117 guard).
+  SSH `fetch`/`push` are not yet wired.
 - HTTP authentication, matching git's credential flow: a remote that answers `401 WWW-Authenticate:
   Basic` is retried once with an `Authorization: Basic` header. Credentials resolve in git's order —
   URL userinfo (`https://user:pass@host`, with the password kept out of the saved `remote.origin.url`),

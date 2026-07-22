@@ -22,7 +22,7 @@ gitana-linked-worktree.workspace = true
 gitana-object.workspace = true
 gitana-object-store.workspace = true
 gitana-porcelain = { workspace = true, features = ["reqwest-transport"] }
-gitana-remote = { workspace = true, features = ["reqwest-transport"] }
+gitana-remote = { workspace = true, features = ["reqwest-transport", "ssh-transport"] }
 gitana-repository-layout.workspace = true
 gitana-repository.workspace = true
 gitana-trust.workspace = true

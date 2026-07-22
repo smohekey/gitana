@@ -11,7 +11,9 @@ use gitana_git_http::{
 	build_receive_pack_request, parse_advertisement, parse_report_status,
 };
 use gitana_object::{HashAlgorithm, ObjectId};
-use gitana_remote::{HttpTransport, Origin, PushRefspec, RECEIVE_PACK_REQUEST, Refspec};
+use gitana_remote::{
+	Connection, HttpTransport, Origin, PushRefspec, RECEIVE_PACK_REQUEST, Refspec,
+};
 use gitana_repository::{HeadState, ReflogIntent, Repository};
 use gitana_worktree::WorkTree;
 
@@ -534,37 +536,35 @@ pub async fn pull_upstream<F: FileStore, H: HashAlgorithm>(
 
 /// Clone the advertised repository into `work` (whose `.git` backs `repo`): initialise it (writing
 /// a config matching `H`), download every advertised tip, recreate the refs and `HEAD`, save the
-/// origin, and check out `HEAD`. `advertisement` is the already-fetched `GET /info/refs` body. The
-/// origin is persisted through `repo`'s file store (no ambient filesystem access), so this runs over
+/// origin, and check out `HEAD`. The ref advertisement and the pack both come over `connection` (an
+/// [`HttpConnection`](gitana_remote::HttpConnection) for a Smart HTTP remote, an
+/// [`SshConnection`](gitana_remote::SshConnection) for SSH), so the same clone drives either transport.
+/// The origin is persisted through `repo`'s file store (no ambient filesystem access), so this runs over
 /// any [`FileStore`] — a local checkout or the wasm descriptor backend.
 ///
-/// `reflog` supplies the committer and verbatim source URL for the `clone: from <url>` entries git
-/// records on `HEAD` and the checked-out branch; `None` (the in-component clone, with no configured
-/// identity) writes no reflog.
-#[allow(clippy::too_many_arguments)]
+/// `persist_url` is the URL written to `remote.origin.url` — the caller resolves it (git records the
+/// pre-`insteadOf` argument, and the CLI redacts any password). `reflog` supplies the committer and
+/// verbatim source URL for the `clone: from <url>` entries git records on `HEAD` and the checked-out
+/// branch; `None` (the in-component clone, with no configured identity) writes no reflog.
 pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
-	transport: &impl HttpTransport,
+	connection: &mut impl Connection,
 	repo: Repository<F, H>,
-	origin: &Origin,
-	advertisement: &[u8],
 	work: W,
 	deepen: &Deepen,
 	reflog: Option<CloneReflog<'_>>,
-	persist_url: Option<&str>,
+	persist_url: &str,
 ) -> Result<()> {
 	repo.init().await?;
 
-	let advertised = parse_advertisement::<H>(advertisement)?;
+	let advertised = parse_advertisement::<H>(connection.advertisement())?;
 	// A shallow clone deepens from the branch tips and `HEAD` (see `shallow_wants`); a full clone ignores
 	// these roots and wants every advertised ref. A shallow clone requests reachable tags (`include-tag`)
 	// so tags pointing into the fetched history are preserved.
 	let roots = shallow_wants(&advertised);
-	download(
-		transport,
+	download_clone(
+		connection,
 		&repo,
-		origin,
 		&advertised,
-		&[],
 		deepen,
 		&roots,
 		!deepen.is_empty(),
@@ -608,14 +608,8 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			repo.refs().update_ref(name, *oid, None, intent).await?;
 		}
 	}
-	// Persist the remote. `clone` passes the *original* URL (git records the pre-`insteadOf` argument, so
-	// a later rewrite-rule change still applies); otherwise the origin's own persisted URL is written.
-	let persisted = persist_url.map(str::to_owned);
-	let store = repo.objects().file_store();
-	match &persisted {
-		Some(url) => origin.save_as(store, url).await?,
-		None => origin.save(store).await?,
-	}
+	// Persist the remote (the caller-resolved URL, scheme-agnostic) through the file store.
+	gitana_remote::save_remote_origin(repo.objects().file_store(), persist_url).await?;
 
 	// Populate the working tree from HEAD (if the repo had any commits).
 	if let Some(commit) = repo.refs().resolve_head().await? {
@@ -626,6 +620,30 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		worktree.checkout(tree, true).await?;
 	}
 	Ok(())
+}
+
+/// Download a **clone**'s objects over a [`Connection`] (the single-round counterpart of [`download`],
+/// which negotiates `have`s for an incremental fetch over the stateless-HTTP path). A full clone wants
+/// every advertised ref; a shallow one deepens from `deepen_roots`. `include_tag` requests reachable
+/// annotated tags for a shallow clone.
+async fn download_clone<F: FileStore, H: HashAlgorithm>(
+	connection: &mut impl Connection,
+	repo: &Repository<F, H>,
+	advertised: &Advertised<H>,
+	deepen: &Deepen,
+	deepen_roots: &[ObjectId<H>],
+	include_tag: bool,
+) -> Result<()> {
+	ensure_deepen_supported(advertised, deepen)?;
+	let wants = if deepen.is_empty() {
+		gitana_remote::advertised_oids(advertised)
+	} else {
+		let mut wants = deepen_roots.to_vec();
+		wants.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+		wants.dedup();
+		wants
+	};
+	gitana_remote::download_clone_pack(connection, repo, &wants, deepen, include_tag).await
 }
 
 /// Download the objects reachable from the advertised tips that `haves` do not already cover, writing

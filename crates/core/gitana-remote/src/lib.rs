@@ -10,29 +10,41 @@
 //! `wasi:http` client.
 
 mod auth_transport;
+mod connection;
 mod credential;
 mod credential_provider;
 mod credential_request;
 mod filled;
 mod http_client;
+mod http_connection;
 mod http_transport;
 mod push_refspec;
 mod refspec;
+mod remote_url;
 #[cfg(feature = "reqwest-transport")]
 mod reqwest_transport;
+#[cfg(feature = "ssh-transport")]
+mod ssh_connection;
+mod ssh_remote;
 mod unauthenticated;
 
 pub use auth_transport::AuthTransport;
+pub use connection::Connection;
 pub use credential::Credential;
 pub use credential_provider::CredentialProvider;
 pub use credential_request::CredentialRequest;
 pub use filled::Filled;
 pub use http_client::{HttpClient, HttpResponse, challenge_offers};
+pub use http_connection::HttpConnection;
 pub use http_transport::HttpTransport;
 pub use push_refspec::PushRefspec;
 pub use refspec::Refspec;
+pub use remote_url::RemoteUrl;
 #[cfg(feature = "reqwest-transport")]
 pub use reqwest_transport::ReqwestTransport;
+#[cfg(feature = "ssh-transport")]
+pub use ssh_connection::SshConnection;
+pub use ssh_remote::SshRemote;
 pub use unauthenticated::Unauthenticated;
 
 use std::collections::HashMap;
@@ -50,7 +62,8 @@ use gitana_object::{
 };
 use gitana_repository::Repository;
 
-const UPLOAD_PACK_REQUEST: &str = "application/x-git-upload-pack-request";
+/// Content type for a `git-upload-pack` request body.
+pub const UPLOAD_PACK_REQUEST: &str = "application/x-git-upload-pack-request";
 /// Content type for a `git-receive-pack` request body.
 pub const RECEIVE_PACK_REQUEST: &str = "application/x-git-receive-pack-request";
 
@@ -61,16 +74,34 @@ pub const ORIGIN_FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
 /// Strip any `user[:pass]@` userinfo from `url`, keeping the rest **verbatim** — git's
 /// `transport_anonymize_url`, used where a URL is recorded or displayed (e.g. a clone reflog) so a
 /// credential in the URL is never persisted, while trailing slashes and the exact path are preserved.
-/// A URL without a scheme or userinfo is returned unchanged.
+/// Handles both the `scheme://[user@]host…` form and the scp-like `[user@]host:path` alias (git
+/// anonymises `alice@host:repo` → `host:repo` too). A URL without userinfo is returned unchanged.
 pub fn anonymize_url(url: &str) -> String {
 	let Some((scheme, rest)) = url.split_once("://") else {
-		return url.to_owned();
+		// No scheme: an scp-like `[user@]host:path` alias also carries userinfo git strips.
+		return anonymize_scp(url);
 	};
 	// The authority runs to the first `/`, `?`, or `#`; keep the tail exactly as given.
 	let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
 	let (authority, tail) = rest.split_at(authority_end);
 	match authority.rsplit_once('@') {
 		Some((_userinfo, host)) => format!("{scheme}://{host}{tail}"),
+		None => url.to_owned(),
+	}
+}
+
+/// Strip a `user@` prefix from an scp-like `[user@]host:path` alias (`alice@host:repo` → `host:repo`),
+/// leaving the host and path verbatim. A string that is not scp-like (no `:` before any `/`) or carries
+/// no userinfo is returned unchanged. Best-effort anonymisation for a log/display value.
+fn anonymize_scp(url: &str) -> String {
+	// scp-like iff a `:` precedes any `/`; the authority is everything before that colon.
+	let colon = match (url.find(':'), url.find('/')) {
+		(Some(colon), slash) if slash.is_none_or(|slash| colon < slash) => colon,
+		_ => return url.to_owned(),
+	};
+	let (authority, tail) = url.split_at(colon);
+	match authority.rsplit_once('@') {
+		Some((_userinfo, host)) => format!("{host}{tail}"),
 		None => url.to_owned(),
 	}
 }
@@ -218,16 +249,7 @@ impl Origin {
 	/// — the *original* argument, not the `url.*.insteadOf`-rewritten transport URL — so a later change
 	/// to the rewrite rules still applies. `url` is written verbatim; the caller redacts any password.
 	pub async fn save_as(&self, store: &impl FileStore, url: &str) -> Result<()> {
-		let bytes = store.read_path("config").await.context("reading config")?;
-		let text = String::from_utf8(bytes).context("config is not UTF-8")?;
-		let mut config = GitConfig::parse(&text).context("parsing config")?;
-		config.set("remote", Some("origin"), "url", url)?;
-		config.set("remote", Some("origin"), "fetch", ORIGIN_FETCH_REFSPEC)?;
-		store
-			.write_path_replace("config", config.render().as_bytes())
-			.await
-			.context("writing config")?;
-		Ok(())
+		save_remote_origin(store, url).await
 	}
 
 	/// Load `remote.origin.url` from `.git/config`.
@@ -247,7 +269,7 @@ impl Origin {
 	/// bare `gta fetch`/`push` still knows which user to authenticate as. The username is
 	/// percent-encoded so a value with reserved characters (`@`, `:`) round-trips back through
 	/// [`parse`](Self::parse).
-	fn persisted_url(&self) -> String {
+	pub fn persisted_url(&self) -> String {
 		match &self.username {
 			Some(username) => match self.url.split_once("://") {
 				Some((scheme, rest)) => format!("{scheme}://{}@{rest}", percent_encode_userinfo(username)),
@@ -304,6 +326,49 @@ pub fn ensure_same_format(local: HashKind, remote: HashKind) -> Result<()> {
 		);
 	}
 	Ok(())
+}
+
+/// Write `remote.origin.url` (verbatim) and the default fetch refspec into the repository's `config`,
+/// through the `store` capability — scheme-agnostic (an HTTP, SSH, or scp-like URL all persist the
+/// same way), so `clone` records the remote it copied from over any [`FileStore`].
+pub async fn save_remote_origin(store: &impl FileStore, url: &str) -> Result<()> {
+	let bytes = store.read_path("config").await.context("reading config")?;
+	let text = String::from_utf8(bytes).context("config is not UTF-8")?;
+	let mut config = GitConfig::parse(&text).context("parsing config")?;
+	config.set("remote", Some("origin"), "url", url)?;
+	config.set("remote", Some("origin"), "fetch", ORIGIN_FETCH_REFSPEC)?;
+	store
+		.write_path_replace("config", config.render().as_bytes())
+		.await
+		.context("writing config")?;
+	Ok(())
+}
+
+/// Download the objects for a **clone** over a [`Connection`] — a single upload-pack round.
+///
+/// A clone starts from an empty local repository (no `have`s), so the negotiation is always one round:
+/// the request sends `wants` (plus the current shallow boundary, if the caller asked for a shallow
+/// clone) and `done`, and the server answers with the pack. This is the connection-based counterpart to
+/// [`fetch_pack`]'s stateless-HTTP negotiation loop; incremental fetch (which offers `have`s over
+/// multiple rounds) stays on that path until a later slice rewires it onto [`Connection`].
+pub async fn download_clone_pack<H: HashAlgorithm>(
+	connection: &mut impl Connection,
+	repo: &Repository<impl FileStore, H>,
+	wants: &[ObjectId<H>],
+	deepen: &Deepen,
+	include_tag: bool,
+) -> Result<()> {
+	// An empty remote advertises no refs, so `wants` is empty and there is nothing to fetch — but the
+	// session must still be finalised (the SSH client owes a terminating flush, and a nonzero transport
+	// exit must surface). Only run the pack exchange when there is something to want.
+	if !wants.is_empty() {
+		let shallow = repo.read_shallow().await?;
+		let request = build_upload_pack_request(wants, &[], &shallow, deepen, include_tag, true);
+		let response = connection.exchange(request).await?;
+		let response = parse_upload_pack_response::<H>(&response)?;
+		store_response(repo, &shallow, response).await?;
+	}
+	connection.finish().await
 }
 
 /// Download the objects reachable from `wants` but not `haves` into `repo`.
@@ -632,6 +697,14 @@ mod tests {
 			anonymize_url("http://example.com/repo.git/"),
 			"http://example.com/repo.git/"
 		);
+		// scp-like alias: the `user@` is stripped, host and path kept (git anonymises these too).
+		assert_eq!(
+			anonymize_url("alice@host:org/repo.git"),
+			"host:org/repo.git"
+		);
+		assert_eq!(anonymize_url("host:org/repo.git"), "host:org/repo.git");
+		// A local path with a `:` only after a `/` is not scp-like — left unchanged.
+		assert_eq!(anonymize_url("./a/b:c"), "./a/b:c");
 	}
 
 	#[test]

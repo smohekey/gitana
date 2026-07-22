@@ -118,7 +118,18 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   `merge-base`, `rev-parse`) and `prune`/`gc` stop at the boundary, and `gc` skips the reachability bitmap
   when shallow. `0a4465f2` (client clone), `e696d560` (server deepen), `52d476f5` (client deepen +
   shallow-aware prune/gc).
-- [ ] Add SSH remote support.
+- [ ] Add SSH remote support. **Slice 1 (clone) done:** `gta clone` over `ssh://` / `git+ssh://` /
+  `ssh+git://` / scp-like `[user@]host:path`, driving the user's `ssh` subprocess (git-faithful:
+  `GIT_SSH_COMMAND`, effective `-C` cwd, `~/.ssh/config`/agent/known-hosts; `GIT_PROTOCOL` cleared to
+  pin v0). New `RemoteUrl`/`SshRemote` scheme dispatch + a `Connection` seam (`HttpConnection` /
+  `SshConnection`) the clone path shares; fetch/push untouched. Hardened via 5 codex rounds:
+  arg-injection guard (CVE-2017-1000117), credential redaction (success message + unsupported-scheme
+  error), `ssh://` percent-decoding (user/host/port/path), user-prefixed IPv6 scp, ssh child
+  exit-status check, empty-path rejection. Oracle-tested vs stock `git-upload-pack` (sha1+sha256, scp).
+  **Remaining:** SSH `fetch`/`push` (slice 2, multi-round negotiation + a connection-finalize
+  lifecycle); the wasm component's SSH path (host-import capability, slice 3); polish (`core.sshCommand`
+  / `GIT_SSH`, plink `-P` variant, Windows drive-letter scp disambiguation). Deferred edges surfaced by
+  codex: finalize an *empty* SSH clone's child exit status; byte-preserving (non-UTF-8) SSH paths.
 - [x] Add `remote` command support for listing, adding, removing, and editing remotes. `gta remote`
   lists the configured remotes (`-v` adds fetch/push URLs); `add <name> <url>` writes the
   `[remote "<name>"]` section with the default fetch refspec; `set-url` retargets it; `remove` drops

@@ -13,8 +13,11 @@ workspace = true
 # The native reqwest-backed `HttpTransport`. On by default so ordinary consumers are unaffected;
 # a wasm build (the `gitana:repo` component, via `gitana-porcelain`) turns it off so `reqwest` — a
 # browser wasm-bindgen HTTP stack — never enters the wasip2 reactor, and supplies its own transport.
-default = ["reqwest-transport"]
+default = ["reqwest-transport", "ssh-transport"]
 reqwest-transport = ["dep:reqwest"]
+# The native `SshConnection`, which drives an `ssh` subprocess. On by default for native consumers; a
+# wasm build turns it off (no process spawn in the wasip2 sandbox — SSH would ride a host import there).
+ssh-transport = ["dep:tokio"]
 
 [dependencies]
 anyhow.workspace = true
@@ -24,6 +27,7 @@ gitana-git-http.workspace = true
 gitana-object.workspace = true
 gitana-repository.workspace = true
 reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["io-util", "process"], optional = true }
 
 [dev-dependencies]
 gitana-file-store-memory.workspace = true

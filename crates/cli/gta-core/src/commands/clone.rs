@@ -1,11 +1,13 @@
 //! `gta clone` — copy a repository from a Git Smart HTTP remote.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
-use gitana_object::{HashKind, Sha1, Sha256};
-use gitana_porcelain::Identity;
-use gitana_remote::{self as transport, Origin};
+use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
+use gitana_porcelain::{Deepen, Identity};
+use gitana_remote::{
+	self as transport, Connection, HttpConnection, Origin, RemoteUrl, SshConnection,
+};
 
 use crate::identity::CliIdentity;
 use crate::shallow::build_deepen;
@@ -31,7 +33,7 @@ pub async fn run(
 	// https). The default checkout directory comes from the *original* argument (git's `guess_dir_name`),
 	// not the rewritten URL, in case a rewrite changes the last path segment.
 	let config = git_config::ambient_effective().await?;
-	let origin = Origin::parse(&url_rewrite::rewrite_fetch_url(&config, &url)?)?;
+	let remote = RemoteUrl::parse(&url_rewrite::rewrite_fetch_url(&config, &url)?)?;
 	let target = dir.unwrap_or_else(|| PathBuf::from(default_directory_name(&url)));
 	if target.exists()
 		&& target
@@ -45,17 +47,77 @@ pub async fn run(
 		);
 	}
 
-	// Negotiate the remote's object format before creating anything locally. Credentials resolve from
-	// the ambient (global/system) config plus any URL userinfo — there is no local config yet — and the
-	// one transport carries them through the advertisement GET and the pack POST alike.
-	// A relative askpass resolves against the launch directory for `clone` (there is no worktree yet).
-	let askpass_cwd = git_config::command_cwd().unwrap_or_else(|| PathBuf::from("."));
-	let http = transport_for(config, &origin, askpass_cwd)?;
-	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
-	let kind = transport::negotiated_kind(&body)?;
-
-	// Create the git directory skeleton, like `init`.
+	// git records `clone: from <url>` on HEAD and the checked-out branch, using the URL **verbatim**
+	// (trailing slash and all, before parsing trims it) except with any `user:pass@` userinfo stripped —
+	// git's `transport_anonymize_url` — so a credential in the URL is never persisted into `.git/logs/*`.
+	let reflog_url = transport::anonymize_url(&url);
+	// Record the ORIGINAL clone argument in `remote.origin.url` (not the `insteadOf`-rewritten transport
+	// URL), so a later change to the rewrite rules still applies on subsequent fetches. The *original
+	// spelling* is preserved — including a trailing slash the rewrite prefix may depend on and an SSH /
+	// scp-like alias. gitana additionally redacts any password (git persists it verbatim; gitana
+	// deliberately never writes a plaintext credential to `.git/config`, as on a plain userinfo clone).
+	let persist_url = redact_url_password(&url);
 	let git_dir = target.join(".git");
+	// The directory external helpers run from — git's effective working directory (`gta`'s `-C`, or the
+	// launch dir): where a relative askpass (HTTP) or a relative `GIT_SSH_COMMAND` / key path (SSH)
+	// resolves. There is no worktree yet, so it is the launch/`-C` directory, matching git.
+	let command_cwd = git_config::command_cwd().unwrap_or_else(|| PathBuf::from("."));
+
+	// Open the transport as a connection, negotiate the object format from the advertisement, then run
+	// the porcelain clone over it — one code path for both HTTP and SSH.
+	match remote {
+		RemoteUrl::Http(origin) => {
+			// Credentials resolve from the ambient (global/system) config plus any URL userinfo — there is
+			// no local config yet — and the one transport carries them through the advertisement GET and the
+			// pack POST alike.
+			let http = transport_for(config, &origin, command_cwd)?;
+			let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
+			let kind = transport::negotiated_kind(&body)?;
+			create_skeleton(&git_dir)?;
+			let mut connection = HttpConnection::new(
+				&http,
+				origin.upload_pack(),
+				transport::UPLOAD_PACK_REQUEST,
+				body,
+			);
+			clone_over(
+				&mut connection,
+				kind,
+				&git_dir,
+				&target,
+				&deepen,
+				&reflog_url,
+				&persist_url,
+			)
+			.await?;
+		}
+		RemoteUrl::Ssh(ssh) => {
+			// SSH sends the ref advertisement on connect — no separate GET — so opening the connection
+			// yields it directly. gitana drives the user's `ssh` binary (no linked SSH stack), run from the
+			// effective command directory so a relative `GIT_SSH_COMMAND` / key resolves as git's would.
+			let mut connection = SshConnection::open(&ssh, "git-upload-pack", &command_cwd).await?;
+			let kind = transport::negotiated_kind(connection.advertisement())?;
+			create_skeleton(&git_dir)?;
+			clone_over(
+				&mut connection,
+				kind,
+				&git_dir,
+				&target,
+				&deepen,
+				&reflog_url,
+				&persist_url,
+			)
+			.await?;
+		}
+	}
+
+	// Report the userinfo-stripped URL — a password in the clone URL must not reach stdout / CI logs.
+	println!("Cloned '{}' into '{}'", reflog_url, target.display());
+	Ok(())
+}
+
+/// Create the git directory skeleton, like `init`.
+fn create_skeleton(git_dir: &Path) -> Result<()> {
 	for sub in [
 		"objects/pack",
 		"objects/info",
@@ -65,64 +127,53 @@ pub async fn run(
 	] {
 		std::fs::create_dir_all(git_dir.join(sub))?;
 	}
+	Ok(())
+}
 
-	// A freshly cloned repository is an ordinary checkout: its per-worktree and common dirs coincide.
-	// git records `clone: from <url>` on HEAD and the checked-out branch, using the URL **verbatim**
-	// (trailing slash and all, before `Origin::parse` trims it) except with any `user:pass@` userinfo
-	// stripped — git's `transport_anonymize_url` — so a credential in the URL is never persisted into
-	// `.git/logs/*`. The committer falls back to a placeholder when unconfigured, as git's reflog writes
-	// do. Resolved before `repo` moves into clone.
-	let reflog_url = transport::anonymize_url(&url);
-	// Record the ORIGINAL clone argument in `remote.origin.url` (not the `insteadOf`-rewritten transport
-	// URL), so a later change to the rewrite rules still applies on subsequent fetches. The *original
-	// spelling* is preserved — including a trailing slash the rewrite prefix may depend on and a non-http
-	// (`scp`-like) alias `Origin::parse` would reject. gitana additionally redacts any password (git
-	// persists it verbatim; gitana deliberately never writes a plaintext credential to `.git/config`, as
-	// on a plain userinfo clone). The one cost of that safety choice is a password embedded *in an
-	// `insteadOf` prefix* (a very unusual config) — the redacted url no longer matches that prefix on a
-	// later fetch; the username-bearing prefix still does.
-	let persist_url = redact_url_password(&url);
+/// Run the porcelain clone over `connection`, dispatching the repository's hash algorithm (negotiated
+/// from the advertisement) so the rest is generic over `H`.
+async fn clone_over(
+	connection: &mut impl Connection,
+	kind: HashKind,
+	git_dir: &Path,
+	target: &Path,
+	deepen: &Deepen,
+	reflog_url: &str,
+	persist_url: &str,
+) -> Result<()> {
 	match kind {
 		HashKind::Sha1 => {
-			let repo = repo::open_generic::<Sha1>(&git_dir, &git_dir).await?;
-			let committer = CliIdentity::new(&repo).committer_or_default().await?;
-			gitana_porcelain::clone(
-				&http,
-				repo,
-				&origin,
-				&body,
-				repo::open_work_dir(&target)?,
-				&deepen,
-				Some(gitana_porcelain::CloneReflog {
-					committer: &committer,
-					url: &reflog_url,
-				}),
-				Some(&persist_url),
-			)
-			.await?;
+			clone_as::<Sha1>(connection, git_dir, target, deepen, reflog_url, persist_url).await
 		}
 		HashKind::Sha256 => {
-			let repo = repo::open_generic::<Sha256>(&git_dir, &git_dir).await?;
-			let committer = CliIdentity::new(&repo).committer_or_default().await?;
-			gitana_porcelain::clone(
-				&http,
-				repo,
-				&origin,
-				&body,
-				repo::open_work_dir(&target)?,
-				&deepen,
-				Some(gitana_porcelain::CloneReflog {
-					committer: &committer,
-					url: &reflog_url,
-				}),
-				Some(&persist_url),
-			)
-			.await?;
+			clone_as::<Sha256>(connection, git_dir, target, deepen, reflog_url, persist_url).await
 		}
 	}
+}
 
-	println!("Cloned '{}' into '{}'", origin.url, target.display());
-	Ok(())
+async fn clone_as<H: HashAlgorithm>(
+	connection: &mut impl Connection,
+	git_dir: &Path,
+	target: &Path,
+	deepen: &Deepen,
+	reflog_url: &str,
+	persist_url: &str,
+) -> Result<()> {
+	let repo = repo::open_generic::<H>(git_dir, git_dir).await?;
+	// The committer falls back to a placeholder when unconfigured, as git's reflog writes do.
+	let committer = CliIdentity::new(&repo).committer_or_default().await?;
+	gitana_porcelain::clone(
+		connection,
+		repo,
+		repo::open_work_dir(target)?,
+		deepen,
+		Some(gitana_porcelain::CloneReflog {
+			committer: &committer,
+			url: reflog_url,
+		}),
+		persist_url,
+	)
+	.await
 }
 
 /// The default checkout directory name for the *original* clone argument (git's `guess_dir_name`): an
