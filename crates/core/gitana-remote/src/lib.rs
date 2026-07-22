@@ -17,7 +17,9 @@ mod credential_request;
 mod filled;
 mod http_client;
 mod http_connection;
+mod http_pack_fetcher;
 mod http_transport;
+mod pack_fetcher;
 mod push_refspec;
 mod refspec;
 mod remote_url;
@@ -25,6 +27,8 @@ mod remote_url;
 mod reqwest_transport;
 #[cfg(feature = "ssh-transport")]
 mod ssh_connection;
+#[cfg(feature = "ssh-transport")]
+mod ssh_pack_fetcher;
 mod ssh_remote;
 mod unauthenticated;
 
@@ -36,7 +40,9 @@ pub use credential_request::CredentialRequest;
 pub use filled::Filled;
 pub use http_client::{HttpClient, HttpResponse, challenge_offers};
 pub use http_connection::HttpConnection;
+pub use http_pack_fetcher::HttpPackFetcher;
 pub use http_transport::HttpTransport;
+pub use pack_fetcher::PackFetcher;
 pub use push_refspec::PushRefspec;
 pub use refspec::Refspec;
 pub use remote_url::RemoteUrl;
@@ -44,6 +50,8 @@ pub use remote_url::RemoteUrl;
 pub use reqwest_transport::ReqwestTransport;
 #[cfg(feature = "ssh-transport")]
 pub use ssh_connection::SshConnection;
+#[cfg(feature = "ssh-transport")]
+pub use ssh_pack_fetcher::SshPackFetcher;
 pub use ssh_remote::SshRemote;
 pub use unauthenticated::Unauthenticated;
 
@@ -436,7 +444,7 @@ pub async fn fetch_pack<H: HashAlgorithm>(
 }
 
 /// The maximum `have`s offered per negotiation round.
-const HAVE_BATCH: usize = 16;
+pub(crate) const HAVE_BATCH: usize = 16;
 
 /// A cap on the local commits walked to offer as `have`s, bounding a deep-divergence negotiation to a
 /// handful of rounds (git similarly stops after a bounded number of unacknowledged haves). Beyond it the
@@ -455,7 +463,7 @@ async fn post_upload_pack(
 }
 
 /// Store a fetched pack response and fold in any shallow-boundary update.
-async fn store_response<H: HashAlgorithm>(
+pub(crate) async fn store_response<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	shallow_before: &[ObjectId<H>],
 	response: gitana_git_http::UploadPackResponse<H>,
@@ -480,7 +488,7 @@ async fn store_response<H: HashAlgorithm>(
 /// Walk local commits to offer as negotiation `have`s: a breadth-first sweep back from the ref-tip
 /// `roots` (tags peeled to their commit), newest-ish first, capped at [`HAVE_CAP`] to bound a
 /// deep-divergence negotiation. Best-effort — an unreadable or non-commit tip is simply not offered.
-async fn collect_have_commits<H: HashAlgorithm>(
+pub(crate) async fn collect_have_commits<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	roots: &[ObjectId<H>],
 ) -> Result<Vec<ObjectId<H>>> {

@@ -56,7 +56,7 @@ pub async fn run(
 	// spelling* is preserved — including a trailing slash the rewrite prefix may depend on and an SSH /
 	// scp-like alias. gitana additionally redacts any password (git persists it verbatim; gitana
 	// deliberately never writes a plaintext credential to `.git/config`, as on a plain userinfo clone).
-	let persist_url = redact_url_password(&url);
+	let persist_url = url_rewrite::redact_password(&url);
 	let git_dir = target.join(".git");
 	// The directory external helpers run from — git's effective working directory (`gta`'s `-C`, or the
 	// launch dir): where a relative askpass (HTTP) or a relative `GIT_SSH_COMMAND` / key path (SSH)
@@ -196,61 +196,9 @@ fn default_directory_name(url: &str) -> String {
 	}
 }
 
-/// The clone URL to persist in `remote.origin.url`: the original `url` verbatim (scheme case, trailing
-/// slash, path all preserved, so it still matches the `insteadOf` rule on a later fetch) with only a
-/// `:password` stripped from the userinfo. git persists the password too; gitana deliberately does not,
-/// keeping a plaintext credential out of `.git/config` (its established behaviour for a userinfo clone).
-/// A string with no `://` (an `scp`-like alias, which carries no password) is returned unchanged.
-fn redact_url_password(url: &str) -> String {
-	let Some((scheme, rest)) = url.split_once("://") else {
-		return url.to_owned();
-	};
-	let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-	let (authority, tail) = rest.split_at(authority_end);
-	// The userinfo is delimited by the last `@`; the username is up to the first `:` (so a password may
-	// contain either). An empty username drops the whole `userinfo@`.
-	let authority = match authority.rsplit_once('@') {
-		Some((userinfo, host)) => {
-			let user = userinfo.split_once(':').map_or(userinfo, |(user, _)| user);
-			if user.is_empty() {
-				host.to_owned()
-			} else {
-				format!("{user}@{host}")
-			}
-		}
-		None => authority.to_owned(),
-	};
-	format!("{scheme}://{authority}{tail}")
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn redacts_password_preserving_spelling() {
-		// Password dropped, username + trailing slash + scheme case preserved.
-		assert_eq!(
-			redact_url_password("HTTPS://alice:secret@host/repo/"),
-			"HTTPS://alice@host/repo/"
-		);
-		// A password containing `@`/`:` is still fully removed (last `@`, first `:`).
-		assert_eq!(
-			redact_url_password("https://alice:se@cr:et@host/r"),
-			"https://alice@host/r"
-		);
-		// No userinfo, and a userinfo-less scp-like alias, pass through unchanged.
-		assert_eq!(redact_url_password("https://host/r"), "https://host/r");
-		assert_eq!(
-			redact_url_password("git@host:org/repo.git"),
-			"git@host:org/repo.git"
-		);
-		// An empty username drops the whole userinfo.
-		assert_eq!(
-			redact_url_password("https://:secret@host/r"),
-			"https://host/r"
-		);
-	}
 
 	#[test]
 	fn default_dir_from_original_url() {

@@ -15,7 +15,7 @@ use crate::{Connection, SshRemote};
 /// and known-hosts all apply), keeping stderr on the terminal for host-key and passphrase prompts.
 pub struct SshConnection {
 	// Held to await ssh's exit status in `finish`, and reaped (kill-on-drop) if the connection is
-	// dropped early; stdin is kept for the multi-round fetch negotiation a later slice adds.
+	// dropped early; stdin stays open across rounds of the multi-round fetch negotiation.
 	child: Child,
 	stdin: ChildStdin,
 	stdout: ChildStdout,
@@ -52,6 +52,105 @@ impl SshConnection {
 			request_sent: false,
 		})
 	}
+
+	/// Write one negotiation message (pkt-lines) without closing stdin — for a multi-round fetch, where
+	/// stdin stays open between rounds and is closed only in [`read_pack`](Self::read_pack) after `done`.
+	pub(crate) async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+		self
+			.stdin
+			.write_all(bytes)
+			.await
+			.context("writing to ssh")?;
+		self
+			.stdin
+			.flush()
+			.await
+			.context("flushing the ssh request")?;
+		self.request_sent = true;
+		Ok(())
+	}
+
+	/// Read one acknowledgment batch (the server's response to a have-group) and report whether the
+	/// client should now send `done`. The batch boundary depends on the negotiation mode the server chose
+	/// from what we advertised:
+	/// - `multi_ack_detailed`: `ACK <oid> common`* then optionally `ACK <oid> ready`, terminated by `NAK`.
+	///   `ready` means the server has a sufficient cut point; the boundary is the trailing `NAK`.
+	/// - plain `multi_ack`: `ACK <oid> continue`* terminated by `NAK` (no `ready` — keep offering haves).
+	/// - single-ack (base protocol v0): a bare `ACK <oid>` is terminal — the server then stays silent
+	///   until `done`, so it must end the batch, or the read deadlocks.
+	///
+	/// (`common`/`continue` acks are consumed but not yet used to prune later have-groups — a follow-up.)
+	pub(crate) async fn read_ack_batch(&mut self) -> Result<bool> {
+		let mut ready = false;
+		loop {
+			match self.read_pkt_line().await? {
+				// A flush also ends a batch (defensive).
+				None => return Ok(ready),
+				Some(line) => {
+					if line == b"NAK\n" {
+						return Ok(ready);
+					}
+					if let Some(rest) = line.strip_prefix(b"ACK ") {
+						match ack_class(rest.strip_suffix(b"\n").unwrap_or(rest)) {
+							// multi_ack_detailed: a `NAK` still terminates this batch.
+							AckClass::Ready => ready = true,
+							// A bare `ACK <oid>` — single-ack base protocol, which sends no terminating `NAK`.
+							AckClass::BareTerminal => return Ok(true),
+							// `common` / `continue`: consumed; keep reading to the terminating `NAK`.
+							AckClass::Partial => {}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	/// Close stdin (git closes the child's input after `done`) and read the final response — the last
+	/// `ACK` and the side-band packfile — to EOF, for [`parse_upload_pack_response`].
+	pub(crate) async fn read_pack(&mut self) -> Result<Vec<u8>> {
+		self
+			.stdin
+			.shutdown()
+			.await
+			.context("closing the ssh stdin")?;
+		let mut response = Vec::new();
+		self
+			.stdout
+			.read_to_end(&mut response)
+			.await
+			.context("reading the pack from ssh")?;
+		Ok(response)
+	}
+
+	// (see `ack_class` below for the per-line classification)
+
+	/// Read one pkt-line's payload from stdout, or `None` on a flush-pkt (`0000`).
+	async fn read_pkt_line(&mut self) -> Result<Option<Vec<u8>>> {
+		let mut len_bytes = [0u8; 4];
+		self
+			.stdout
+			.read_exact(&mut len_bytes)
+			.await
+			.context("reading a pkt-line length")?;
+		let len = usize::from_str_radix(
+			std::str::from_utf8(&len_bytes).context("pkt-line length is not UTF-8")?,
+			16,
+		)
+		.context("pkt-line length is not hex")?;
+		if len == 0 {
+			return Ok(None);
+		}
+		if len < 4 {
+			bail!("invalid pkt-line length {len}");
+		}
+		let mut body = vec![0u8; len - 4];
+		self
+			.stdout
+			.read_exact(&mut body)
+			.await
+			.context("reading a pkt-line body")?;
+		Ok(Some(body))
+	}
 }
 
 impl Connection for SshConnection {
@@ -72,17 +171,16 @@ impl Connection for SshConnection {
 			.context("flushing the ssh request")?;
 		self.request_sent = true;
 		// Close stdin after the request (git closes the child's input after `done`), so a wrapper that
-		// waits for stdin EOF before finishing its stdout does not deadlock our `read_to_end`. This is the
-		// final round for a clone; multi-round fetch (a later slice) closes stdin only after its last round.
+		// waits for stdin EOF before finishing its stdout does not deadlock our `read_to_end`. `exchange`
+		// is the single-round shape (clone / push / receive-pack); the multi-round fetch keeps stdin open
+		// between rounds via `write`/`read_ack_batch`, closing it only in `read_pack`.
 		self
 			.stdin
 			.shutdown()
 			.await
 			.context("closing the ssh stdin")?;
-		// A full clone is a single negotiation round: after `done`, upload-pack streams the pack and
-		// closes its stdout, so reading to EOF collects the whole response. Multi-round fetch negotiation
-		// — which must stop at a boundary rather than EOF — is a later slice. The child's exit status is
-		// checked in `finish`.
+		// A single-round exchange: after the request, the server streams its whole response and closes its
+		// stdout, so reading to EOF collects it. The child's exit status is checked in `finish`.
 		let mut response = Vec::new();
 		self
 			.stdout
@@ -221,9 +319,39 @@ async fn read_advertisement(reader: &mut (impl AsyncRead + Unpin)) -> Result<Vec
 	Ok(out)
 }
 
+/// The negotiation meaning of an `ACK …` line's tail (the text after `ACK `, trailing newline trimmed).
+enum AckClass {
+	/// `ACK <oid> ready` — the server has a sufficient cut point (the `NAK` still ends the batch).
+	Ready,
+	/// `ACK <oid> common` / `ACK <oid> continue` — a common commit under multi_ack; keep reading.
+	Partial,
+	/// A bare `ACK <oid>` — single-ack base protocol: terminal, since no `NAK` follows.
+	BareTerminal,
+}
+
+/// Classify an `ACK …` line's tail, distinguishing the multi_ack forms from a bare single-ack `ACK`.
+fn ack_class(body: &[u8]) -> AckClass {
+	if body.ends_with(b" ready") {
+		AckClass::Ready
+	} else if body.contains(&b' ') {
+		AckClass::Partial
+	} else {
+		AckClass::BareTerminal
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn classifies_ack_lines_by_mode() {
+		// multi_ack_detailed `ready`, multi_ack `common`/`continue`, and a bare single-ack `ACK`.
+		assert!(matches!(ack_class(b"abc123 ready"), AckClass::Ready));
+		assert!(matches!(ack_class(b"abc123 common"), AckClass::Partial));
+		assert!(matches!(ack_class(b"abc123 continue"), AckClass::Partial));
+		assert!(matches!(ack_class(b"abc123"), AckClass::BareTerminal));
+	}
 
 	#[test]
 	fn single_quotes_paths_git_style() {

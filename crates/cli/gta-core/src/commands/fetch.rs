@@ -6,7 +6,10 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_porcelain::{Deepen, Identity, TagFetch};
-use gitana_remote::{self as transport, HttpTransport, Origin};
+use gitana_remote::{
+	self as transport, Connection, HttpPackFetcher, PackFetcher, RemoteUrl, SshConnection,
+	SshPackFetcher,
+};
 
 use crate::dispatch;
 use crate::identity::CliIdentity;
@@ -43,39 +46,85 @@ pub async fn run(
 	let found = repo::discover(cwd).await?;
 	// The origin URL is `remote.origin.url` with `url.*.insteadOf` applied, read from the merged config.
 	let config = git_config::effective_config_at(&found.git_dir, &found.common_dir).await?;
-	let origin = url_rewrite::fetch_origin(&config, "origin")?;
-	// A relative askpass resolves against the worktree root, as git runs it from there (bare: git dir).
+	let url = url_rewrite::resolve_fetch_url(&config, "origin")?;
+	let remote = RemoteUrl::parse(&url)?;
+	// A credential-free form for the "Fetched from" line — *all* userinfo stripped (a token can occupy
+	// the username field), since the raw `url` is only for the auth-bearing transport parse above.
+	let display = transport::anonymize_url(&url);
+	// A relative askpass (HTTP) / `GIT_SSH_COMMAND` (SSH) resolves against the worktree root, as git runs
+	// it from there (bare: git dir).
 	let askpass_cwd = found
 		.worktree_root
 		.clone()
 		.unwrap_or_else(|| found.common_dir.clone());
-	let http = transport_for(config, &origin, askpass_cwd)?;
-	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
-
-	let local = dispatch::detect_algorithm(&found.common_dir)?;
-	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
-
 	let tags = match (all_tags, no_tags) {
 		(true, _) => TagFetch::All,
 		(_, true) => TagFetch::None,
 		_ => TagFetch::Auto,
 	};
-	match local {
-		HashKind::Sha1 => {
-			fetch_into::<Sha1>(&http, &origin, &found, &body, tags, &deepen, unshallow).await
+
+	// Open the transport as a pack fetcher (HTTP stateless-RPC, or the SSH stateful stream), then run the
+	// dispatch — one path for both, differing only in how the negotiation downloads the pack.
+	match remote {
+		RemoteUrl::Http(origin) => {
+			let http = transport_for(config, &origin, askpass_cwd)?;
+			let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
+			let mut fetcher = HttpPackFetcher::new(&http, &origin);
+			fetch_dispatch(
+				&mut fetcher,
+				&found,
+				&body,
+				&display,
+				tags,
+				&deepen,
+				unshallow,
+			)
+			.await
 		}
+		RemoteUrl::Ssh(ssh) => {
+			let connection = SshConnection::open(&ssh, "git-upload-pack", &askpass_cwd).await?;
+			let body = connection.advertisement().to_vec();
+			let mut fetcher = SshPackFetcher::new(connection);
+			fetch_dispatch(
+				&mut fetcher,
+				&found,
+				&body,
+				&display,
+				tags,
+				&deepen,
+				unshallow,
+			)
+			.await
+		}
+	}
+}
+
+/// Negotiate the object format from the advertisement, then run the per-hash fetch over `fetcher`.
+async fn fetch_dispatch(
+	fetcher: &mut impl PackFetcher,
+	found: &repo::RepositoryLayout,
+	body: &[u8],
+	url: &str,
+	tags: TagFetch,
+	deepen: &Deepen,
+	unshallow: bool,
+) -> Result<()> {
+	let local = dispatch::detect_algorithm(&found.common_dir)?;
+	transport::ensure_same_format(local, transport::negotiated_kind(body)?)?;
+	match local {
+		HashKind::Sha1 => fetch_into::<Sha1>(fetcher, found, body, url, tags, deepen, unshallow).await,
 		HashKind::Sha256 => {
-			fetch_into::<Sha256>(&http, &origin, &found, &body, tags, &deepen, unshallow).await
+			fetch_into::<Sha256>(fetcher, found, body, url, tags, deepen, unshallow).await
 		}
 	}
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn fetch_into<H: HashAlgorithm>(
-	http: &impl HttpTransport,
-	origin: &Origin,
+	fetcher: &mut impl PackFetcher,
 	found: &repo::RepositoryLayout,
 	body: &[u8],
+	url: &str,
 	tags: TagFetch,
 	deepen: &Deepen,
 	unshallow: bool,
@@ -98,9 +147,8 @@ async fn fetch_into<H: HashAlgorithm>(
 	let committer = CliIdentity::new(&repository).committer_or_default().await?;
 	let action = crate::identity::reflog_action("fetch");
 	let outcome = gitana_porcelain::fetch(
-		http,
+		fetcher,
 		&repository,
-		origin,
 		body,
 		false,
 		tags,
@@ -112,7 +160,7 @@ async fn fetch_into<H: HashAlgorithm>(
 		}),
 	)
 	.await?;
-	println!("Fetched from {}", origin.url);
+	println!("Fetched from {url}");
 	for (tracking, _) in &outcome.updated {
 		println!("   {tracking}");
 	}

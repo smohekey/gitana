@@ -12,7 +12,9 @@ use gitana_file_store_local::{DescriptorWorkDir, WorktreeFileStore};
 use gitana_object::HashAlgorithm;
 use gitana_object_store::ObjectStore;
 use gitana_porcelain::Deepen;
-use gitana_remote::{AuthTransport, HttpConnection, Origin, UPLOAD_PACK_REQUEST};
+use gitana_remote::{
+	AuthTransport, HttpConnection, HttpPackFetcher, Origin, RECEIVE_PACK_REQUEST, UPLOAD_PACK_REQUEST,
+};
 use gitana_repository::Repository;
 
 use super::WasiCredentialProvider;
@@ -64,11 +66,12 @@ pub(crate) async fn fetch<H: HashAlgorithm>(
 	}
 
 	// The component sees a single worktree through its capability descriptors, so it has no view of any
-	// sibling linked worktrees; the current HEAD is still guarded inside the porcelain.
+	// sibling linked worktrees; the current HEAD is still guarded inside the porcelain. Fetch negotiates
+	// over the `wasi:http` transport (stateless-RPC); SSH is native-only.
+	let mut fetcher = HttpPackFetcher::new(&transport, &origin);
 	let outcome = gitana_porcelain::fetch(
-		&transport,
+		&mut fetcher,
 		repo,
-		&origin,
 		&advertisement,
 		false,
 		gitana_porcelain::TagFetch::Auto,
@@ -132,11 +135,17 @@ pub(crate) async fn push<H: HashAlgorithm>(
 		],
 	};
 	// The component surface pushes a single ref, so atomicity would be a no-op; it is not exposed in
-	// the WIT contract.
-	let outcome = gitana_porcelain::push(
+	// the WIT contract. The receive-pack request is one exchange over the `wasi:http` transport (the
+	// connection's own advertisement is unused, since push takes it as an argument).
+	let mut connection = HttpConnection::new(
 		&transport,
+		origin.receive_pack(),
+		RECEIVE_PACK_REQUEST,
+		Vec::new(),
+	);
+	let outcome = gitana_porcelain::push(
+		&mut connection,
 		repo,
-		&origin,
 		&advertisement,
 		force,
 		false,

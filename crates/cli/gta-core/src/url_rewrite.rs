@@ -3,12 +3,11 @@
 //! git rewrites a remote URL before use: the longest `url.<base>.insteadOf` whose value is a prefix of
 //! the URL has that prefix replaced with `<base>` (ties resolve to the first rule in config order).
 //! For a push, `pushInsteadOf` takes precedence when one of its prefixes matches, otherwise `insteadOf`
-//! applies. This is the same rewriting `gta remote -v` reports; here it is applied when building the
-//! [`Origin`](gitana_remote::Origin) that `clone`/`fetch`/`pull`/`push` actually talk to.
+//! applies. This is the same rewriting `gta remote -v` reports; here it resolves the remote URL string
+//! that `clone`/`fetch`/`pull`/`push` parse (`RemoteUrl` for transport dispatch) and talk to.
 
 use anyhow::{Context, Result, anyhow, bail};
 use gitana_config::GitConfig;
-use gitana_remote::Origin;
 
 /// The surviving values of the multi-valued `remote.<remote>.<key>` (`url` or `pushurl`), in config
 /// order with git's empty-value **reset** applied — an empty (`= ""`) value clears everything
@@ -36,29 +35,58 @@ pub(crate) fn remote_urls<'a>(
 	Ok(urls)
 }
 
-/// Resolve the fetch-direction [`Origin`] for `remote` from `config`: the **first** surviving
-/// `remote.<remote>.url` (git fetches from the first) with `url.*.insteadOf` applied. Used by
+/// Resolve the fetch-direction remote URL for `remote` from `config`: the **first** surviving
+/// `remote.<remote>.url` (git fetches from the first) with `url.*.insteadOf` applied. The caller parses
+/// it (`RemoteUrl` for the transport dispatch, or `Origin` where only HTTP is supported). Used by
 /// `fetch`/`pull` (and `trust sync`) — `clone` rewrites its CLI argument directly with
 /// [`rewrite_fetch_url`].
-pub fn fetch_origin(config: &GitConfig, remote: &str) -> Result<Origin> {
+pub fn resolve_fetch_url(config: &GitConfig, remote: &str) -> Result<String> {
 	let urls = remote_urls(config, remote, "url")?;
 	let url = *urls
 		.first()
 		.with_context(|| format!("no remote.{remote}.url configured"))?;
-	Origin::parse(&rewrite_fetch_url(config, url)?)
+	rewrite_fetch_url(config, url)
 }
 
 /// A URL rewriter: applies git's `insteadOf`/`pushInsteadOf` rules to one remote URL.
 type UrlRewrite = fn(&GitConfig, &str) -> Result<String>;
 
-/// Resolve the push-direction [`Origin`] for `remote`, matching git's push-URL selection: the
+/// A credential-safe form of `url` for display, persistence, or a push certificate's pushee: the URL
+/// verbatim (scheme case, path, trailing slash preserved) with only a `:password` stripped from the
+/// userinfo — the username is kept (git keeps it; it is not a secret), the password is not. A string
+/// with no `://` (an scp-like alias, which carries no password) is returned unchanged. Used wherever a
+/// remote URL leaves the authentication path, so a plaintext credential never reaches a print, a
+/// `.git/config`, a reflog-adjacent commit message, or a signed certificate.
+pub fn redact_password(url: &str) -> String {
+	let Some((scheme, rest)) = url.split_once("://") else {
+		return url.to_owned();
+	};
+	let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+	let (authority, tail) = rest.split_at(authority_end);
+	// The userinfo is delimited by the last `@`; the username is up to the first `:` (so a password may
+	// contain either). An empty username drops the whole `userinfo@`.
+	let authority = match authority.rsplit_once('@') {
+		Some((userinfo, host)) => {
+			let user = userinfo.split_once(':').map_or(userinfo, |(user, _)| user);
+			if user.is_empty() {
+				host.to_owned()
+			} else {
+				format!("{user}@{host}")
+			}
+		}
+		None => authority.to_owned(),
+	};
+	format!("{scheme}://{authority}{tail}")
+}
+
+/// Resolve the push-direction remote URL for `remote`, matching git's push-URL selection: the
 /// `remote.<remote>.pushurl`s (with `insteadOf` rewriting) if any, else the `remote.<remote>.url`s with
-/// `pushInsteadOf` (falling back to `insteadOf`).
+/// `pushInsteadOf` (falling back to `insteadOf`). The caller parses it (`RemoteUrl` for dispatch).
 ///
 /// git pushes to *every* surviving destination (mirroring); gta pushes to a single one, so more than one
 /// is an explicit error rather than a silent push to just one — leaving the other mirrors stale would be
 /// worse than declining. (Multi-destination push is a deferred feature.)
-pub fn push_origin(config: &GitConfig, remote: &str) -> Result<Origin> {
+pub fn resolve_push_url(config: &GitConfig, remote: &str) -> Result<String> {
 	let pushurls = remote_urls(config, remote, "pushurl")?;
 	// A pushurl is rewritten with `insteadOf`; a fetch url falling through is rewritten with
 	// `pushInsteadOf`. Both honour git's empty-value reset via `remote_urls`.
@@ -69,7 +97,7 @@ pub fn push_origin(config: &GitConfig, remote: &str) -> Result<Origin> {
 	};
 	match destinations.as_slice() {
 		[] => bail!("no remote.{remote}.url configured"),
-		[one] => Origin::parse(&rewrite(config, one)?),
+		[one] => rewrite(config, one),
 		_ => bail!(
 			"remote.{remote} has multiple push destinations; gta pushes to a single destination \
 			 (multi-destination push is not yet supported)"
@@ -143,6 +171,30 @@ mod tests {
 	}
 
 	#[test]
+	fn redact_password_preserves_spelling() {
+		// Password dropped, username + trailing slash + scheme case preserved.
+		assert_eq!(
+			redact_password("HTTPS://alice:secret@host/repo/"),
+			"HTTPS://alice@host/repo/"
+		);
+		// A password containing `@`/`:` is still fully removed (last `@`, first `:`).
+		assert_eq!(
+			redact_password("https://alice:se@cr:et@host/r"),
+			"https://alice@host/r"
+		);
+		// No userinfo, and a userinfo-less scp-like alias, pass through unchanged (an ssh login user is
+		// kept — it is not a secret).
+		assert_eq!(redact_password("https://host/r"), "https://host/r");
+		assert_eq!(
+			redact_password("git@host:org/repo.git"),
+			"git@host:org/repo.git"
+		);
+		assert_eq!(redact_password("ssh://git@host/r"), "ssh://git@host/r");
+		// An empty username drops the whole userinfo.
+		assert_eq!(redact_password("https://:secret@host/r"), "https://host/r");
+	}
+
+	#[test]
 	fn fetch_applies_insteadof_longest_prefix() {
 		let config = parse(
 			"[url \"https://internal/\"]\n\tinsteadOf = https://example.com/\n\
@@ -162,7 +214,7 @@ mod tests {
 	fn valueless_remote_url_is_an_error() {
 		// A bare `url` (no `=`) is a config error git aborts on — not a silent revival of a prior url.
 		let config = parse("[remote \"origin\"]\n\turl = https://old.example/r\n\turl\n");
-		assert!(fetch_origin(&config, "origin").is_err());
+		assert!(resolve_fetch_url(&config, "origin").is_err());
 	}
 
 	#[test]
@@ -201,13 +253,13 @@ mod tests {
 	}
 
 	#[test]
-	fn push_origin_prefers_pushurl_then_url() {
+	fn resolve_push_url_prefers_pushurl_then_url() {
 		// An explicit pushurl (insteadOf-rewritten) wins over the fetch url.
 		let with_pushurl = parse(
 			"[remote \"origin\"]\n\turl = https://fetch.example/r\n\tpushurl = https://push.example/r\n",
 		);
 		assert_eq!(
-			push_origin(&with_pushurl, "origin").unwrap().url,
+			resolve_push_url(&with_pushurl, "origin").unwrap(),
 			"https://push.example/r"
 		);
 		// With no pushurl, the fetch url is rewritten with pushInsteadOf.
@@ -216,18 +268,18 @@ mod tests {
 			 [url \"https://mirror/\"]\n\tpushInsteadOf = https://example.com/\n",
 		);
 		assert_eq!(
-			push_origin(&no_pushurl, "origin").unwrap().url,
+			resolve_push_url(&no_pushurl, "origin").unwrap(),
 			"https://mirror/r"
 		);
 	}
 
 	#[test]
-	fn push_origin_rejects_multiple_pushurls() {
+	fn resolve_push_url_rejects_multiple_pushurls() {
 		let config = parse(
 			"[remote \"origin\"]\n\turl = https://example.com/r\n\
 			 \tpushurl = https://a.example/r\n\tpushurl = https://b.example/r\n",
 		);
-		assert!(push_origin(&config, "origin").is_err());
+		assert!(resolve_push_url(&config, "origin").is_err());
 	}
 
 	#[test]
@@ -237,7 +289,7 @@ mod tests {
 			"[remote \"origin\"]\n\turl = https://first.example/r\n\turl = https://second.example/r\n",
 		);
 		assert_eq!(
-			fetch_origin(&two, "origin").unwrap().url,
+			resolve_fetch_url(&two, "origin").unwrap(),
 			"https://first.example/r"
 		);
 		// An empty url resets the accumulated list, so a later url becomes the sole survivor.
@@ -245,7 +297,7 @@ mod tests {
 			"[remote \"origin\"]\n\turl = https://stale.example/r\n\turl =\n\turl = https://live.example/r\n",
 		);
 		assert_eq!(
-			fetch_origin(&reset, "origin").unwrap().url,
+			resolve_fetch_url(&reset, "origin").unwrap(),
 			"https://live.example/r"
 		);
 	}
@@ -255,7 +307,7 @@ mod tests {
 		// git pushes to every url when no pushurl is set; gta is single-destination and declines.
 		let config =
 			parse("[remote \"origin\"]\n\turl = https://a.example/r\n\turl = https://b.example/r\n");
-		assert!(push_origin(&config, "origin").is_err());
+		assert!(resolve_push_url(&config, "origin").is_err());
 	}
 
 	#[test]
@@ -266,7 +318,7 @@ mod tests {
 			 \tpushurl = https://a.example/r\n\tpushurl =\n",
 		);
 		assert_eq!(
-			push_origin(&config, "origin").unwrap().url,
+			resolve_push_url(&config, "origin").unwrap(),
 			"https://example.com/r"
 		);
 	}

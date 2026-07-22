@@ -11,9 +11,7 @@ use gitana_git_http::{
 	build_receive_pack_request, parse_advertisement, parse_report_status,
 };
 use gitana_object::{HashAlgorithm, ObjectId};
-use gitana_remote::{
-	Connection, HttpTransport, Origin, PushRefspec, RECEIVE_PACK_REQUEST, Refspec,
-};
+use gitana_remote::{Connection, PackFetcher, PushRefspec, Refspec};
 use gitana_repository::{HeadState, ReflogIntent, Repository};
 use gitana_worktree::WorkTree;
 
@@ -91,9 +89,8 @@ pub struct CloneReflog<'a> {
 /// records (git's `<action>: <status>`); `None` writes no reflog (see [`FetchReflog`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn fetch<F: FileStore, H: HashAlgorithm>(
-	transport: &impl HttpTransport,
+	fetcher: &mut impl PackFetcher,
 	repo: &Repository<F, H>,
-	origin: &Origin,
 	advertisement: &[u8],
 	update_head_ok: bool,
 	tags: TagFetch,
@@ -175,9 +172,8 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	// history arrive — unless `--no-tags` disabled tag fetching entirely, which git also omits it for.
 	let include_tag = !deepen.is_empty() && tags != TagFetch::None;
 	download(
-		transport,
+		fetcher,
 		repo,
-		origin,
 		&advertised,
 		&haves,
 		deepen,
@@ -656,9 +652,8 @@ async fn download_clone<F: FileStore, H: HashAlgorithm>(
 /// disabling tags (`--no-tags`) passes `false`.
 #[allow(clippy::too_many_arguments)]
 async fn download<F: FileStore, H: HashAlgorithm>(
-	transport: &impl HttpTransport,
+	fetcher: &mut impl PackFetcher,
 	repo: &Repository<F, H>,
-	origin: &Origin,
 	advertised: &Advertised<H>,
 	haves: &[ObjectId<H>],
 	deepen: &Deepen,
@@ -674,7 +669,9 @@ async fn download<F: FileStore, H: HashAlgorithm>(
 		wants.dedup();
 		wants
 	};
-	gitana_remote::fetch_pack(transport, origin, repo, &wants, haves, deepen, include_tag).await?;
+	fetcher
+		.fetch_pack(repo, &wants, haves, deepen, include_tag)
+		.await?;
 	Ok(())
 }
 
@@ -780,9 +777,8 @@ pub enum PushTags {
 /// [`push_signed`].
 #[allow(clippy::too_many_arguments)]
 pub async fn push<F: FileStore, H: HashAlgorithm>(
-	transport: &impl HttpTransport,
+	connection: &mut impl Connection,
 	repo: &Repository<F, H>,
-	origin: &Origin,
 	advertisement: &[u8],
 	force: bool,
 	atomic: bool,
@@ -793,6 +789,9 @@ pub async fn push<F: FileStore, H: HashAlgorithm>(
 	ensure_atomic_supported(&advertised, atomic)?;
 	let planned = plan_push(repo, &advertised, refspecs, force, tags).await?;
 	if planned.is_empty() {
+		// Nothing to push (already up to date): still finalise the session — an SSH connection owes the
+		// terminating flush and a nonzero transport exit must surface (a no-op for stateless HTTP).
+		connection.finish().await?;
 		return Ok(PushOutcome {
 			results: Vec::new(),
 			signed: false,
@@ -801,7 +800,7 @@ pub async fn push<F: FileStore, H: HashAlgorithm>(
 	let updates: Vec<RefUpdate<H>> = planned.iter().map(|p| p.update.clone()).collect();
 	let pack = pack_for(repo, &advertised, &planned).await?;
 	let request = build_receive_pack_request(&updates, atomic, &pack);
-	send_receive_pack(transport, origin, request).await?;
+	send_receive_pack(connection, request).await?;
 	Ok(PushOutcome {
 		results: results_of(&planned),
 		signed: false,
@@ -816,9 +815,9 @@ pub async fn push<F: FileStore, H: HashAlgorithm>(
 /// signed pushes".
 #[allow(clippy::too_many_arguments)]
 pub async fn push_signed<F: FileStore, H: HashAlgorithm, S: Signer>(
-	transport: &impl HttpTransport,
+	connection: &mut impl Connection,
 	repo: &Repository<F, H>,
-	origin: &Origin,
+	pushee: &str,
 	advertisement: &[u8],
 	force: bool,
 	atomic: bool,
@@ -831,6 +830,8 @@ pub async fn push_signed<F: FileStore, H: HashAlgorithm, S: Signer>(
 	ensure_atomic_supported(&advertised, atomic)?;
 	let planned = plan_push(repo, &advertised, refspecs, force, tags).await?;
 	if planned.is_empty() {
+		// Nothing to push: finalise the session (SSH flush + exit status) before returning up-to-date.
+		connection.finish().await?;
 		return Ok(PushOutcome {
 			results: Vec::new(),
 			signed: true,
@@ -841,13 +842,13 @@ pub async fn push_signed<F: FileStore, H: HashAlgorithm, S: Signer>(
 		.clone()
 		.context("the server does not accept signed pushes")?;
 	let updates: Vec<RefUpdate<H>> = planned.iter().map(|p| p.update.clone()).collect();
-	let mut cert = build_cert(origin, pusher().await?, nonce, &updates);
+	let mut cert = build_cert(pushee, pusher().await?, nonce, &updates);
 	// The signer emits an SSHSIG armor (git's `git` namespace) over the certificate body — exactly what
 	// receive-pack verifies via `verify_sshsig(cert.payload(), cert.signature, keys, "git")`.
 	cert.signature = signer.sign(&cert.payload()).await?;
 	let pack = pack_for(repo, &advertised, &planned).await?;
 	let request = build_push_cert(&cert, &push_caps::<H>(atomic), &pack);
-	send_receive_pack(transport, origin, request).await?;
+	send_receive_pack(connection, request).await?;
 	Ok(PushOutcome {
 		results: results_of(&planned),
 		signed: true,
@@ -1184,23 +1185,17 @@ fn results_of<H: HashAlgorithm>(planned: &[Planned<H>]) -> Vec<PushResult> {
 }
 
 /// POST a receive-pack request to `origin` and check the report-status it returns.
-async fn send_receive_pack(
-	transport: &impl HttpTransport,
-	origin: &Origin,
-	request: Vec<u8>,
-) -> Result<()> {
-	let response = transport
-		.post(&origin.receive_pack(), RECEIVE_PACK_REQUEST, request)
-		.await?;
+async fn send_receive_pack(connection: &mut impl Connection, request: Vec<u8>) -> Result<()> {
+	let response = connection.exchange(request).await?;
 	parse_report_status(&response)?;
-	Ok(())
+	connection.finish().await
 }
 
 /// Build a push certificate carrying one command per `update`, with an empty `signature`: the caller
 /// signs [`PushCert::payload`] and fills it in. Each command's `old`/`new` are the ref's before/after
 /// values — a `None` becomes the all-zero id, so a create is `old: None` and a delete is `new: None`.
 fn build_cert<H: HashAlgorithm>(
-	origin: &Origin,
+	pushee: &str,
 	pusher: String,
 	nonce: String,
 	updates: &[RefUpdate<H>],
@@ -1210,7 +1205,7 @@ fn build_cert<H: HashAlgorithm>(
 	PushCert {
 		version: "0.1".to_owned(),
 		pusher,
-		pushee: origin.url.clone(),
+		pushee: pushee.to_owned(),
 		nonce,
 		push_options: Vec::new(),
 		commands: updates
@@ -1331,23 +1326,38 @@ mod tests {
 		assert!(!push_caps::<Sha256>(false).contains("atomic"));
 	}
 
-	/// A [`HttpTransport`] double that records the single POSTed request and answers with a success
+	/// The pushee URL the certificate tests bind to (the value of the parsed origin's `url`).
+	const PUSHEE: &str = "http://host/acme/app";
+
+	/// A [`Connection`] double that records the single request exchanged and answers with a success
 	/// `report-status` (`unpack ok`), so a push completes without a real server.
-	struct CapturingTransport {
+	struct CapturingConnection {
 		posted: RefCell<Option<Vec<u8>>>,
 	}
 
-	impl HttpTransport for CapturingTransport {
-		async fn get(&self, _url: &str) -> Result<Vec<u8>> {
-			unreachable!("push does not GET the advertisement (the caller passes it in)")
+	impl CapturingConnection {
+		fn new() -> Self {
+			Self {
+				posted: RefCell::new(None),
+			}
+		}
+	}
+
+	impl Connection for CapturingConnection {
+		fn advertisement(&self) -> &[u8] {
+			unreachable!("push passes the advertisement in; it does not read it from the connection")
 		}
 
-		async fn post(&self, _url: &str, _content_type: &str, body: Vec<u8>) -> Result<Vec<u8>> {
+		async fn exchange(&mut self, body: Vec<u8>) -> Result<Vec<u8>> {
 			*self.posted.borrow_mut() = Some(body);
 			let mut report = Vec::new();
 			write_pkt(&mut report, b"unpack ok\n").unwrap();
 			write_flush(&mut report);
 			Ok(report)
+		}
+
+		async fn finish(&mut self) -> Result<()> {
+			Ok(())
 		}
 	}
 
@@ -1379,17 +1389,14 @@ mod tests {
 		.await
 		.unwrap();
 
-		let origin = Origin::parse("http://host/acme/app").unwrap();
 		let signer = TestSigner::new(7);
 		let public_line = signer.public_line();
-		let transport = CapturingTransport {
-			posted: RefCell::new(None),
-		};
+		let mut conn = CapturingConnection::new();
 
 		let outcome = push_signed(
-			&transport,
+			&mut conn,
 			wt.repository(),
-			&origin,
+			PUSHEE,
 			&advertisement,
 			false,
 			false,
@@ -1402,11 +1409,11 @@ mod tests {
 		.unwrap();
 		assert!(outcome.signed && outcome.results.len() == 1 && !outcome.results[0].deleted);
 
-		// The posted request is a push certificate binding this create to the server's nonce.
-		let request = transport.posted.into_inner().expect("a request was POSTed");
+		// The exchanged request is a push certificate binding this create to the server's nonce.
+		let request = conn.posted.into_inner().expect("a request was exchanged");
 		let cert = peek_push_cert(&request).expect("a signed push-cert request");
 		assert_eq!(cert.nonce, nonce);
-		assert_eq!(cert.pushee, origin.url);
+		assert_eq!(cert.pushee, PUSHEE);
 		assert_eq!(cert.commands.len(), 1);
 		assert_eq!(cert.commands[0].refname, "refs/heads/main");
 		assert_eq!(cert.commands[0].new, tip.to_hex());
@@ -1451,17 +1458,14 @@ mod tests {
 
 		// The client repo is irrelevant to a delete (no objects are sent); any repo satisfies the type.
 		let (_dir, wt) = fixture().await;
-		let origin = Origin::parse("http://host/acme/app").unwrap();
 		let signer = TestSigner::new(7);
 		let public_line = signer.public_line();
-		let transport = CapturingTransport {
-			posted: RefCell::new(None),
-		};
+		let mut conn = CapturingConnection::new();
 
 		let outcome = push_signed(
-			&transport,
+			&mut conn,
 			wt.repository(),
-			&origin,
+			PUSHEE,
 			&advertisement,
 			false,
 			false,
@@ -1476,8 +1480,8 @@ mod tests {
 		assert!(outcome.results[0].deleted);
 		assert_eq!(outcome.results[0].refname, "refs/heads/main");
 
-		// The posted request is a push certificate whose command deletes the ref (new = zero, old = tip).
-		let request = transport.posted.into_inner().expect("a request was POSTed");
+		// The exchanged request is a push certificate whose command deletes the ref (new = zero, old = tip).
+		let request = conn.posted.into_inner().expect("a request was exchanged");
 		let cert = peek_push_cert(&request).expect("a signed push-cert request");
 		assert_eq!(cert.nonce, nonce);
 		assert_eq!(cert.commands.len(), 1);
@@ -1521,14 +1525,11 @@ mod tests {
 		.await
 		.unwrap();
 
-		let origin = Origin::parse("http://host/acme/app").unwrap();
-		let transport = CapturingTransport {
-			posted: RefCell::new(None),
-		};
+		let mut conn = CapturingConnection::new();
 		let result = push_signed(
-			&transport,
+			&mut conn,
 			wt.repository(),
-			&origin,
+			PUSHEE,
 			&advertisement,
 			false,
 			false,
@@ -1545,10 +1546,7 @@ mod tests {
 			err.to_string().contains("does not accept signed pushes"),
 			"{err}"
 		);
-		assert!(
-			transport.posted.into_inner().is_none(),
-			"nothing was POSTed"
-		);
+		assert!(conn.posted.into_inner().is_none(), "nothing was exchanged");
 	}
 
 	#[tokio::test]
@@ -1586,14 +1584,10 @@ mod tests {
 		.await
 		.unwrap();
 
-		let origin = Origin::parse("http://host/acme/app").unwrap();
-		let transport = CapturingTransport {
-			posted: RefCell::new(None),
-		};
+		let mut conn = CapturingConnection::new();
 		let result = push(
-			&transport,
+			&mut conn,
 			wt.repository(),
-			&origin,
 			&advertisement,
 			false,
 			false,
@@ -1608,9 +1602,6 @@ mod tests {
 			panic!("two refspecs to one destination must be rejected");
 		};
 		assert!(err.to_string().contains("more than one refspec"), "{err}");
-		assert!(
-			transport.posted.into_inner().is_none(),
-			"nothing was POSTed"
-		);
+		assert!(conn.posted.into_inner().is_none(), "nothing was exchanged");
 	}
 }

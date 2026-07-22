@@ -85,7 +85,9 @@ async fn sync(cwd: &Path, expect: Option<String>) -> Result<()> {
 	// (`trust sync` both fetches and pushes the trust ref over this one origin; it uses fetch-direction
 	// `insteadOf` rather than `pushInsteadOf`, which would only differ under a push-specific rewrite.)
 	let config = git_config::effective_config_at(&found.git_dir, &found.common_dir).await?;
-	let origin = url_rewrite::fetch_origin(&config, "origin")?;
+	// `trust sync` transacts over Smart HTTP only (the trust-ref fetch+push composite is HTTP-bound); an
+	// SSH origin is rejected here (`Origin::parse`) rather than silently mis-handled.
+	let origin = Origin::parse(&url_rewrite::resolve_fetch_url(&config, "origin")?)?;
 	// A relative askpass resolves against the worktree root, as git runs it from there (bare: git dir).
 	let askpass_cwd = found
 		.worktree_root
