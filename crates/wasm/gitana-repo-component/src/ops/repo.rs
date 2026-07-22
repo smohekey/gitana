@@ -93,8 +93,9 @@ pub(crate) async fn read_config<H: HashAlgorithm>(
 ///
 /// Config is read **once at open** (like a git process reading its config at startup), a snapshot — a
 /// handle does not observe a `config`/HEAD change made after it opened; reopen to pick one up. The
-/// component's only config layer is the local file (no global/system/`-c`), and its FileStore capability
-/// is path-less, so — matching git as far as the capability allows — `onbranch:` (via HEAD) and
+/// component's config layers are the common `config` and, under `extensions.worktreeConfig`, the
+/// per-worktree `config.worktree` above it (no global/system/`-c`), and its FileStore capability is
+/// path-less, so — matching git as far as the capability allows — `onbranch:` (via HEAD) and
 /// `hasconfig:remote.*.url:` (via a local remote-URL pre-scan) apply, as do relative includes resolved
 /// under the git dir, while `gitdir:` conditions never match (no gitdir path in a descriptor) and an
 /// include outside the capability is handled by
@@ -110,55 +111,109 @@ pub(crate) async fn install_effective_config<H: HashAlgorithm>(
 	Ok(())
 }
 
-/// Read and include-expand the local `config`, returning the effective [`GitConfig`], or `None` when the
-/// file is absent. See [`install_effective_config`] for the capability semantics.
+/// Read and include-expand the repository config, returning the effective [`GitConfig`], or `None` when
+/// even the common `config` is absent. See [`install_effective_config`] for the capability semantics.
+///
+/// git's `config` lives in the *common* dir; when `extensions.worktreeConfig` is enabled (read from the
+/// **unexpanded** common config, git's rule), `<git-dir>/config.worktree` is layered **above** it —
+/// `local < config.worktree`. Each layer's relative `[include]` targets resolve against its own store
+/// (common vs per-worktree), routing an include named like a per-worktree file (`config.worktree`,
+/// `HEAD`, …) to the right directory rather than through the per-path routing. The whole-config
+/// `hasconfig` pre-scan spans both layers.
 async fn expand_local_config(store: &WorktreeFileStore) -> Result<Option<GitConfig>, RepoError> {
-	// git's `config` and its relative `[include]` targets live in the *common* dir, so read them from the
-	// common store directly — routing an include named like a per-worktree file (`config.worktree`, …)
-	// through the store would send it to the wrong directory. HEAD (for `onbranch:`) stays per-worktree.
 	let common = store.common();
-	let text = match common.read_path("config").await {
-		Ok(bytes) => {
-			String::from_utf8(bytes).map_err(|_| RepoError::Invalid("config is not UTF-8".to_owned()))?
-		}
-		Err(FileStoreError::NotFound) => return Ok(None),
-		Err(error) => return Err(repo_error(RepositoryError::FileStore(error))),
+	let Some(common_source) = parse_config(common, "config").await? else {
+		return Ok(None);
 	};
-	let mut source = GitConfigSource::parse(&text).map_err(config_error)?;
+
+	// `extensions.worktreeConfig` is a repository-format extension git honours only from the repo-local
+	// config, read directly (before includes). A bad boolean aborts, as git does.
+	let worktree_config = common_source
+		.get_bool_validated("extensions", None, "worktreeconfig")
+		.map_err(config_error)?
+		.unwrap_or(false);
+	let worktree_source = if worktree_config {
+		parse_config(store.worktree(), "config.worktree").await?
+	} else {
+		None
+	};
+
+	// Ordered lowest → highest precedence, each paired with the store its includes resolve against.
+	let mut layers: Vec<(GitConfigSource, &LocalFileStore)> = vec![(common_source, common)];
+	if let Some(worktree_source) = worktree_source {
+		layers.push((worktree_source, store.worktree()));
+	}
+
 	let branch = head_branch(store).await;
-	let resolver = FileStoreIncludeResolver::new(common);
-	// The config file is the store root, so its directory is empty: a relative include resolves to a
+	// Each config file is its store root, so its directory is empty: a relative include resolves to a
 	// plain store-relative path. The lexical and real dirs coincide (no symlinks in the store).
 	let dir = Path::new("");
-	// git's whole-config remote-URL pre-scan precedes expansion (it supplies `hasconfig` URLs and fires
-	// the paradox guard); here it runs over the single local layer.
-	let prescan_ctx = IncludeContext {
-		home: None,
-		gitdir: None,
-		gitdir_absolute: None,
-		branch: branch.as_deref(),
-		remote_urls: None,
-	};
-	let scan = source
-		.scan_remote_urls(dir, dir, &prescan_ctx, &resolver)
-		.await
-		.map_err(config_error)?;
-	if scan.has_hasconfig && scan.forbidden_url {
+
+	// git's whole-config remote-URL pre-scan spans every layer (supplying `hasconfig` URLs and firing the
+	// paradox guard) before any expansion.
+	let prescan_ctx = include_context(branch.as_deref(), None);
+	let mut urls: Vec<String> = Vec::new();
+	let mut has_hasconfig = false;
+	let mut forbidden_url = false;
+	for (source, layer_store) in &layers {
+		let resolver = FileStoreIncludeResolver::new(*layer_store);
+		let scan = source
+			.scan_remote_urls(dir, dir, &prescan_ctx, &resolver)
+			.await
+			.map_err(config_error)?;
+		urls.extend(scan.urls);
+		has_hasconfig |= scan.has_hasconfig;
+		forbidden_url |= scan.forbidden_url;
+	}
+	if has_hasconfig && forbidden_url {
 		return Err(config_error(ConfigError::HasconfigIncludeSetsRemoteUrl));
 	}
-	let urls: Vec<&str> = scan.urls.iter().map(String::as_str).collect();
-	let ctx = IncludeContext {
+
+	let url_refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+	let ctx = include_context(branch.as_deref(), Some(url_refs.as_slice()));
+	for (source, layer_store) in &mut layers {
+		let resolver = FileStoreIncludeResolver::new(*layer_store);
+		source
+			.expand_includes(dir, dir, &ctx, &resolver)
+			.await
+			.map_err(config_error)?;
+	}
+
+	Ok(Some(GitConfig::from_sources(
+		layers.into_iter().map(|(source, _)| source).collect(),
+	)))
+}
+
+/// Read and parse a config file through `store`, or `None` when it is absent (git skips an absent
+/// layer). A present-but-unreadable/unparseable file aborts, as git aborts on a bad config.
+async fn parse_config(
+	store: &LocalFileStore,
+	path: &str,
+) -> Result<Option<GitConfigSource>, RepoError> {
+	match store.read_path(path).await {
+		Ok(bytes) => {
+			let text =
+				String::from_utf8(bytes).map_err(|_| RepoError::Invalid(format!("{path} is not UTF-8")))?;
+			Ok(Some(GitConfigSource::parse(&text).map_err(config_error)?))
+		}
+		Err(FileStoreError::NotFound) => Ok(None),
+		Err(error) => Err(repo_error(RepositoryError::FileStore(error))),
+	}
+}
+
+/// The include context the component drives expansion with: `onbranch:` from HEAD; no `$HOME`, gitdir
+/// path, or `$PWD` (so `gitdir:` never matches and there is no `gitdir_absolute` candidate).
+fn include_context<'a>(
+	branch: Option<&'a str>,
+	remote_urls: Option<&'a [&'a str]>,
+) -> IncludeContext<'a> {
+	IncludeContext {
 		home: None,
 		gitdir: None,
 		gitdir_absolute: None,
-		branch: branch.as_deref(),
-		remote_urls: Some(urls.as_slice()),
-	};
-	source
-		.expand_includes(dir, dir, &ctx, &resolver)
-		.await
-		.map_err(config_error)?;
-	Ok(Some(GitConfig::from_sources(vec![source])))
+		branch,
+		remote_urls,
+	}
 }
 
 /// The short branch name of a symbolic `HEAD` (`ref: refs/heads/<name>`) for `onbranch:` matching, read

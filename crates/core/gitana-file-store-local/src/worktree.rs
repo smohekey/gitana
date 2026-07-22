@@ -69,6 +69,14 @@ impl WorktreeFileStore {
 		self.common.as_ref()
 	}
 
+	/// The **per-worktree** store — where this checkout's private files live (`HEAD`, `index`,
+	/// `config.worktree`, …); for an ordinary repository it is the same store as [`common`](Self::common).
+	/// git resolves `config.worktree`'s relative `[include]` targets against this directory, so a consumer
+	/// reading that layer must read them here.
+	pub fn worktree(&self) -> &LocalFileStore {
+		self.worktree.as_ref()
+	}
+
 	/// The underlying store that owns `path`: the per-worktree store for git's per-worktree files,
 	/// the common store otherwise.
 	fn store(&self, path: &str) -> &LocalFileStore {

@@ -11,7 +11,9 @@
 //! set only via an include makes `repack` fail, where a raw read — which sees the `[include]` directive,
 //! not the included value — would not); `onbranch:` is evaluated from HEAD; `hasconfig:` reads the
 //! included file (its paradox fires); a cycle aborts open; git's filesystem `..` (missing-prefix skip,
-//! in-root resolve) and directory-target semantics; and the common-dir resolution for a linked worktree.
+//! in-root resolve) and directory-target semantics; the common-dir resolution for a linked worktree; and
+//! the `config.worktree` layer under `extensions.worktreeConfig` (gating, precedence, and its includes
+//! resolving in the per-worktree dir).
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -277,6 +279,121 @@ async fn benign_relative_include_opens_cleanly() -> Result<()> {
 	assert!(
 		repack(&mut session).await?.is_ok(),
 		"a benign relative include should open and operate normally"
+	);
+	Ok(())
+}
+
+#[tokio::test]
+async fn worktree_config_layer_is_applied_only_when_enabled() -> Result<()> {
+	// With `extensions.worktreeConfig = true`, git layers `config.worktree` above the common config, so a
+	// malformed `pack.packSizeLimit` there makes repack fail. Without the extension, `config.worktree` is
+	// ignored — repack succeeds.
+	let enabled = build_fixture::<Sha256>().await?;
+	std::fs::write(
+		enabled.dir.path().join("config.worktree"),
+		"[pack]\n\tpackSizeLimit = notanumber\n",
+	)?;
+	append_config(
+		enabled.dir.path(),
+		"[extensions]\n\tworktreeConfig = true\n",
+	);
+	let mut session = Session::open(enabled.dir.path()).await?;
+	assert!(
+		repack(&mut session).await?.is_err(),
+		"config.worktree should be layered when extensions.worktreeConfig is enabled"
+	);
+
+	// Same config.worktree, but the extension is absent → the layer is not read.
+	let disabled = build_fixture::<Sha256>().await?;
+	std::fs::write(
+		disabled.dir.path().join("config.worktree"),
+		"[pack]\n\tpackSizeLimit = notanumber\n",
+	)?;
+	let mut session = Session::open(disabled.dir.path()).await?;
+	assert!(
+		repack(&mut session).await?.is_ok(),
+		"config.worktree must be ignored without extensions.worktreeConfig"
+	);
+	Ok(())
+}
+
+#[tokio::test]
+async fn worktree_config_overrides_common_config() -> Result<()> {
+	// Precedence is `common config < config.worktree`: the common config sets a valid limit, the worktree
+	// layer overrides it with a malformed one, so repack fails — the worktree layer won.
+	let fixture = build_fixture::<Sha256>().await?;
+	append_config(
+		fixture.dir.path(),
+		"[extensions]\n\tworktreeConfig = true\n[pack]\n\tpackSizeLimit = 2097152\n",
+	);
+	std::fs::write(
+		fixture.dir.path().join("config.worktree"),
+		"[pack]\n\tpackSizeLimit = notanumber\n",
+	)?;
+	let mut session = Session::open(fixture.dir.path()).await?;
+	assert!(
+		repack(&mut session).await?.is_err(),
+		"config.worktree should override the common config"
+	);
+	Ok(())
+}
+
+#[tokio::test]
+async fn worktree_config_includes_resolve_in_the_per_worktree_dir() -> Result<()> {
+	// For a linked worktree, `config.worktree` lives in the per-worktree git dir, and its relative
+	// includes resolve there — not the common dir. The extension is set in the common config; the worktree
+	// layer includes a file present only in the per-worktree dir that sets a malformed limit → repack fails.
+	let common = build_fixture::<Sha256>().await?;
+	append_config(common.dir.path(), "[extensions]\n\tworktreeConfig = true\n");
+
+	let worktree = tempfile::tempdir()?;
+	std::fs::write(worktree.path().join("HEAD"), "ref: refs/heads/feature\n")?;
+	std::fs::write(
+		worktree.path().join("config.worktree"),
+		"[include]\n\tpath = wt-inc.cfg\n",
+	)?;
+	std::fs::write(
+		worktree.path().join("wt-inc.cfg"),
+		"[pack]\n\tpackSizeLimit = notanumber\n",
+	)?;
+	// A same-named file in the COMMON dir must NOT be the one resolved.
+	std::fs::write(
+		common.dir.path().join("wt-inc.cfg"),
+		"[pack]\n\tpackSizeLimit = 2097152\n",
+	)?;
+	let work = tempfile::tempdir()?;
+	let mut session = Session::open_worktree(worktree.path(), common.dir.path(), work.path()).await?;
+	assert!(
+		repack(&mut session).await?.is_err(),
+		"config.worktree's include should resolve against the per-worktree dir"
+	);
+	Ok(())
+}
+
+#[tokio::test]
+async fn malformed_worktree_config_extension_aborts_open() -> Result<()> {
+	// A non-boolean `extensions.worktreeConfig` is a bad config value; git aborts, so open fails.
+	let dir = minimal_repo().await?;
+	append_config(dir.path(), "[extensions]\n\tworktreeConfig = notabool\n");
+	assert!(
+		Session::open(dir.path()).await.is_err(),
+		"a malformed extensions.worktreeConfig should abort open"
+	);
+	Ok(())
+}
+
+#[tokio::test]
+async fn shadowed_malformed_worktree_config_extension_aborts_open() -> Result<()> {
+	// git validates `extensions.worktreeConfig` eagerly: a malformed value aborts even when a later, valid
+	// occurrence shadows it. The component validates every occurrence too, so open still fails.
+	let dir = minimal_repo().await?;
+	append_config(
+		dir.path(),
+		"[extensions]\n\tworktreeConfig = notabool\n\tworktreeConfig = true\n",
+	);
+	assert!(
+		Session::open(dir.path()).await.is_err(),
+		"a shadowed-malformed extensions.worktreeConfig should still abort open"
 	);
 	Ok(())
 }

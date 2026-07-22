@@ -104,10 +104,11 @@ pub async fn effective_config_for_worktree(common: &Path, git_dir: &Path) -> Res
 	let local = local_layer(common).await?;
 	// `extensions.worktreeConfig` is a repository-format extension: git honours it **only** from the
 	// repository-local config, ignoring any global/system setting, and reads it from the file directly
-	// (before includes). A bad boolean aborts, as git does.
+	// (before includes). git validates it eagerly — a malformed value aborts even when a later occurrence
+	// shadows it — so every occurrence is validated, not just the last.
 	let worktree_config = local
 		.source
-		.get_bool("extensions", None, "worktreeconfig")?
+		.get_bool_validated("extensions", None, "worktreeconfig")?
 		.unwrap_or(false);
 	let mut base = global_and_system_layers().await?;
 	base.push(local);

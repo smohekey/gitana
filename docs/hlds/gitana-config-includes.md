@@ -159,19 +159,23 @@ Consumers and where the driver lives:
    is skipped, `sub/../x` with `sub` present is read); a **directory** target aborts (git fatals `Is a
    directory`) while any other read failure skips. (Residual: git resolves a *symlinked* prefix through the
    link, which the path-less store cannot — no `realpath` — so a `..` after a symlink is the one divergence;
-   realistic include paths do not use it.) Config and its relative includes are read from the **common** store
-   (`WorktreeFileStore::common()`, added this slice) — git resolves them against the common dir, so routing an
-   include named like a per-worktree file (`config.worktree`, `HEAD`, …) through the per-path routing would
-   send it to the wrong directory; only HEAD (for `onbranch:`) is read per-worktree.
+   realistic include paths do not use it.) The common `config` and its relative includes are read from the
+   **common** store (`WorktreeFileStore::common()`) — git resolves them against the common dir, so routing an
+   include named like a per-worktree file through the per-path routing would send it to the wrong directory.
+   Under `extensions.worktreeConfig` (read from the *unexpanded* common config, git's rule), the per-worktree
+   `<git-dir>/config.worktree` is layered **above** it (`local < config.worktree`), read from the per-worktree
+   store (`WorktreeFileStore::worktree()`) so *its* relative includes resolve there; HEAD (for `onbranch:`) is
+   likewise per-worktree. The whole-config `hasconfig` pre-scan spans both layers.
 
-   Config is expanded **once at open** — pre-scan (`scan_remote_urls`) *before* `expand_includes`, as gta-core
-   does — and installed via `set_effective_config`, so **every** consumer honours includes: `pack.packSizeLimit`
-   (`repack`), `remote.origin.fetch`/`tagOpt` (`fetch`, via `gitana_porcelain`), and `core.logAllRefUpdates`
-   (ref writes) all read the installed effective config. `read-config` stays the **raw** file (git's plumbing
-   contract, host-parsed). `init` installs too (it is idempotent and may reopen a repo that already has
-   includes). A structurally bad include (cycle/paradox/directory/`~`-no-home) aborts the *open*; a bad *value*
-   surfaces at its consumer (a malformed `pack.packSizeLimit` fails `repack`). `onbranch:` resolves from HEAD;
-   `hasconfig:remote.*.url:` from the local pre-scan.
+   Config is expanded **once at open** — pre-scan (`scan_remote_urls`) *before* `expand_includes`, per layer, as
+   gta-core does — and installed via `set_effective_config`, so **every** consumer honours includes:
+   `pack.packSizeLimit` (`repack`), `remote.origin.fetch`/`tagOpt` (`fetch`, via `gitana_porcelain`), and
+   `core.logAllRefUpdates` (ref writes) all read the installed effective config. `read-config` stays the **raw**
+   file (git's plumbing contract, host-parsed). `init` installs too (it is idempotent and may reopen a repo that
+   already has includes). A structurally bad include (cycle/paradox/directory/`~`-no-home) or a malformed
+   `extensions.worktreeConfig` aborts the *open*; a bad *value* surfaces at its consumer (a malformed
+   `pack.packSizeLimit` fails `repack`). `onbranch:` resolves from HEAD; `hasconfig:remote.*.url:` from the
+   whole-config pre-scan.
 
    Inherent capability limits (documented divergences): **`gitdir:` conditions never match** (no gitdir path in
    a descriptor); there is no global/system/`-c` layer or `$PWD` (so no `gitdir_absolute` candidate); a
@@ -183,11 +187,11 @@ Consumers and where the driver lives:
    `ENOTDIR` that git *does* skip — the store hides the distinction; (c) a **trailing-`/`/`.`** terminal
    (`x/`, `.`) is normalised rather than carrying git's must-be-a-directory requirement; (d) a **symref chain**
    `HEAD → a → b` matches on the first target for `onbranch:`, not the chain's end. These are exotic and bounded
-   by the capability model; each is a deliberate limit, not silent breakage. Separately, the component does not
-   layer `<git-dir>/config.worktree` under `extensions.worktreeConfig` — a **pre-existing** gap (it never had a
-   worktree-config layer, before or after this slice), so its includes are out of scope here; adding the
-   worktree layer is a distinct feature, not an include-expansion fix. An empty/`.`/`sub/..` include value —
-   which resolves to the config directory — **does** abort as a directory target, matching git.
+   by the capability model; each is a deliberate limit, not silent breakage. An empty/`.`/`sub/..` include value
+   — which resolves to the config directory — **does** abort as a directory target, matching git.
+
+   (Follow-up, landed after the four slices: the component now layers `<git-dir>/config.worktree` under
+   `extensions.worktreeConfig`, closing the gap slice 4 documented as out of scope — see the paragraph above.)
 
    9 host e2e tests (included `packSizeLimit` reaching `repack`; `onbranch` via HEAD; cycle/paradox/directory
    aborting open; `..` through a missing prefix skipped and an in-root `..` resolved; linked-worktree includes

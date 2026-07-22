@@ -622,6 +622,23 @@ impl GitConfigSource {
 		}
 	}
 
+	/// Like [`get_bool`](Self::get_bool), but validates **every** occurrence, keeping the last as the
+	/// effective value — the single-source counterpart to [`GitConfig::get_bool_validated`](crate::GitConfig::get_bool_validated).
+	/// git validates a repository-format extension boolean (`extensions.worktreeConfig`) eagerly and aborts
+	/// on *any* malformed value, even one a later occurrence shadows; use this for such a boolean.
+	pub fn get_bool_validated(
+		&self,
+		section: &str,
+		subsection: Option<&str>,
+		name: &str,
+	) -> Result<Option<bool>, ConfigError> {
+		let mut effective = None;
+		for raw in self.get_all_raw(section, subsection, name) {
+			effective = Some(interpret_bool(raw)?);
+		}
+		Ok(effective)
+	}
+
 	/// Interpret the last value as a git integer (optional `k`/`m`/`g` 1024-multiplier). A bare
 	/// (valueless) variable is present, not absent, so it interprets as `""` — a parse error,
 	/// as git reports — rather than `None`.
@@ -1181,6 +1198,38 @@ mod tests {
 		assert!(!interpret_bool(Some("off")).unwrap());
 		assert!(!interpret_bool(Some("")).unwrap());
 		assert!(interpret_bool(Some("maybe")).is_err());
+	}
+
+	#[test]
+	fn get_bool_validated_checks_every_occurrence() {
+		// `get_bool` reads only the last value; `get_bool_validated` errors on a malformed *earlier*
+		// occurrence even when a later valid one shadows it, matching git's eager extension validation.
+		let config = GitConfigSource::parse(
+			"[extensions]\n\tworktreeConfig = notabool\n\tworktreeConfig = true\n",
+		)
+		.unwrap();
+		assert_eq!(
+			config
+				.get_bool("extensions", None, "worktreeconfig")
+				.unwrap(),
+			Some(true),
+			"get_bool takes the last (valid) value"
+		);
+		assert!(
+			config
+				.get_bool_validated("extensions", None, "worktreeconfig")
+				.is_err(),
+			"get_bool_validated rejects a shadowed-malformed value"
+		);
+		// All-valid: validated read returns the last effective value.
+		let ok =
+			GitConfigSource::parse("[extensions]\n\tworktreeConfig = false\n\tworktreeConfig = on\n")
+				.unwrap();
+		assert_eq!(
+			ok.get_bool_validated("extensions", None, "worktreeconfig")
+				.unwrap(),
+			Some(true)
+		);
 	}
 
 	#[test]
