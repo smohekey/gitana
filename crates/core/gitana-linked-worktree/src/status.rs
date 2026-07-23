@@ -91,6 +91,40 @@ impl WorktreeStatusReport {
 	}
 }
 
+/// A read-only readout of the local-only state a checkout holds — the state that removing the checkout
+/// would discard.
+///
+/// Like [`status`](fn@self::status) it is computed for a live worktree of a repository, but it combines
+/// the three-way working-tree status with two repository-state reads — a stash entry, and an in-progress
+/// rebase/merge/cherry-pick/revert — so a caller deciding whether a whole checkout is safe to remove
+/// reads one value rather than reconstructing these from the store internals. It is a *local* judgement:
+/// whether the checkout's commits are pushed to a remote is deliberately not its concern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutSafety {
+	/// The destination this readout was computed for.
+	pub destination: PathBuf,
+	/// Any tracked path has a staged, unstaged, conflicted, or missing change.
+	pub has_tracked_changes: bool,
+	/// Any untracked (non-ignored) path is present in the working tree.
+	pub has_untracked: bool,
+	/// A `refs/stash` entry exists in the repository.
+	pub has_stash: bool,
+	/// A rebase, merge, cherry-pick, or revert is in progress in this worktree.
+	pub operation_in_progress: bool,
+}
+
+impl CheckoutSafety {
+	/// Whether removing the checkout would discard no local-only state: a clean working tree (no tracked
+	/// change and no untracked path), no stash entry, and no operation in progress. This does not consider
+	/// whether commits are pushed — a caller wanting that must check the remote separately.
+	pub fn holds_no_local_only_state(&self) -> bool {
+		!self.has_tracked_changes
+			&& !self.has_untracked
+			&& !self.has_stash
+			&& !self.operation_in_progress
+	}
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
 	use super::*;
@@ -118,14 +152,26 @@ mod native {
 		repo: &RepositoryId,
 		destination: &Path,
 	) -> Result<WorktreeStatusReport, LinkedWorktreeError> {
+		let git_dir = resolve_live_worktree_git_dir(repo, destination)?;
+		status_at(&git_dir, repo.common_dir(), destination).await
+	}
+
+	/// Resolve the per-worktree git dir for `destination`, requiring it to be a live worktree of `repo`
+	/// (its main worktree or a registered linked worktree). Shared by [`status`] and
+	/// [`checkout_safety`], which attribute a readout to a worktree identically; a destination that is a
+	/// symlink or not a live worktree is a hard error, never a silently-clean readout.
+	pub(crate) fn resolve_live_worktree_git_dir(
+		repo: &RepositoryId,
+		destination: &Path,
+	) -> Result<PathBuf, LinkedWorktreeError> {
 		if !destination.is_absolute() {
 			return Err(LinkedWorktreeError::RelativePath(destination.to_path_buf()));
 		}
-		// A destination that is itself a symlink is never a worktree we status — following the alias to open
+		// A destination that is itself a symlink is never a worktree we read — following the alias to open
 		// its target's `.git`/index would violate the no-follow boundary. It is a hard error, not a report.
 		if is_leaf_symlink(destination) {
 			return Err(LinkedWorktreeError::io(
-				"status: destination is a symlink, not a worktree",
+				"worktree readout: destination is a symlink, not a worktree",
 				destination,
 				std::io::Error::from(std::io::ErrorKind::InvalidInput),
 			));
@@ -133,9 +179,9 @@ mod native {
 		let common = repo.common_dir();
 		// A registered linked worktree — accepted only when its checkout is *live* (the checkout's `.git`
 		// gitfile names the admin). A stale registration whose path was reused is not a worktree we can
-		// status; it falls through to the hard error rather than opening an unrelated directory with the
+		// read; it falls through to the hard error rather than opening an unrelated directory with the
 		// stale admin index.
-		// A single live registration is a linked worktree we can status. Zero, a duplicate (corruption), or
+		// A single live registration is a linked worktree we can read. Zero, a duplicate (corruption), or
 		// a stale registration (its checkout gone/reused) all fall through to the hard error below.
 		let registered = match admin_dirs_for(common, destination)?.as_slice() {
 			[admin] if checkout_gitfile_names(destination, admin)? => Some(admin.clone()),
@@ -152,19 +198,75 @@ mod native {
 			&& !canonical_eq(destination, common)
 			&& main_checkout_identifies_common(destination, common)?;
 		// The per-worktree git dir holding this destination's index/HEAD.
-		let git_dir = if let Some(admin) = registered {
-			admin
+		if let Some(admin) = registered {
+			Ok(admin)
 		} else if is_main {
-			common.to_path_buf()
+			Ok(common.to_path_buf())
 		} else {
-			return Err(LinkedWorktreeError::io(
-				"status: not a worktree of this repository",
+			Err(LinkedWorktreeError::io(
+				"worktree readout: not a worktree of this repository",
 				destination,
 				std::io::Error::from(std::io::ErrorKind::NotFound),
-			));
-		};
+			))
+		}
+	}
 
-		status_at(&git_dir, common, destination).await
+	/// Read the local-only state the checkout at `destination` holds — working-tree dirtiness, a stash
+	/// entry, and any in-progress rebase/merge/cherry-pick/revert — in one readout. The destination must
+	/// be a live worktree of `repo` (its main worktree or a registered linked worktree); otherwise this
+	/// is a hard error, never a silently-clean readout. See [`CheckoutSafety`].
+	pub async fn checkout_safety(
+		repo: &RepositoryId,
+		destination: &Path,
+	) -> Result<CheckoutSafety, LinkedWorktreeError> {
+		let git_dir = resolve_live_worktree_git_dir(repo, destination)?;
+		safety_at(&git_dir, repo.common_dir(), destination).await
+	}
+
+	/// Open the checkout at `destination` against its per-worktree `git_dir` and the shared `common`, and
+	/// read its working-tree status plus the repository-state signals. The caller has already established
+	/// that `destination` is a live worktree; this only opens the stores and reads. The repository-state
+	/// reads happen before the working tree is moved into the [`WorkTree`].
+	pub(crate) async fn safety_at(
+		git_dir: &Path,
+		common: &Path,
+		destination: &Path,
+	) -> Result<CheckoutSafety, LinkedWorktreeError> {
+		let store = open_store_raw(git_dir, common)?;
+		let work = open_work_dir(destination)?;
+		let (status, has_stash, operation_in_progress) = match detect_kind(&store).await? {
+			HashKind::Sha1 => {
+				let repo = Repository::<_, Sha1>::new(ObjectStore::new(store));
+				let has_stash = repo.refs().resolve("refs/stash").await?.is_some();
+				let operation_in_progress = repo.rebase_in_progress().await?
+					|| repo.merge_head().await?.is_some()
+					|| repo.cherry_pick_head().await?.is_some()
+					|| repo.revert_head().await?.is_some();
+				let status = WorkTree::new(repo, work, git_dir.to_path_buf())
+					.status()
+					.await?;
+				(status, has_stash, operation_in_progress)
+			}
+			HashKind::Sha256 => {
+				let repo = Repository::<_, Sha256>::new(ObjectStore::new(store));
+				let has_stash = repo.refs().resolve("refs/stash").await?.is_some();
+				let operation_in_progress = repo.rebase_in_progress().await?
+					|| repo.merge_head().await?.is_some()
+					|| repo.cherry_pick_head().await?.is_some()
+					|| repo.revert_head().await?.is_some();
+				let status = WorkTree::new(repo, work, git_dir.to_path_buf())
+					.status()
+					.await?;
+				(status, has_stash, operation_in_progress)
+			}
+		};
+		Ok(CheckoutSafety {
+			destination: destination.to_path_buf(),
+			has_tracked_changes: !status.changed.is_empty(),
+			has_untracked: !status.untracked.is_empty(),
+			has_stash,
+			operation_in_progress,
+		})
 	}
 
 	/// Compute the working-tree status of the checkout at `destination`, opened against the per-worktree
@@ -625,7 +727,7 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::status;
+pub use native::{checkout_safety, status};
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use native::{
 	diverged_tracked_content_paths, first_unreachable_admin_anchor, is_sparse_index,
