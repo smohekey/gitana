@@ -19,8 +19,10 @@ use cap_std::fs::Dir;
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
+use gitana_porcelain::TagFetch;
 use gitana_remote::{
-	self as remote, AuthTransport, Connection, HttpConnection, RemoteUrl, ReqwestTransport,
+	self as remote, AuthTransport, Connection, HttpConnection, HttpPackFetcher, PackFetcher,
+	RemoteUrl, ReqwestTransport,
 };
 use gitana_repository::Repository;
 
@@ -123,6 +125,98 @@ pub async fn clone_url(
 			clone_into::<Sha256>(&mut connection, &git_dir, destination, deepen, &persist_url).await
 		}
 	}
+}
+
+/// Fetch the origin of the existing standalone checkout at `worktree_root`, updating its
+/// `refs/remotes/origin/*` without touching the working tree, authenticating through `credentials`.
+///
+/// The fetch is always **complete** (never shallow): a caller judges reachability from the updated
+/// remote-tracking refs, and a shallow boundary would make that judgement wrong. Local tags are left
+/// untouched (`TagFetch::None`), so they remain a faithful record of local-only work rather than being
+/// overwritten by the remote's. `worktree_root` is a standalone checkout whose git directory is
+/// `<worktree_root>/.git`. HTTP(S) only; an SSH URL is [`FetchError::UnsupportedTransport`]. Headless,
+/// like [`clone_url`]: no reflog identity, and credentials come only from `credentials`.
+pub async fn fetch_url(
+	url: &str,
+	worktree_root: &Path,
+	credentials: impl CredentialProvider,
+) -> Result<(), FetchError> {
+	let remote = RemoteUrl::parse(url).map_err(|source| FetchError::Url {
+		url: url.to_owned(),
+		source: source.into(),
+	})?;
+	let origin = match remote {
+		RemoteUrl::Http(origin) => origin,
+		RemoteUrl::Ssh(_) => return Err(FetchError::UnsupportedTransport),
+	};
+	let git_dir = worktree_root.join(".git");
+
+	// One authenticating transport, built exactly as `clone_url`'s, carries the credential through the
+	// advertisement GET and the pack POST.
+	let transport = AuthTransport::with_userinfo(
+		ReqwestTransport::new(),
+		credentials,
+		origin.url.clone(),
+		origin.username.clone(),
+		origin.password.clone(),
+	);
+	let advertisement = remote::fetch_advertisement(&transport, &origin, "git-upload-pack")
+		.await
+		.map_err(|source| FetchError::Advertisement {
+			url: origin.url.clone(),
+			source: source.into(),
+		})?;
+	let kind =
+		remote::negotiated_kind(&advertisement).map_err(|source| FetchError::Advertisement {
+			url: origin.url.clone(),
+			source: source.into(),
+		})?;
+	let mut fetcher = HttpPackFetcher::new(&transport, &origin);
+	match kind {
+		HashKind::Sha1 => fetch_into::<Sha1>(&mut fetcher, &git_dir, &advertisement).await,
+		HashKind::Sha256 => fetch_into::<Sha256>(&mut fetcher, &git_dir, &advertisement).await,
+	}
+}
+
+async fn fetch_into<H: HashAlgorithm>(
+	fetcher: &mut impl PackFetcher,
+	git_dir: &Path,
+	advertisement: &[u8],
+) -> Result<(), FetchError> {
+	let repository = open_fetch_repository::<H>(git_dir)?;
+	gitana_porcelain::fetch(
+		fetcher,
+		&repository,
+		advertisement,
+		false,              // update_head_ok: never advance the checked-out branch
+		TagFetch::None,     // leave local tags untouched
+		&Deepen::default(), // complete fetch — reachability needs the full remote history
+		&[],                // the default origin refspec targets refs/remotes/*, refusing no checkout
+		None,               // headless: no reflog identity
+	)
+	.await
+	.map_err(|source| FetchError::Fetch {
+		source: source.into(),
+	})?;
+	Ok(())
+}
+
+/// Open the existing repository at `git_dir`. A standalone checkout's common directory is its git
+/// directory, so both capabilities open the same path (as [`open_repository`] does for a fresh clone).
+fn open_fetch_repository<H: HashAlgorithm>(
+	git_dir: &Path,
+) -> Result<Repository<WorktreeFileStore, H>, FetchError> {
+	let open = |path: &Path| {
+		Dir::open_ambient_dir(path, ambient_authority()).map_err(|source| FetchError::Destination {
+			path: path.to_owned(),
+			source,
+		})
+	};
+	let common = open(git_dir)?;
+	let git = open(git_dir)?;
+	Ok(Repository::new(ObjectStore::new(WorktreeFileStore::new(
+		common, git,
+	))))
 }
 
 async fn clone_into<H: HashAlgorithm>(
@@ -247,6 +341,36 @@ pub enum CloneError {
 	},
 }
 
+/// Why a [`fetch_url`] did not complete.
+#[derive(Debug, thiserror::Error)]
+pub enum FetchError {
+	#[error("fetch URL {url:?} is not a valid remote URL")]
+	Url {
+		url: String,
+		#[source]
+		source: Box<dyn std::error::Error + Send + Sync>,
+	},
+	#[error("only HTTP(S) fetch is supported; SSH is not yet implemented")]
+	UnsupportedTransport,
+	#[error("opening the repository at {}", .path.display())]
+	Destination {
+		path: PathBuf,
+		#[source]
+		source: std::io::Error,
+	},
+	#[error("fetching the ref advertisement from {url:?}")]
+	Advertisement {
+		url: String,
+		#[source]
+		source: Box<dyn std::error::Error + Send + Sync>,
+	},
+	#[error("fetching from the remote")]
+	Fetch {
+		#[source]
+		source: Box<dyn std::error::Error + Send + Sync>,
+	},
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -296,5 +420,23 @@ mod tests {
 		.await
 		.expect_err("a non-empty destination must be refused");
 		assert!(matches!(error, CloneError::DestinationNotEmpty(_)));
+	}
+
+	#[tokio::test]
+	async fn fetch_refuses_an_ssh_url() {
+		let temp = tempfile::tempdir().unwrap();
+		let error = fetch_url("ssh://git@example.invalid/repo.git", temp.path(), Anonymous)
+			.await
+			.expect_err("SSH must be refused");
+		assert!(matches!(error, FetchError::UnsupportedTransport));
+	}
+
+	#[tokio::test]
+	async fn fetch_reports_a_malformed_url() {
+		let temp = tempfile::tempdir().unwrap();
+		let error = fetch_url("not a url", temp.path(), Anonymous)
+			.await
+			.expect_err("a malformed URL must be refused");
+		assert!(matches!(error, FetchError::Url { .. }));
 	}
 }

@@ -14,7 +14,7 @@ use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use gitana_clone::{Anonymous, CloneError, Deepen, clone_url};
+use gitana_clone::{Anonymous, CloneError, Deepen, clone_url, fetch_url};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
@@ -223,6 +223,50 @@ async fn clones_a_repository_over_http() {
 		git(&destination, &["config", "remote.origin.url"]),
 		format!("{base}/repo.git")
 	);
+}
+
+#[tokio::test]
+async fn fetches_new_commits_over_http() {
+	if !git_http_backend_available() {
+		eprintln!("skipping: git http-backend is not installed");
+		return;
+	}
+	let temp = tempfile::tempdir().unwrap();
+	let head1 = build_bare(temp.path());
+	let base = serve_git_http_backend(temp.path().to_path_buf()).await;
+
+	let destination = temp.path().join("cloned");
+	clone_url(
+		&format!("{base}/repo.git"),
+		&destination,
+		Anonymous,
+		&Deepen::default(),
+	)
+	.await
+	.expect("clone over HTTP");
+
+	// Advance the origin: a second commit on `main`, pushed into the served bare repo.
+	let work = temp.path().join("work");
+	std::fs::write(work.join("a.txt"), b"hello\nagain\n").unwrap();
+	git(&work, &["commit", "-aqm", "second"]);
+	let head2 = git(&work, &["rev-parse", "HEAD"]);
+	let bare = temp.path().join("repo.git");
+	git(&work, &["push", "-q", bare.to_str().unwrap(), "main"]);
+
+	// Fetch lands the new commit and advances the remote-tracking ref to head2.
+	fetch_url(&format!("{base}/repo.git"), &destination, Anonymous)
+		.await
+		.expect("fetch over HTTP");
+	assert_eq!(
+		git(&destination, &["rev-parse", "refs/remotes/origin/main"]),
+		head2
+	);
+	// The working tree and HEAD are untouched — a fetch updates tracking refs only.
+	assert_eq!(
+		std::fs::read_to_string(destination.join("a.txt")).unwrap(),
+		"hello\n"
+	);
+	assert_eq!(git(&destination, &["rev-parse", "HEAD"]), head1);
 }
 
 #[tokio::test]
