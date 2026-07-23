@@ -3,7 +3,7 @@
 use gitana_file_store_local::{DescriptorWorkDir, LocalFileStore, WorktreeFileStore};
 use gitana_object::{HashAlgorithm, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
-use gitana_remote::Origin;
+use gitana_remote::{Origin, RemoteUrl, SshRemote};
 use gitana_repository::{Repository, detect_hash_kind};
 use gitana_worktree::WorkTree;
 use wasip2::filesystem::types::Descriptor;
@@ -169,12 +169,23 @@ impl Inner {
 		work_dir: Descriptor,
 		url: &str,
 	) -> Result<(), RepoError> {
-		let origin = Origin::parse(url).map_err(|e| RepoError::Invalid(e.to_string()))?;
+		match ops::parse_remote_url(url)? {
+			RemoteUrl::Http(origin) => Self::clone_http(git_dir, work_dir, &origin),
+			RemoteUrl::Ssh(ssh) => Self::clone_ssh(git_dir, work_dir, &ssh, url),
+		}
+	}
+
+	/// Clone a Smart HTTP remote over the `wasi:http` capability.
+	fn clone_http(
+		git_dir: Descriptor,
+		work_dir: Descriptor,
+		origin: &Origin,
+	) -> Result<(), RepoError> {
 		// One transport for the whole clone: the credential it authenticates during negotiation (the
 		// advertisement `GET`) is cached and reused by the pack `POST` below, so a host that answers
 		// `fill` only once still authenticates both phases.
-		let transport = ops::auth_transport(&origin);
-		let (advertisement, kind) = block_on(ops::clone_negotiate(&transport, &origin))?;
+		let transport = ops::auth_transport(origin);
+		let (advertisement, kind) = block_on(ops::clone_negotiate(&transport, origin))?;
 
 		let git = LocalFileStore::from_descriptor(git_dir);
 		block_on(ops::init_layout(&git))?;
@@ -186,16 +197,39 @@ impl Inner {
 				&transport,
 				store,
 				work,
-				&origin,
+				origin,
 				&advertisement,
 			)),
 			HashKind::Sha256 => block_on(ops::clone::<Sha256>(
 				&transport,
 				store,
 				work,
-				&origin,
+				origin,
 				&advertisement,
 			)),
+		}
+	}
+
+	/// Clone an SSH remote over the host `ssh-transport` capability. Unlike HTTP, the connection is
+	/// stateful and carries its ref advertisement on connect, so opening it *is* the negotiation; the
+	/// format is read from that advertisement, then the clone runs over the same connection under the
+	/// matching `H`. `url` is the original argument, persisted as `remote.origin.url` (password redacted).
+	fn clone_ssh(
+		git_dir: Descriptor,
+		work_dir: Descriptor,
+		ssh: &SshRemote,
+		url: &str,
+	) -> Result<(), RepoError> {
+		let (connection, kind) = block_on(ops::open_ssh_clone(ssh))?;
+
+		let git = LocalFileStore::from_descriptor(git_dir);
+		block_on(ops::init_layout(&git))?;
+		let store = WorktreeFileStore::single(git);
+		let work = DescriptorWorkDir::from_descriptor(work_dir);
+
+		match kind {
+			HashKind::Sha1 => block_on(ops::clone_ssh::<Sha1>(connection, store, work, url)),
+			HashKind::Sha256 => block_on(ops::clone_ssh::<Sha256>(connection, store, work, url)),
 		}
 	}
 

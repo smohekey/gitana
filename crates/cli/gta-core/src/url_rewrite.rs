@@ -51,34 +51,6 @@ pub fn resolve_fetch_url(config: &GitConfig, remote: &str) -> Result<String> {
 /// A URL rewriter: applies git's `insteadOf`/`pushInsteadOf` rules to one remote URL.
 type UrlRewrite = fn(&GitConfig, &str) -> Result<String>;
 
-/// A credential-safe form of `url` for display, persistence, or a push certificate's pushee: the URL
-/// verbatim (scheme case, path, trailing slash preserved) with only a `:password` stripped from the
-/// userinfo — the username is kept (git keeps it; it is not a secret), the password is not. A string
-/// with no `://` (an scp-like alias, which carries no password) is returned unchanged. Used wherever a
-/// remote URL leaves the authentication path, so a plaintext credential never reaches a print, a
-/// `.git/config`, a reflog-adjacent commit message, or a signed certificate.
-pub fn redact_password(url: &str) -> String {
-	let Some((scheme, rest)) = url.split_once("://") else {
-		return url.to_owned();
-	};
-	let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-	let (authority, tail) = rest.split_at(authority_end);
-	// The userinfo is delimited by the last `@`; the username is up to the first `:` (so a password may
-	// contain either). An empty username drops the whole `userinfo@`.
-	let authority = match authority.rsplit_once('@') {
-		Some((userinfo, host)) => {
-			let user = userinfo.split_once(':').map_or(userinfo, |(user, _)| user);
-			if user.is_empty() {
-				host.to_owned()
-			} else {
-				format!("{user}@{host}")
-			}
-		}
-		None => authority.to_owned(),
-	};
-	format!("{scheme}://{authority}{tail}")
-}
-
 /// Resolve the push-direction remote URL for `remote`, matching git's push-URL selection: the
 /// `remote.<remote>.pushurl`s (with `insteadOf` rewriting) if any, else the `remote.<remote>.url`s with
 /// `pushInsteadOf` (falling back to `insteadOf`). The caller parses it (`RemoteUrl` for dispatch).
@@ -168,30 +140,6 @@ mod tests {
 
 	fn parse(text: &str) -> GitConfig {
 		GitConfig::parse(text).expect("parse config")
-	}
-
-	#[test]
-	fn redact_password_preserves_spelling() {
-		// Password dropped, username + trailing slash + scheme case preserved.
-		assert_eq!(
-			redact_password("HTTPS://alice:secret@host/repo/"),
-			"HTTPS://alice@host/repo/"
-		);
-		// A password containing `@`/`:` is still fully removed (last `@`, first `:`).
-		assert_eq!(
-			redact_password("https://alice:se@cr:et@host/r"),
-			"https://alice@host/r"
-		);
-		// No userinfo, and a userinfo-less scp-like alias, pass through unchanged (an ssh login user is
-		// kept — it is not a secret).
-		assert_eq!(redact_password("https://host/r"), "https://host/r");
-		assert_eq!(
-			redact_password("git@host:org/repo.git"),
-			"git@host:org/repo.git"
-		);
-		assert_eq!(redact_password("ssh://git@host/r"), "ssh://git@host/r");
-		// An empty username drops the whole userinfo.
-		assert_eq!(redact_password("https://:secret@host/r"), "https://host/r");
 	}
 
 	#[test]

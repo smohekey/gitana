@@ -13,7 +13,8 @@ use gitana_object::HashAlgorithm;
 use gitana_object_store::ObjectStore;
 use gitana_porcelain::Deepen;
 use gitana_remote::{
-	AuthTransport, HttpConnection, HttpPackFetcher, Origin, RECEIVE_PACK_REQUEST, UPLOAD_PACK_REQUEST,
+	AuthTransport, Connection, HttpConnection, HttpPackFetcher, Origin, PackConnection,
+	RECEIVE_PACK_REQUEST, RemoteUrl, SshPackFetcher, SshRemote, UPLOAD_PACK_REQUEST,
 };
 use gitana_repository::Repository;
 
@@ -22,6 +23,7 @@ use crate::bindings::exports::gitana::repo::porcelain::{
 	FetchOutcome, HashKind, PushOutcome as WitPushOutcome, PushSummary, RefEntry, RepoError,
 };
 use crate::wasi_http_transport::WasiHttpTransport;
+use crate::wasi_ssh_transport::WasiSshStream;
 
 /// The component's authenticating transport: the `wasi:http` client wrapped with the host credential
 /// capability. Held across a whole operation so an accepted credential is cached and re-sent on later
@@ -44,46 +46,102 @@ pub(crate) fn auth_transport(origin: &Origin) -> ComponentTransport {
 	)
 }
 
-/// Fetch from the remote at `url` into `repo`, returning the tracking-ref outcome. The advertised
-/// object-format is checked against `repo`'s before any objects are downloaded.
+/// Fetch from the remote at `url` into `repo`, returning the tracking-ref outcome. Dispatches on the
+/// URL scheme — Smart HTTP over the `wasi:http` capability, or SSH over the host `ssh-transport`
+/// capability. The advertised object-format is checked against `repo`'s before any objects download.
 pub(crate) async fn fetch<H: HashAlgorithm>(
 	repo: &Repository<WorktreeFileStore, H>,
 	url: &str,
 ) -> Result<FetchOutcome, RepoError> {
-	let origin = Origin::parse(url).map_err(|e| RepoError::Invalid(e.to_string()))?;
-	let transport = auth_transport(&origin);
+	match parse_remote_url(url)? {
+		RemoteUrl::Http(origin) => fetch_http(repo, &origin).await,
+		RemoteUrl::Ssh(ssh) => fetch_ssh(repo, &ssh).await,
+	}
+}
 
-	let advertisement = gitana_remote::fetch_advertisement(&transport, &origin, "git-upload-pack")
-		.await
-		.map_err(remote_error)?;
-	let remote = gitana_remote::negotiated_kind(&advertisement).map_err(remote_error)?;
-	if H::NAME != remote.name() {
+/// Parse a remote URL for a component operation, first rejecting a DOS-drive-prefixed path (`C:/repo`,
+/// `C:\repo`). A wasm component cannot know its host's OS, so git's platform gate — which treats
+/// `C:/repo` as a *local path* on Windows but as the scp remote `host = C` elsewhere — is unavailable
+/// here (`SshRemote`'s `has_dos_drive_prefix` is compiled for the wasm target, never Windows). Rather
+/// than dispatch such a path to the SSH provider on a Windows host, the component refuses it as
+/// unsupported, matching what the pre-SSH (HTTP-only) component did. This sacrifices the exotic
+/// single-character scp hostname, which is not worth an unintended connection from a fat-fingered path.
+pub(crate) fn parse_remote_url(url: &str) -> Result<RemoteUrl, RepoError> {
+	if looks_like_dos_drive_path(url) {
 		return Err(RepoError::Invalid(format!(
-			"remote object-format is {}, but the local repository is {}",
-			remote.name(),
-			H::NAME
+			"unsupported remote URL (looks like a local path): {}",
+			gitana_remote::anonymize_url(url)
 		)));
 	}
+	RemoteUrl::parse(url).map_err(|e| RepoError::Invalid(e.to_string()))
+}
+
+/// Whether `url` begins with a `<letter>:` DOS-drive prefix (git's `has_dos_drive_prefix`) — a local
+/// path on Windows, which a platform-agnostic wasm component cannot distinguish from an scp `host:path`.
+fn looks_like_dos_drive_path(url: &str) -> bool {
+	let bytes = url.as_bytes();
+	bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// Fetch from the Smart HTTP remote `origin` over the `wasi:http` transport (stateless-RPC negotiation).
+async fn fetch_http<H: HashAlgorithm>(
+	repo: &Repository<WorktreeFileStore, H>,
+	origin: &Origin,
+) -> Result<FetchOutcome, RepoError> {
+	let transport = auth_transport(origin);
+
+	let advertisement = gitana_remote::fetch_advertisement(&transport, origin, "git-upload-pack")
+		.await
+		.map_err(remote_error)?;
+	ensure_same_format::<H>(&advertisement)?;
 
 	// The component sees a single worktree through its capability descriptors, so it has no view of any
-	// sibling linked worktrees; the current HEAD is still guarded inside the porcelain. Fetch negotiates
-	// over the `wasi:http` transport (stateless-RPC); SSH is native-only.
-	let mut fetcher = HttpPackFetcher::new(&transport, &origin);
-	let outcome = gitana_porcelain::fetch(
-		&mut fetcher,
+	// sibling linked worktrees; the current HEAD is still guarded inside the porcelain.
+	let mut fetcher = HttpPackFetcher::new(&transport, origin);
+	let outcome = run_fetch(&mut fetcher, repo, &advertisement).await?;
+	Ok(to_fetch_outcome(outcome))
+}
+
+/// Fetch from the SSH remote `ssh`: open a stateful `git-upload-pack` session over the host capability
+/// (its ref advertisement arrives on connect), then run git's `multi_ack_detailed` negotiation over it.
+async fn fetch_ssh<H: HashAlgorithm>(
+	repo: &Repository<WorktreeFileStore, H>,
+	ssh: &SshRemote,
+) -> Result<FetchOutcome, RepoError> {
+	let connection = open_ssh_connection(ssh, "git-upload-pack").await?;
+	let advertisement = connection.advertisement().to_vec();
+	ensure_same_format::<H>(&advertisement)?;
+
+	let mut fetcher = SshPackFetcher::new(connection);
+	let outcome = run_fetch(&mut fetcher, repo, &advertisement).await?;
+	Ok(to_fetch_outcome(outcome))
+}
+
+/// Run the porcelain fetch over `fetcher` with the component's fixed policy (auto-follow tags, no
+/// shallow, no reflog — the component resolves no committer identity through its descriptors). Shared by
+/// the HTTP and SSH paths, which differ only in the `PackFetcher`.
+async fn run_fetch<H: HashAlgorithm>(
+	fetcher: &mut impl gitana_remote::PackFetcher,
+	repo: &Repository<WorktreeFileStore, H>,
+	advertisement: &[u8],
+) -> Result<gitana_porcelain::FetchOutcome<H>, RepoError> {
+	gitana_porcelain::fetch(
+		fetcher,
 		repo,
-		&advertisement,
+		advertisement,
 		false,
 		gitana_porcelain::TagFetch::Auto,
 		&gitana_porcelain::Deepen::default(),
 		&[],
-		// The component resolves no committer identity through its descriptors, so its tracking-ref
-		// updates go unlogged (a deferred follow-up, like the plumbing `update_ref` exports).
 		None,
 	)
 	.await
-	.map_err(remote_error)?;
-	Ok(FetchOutcome {
+	.map_err(remote_error)
+}
+
+/// Map the porcelain fetch outcome into the WIT record.
+fn to_fetch_outcome<H: HashAlgorithm>(outcome: gitana_porcelain::FetchOutcome<H>) -> FetchOutcome {
+	FetchOutcome {
 		updated: outcome
 			.updated
 			.into_iter()
@@ -93,38 +151,77 @@ pub(crate) async fn fetch<H: HashAlgorithm>(
 			})
 			.collect(),
 		rejected: outcome.rejected,
-	})
+	}
 }
 
 /// Push `HEAD`'s branch to the remote at `url` (or, with `delete`, remove a remote branch),
-/// returning the outcome. The advertised object-format is checked against `repo`'s first. This is an
-/// unsigned push: certificate signing shells out to `ssh-keygen`, which the component has no authority
-/// to do, so `gta push --signed` stays on the CLI.
+/// returning the outcome. Dispatches on the URL scheme — Smart HTTP or SSH. The advertised
+/// object-format is checked against `repo`'s first. This is an unsigned push: certificate signing shells
+/// out to `ssh-keygen`, which the component has no authority to do, so `gta push --signed` stays on the CLI.
 pub(crate) async fn push<H: HashAlgorithm>(
 	repo: &Repository<WorktreeFileStore, H>,
 	url: &str,
 	force: bool,
 	delete: Option<String>,
 ) -> Result<WitPushOutcome, RepoError> {
-	let origin = Origin::parse(url).map_err(|e| RepoError::Invalid(e.to_string()))?;
-	let transport = auth_transport(&origin);
+	match parse_remote_url(url)? {
+		RemoteUrl::Http(origin) => push_http(repo, &origin, force, delete).await,
+		RemoteUrl::Ssh(ssh) => push_ssh(repo, &ssh, force, delete).await,
+	}
+}
 
-	let advertisement = gitana_remote::fetch_advertisement(&transport, &origin, "git-receive-pack")
+/// Push to the Smart HTTP remote `origin`: one receive-pack exchange over the `wasi:http` transport
+/// (the advertisement is fetched separately and passed to the porcelain, so the connection carries none).
+async fn push_http<H: HashAlgorithm>(
+	repo: &Repository<WorktreeFileStore, H>,
+	origin: &Origin,
+	force: bool,
+	delete: Option<String>,
+) -> Result<WitPushOutcome, RepoError> {
+	let transport = auth_transport(origin);
+	let advertisement = gitana_remote::fetch_advertisement(&transport, origin, "git-receive-pack")
 		.await
 		.map_err(remote_error)?;
-	let remote = gitana_remote::negotiated_kind(&advertisement).map_err(remote_error)?;
-	if H::NAME != remote.name() {
-		return Err(RepoError::Invalid(format!(
-			"remote object-format is {}, but the local repository is {}",
-			remote.name(),
-			H::NAME
-		)));
-	}
+	ensure_same_format::<H>(&advertisement)?;
 
-	// The component surface pushes `HEAD`'s branch or deletes one ref — expressed as push refspecs.
-	// The push case is an explicit `HEAD` refspec (not an empty list): the porcelain default would
-	// honour `remote.origin.push`, which could push a different or multiple refs and break this WIT
-	// contract of "push HEAD's branch" (and the single-result mapping below).
+	let mut connection = HttpConnection::new(
+		&transport,
+		origin.receive_pack(),
+		RECEIVE_PACK_REQUEST,
+		Vec::new(),
+	);
+	let outcome = run_push(&mut connection, repo, &advertisement, force, delete).await?;
+	Ok(to_push_outcome(outcome))
+}
+
+/// Push to the SSH remote `ssh`: open a `git-receive-pack` session over the host capability (its ref
+/// advertisement arrives on connect) and send the update in a single exchange over that connection.
+async fn push_ssh<H: HashAlgorithm>(
+	repo: &Repository<WorktreeFileStore, H>,
+	ssh: &SshRemote,
+	force: bool,
+	delete: Option<String>,
+) -> Result<WitPushOutcome, RepoError> {
+	let mut connection = open_ssh_connection(ssh, "git-receive-pack").await?;
+	let advertisement = connection.advertisement().to_vec();
+	ensure_same_format::<H>(&advertisement)?;
+
+	let outcome = run_push(&mut connection, repo, &advertisement, force, delete).await?;
+	Ok(to_push_outcome(outcome))
+}
+
+/// Run the porcelain push of `HEAD`'s branch (or a single-ref delete) over `connection`. Shared by the
+/// HTTP and SSH paths, which differ only in the `Connection`.
+async fn run_push<H: HashAlgorithm>(
+	connection: &mut impl gitana_remote::Connection,
+	repo: &Repository<WorktreeFileStore, H>,
+	advertisement: &[u8],
+	force: bool,
+	delete: Option<String>,
+) -> Result<gitana_porcelain::PushOutcome, RepoError> {
+	// The component surface pushes `HEAD`'s branch or deletes one ref — an explicit refspec (not an empty
+	// list): the porcelain default would honour `remote.origin.push`, which could push a different or
+	// multiple refs and break this WIT contract of "push HEAD's branch" (and the single-result mapping).
 	let refspecs = match delete {
 		Some(target) => vec![
 			gitana_remote::PushRefspec::parse(&format!(":{target}"))
@@ -134,37 +231,32 @@ pub(crate) async fn push<H: HashAlgorithm>(
 			gitana_remote::PushRefspec::parse("HEAD").map_err(|e| RepoError::Invalid(e.to_string()))?,
 		],
 	};
-	// The component surface pushes a single ref, so atomicity would be a no-op; it is not exposed in
-	// the WIT contract. The receive-pack request is one exchange over the `wasi:http` transport (the
-	// connection's own advertisement is unused, since push takes it as an argument).
-	let mut connection = HttpConnection::new(
-		&transport,
-		origin.receive_pack(),
-		RECEIVE_PACK_REQUEST,
-		Vec::new(),
-	);
-	let outcome = gitana_porcelain::push(
-		&mut connection,
+	// The component surface pushes a single ref, so atomicity would be a no-op; it is not exposed in the
+	// WIT contract.
+	gitana_porcelain::push(
+		connection,
 		repo,
-		&advertisement,
+		advertisement,
 		force,
 		false,
 		refspecs,
 		gitana_porcelain::PushTags::None,
 	)
 	.await
-	.map_err(remote_error)?;
+	.map_err(remote_error)
+}
 
-	// Exactly one result in the component case (a branch push or a single delete), or none when the
-	// remote was already up to date.
-	Ok(match outcome.results.first() {
+/// Map the porcelain push outcome into the WIT variant. Exactly one result in the component case (a
+/// branch push or a single delete), or none when the remote was already up to date.
+fn to_push_outcome(outcome: gitana_porcelain::PushOutcome) -> WitPushOutcome {
+	match outcome.results.first() {
 		None => WitPushOutcome::UpToDate,
 		Some(result) if result.deleted => WitPushOutcome::Deleted(result.refname.clone()),
 		Some(result) => WitPushOutcome::Pushed(PushSummary {
 			branch: result.refname.clone(),
 			forced: result.forced,
 		}),
-	})
+	}
 }
 
 /// Fetch the remote's ref advertisement and read the object format it advertises — the pre-dispatch
@@ -217,6 +309,72 @@ pub(crate) async fn clone<H: HashAlgorithm>(
 		&Deepen::default(),
 		None,
 		&origin.persisted_url(),
+	)
+	.await
+	.map_err(remote_error)
+}
+
+/// Require the remote's advertised object-format to match the local repository's `H` — objects of one
+/// hash cannot be stored in a repository of the other.
+fn ensure_same_format<H: HashAlgorithm>(advertisement: &[u8]) -> Result<(), RepoError> {
+	let remote = gitana_remote::negotiated_kind(advertisement).map_err(remote_error)?;
+	if H::NAME != remote.name() {
+		return Err(RepoError::Invalid(format!(
+			"remote object-format is {}, but the local repository is {}",
+			remote.name(),
+			H::NAME
+		)));
+	}
+	Ok(())
+}
+
+/// Open a stateful SSH connection to `service` (`git-upload-pack` / `git-receive-pack`) on `ssh` over
+/// the host `ssh-transport` capability, reading the ref advertisement the server sends on connect.
+async fn open_ssh_connection(
+	ssh: &SshRemote,
+	service: &str,
+) -> Result<PackConnection<WasiSshStream>, RepoError> {
+	let stream = WasiSshStream::open(service, ssh).map_err(remote_error)?;
+	PackConnection::open_over(stream)
+		.await
+		.map_err(remote_error)
+}
+
+/// Open a `git-upload-pack` SSH session for a clone and read the object format the remote advertises —
+/// the pre-dispatch step run before any local repository exists (the SSH counterpart of
+/// [`clone_negotiate`]). Returns the opened connection, its advertisement already read, so the caller
+/// drives the clone over it under the matching `H`, plus the negotiated [`HashKind`].
+pub(crate) async fn open_ssh_clone(
+	ssh: &SshRemote,
+) -> Result<(PackConnection<WasiSshStream>, HashKind), RepoError> {
+	let connection = open_ssh_connection(ssh, "git-upload-pack").await?;
+	let kind =
+		match gitana_remote::negotiated_kind(connection.advertisement()).map_err(remote_error)? {
+			gitana_object::HashKind::Sha1 => HashKind::Sha1,
+			gitana_object::HashKind::Sha256 => HashKind::Sha256,
+		};
+	Ok((connection, kind))
+}
+
+/// Clone the SSH remote into a fresh checkout backed by `store` (the git directory) and `work` (the
+/// working tree) as hash `H`, driving `gitana-porcelain`'s clone over the already-opened `connection`
+/// (its advertisement read by [`open_ssh_clone`]). `url` is the original clone argument, persisted as
+/// `remote.origin.url` with any password redacted — matching the CLI. There is no `insteadOf` rewriting
+/// here, and no committer identity through the component's descriptors, so clone writes no reflog.
+pub(crate) async fn clone_ssh<H: HashAlgorithm>(
+	mut connection: PackConnection<WasiSshStream>,
+	store: WorktreeFileStore,
+	work: DescriptorWorkDir,
+	url: &str,
+) -> Result<(), RepoError> {
+	let repo: Repository<WorktreeFileStore, H> = Repository::new(ObjectStore::new(store));
+	gitana_porcelain::clone(
+		&mut connection,
+		repo,
+		work,
+		&Deepen::default(),
+		None,
+		&gitana_remote::redact_password(url),
 	)
 	.await
 	.map_err(remote_error)

@@ -14,8 +14,8 @@ use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, Tag, encode_tag};
 use gitana_object_store::ObjectStore;
 use gitana_repo_host::exports::gitana::repo::porcelain::{HashKind, RepoError};
 use gitana_repo_host::{
-	HostCredentialProvider, Repo, State, engine, grant_dir, instantiate, store,
-	store_with_credentials,
+	HostCredentialProvider, HostSshProvider, Repo, State, engine, grant_dir, instantiate, store,
+	store_with_credentials, store_with_ssh,
 };
 use gitana_repository::{FileMode, ReflogIntent, Repository, TreeBuildEntry};
 use wasmtime::Store;
@@ -265,6 +265,26 @@ impl Session {
 	) -> Result<Self> {
 		let engine = engine()?;
 		let mut store = store_with_credentials(&engine, credentials);
+		let repo = instantiate(&engine, &mut store, build_component()).await?;
+		let dir = grant_dir(&mut store, git_dir)?;
+		let handle = repo
+			.gitana_repo_porcelain()
+			.repository()
+			.call_open(&mut store, dir)
+			.await?
+			.map_err(|error| anyhow!("open: {error:?}"))?;
+		Ok(Self {
+			store,
+			repo,
+			handle,
+		})
+	}
+
+	/// Like [`Session::open`], but granting `ssh` as the host source answering the guest's
+	/// `ssh-transport` import — so a fetch/push against an SSH remote spawns via the provider.
+	pub async fn open_with_ssh(git_dir: &Path, ssh: Box<dyn HostSshProvider>) -> Result<Self> {
+		let engine = engine()?;
+		let mut store = store_with_ssh(&engine, ssh);
 		let repo = instantiate(&engine, &mut store, build_component()).await?;
 		let dir = grant_dir(&mut store, git_dir)?;
 		let handle = repo

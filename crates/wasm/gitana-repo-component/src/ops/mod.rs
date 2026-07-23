@@ -23,7 +23,10 @@ pub(crate) use self::{
 	refs::{
 		delete_ref, head, list_refs, read_symbolic_ref, resolve_ref, set_symbolic_ref, update_ref,
 	},
-	remote::{auth_transport, clone, clone_negotiate, fetch, push},
+	remote::{
+		auth_transport, clone, clone_negotiate, clone_ssh, fetch, open_ssh_clone, parse_remote_url,
+		push,
+	},
 	repo::{init_layout, init_repo, install_effective_config, read_config, repack},
 	revisions::{is_ancestor, merge_base, rev_list, rev_parse},
 	wasi_credentials::WasiCredentialProvider,

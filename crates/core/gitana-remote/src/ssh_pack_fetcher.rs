@@ -7,25 +7,27 @@ use gitana_object::{HashAlgorithm, ObjectId, write_flush, write_pkt};
 use gitana_repository::Repository;
 
 use crate::{
-	Connection, HAVE_BATCH, PackFetcher, SshConnection, collect_have_commits, store_response,
+	Connection, HAVE_BATCH, PackConnection, PackFetcher, PackStream, collect_have_commits,
+	store_response,
 };
 
 /// A [`PackFetcher`] that negotiates over a single stateful SSH stream. Unlike Smart HTTP's
 /// stateless-RPC (re-POST each round), the client sends the wants once and then reads the server's ACK
 /// batch after each have-group, sending more haves until the server is `ready` (or they run out), then
-/// `done` — all on the one connection.
-pub struct SshPackFetcher {
-	connection: SshConnection,
+/// `done` — all on the one connection. Generic over the byte transport `S`, so both the native `ssh`
+/// subprocess and the wasm host-granted SSH stream reuse this negotiation.
+pub struct SshPackFetcher<S: PackStream> {
+	connection: PackConnection<S>,
 }
 
-impl SshPackFetcher {
+impl<S: PackStream> SshPackFetcher<S> {
 	/// A fetcher over an already-opened `git-upload-pack` connection (its ref advertisement already read).
-	pub fn new(connection: SshConnection) -> Self {
+	pub fn new(connection: PackConnection<S>) -> Self {
 		Self { connection }
 	}
 }
 
-impl PackFetcher for SshPackFetcher {
+impl<S: PackStream> PackFetcher for SshPackFetcher<S> {
 	async fn fetch_pack<F: FileStore, H: HashAlgorithm>(
 		&mut self,
 		repo: &Repository<F, H>,
@@ -47,8 +49,8 @@ impl PackFetcher for SshPackFetcher {
 }
 
 /// Drive git's stateful fetch negotiation over `connection`.
-async fn negotiate<F: FileStore, H: HashAlgorithm>(
-	connection: &mut SshConnection,
+async fn negotiate<S: PackStream, F: FileStore, H: HashAlgorithm>(
+	connection: &mut PackConnection<S>,
 	repo: &Repository<F, H>,
 	wants: &[ObjectId<H>],
 	haves: &[ObjectId<H>],
@@ -87,8 +89,8 @@ async fn negotiate<F: FileStore, H: HashAlgorithm>(
 }
 
 /// Read the pack response after the client's final `done`, store it, and await ssh's exit.
-async fn finish_pack<F: FileStore, H: HashAlgorithm>(
-	connection: &mut SshConnection,
+async fn finish_pack<S: PackStream, F: FileStore, H: HashAlgorithm>(
+	connection: &mut PackConnection<S>,
 	repo: &Repository<F, H>,
 	shallow_before: &[ObjectId<H>],
 ) -> Result<()> {

@@ -39,6 +39,8 @@ mod inner;
 mod ops;
 #[cfg(target_arch = "wasm32")]
 mod wasi_http_transport;
+#[cfg(target_arch = "wasm32")]
+mod wasi_ssh_transport;
 
 #[cfg(target_arch = "wasm32")]
 use self::component::Component;

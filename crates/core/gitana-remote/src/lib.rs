@@ -19,7 +19,9 @@ mod http_client;
 mod http_connection;
 mod http_pack_fetcher;
 mod http_transport;
+mod pack_connection;
 mod pack_fetcher;
+mod pack_stream;
 mod push_refspec;
 mod refspec;
 mod remote_url;
@@ -29,7 +31,6 @@ mod reqwest_transport;
 mod ssh_command;
 #[cfg(feature = "ssh-transport")]
 mod ssh_connection;
-#[cfg(feature = "ssh-transport")]
 mod ssh_pack_fetcher;
 mod ssh_remote;
 #[cfg(feature = "ssh-transport")]
@@ -46,7 +47,9 @@ pub use http_client::{HttpClient, HttpResponse, challenge_offers};
 pub use http_connection::HttpConnection;
 pub use http_pack_fetcher::HttpPackFetcher;
 pub use http_transport::HttpTransport;
+pub use pack_connection::PackConnection;
 pub use pack_fetcher::PackFetcher;
+pub use pack_stream::PackStream;
 pub use push_refspec::PushRefspec;
 pub use refspec::Refspec;
 pub use remote_url::RemoteUrl;
@@ -57,8 +60,10 @@ pub use ssh_command::SshCommand;
 #[cfg(feature = "ssh-transport")]
 pub(crate) use ssh_command::SshCommandKind;
 #[cfg(feature = "ssh-transport")]
-pub use ssh_connection::SshConnection;
+pub use ssh_connection::ChildStream;
+/// The native SSH connection: a [`PackConnection`] over an `ssh` subprocess ([`ChildStream`]).
 #[cfg(feature = "ssh-transport")]
+pub type SshConnection = PackConnection<ChildStream>;
 pub use ssh_pack_fetcher::SshPackFetcher;
 pub use ssh_remote::SshRemote;
 #[cfg(feature = "ssh-transport")]
@@ -122,6 +127,36 @@ fn anonymize_scp(url: &str) -> String {
 		Some((_userinfo, host)) => format!("{host}{tail}"),
 		None => url.to_owned(),
 	}
+}
+
+/// A credential-safe form of `url` for display, persistence, or a push certificate's pushee: the URL
+/// verbatim (scheme case, path, trailing slash preserved) with only a `:password` stripped from the
+/// userinfo — the username is kept (git keeps it; it is not a secret), the password is not. A string
+/// with no `://` (an scp-like alias, which carries no password) is returned unchanged. Used wherever a
+/// remote URL leaves the authentication path, so a plaintext credential never reaches a print, a
+/// `.git/config`, a reflog-adjacent commit message, or a signed certificate. Unlike [`anonymize_url`]
+/// (which strips the whole userinfo), this keeps the login user — essential for an SSH remote, whose
+/// `user@` selects the account.
+pub fn redact_password(url: &str) -> String {
+	let Some((scheme, rest)) = url.split_once("://") else {
+		return url.to_owned();
+	};
+	let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+	let (authority, tail) = rest.split_at(authority_end);
+	// The userinfo is delimited by the last `@`; the username is up to the first `:` (so a password may
+	// contain either). An empty username drops the whole `userinfo@`.
+	let authority = match authority.rsplit_once('@') {
+		Some((userinfo, host)) => {
+			let user = userinfo.split_once(':').map_or(userinfo, |(user, _)| user);
+			if user.is_empty() {
+				host.to_owned()
+			} else {
+				format!("{user}@{host}")
+			}
+		}
+		None => authority.to_owned(),
+	};
+	format!("{scheme}://{authority}{tail}")
 }
 
 /// Percent-decode `s` (`%XX` → byte), decoding the resulting bytes as UTF-8 (lossily, since a
@@ -706,6 +741,30 @@ mod tests {
 		let none = Origin::parse("https://example.com/app").unwrap();
 		assert_eq!(none.username, None);
 		assert_eq!(none.password, None);
+	}
+
+	#[test]
+	fn redact_password_preserves_spelling() {
+		// Password dropped, username + trailing slash + scheme case preserved.
+		assert_eq!(
+			redact_password("HTTPS://alice:secret@host/repo/"),
+			"HTTPS://alice@host/repo/"
+		);
+		// A password containing `@`/`:` is still fully removed (last `@`, first `:`).
+		assert_eq!(
+			redact_password("https://alice:se@cr:et@host/r"),
+			"https://alice@host/r"
+		);
+		// No userinfo, and a userinfo-less scp-like alias, pass through unchanged (an ssh login user is
+		// kept — it is not a secret).
+		assert_eq!(redact_password("https://host/r"), "https://host/r");
+		assert_eq!(
+			redact_password("git@host:org/repo.git"),
+			"git@host:org/repo.git"
+		);
+		assert_eq!(redact_password("ssh://git@host/r"), "ssh://git@host/r");
+		// An empty username drops the whole userinfo.
+		assert_eq!(redact_password("https://:secret@host/r"), "https://host/r");
 	}
 
 	#[test]

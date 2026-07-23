@@ -56,7 +56,7 @@ pub async fn run(
 	// spelling* is preserved — including a trailing slash the rewrite prefix may depend on and an SSH /
 	// scp-like alias. gitana additionally redacts any password (git persists it verbatim; gitana
 	// deliberately never writes a plaintext credential to `.git/config`, as on a plain userinfo clone).
-	let persist_url = url_rewrite::redact_password(&url);
+	let persist_url = transport::redact_password(&url);
 	let git_dir = target.join(".git");
 	// The directory external helpers run from — git's effective working directory (`gta`'s `-C`, or the
 	// launch dir): where a relative askpass (HTTP) or a relative `GIT_SSH_COMMAND` / key path (SSH)

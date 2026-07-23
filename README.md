@@ -40,14 +40,21 @@ What works today:
   (CAS updates), `repack`, and `init` — plus the working-tree porcelain
   (`status`, `add`, `checkout`, `commit`) over a repository opened with its
   working tree (`open-worktree`, which grants a third `work-dir` descriptor), and
-  the Smart HTTP remote operations (`fetch`, `push`, and `clone`) over a
-  host-granted `wasi:http` capability — no `reqwest`, no ambient network. A `401`
-  challenge on those operations is authenticated the git way, with the credential
-  answered by the host over a `credentials` WIT import (`fill`/`approve`/`reject`,
-  the `wasi:http` capability model) — the component reaches for no ambient netrc,
-  helper, or prompt. The component's only filesystem authority is the
-  `wasi:filesystem` directory descriptors passed in by the host (no preopens, no
-  ambient access).
+  the remote operations (`fetch`, `push`, and `clone`) over both transports: Smart
+  HTTP over a host-granted `wasi:http` capability, and **SSH** over a host-granted
+  `ssh-transport` capability — no `reqwest`, no ambient network, and (since a
+  component cannot spawn a subprocess) no ambient `ssh`. A `401` challenge on the
+  HTTP path is authenticated the git way, with the credential answered by the host
+  over a `credentials` WIT import (`fill`/`approve`/`reject`, the `wasi:http`
+  capability model) — the component reaches for no ambient netrc, helper, or
+  prompt. An `ssh://` / scp-like remote is served by the host spawning `ssh` (its
+  policy: which binary, keys, `~/.ssh/config`, variant) and bridging the
+  subprocess's stdio into `wasi:io` streams the component drives the pkt-line
+  negotiation over; the host owns the trust boundary (a git-service allow-list, the
+  CVE-2017-1000117 option-injection guard, remote-command quoting, and protocol v0),
+  so the granted capability cannot spawn an arbitrary process. The component's only
+  filesystem authority is the `wasi:filesystem` directory descriptors passed in by
+  the host (no preopens, no ambient access).
   `crates/wasm/gitana-repo-host` embeds it under wasmtime; see
   `docs/hlds/wasi-component-porcelain.md` and `docs/hlds/wasi-http-transport.md`.
 - A trust and signing subsystem (`docs/hlds/secure-git-trust-signing.md`) that makes
@@ -91,8 +98,10 @@ Major gaps:
 - Remote transport supports HTTP(S) Smart HTTP remotes and **SSH** —
   `gta clone` / `fetch` / `pull` / `push` all speak it (`ssh://[user@]host[:port]/path`,
   the `git+ssh://` / `ssh+git://` aliases, and the scp-like `[user@]host:path`).
-  Like git, gitana drives the user's `ssh` binary rather than linking an SSH stack —
-  so it is native-only (the wasm component stays HTTP-only). The command is resolved
+  Like git, gitana drives the user's `ssh` binary rather than linking an SSH stack:
+  the CLI spawns it directly, and the wasm component — which cannot spawn a subprocess
+  — has the host spawn it behind the `ssh-transport` capability (see the component
+  entry above). The command is resolved
   with git's precedence (`GIT_SSH_COMMAND` → `core.sshCommand` → `GIT_SSH` → `ssh`),
   and the port flag follows the variant (`GIT_SSH_VARIANT` / `ssh.variant` / basename:
   `-p` for OpenSSH, `-P` for the PuTTY family). `fetch`/`pull` run git's stateful

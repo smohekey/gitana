@@ -23,6 +23,9 @@ wasmtime-wasi.workspace = true
 # Satisfies the guest's `wasi:http/outgoing-handler` import so the in-component remote porcelain can
 # reach a Smart HTTP server. Outbound is host-mediated: the host mints the capability, not the guest.
 wasmtime-wasi-http.workspace = true
+# The `ssh-transport` capability spawns `ssh` on the host and bridges its stdio into wasi:io streams:
+# the host names `tokio::process::Child` (the provider's product) and awaits its exit.
+tokio = { workspace = true, features = ["process"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # axum + gitana-git-http stand up a loopback Smart-HTTP server (gitana's OWN handlers) as the oracle

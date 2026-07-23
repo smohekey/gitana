@@ -1,4 +1,4 @@
-package gitana:repo@0.9.0;
+package gitana:repo@0.10.0;
 
 /// HTTP credential resolution, granted by the host.
 ///
@@ -82,6 +82,53 @@ interface credentials {
 	/// Record that `cred` (for `request`) was rejected by the server, so the host may erase a stale
 	/// entry (git's `credential reject`). Best-effort, like `approve`.
 	reject: func(request: credential-request, cred: credential);
+}
+
+/// SSH transport to a git remote, granted by the host.
+///
+/// A component cannot spawn a subprocess, so it holds no authority to run `ssh` — yet git's SSH
+/// transport *is* a subprocess (git never links an SSH stack, and neither does gitana's native side).
+/// So the component *imports* this capability and the **host** owns all ssh policy: which `ssh` binary,
+/// which keys, `~/.ssh/config`, the variant and port flag, known-hosts — exactly as `wasi:http` backs
+/// the Smart HTTP porcelain. The guest passes only the parsed remote components; the host spawns
+/// `git-upload-pack` / `git-receive-pack` on the far side and bridges the subprocess's stdio into a pair
+/// of `wasi:io` streams the guest drives the pkt-line negotiation over. The streams are modelled on how
+/// `wasi:http` exposes a body: each accessor yields the stream *once* (the guest reads/writes it for the
+/// life of the session), and `finish` awaits the subprocess so a nonzero exit surfaces as a transport
+/// error rather than a silently truncated pack.
+interface ssh-transport {
+	use wasi:io/streams@0.2.12.{input-stream, output-stream};
+
+	/// One SSH session to a remote git service — the byte streams of a running `ssh …host git-<service>
+	/// '<path>'`, plus its eventual exit. The guest writes its request (`want`/`have`/`done` or a
+	/// receive-pack update) to `stdin` and reads the advertisement, ACKs, and packfile from `stdout`, then
+	/// `finish`es to reap the subprocess. Dropping the session without `finish` reaps it too.
+	resource ssh-session {
+		/// The session's response side — the subprocess's stdout (server → client). Yields the stream
+		/// once; a second call traps, as the guest holds it for the session's life.
+		stdout: func() -> input-stream;
+
+		/// The session's request side — the subprocess's stdin (client → server). Yields the stream once;
+		/// the guest closes the request side by dropping it, signalling end-of-request to the server.
+		stdin: func() -> output-stream;
+
+		/// Await the subprocess's exit, failing on an unsuccessful status. Stock git reports a nonzero
+		/// `ssh` exit as a transport error even when a complete pack was already read, so the guest calls
+		/// this once the exchange is done; the payload is a human-readable failure description.
+		finish: func() -> result<_, string>;
+	}
+
+	/// Open an SSH session running `git-<service>` on the remote — `service` is `git-upload-pack` (fetch/
+	/// clone) or `git-receive-pack` (push), `host`/`port`/`user` the connection target, and `path` the
+	/// repository path on the remote (single-quoted for the remote shell by the host, as git does). The
+	/// host resolves the `ssh` command and variant. Because the component holds no ambient authority, the
+	/// host enforces this capability's scope on the arguments before spawning anything: a `service` other
+	/// than the two git pack services, or a `-`-leading `host`/`user`/`path`, is refused (git's
+	/// CVE-2017-1000117 guard) — a guest cannot use the capability to run an arbitrary process or inject
+	/// an `ssh` option. `err` is a human-readable failure (the request was refused, or the ssh command
+	/// could not be built or spawned).
+	open: func(service: string, host: string, port: option<u16>,
+		user: option<string>, path: string) -> result<ssh-session, string>;
 }
 
 /// Repository operations over a capability-granted git directory.
@@ -497,6 +544,10 @@ world repo {
 	// The credential capability for authenticating a Smart HTTP `401`: the host answers `fill`/`approve`/
 	// `reject`, so the component reaches for no ambient netrc/helper/prompt.
 	import credentials;
+	// The SSH transport capability for the remote porcelain over `ssh://` / scp-like remotes: the host
+	// spawns `ssh` and bridges its stdio into `wasi:io` streams, the component's only means of reaching an
+	// SSH git remote (it cannot spawn a subprocess itself).
+	import ssh-transport;
 
 	export porcelain;
 }
