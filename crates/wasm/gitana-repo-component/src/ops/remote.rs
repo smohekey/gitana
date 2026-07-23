@@ -131,6 +131,7 @@ async fn run_fetch<H: HashAlgorithm>(
 		advertisement,
 		false,
 		gitana_porcelain::TagFetch::Auto,
+		false, // no prune under the component's fixed fetch policy
 		&gitana_porcelain::Deepen::default(),
 		&[],
 		None,

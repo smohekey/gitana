@@ -270,6 +270,74 @@ async fn fetches_new_commits_over_http() {
 }
 
 #[tokio::test]
+async fn fetch_prunes_a_branch_deleted_upstream() {
+	if !git_http_backend_available() {
+		eprintln!("skipping: git http-backend is not installed");
+		return;
+	}
+	let temp = tempfile::tempdir().unwrap();
+	build_bare(temp.path());
+	let work = temp.path().join("work");
+	let bare = temp.path().join("repo.git");
+	let base = serve_git_http_backend(temp.path().to_path_buf()).await;
+
+	let destination = temp.path().join("cloned");
+	clone_url(
+		&format!("{base}/repo.git"),
+		&destination,
+		Anonymous,
+		&Deepen::default(),
+	)
+	.await
+	.expect("clone over HTTP");
+
+	// Publish a `feature` branch on the origin, then fetch: the wildcard refspec mirrors it into a
+	// tracking ref (a clone tracks only the default branch, so the fetch is what establishes this ref).
+	git(&work, &["checkout", "-q", "-b", "feature"]);
+	std::fs::write(work.join("b.txt"), b"feature\n").unwrap();
+	git(&work, &["add", "."]);
+	git(&work, &["commit", "-qm", "feature work"]);
+	git(&work, &["push", "-q", bare.to_str().unwrap(), "feature"]);
+	fetch_url(&format!("{base}/repo.git"), &destination, Anonymous)
+		.await
+		.expect("fetch feature");
+	assert!(
+		git_try(
+			&destination,
+			&["rev-parse", "--verify", "refs/remotes/origin/feature"]
+		)
+		.status
+		.success(),
+		"the fetch should mirror the upstream feature branch into a tracking ref"
+	);
+
+	// Delete `feature` upstream, then fetch again: the prune must drop the now-stale tracking ref.
+	git(&work, &["push", "-q", bare.to_str().unwrap(), ":feature"]);
+	fetch_url(&format!("{base}/repo.git"), &destination, Anonymous)
+		.await
+		.expect("fetch over HTTP");
+	assert!(
+		!git_try(
+			&destination,
+			&["rev-parse", "--verify", "refs/remotes/origin/feature"]
+		)
+		.status
+		.success(),
+		"the stale tracking ref for the deleted upstream branch must be pruned",
+	);
+	// The surviving `main` tracking ref is untouched by the prune.
+	assert!(
+		git_try(
+			&destination,
+			&["rev-parse", "--verify", "refs/remotes/origin/main"]
+		)
+		.status
+		.success(),
+		"a still-advertised branch keeps its tracking ref",
+	);
+}
+
+#[tokio::test]
 async fn a_missing_repository_reports_a_clone_error() {
 	if !git_http_backend_available() {
 		return;

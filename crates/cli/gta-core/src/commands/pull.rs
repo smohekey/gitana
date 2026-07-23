@@ -112,6 +112,7 @@ async fn pull_into<H: HashAlgorithm>(
 		body,
 		true,
 		gitana_porcelain::TagFetch::Auto,
+		false, // pull does not prune (git prunes only under an explicit --prune)
 		&gitana_porcelain::Deepen::default(),
 		&checkouts,
 		Some(gitana_porcelain::FetchReflog {

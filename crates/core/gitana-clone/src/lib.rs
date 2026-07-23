@@ -188,8 +188,10 @@ async fn fetch_into<H: HashAlgorithm>(
 		fetcher,
 		&repository,
 		advertisement,
-		false,              // update_head_ok: never advance the checked-out branch
-		TagFetch::None,     // leave local tags untouched
+		false,          // update_head_ok: never advance the checked-out branch
+		TagFetch::None, // leave local tags untouched
+		true,           // prune: drop tracking refs for branches deleted upstream, so a stale one
+		// cannot assert a deleted branch is still pushed when a caller judges reachability
 		&Deepen::default(), // complete fetch — reachability needs the full remote history
 		&[],                // the default origin refspec targets refs/remotes/*, refusing no checkout
 		None,               // headless: no reflog identity

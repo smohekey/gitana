@@ -153,6 +153,7 @@ async fn fetch_into<H: HashAlgorithm>(
 		body,
 		false,
 		tags,
+		false, // no --prune flag yet; a plain `gta fetch` matches git's default of not pruning
 		deepen,
 		&checkouts,
 		Some(gitana_porcelain::FetchReflog {

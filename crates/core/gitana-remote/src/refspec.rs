@@ -201,6 +201,30 @@ impl Refspec {
 			Pattern::Glob { .. } => None,
 		}
 	}
+
+	/// The fixed prefix of this positive refspec's *destination* glob, for enumerating the local tracking
+	/// refs that fall under it (the candidates a `--prune` fetch considers). `None` when the destination
+	/// is absent or exact — only a wildcard destination owns a namespace to prune. For
+	/// `+refs/heads/*:refs/remotes/origin/*` this is `Some("refs/remotes/origin/")`.
+	pub fn destination_glob_prefix(&self) -> Option<&str> {
+		if self.negative {
+			return None;
+		}
+		match self.dst.as_ref()? {
+			Pattern::Glob { prefix, .. } => Some(prefix),
+			Pattern::Exact(_) => None,
+		}
+	}
+
+	/// Whether local tracking ref `tracking` is covered by this positive refspec's destination glob — i.e.
+	/// this refspec is the one that would produce `tracking` from some advertised ref. A `tracking` that
+	/// is covered but that no advertised ref maps to is a prune candidate under this refspec.
+	pub fn covers_destination(&self, tracking: &str) -> bool {
+		if self.negative {
+			return false;
+		}
+		matches!(self.dst.as_ref(), Some(dst @ Pattern::Glob { .. }) if dst.match_capture(tracking).is_some())
+	}
 }
 
 #[cfg(test)]
@@ -223,6 +247,31 @@ mod tests {
 		);
 		// A non-branch ref does not match.
 		assert_eq!(spec.destination("refs/tags/v1"), None);
+	}
+
+	#[test]
+	fn destination_glob_prefix_and_coverage_drive_prune() {
+		// The default fetch refspec owns the `refs/remotes/origin/` namespace to prune.
+		let wild = Refspec::parse("+refs/heads/*:refs/remotes/origin/*").unwrap();
+		assert_eq!(wild.destination_glob_prefix(), Some("refs/remotes/origin/"));
+		assert!(wild.covers_destination("refs/remotes/origin/feature"));
+		assert!(wild.covers_destination("refs/remotes/origin/feature/x"));
+		// A ref outside the destination namespace is not covered.
+		assert!(!wild.covers_destination("refs/heads/main"));
+		assert!(!wild.covers_destination("refs/remotes/upstream/main"));
+
+		// An exact destination owns no namespace: it maps a single ref, so a prune walks nothing.
+		let exact = Refspec::parse("refs/heads/main:refs/remotes/origin/main").unwrap();
+		assert_eq!(exact.destination_glob_prefix(), None);
+		assert!(!exact.covers_destination("refs/remotes/origin/main"));
+
+		// A source-only refspec (no destination) and a negative refspec prune nothing.
+		let source_only = Refspec::parse("refs/heads/main").unwrap();
+		assert_eq!(source_only.destination_glob_prefix(), None);
+		assert!(!source_only.covers_destination("refs/remotes/origin/main"));
+		let negative = Refspec::parse("^refs/heads/wip/*").unwrap();
+		assert_eq!(negative.destination_glob_prefix(), None);
+		assert!(!negative.covers_destination("refs/remotes/origin/wip"));
 	}
 
 	#[test]

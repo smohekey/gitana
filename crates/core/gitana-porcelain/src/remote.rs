@@ -38,6 +38,10 @@ pub struct FetchOutcome<H: HashAlgorithm> {
 	/// Tracking refs left unchanged because the update was not a fast-forward and the matching refspec
 	/// was not forced (no leading `+`) — git rejects these too.
 	pub rejected: Vec<String>,
+	/// Tracking refs deleted because the fetch was a prune (`prune` was set) and the remote no longer
+	/// advertises any ref mapping onto them — their upstream branch was deleted. Empty when `prune` is
+	/// false. Judging reachability after a prune is what makes a stale tracking ref safe to trust.
+	pub pruned: Vec<String>,
 }
 
 /// The reflog identity for a [`fetch`]'s tracking-ref updates: the committer line and the action
@@ -85,6 +89,12 @@ pub struct CloneReflog<'a> {
 /// `--shallow-since` / `--shallow-exclude`): only the branch tips are deepened and the server's new
 /// shallow boundary is folded into `.git/shallow`. An empty `deepen` (the default) is a normal fetch.
 ///
+/// `prune` (git's `fetch --prune`) additionally deletes every tracking ref under a wildcard refspec's
+/// destination namespace that no advertised ref maps to — the upstream branch was removed. This matters
+/// for any caller that judges reachability from `refs/remotes/*`: without it a stale tracking ref left
+/// by a deleted upstream branch keeps asserting that branch's commits are present, so the prune must run
+/// before such a judgement.
+///
 /// `reflog` supplies the committer and action prefix for the tracking-ref reflog each advanced ref
 /// records (git's `<action>: <status>`); `None` writes no reflog (see [`FetchReflog`]).
 #[allow(clippy::too_many_arguments)]
@@ -94,6 +104,7 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	advertisement: &[u8],
 	update_head_ok: bool,
 	tags: TagFetch,
+	prune: bool,
 	deepen: &Deepen,
 	checkouts: &[(String, String)],
 	reflog: Option<FetchReflog<'_>>,
@@ -330,7 +341,41 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 		)
 		.await?;
 	}
-	Ok(FetchOutcome { updated, rejected })
+	// Prune (git's `--prune`): delete every tracking ref under a wildcard refspec's destination namespace
+	// that no advertised ref maps to. `claimed` holds exactly the destinations some advertised,
+	// non-excluded ref mapped to during planning, so a covered tracking ref absent from it is stale — its
+	// upstream branch was deleted. A CAS on the resolved oid keeps the delete from racing a concurrent
+	// move. Only wildcard destinations own a namespace to prune; an exact/source-only refspec prunes
+	// nothing.
+	let mut pruned = Vec::new();
+	if prune {
+		let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+		for spec in &positive {
+			let Some(prefix) = spec.destination_glob_prefix() else {
+				continue;
+			};
+			for (tracking, _) in repo.refs().list(prefix).await? {
+				if claimed.contains_key(tracking.as_str())
+					|| !spec.covers_destination(&tracking)
+					|| !seen.insert(tracking.clone())
+				{
+					continue;
+				}
+				let current = repo.refs().resolve(&tracking).await?;
+				repo
+					.refs()
+					.delete_ref(&tracking, current, ReflogIntent::Skip)
+					.await?;
+				pruned.push(tracking);
+			}
+		}
+	}
+
+	Ok(FetchOutcome {
+		updated,
+		rejected,
+		pruned,
+	})
 }
 
 /// The fetch's fatal, structural errors — checked before any download so a fetch that fails persists no
