@@ -19,6 +19,7 @@ flate2 = "1.1.9"
 gitana-clone = { path = "crates/core/gitana-clone" }
 gitana-config = { path = "crates/core/gitana-config" }
 gitana-config-native = { path = "crates/core/gitana-config-native" }
+gitana-credential = { path = "crates/core/gitana-credential" }
 gitana-diff = { path = "crates/core/gitana-diff" }
 gitana-file-store = { path = "crates/core/gitana-file-store" }
 gitana-file-store-conformance = { path = "crates/core/gitana-file-store-conformance" }

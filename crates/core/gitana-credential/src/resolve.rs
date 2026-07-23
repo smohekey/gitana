@@ -11,7 +11,7 @@ use anyhow::{Result, bail};
 use gitana_config::GitConfig;
 use gitana_remote::CredentialRequest;
 
-use super::Helper;
+use crate::helper::Helper;
 
 /// The resolved credential configuration for one request: the ordered helper chain, the configured
 /// username (before the URL-userinfo hint is considered), and whether the repository path is part of
@@ -58,7 +58,7 @@ pub(crate) fn resolve(config: &GitConfig, request: &CredentialRequest) -> Result
 		}
 		match value {
 			Some(value) => {
-				use_http_path = crate::git_config::parse_git_bool(value).ok_or_else(|| {
+				use_http_path = gitana_config_native::parse_git_bool(value).ok_or_else(|| {
 					anyhow::anyhow!("bad boolean value '{value}' for 'credential.useHttpPath'")
 				})?
 			}
@@ -310,7 +310,7 @@ fn is_reserved_or_unreserved(byte: u8) -> bool {
 /// pattern encoding — it escapes a reserved `:`/`@` too — so a request path and a pattern only match
 /// when spelled the same way (git decodes then re-encodes the request, so `a%2Fb` → `a/b`, `a%00b` →
 /// `a%2500b`, and a raw `0xFF` byte → `%FF`).
-pub(crate) fn percent_encode_request_path(bytes: &[u8]) -> String {
+pub fn percent_encode_request_path(bytes: &[u8]) -> String {
 	const HEX: &[u8; 16] = b"0123456789ABCDEF";
 	let mut out = String::with_capacity(bytes.len());
 	for &byte in bytes {

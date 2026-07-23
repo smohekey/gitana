@@ -5,7 +5,6 @@
 
 pub mod commands;
 mod credential;
-mod credential_helper;
 mod dispatch;
 mod error;
 mod git_config;

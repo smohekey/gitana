@@ -1,0 +1,22 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "gitana-credential"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+
+[lints]
+workspace = true
+
+# Native-only: it spawns `git-credential-*` subprocesses to speak git's credential-helper
+# protocol, so it never builds for wasm (the wasm component has no keychain to reach).
+[dependencies]
+anyhow.workspace = true
+gitana-config.workspace = true
+gitana-config-native.workspace = true
+gitana-remote = { workspace = true, default-features = false }
+tokio = { workspace = true, features = ["io-util", "process"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

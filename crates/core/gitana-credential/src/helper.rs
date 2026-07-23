@@ -19,8 +19,8 @@ use tokio::process::Command;
 ///
 /// The operation (`get`/`store`/`erase`) is appended as the final argument, and git runs the whole
 /// line through the shell (`use_shell = 1`); this mirrors that with `sh -c`, so a value carrying its
-/// own arguments (`foo --opt`) and shell forms both behave as git's do. Unix-oriented, like the
-/// `/dev/tty` prompt fallback in [`super::super::prompt`].
+/// own arguments (`foo --opt`) and shell forms both behave as git's do. Unix-oriented, like git's
+/// own `/dev/tty` credential-prompt fallback.
 pub(crate) struct Helper {
 	/// The shell command line git builds for this helper, minus the trailing operation argument.
 	command: String,
@@ -348,13 +348,13 @@ fn apply_get_output(output: &str, state: &mut GetOutput) -> Result<()> {
 			"authtype" => state.authtype = Some(value.to_owned()),
 			"credential" => state.credential = Some(value.to_owned()),
 			"ephemeral" => {
-				state.ephemeral = crate::git_config::parse_git_bool(value).ok_or_else(|| {
+				state.ephemeral = gitana_config_native::parse_git_bool(value).ok_or_else(|| {
 					anyhow::anyhow!("credential helper returned a bad boolean 'ephemeral={value}'")
 				})?
 			}
 			"state[]" => state.state.push(value.to_owned()),
 			"continue" => {
-				state.more = crate::git_config::parse_git_bool(value).ok_or_else(|| {
+				state.more = gitana_config_native::parse_git_bool(value).ok_or_else(|| {
 					anyhow::anyhow!("credential helper returned a bad boolean 'continue={value}'")
 				})?
 			}
@@ -380,7 +380,7 @@ fn apply_get_output(output: &str, state: &mut GetOutput) -> Result<()> {
 			}
 			// git treats a malformed `quit`/`terminate` boolean as a fatal config error.
 			"quit" => {
-				state.quit = crate::git_config::parse_git_bool(value).ok_or_else(|| {
+				state.quit = gitana_config_native::parse_git_bool(value).ok_or_else(|| {
 					anyhow::anyhow!("credential helper returned a bad boolean 'quit={value}'")
 				})?
 			}

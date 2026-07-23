@@ -15,7 +15,7 @@
 //! This intentionally does not reimplement git's full `url_normalize` (percent-escape canonicalisation)
 //! or match a `http.<user@host>` pattern (the request URL here carries no userinfo); those are noted
 //! simplifications for uncommon inputs. It shares no code with the credential URL matcher
-//! (`credential_helper`) yet — the two are candidates for a future shared `urlmatch` module.
+//! (`gitana-credential`) yet — the two are candidates for a future shared `urlmatch` module.
 
 use anyhow::{Result, anyhow};
 use gitana_config::GitConfig;
