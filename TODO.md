@@ -125,7 +125,7 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   `merge-base`, `rev-parse`) and `prune`/`gc` stop at the boundary, and `gc` skips the reachability bitmap
   when shallow. `0a4465f2` (client clone), `e696d560` (server deepen), `52d476f5` (client deepen +
   shallow-aware prune/gc).
-- [ ] Add SSH remote support. **Slices 1–2 (clone/fetch/pull/push) done:** all four speak SSH over
+- [x] Add SSH remote support. **All four slices done.** **Slices 1–2 (clone/fetch/pull/push) done:** all four speak SSH over
   `ssh://` / `git+ssh://` / `ssh+git://` / scp-like `[user@]host:path`, driving the user's `ssh`
   subprocess (git-faithful: `GIT_SSH_COMMAND`, effective `-C` cwd, `~/.ssh/config`/agent/known-hosts;
   `GIT_PROTOCOL` cleared to pin v0). `RemoteUrl`/`SshRemote` scheme dispatch; a `Connection` seam
@@ -141,9 +141,15 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   (`GIT_SSH_VARIANT` / `ssh.variant` / basename → OpenSSH `-p` / PuTTY `-P` / `simple` errors on a port;
   the runtime `-G` probe omitted by design), and Windows DOS-drive scp disambiguation (`C:\repo`, via a
   `cfg(windows)` `has_dos_drive_prefix`). New `SshCommand`/`SshVariant` types + a gta-core resolver.
-  **Remaining:** the wasm component's SSH path (host-import capability, slice 3). Deferred: `ACK … common`
-  have-pruning (a second-pass optimization — negotiation is correct without it); byte-preserving
-  (non-UTF-8) SSH paths.
+  **Slice 3 (wasm component SSH) done (`976e557e`):** the `wasm32-wasip2` component does clone/fetch/push
+  over `ssh://`/scp via a host-driven `ssh-transport` WIT capability (the guest can't spawn, so the host
+  spawns `ssh` and bridges its stdio into `wasi:io` streams). The host owns the whole trust boundary
+  (git-service allow-list, CVE-2017-1000117 guard on host/user/path, remote-command `sq_quote`, v0
+  `GIT_PROTOCOL` scrub, stdio/kill/spawn); the pluggable `HostSshProvider` returns an unspawned
+  `Command` (`open(host, port, user, remote_command)`), and `store_with` grants the credentials +
+  ssh-transport capabilities together. Oracle-tested vs stock git in both hash formats; 6 codex rounds.
+  Deferred: `ACK … common` have-pruning (a second-pass optimization — negotiation is correct without it);
+  byte-preserving (non-UTF-8) SSH paths.
 - [x] Add `remote` command support for listing, adding, removing, and editing remotes. `gta remote`
   lists the configured remotes (`-v` adds fetch/push URLs); `add <name> <url>` writes the
   `[remote "<name>"]` section with the default fetch refspec; `set-url` retargets it; `remove` drops
