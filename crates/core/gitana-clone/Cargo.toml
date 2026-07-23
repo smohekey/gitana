@@ -1,0 +1,23 @@
+[package]
+name = "gitana-clone"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cap-std.workspace = true
+gitana-file-store-local.workspace = true
+gitana-object.workspace = true
+gitana-object-store.workspace = true
+gitana-porcelain = { workspace = true, features = ["reqwest-transport"] }
+gitana-remote = { workspace = true, features = ["reqwest-transport"] }
+gitana-repository.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+axum.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread"] }

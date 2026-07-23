@@ -1601,6 +1601,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitana-clone"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "cap-std 4.0.2",
+ "gitana-file-store-local",
+ "gitana-object",
+ "gitana-object-store",
+ "gitana-porcelain",
+ "gitana-remote",
+ "gitana-repository",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "gitana-config"
 version = "0.1.0"
 dependencies = [
