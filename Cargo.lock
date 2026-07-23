@@ -1627,6 +1627,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitana-config-native"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gitana-config",
+ "tokio",
+]
+
+[[package]]
 name = "gitana-diff"
 version = "0.1.0"
 
@@ -1907,6 +1916,7 @@ dependencies = [
  "anyhow",
  "cap-std 4.0.2",
  "gitana-config",
+ "gitana-config-native",
  "gitana-diff",
  "gitana-file-store",
  "gitana-file-store-local",

@@ -1,0 +1,22 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "gitana-config-native"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+
+[lints]
+workspace = true
+
+# Native-only: this crate does the ambient path/env I/O that `gitana-config`
+# deliberately abstains from — reading git's system/global/local config files off
+# disk and merging them in git's precedence order. It is the frontend authority
+# `gitana-config` (pure, wasm-portable) leaves out, so it never builds for wasm.
+[dependencies]
+anyhow.workspace = true
+gitana-config.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

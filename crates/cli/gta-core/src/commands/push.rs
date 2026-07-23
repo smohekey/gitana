@@ -69,7 +69,7 @@ pub async fn run(
 	let found = repo::discover(cwd).await?;
 	// git's push-URL selection: `remote.origin.pushurl` (with `insteadOf`) if set, else
 	// `remote.origin.url` with `pushInsteadOf` (falling back to `insteadOf`) — over the merged config.
-	let config = git_config::effective_config_at(&found.git_dir, &found.common_dir).await?;
+	let config = git_config::from_repo(&found.git_dir, &found.common_dir).await?;
 	let url = url_rewrite::resolve_push_url(&config, "origin")?;
 	let remote = RemoteUrl::parse(&url)?;
 	// A credential-free form for display and the push certificate's pushee — *all* userinfo stripped (a

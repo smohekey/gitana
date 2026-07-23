@@ -102,7 +102,7 @@ async fn run_unscoped(cwd: &Path, args: ConfigArgs) -> Result<()> {
 	// A read genuinely outside a repository (`try_discover` → `None`) falls back to the ambient stack;
 	// a *malformed* repository is an error (propagated by `?`), not a fall-through — matching git.
 	if !is_write && crate::repo::try_discover(cwd).await?.is_none() {
-		return emit_reads(&git_config::ambient_effective().await?, &args);
+		return emit_reads(&git_config::from_ambient().await?, &args);
 	}
 	dispatch::on_repo(
 		cwd,

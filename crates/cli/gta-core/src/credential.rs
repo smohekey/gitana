@@ -60,8 +60,8 @@ pub struct CliCredentialProvider {
 }
 
 impl CliCredentialProvider {
-	/// A provider reading from `config` (typically `git_config::effective_config`, or
-	/// `ambient_effective` before a repo exists), resolving a relative askpass helper against `cwd`.
+	/// A provider reading from `config` (typically `git_config::from_repo`, or `from_ambient`
+	/// before a repo exists), resolving a relative askpass helper against `cwd`.
 	/// `cwd` is made absolute up front (against the process directory) so joining a relative askpass
 	/// path against it, *and* running the helper from it, do not compound into a doubled path.
 	pub fn new(config: GitConfig, cwd: PathBuf) -> Self {

@@ -84,7 +84,7 @@ async fn sync(cwd: &Path, expect: Option<String>) -> Result<()> {
 	// The origin URL is `remote.origin.url` with `url.*.insteadOf` applied, read from the merged config.
 	// (`trust sync` both fetches and pushes the trust ref over this one origin; it uses fetch-direction
 	// `insteadOf` rather than `pushInsteadOf`, which would only differ under a push-specific rewrite.)
-	let config = git_config::effective_config_at(&found.git_dir, &found.common_dir).await?;
+	let config = git_config::from_repo(&found.git_dir, &found.common_dir).await?;
 	// `trust sync` transacts over Smart HTTP only (the trust-ref fetch+push composite is HTTP-bound); an
 	// SSH origin is rejected here (`Origin::parse`) rather than silently mis-handled.
 	let origin = Origin::parse(&url_rewrite::resolve_fetch_url(&config, "origin")?)?;

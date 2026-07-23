@@ -45,7 +45,7 @@ pub async fn run(
 	)?;
 	let found = repo::discover(cwd).await?;
 	// The origin URL is `remote.origin.url` with `url.*.insteadOf` applied, read from the merged config.
-	let config = git_config::effective_config_at(&found.git_dir, &found.common_dir).await?;
+	let config = git_config::from_repo(&found.git_dir, &found.common_dir).await?;
 	let url = url_rewrite::resolve_fetch_url(&config, "origin")?;
 	let remote = RemoteUrl::parse(&url)?;
 	// A credential-free form for the "Fetched from" line — *all* userinfo stripped (a token can occupy

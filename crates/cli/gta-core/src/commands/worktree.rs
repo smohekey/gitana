@@ -182,7 +182,7 @@ async fn add(
 	// `core.logAllRefUpdates` gating (git's full precedence stack), as `list` injects it; `committer` carries
 	// the env-aware identity, and `reflog_start` the user's start-point spelling for a new branch's reflog
 	// message (git records the token as named — `branch: Created from HEAD` — not the resolved hash).
-	let effective = crate::git_config::effective_config_for_worktree(common, &found.git_dir).await?;
+	let effective = crate::git_config::for_worktree(common, &found.git_dir).await?;
 	let reflog_start = matches!(checkout_target, CheckoutTarget::NewBranch { .. })
 		.then(|| commit_ish.unwrap_or("HEAD").to_owned());
 	let request = CreateRequest {
@@ -481,8 +481,7 @@ async fn list(cwd: &Path, porcelain: bool) -> Result<()> {
 	// discovered layout still carries that worktree's git dir. The library honours the injected
 	// `core.ignorecase` for its listing order (git sorts linked worktrees by checkout path, case-folded
 	// when `core.ignorecase` is set — typical on macOS/Windows).
-	let effective =
-		crate::git_config::effective_config_for_worktree(&found.common_dir, &found.git_dir).await?;
+	let effective = crate::git_config::for_worktree(&found.common_dir, &found.git_dir).await?;
 	// `core.ignorecase` is a startup `core.*` boolean: git validates every occurrence and aborts on any
 	// malformed value — even one shadowed by a higher-precedence source. The library trusts its injected
 	// config (validation is a property of a git process booting, not of a library answering a query), so

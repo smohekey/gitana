@@ -32,7 +32,7 @@ pub async fn run(
 	// config yet. git rewrites the transport URL this way (so a `git@…`-style alias could even map to
 	// https). The default checkout directory comes from the *original* argument (git's `guess_dir_name`),
 	// not the rewritten URL, in case a rewrite changes the last path segment.
-	let config = git_config::ambient_effective().await?;
+	let config = git_config::from_ambient().await?;
 	let remote = RemoteUrl::parse(&url_rewrite::rewrite_fetch_url(&config, &url)?)?;
 	let target = dir.unwrap_or_else(|| PathBuf::from(default_directory_name(&url)));
 	if target.exists()

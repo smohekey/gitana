@@ -13,6 +13,7 @@ workspace = true
 anyhow.workspace = true
 cap-std.workspace = true
 gitana-config.workspace = true
+gitana-config-native.workspace = true
 gitana-diff.workspace = true
 gitana-file-store.workspace = true
 gitana-file-store-local.workspace = true
