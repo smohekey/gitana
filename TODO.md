@@ -97,6 +97,13 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 
 ## Remote And Protocol Parity
 
+- [ ] Resolve remote-command config against the *worktree-effective* stack. `fetch`/`pull`/`push` (and
+  `trust sync`) read config via `git_config::effective_config_at` (system → global → local), which omits
+  `<gitdir>/config.worktree` — only `effective_config_for_worktree` layers it. So a per-worktree override
+  set with `git config --worktree <key>` (e.g. `core.sshCommand`, `ssh.variant`, `remote.origin.url`,
+  `http.*`) is ignored by the remote commands, unlike git. Pre-existing (predates SSH); surfaced during
+  SSH slice 4. Fix = have the remote handlers assemble config with the worktree layer, taking care that
+  they resolve config before opening the repo. Affects *all* remote config reads, not just SSH.
 - [x] Add HTTP authentication hooks compatible with ordinary Git credential flows. Git's full credential
   flow: a `401 WWW-Authenticate: Basic`/`Bearer` retry with credentials resolved in git's order — URL
   userinfo (password kept out of the saved `remote.origin.url`), `credential.username`, credential
@@ -129,10 +136,14 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   string; `push --signed` works over SSH. Oracle-tested vs stock `git-upload-pack`/`git-receive-pack`
   (sha1+sha256, scp, multi-round). Slice 1 hardened via 8 codex rounds (arg-injection guard
   CVE-2017-1000117, credential redaction, percent-decoding, IPv6 scp, empty-path/empty-repo, stdin
-  close, empty `GIT_SSH_COMMAND`). **Remaining:** the wasm component's SSH path (host-import capability,
-  slice 3); polish (`core.sshCommand` / `GIT_SSH`, plink `-P` variant, Windows drive-letter scp
-  disambiguation). Deferred: `ACK … common` have-pruning (a second-pass optimization — negotiation is
-  correct without it); byte-preserving (non-UTF-8) SSH paths.
+  close, empty `GIT_SSH_COMMAND`). **Slice 4 (ssh-config polish) done:** full command precedence
+  (`GIT_SSH_COMMAND` → `core.sshCommand` → `GIT_SSH` → `ssh`; shell vs program), the port-flag variant
+  (`GIT_SSH_VARIANT` / `ssh.variant` / basename → OpenSSH `-p` / PuTTY `-P` / `simple` errors on a port;
+  the runtime `-G` probe omitted by design), and Windows DOS-drive scp disambiguation (`C:\repo`, via a
+  `cfg(windows)` `has_dos_drive_prefix`). New `SshCommand`/`SshVariant` types + a gta-core resolver.
+  **Remaining:** the wasm component's SSH path (host-import capability, slice 3). Deferred: `ACK … common`
+  have-pruning (a second-pass optimization — negotiation is correct without it); byte-preserving
+  (non-UTF-8) SSH paths.
 - [x] Add `remote` command support for listing, adding, removing, and editing remotes. `gta remote`
   lists the configured remotes (`-v` adds fetch/push URLs); `add <name> <url>` writes the
   `[remote "<name>"]` section with the default fetch refspec; `set-url` retargets it; `remove` drops

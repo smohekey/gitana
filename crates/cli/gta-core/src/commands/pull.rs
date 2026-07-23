@@ -45,7 +45,8 @@ pub async fn run(cwd: &Path) -> Result<()> {
 			pull_dispatch(&mut fetcher, &found, &body, &display, cwd).await
 		}
 		RemoteUrl::Ssh(ssh) => {
-			let connection = SshConnection::open(&ssh, "git-upload-pack", &askpass_cwd).await?;
+			let ssh_cmd = crate::ssh::resolve_ssh_command(&config)?;
+			let connection = SshConnection::open(&ssh, "git-upload-pack", &ssh_cmd, &askpass_cwd).await?;
 			let body = connection.advertisement().to_vec();
 			let mut fetcher = SshPackFetcher::new(connection);
 			pull_dispatch(&mut fetcher, &found, &body, &display, cwd).await

@@ -166,10 +166,14 @@ fn parse_port(port: &str) -> Result<Option<u16>> {
 }
 
 /// The index of the scp separator `:` in `url`, or `None` if `url` is not scp-like. The separator is the
-/// first `:` that comes before any `/` and is not inside a leading `[…]` IPv6 bracket. (Distinguishing a
-/// Windows drive letter — `C:\repo` — is a git wart deferred to a later slice.)
+/// first `:` that comes before any `/` and is not inside a leading `[…]` IPv6 bracket. On Windows a
+/// leading DOS drive prefix (`C:\repo` / `C:/repo`) is a local path, not an scp host, so it is excluded
+/// there (git's `has_dos_drive_prefix`); on other platforms `C:repo` is a valid scp remote (host `C`).
 fn scp_separator(url: &str) -> Option<usize> {
 	if url.contains("://") {
+		return None;
+	}
+	if has_dos_drive_prefix(url) {
 		return None;
 	}
 	// A bracketed IPv6 host may sit at the start or right after a `user@` (git's `@[`); the host/path
@@ -189,6 +193,19 @@ fn scp_separator(url: &str) -> Option<usize> {
 		Some(slash) if slash < colon => None,
 		_ => Some(colon),
 	}
+}
+
+/// Whether `url` begins with a Windows DOS drive prefix (`<letter>:`). Only meaningful on Windows —
+/// there `C:\repo` is a local path, not the scp remote `C:repo` — so it is always `false` elsewhere.
+#[cfg(windows)]
+fn has_dos_drive_prefix(url: &str) -> bool {
+	let bytes = url.as_bytes();
+	bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+#[cfg(not(windows))]
+fn has_dos_drive_prefix(_url: &str) -> bool {
+	false
 }
 
 #[cfg(test)]
@@ -344,5 +361,23 @@ mod tests {
 		assert_eq!(scp_separator("/local/path"), None);
 		// Bracketed IPv6 scp.
 		assert_eq!(scp_separator("[::1]:repo.git"), Some(5));
+	}
+
+	#[test]
+	#[cfg(not(windows))]
+	fn drive_letter_is_scp_off_windows() {
+		// Off Windows, `C:/repo` is the scp remote `C:/repo` (host `C`) — matching git, which only
+		// treats a DOS drive prefix as a local path on Windows.
+		assert_eq!(scp_separator("C:/repo"), Some(1));
+		assert!(SshRemote::is_scp_like("C:/repo"));
+	}
+
+	#[test]
+	#[cfg(windows)]
+	fn drive_letter_is_a_local_path_on_windows() {
+		// On Windows `C:\repo` / `C:/repo` is a local path, not the scp remote `C:repo`.
+		assert_eq!(scp_separator("C:/repo"), None);
+		assert_eq!(scp_separator("C:\\repo"), None);
+		assert!(!SshRemote::is_scp_like("C:/repo"));
 	}
 }

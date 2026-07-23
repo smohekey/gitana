@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-use crate::{Connection, SshRemote};
+use crate::{Connection, SshCommand, SshCommandKind, SshRemote, SshVariant};
 
 /// A single SSH session: spawn `ssh …host git-<service> '<path>'`, read the ref advertisement the
 /// remote sends on connect, then exchange the pack negotiation over the child's stdin/stdout. Like git,
@@ -27,11 +27,18 @@ pub struct SshConnection {
 
 impl SshConnection {
 	/// Open a connection to `service` (`git-upload-pack` / `git-receive-pack`) on `remote`, reading the
-	/// ref advertisement the server sends immediately after the remote command starts. `cwd` is the
-	/// directory the `ssh` subprocess runs from (git runs ssh from the command's working directory), so a
-	/// relative `GIT_SSH_COMMAND` or key path resolves against `gta`'s effective `-C` directory.
-	pub async fn open(remote: &SshRemote, service: &str, cwd: &Path) -> Result<Self> {
-		let mut command = ssh_command(remote, service)?;
+	/// ref advertisement the server sends immediately after the remote command starts. `ssh` is the
+	/// caller-resolved [`SshCommand`] (git's `GIT_SSH_COMMAND` / `core.sshCommand` / `GIT_SSH` precedence
+	/// and the port-flag [`SshVariant`]). `cwd` is the directory the subprocess runs from (git runs ssh
+	/// from the command's working directory), so a relative command or key path resolves against `gta`'s
+	/// effective `-C` directory.
+	pub async fn open(
+		remote: &SshRemote,
+		service: &str,
+		ssh: &SshCommand,
+		cwd: &Path,
+	) -> Result<Self> {
+		let mut command = ssh_command(ssh, remote, service)?;
 		command.current_dir(cwd);
 		command.stdin(Stdio::piped()).stdout(Stdio::piped());
 		// Reap the ssh process if the connection is dropped before the exchange completes (e.g. the
@@ -223,48 +230,83 @@ impl Connection for SshConnection {
 	}
 }
 
-/// Build the `ssh` invocation for `service` on `remote`. Program resolution follows a subset of git's
-/// precedence: `GIT_SSH_COMMAND` (a shell snippet) then the `ssh` binary on `PATH`. (`core.sshCommand`,
-/// `GIT_SSH`, and the PuTTY/plink `-P` port variant are a later slice.) The remote command is
-/// `git-<service> '<path>'` with the path single-quoted for the remote shell, matching git.
-fn ssh_command(remote: &SshRemote, service: &str) -> Result<Command> {
+/// Build the `ssh` invocation for `service` on `remote` from the resolved [`SshCommand`]. A shell
+/// command runs as `sh -c '<cmd> "$@"' ssh <args>`; a program runs directly. The port flag follows the
+/// [`SshVariant`]: `-p` for OpenSSH, `-P` for the PuTTY family, and none for `simple` (which errors if a
+/// port is set). The remote command is `git-<service> '<path>'`, the path single-quoted for the remote
+/// shell, matching git.
+fn ssh_command(ssh: &SshCommand, remote: &SshRemote, service: &str) -> Result<Command> {
+	if remote.port.is_some() && ssh.variant == SshVariant::Simple {
+		bail!("ssh variant 'simple' does not support setting a port");
+	}
 	let remote_command = format!("{service} {}", sq_quote(&remote.path));
 	let target = match &remote.user {
 		Some(user) => format!("{user}@{}", remote.host),
 		None => remote.host.clone(),
 	};
 
-	let mut command = match std::env::var_os("GIT_SSH_COMMAND") {
-		// git treats an explicitly *empty* `GIT_SSH_COMMAND` as authoritative and fails rather than
-		// falling back to `ssh` — so an env set to disable ssh never makes an unexpected connection.
-		Some(ssh_command) if ssh_command.is_empty() => {
-			bail!("GIT_SSH_COMMAND is set but empty");
+	let mut command = match &ssh.kind {
+		// git treats an explicitly *empty* command as authoritative and fails rather than falling back to
+		// `ssh` — so a `GIT_SSH_COMMAND=` / `core.sshCommand=` / `GIT_SSH=` set to disable ssh never makes
+		// an unexpected connection.
+		SshCommandKind::Shell(command) if command.is_empty() => {
+			bail!("the ssh command is set but empty");
 		}
-		Some(ssh_command) => {
-			// git runs the custom command through a shell: `sh -c '<cmd> "$@"' <cmd> <ssh args…>`.
-			let mut command = Command::new("sh");
-			command.arg("-c");
-			command.arg(format!("{} \"$@\"", ssh_command.to_string_lossy()));
-			command.arg("ssh");
-			push_ssh_args(&mut command, remote.port, &target, &remote_command);
-			command
+		SshCommandKind::Program(program) if program.is_empty() => {
+			bail!("the ssh command is set but empty");
 		}
-		None => {
-			let mut command = Command::new("ssh");
-			push_ssh_args(&mut command, remote.port, &target, &remote_command);
-			command
+		SshCommandKind::Shell(command) => {
+			// git runs the custom command through a shell: `sh -c '<cmd> "$@"' ssh <ssh args…>`.
+			let mut process = Command::new("sh");
+			process.arg("-c");
+			process.arg(format!("{command} \"$@\""));
+			process.arg("ssh");
+			push_ssh_args(
+				&mut process,
+				ssh.variant,
+				remote.port,
+				&target,
+				&remote_command,
+			);
+			process
+		}
+		SshCommandKind::Program(program) => {
+			let mut process = Command::new(program);
+			push_ssh_args(
+				&mut process,
+				ssh.variant,
+				remote.port,
+				&target,
+				&remote_command,
+			);
+			process
 		}
 	};
 	// gitana speaks Git protocol v0 only. We never send `-o SendEnv=GIT_PROTOCOL`, so a plain `ssh`
-	// won't forward the variable, but a `GIT_SSH_COMMAND` wrapper that runs upload-pack directly would
-	// inherit it — clear it so an ambient `GIT_PROTOCOL=version=2` can't make the server answer in v2.
+	// won't forward the variable, but a shell command that runs upload-pack directly would inherit it —
+	// clear it so an ambient `GIT_PROTOCOL=version=2` can't make the server answer in v2.
 	command.env_remove("GIT_PROTOCOL");
 	Ok(command)
 }
 
-fn push_ssh_args(command: &mut Command, port: Option<u16>, target: &str, remote_command: &str) {
+fn push_ssh_args(
+	command: &mut Command,
+	variant: SshVariant,
+	port: Option<u16>,
+	target: &str,
+	remote_command: &str,
+) {
+	// TortoisePlink runs `-batch` so an unattended fetch/push never blocks on an interactive dialog.
+	if variant == SshVariant::TortoisePlink {
+		command.arg("-batch");
+	}
 	if let Some(port) = port {
-		command.arg("-p").arg(port.to_string());
+		// OpenSSH uses `-p`, the PuTTY family `-P`; `simple` was rejected above.
+		let flag = match variant {
+			SshVariant::Putty | SshVariant::TortoisePlink => "-P",
+			_ => "-p",
+		};
+		command.arg(flag).arg(port.to_string());
 	}
 	command.arg(target);
 	command.arg(remote_command);

@@ -91,11 +91,13 @@ Major gaps:
 - Remote transport supports HTTP(S) Smart HTTP remotes and **SSH** —
   `gta clone` / `fetch` / `pull` / `push` all speak it (`ssh://[user@]host[:port]/path`,
   the `git+ssh://` / `ssh+git://` aliases, and the scp-like `[user@]host:path`).
-  Like git, gitana drives the user's `ssh` binary (honouring `GIT_SSH_COMMAND`)
-  rather than linking an SSH stack — so it is native-only (the wasm component stays
-  HTTP-only). `fetch`/`pull` run git's stateful `multi_ack_detailed` negotiation over
-  the ssh stream; `push` (including `--signed`) sends receive-pack over it. Other URL
-  schemes (`git://`, `file://`) are unsupported.
+  Like git, gitana drives the user's `ssh` binary rather than linking an SSH stack —
+  so it is native-only (the wasm component stays HTTP-only). The command is resolved
+  with git's precedence (`GIT_SSH_COMMAND` → `core.sshCommand` → `GIT_SSH` → `ssh`),
+  and the port flag follows the variant (`GIT_SSH_VARIANT` / `ssh.variant` / basename:
+  `-p` for OpenSSH, `-P` for the PuTTY family). `fetch`/`pull` run git's stateful
+  `multi_ack_detailed` negotiation over the ssh stream; `push` (including `--signed`)
+  sends receive-pack over it. Other URL schemes (`git://`, `file://`) are unsupported.
 - Object storage now uses pack `.idx` and a multi-pack-index for lookup. `gta repack`
   consolidates into size-bounded packs (honoring `pack.packSizeLimit`); `gta gc` prunes,
   repacks *incrementally* (git's geometric strategy — keeping the large packs, as does
@@ -174,10 +176,12 @@ Implemented command groups:
   enforcing fast-forward for non-forced refspecs. A refspec that would write a branch checked out in
   any worktree — the current one or a linked one — is refused, as git does. `clone`/`fetch`/`pull`/`push`
   all also speak the SSH transport (`ssh://`, `git+ssh://` / `ssh+git://`, and scp-like
-  `[user@]host:path`), running the user's `ssh` binary (git's `GIT_SSH_COMMAND`, `~/.ssh/config`, agent,
-  known-hosts) to invoke `git-upload-pack` / `git-receive-pack` on the remote — a dash-leading host/path
-  is refused (git's CVE-2017-1000117 guard). `fetch`/`pull` run git's stateful `multi_ack_detailed`
-  negotiation over the ssh stream; `push` (and `push --signed`) sends receive-pack over it.
+  `[user@]host:path`), running the user's `ssh` (resolved with git's `GIT_SSH_COMMAND` → `core.sshCommand`
+  → `GIT_SSH` → `ssh` precedence, `~/.ssh/config` / agent / known-hosts, and the `-p`/`-P` port flag per
+  the OpenSSH/PuTTY variant) to invoke `git-upload-pack` / `git-receive-pack` on the remote — a
+  dash-leading host/path is refused (git's CVE-2017-1000117 guard). `fetch`/`pull` run git's stateful
+  `multi_ack_detailed` negotiation over the ssh stream; `push` (and `push --signed`) sends receive-pack
+  over it.
 - HTTP authentication, matching git's credential flow: a remote that answers `401 WWW-Authenticate:
   Basic` is retried once with an `Authorization: Basic` header. Credentials resolve in git's order —
   URL userinfo (`https://user:pass@host`, with the password kept out of the saved `remote.origin.url`),

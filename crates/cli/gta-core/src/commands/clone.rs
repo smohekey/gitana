@@ -93,9 +93,12 @@ pub async fn run(
 		}
 		RemoteUrl::Ssh(ssh) => {
 			// SSH sends the ref advertisement on connect — no separate GET — so opening the connection
-			// yields it directly. gitana drives the user's `ssh` binary (no linked SSH stack), run from the
-			// effective command directory so a relative `GIT_SSH_COMMAND` / key resolves as git's would.
-			let mut connection = SshConnection::open(&ssh, "git-upload-pack", &command_cwd).await?;
+			// yields it directly. gitana drives the user's `ssh` (resolved from git's `GIT_SSH_COMMAND` /
+			// `core.sshCommand` / `GIT_SSH` precedence and variant), run from the effective command
+			// directory so a relative command / key resolves as git's would.
+			let ssh_cmd = crate::ssh::resolve_ssh_command(&config)?;
+			let mut connection =
+				SshConnection::open(&ssh, "git-upload-pack", &ssh_cmd, &command_cwd).await?;
 			let kind = transport::negotiated_kind(connection.advertisement())?;
 			create_skeleton(&git_dir)?;
 			clone_over(

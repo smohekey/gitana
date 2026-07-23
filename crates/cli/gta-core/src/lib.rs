@@ -15,6 +15,7 @@ mod prompt;
 mod repo;
 mod shallow;
 mod signer;
+mod ssh;
 mod url_rewrite;
 
 pub use credential::{CliCredentialProvider, transport_for};

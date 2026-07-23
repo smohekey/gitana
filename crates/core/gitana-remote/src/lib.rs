@@ -26,10 +26,14 @@ mod remote_url;
 #[cfg(feature = "reqwest-transport")]
 mod reqwest_transport;
 #[cfg(feature = "ssh-transport")]
+mod ssh_command;
+#[cfg(feature = "ssh-transport")]
 mod ssh_connection;
 #[cfg(feature = "ssh-transport")]
 mod ssh_pack_fetcher;
 mod ssh_remote;
+#[cfg(feature = "ssh-transport")]
+mod ssh_variant;
 mod unauthenticated;
 
 pub use auth_transport::AuthTransport;
@@ -49,10 +53,16 @@ pub use remote_url::RemoteUrl;
 #[cfg(feature = "reqwest-transport")]
 pub use reqwest_transport::ReqwestTransport;
 #[cfg(feature = "ssh-transport")]
+pub use ssh_command::SshCommand;
+#[cfg(feature = "ssh-transport")]
+pub(crate) use ssh_command::SshCommandKind;
+#[cfg(feature = "ssh-transport")]
 pub use ssh_connection::SshConnection;
 #[cfg(feature = "ssh-transport")]
 pub use ssh_pack_fetcher::SshPackFetcher;
 pub use ssh_remote::SshRemote;
+#[cfg(feature = "ssh-transport")]
+pub use ssh_variant::SshVariant;
 pub use unauthenticated::Unauthenticated;
 
 use std::collections::HashMap;
