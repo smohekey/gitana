@@ -418,9 +418,13 @@ pub async fn fetch_pack<H: HashAlgorithm>(
 	// single final round (`done`) carrying the ref-tip haves and the current boundary.
 	if !deepen.is_empty() || !shallow.is_empty() {
 		let request = build_upload_pack_request(wants, haves, &shallow, deepen, include_tag, true);
-		let response = post_upload_pack(transport, origin, request).await?;
+		// Box the two heavy sub-futures — the HTTP round-trip (a large reqwest/TLS future) and the pack
+		// store (decode + write) — so this function's future does not inline their state. Composed by
+		// value they telescope up the whole `fetch_url → … → fetch_pack` chain into one multi-megabyte
+		// future that overflows a default (2 MB) worker-thread stack when polled; boxing heaps each stage.
+		let response = Box::pin(post_upload_pack(transport, origin, request)).await?;
 		let response = parse_upload_pack_response::<H>(&response)?;
-		return store_response(repo, &shallow, response).await;
+		return Box::pin(store_response(repo, &shallow, response)).await;
 	}
 
 	// A plain fetch negotiates: offer local commits (walked back from the ref-tip `haves`) in batches,
@@ -437,10 +441,11 @@ pub async fn fetch_pack<H: HashAlgorithm>(
 			offered.extend(remaining.drain(..batch));
 		}
 		let request = build_upload_pack_request(wants, &offered, &[], deepen, include_tag, done);
-		let response = post_upload_pack(transport, origin, request).await?;
+		// Box the heavy sub-futures — see the shallow-path note above.
+		let response = Box::pin(post_upload_pack(transport, origin, request)).await?;
 		let response = parse_upload_pack_response::<H>(&response)?;
 		if !response.pack.is_empty() {
-			return store_response(repo, &shallow, response).await;
+			return Box::pin(store_response(repo, &shallow, response)).await;
 		}
 		// A negotiation round carried only acknowledgments. Once we have sent `done`, the server owed us a
 		// pack — an empty body is a server-side failure (e.g. `git http-backend` exiting after the headers).
