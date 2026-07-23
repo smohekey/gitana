@@ -19,12 +19,44 @@ use cap_std::fs::Dir;
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
-use gitana_porcelain::Deepen;
 use gitana_remote::{
-	self as remote, AuthTransport, Connection, CredentialProvider, HttpConnection, RemoteUrl,
-	ReqwestTransport,
+	self as remote, AuthTransport, Connection, HttpConnection, RemoteUrl, ReqwestTransport,
 };
 use gitana_repository::Repository;
+
+// Re-export the vocabulary [`clone_url`]'s signature exposes, so a consumer speaks to this crate alone
+// rather than reaching into `gitana-porcelain` and `gitana-remote` to name a `Deepen` or implement a
+// `CredentialProvider`.
+pub use gitana_porcelain::Deepen;
+pub use gitana_remote::{Credential, CredentialProvider, CredentialRequest, Filled};
+
+/// A [`CredentialProvider`] that never supplies a credential — an anonymous clone. Public
+/// repositories clone; a private one fails with an authentication error. A consumer wanting
+/// authenticated access supplies its own provider (e.g. one reading the OS credential store).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Anonymous;
+
+impl CredentialProvider for Anonymous {
+	async fn fill(&self, _request: &CredentialRequest) -> Result<Option<Filled>, anyhow::Error> {
+		Ok(None)
+	}
+
+	async fn approve(
+		&self,
+		_request: &CredentialRequest,
+		_credential: &Credential,
+	) -> Result<(), anyhow::Error> {
+		Ok(())
+	}
+
+	async fn reject(
+		&self,
+		_request: &CredentialRequest,
+		_credential: &Credential,
+	) -> Result<(), anyhow::Error> {
+		Ok(())
+	}
+}
 
 /// Clone the repository at `url` into `destination`, authenticating through `credentials`.
 ///
@@ -217,34 +249,7 @@ pub enum CloneError {
 
 #[cfg(test)]
 mod tests {
-	use gitana_remote::{Credential, CredentialRequest, Filled};
-
 	use super::*;
-
-	/// A provider that never supplies a credential — an anonymous clone.
-	struct Anonymous;
-
-	impl CredentialProvider for Anonymous {
-		async fn fill(&self, _request: &CredentialRequest) -> anyhow::Result<Option<Filled>> {
-			Ok(None)
-		}
-
-		async fn approve(
-			&self,
-			_request: &CredentialRequest,
-			_credential: &Credential,
-		) -> anyhow::Result<()> {
-			Ok(())
-		}
-
-		async fn reject(
-			&self,
-			_request: &CredentialRequest,
-			_credential: &Credential,
-		) -> anyhow::Result<()> {
-			Ok(())
-		}
-	}
 
 	#[tokio::test]
 	async fn an_ssh_url_is_unsupported() {

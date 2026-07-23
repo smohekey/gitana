@@ -14,36 +14,9 @@ use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use gitana_clone::{CloneError, clone_url};
-use gitana_porcelain::Deepen;
-use gitana_remote::{Credential, CredentialProvider, CredentialRequest, Filled};
+use gitana_clone::{Anonymous, CloneError, Deepen, clone_url};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-
-/// A provider that never supplies a credential — an anonymous clone.
-struct Anonymous;
-
-impl CredentialProvider for Anonymous {
-	async fn fill(&self, _request: &CredentialRequest) -> anyhow::Result<Option<Filled>> {
-		Ok(None)
-	}
-
-	async fn approve(
-		&self,
-		_request: &CredentialRequest,
-		_credential: &Credential,
-	) -> anyhow::Result<()> {
-		Ok(())
-	}
-
-	async fn reject(
-		&self,
-		_request: &CredentialRequest,
-		_credential: &Credential,
-	) -> anyhow::Result<()> {
-		Ok(())
-	}
-}
 
 fn git_try(dir: &Path, args: &[&str]) -> Output {
 	Command::new("git")

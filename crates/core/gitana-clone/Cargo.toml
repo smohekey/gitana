@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 cap-std.workspace = true
 gitana-file-store-local.workspace = true
 gitana-object.workspace = true
@@ -17,7 +18,6 @@ gitana-repository.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-anyhow.workspace = true
 axum.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread"] }
