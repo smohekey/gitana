@@ -125,15 +125,29 @@ impl CheckoutSafety {
 	}
 }
 
+/// A local ref whose commit no remote-tracking ref contains — a branch tip, local tag, or detached
+/// `HEAD` carrying work that is not on any remote. The *remote* half of the delete-safety judgement
+/// [`CheckoutSafety`] deliberately omits (see [`unpushed_refs`](fn.unpushed_refs.html)): a checkout is
+/// safe to remove only when this set is empty, i.e. every local commit is pushed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnpushedRef {
+	/// The full ref name (`refs/heads/…`, `refs/tags/…`), or `HEAD` for a detached head.
+	pub name: String,
+	/// The commit the ref resolves to (hex) that no `refs/remotes/…` ref contains. A tag or `HEAD`
+	/// whose target could not be read or is not a commit is reported here too, its raw target id given.
+	pub commit: String,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
 	use super::*;
 
 	use std::path::Path;
 
-	use gitana_object::{HashKind, ObjectId, Sha1, Sha256};
+	use gitana_file_store::FileStore;
+	use gitana_object::{HashAlgorithm, HashKind, ObjectId, ObjectKind, Sha1, Sha256, parse_tag};
 	use gitana_object_store::ObjectStore;
-	use gitana_repository::Repository;
+	use gitana_repository::{HeadState, Repository};
 	use gitana_worktree::WorkTree;
 
 	use crate::WorktreeObjectId;
@@ -222,6 +236,99 @@ mod native {
 		let git_dir = resolve_live_worktree_git_dir(repo, destination)?;
 		safety_at(&git_dir, repo.common_dir(), destination).await
 	}
+
+	/// The local refs of `repo` whose commit no remote-tracking ref contains — the *remote* half of the
+	/// delete-safety judgement [`checkout_safety`] omits. A branch tip (`refs/heads/…`), a local tag
+	/// (`refs/tags/…`, peeled to the commit it names), and a detached `HEAD` must each be reachable from
+	/// some `refs/remotes/…` ref; any that is not is returned, so a caller can keep the checkout and name
+	/// the work at risk. An **empty** result means every local commit is pushed — the checkout is
+	/// removable as far as the remote is concerned.
+	///
+	/// Judge this against **freshly-fetched** remote-tracking refs: a stale `refs/remotes/…` can assert
+	/// reachability for a branch since deleted upstream, and trusting it would drop the last copy of real
+	/// work. With no remote-tracking refs at all, nothing is provably pushed, so every local ref is
+	/// returned. A tag or `HEAD` whose target cannot be read or is not a commit is reported (kept), never
+	/// silently treated as pushed.
+	pub async fn unpushed_refs(repo: &RepositoryId) -> Result<Vec<UnpushedRef>, LinkedWorktreeError> {
+		let store = open_store_raw(repo.common_dir(), repo.common_dir())?;
+		match detect_kind(&store).await? {
+			HashKind::Sha1 => {
+				unpushed_refs_at(&Repository::<_, Sha1>::new(ObjectStore::new(store))).await
+			}
+			HashKind::Sha256 => {
+				unpushed_refs_at(&Repository::<_, Sha256>::new(ObjectStore::new(store))).await
+			}
+		}
+	}
+
+	async fn unpushed_refs_at<F: FileStore, H: HashAlgorithm>(
+		repo: &Repository<F, H>,
+	) -> Result<Vec<UnpushedRef>, LinkedWorktreeError> {
+		let refs = repo.refs();
+		let remote_tips: Vec<ObjectId<H>> = refs
+			.list("refs/remotes/")
+			.await?
+			.into_iter()
+			.map(|(_, oid)| oid)
+			.collect();
+
+		// The local commits that must each be reachable from a remote tip. Tags are peeled to the commit
+		// they ultimately name; a detached HEAD adds a tip no `refs/heads/` entry covers.
+		let mut local: Vec<(String, ObjectId<H>)> = refs.list("refs/heads/").await?;
+		let mut unpushed: Vec<UnpushedRef> = Vec::new();
+		for (name, target) in refs.list("refs/tags/").await? {
+			match peel_to_commit(repo, target).await {
+				Some(commit) => local.push((name, commit)),
+				// A tag on a non-commit, or one we cannot read, cannot be shown pushed: keep it.
+				None => unpushed.push(UnpushedRef {
+					name,
+					commit: target.to_hex(),
+				}),
+			}
+		}
+		if let HeadState::Detached(oid) = refs.read_head().await? {
+			local.push(("HEAD".to_owned(), oid));
+		}
+
+		for (name, tip) in local {
+			let mut pushed = false;
+			for remote in &remote_tips {
+				if repo.is_ancestor(tip, *remote).await? {
+					pushed = true;
+					break;
+				}
+			}
+			if !pushed {
+				unpushed.push(UnpushedRef {
+					name,
+					commit: tip.to_hex(),
+				});
+			}
+		}
+		unpushed.sort();
+		Ok(unpushed)
+	}
+
+	/// Follow a tag target to the commit it names, through a chain of annotated tags. `None` if the
+	/// target is not a commit (a tag on a tree/blob) or cannot be read — either way it is not shown
+	/// pushed. Bounded against a pathological tag cycle.
+	async fn peel_to_commit<F: FileStore, H: HashAlgorithm>(
+		repo: &Repository<F, H>,
+		mut oid: ObjectId<H>,
+	) -> Option<ObjectId<H>> {
+		for _ in 0..MAX_TAG_PEEL_DEPTH {
+			let (kind, data) = repo.objects().read_object(&oid).await.ok()?;
+			match kind {
+				ObjectKind::Commit => return Some(oid),
+				ObjectKind::Tag => oid = parse_tag::<H>(&data).ok()?.object,
+				_ => return None,
+			}
+		}
+		None
+	}
+
+	/// A tag chain deeper than this is treated as unresolvable — far beyond any real annotated-tag nesting.
+	const MAX_TAG_PEEL_DEPTH: usize = 16;
 
 	/// Open the checkout at `destination` against its per-worktree `git_dir` and the shared `common`, and
 	/// read its working-tree status plus the repository-state signals. The caller has already established
@@ -727,7 +834,7 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{checkout_safety, status};
+pub use native::{checkout_safety, status, unpushed_refs};
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use native::{
 	diverged_tracked_content_paths, first_unreachable_admin_anchor, is_sparse_index,

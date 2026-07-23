@@ -70,7 +70,7 @@ pub use remove_policy::RemovePolicy;
 pub use remove_request::RemoveRequest;
 pub use repo_id::RepositoryId;
 pub use request::{CheckoutTarget, CreateRequest};
-pub use status::{CheckoutSafety, WorktreeStatusReport};
+pub use status::{CheckoutSafety, UnpushedRef, WorktreeStatusReport};
 pub use worktree_context::WorktreeContext;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -82,4 +82,4 @@ pub use inspect::inspect;
 #[cfg(not(target_arch = "wasm32"))]
 pub use remove::remove;
 #[cfg(not(target_arch = "wasm32"))]
-pub use status::{checkout_safety, status};
+pub use status::{checkout_safety, status, unpushed_refs};
