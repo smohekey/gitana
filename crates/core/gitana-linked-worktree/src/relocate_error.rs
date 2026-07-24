@@ -53,14 +53,6 @@ pub enum RelocateError {
 	#[error("cannot relocate a worktree that encloses the repository git dir: {}", .0.display())]
 	EnclosesRepository(PathBuf),
 
-	/// `from` contains submodules. Moving the checkout would leave each submodule's absorbed administration
-	/// pointing at the old working-tree path, breaking git commands inside the moved submodule — git's own
-	/// `worktree move` refuses this, and so does this safe surface. (A conservative refusal: any worktree that
-	/// *declares* submodules via a tracked `.gitmodules` is refused, not only those with initialized ones.)
-	/// Carries `from`.
-	#[error("cannot relocate a worktree that contains submodules: {}", .0.display())]
-	HasSubmodules(PathBuf),
-
 	/// A move step ran but the worktree is now neither fully at `from` nor fully at `to` — a partial move (or
 	/// a concurrent change) a caller must inspect and retry. Carries the observed post-state of `from`. (A
 	/// relocate never reports success for a state it did not fully establish.)

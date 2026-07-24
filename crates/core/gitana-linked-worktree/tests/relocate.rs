@@ -22,11 +22,22 @@ fn req(
 	to: &std::path::Path,
 	branch: Option<&str>,
 ) -> RelocateRequest {
+	req_force(work, from, to, branch, 0)
+}
+
+fn req_force(
+	work: &std::path::Path,
+	from: &std::path::Path,
+	to: &std::path::Path,
+	branch: Option<&str>,
+	force: u8,
+) -> RelocateRequest {
 	RelocateRequest {
 		repo: rid_at(work),
 		from: from.to_path_buf(),
 		to: to.to_path_buf(),
 		expected_branch: branch.map(BranchName::new),
+		force,
 	}
 }
 
@@ -333,42 +344,10 @@ async fn relocate_refuses_a_destination_with_a_stale_registration() {
 }
 
 #[tokio::test]
-async fn relocate_refuses_a_worktree_with_submodules() {
-	// A worktree declaring submodules cannot be moved safely (the rename would strand each submodule's
-	// absorbed admin) — git refuses it, and so does relocate.
-	let base = unique_tmp("relocate-submod");
-	let work = base.join("repo");
-	init_repo(&work, "sha1");
-	commit_file(&work, "a.txt", "1\n", "init");
-	let from = base.join("from");
-	git(&[
-		"-C",
-		work.to_str().unwrap(),
-		"worktree",
-		"add",
-		"-b",
-		"feature",
-		from.to_str().unwrap(),
-	]);
-	std::fs::write(
-		from.join(".gitmodules"),
-		"[submodule \"x\"]\n\tpath = x\n\turl = ./x\n",
-	)
-	.unwrap();
-
-	let to = base.join("to");
-	let err = relocate(&req(&work, &from, &to, None))
-		.await
-		.expect_err("refuses submodules");
-	assert!(matches!(err, RelocateError::HasSubmodules(_)));
-	assert!(from.exists() && !to.exists(), "nothing was moved");
-}
-
-#[tokio::test]
-async fn relocate_normalises_a_relative_checkout_pointer_across_depths() {
+async fn relocate_preserves_a_relative_checkout_pointer_across_depths() {
 	// A worktree with a *relative* checkout `.git` (git's `worktree.useRelativePaths`) breaks if moved to a
-	// different depth unless the pointer is rewritten. relocate normalises it to absolute, so git works at the
-	// new location.
+	// different depth unless the pointer is recomputed. relocate preserves the relative style, recomputing it
+	// for the new depth, so git works at the new location.
 	let base = unique_tmp("relocate-relative");
 	let work = base.join("repo");
 	init_repo(&work, "sha1");
@@ -418,8 +397,56 @@ async fn relocate_normalises_a_relative_checkout_pointer_across_depths() {
 	assert!(
 		std::fs::read_to_string(nested.join(".git"))
 			.unwrap()
-			.starts_with("gitdir: /"),
-		"the checkout pointer was normalised to absolute",
+			.starts_with("gitdir: .."),
+		"the checkout pointer stayed relative, recomputed for the new depth",
+	);
+}
+
+#[tokio::test]
+async fn relocate_force_drops_a_stale_destination_registration() {
+	// With force, a destination registered to a since-deleted (prunable) worktree is moved onto — the stale
+	// registration is dropped, so the repository never ends up with two admins for one checkout path.
+	let base = unique_tmp("relocate-force-stale");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+
+	let to = base.join("to");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"a",
+		to.to_str().unwrap(),
+	]);
+	std::fs::remove_dir_all(&to).unwrap(); // prunable registration naming `to`
+
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	relocate(&req_force(&work, &from, &to, None, 1))
+		.await
+		.expect("force move onto stale dest");
+	assert_eq!(
+		g(&["-C", to.to_str().unwrap(), "symbolic-ref", "HEAD"]),
+		"refs/heads/feature"
+	);
+	// Exactly one registration remains for the destination (the moved worktree); git lists it once.
+	let listed = git_listed_paths(&work);
+	assert_eq!(
+		listed.iter().filter(|p| p.ends_with("/to")).count(),
+		1,
+		"no duplicate registration for the destination",
 	);
 }
 
