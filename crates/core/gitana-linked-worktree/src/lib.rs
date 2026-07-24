@@ -31,6 +31,9 @@ mod facts;
 mod inspect;
 mod object_id;
 mod query;
+mod relocate_error;
+mod relocate_outcome;
+mod relocate_request;
 mod remove_error;
 mod remove_outcome;
 mod remove_policy;
@@ -51,6 +54,8 @@ mod pointers;
 #[cfg(not(target_arch = "wasm32"))]
 mod registration_lock;
 #[cfg(not(target_arch = "wasm32"))]
+mod relocate;
+#[cfg(not(target_arch = "wasm32"))]
 mod remove;
 
 pub use classify::{ProtectionReason, WorktreeClassification, classify};
@@ -64,6 +69,9 @@ pub use inspect::{
 };
 pub use object_id::WorktreeObjectId;
 pub use query::{BranchName, WorktreeQuery};
+pub use relocate_error::RelocateError;
+pub use relocate_outcome::RelocateOutcome;
+pub use relocate_request::RelocateRequest;
 pub use remove_error::RemoveError;
 pub use remove_outcome::RemoveOutcome;
 pub use remove_policy::RemovePolicy;
@@ -79,6 +87,8 @@ pub use create::create;
 pub use enumerate::enumerate;
 #[cfg(not(target_arch = "wasm32"))]
 pub use inspect::inspect;
+#[cfg(not(target_arch = "wasm32"))]
+pub use relocate::relocate;
 #[cfg(not(target_arch = "wasm32"))]
 pub use remove::remove;
 #[cfg(not(target_arch = "wasm32"))]

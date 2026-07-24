@@ -1,0 +1,310 @@
+//! Safe move of a linked worktree, oracle-checked against stock `git worktree move`/`list` and by having
+//! stock `git` operate on the worktree before/after, over SHA-1 and SHA-256.
+#![cfg(unix)]
+
+mod common;
+
+use common::*;
+use gitana_linked_worktree::{
+	BranchName, ProtectionReason, RelocateError, RelocateOutcome, RelocateRequest,
+	WorktreeClassification, relocate,
+};
+
+/// `git`, trimmed — the shared `common::git` returns raw stdout (trailing newline), so trim for value
+/// comparisons against hashes/refs.
+fn g(args: &[&str]) -> String {
+	git(args).trim().to_owned()
+}
+
+fn req(
+	work: &std::path::Path,
+	from: &std::path::Path,
+	to: &std::path::Path,
+	branch: Option<&str>,
+) -> RelocateRequest {
+	RelocateRequest {
+		repo: rid_at(work),
+		from: from.to_path_buf(),
+		to: to.to_path_buf(),
+		expected_branch: branch.map(BranchName::new),
+	}
+}
+
+/// The single admin id under `<work>/.git/worktrees` (the `git worktree` id). Panics unless exactly one
+/// linked worktree is registered — the fixtures here register exactly one.
+fn admin_id(work: &std::path::Path) -> String {
+	let dir = work.join(".git").join("worktrees");
+	let mut ids: Vec<_> = std::fs::read_dir(&dir)
+		.expect("worktrees dir")
+		.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+		.collect();
+	assert_eq!(ids.len(), 1, "exactly one registered worktree");
+	ids.pop().unwrap()
+}
+
+/// The canonical checkout paths stock `git worktree list --porcelain` reports (the primary first).
+fn git_listed_paths(work: &std::path::Path) -> Vec<String> {
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"list",
+		"--porcelain",
+	])
+	.lines()
+	.filter_map(|l| l.strip_prefix("worktree "))
+	.map(str::to_owned)
+	.collect()
+}
+
+#[tokio::test]
+async fn relocate_moves_the_checkout_and_git_agrees() {
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("relocate-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+
+		// Build the worktree the oracle way: stock `git worktree add -b feature <from>`.
+		let from = base.join("from");
+		git(&[
+			"-C",
+			work.to_str().unwrap(),
+			"worktree",
+			"add",
+			"-b",
+			"feature",
+			from.to_str().unwrap(),
+		]);
+		let id_before = admin_id(&work);
+
+		let to = base.join("to");
+		let outcome = relocate(&req(&work, &from, &to, None))
+			.await
+			.expect("relocate");
+		assert_eq!(
+			outcome,
+			RelocateOutcome::Relocated {
+				from: from.clone(),
+				to: to.clone(),
+			}
+		);
+
+		// The checkout moved; the old path is gone, the new one is a working checkout.
+		assert!(!from.exists(), "old checkout path gone");
+		assert_eq!(g(&["-C", to.to_str().unwrap(), "rev-parse", "HEAD"]), head);
+		assert_eq!(
+			g(&["-C", to.to_str().unwrap(), "symbolic-ref", "HEAD"]),
+			"refs/heads/feature"
+		);
+		// Its working tree is clean and operable under stock git (the pointers are consistent).
+		assert_eq!(
+			g(&["-C", to.to_str().unwrap(), "status", "--porcelain"]),
+			""
+		);
+
+		// Identity preserved: the admin id (git worktree id) is unchanged by the move.
+		assert_eq!(
+			admin_id(&work),
+			id_before,
+			"admin id stable across the move"
+		);
+
+		// Stock git's own worktree list reports the new path and not the old.
+		let listed = git_listed_paths(&work);
+		assert!(
+			listed.contains(&canonical(&to).to_string_lossy().into_owned()),
+			"new path listed"
+		);
+		assert!(
+			!listed.contains(&canonical(&from).to_string_lossy().into_owned()),
+			"old path not listed",
+		);
+	}
+}
+
+#[tokio::test]
+async fn relocate_supports_a_nested_destination_when_the_parent_exists() {
+	// The session-label use case: move `<guid>` to a nested branch-shaped label. relocate is git-faithful —
+	// it does not create intermediate dirs, so the caller makes the parent first.
+	let base = unique_tmp("relocate-nested");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+
+	let from = base.join("guid");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature/login",
+		from.to_str().unwrap(),
+	]);
+
+	let nested = work.join(".codehenge/worktrees/feature/login");
+	std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+	relocate(&req(&work, &from, &nested, None))
+		.await
+		.expect("relocate nested");
+	assert_eq!(
+		g(&["-C", nested.to_str().unwrap(), "symbolic-ref", "HEAD"]),
+		"refs/heads/feature/login"
+	);
+}
+
+#[tokio::test]
+async fn relocate_moves_a_dirty_worktree_intact() {
+	// A move relocates files; it is not a cleanliness decision — a dirty worktree rides along (git's behaviour).
+	let base = unique_tmp("relocate-dirty");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+	std::fs::write(from.join("a.txt"), "dirty\n").unwrap();
+
+	let to = base.join("to");
+	relocate(&req(&work, &from, &to, None))
+		.await
+		.expect("relocate dirty");
+	assert_eq!(
+		std::fs::read_to_string(to.join("a.txt")).unwrap(),
+		"dirty\n",
+		"dirty content preserved"
+	);
+}
+
+#[tokio::test]
+async fn relocate_is_idempotent_when_from_equals_to() {
+	let base = unique_tmp("relocate-idem");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	let outcome = relocate(&req(&work, &from, &from, None))
+		.await
+		.expect("idempotent");
+	assert_eq!(outcome, RelocateOutcome::AlreadyAt { to: from.clone() });
+	assert!(from.exists(), "the worktree is untouched");
+}
+
+#[tokio::test]
+async fn relocate_refuses_the_primary_worktree() {
+	let base = unique_tmp("relocate-primary");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+
+	let to = base.join("elsewhere");
+	let err = relocate(&req(&work, &work, &to, None))
+		.await
+		.expect_err("refuses primary");
+	assert!(matches!(err, RelocateError::IsPrimaryWorktree(_)));
+	assert!(!to.exists(), "nothing was moved");
+}
+
+#[tokio::test]
+async fn relocate_refuses_a_locked_worktree() {
+	let base = unique_tmp("relocate-locked");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"lock",
+		from.to_str().unwrap(),
+	]);
+
+	let to = base.join("to");
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("refuses locked");
+	assert!(matches!(
+		err,
+		RelocateError::Refused(WorktreeClassification::ProtectedWithReason {
+			reason: ProtectionReason::Locked { .. }
+		})
+	));
+	assert!(from.exists() && !to.exists(), "the worktree stays put");
+}
+
+#[tokio::test]
+async fn relocate_refuses_an_occupied_destination() {
+	let base = unique_tmp("relocate-occupied");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	let to = base.join("to");
+	std::fs::create_dir_all(&to).unwrap();
+	std::fs::write(to.join("other.txt"), "x").unwrap();
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("refuses occupied dest");
+	assert!(matches!(err, RelocateError::DestinationOccupied { .. }));
+	assert!(from.exists(), "the source is untouched");
+	assert_eq!(
+		std::fs::read_to_string(to.join("other.txt")).unwrap(),
+		"x",
+		"the destination is untouched"
+	);
+}
+
+#[tokio::test]
+async fn relocate_refuses_an_absent_source() {
+	let base = unique_tmp("relocate-absent");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+
+	let from = base.join("never-created");
+	let to = base.join("to");
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("refuses absent source");
+	assert!(matches!(err, RelocateError::Refused(_)));
+	assert!(!to.exists(), "nothing was moved");
+}
