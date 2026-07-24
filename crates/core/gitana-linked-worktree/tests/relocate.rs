@@ -294,6 +294,156 @@ async fn relocate_refuses_an_occupied_destination() {
 }
 
 #[tokio::test]
+async fn relocate_refuses_a_destination_with_a_stale_registration() {
+	// `to` is absent on disk but still named by a prunable registration (its checkout was deleted). Moving
+	// there would leave two admins naming one checkout — refuse.
+	let base = unique_tmp("relocate-staledest");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+
+	let to = base.join("to");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"a",
+		to.to_str().unwrap(),
+	]);
+	std::fs::remove_dir_all(&to).unwrap(); // leaves a prunable registration naming `to`
+
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"b",
+		from.to_str().unwrap(),
+	]);
+
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("refuses stale-registered dest");
+	assert!(matches!(err, RelocateError::DestinationRegistered { .. }));
+	assert!(from.exists(), "the source is untouched");
+}
+
+#[tokio::test]
+async fn relocate_refuses_a_worktree_with_submodules() {
+	// A worktree declaring submodules cannot be moved safely (the rename would strand each submodule's
+	// absorbed admin) — git refuses it, and so does relocate.
+	let base = unique_tmp("relocate-submod");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+	std::fs::write(
+		from.join(".gitmodules"),
+		"[submodule \"x\"]\n\tpath = x\n\turl = ./x\n",
+	)
+	.unwrap();
+
+	let to = base.join("to");
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("refuses submodules");
+	assert!(matches!(err, RelocateError::HasSubmodules(_)));
+	assert!(from.exists() && !to.exists(), "nothing was moved");
+}
+
+#[tokio::test]
+async fn relocate_normalises_a_relative_checkout_pointer_across_depths() {
+	// A worktree with a *relative* checkout `.git` (git's `worktree.useRelativePaths`) breaks if moved to a
+	// different depth unless the pointer is rewritten. relocate normalises it to absolute, so git works at the
+	// new location.
+	let base = unique_tmp("relocate-relative");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// Rewrite the checkout `.git` to a *relative* pointer (as `worktree.useRelativePaths` would): from
+	// `<base>/from`, `../repo/.git/worktrees/<id>` resolves to the admin dir.
+	let id = admin_id(&work);
+	std::fs::write(
+		from.join(".git"),
+		format!("gitdir: ../repo/.git/worktrees/{id}\n"),
+	)
+	.unwrap();
+	assert_eq!(
+		g(&[
+			"-C",
+			from.to_str().unwrap(),
+			"rev-parse",
+			"--abbrev-ref",
+			"HEAD"
+		]),
+		"feature"
+	);
+
+	// Move to a *different depth* (nested inside the repo). Without a checkout-pointer rewrite the relative
+	// path would now resolve to the wrong place.
+	let nested = work.join(".codehenge/worktrees/x/y");
+	std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+	relocate(&req(&work, &from, &nested, None))
+		.await
+		.expect("relocate a relative-pointer worktree");
+	assert_eq!(
+		g(&["-C", nested.to_str().unwrap(), "status", "--porcelain"]),
+		"",
+		"git works at the new depth"
+	);
+	assert!(
+		std::fs::read_to_string(nested.join(".git"))
+			.unwrap()
+			.starts_with("gitdir: /"),
+		"the checkout pointer was normalised to absolute",
+	);
+}
+
+#[tokio::test]
+async fn relocate_from_equals_to_still_validates_the_source() {
+	// The idempotent `from == to` no-op must only apply to a genuine, movable worktree — not to an absent or
+	// primary source.
+	let base = unique_tmp("relocate-idem-valid");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+
+	let ghost = base.join("ghost");
+	assert!(matches!(
+		relocate(&req(&work, &ghost, &ghost, None)).await,
+		Err(RelocateError::Refused(_))
+	));
+	assert!(matches!(
+		relocate(&req(&work, &work, &work, None)).await,
+		Err(RelocateError::IsPrimaryWorktree(_))
+	));
+}
+
+#[tokio::test]
 async fn relocate_refuses_an_absent_source() {
 	let base = unique_tmp("relocate-absent");
 	let work = base.join("repo");

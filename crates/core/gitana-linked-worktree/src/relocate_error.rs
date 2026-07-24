@@ -24,8 +24,8 @@ pub enum RelocateError {
 	#[error("cannot relocate the primary working tree: {}", .0.display())]
 	IsPrimaryWorktree(PathBuf),
 
-	/// Something already occupies `to` — the move never overwrites it (git: "target already exists"). Carries
-	/// the destination and what sits there.
+	/// Something already occupies `to` on disk — the move never overwrites it (git: "target already exists").
+	/// Carries the destination and what sits there.
 	#[error("relocate refused: destination {} already exists ({kind:?})", .path.display())]
 	DestinationOccupied {
 		/// The occupied destination path.
@@ -33,6 +33,33 @@ pub enum RelocateError {
 		/// What sits at the destination.
 		kind: DestinationKind,
 	},
+
+	/// Another worktree registration already names `to` (a live or a checkout-missing/prunable admin). Moving
+	/// there would leave two admin directories naming one checkout — git would list it twice and later
+	/// inspection would report a duplicate registration — so it is refused. Carries the destination and the
+	/// registering admin directory.
+	#[error("relocate refused: destination {} is already a registered worktree ({})", .path.display(), .admin_dir.display())]
+	DestinationRegistered {
+		/// The destination already claimed by a registration.
+		path: PathBuf,
+		/// The admin directory that claims it.
+		admin_dir: PathBuf,
+	},
+
+	/// `from` **encloses the repository's own git storage** (its shared common dir lives inside the checkout —
+	/// a `--separate-git-dir`/relocated-bare topology). Moving `from` would relocate the repository, the admin
+	/// directory, and the held registration lock along with it, stranding them and failing the pointer rewrite
+	/// — so it is refused before the rename. Carries the common dir found inside `from`.
+	#[error("cannot relocate a worktree that encloses the repository git dir: {}", .0.display())]
+	EnclosesRepository(PathBuf),
+
+	/// `from` contains submodules. Moving the checkout would leave each submodule's absorbed administration
+	/// pointing at the old working-tree path, breaking git commands inside the moved submodule — git's own
+	/// `worktree move` refuses this, and so does this safe surface. (A conservative refusal: any worktree that
+	/// *declares* submodules via a tracked `.gitmodules` is refused, not only those with initialized ones.)
+	/// Carries `from`.
+	#[error("cannot relocate a worktree that contains submodules: {}", .0.display())]
+	HasSubmodules(PathBuf),
 
 	/// A move step ran but the worktree is now neither fully at `from` nor fully at `to` — a partial move (or
 	/// a concurrent change) a caller must inspect and retry. Carries the observed post-state of `from`. (A

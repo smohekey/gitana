@@ -22,8 +22,8 @@ mod native {
 	use crate::head::read_lock_reason;
 	use crate::inspect::{DestinationKind, Registration, WorktreeInspection, inspect};
 	use crate::pointers::{
-		admin_dirs_for, canonical, is_bare, is_leaf_symlink, main_checkout_identifies_common,
-		path_to_bytes,
+		admin_dirs_for, canonical, canonical_eq, is_bare, is_leaf_symlink,
+		main_checkout_identifies_common, path_to_bytes,
 	};
 	use crate::query::WorktreeQuery;
 	use crate::registration_lock::RegistrationLock;
@@ -41,13 +41,6 @@ mod native {
 		}
 		if !request.to.is_absolute() {
 			return Err(LinkedWorktreeError::RelativePath(request.to.clone()).into());
-		}
-		// Idempotent no-op: the worktree is already where the request asks. Compare canonically so a
-		// non-normalised or symlinked spelling of the same path is recognised as equal.
-		if canonical(&request.from) == canonical(&request.to) {
-			return Ok(RelocateOutcome::AlreadyAt {
-				to: request.to.clone(),
-			});
 		}
 
 		let common = request.repo.common_dir();
@@ -71,11 +64,23 @@ mod native {
 			));
 		}
 
-		// Decide the move is safe (a movable `from`, an unoccupied `to`), then re-verify **immediately before**
-		// the move — a race that changed either side aborts without moving.
+		// Validate that `from` is a movable worktree (identity, pinned branch, primary, submodules) **before**
+		// the idempotent short-circuit, so `from == to` only reports a no-op for a genuine, movable worktree —
+		// not for an absent, foreign, primary, locked, or wrong-branch source.
 		let admin = decide_relocate(request, common).await?;
+
+		// Idempotent no-op: the (validated) worktree is already where the request asks. Compare canonically so
+		// a non-normalised or symlinked spelling of the same path is recognised as equal.
+		if canonical(&request.from) == canonical(&request.to) {
+			return Ok(RelocateOutcome::AlreadyAt {
+				to: request.to.clone(),
+			});
+		}
+
 		verify_destination_free(request).await?;
 
+		// Re-verify **immediately before** the move — a race that changed `from`'s registration or occupied
+		// `to` aborts without moving.
 		let recheck_admin = decide_relocate(request, common).await?;
 		if recheck_admin != admin {
 			// The worktree at `from` became a *different* registration between the decision and the move — do
@@ -85,7 +90,7 @@ mod native {
 		}
 		verify_destination_free(request).await?;
 
-		perform_relocate(request, &admin)?;
+		perform_relocate(request, &admin).await?;
 		Ok(RelocateOutcome::Relocated {
 			from: request.from.clone(),
 			to: request.to.clone(),
@@ -115,6 +120,19 @@ mod native {
 		if is_primary_worktree(&inspection, common)? {
 			return Err(RelocateError::IsPrimaryWorktree(request.from.clone()));
 		}
+		// `from` enclosing the repository's own git storage (a relocated-bare / `--separate-git-dir`
+		// topology) — moving it would relocate the repo, the admin dir, and the held registration lock. Refused
+		// *after* the primary check: an ordinary primary's common dir is inside it too, but that is the more
+		// specific `IsPrimaryWorktree` refusal. A non-primary enclosing worktree is caught here, still before
+		// any effect (the lock is created under `<common>` and dropped on return, since nothing moved).
+		if let Some(enclosed) = common_dir_within(&request.from, common) {
+			return Err(RelocateError::EnclosesRepository(enclosed));
+		}
+		// A worktree that declares submodules cannot be moved safely — the rename would strand each
+		// initialized submodule's absorbed admin at the old path. Refuse, as git's own `worktree move` does.
+		if has_submodules(&request.from)? {
+			return Err(RelocateError::HasSubmodules(request.from.clone()));
+		}
 		match classify(&inspection) {
 			// A registered, cross-pointer-consistent, present worktree (on a branch, detached, or unborn) —
 			// safe to move. Its admin directory is the registration's.
@@ -131,8 +149,10 @@ mod native {
 		}
 	}
 
-	/// Verify nothing occupies `to`. A faithful `git worktree move` refuses any existing target, so only an
-	/// absent path is accepted (the caller creates parent directories, not the target itself).
+	/// Verify nothing occupies `to` — neither on disk nor as a registration. A faithful `git worktree move`
+	/// refuses any existing target, so only an absent path with no registration is accepted (the caller
+	/// creates parent directories, not the target itself). A stale registration naming `to` (a live or a
+	/// checkout-missing/prunable admin) is refused too, since moving there would duplicate the registration.
 	async fn verify_destination_free(request: &RelocateRequest) -> Result<(), RelocateError> {
 		let query = WorktreeQuery {
 			repo: request.repo.clone(),
@@ -142,6 +162,14 @@ mod native {
 			with_status: false,
 		};
 		let inspection = inspect(&query).await?;
+		if let Registration::Present { admin_dir }
+		| Registration::PresentCheckoutMissing { admin_dir } = &inspection.registration
+		{
+			return Err(RelocateError::DestinationRegistered {
+				path: request.to.clone(),
+				admin_dir: admin_dir.clone(),
+			});
+		}
 		match inspection.destination_kind {
 			DestinationKind::Absent => Ok(()),
 			other => Err(RelocateError::DestinationOccupied {
@@ -167,22 +195,82 @@ mod native {
 		Ok(!is_bare(common)? && main_checkout_identifies_common(&inspection.destination, common)?)
 	}
 
-	/// Perform the move: rename the checkout directory, then rewrite the admin's `gitdir` back-pointer to the
-	/// checkout's new `.git`. The rename moves the whole tree — including its `.git` gitfile, which names the
-	/// unmoved admin dir with an absolute path and so stays valid — in one step. If the rename lands but the
-	/// pointer rewrite fails, the admin still names the old path: a re-inspectable partial (git's `worktree
-	/// repair` also fixes it), reported as [`RelocateError::Incomplete`] by the caller on the next inspection.
-	fn perform_relocate(request: &RelocateRequest, admin: &Path) -> Result<(), RelocateError> {
+	/// Perform the move: rename the checkout directory, then rewrite **both** cross-pointers to absolute
+	/// paths. The rename moves the whole tree in one step. The admin's `gitdir` back-pointer is rewritten to
+	/// the checkout's new `.git`; the checkout's own `.git` gitfile is rewritten to the (unmoved) admin dir —
+	/// necessary because a git worktree created with `worktree.useRelativePaths=true` stores a **relative**
+	/// pointer whose base changed with the move (a same-depth move would keep it valid, but a different-depth
+	/// one would not). Both are normalised to absolute, byte-clean paths — always valid regardless of the
+	/// move's depth — exactly how `create` writes them.
+	///
+	/// The rename itself failing (before anything moved) is an ordinary [`Failed`](RelocateError::Failed). A
+	/// pointer rewrite failing **after** the rename is a *partial* move — the checkout is at `to` but its
+	/// administration still names `from` — so it is reported as [`RelocateError::Incomplete`] with the observed
+	/// state (git's `worktree repair` also fixes such a state), never a plain failure.
+	async fn perform_relocate(request: &RelocateRequest, admin: &Path) -> Result<(), RelocateError> {
 		std::fs::rename(&request.from, &request.to)
 			.map_err(|e| LinkedWorktreeError::io("moving worktree checkout", &request.to, e))?;
 
-		// Byte-clean, absolute, canonical `<to>/.git` + newline — exactly how `create` writes the admin
-		// `gitdir`, so a non-UTF-8 destination round-trips and each side resolves regardless of the cwd.
-		let gitfile = canonical(&request.to).join(".git");
-		let mut bytes = path_to_bytes(&gitfile);
-		bytes.push(b'\n');
-		write_file_atomic(&admin.join("gitdir"), &bytes)?;
+		// Past this point the checkout has moved: a pointer-write failure is a partial move, not a pre-effect
+		// failure — re-inspect `from` and report it as `Incomplete` (falling back to the write error only if
+		// even the re-inspection fails).
+		if let Err(write_err) = rewrite_pointers(request, admin) {
+			return match inspect(&from_query(request)).await {
+				Ok(post) => Err(RelocateError::Incomplete(Box::new(post))),
+				Err(_) => Err(RelocateError::Failed(write_err)),
+			};
+		}
 		Ok(())
+	}
+
+	/// Rewrite both cross-pointers to absolute, byte-clean paths after a rename: the admin's `gitdir` to
+	/// `<to>/.git`, and the checkout's `.git` gitfile to the admin dir.
+	fn rewrite_pointers(request: &RelocateRequest, admin: &Path) -> Result<(), LinkedWorktreeError> {
+		let to = canonical(&request.to);
+		let gitfile = to.join(".git");
+
+		let mut admin_gitdir = path_to_bytes(&gitfile);
+		admin_gitdir.push(b'\n');
+		write_file_atomic(&admin.join("gitdir"), &admin_gitdir)?;
+
+		let mut checkout_gitfile = b"gitdir: ".to_vec();
+		checkout_gitfile.extend_from_slice(&path_to_bytes(admin));
+		checkout_gitfile.push(b'\n');
+		write_file_atomic(&gitfile, &checkout_gitfile)?;
+		Ok(())
+	}
+
+	/// The shared common dir found *inside* `from` (an enclosed repository), or `None`. Walks up from the
+	/// canonical common dir looking for `from`; mirrors the enclosure check `remove` performs.
+	fn common_dir_within(from: &Path, common: &Path) -> Option<PathBuf> {
+		let common_real = canonical(common);
+		let mut ancestor: &Path = &common_real;
+		loop {
+			if canonical_eq(ancestor, from) {
+				return Some(common_real.clone());
+			}
+			match ancestor.parent() {
+				Some(parent) => ancestor = parent,
+				None => return None,
+			}
+		}
+	}
+
+	/// Whether the worktree at `from` declares submodules — a tracked `.gitmodules` at its root. A
+	/// conservative check: it refuses any worktree that declares submodules, not only those with an
+	/// initialized one (a precise, initialized-only check is a deferred follow-up). Moving such a checkout
+	/// would strand a submodule's absorbed admin, which git's own `worktree move` also refuses.
+	fn has_submodules(from: &Path) -> Result<bool, LinkedWorktreeError> {
+		let gitmodules = from.join(".gitmodules");
+		match std::fs::symlink_metadata(&gitmodules) {
+			Ok(_) => Ok(true),
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+			Err(e) => Err(LinkedWorktreeError::io(
+				"checking for submodules",
+				&gitmodules,
+				e,
+			)),
+		}
 	}
 
 	/// Publish `contents` at `path` atomically: write a temp sibling, `fsync` it, then `rename` it onto
