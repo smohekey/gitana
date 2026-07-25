@@ -471,6 +471,57 @@ async fn relocate_from_equals_to_still_validates_the_source() {
 }
 
 #[tokio::test]
+async fn relocate_refuses_a_foreign_registration_at_the_destination() {
+	// An admin whose `gitdir` names `to` but whose ownership (`commondir`) is broken is still listed by git;
+	// relocating onto it without force would leave a duplicate registration, so it must be refused. (An
+	// ownership-filtered scan would miss it.)
+	let base = unique_tmp("relocate-foreign-dest");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+
+	// Register both worktrees while healthy (git refuses to add one once another's commondir is broken).
+	let to = base.join("to");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"other",
+		to.to_str().unwrap(),
+	]);
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// Now break `to`'s `commondir` so ownership no longer matches this repo, and remove its checkout — a
+	// prunable, foreign-looking registration that still names `to` (git lists it; its gitdir is intact).
+	std::fs::write(
+		work.join(".git/worktrees/to/commondir"),
+		"/nonexistent/gitdir\n",
+	)
+	.unwrap();
+	std::fs::remove_dir_all(&to).unwrap();
+
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("refuses foreign registration");
+	assert!(
+		matches!(err, RelocateError::DestinationRegistered { .. }),
+		"got {err:?}"
+	);
+	assert!(from.exists(), "the source is untouched");
+}
+
+#[tokio::test]
 async fn relocate_refuses_a_destination_with_a_malformed_git_file() {
 	// A non-empty destination holding a malformed regular `.git` is occupied — reported as DestinationOccupied
 	// (git's "already exists"), not a metadata-parse Failed. Occupancy must not parse the target `.git`.

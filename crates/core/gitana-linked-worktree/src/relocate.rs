@@ -34,7 +34,8 @@ mod native {
 	};
 	use crate::pointers::{
 		admin_dirs_for, canonical, canonical_eq, ensure_representable_path, is_bare, is_leaf_symlink,
-		main_checkout_identifies_common, os_string_from_bytes, path_to_bytes,
+		linked_admin_dirs, main_checkout_identifies_common, os_string_from_bytes, path_to_bytes,
+		worktree_path_of,
 	};
 	use crate::query::WorktreeQuery;
 	use crate::registration_lock::RegistrationLock;
@@ -209,9 +210,17 @@ mod native {
 			});
 		}
 
-		let stale: Vec<PathBuf> = admin_dirs_for(common, &request.to)?
+		// Scan **all** admin registrations, not only those this repository currently owns: an admin whose
+		// `gitdir` names `to` but whose `commondir` is missing or retargeted is still listed by git, so leaving
+		// it would duplicate the registration for the moved checkout. Match by the recorded checkout path
+		// (git's own listing criterion), excluding the source's own admin. (`admin_dirs_for`, used for the
+		// source, filters by ownership — appropriate there, but it would miss these foreign registrations.)
+		let stale: Vec<PathBuf> = linked_admin_dirs(common)?
 			.into_iter()
 			.filter(|admin| !canonical_eq(admin, source_admin))
+			.filter(|admin| {
+				worktree_path_of(admin).is_ok_and(|recorded| canonical_eq(&recorded, &request.to))
+			})
 			.collect();
 		if !stale.is_empty() {
 			let any_locked = stale
