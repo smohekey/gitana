@@ -12,6 +12,7 @@ use gitana_repository::HeadState;
 use crate::LinkedWorktreeError;
 use crate::error::PointerKind;
 use crate::facts::LockState;
+use crate::pointers::strip_eol_bytes;
 
 /// Parse `<git_dir>/HEAD`. `Ok(None)` when the file is absent (no checkout / not a git dir). A **legacy
 /// symlink** HEAD (`.git/HEAD -> refs/heads/main`) is symbolic — git resolves it that way — so its link
@@ -70,8 +71,8 @@ pub(crate) fn structural_head_branch(git_dir: &std::path::Path) -> Option<Option
 	// A detached HEAD is a bare object id with NO surrounding whitespace — git rejects a space/tab-padded one
 	// under `-f -f`. `text` is already stripped of trailing line terminators; do *not* additionally trim, so
 	// `"  <hex>  "` fails the exact length/charset check and is invalid.
-	structural_head_branch_with(git_dir, |text| {
-		matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+	structural_head_branch_with(git_dir, |raw| {
+		matches!(raw.len(), 40 | 64) && raw.iter().all(u8::is_ascii_hexdigit)
 	})
 }
 
@@ -85,21 +86,25 @@ pub(crate) fn structural_head_branch_for_move(
 	git_dir: &std::path::Path,
 	hexsz: usize,
 ) -> Option<Option<String>> {
-	structural_head_branch_with(git_dir, move |text| {
-		// git parses the leading object-id of the repository's width and ignores whatever follows; a shorter
-		// run, or any non-hex within the first `hexsz` chars (e.g. leading whitespace), is not a valid id.
-		text
-			.as_bytes()
+	structural_head_branch_with(git_dir, move |raw| {
+		// git parses the leading object-id of the repository's width and ignores whatever follows — even a
+		// non-UTF-8 trailing byte, so the detached form is matched on **raw bytes**, never a UTF-8 decode of
+		// the whole file. A shorter run, or any non-hex within the first `hexsz` bytes (e.g. leading
+		// whitespace), is not a valid id.
+		raw
 			.get(..hexsz)
 			.is_some_and(|prefix| prefix.iter().all(u8::is_ascii_hexdigit))
 	})
 }
 
-/// Shared structural HEAD read; `is_valid_detached` decides which non-`ref:` (detached) texts are accepted,
-/// the only axis on which the force-removal and move gates differ.
+/// Shared structural HEAD read; `is_valid_detached` decides which non-`ref:` (detached) **raw byte** texts
+/// are accepted, the only axis on which the force-removal and move gates differ. The detached form is
+/// matched on bytes (never a UTF-8 decode of the whole file) so a valid hex id with a non-UTF-8 trailing
+/// byte — which git's fixed-width parse accepts — is not lost; only a *symbolic* target is decoded (a ref
+/// name that must be valid UTF-8 to return as a `String`).
 fn structural_head_branch_with(
 	git_dir: &std::path::Path,
-	is_valid_detached: impl Fn(&str) -> bool,
+	is_valid_detached: impl Fn(&[u8]) -> bool,
 ) -> Option<Option<String>> {
 	let path = git_dir.join("HEAD");
 	match std::fs::symlink_metadata(&path) {
@@ -116,22 +121,41 @@ fn structural_head_branch_with(
 			let bytes = std::fs::read(&path).ok()?;
 			// Parse the HEAD file's own bytes structurally — the same grammar as `HeadState::parse` (trim only
 			// trailing line terminators; `ref:` then space/tab), without an object-store read.
-			let text = std::str::from_utf8(&bytes)
-				.ok()?
-				.trim_end_matches(['\n', '\r']);
-			if let Some(target) = text.strip_prefix("ref:") {
+			let raw = strip_eol_bytes(&bytes);
+			if let Some(rest) = raw.strip_prefix(b"ref:".as_slice()) {
 				// git accepts space/tab (only) between `ref:` and the target, so trim those from the *symbolic*
 				// target — but it is valid only when it then names a full ref (`refs/...`); `ref: main`, an empty
 				// target, or a non-space/tab separator left in the target is not a HEAD to force past.
-				let target = target.trim_matches([' ', '\t']);
+				let target = trim_spaces_and_tabs(rest);
+				let target = std::str::from_utf8(target).ok()?;
 				target.starts_with("refs/").then(|| Some(target.to_owned()))
 			} else {
-				is_valid_detached(text).then_some(None)
+				is_valid_detached(raw).then_some(None)
 			}
 		}
 		// Absent, a directory, or any stat/read failure — structurally invalid.
 		_ => None,
 	}
+}
+
+/// Trim leading and trailing space/tab bytes only (not other whitespace), matching git's `ref:` separator
+/// grammar, on a raw byte slice.
+fn trim_spaces_and_tabs(mut bytes: &[u8]) -> &[u8] {
+	while let [first, rest @ ..] = bytes {
+		if matches!(first, b' ' | b'\t') {
+			bytes = rest;
+		} else {
+			break;
+		}
+	}
+	while let [rest @ .., last] = bytes {
+		if matches!(last, b' ' | b'\t') {
+			bytes = rest;
+		} else {
+			break;
+		}
+	}
+	bytes
 }
 
 /// The lock state of a worktree whose git directory may hold a `locked` file. git writes the reason

@@ -240,6 +240,21 @@ mod native {
 			});
 		}
 
+		// `to` anywhere beneath `<common>/worktrees` is prune-unsafe. `git worktree prune` (and `gta worktree
+		// prune`) scan that container and recursively remove any child that is not a live admin — a moved
+		// checkout there, a bare child of `worktrees/` or nested inside an unlisted/incomplete one, has no
+		// valid `gitdir` and looks exactly like such a prunable entry, so it (and its dirty/untracked data)
+		// would be deleted. Refuse before the scan and rename, for *any* position under the container — not
+		// only inside a currently listed admin (a bare new child is enclosed by none). This subsumes the
+		// per-admin enclosure, since every admin lives under `worktrees/`.
+		let worktrees = common.join("worktrees");
+		if contains(&worktrees, &request.to) {
+			return Err(RelocateError::DestinationInsideRegistration {
+				path: request.to.clone(),
+				admin_dir: worktrees_child(&worktrees, &request.to),
+			});
+		}
+
 		// Scan **every** admin registration git would list, matched by its recorded checkout path (git's own
 		// listing criterion), so leaving a duplicate registration for the moved checkout is impossible. The
 		// scan is fail-closed and no-follow, and ownership-agnostic:
@@ -251,8 +266,10 @@ mod native {
 		//   * no ownership filter, so a *foreign* admin (broken/retargeted `commondir`) whose `gitdir` still
 		//     names `to` is caught. (`admin_dirs_for`, used for the source's lock probe, applies both filters.)
 		let mut stale: Vec<PathBuf> = Vec::new();
-		let mut enclosing: Option<PathBuf> = None;
 		for admin in read_worktree_admins(common)? {
+			if canonical_eq(&admin, source_admin) {
+				continue;
+			}
 			if is_leaf_symlink(&admin) {
 				return Err(RelocateError::UntrustedRegistration(admin));
 			}
@@ -262,31 +279,9 @@ mod native {
 			if !is_listed_admin(&admin)? {
 				continue;
 			}
-			// `to` inside ANY admin dir (`<common>/worktrees/<id>`) is prune-unsafe: a later
-			// `git worktree prune` / `gta worktree prune` recursively removes a prunable admin and would delete
-			// the just-moved checkout (and its dirty files) with it. Checked for **every** listed admin —
-			// including the source's own admin and, crucially, a *prunable* one whose `gitdir` names its own
-			// missing checkout rather than `to` (so the stale match below never records it) — independent of
-			// whether its backlink equals `to`.
-			if contains(&admin, &request.to) {
-				enclosing.get_or_insert(admin.clone());
-			}
-			if canonical_eq(&admin, source_admin) {
-				continue;
-			}
 			if canonical_eq(&worktree_path_of(&admin)?, &request.to) {
 				stale.push(admin);
 			}
-		}
-
-		// An admin that *encloses* the destination makes the move prune-unsafe (above): refuse it outright,
-		// before any rename. This subsumes the stale-registration enclosure — a stale admin naming `to` cannot
-		// also strictly contain it, but a *different* admin can.
-		if let Some(admin_dir) = enclosing {
-			return Err(RelocateError::DestinationInsideRegistration {
-				path: request.to.clone(),
-				admin_dir,
-			});
 		}
 
 		if !stale.is_empty() {
@@ -388,6 +383,22 @@ mod native {
 			match ancestor.parent() {
 				Some(parent) => ancestor = parent,
 				None => return false,
+			}
+		}
+	}
+
+	/// The immediate child of `worktrees` on the path down to `to` — the admin slot `git worktree prune`
+	/// would act on (`<worktrees>/<slot>[/…]` → `<worktrees>/<slot>`). Reported as the offending admin dir
+	/// when a destination is refused for lying under the container. Falls back to `worktrees` itself when
+	/// `to` resolves to the container exactly. Called only when `contains(worktrees, to)` already holds.
+	fn worktrees_child(worktrees: &Path, to: &Path) -> PathBuf {
+		let to_real = canonical(to);
+		let mut current: &Path = &to_real;
+		loop {
+			match current.parent() {
+				Some(parent) if canonical_eq(parent, worktrees) => return current.to_path_buf(),
+				Some(parent) => current = parent,
+				None => return worktrees.to_path_buf(),
 			}
 		}
 	}

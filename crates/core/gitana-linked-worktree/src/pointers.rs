@@ -922,17 +922,55 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), Link
 /// partial pointer is in any case repairable with `git worktree repair`. `write_file_atomic` remains for
 /// `create`, which publishes a *new* registration where the temp + rename (never clobbering an existing
 /// file) is the right primitive.
+///
+/// **Never follows a symlinked pointer.** git writes these as regular files; a symlink in their place is
+/// corruption or an attack, and following it would truncate and rewrite a file *outside* the admin. Because
+/// a plain pre-check races a concurrent swap (and this crate carries no `O_NOFOLLOW` binding), the file is
+/// opened **without** `O_TRUNC` and the opened descriptor's identity is compared against the pre-open
+/// `lstat`: a symlink swapped in between is followed to a *different* inode, so the mismatch is caught and
+/// the write refused **before** any truncation — a redirected pointer can never clobber its target.
 pub(crate) fn update_file_in_place(
 	path: &Path,
 	contents: &[u8],
 ) -> Result<(), LinkedWorktreeError> {
 	use std::io::Write as _;
+
+	let pre = std::fs::symlink_metadata(path)
+		.map_err(|e| LinkedWorktreeError::io("stat pointer file for update", path, e))?;
+	if pre.file_type().is_symlink() {
+		return Err(LinkedWorktreeError::io(
+			"refusing to update a symlinked pointer file",
+			path,
+			std::io::Error::from(std::io::ErrorKind::InvalidInput),
+		));
+	}
+
+	// No `.truncate(true)`: truncation must wait until the opened descriptor is confirmed to be the very
+	// regular file just `lstat`ed, so a symlink swapped in after the `lstat` cannot have its target clobbered.
 	let mut file = std::fs::OpenOptions::new()
 		.write(true)
 		.create(false)
-		.truncate(true)
 		.open(path)
 		.map_err(|e| LinkedWorktreeError::io("opening pointer file for update", path, e))?;
+
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt as _;
+		let opened = file
+			.metadata()
+			.map_err(|e| LinkedWorktreeError::io("stat opened pointer file", path, e))?;
+		if !opened.file_type().is_file() || opened.dev() != pre.dev() || opened.ino() != pre.ino() {
+			return Err(LinkedWorktreeError::io(
+				"pointer file changed identity during update",
+				path,
+				std::io::Error::from(std::io::ErrorKind::InvalidInput),
+			));
+		}
+	}
+
+	file
+		.set_len(0)
+		.map_err(|e| LinkedWorktreeError::io("truncating pointer file", path, e))?;
 	file
 		.write_all(contents)
 		.map_err(|e| LinkedWorktreeError::io("updating pointer file", path, e))?;

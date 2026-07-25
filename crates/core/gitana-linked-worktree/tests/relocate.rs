@@ -1274,3 +1274,137 @@ async fn relocate_moves_with_a_cyclic_symbolic_branch_pin() {
 		"new path listed",
 	);
 }
+
+#[tokio::test]
+async fn relocate_refuses_a_destination_that_is_a_new_worktrees_child() {
+	// A destination directly under `<common>/worktrees` (a *new* slot enclosed by no listed admin) is
+	// prune-unsafe: `git worktree prune` would delete the moved checkout as a gitdir-less entry. Refuse it.
+	let base = unique_tmp("relocate-worktrees-child");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// A brand-new child of the worktrees container — no admin named `newslot` exists.
+	let to = work.join(".git").join("worktrees").join("newslot");
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("a new worktrees-container child is refused");
+	assert!(
+		matches!(err, RelocateError::DestinationInsideRegistration { .. }),
+		"got {err:?}"
+	);
+	assert!(from.exists() && !to.exists(), "the worktree stays put");
+}
+
+#[tokio::test]
+async fn relocate_refuses_to_write_through_a_symlinked_backlink() {
+	// If the admin `gitdir` is a symlink, rewriting it must NOT follow the link and truncate its target
+	// (an arbitrary-file-truncation vector). relocate refuses the in-place write; the target is untouched.
+	use std::os::unix::fs::symlink;
+	let base = unique_tmp("relocate-symlinked-backlink");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// Redirect the admin `gitdir` through a symlink to an external file holding the *same* bare backlink, so
+	// inspection still classifies the worktree consistent (git follows a symlinked gitdir when reading).
+	let admin = work.join(".git").join("worktrees").join("from");
+	let backlink = admin.join("gitdir");
+	let original = std::fs::read(&backlink).unwrap();
+	let victim = base.join("victim");
+	std::fs::write(&victim, &original).unwrap();
+	std::fs::remove_file(&backlink).unwrap();
+	symlink(&victim, &backlink).unwrap();
+
+	let to = base.join("to");
+	let result = relocate(&req(&work, &from, &to, None)).await;
+	assert!(
+		result.is_err(),
+		"the move must not succeed by writing through the symlink: {result:?}"
+	);
+	// The symlink target was never followed/truncated: it still holds the original backlink bytes.
+	assert_eq!(
+		std::fs::read(&victim).unwrap(),
+		original,
+		"the external target must be untouched"
+	);
+}
+
+#[tokio::test]
+async fn relocate_moves_a_detached_head_with_a_non_utf8_trailing_byte() {
+	// git's detached-HEAD parse reads a fixed-width hex prefix and ignores the rest — including a non-UTF-8
+	// trailing byte (verified vs stock git). relocate matches the leading object-id on raw bytes, never a
+	// UTF-8 decode of the whole file, so it moves it too.
+	let base = unique_tmp("relocate-detached-non-utf8");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	let head = commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// A 40-hex object id followed by a 0xFF (non-UTF-8) byte.
+	let admin = work.join(".git").join("worktrees").join("from");
+	let mut head_bytes = head.into_bytes();
+	head_bytes.push(0xFF);
+	head_bytes.push(b'\n');
+	std::fs::write(admin.join("HEAD"), &head_bytes).unwrap();
+
+	// Oracle: stock git moves it (to a throwaway path, then back).
+	let probe = base.join("probe");
+	assert!(
+		git_ok(&[
+			"-C",
+			work.to_str().unwrap(),
+			"worktree",
+			"move",
+			from.to_str().unwrap(),
+			probe.to_str().unwrap(),
+		]),
+		"stock git moves a non-UTF-8-trailing detached HEAD",
+	);
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"move",
+		probe.to_str().unwrap(),
+		from.to_str().unwrap(),
+	]);
+
+	let to = base.join("to");
+	relocate(&req(&work, &from, &to, None))
+		.await
+		.expect("relocate moves the non-UTF-8-trailing detached-HEAD worktree");
+	assert!(
+		git_listed_paths(&work).contains(&canonical(&to).to_string_lossy().into_owned()),
+		"new path listed",
+	);
+}
