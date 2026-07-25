@@ -1115,9 +1115,11 @@ async fn move_worktree(cwd: &Path, worktree: &Path, new_path: &Path, force: u8) 
 		// An occupied destination (a non-empty directory or a file).
 		Err(RelocateError::DestinationOccupied { .. }) => bail!("'{display}' already exists"),
 		// A destination still registered to another — since-deleted — worktree: a *locked* stale
-		// registration needs a second `-f`, a plain one a single `-f` (as `remove`).
-		Err(RelocateError::DestinationRegistered { admin_dir, .. }) => {
-			if read_lock_reason(&admin_dir).is_some() {
+		// registration needs a second `-f`, a plain one a single `-f` (as `remove`). The library reports the
+		// required force (computed with its byte-clean, no-follow lock reader over all stale admins), so no
+		// re-probe of a possibly non-UTF-8 or symlinked lock file is needed here.
+		Err(RelocateError::DestinationRegistered { required_force, .. }) => {
+			if required_force >= 2 {
 				bail!(
 					"'{display}' is a missing but locked worktree;\nuse 'move -f -f' to override, or 'unlock' and 'prune' or 'remove' to clear"
 				)

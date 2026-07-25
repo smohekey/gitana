@@ -2,17 +2,20 @@
 //! `git worktree move`, extracted from the `gta` CLI so any library consumer (not just the CLI) can move a
 //! worktree without spawning `git`.
 //!
-//! `relocate` holds the per-repository registration lock, inspects `from`, decides the move is safe (a
-//! present, cross-pointer-consistent, non-primary, non-enclosing worktree of this repository — unlocked
-//! unless `force >= 2`), checks the destination is free (an empty directory is moved onto; a non-empty one,
-//! or one still registered to another worktree without enough `force`, is refused), re-verifies immediately
-//! before the rename, then moves the checkout directory and repoints the administration.
+//! `relocate` holds the per-repository registration lock, checks the source's lock file directly (so a
+//! locked worktree with malformed metadata still refuses cleanly), inspects `from`, decides the move is
+//! safe (a present, cross-pointer-consistent, non-primary, non-enclosing worktree of this repository —
+//! unlocked unless `force >= 2`), checks the destination is free (an empty directory is moved onto; a
+//! non-empty one, or one still registered to another worktree without enough `force`, is refused),
+//! re-verifies both sides immediately before the rename, then moves the checkout directory and repoints the
+//! administration.
 //!
 //! It **preserves each pointer's representation**: a worktree created with `worktree.useRelativePaths`
 //! records *relative* cross-pointers so the tree can be relocated as a unit; the relative/absolute style of
 //! each side is captured before the rename and re-emitted after, recomputing a relative checkout pointer for
 //! the new depth. An absolute checkout pointer moves with the directory and still names the (unmoved) admin,
-//! so it is left untouched. A **dirty** worktree moves intact (a move relocates files, not a cleanliness
+//! so it is left untouched. Pointers are read and written **byte-clean** (as `create` does), so a non-UTF-8
+//! path round-trips exactly. A **dirty** worktree moves intact (a move relocates files, not a cleanliness
 //! decision), matching stock git.
 //!
 //! **Submodules are out of scope here**, exactly as for [`remove`](crate::remove): the library has no
@@ -31,7 +34,7 @@ mod native {
 	};
 	use crate::pointers::{
 		admin_dirs_for, canonical, canonical_eq, is_bare, is_leaf_symlink,
-		main_checkout_identifies_common,
+		main_checkout_identifies_common, os_string_from_bytes, path_to_bytes,
 	};
 	use crate::query::WorktreeQuery;
 	use crate::registration_lock::RegistrationLock;
@@ -58,6 +61,21 @@ mod native {
 		// Released on any return (and on cancellation).
 		let _lock = RegistrationLock::acquire(common).await?;
 
+		// Lock-first, even under corrupted administration: read the source's lock file **directly** — no
+		// HEAD/index parse — so a locked worktree with a malformed `HEAD` still returns the structured `Locked`
+		// refusal rather than a `Failed` from `inspect`, exactly as stock git and `remove` report the lock
+		// first. `force >= 2` overrides the lock (git's `move -f -f`).
+		if request.force < 2
+			&& let [admin] = admin_dirs_for(common, &request.from)?.as_slice()
+			&& let LockState::Locked { reason } = read_lock_reason(admin)
+		{
+			return Err(RelocateError::Refused(
+				WorktreeClassification::ProtectedWithReason {
+					reason: ProtectionReason::Locked { reason },
+				},
+			));
+		}
+
 		// Validate that `from` is a movable worktree (identity, pinned branch, primary, enclosure, lock)
 		// **before** the idempotent short-circuit, so `from == to` only reports a no-op for a genuine,
 		// movable worktree — not for an absent, foreign, primary, or (without enough force) locked source.
@@ -71,16 +89,18 @@ mod native {
 			});
 		}
 
-		// The destination must be free: refuse a non-empty occupant, and a stale registration naming `to`
-		// unless `force` permits dropping it. Returns the stale admins to drop *after* a successful move.
-		let stale = prepare_destination(request, common, &admin)?;
+		// Fail fast on an occupied or force-insufficient destination.
+		prepare_destination(request, common, &admin).await?;
 
-		// Re-verify `from` immediately before the move — a race that changed its registration aborts.
+		// Re-verify **both** sides immediately before the move: a race that changed `from`'s registration, or
+		// (via a concurrent `lock`) the protection of a stale destination admin, aborts without moving. The
+		// destination's stale set is recomputed here so the move acts on the just-verified state.
 		let recheck_admin = decide_relocate(request, common).await?;
 		if recheck_admin != admin {
 			let post = inspect(&from_query(request)).await?;
 			return Err(RelocateError::Incomplete(Box::new(post)));
 		}
+		let stale = prepare_destination(request, common, &admin).await?;
 
 		perform_relocate(request, &admin, &stale).await?;
 		Ok(RelocateOutcome::Relocated {
@@ -119,7 +139,8 @@ mod native {
 		if let Some(enclosed) = common_dir_within(&request.from, common) {
 			return Err(RelocateError::EnclosesRepository(enclosed));
 		}
-		// A locked source needs two forces to move (git's `move -f -f`); a lower force refuses.
+		// A locked (and readable) source needs two forces to move; the lock-first probe above already caught
+		// the malformed-metadata case.
 		if let LockState::Locked { reason } = &inspection.lock
 			&& request.force < 2
 		{
@@ -154,24 +175,27 @@ mod native {
 
 	/// Check the destination is free and return the stale registrations to drop after a successful move.
 	///
-	/// A non-empty directory (or a file) at `to` is refused as occupied. Any admin registration naming `to`
-	/// other than the source's own — a live or prunable/checkout-missing worktree — is refused unless `force`
-	/// permits: a locked stale registration needs `force >= 2`, an unlocked one `force >= 1`. (A live worktree
-	/// at `to` is caught by the occupancy check first.) With enough force the stale admins are returned so the
-	/// caller drops them *after* the rename lands.
-	fn prepare_destination(
+	/// The destination is classified **without following symlinks** (via [`inspect`], not a symlink-following
+	/// `Path::exists`): an absent path or an empty directory is free; anything else — a file, a symlink, a
+	/// non-empty directory, or a linked-worktree checkout — is refused as occupied with its accurate kind. Any
+	/// admin registration naming `to` other than the source's own — a live or prunable/checkout-missing
+	/// worktree — is refused unless `force` permits: a locked stale registration needs `force >= 2`, an
+	/// unlocked one `force >= 1`. The required force is carried in the error so a caller need not re-probe the
+	/// admin's (possibly non-UTF-8 or symlinked) lock file. With enough force the stale admins are returned so
+	/// the caller drops them *after* the rename lands.
+	async fn prepare_destination(
 		request: &RelocateRequest,
 		common: &Path,
 		source_admin: &Path,
 	) -> Result<Vec<PathBuf>, RelocateError> {
-		if request.to.exists() && dir_non_empty(&request.to) {
+		let inspection = inspect(&to_query(request)).await?;
+		if !matches!(
+			inspection.destination_kind,
+			DestinationKind::Absent | DestinationKind::EmptyDir
+		) {
 			return Err(RelocateError::DestinationOccupied {
 				path: request.to.clone(),
-				kind: if request.to.is_dir() {
-					DestinationKind::UnrelatedContent
-				} else {
-					DestinationKind::OtherFsObject
-				},
+				kind: inspection.destination_kind,
 			});
 		}
 
@@ -183,15 +207,27 @@ mod native {
 			let any_locked = stale
 				.iter()
 				.any(|admin| matches!(read_lock_reason(admin), LockState::Locked { .. }));
-			let required = if any_locked { 2 } else { 1 };
-			if request.force < required {
+			let required_force = if any_locked { 2 } else { 1 };
+			if request.force < required_force {
 				return Err(RelocateError::DestinationRegistered {
 					path: request.to.clone(),
 					admin_dir: stale[0].clone(),
+					required_force,
 				});
 			}
 		}
 		Ok(stale)
+	}
+
+	/// A read query for the destination (no branch expectation, no status).
+	fn to_query(request: &RelocateRequest) -> WorktreeQuery {
+		WorktreeQuery {
+			repo: request.repo.clone(),
+			destination: request.to.clone(),
+			expected_branch: None,
+			start: None,
+			with_status: false,
+		}
 	}
 
 	/// Whether the inspected destination is the repository's **primary/main** worktree — never moved by this
@@ -226,8 +262,9 @@ mod native {
 		}
 	}
 
-	/// Perform the move: capture pointer styles, clear an empty destination directory, rename the checkout,
-	/// drop any stale destination registrations, then repoint the administration — preserving each pointer's
+	/// Perform the move: capture pointer styles, rename the checkout (a rename replaces an empty destination
+	/// directory, so none is pre-removed — a rename failure then leaves the caller's directory intact), drop
+	/// any stale destination registrations, then repoint the administration — preserving each pointer's
 	/// relative/absolute representation. A failure *after* the rename (the checkout has moved but its
 	/// administration is not fully repointed) is reported as [`RelocateError::Incomplete`], not a plain
 	/// failure; a failure of the rename itself (nothing moved) is an ordinary [`Failed`](RelocateError::Failed).
@@ -236,15 +273,11 @@ mod native {
 		admin: &Path,
 		stale: &[PathBuf],
 	) -> Result<(), RelocateError> {
-		// Capture each pointer's representation while the source is still in place.
-		let checkout_relative = gitfile_is_relative(&request.from.join(".git"));
-		let admin_relative = admin_gitdir_is_relative(&admin.join("gitdir"));
-
-		// An empty directory at the destination would block `rename`; clear it (already validated empty).
-		if request.to.is_dir() {
-			std::fs::remove_dir(&request.to)
-				.map_err(|e| LinkedWorktreeError::io("clearing empty destination", &request.to, e))?;
-		}
+		// Capture each pointer's *written* representation (relative vs absolute) while the source is still in
+		// place. Read byte-clean from the **raw** pointer text — not a resolved target — so a relative pointer
+		// (possibly with non-UTF-8 bytes) is detected as relative, and its style is preserved by the move.
+		let checkout_relative = raw_pointer_is_relative(&request.from.join(".git"), true);
+		let admin_relative = raw_pointer_is_relative(&admin.join("gitdir"), false);
 
 		std::fs::rename(&request.from, &request.to)
 			.map_err(|e| LinkedWorktreeError::io("moving worktree checkout", &request.to, e))?;
@@ -262,7 +295,8 @@ mod native {
 
 	/// The post-rename administration fix-up: drop stale destination registrations, repoint the admin's
 	/// backlink, and (only when the checkout pointer was relative) recompute the checkout's `.git` for its new
-	/// depth. Direct writes — no temp file, so nothing in the moved checkout can be clobbered.
+	/// depth. Pointers are written **byte-clean** (as `create` does). Direct writes — no temp file, so nothing
+	/// in the moved checkout can be clobbered.
 	fn finish_relocate(
 		request: &RelocateRequest,
 		admin: &Path,
@@ -270,8 +304,6 @@ mod native {
 		checkout_relative: bool,
 		admin_relative: bool,
 	) -> Result<(), LinkedWorktreeError> {
-		// Drop stale destination registrations only *after* the move succeeds, so a failed rename would have
-		// left them intact (matching git).
 		for other in stale {
 			std::fs::remove_dir_all(other).map_err(|e| {
 				LinkedWorktreeError::io("removing stale destination registration", other, e)
@@ -280,44 +312,40 @@ mod native {
 
 		let gitfile = request.to.join(".git");
 		let backlink = admin.join("gitdir");
-		std::fs::write(
-			&backlink,
-			format!("{}\n", pointer(admin, &gitfile, admin_relative)),
-		)
-		.map_err(|e| LinkedWorktreeError::io("updating admin gitdir", &backlink, e))?;
+
+		// admin `gitdir` → the checkout's new `.git`, byte-clean, its original relative/absolute style.
+		let mut admin_bytes = path_to_bytes(&pointer(admin, &gitfile, admin_relative));
+		admin_bytes.push(b'\n');
+		std::fs::write(&backlink, admin_bytes)
+			.map_err(|e| LinkedWorktreeError::io("updating admin gitdir", &backlink, e))?;
+
 		// An absolute checkout pointer moved with the directory and still names the (unmoved) admin. A
-		// relative one is now wrong at the new depth, so recompute it.
+		// relative one is now wrong at the new depth, so recompute and rewrite it byte-clean.
 		if checkout_relative {
-			std::fs::write(
-				&gitfile,
-				format!("gitdir: {}\n", pointer(&request.to, admin, true)),
-			)
-			.map_err(|e| LinkedWorktreeError::io("updating checkout .git", &gitfile, e))?;
+			let mut checkout_bytes = b"gitdir: ".to_vec();
+			checkout_bytes.extend_from_slice(&path_to_bytes(&pointer(&request.to, admin, true)));
+			checkout_bytes.push(b'\n');
+			std::fs::write(&gitfile, checkout_bytes)
+				.map_err(|e| LinkedWorktreeError::io("updating checkout .git", &gitfile, e))?;
 		}
 		Ok(())
 	}
 
-	/// Whether a directory holds any entry (a non-directory path counts as occupied).
-	fn dir_non_empty(dir: &Path) -> bool {
-		match std::fs::read_dir(dir) {
-			Ok(mut entries) => entries.next().is_some(),
-			Err(_) => true,
-		}
-	}
-
 	/// `target` from `from_dir`, relative when `prefer_relative` and a relative form exists, else absolute —
 	/// exactly how git writes a pointer (a `worktree.useRelativePaths` worktree keeps relative pointers).
-	fn pointer(from_dir: &Path, target: &Path, prefer_relative: bool) -> String {
+	/// Returned as a [`PathBuf`] so it serialises byte-clean (a non-UTF-8 path is never lossily displayed).
+	fn pointer(from_dir: &Path, target: &Path, prefer_relative: bool) -> PathBuf {
 		if prefer_relative && let Some(relative) = relativize(from_dir, target) {
 			return relative;
 		}
-		canonical(target).display().to_string()
+		canonical(target)
 	}
 
 	/// `target` expressed relative to `from_dir` (both resolved first), as git writes a
 	/// `worktree.useRelativePaths` pointer. `None` when no relative form exists (no shared component, e.g.
-	/// different roots) or either path cannot be resolved, so the caller writes an absolute pointer.
-	fn relativize(from_dir: &Path, target: &Path) -> Option<String> {
+	/// different roots) or either path cannot be resolved, so the caller writes an absolute pointer. The
+	/// components are copied byte-for-byte, so a non-UTF-8 path segment is preserved.
+	fn relativize(from_dir: &Path, target: &Path) -> Option<PathBuf> {
 		let from = from_dir.canonicalize().ok()?;
 		let from: Vec<_> = from.components().collect();
 		let to = target.canonicalize().ok()?;
@@ -326,37 +354,36 @@ mod native {
 		if shared == 0 {
 			return None;
 		}
-		let ups = from.len() - shared;
 		let mut result = PathBuf::new();
-		for _ in 0..ups {
+		for _ in 0..(from.len() - shared) {
 			result.push("..");
 		}
 		for component in &to[shared..] {
 			result.push(component.as_os_str());
 		}
-		Some(result.display().to_string())
+		Some(result)
 	}
 
-	/// Whether the checkout's `.git` gitfile records a relative pointer (`worktree.useRelativePaths`).
-	fn gitfile_is_relative(gitfile: &Path) -> bool {
-		std::fs::read_to_string(gitfile)
-			.ok()
-			.and_then(|content| {
-				content
-					.lines()
-					.next()
-					.and_then(|line| line.strip_prefix("gitdir:"))
-					.map(|dir| Path::new(dir.trim()).is_relative())
-			})
-			.unwrap_or(false)
-	}
-
-	/// Whether an admin `gitdir` file records a relative pointer.
-	fn admin_gitdir_is_relative(gitdir: &Path) -> bool {
-		std::fs::read_to_string(gitdir)
-			.ok()
-			.map(|content| Path::new(content.trim()).is_relative())
-			.unwrap_or(false)
+	/// Whether a pointer file records a **relative** path, read byte-clean from its raw first line (a
+	/// `.git` gitfile with `strip_gitdir_prefix` true carries a `gitdir: ` prefix; an admin `gitdir` file
+	/// carries the bare path). The raw path is inspected without resolving it, so a relative pointer is seen
+	/// as relative regardless of where it points, and a non-UTF-8 byte in it does not make the read fail (and
+	/// wrongly report absolute). A missing/empty/malformed pointer reads as not-relative (absolute default).
+	fn raw_pointer_is_relative(path: &Path, strip_gitdir_prefix: bool) -> bool {
+		let Ok(bytes) = std::fs::read(path) else {
+			return false;
+		};
+		let line = bytes.split(|&byte| byte == b'\n').next().unwrap_or(&[]);
+		let raw = if strip_gitdir_prefix {
+			match line.strip_prefix(b"gitdir:") {
+				Some(rest) => rest,
+				None => return false,
+			}
+		} else {
+			line
+		}
+		.trim_ascii();
+		!raw.is_empty() && Path::new(&os_string_from_bytes(raw)).is_relative()
 	}
 }
 

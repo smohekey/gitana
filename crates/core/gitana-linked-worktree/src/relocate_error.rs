@@ -36,14 +36,18 @@ pub enum RelocateError {
 
 	/// Another worktree registration already names `to` (a live or a checkout-missing/prunable admin). Moving
 	/// there would leave two admin directories naming one checkout — git would list it twice and later
-	/// inspection would report a duplicate registration — so it is refused. Carries the destination and the
-	/// registering admin directory.
-	#[error("relocate refused: destination {} is already a registered worktree ({})", .path.display(), .admin_dir.display())]
+	/// inspection would report a duplicate registration — so it is refused unless `force` permits dropping the
+	/// stale registration. `required_force` is the force that *would* have permitted it (2 when any stale
+	/// admin is locked, else 1), computed with the byte-clean, no-follow lock reader — carried so a caller
+	/// reports the right `-f`/`-f -f` guidance without re-probing the admin's lock file.
+	#[error("relocate refused: destination {} is already a registered worktree ({}); needs force {required_force}", .path.display(), .admin_dir.display())]
 	DestinationRegistered {
 		/// The destination already claimed by a registration.
 		path: PathBuf,
-		/// The admin directory that claims it.
+		/// The admin directory that claims it (the first, when several do).
 		admin_dir: PathBuf,
+		/// The `force` that would permit dropping the stale registration(s): 2 if any is locked, else 1.
+		required_force: u8,
 	},
 
 	/// `from` **encloses the repository's own git storage** (its shared common dir lives inside the checkout —
