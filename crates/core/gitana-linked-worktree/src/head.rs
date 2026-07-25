@@ -67,6 +67,40 @@ pub(crate) fn read_head<H: HashAlgorithm>(
 ///   symlink, a `ref:` target not under `refs/`, or a hex string of the wrong length. git refuses these
 ///   under `-f -f`, so the forced path must not delete such a worktree.
 pub(crate) fn structural_head_branch(git_dir: &std::path::Path) -> Option<Option<String>> {
+	// A detached HEAD is a bare object id with NO surrounding whitespace — git rejects a space/tab-padded one
+	// under `-f -f`. `text` is already stripped of trailing line terminators; do *not* additionally trim, so
+	// `"  <hex>  "` fails the exact length/charset check and is invalid.
+	structural_head_branch_with(git_dir, |text| {
+		matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+	})
+}
+
+/// Like [`structural_head_branch`], but with the **looser detached grammar `git worktree move` accepts**:
+/// a valid object-id *prefix* of the repository's hash width (`hexsz` hex chars — 40 for SHA-1, 64 for
+/// SHA-256), with any trailing content ignored — where the force-removal gate requires the *exact*,
+/// unpadded id. Probed against git 2.50.1: `move` accepts `<40 hex> trailing`, `<40 hex>AA…` (overlong), and
+/// the bare id, but refuses an absent/empty/garbage/short/whitespace-padded HEAD, and a symbolic HEAD only
+/// when it names a full `refs/...`. Symbolic-HEAD handling is identical to [`structural_head_branch`].
+pub(crate) fn structural_head_branch_for_move(
+	git_dir: &std::path::Path,
+	hexsz: usize,
+) -> Option<Option<String>> {
+	structural_head_branch_with(git_dir, move |text| {
+		// git parses the leading object-id of the repository's width and ignores whatever follows; a shorter
+		// run, or any non-hex within the first `hexsz` chars (e.g. leading whitespace), is not a valid id.
+		text
+			.as_bytes()
+			.get(..hexsz)
+			.is_some_and(|prefix| prefix.iter().all(u8::is_ascii_hexdigit))
+	})
+}
+
+/// Shared structural HEAD read; `is_valid_detached` decides which non-`ref:` (detached) texts are accepted,
+/// the only axis on which the force-removal and move gates differ.
+fn structural_head_branch_with(
+	git_dir: &std::path::Path,
+	is_valid_detached: impl Fn(&str) -> bool,
+) -> Option<Option<String>> {
 	let path = git_dir.join("HEAD");
 	match std::fs::symlink_metadata(&path) {
 		// A legacy symbolic-ref HEAD is a filesystem symlink whose *link target* names a ref. Read the link
@@ -81,8 +115,7 @@ pub(crate) fn structural_head_branch(git_dir: &std::path::Path) -> Option<Option
 		Ok(meta) if meta.is_file() => {
 			let bytes = std::fs::read(&path).ok()?;
 			// Parse the HEAD file's own bytes structurally — the same grammar as `HeadState::parse` (trim only
-			// trailing line terminators; `ref:` then space/tab), but algorithm-agnostic for the detached case so
-			// a 40-hex SHA-1 id is accepted as readily as a 64-hex SHA-256 one, without an object-store read.
+			// trailing line terminators; `ref:` then space/tab), without an object-store read.
 			let text = std::str::from_utf8(&bytes)
 				.ok()?
 				.trim_end_matches(['\n', '\r']);
@@ -93,11 +126,7 @@ pub(crate) fn structural_head_branch(git_dir: &std::path::Path) -> Option<Option
 				let target = target.trim_matches([' ', '\t']);
 				target.starts_with("refs/").then(|| Some(target.to_owned()))
 			} else {
-				// A detached HEAD is a bare object id with NO surrounding whitespace — git rejects a space/tab-
-				// padded one under `-f -f`. `text` is already stripped of trailing line terminators; do *not*
-				// additionally trim spaces/tabs, so `"  <hex>  "` fails the length/charset check and is invalid.
-				let is_oid = matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit());
-				is_oid.then_some(None)
+				is_valid_detached(text).then_some(None)
 			}
 		}
 		// Absent, a directory, or any stat/read failure — structurally invalid.

@@ -251,10 +251,8 @@ mod native {
 		//   * no ownership filter, so a *foreign* admin (broken/retargeted `commondir`) whose `gitdir` still
 		//     names `to` is caught. (`admin_dirs_for`, used for the source's lock probe, applies both filters.)
 		let mut stale: Vec<PathBuf> = Vec::new();
+		let mut enclosing: Option<PathBuf> = None;
 		for admin in read_worktree_admins(common)? {
-			if canonical_eq(&admin, source_admin) {
-				continue;
-			}
 			if is_leaf_symlink(&admin) {
 				return Err(RelocateError::UntrustedRegistration(admin));
 			}
@@ -264,17 +262,30 @@ mod native {
 			if !is_listed_admin(&admin)? {
 				continue;
 			}
+			// `to` inside ANY admin dir (`<common>/worktrees/<id>`) is prune-unsafe: a later
+			// `git worktree prune` / `gta worktree prune` recursively removes a prunable admin and would delete
+			// the just-moved checkout (and its dirty files) with it. Checked for **every** listed admin —
+			// including the source's own admin and, crucially, a *prunable* one whose `gitdir` names its own
+			// missing checkout rather than `to` (so the stale match below never records it) — independent of
+			// whether its backlink equals `to`.
+			if contains(&admin, &request.to) {
+				enclosing.get_or_insert(admin.clone());
+			}
+			if canonical_eq(&admin, source_admin) {
+				continue;
+			}
 			if canonical_eq(&worktree_path_of(&admin)?, &request.to) {
 				stale.push(admin);
 			}
 		}
 
-		// A stale admin that *encloses* the destination cannot be dropped: recursively removing it after the
-		// rename would delete the just-moved checkout inside it. Refuse the overlapping move outright.
-		if let Some(enclosing) = stale.iter().find(|admin| contains(admin, &request.to)) {
+		// An admin that *encloses* the destination makes the move prune-unsafe (above): refuse it outright,
+		// before any rename. This subsumes the stale-registration enclosure — a stale admin naming `to` cannot
+		// also strictly contain it, but a *different* admin can.
+		if let Some(admin_dir) = enclosing {
 			return Err(RelocateError::DestinationInsideRegistration {
 				path: request.to.clone(),
-				admin_dir: enclosing.clone(),
+				admin_dir,
 			});
 		}
 
@@ -295,11 +306,13 @@ mod native {
 	}
 
 	/// A shallow, no-follow occupancy classification of the destination — enough to decide free (absent or an
-	/// empty directory) vs occupied, **without parsing a target `.git`**. `classify_destination` would parse
-	/// it (to tell a linked-worktree checkout from unrelated content), so a non-empty directory holding a
-	/// *malformed* `.git` would surface as a `Failed` rather than the "already exists" occupancy git reports —
-	/// this only distinguishes empty from non-empty. A leaf symlink is seen (the trailing separator is
-	/// stripped so POSIX does not resolve it) and classified as a non-directory occupant.
+	/// empty directory) vs occupied. A non-empty directory is distinguished only by a **lenient, non-fatal**
+	/// read of its own `.git`: a regular gitfile that parses (`gitdir: <target>`) is a
+	/// [`LinkedWorktreeCheckout`](DestinationKind::LinkedWorktreeCheckout), so the occupancy error names what
+	/// collides; a malformed/absent/symlinked `.git` stays
+	/// [`UnrelatedContent`](DestinationKind::UnrelatedContent) — never a parse `Failed`, matching the
+	/// "already exists" occupancy git reports. A leaf symlink is seen (the trailing separator is stripped so
+	/// POSIX does not resolve it) and classified as a non-directory occupant.
 	fn destination_occupancy(to: &Path) -> Result<DestinationKind, LinkedWorktreeError> {
 		let leaf = to.components().as_path();
 		match std::fs::symlink_metadata(leaf) {
@@ -307,7 +320,7 @@ mod native {
 				let mut entries = std::fs::read_dir(to)
 					.map_err(|e| LinkedWorktreeError::io("reading destination", to, e))?;
 				if entries.next().is_some() {
-					Ok(DestinationKind::UnrelatedContent)
+					Ok(destination_git_kind(to))
 				} else {
 					Ok(DestinationKind::EmptyDir)
 				}
@@ -316,6 +329,28 @@ mod native {
 			Ok(_) => Ok(DestinationKind::OtherFsObject),
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DestinationKind::Absent),
 			Err(e) => Err(LinkedWorktreeError::io("stat destination", to, e)),
+		}
+	}
+
+	/// Classify a **non-empty** destination directory: a linked-worktree checkout (its `.git` is a *regular
+	/// file* naming an admin — `gitdir: <target>`) versus unrelated content. Deliberately lenient and
+	/// **infallible** — a malformed, absent, or symlinked `.git` (a symlink is never followed) is
+	/// `UnrelatedContent`, never an error — so occupancy reports git's "already exists" rather than a parse
+	/// failure. The target is not resolved; only the gitfile *shape* is recognised.
+	fn destination_git_kind(to: &Path) -> DestinationKind {
+		let gitfile = to.join(".git");
+		match std::fs::symlink_metadata(&gitfile) {
+			Ok(meta) if meta.is_file() => match std::fs::read(&gitfile) {
+				Ok(bytes)
+					if strip_eol_bytes(&bytes)
+						.strip_prefix(b"gitdir: ".as_slice())
+						.is_some_and(|target| !target.is_empty()) =>
+				{
+					DestinationKind::LinkedWorktreeCheckout
+				}
+				_ => DestinationKind::UnrelatedContent,
+			},
+			_ => DestinationKind::UnrelatedContent,
 		}
 	}
 

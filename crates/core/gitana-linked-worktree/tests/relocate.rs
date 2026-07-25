@@ -6,7 +6,7 @@ mod common;
 
 use common::*;
 use gitana_linked_worktree::{
-	BranchName, ProtectionReason, RelocateError, RelocateOutcome, RelocateRequest,
+	BranchName, DestinationKind, ProtectionReason, RelocateError, RelocateOutcome, RelocateRequest,
 	WorktreeClassification, relocate,
 };
 
@@ -1081,6 +1081,194 @@ async fn relocate_matches_the_expected_branch_structurally() {
 	relocate(&req(&work, &from, &to, Some("feature")))
 		.await
 		.expect("the exact expected branch moves");
+	assert!(
+		git_listed_paths(&work).contains(&canonical(&to).to_string_lossy().into_owned()),
+		"new path listed",
+	);
+}
+
+#[tokio::test]
+async fn relocate_refuses_a_destination_inside_a_prunable_admin() {
+	// A destination beneath a *different* prunable admin directory (its checkout gone, so its `gitdir` names
+	// the missing checkout, not `to`) is prune-unsafe: a later `git worktree prune` would recursively delete
+	// the admin and the just-moved checkout inside it. Refuse it — even though no registration names `to`.
+	let base = unique_tmp("relocate-into-prunable-admin");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+	// A second worktree, then delete its checkout so its admin is prunable (retained, checkout missing).
+	let victim = base.join("victim");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"vic",
+		victim.to_str().unwrap(),
+	]);
+	std::fs::remove_dir_all(&victim).unwrap();
+	let victim_admin = work.join(".git").join("worktrees").join("victim");
+	assert!(victim_admin.is_dir(), "prunable admin retained");
+
+	// `to` inside the prunable admin.
+	let to = victim_admin.join("moved");
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("a destination inside a prunable admin is refused");
+	assert!(
+		matches!(err, RelocateError::DestinationInsideRegistration { .. }),
+		"got {err:?}"
+	);
+	assert!(from.exists() && !to.exists(), "the worktree stays put");
+}
+
+#[tokio::test]
+async fn relocate_moves_a_detached_head_with_trailing_content() {
+	// `git worktree move`'s detached-HEAD grammar is lenient: a leading object-id of the repo's width with any
+	// trailing content is accepted (verified against stock git), unlike the exact id the force-removal gate
+	// requires. relocate reads HEAD with the move grammar, so it matches.
+	let base = unique_tmp("relocate-detached-trailing");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	let head = commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// A 40-hex object id (SHA-1 width) followed by trailing text.
+	let admin = work.join(".git").join("worktrees").join("from");
+	std::fs::write(admin.join("HEAD"), format!("{head} trailing\n")).unwrap();
+
+	// Oracle: stock git moves it (to a throwaway path, then back).
+	let probe = base.join("probe");
+	assert!(
+		git_ok(&[
+			"-C",
+			work.to_str().unwrap(),
+			"worktree",
+			"move",
+			from.to_str().unwrap(),
+			probe.to_str().unwrap(),
+		]),
+		"stock git moves a trailing-content detached HEAD",
+	);
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"move",
+		probe.to_str().unwrap(),
+		from.to_str().unwrap(),
+	]);
+
+	let to = base.join("to");
+	relocate(&req(&work, &from, &to, None))
+		.await
+		.expect("relocate moves the lenient detached-HEAD worktree");
+	assert!(
+		git_listed_paths(&work).contains(&canonical(&to).to_string_lossy().into_owned()),
+		"new path listed",
+	);
+}
+
+#[tokio::test]
+async fn relocate_reports_a_linked_worktree_checkout_occupant() {
+	// When the destination is itself an existing linked-worktree checkout, the occupancy error distinguishes
+	// it (`LinkedWorktreeCheckout`) from unrelated files, so structured callers can tell a worktree collision
+	// from a stray directory.
+	let base = unique_tmp("relocate-occupied-by-worktree");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+	// A second, live worktree occupying the destination.
+	let occupant = base.join("occupant");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"other",
+		occupant.to_str().unwrap(),
+	]);
+
+	let err = relocate(&req(&work, &from, &occupant, None))
+		.await
+		.expect_err("an occupied destination is refused");
+	assert!(
+		matches!(
+			err,
+			RelocateError::DestinationOccupied {
+				kind: DestinationKind::LinkedWorktreeCheckout,
+				..
+			}
+		),
+		"got {err:?}"
+	);
+	assert!(from.exists(), "the source is untouched");
+}
+
+#[tokio::test]
+async fn relocate_moves_with_a_cyclic_symbolic_branch_pin() {
+	// The pinned `expected_branch` is matched by unpeeled name only; its ref chain is never resolved. So a pin
+	// naming a cyclic symref that HEAD also names still moves — where resolving the pin would fail the move
+	// git allows.
+	let base = unique_tmp("relocate-cyclic-pin");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// A self-cyclic symref `refs/heads/alias -> refs/heads/alias`, with the worktree HEAD naming it.
+	std::fs::write(
+		work.join(".git/refs/heads/alias"),
+		"ref: refs/heads/alias\n",
+	)
+	.unwrap();
+	let admin = work.join(".git").join("worktrees").join("from");
+	std::fs::write(admin.join("HEAD"), "ref: refs/heads/alias\n").unwrap();
+
+	let to = base.join("to");
+	relocate(&req(&work, &from, &to, Some("alias")))
+		.await
+		.expect("the unpeeled pin matches without resolving the cyclic chain");
 	assert!(
 		git_listed_paths(&work).contains(&canonical(&to).to_string_lossy().into_owned()),
 		"new path listed",

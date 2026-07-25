@@ -276,7 +276,7 @@ mod native {
 	use gitana_repository::{HeadState, Repository};
 
 	use crate::LinkedWorktreeError;
-	use crate::head::{read_head, read_lock_reason, structural_head_branch};
+	use crate::head::{read_head, read_lock_reason, structural_head_branch_for_move};
 	use crate::object_id::IntoWorktreeObjectId;
 	use crate::pointers::{
 		RefSource, SYMREF_MAXDEPTH, admin_dirs_for, admin_gitdir_target, admin_owned_by,
@@ -432,7 +432,9 @@ mod native {
 			// carries without following the symref chain or touching the object store, so a cyclic/unreadable
 			// chain still yields a movable worktree. `object` is unknown here (`None`); `branch` is the unpeeled
 			// ref. A structurally invalid HEAD (absent/malformed) is `None`, which the move refuses as invalid.
-			Some(dir) if !resolve_head => match structural_head_branch(dir) {
+			// The detached grammar is `git worktree move`'s (a leading object-id of this repo's width, trailing
+			// ignored), not the stricter force-removal one.
+			Some(dir) if !resolve_head => match structural_head_branch_for_move(dir, H::RAW_LEN * 2) {
 				None => None,
 				Some(Some(branch)) => Some(HeadFacts {
 					state: HeadKind::Symbolic,
@@ -482,9 +484,14 @@ mod native {
 			},
 		};
 
-		let requested_branch = match &query.expected_branch {
-			None => RequestedBranch::NotRequested,
-			Some(branch) => {
+		// In **structural** mode (a move) the requested-branch *facts* are never computed: doing so would
+		// resolve the pin's terminal ref, scan other worktrees, and read the object store — the very chain
+		// resolution the move avoids, which would fail a move git allows when the pin names a cyclic/malformed
+		// symref. The move needs no requested-branch facts; its only branch check is the unpeeled name compare
+		// in `registered_to_different_branch` below. `NotRequested` keeps that resolution off entirely.
+		let requested_branch = match (&query.expected_branch, resolve_head) {
+			(None, _) | (Some(_), false) => RequestedBranch::NotRequested,
+			(Some(branch), true) => {
 				let refname = branch.refname();
 				// Resolve the requested branch's *terminal* ref FIRST — before the occupancy scan below — a
 				// legacy *symlink* symref (`refs/heads/alias -> refs/heads/feature`) is symbolic to git, but
