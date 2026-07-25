@@ -674,4 +674,5 @@ mod native {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::inspect;
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) use native::inspect_structural_head;
