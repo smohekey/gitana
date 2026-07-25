@@ -45,6 +45,7 @@ async fn classify_at(
 		expected_branch: None,
 		start: None,
 		with_status,
+		resolve_head: true,
 	};
 	classify(&inspect(&q).await.unwrap())
 }
@@ -1879,6 +1880,7 @@ async fn a_partial_whose_branch_is_checked_out_elsewhere_is_a_branch_use_conflic
 			expected_branch: Some(BranchName::new("feature")),
 			start: None,
 			with_status: false,
+			resolve_head: true,
 		};
 		let classification = classify(&inspect(&q).await.unwrap());
 		assert!(

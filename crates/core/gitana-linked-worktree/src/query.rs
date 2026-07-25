@@ -55,4 +55,13 @@ pub struct WorktreeQuery {
 	/// (removal), so a plain `inspect` stays cheap. Only a present, cross-pointer-consistent live checkout is
 	/// statused; a missing/partial checkout has no status to compute.
 	pub with_status: bool,
+	/// Whether HEAD is **resolved** (the symref chain followed to its terminal branch and that branch to its
+	/// object) or read only **structurally** (the branch HEAD directly names, without following the chain or
+	/// touching the object store). `true` — the default — is needed by decisions that reason about the
+	/// worktree's commit or its terminal branch (creation, removal). `false` matches what stock
+	/// `git worktree move` needs: it validates HEAD's *structure* and names its branch, but never resolves the
+	/// chain, so a worktree whose HEAD symref chain is cyclic or unreadable is still movable (git moves it,
+	/// listing HEAD as all-zero) rather than failing the resolution. In structural mode [`HeadFacts::object`]
+	/// is always `None` and [`HeadFacts::branch`] is the unpeeled ref HEAD names.
+	pub resolve_head: bool,
 }

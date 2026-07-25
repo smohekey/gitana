@@ -895,3 +895,112 @@ async fn relocate_refuses_a_source_with_no_head() {
 	assert!(from.exists(), "the source is untouched");
 	assert!(!to.exists(), "nothing was moved");
 }
+
+#[tokio::test]
+async fn relocate_moves_a_source_with_a_cyclic_head_symref() {
+	// `git worktree move` never resolves HEAD's ref chain, so a *structurally valid* symbolic HEAD pointing at
+	// a cyclic (or otherwise unresolvable) chain is still movable — verified against stock git, which moves it
+	// and lists HEAD as all-zero. relocate reads HEAD structurally (`resolve_head: false`), so it matches;
+	// resolving the chain, as a full inspection does, would wrongly fail the move with a malformed-HEAD error.
+	let base = unique_tmp("relocate-cyclic-head");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// A self-cyclic symref, with the worktree HEAD pointing into it — structurally valid, unresolvable.
+	std::fs::write(work.join(".git/refs/heads/a"), "ref: refs/heads/a\n").unwrap();
+	let admin = work.join(".git").join("worktrees").join(admin_id(&work));
+	std::fs::write(admin.join("HEAD"), "ref: refs/heads/a\n").unwrap();
+
+	// Oracle: stock git moves it (to a throwaway path, then back), confirming git does not resolve the chain.
+	let probe = base.join("probe");
+	assert!(
+		git_ok(&[
+			"-C",
+			work.to_str().unwrap(),
+			"worktree",
+			"move",
+			from.to_str().unwrap(),
+			probe.to_str().unwrap(),
+		]),
+		"stock git moves a cyclic-HEAD worktree",
+	);
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"move",
+		probe.to_str().unwrap(),
+		from.to_str().unwrap(),
+	]);
+
+	let to = base.join("to");
+	let outcome = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect("relocate moves the cyclic-HEAD worktree");
+	assert_eq!(
+		outcome,
+		RelocateOutcome::Relocated {
+			from: from.clone(),
+			to: to.clone(),
+		}
+	);
+	assert!(!from.exists(), "old checkout path gone");
+	assert!(
+		git_listed_paths(&work).contains(&canonical(&to).to_string_lossy().into_owned()),
+		"new path listed",
+	);
+}
+
+#[tokio::test]
+async fn relocate_matches_the_expected_branch_structurally() {
+	// The move validates its pinned `expected_branch` against the worktree's HEAD branch read *structurally*
+	// (no chain resolution): a mismatch is refused as an identity conflict; the exact branch moves.
+	let base = unique_tmp("relocate-expected-branch");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// Wrong branch → refused, source untouched.
+	let to = base.join("to");
+	let err = relocate(&req(&work, &from, &to, Some("other")))
+		.await
+		.expect_err("a pinned-branch mismatch is refused");
+	assert!(
+		matches!(
+			err,
+			RelocateError::Refused(WorktreeClassification::IdentityConflict { .. })
+		),
+		"got {err:?}"
+	);
+	assert!(from.exists() && !to.exists(), "the worktree stays put");
+
+	// Correct branch → moves.
+	relocate(&req(&work, &from, &to, Some("feature")))
+		.await
+		.expect("the exact expected branch moves");
+	assert!(
+		git_listed_paths(&work).contains(&canonical(&to).to_string_lossy().into_owned()),
+		"new path listed",
+	);
+}

@@ -111,7 +111,9 @@ mod native {
 	}
 
 	/// A read query for the worktree at `from`, pinned to the request's `expected_branch`. No status walk is
-	/// needed — a move is not a cleanliness decision.
+	/// needed — a move is not a cleanliness decision — and HEAD is read **structurally** (`resolve_head:
+	/// false`): a move validates HEAD's structure and matches its branch without following the symref chain,
+	/// so a worktree whose HEAD chain is cyclic/unreadable is still movable, exactly as stock git moves it.
 	fn from_query(request: &RelocateRequest) -> WorktreeQuery {
 		WorktreeQuery {
 			repo: request.repo.clone(),
@@ -119,6 +121,7 @@ mod native {
 			expected_branch: request.expected_branch.clone(),
 			start: None,
 			with_status: false,
+			resolve_head: false,
 		}
 	}
 
@@ -161,12 +164,13 @@ mod native {
 				},
 			));
 		}
-		// Movable = a present, cross-pointer-consistent linked worktree of this repository **with a readable
-		// HEAD**. Keyed off the inspection directly (not `classify`, which reports a force-overridden lock as
-		// `Locked`). The `head.is_some()` guard matches stock `git worktree move`, which rejects a source whose
-		// `<admin>/HEAD` is absent as invalid even though its cross-pointers are consistent — without it such a
-		// partial would be reported `Relocated`. Anything else — absent, prunable, HEAD-less, foreign, or
-		// unrelated content — is refused with `classify`'s reading.
+		// Movable = a present, cross-pointer-consistent linked worktree of this repository **with a
+		// structurally valid HEAD**. Keyed off the inspection directly (not `classify`, which reports a
+		// force-overridden lock as `Locked`). `from_query` reads HEAD structurally (`resolve_head: false`), so
+		// `head.is_some()` here means HEAD is present and well-formed *without* its ref chain being resolved:
+		// it matches stock `git worktree move`, which refuses a source whose `<admin>/HEAD` is absent/malformed
+		// yet moves one whose HEAD symref chain is merely cyclic or unreadable. Anything else — absent,
+		// prunable, HEAD-less, foreign, or unrelated content — is refused with `classify`'s reading.
 		let admin_dir = match &inspection.registration {
 			Registration::Present { admin_dir }
 				if inspection.cross_pointers == CrossPointerHealth::Consistent

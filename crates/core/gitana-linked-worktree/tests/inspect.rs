@@ -22,6 +22,7 @@ fn query_no_branch(
 		expected_branch: None,
 		start: None,
 		with_status: false,
+		resolve_head: true,
 	}
 }
 
@@ -38,6 +39,7 @@ fn query(
 		expected_branch: Some(BranchName::new(branch)),
 		start: None,
 		with_status: false,
+		resolve_head: true,
 	}
 }
 
@@ -55,6 +57,7 @@ fn query_with_start(
 		expected_branch: Some(BranchName::new(branch)),
 		start: Some(start),
 		with_status: false,
+		resolve_head: true,
 	}
 }
 
@@ -2123,6 +2126,7 @@ async fn a_relative_destination_is_rejected() {
 			expected_branch: None,
 			start: None,
 			with_status: false,
+			resolve_head: true,
 		};
 		assert!(
 			inspect(&q).await.is_err(),

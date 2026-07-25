@@ -276,7 +276,7 @@ mod native {
 	use gitana_repository::{HeadState, Repository};
 
 	use crate::LinkedWorktreeError;
-	use crate::head::{read_head, read_lock_reason};
+	use crate::head::{read_head, read_lock_reason, structural_head_branch};
 	use crate::object_id::IntoWorktreeObjectId;
 	use crate::pointers::{
 		RefSource, SYMREF_MAXDEPTH, admin_dirs_for, admin_gitdir_target, admin_owned_by,
@@ -395,6 +395,23 @@ mod native {
 
 		let head = match &head_dir {
 			None => None,
+			// Structural (no-resolve) HEAD, as `git worktree move` reads it: name the branch HEAD *directly*
+			// carries without following the symref chain or touching the object store, so a cyclic/unreadable
+			// chain still yields a movable worktree. `object` is unknown here (`None`); `branch` is the unpeeled
+			// ref. A structurally invalid HEAD (absent/malformed) is `None`, which the move refuses as invalid.
+			Some(dir) if !query.resolve_head => match structural_head_branch(dir) {
+				None => None,
+				Some(Some(branch)) => Some(HeadFacts {
+					state: HeadKind::Symbolic,
+					branch: Some(branch),
+					object: None,
+				}),
+				Some(None) => Some(HeadFacts {
+					state: HeadKind::Detached,
+					branch: None,
+					object: None,
+				}),
+			},
 			Some(dir) => match read_head::<H>(dir)? {
 				None => None,
 				Some(HeadState::Symbolic(refname)) => {
