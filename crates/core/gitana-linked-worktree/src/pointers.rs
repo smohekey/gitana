@@ -860,6 +860,60 @@ pub(crate) fn path_to_bytes(path: &Path) -> Vec<u8> {
 	}
 }
 
+/// Ensure a path can round-trip the (byte-clean) pointer I/O before any state is written. On **Unix** the
+/// pointers are byte-clean, so this is a no-op — a non-UTF-8 path is accepted. On **non-Unix**, where
+/// [`path_to_bytes`] still falls back to a *lossy* UTF-8 rendering, a non-UTF-8 path would serialize to a
+/// back-pointer that no longer identifies the destination; reject it here (before any state is written) so
+/// the caller never mutates state it would then fail to establish. Shared by `create` and `relocate`, which
+/// both write these pointers. Windows WTF-8 pointer I/O is a deferred follow-up.
+#[cfg(unix)]
+pub(crate) fn ensure_representable_path(_path: &Path) -> Result<(), LinkedWorktreeError> {
+	Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_representable_path(path: &Path) -> Result<(), LinkedWorktreeError> {
+	// Check the **resolved** form the pointer files will actually record — a symlink/junction can resolve a
+	// UTF-8 lexical path to a non-representable one, which would then serialize lossily *after* the writes.
+	// Rejecting it here keeps the operation side-effect-free on failure.
+	if resolved_for_pointers(path).to_str().is_some() {
+		Ok(())
+	} else {
+		Err(LinkedWorktreeError::io(
+			"non-UTF-8 path is unsupported on this platform (byte-clean pointer I/O is Unix-only)",
+			path,
+			std::io::Error::from(std::io::ErrorKind::InvalidInput),
+		))
+	}
+}
+
+/// The form of `path` the pointer files will actually record — its deepest existing ancestor canonicalized
+/// (so a symlinked parent is resolved to its real target, exactly as `create_dir_all` + `canonicalize`
+/// would), with the still-absent tail appended lexically. Used only by the non-Unix representability
+/// preflight; on Unix the pointers are byte-clean so no such check is needed.
+#[cfg(not(unix))]
+fn resolved_for_pointers(path: &Path) -> PathBuf {
+	use std::path::Component;
+	let mut resolved = PathBuf::new();
+	for component in path.components() {
+		match component {
+			Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+			Component::RootDir => resolved.push(Component::RootDir.as_os_str()),
+			Component::CurDir => {}
+			Component::ParentDir => {
+				resolved.pop();
+			}
+			Component::Normal(name) => {
+				resolved.push(name);
+				if let Ok(canonical) = resolved.canonicalize() {
+					resolved = canonical;
+				}
+			}
+		}
+	}
+	resolved
+}
+
 /// A pointer path (already stripped of its line terminator) resolved against `base` when relative, else
 /// taken as-is (git records either form — relative under `worktree.useRelativePaths`). Significant
 /// whitespace in the path is preserved (not trimmed), matching git.

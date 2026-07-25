@@ -34,7 +34,7 @@ mod native {
 		inspect,
 	};
 	use crate::pointers::{
-		admin_dirs_for, canonical, canonical_eq, is_bare, is_leaf_symlink,
+		admin_dirs_for, canonical, canonical_eq, ensure_representable_path, is_bare, is_leaf_symlink,
 		main_checkout_identifies_common, os_string_from_bytes, path_to_bytes,
 	};
 	use crate::query::WorktreeQuery;
@@ -164,14 +164,23 @@ mod native {
 		// Movable = a present, cross-pointer-consistent linked worktree of this repository. Keyed off the
 		// inspection directly (not `classify`, which reports a force-overridden lock as `Locked`). Anything
 		// else — absent, prunable, foreign, or unrelated content — is refused with `classify`'s reading.
-		match &inspection.registration {
+		let admin_dir = match &inspection.registration {
 			Registration::Present { admin_dir }
 				if inspection.cross_pointers == CrossPointerHealth::Consistent =>
 			{
-				Ok(admin_dir.clone())
+				admin_dir
 			}
-			_ => Err(RelocateError::Refused(classify(&inspection))),
+			_ => return Err(RelocateError::Refused(classify(&inspection))),
+		};
+		// Refuse when the checkout equals or contains its own admin directory — a checkout placed directly at
+		// `<common>/worktrees/<id>`. Moving it would relocate the admin out of the repository, so the backlink
+		// write would fail at its old path and the registration would be lost. The common-dir enclosure check
+		// above does not catch this: the admin dir sits *below* the common dir, so `from` enclosing its admin
+		// need not enclose the common dir.
+		if contains(&request.from, admin_dir) {
+			return Err(RelocateError::EnclosesRepository(canonical(admin_dir)));
 		}
+		Ok(admin_dir.clone())
 	}
 
 	/// Check the destination is free and return the stale registrations to drop after a successful move.
@@ -237,18 +246,24 @@ mod native {
 		Ok(!is_bare(common)? && main_checkout_identifies_common(&inspection.destination, common)?)
 	}
 
-	/// The shared common dir found *inside* `from` (an enclosed repository), or `None`. Walks up from the
-	/// canonical common dir looking for `from`; mirrors the enclosure check `remove` performs.
+	/// The shared common dir found *inside* `from` (an enclosed repository), or `None` — the enclosure check
+	/// `remove` performs.
 	fn common_dir_within(from: &Path, common: &Path) -> Option<PathBuf> {
-		let common_real = canonical(common);
-		let mut ancestor: &Path = &common_real;
+		contains(from, common).then(|| canonical(common))
+	}
+
+	/// Whether `outer` is equal to, or an ancestor of, `inner` (i.e. `inner` lives inside `outer`) — compared
+	/// by filesystem identity, walking up from the canonical `inner`.
+	fn contains(outer: &Path, inner: &Path) -> bool {
+		let inner_real = canonical(inner);
+		let mut ancestor: &Path = &inner_real;
 		loop {
-			if canonical_eq(ancestor, from) {
-				return Some(common_real.clone());
+			if canonical_eq(ancestor, outer) {
+				return true;
 			}
 			match ancestor.parent() {
 				Some(parent) => ancestor = parent,
-				None => return None,
+				None => return false,
 			}
 		}
 	}
@@ -269,6 +284,13 @@ mod native {
 		// (possibly with non-UTF-8 bytes) is detected as relative, and its style is preserved by the move.
 		let checkout_relative = raw_pointer_is_relative(&request.from.join(".git"), true);
 		let admin_relative = raw_pointer_is_relative(&admin.join("gitdir"), false);
+
+		// Before any effect, reject a destination (or admin) the pointer files cannot serialise byte-clean —
+		// a non-representable path on a non-Unix platform, where `path_to_bytes` is lossy. A no-op on Unix
+		// (pointers are byte-clean there), matching `create`, so the move never renames-then-corrupts a
+		// backlink it cannot faithfully write.
+		ensure_representable_path(&request.to)?;
+		ensure_representable_path(admin)?;
 
 		// POSIX `rename` replaces an empty destination directory; Windows `rename` cannot. `prepare_destination`
 		// validated `to` as absent or empty, so clear a validated-empty directory first for portability — and

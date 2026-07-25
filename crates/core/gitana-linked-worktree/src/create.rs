@@ -426,8 +426,8 @@ mod native {
 		// On a platform without byte-clean pointer I/O (non-Unix), a non-representable path can't round-trip
 		// the pointers, so reject it **up front** — before the branch/admin/checkout are written — rather than
 		// mutate then fail the post-write inspection. A no-op on Unix (the pointers are byte-clean there).
-		ensure_representable_path(destination)?;
-		ensure_representable_path(&admin)?;
+		crate::pointers::ensure_representable_path(destination)?;
+		crate::pointers::ensure_representable_path(&admin)?;
 
 		// Create the branch through the transactional ref layer. Strict `-b` requires the ref be absent
 		// (`expected: None`, git's create CAS). git `-B` (`force_reset`) resets an existing *direct* branch:
@@ -612,59 +612,8 @@ mod native {
 		})
 	}
 
-	/// Ensure a path can round-trip the (byte-clean) pointer I/O before any state is written. On **Unix**
-	/// the pointers are byte-clean, so this is a no-op — a non-UTF-8 path is accepted. On **non-Unix**, where
-	/// `path_to_bytes` still falls back to a *lossy* UTF-8 rendering, a non-UTF-8 path would serialize to a
-	/// back-pointer that no longer identifies the destination; reject it here (before the branch/admin/
-	/// checkout are written) so `create` never mutates state it would then fail to establish. Windows WTF-8
-	/// pointer I/O is a deferred follow-up.
-	#[cfg(unix)]
-	fn ensure_representable_path(_path: &Path) -> Result<(), LinkedWorktreeError> {
-		Ok(())
-	}
-
-	#[cfg(not(unix))]
-	fn ensure_representable_path(path: &Path) -> Result<(), LinkedWorktreeError> {
-		// Check the **resolved** form the pointer files will actually record — a symlink/junction can resolve
-		// a UTF-8 lexical path to a non-representable one, which would then serialize lossily *after* the
-		// branch/admin/checkout are written. Rejecting it here keeps `create` side-effect-free on failure.
-		if resolved_for_pointers(path).to_str().is_some() {
-			Ok(())
-		} else {
-			Err(LinkedWorktreeError::io(
-				"non-UTF-8 path is unsupported on this platform (byte-clean pointer I/O is Unix-only)",
-				path,
-				std::io::Error::from(std::io::ErrorKind::InvalidInput),
-			))
-		}
-	}
-
-	/// The form of `path` the pointer files will actually record — its deepest existing ancestor
-	/// canonicalized (so a symlinked parent is resolved to its real target, exactly as `create_dir_all` +
-	/// `canonicalize` would), with the still-absent tail appended lexically. Used only by the non-Unix
-	/// representability preflight; on Unix the pointers are byte-clean so no such check is needed.
-	#[cfg(not(unix))]
-	fn resolved_for_pointers(path: &Path) -> PathBuf {
-		use std::path::Component;
-		let mut resolved = PathBuf::new();
-		for component in path.components() {
-			match component {
-				Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
-				Component::RootDir => resolved.push(Component::RootDir.as_os_str()),
-				Component::CurDir => {}
-				Component::ParentDir => {
-					resolved.pop();
-				}
-				Component::Normal(name) => {
-					resolved.push(name);
-					if let Ok(canonical) = resolved.canonicalize() {
-						resolved = canonical;
-					}
-				}
-			}
-		}
-		resolved
-	}
+	// The representability preflight (`ensure_representable_path`) lives in `crate::pointers`, shared with
+	// `relocate`, since both write the byte-clean pointer files this guards.
 
 	/// Sanitize a destination basename into a worktree admin-directory name, mirroring git (probed against
 	/// git 2.50.1). git reuses the admin name as a per-worktree ref namespace, so it must be a valid refname
