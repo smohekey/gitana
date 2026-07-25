@@ -30,7 +30,8 @@ mod native {
 	use crate::facts::LockState;
 	use crate::head::read_lock_reason;
 	use crate::inspect::{
-		CrossPointerHealth, DestinationKind, Registration, WorktreeInspection, inspect,
+		CrossPointerHealth, DestinationKind, Registration, WorktreeInspection, classify_destination,
+		inspect,
 	};
 	use crate::pointers::{
 		admin_dirs_for, canonical, canonical_eq, is_bare, is_leaf_symlink,
@@ -90,7 +91,7 @@ mod native {
 		}
 
 		// Fail fast on an occupied or force-insufficient destination.
-		prepare_destination(request, common, &admin).await?;
+		prepare_destination(request, common, &admin)?;
 
 		// Re-verify **both** sides immediately before the move: a race that changed `from`'s registration, or
 		// (via a concurrent `lock`) the protection of a stale destination admin, aborts without moving. The
@@ -100,7 +101,7 @@ mod native {
 			let post = inspect(&from_query(request)).await?;
 			return Err(RelocateError::Incomplete(Box::new(post)));
 		}
-		let stale = prepare_destination(request, common, &admin).await?;
+		let stale = prepare_destination(request, common, &admin)?;
 
 		perform_relocate(request, &admin, &stale).await?;
 		Ok(RelocateOutcome::Relocated {
@@ -175,27 +176,28 @@ mod native {
 
 	/// Check the destination is free and return the stale registrations to drop after a successful move.
 	///
-	/// The destination is classified **without following symlinks** (via [`inspect`], not a symlink-following
-	/// `Path::exists`): an absent path or an empty directory is free; anything else — a file, a symlink, a
-	/// non-empty directory, or a linked-worktree checkout — is refused as occupied with its accurate kind. Any
-	/// admin registration naming `to` other than the source's own — a live or prunable/checkout-missing
+	/// The destination is classified with a **shallow, no-follow** stat ([`classify_destination`], not a
+	/// symlink-following `Path::exists` and not a full [`inspect`] that parses checkout/admin metadata): an
+	/// absent path or an empty directory is free; anything else — a file, a symlink, a non-empty directory, or
+	/// a linked-worktree checkout — is refused as occupied with its accurate kind. Reading only shallow facts
+	/// here matters: a non-empty target with a *malformed* `.git`, or an absent target whose stale admin has a
+	/// malformed `HEAD`, must still yield the occupied / force outcomes rather than a metadata-parse `Failed`.
+	///
+	/// Any admin registration naming `to` other than the source's own — a live or prunable/checkout-missing
 	/// worktree — is refused unless `force` permits: a locked stale registration needs `force >= 2`, an
 	/// unlocked one `force >= 1`. The required force is carried in the error so a caller need not re-probe the
 	/// admin's (possibly non-UTF-8 or symlinked) lock file. With enough force the stale admins are returned so
 	/// the caller drops them *after* the rename lands.
-	async fn prepare_destination(
+	fn prepare_destination(
 		request: &RelocateRequest,
 		common: &Path,
 		source_admin: &Path,
 	) -> Result<Vec<PathBuf>, RelocateError> {
-		let inspection = inspect(&to_query(request)).await?;
-		if !matches!(
-			inspection.destination_kind,
-			DestinationKind::Absent | DestinationKind::EmptyDir
-		) {
+		let kind = classify_destination(&request.to)?;
+		if !matches!(kind, DestinationKind::Absent | DestinationKind::EmptyDir) {
 			return Err(RelocateError::DestinationOccupied {
 				path: request.to.clone(),
-				kind: inspection.destination_kind,
+				kind,
 			});
 		}
 
@@ -217,17 +219,6 @@ mod native {
 			}
 		}
 		Ok(stale)
-	}
-
-	/// A read query for the destination (no branch expectation, no status).
-	fn to_query(request: &RelocateRequest) -> WorktreeQuery {
-		WorktreeQuery {
-			repo: request.repo.clone(),
-			destination: request.to.clone(),
-			expected_branch: None,
-			start: None,
-			with_status: false,
-		}
 	}
 
 	/// Whether the inspected destination is the repository's **primary/main** worktree — never moved by this
@@ -279,8 +270,24 @@ mod native {
 		let checkout_relative = raw_pointer_is_relative(&request.from.join(".git"), true);
 		let admin_relative = raw_pointer_is_relative(&admin.join("gitdir"), false);
 
-		std::fs::rename(&request.from, &request.to)
-			.map_err(|e| LinkedWorktreeError::io("moving worktree checkout", &request.to, e))?;
+		// POSIX `rename` replaces an empty destination directory; Windows `rename` cannot. `prepare_destination`
+		// validated `to` as absent or empty, so clear a validated-empty directory first for portability — and
+		// restore it (best-effort) if the rename then fails, so a failed move never deletes the caller's
+		// (empty) directory.
+		let dest_was_empty_dir = matches!(
+			classify_destination(&request.to),
+			Ok(DestinationKind::EmptyDir)
+		);
+		if dest_was_empty_dir {
+			std::fs::remove_dir(&request.to)
+				.map_err(|e| LinkedWorktreeError::io("clearing empty destination", &request.to, e))?;
+		}
+		if let Err(e) = std::fs::rename(&request.from, &request.to) {
+			if dest_was_empty_dir {
+				let _ = std::fs::create_dir(&request.to);
+			}
+			return Err(LinkedWorktreeError::io("moving worktree checkout", &request.to, e).into());
+		}
 
 		// Past the rename the checkout has moved: a failure now is a *partial* move — re-inspect `from` and
 		// report `Incomplete` (falling back to the underlying error only if even the re-inspection fails).
