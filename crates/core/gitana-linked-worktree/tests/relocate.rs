@@ -522,6 +522,36 @@ async fn relocate_refuses_a_foreign_registration_at_the_destination() {
 }
 
 #[tokio::test]
+async fn relocate_ignores_a_stray_non_admin_entry_under_worktrees() {
+	// A harmless non-admin child of worktrees/ (e.g. `.DS_Store`) is not a git-listed registration and must
+	// not block the move by failing when its (nonexistent) backlink is read.
+	let base = unique_tmp("relocate-stray");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+	std::fs::write(work.join(".git/worktrees/.DS_Store"), b"junk").unwrap();
+
+	let to = base.join("to");
+	relocate(&req(&work, &from, &to, None))
+		.await
+		.expect("a stray entry does not block the move");
+	assert_eq!(
+		g(&["-C", to.to_str().unwrap(), "symbolic-ref", "HEAD"]),
+		"refs/heads/feature"
+	);
+}
+
+#[tokio::test]
 async fn relocate_refuses_an_untrusted_symlinked_registration() {
 	// A symlinked admin leaf under worktrees/ is git-listed but cannot be read no-follow — it might name the
 	// destination, so relocate fails closed rather than dereference it or ignore it.

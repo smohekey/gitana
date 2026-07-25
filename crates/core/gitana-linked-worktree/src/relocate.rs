@@ -34,8 +34,8 @@ mod native {
 	};
 	use crate::pointers::{
 		admin_dirs_for, canonical, canonical_eq, ensure_representable_path, is_bare, is_leaf_symlink,
-		main_checkout_identifies_common, os_string_from_bytes, path_to_bytes, read_worktree_admins,
-		worktree_path_of,
+		is_listed_admin, main_checkout_identifies_common, os_string_from_bytes, path_to_bytes,
+		read_worktree_admins, temp_sibling, worktree_path_of, write_file_atomic,
 	};
 	use crate::query::WorktreeQuery;
 	use crate::registration_lock::RegistrationLock;
@@ -228,6 +228,12 @@ mod native {
 			if is_leaf_symlink(&admin) {
 				return Err(RelocateError::UntrustedRegistration(admin));
 			}
+			// Skip a stray non-admin entry under `worktrees/` (a `.DS_Store`, a directory without a `gitdir`):
+			// it is not a git-listed registration and cannot name `to`, so reading its backlink (ENOTDIR /
+			// absent) must not fail the whole move.
+			if !is_listed_admin(&admin)? {
+				continue;
+			}
 			if canonical_eq(&worktree_path_of(&admin)?, &request.to) {
 				stale.push(admin);
 			}
@@ -346,22 +352,32 @@ mod native {
 		ensure_representable_path(admin)?;
 
 		// POSIX `rename` replaces an empty destination directory; Windows `rename` cannot. `prepare_destination`
-		// validated `to` as absent or empty, so clear a validated-empty directory first for portability — and
-		// restore it (best-effort) if the rename then fails, so a failed move never deletes the caller's
-		// (empty) directory.
+		// validated `to` as absent or empty, so an existing empty directory is **staged aside** first (a
+		// reversible rename to a temp sibling) rather than deleted — preserving its mode/ACLs/xattrs. On a
+		// failed move it is renamed back, restoring the original directory exactly; on success the staged
+		// (empty) directory is dropped.
 		let dest_was_empty_dir = matches!(
 			destination_occupancy(&request.to),
 			Ok(DestinationKind::EmptyDir)
 		);
-		if dest_was_empty_dir {
-			std::fs::remove_dir(&request.to)
-				.map_err(|e| LinkedWorktreeError::io("clearing empty destination", &request.to, e))?;
-		}
+		let staged = if dest_was_empty_dir {
+			let staged = temp_sibling(&request.to);
+			std::fs::rename(&request.to, &staged)
+				.map_err(|e| LinkedWorktreeError::io("staging the empty destination", &request.to, e))?;
+			Some(staged)
+		} else {
+			None
+		};
 		if let Err(e) = std::fs::rename(&request.from, &request.to) {
-			if dest_was_empty_dir {
-				let _ = std::fs::create_dir(&request.to);
+			if let Some(staged) = &staged {
+				// Restore the original empty directory exactly (metadata intact).
+				let _ = std::fs::rename(staged, &request.to);
 			}
 			return Err(LinkedWorktreeError::io("moving worktree checkout", &request.to, e).into());
+		}
+		if let Some(staged) = &staged {
+			// The move succeeded onto the destination; drop the now-detached empty directory.
+			let _ = std::fs::remove_dir(staged);
 		}
 
 		// Past the rename the checkout has moved: a failure now is a *partial* move — re-inspect `from` and
@@ -396,10 +412,12 @@ mod native {
 		let backlink = admin.join("gitdir");
 
 		// admin `gitdir` → the checkout's new `.git`, byte-clean, its original relative/absolute style.
+		// Published atomically (temp + rename): a short write (ENOSPC/EFBIG) then leaves the *old* pointer
+		// intact rather than an empty/partial one, so the post-rename re-inspection sees a coherent (if stale)
+		// state and reports `Incomplete`, not a `Failed` from a malformed pointer.
 		let mut admin_bytes = path_to_bytes(&pointer(admin, &gitfile, admin_relative));
 		admin_bytes.push(b'\n');
-		std::fs::write(&backlink, admin_bytes)
-			.map_err(|e| LinkedWorktreeError::io("updating admin gitdir", &backlink, e))?;
+		write_file_atomic(&backlink, &admin_bytes)?;
 
 		// Always rewrite the checkout's `.git` to name the (unmoved) admin, preserving its representation: a
 		// relative pointer recomputed for the new depth, an absolute one rewritten to the canonical admin.
@@ -413,8 +431,7 @@ mod native {
 			checkout_relative,
 		)));
 		checkout_bytes.push(b'\n');
-		std::fs::write(&gitfile, checkout_bytes)
-			.map_err(|e| LinkedWorktreeError::io("updating checkout .git", &gitfile, e))?;
+		write_file_atomic(&gitfile, &checkout_bytes)?;
 		Ok(())
 	}
 

@@ -88,7 +88,7 @@ fn list_worktree_admins(common: &Path) -> Result<Vec<PathBuf>, LinkedWorktreeErr
 /// This is git's worktree-list membership — deliberately **independent of `commondir` ownership**: git
 /// lists (and refuses another checkout of the branch of) an admin whose `commondir` is missing or points
 /// elsewhere. Ownership of a *destination's registration* is a stricter, separate test ([`is_registration`]).
-fn is_listed_admin(admin: &Path) -> Result<bool, LinkedWorktreeError> {
+pub(crate) fn is_listed_admin(admin: &Path) -> Result<bool, LinkedWorktreeError> {
 	match std::fs::metadata(admin) {
 		Ok(meta) if meta.is_dir() => {}
 		Ok(_) => return Ok(false), // a stray file / a symlink to a non-directory
@@ -858,6 +858,50 @@ pub(crate) fn path_to_bytes(path: &Path) -> Vec<u8> {
 	{
 		path.to_string_lossy().into_owned().into_bytes()
 	}
+}
+
+/// A unique temp sibling of `path` (`<name>.tmp.<pid>.<seq>`) for a write-then-rename publish. Unique per
+/// process and per call (a monotonic counter), so concurrent writes never collide on the same temp name.
+pub(crate) fn temp_sibling(path: &Path) -> PathBuf {
+	use std::sync::atomic::{AtomicU64, Ordering};
+	static SEQ: AtomicU64 = AtomicU64::new(0);
+	let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+	let mut name = path
+		.file_name()
+		.map(|n| n.to_os_string())
+		.unwrap_or_default();
+	name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+	path.with_file_name(name)
+}
+
+/// Create `path` **exclusively** (`O_CREAT | O_EXCL`, never clobbering an existing file), write `contents`,
+/// and `fsync` — so a torn write is never published and the bytes are durable before the rename.
+fn write_and_sync(path: &Path, contents: &[u8]) -> Result<(), LinkedWorktreeError> {
+	use std::io::Write as _;
+	let mut file = std::fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(path)
+		.map_err(|e| LinkedWorktreeError::io("creating temp file", path, e))?;
+	file
+		.write_all(contents)
+		.map_err(|e| LinkedWorktreeError::io("writing temp file", path, e))?;
+	file
+		.sync_all()
+		.map_err(|e| LinkedWorktreeError::io("syncing temp file", path, e))
+}
+
+/// Publish `contents` at `path` atomically: fully write an exclusive temp sibling, then `rename` it onto
+/// `path` (replacing) — a reader never observes a torn pointer, and a crash leaves the target absent (a
+/// classifiable partial state) rather than a half-written file (a malformed-pointer hard error). Shared by
+/// `create` and `relocate`, which both publish pointer files.
+pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), LinkedWorktreeError> {
+	let tmp = temp_sibling(path);
+	write_and_sync(&tmp, contents)?;
+	std::fs::rename(&tmp, path).map_err(|e| {
+		let _ = std::fs::remove_file(&tmp);
+		LinkedWorktreeError::io("publishing admin file", path, e)
+	})
 }
 
 /// Ensure a path can round-trip the (byte-clean) pointer I/O before any state is written. On **Unix** the

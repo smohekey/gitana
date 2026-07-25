@@ -26,7 +26,7 @@ mod native {
 		CrossPointerHealth, DestinationKind, Registration, RequestedBranch, inspect,
 	};
 	use crate::object_id::IntoWorktreeObjectId;
-	use crate::pointers::is_valid_refname;
+	use crate::pointers::{is_valid_refname, write_file_atomic};
 	use crate::query::WorktreeQuery;
 	use crate::registration_lock::RegistrationLock;
 	use crate::repo_id::{detect_kind, open_store_raw, open_work_dir};
@@ -660,48 +660,8 @@ mod native {
 		out
 	}
 
-	/// A unique temp sibling of `path` (`<name>.tmp.<pid>.<seq>`) for the write-then-rename dance. Unique per
-	/// process + call so two creates targeting the same directory never collide on the staging file.
-	fn temp_sibling(path: &Path) -> PathBuf {
-		use std::sync::atomic::{AtomicU64, Ordering};
-		static SEQ: AtomicU64 = AtomicU64::new(0);
-		let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-		let mut name = path
-			.file_name()
-			.map(|n| n.to_os_string())
-			.unwrap_or_default();
-		name.push(format!(".tmp.{}.{}", std::process::id(), seq));
-		path.with_file_name(name)
-	}
-
-	/// Create `path` exclusively, write `contents`, and `fsync` — so the file's bytes are durable before it
-	/// is published. The caller then links/renames it into its final name.
-	fn write_and_sync(path: &Path, contents: &[u8]) -> Result<(), LinkedWorktreeError> {
-		use std::io::Write as _;
-		let mut file = std::fs::OpenOptions::new()
-			.write(true)
-			.create_new(true)
-			.open(path)
-			.map_err(|e| LinkedWorktreeError::io("creating temp file", path, e))?;
-		file
-			.write_all(contents)
-			.map_err(|e| LinkedWorktreeError::io("writing temp file", path, e))?;
-		file
-			.sync_all()
-			.map_err(|e| LinkedWorktreeError::io("syncing temp file", path, e))
-	}
-
-	/// Publish `contents` at `path` atomically: fully write a temp sibling, then `rename` it onto `path`
-	/// (replacing) — a reader never observes a torn pointer, and a crash leaves the target absent (a
-	/// classifiable partial state) rather than a half-written file (a malformed-pointer hard error).
-	fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), LinkedWorktreeError> {
-		let tmp = temp_sibling(path);
-		write_and_sync(&tmp, contents)?;
-		std::fs::rename(&tmp, path).map_err(|e| {
-			let _ = std::fs::remove_file(&tmp);
-			LinkedWorktreeError::io("publishing admin file", path, e)
-		})
-	}
+	// `write_file_atomic` (and its `temp_sibling`/`write_and_sync` helpers) live in `crate::pointers`, shared
+	// with `relocate`, since both publish pointer files atomically.
 
 	/// Write git's admin layout for the new worktree — the admin's `gitdir` back-pointer, `commondir`,
 	/// `HEAD`, and (for a non-orphan) `ORIG_HEAD` plus a seeded `logs/HEAD` — returning the canonical admin
