@@ -45,6 +45,16 @@ impl WorkDirFs for CapWorkDir {
 			{
 				Ok(None)
 			}
+			// A path that leaves the capability root (a symlink component pointing outside) is not
+			// reachable from this working tree, so — like git ignoring an omitted child behind an
+			// untracked symlink — treat it as absent rather than aborting `status`/`diff`/reapply.
+			// cap-std synthesises this as a `PermissionDenied` with no OS errno (a `Custom` error); a
+			// real `EACCES` carries `raw_os_error() == Some(..)` and still propagates.
+			Err(error)
+				if error.kind() == io::ErrorKind::PermissionDenied && error.raw_os_error().is_none() =>
+			{
+				Ok(None)
+			}
 			Err(error) => Err(error),
 		}
 	}

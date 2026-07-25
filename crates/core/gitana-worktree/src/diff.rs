@@ -35,6 +35,12 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	let mut out = Vec::new();
 	for entry in index.entries.iter().filter(|e| e.stage == 0) {
 		let Some(meta) = wt.work().lstat(&entry.path)? else {
+			// An omitted sparse path (skip-worktree) is absent by design — git ignores the working tree for
+			// it, so its absence is not an unstaged deletion. A skip-worktree path that *is* present falls
+			// through to the normal comparison below.
+			if entry.skip_worktree {
+				continue;
+			}
 			// Deleted in the working tree.
 			let old = wt.repository().read_blob(entry.oid).await?;
 			out.push(FileDiff {

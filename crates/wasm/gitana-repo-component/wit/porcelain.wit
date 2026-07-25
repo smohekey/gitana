@@ -1,4 +1,4 @@
-package gitana:repo@0.10.0;
+package gitana:repo@0.11.0;
 
 /// HTTP credential resolution, granted by the host.
 ///
@@ -353,6 +353,28 @@ interface porcelain {
 		untracked: list<string>,
 	}
 
+	/// A sparse-checkout set — the arguments to `sparse-set`/`sparse-add` and what `sparse-list`
+	/// returns. `cone` selects the mode (`core.sparseCheckoutCone`): when true, `entries` are the
+	/// included directories (git's cone model); when false, they are full gitignore-style pattern
+	/// lines. The default cone set (root files only) is `sparse-set` with an empty `entries`.
+	record sparse-patterns {
+		/// Whether this is cone mode (directories) rather than non-cone (patterns).
+		cone: bool,
+		/// The included directories (cone) or pattern lines (non-cone).
+		entries: list<string>,
+	}
+
+	/// The outcome of applying (or reapplying) sparse patterns. Both lists are paths the caller
+	/// resolves before reapplying; no work is lost in either case. git prints these as "left despite
+	/// sparse patterns" and "already present ... not updated despite sparse patterns" respectively.
+	record sparse-outcome {
+		/// Excluded-but-modified paths left in the working tree (skip-worktree not set).
+		left-dirty: list<string>,
+		/// Included paths not materialised because an untracked file occupies an ancestor slot: that
+		/// file is preserved and the path's skip-worktree bit is cleared, but nothing is written.
+		not-updated: list<string>,
+	}
+
 	resource repository {
 		/// Open the repository whose git directory is `git-dir` — an owned
 		/// directory descriptor granted by the host. Reads `config` through the
@@ -533,6 +555,35 @@ interface porcelain {
 		/// Requires a symbolic `HEAD` (committing on a detached `HEAD` is not
 		/// supported).
 		commit: func(message: string, author: string, committer: string) -> result<string, repo-error>;
+
+		// -- Sparse-checkout (require a repository opened via `open-worktree`).
+
+		/// Replace the sparse-checkout set with `patterns` and apply it (git's `sparse-checkout set`, and
+		/// `init` when `patterns` is empty). `cone` selects the mode: cone directories, or non-cone
+		/// gitignore-style pattern lines. Persists git's config (`extensions.worktreeConfig` in the common
+		/// config; `core.sparseCheckout`/`core.sparseCheckoutCone` per-worktree), writes
+		/// `info/sparse-checkout`, and materialises/omits working-tree files to match — returning any
+		/// excluded-but-modified paths left behind.
+		sparse-set: func(patterns: list<string>, cone: bool) -> result<sparse-outcome, repo-error>;
+
+		/// Extend the current sparse-checkout set with `patterns`, keeping the configured mode, then apply
+		/// it (git's `sparse-checkout add`). Fails with `invalid` if sparse-checkout is not enabled.
+		sparse-add: func(patterns: list<string>) -> result<sparse-outcome, repo-error>;
+
+		/// The current sparse-checkout set — the included directories (cone) or pattern lines (non-cone) —
+		/// or `none` when sparse-checkout is not enabled (git's `sparse-checkout list`).
+		sparse-list: func() -> result<option<sparse-patterns>, repo-error>;
+
+		/// Disable sparse-checkout, materialising the whole working tree and clearing the skip-worktree
+		/// bits (git's `sparse-checkout disable`). The config booleans are set false; the pattern file is
+		/// left in place, as git leaves it. `not-updated` reports any path whose materialisation an
+		/// untracked file blocked (`left-dirty` is always empty here — disable removes no content).
+		sparse-disable: func() -> result<sparse-outcome, repo-error>;
+
+		/// Re-apply the current sparse-checkout patterns to the working tree (git's `sparse-checkout
+		/// reapply`) — omitting newly-excluded clean files, materialising newly-included ones. A no-op
+		/// when sparse-checkout is disabled.
+		sparse-reapply: func() -> result<sparse-outcome, repo-error>;
 	}
 }
 

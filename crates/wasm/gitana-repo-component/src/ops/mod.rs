@@ -30,5 +30,8 @@ pub(crate) use self::{
 	repo::{init_layout, init_repo, install_effective_config, read_config, repack},
 	revisions::{is_ancestor, merge_base, rev_list, rev_parse},
 	wasi_credentials::WasiCredentialProvider,
-	worktree::{add, checkout, commit, status},
+	worktree::{
+		add, checkout, commit, sparse_add, sparse_disable, sparse_list, sparse_reapply, sparse_set,
+		status,
+	},
 };

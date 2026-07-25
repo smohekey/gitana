@@ -113,14 +113,14 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		}
 	}
 
-	// Working tree vs index (the Y column). A **skip-worktree** entry (sparse checkout) is not compared to the
-	// working tree at all — git ignores the working tree for it, so an omitted file is not a deletion and a
-	// present one is not a modification.
-	for entry in index
-		.entries
-		.iter()
-		.filter(|e| e.stage == 0 && !e.skip_worktree)
-	{
+	// Working tree vs index (the Y column). A **skip-worktree** (sparse) entry is compared only when its
+	// file is PRESENT: git ignores the working tree for an omitted (absent) sparse path — so its absence is
+	// not a deletion — but a file the user recreated or edited at that path is reported modified (git clears
+	// the bit when it notices the file; gitana reports it without mutating the index).
+	for entry in index.entries.iter().filter(|e| e.stage == 0) {
+		if entry.skip_worktree && wt.work().lstat(&entry.path)?.is_none() {
+			continue;
+		}
 		let code = worktree_change(wt.work(), entry, &entry.path, file_mode)?;
 		if code != ' ' {
 			at(&mut merged, &entry.path).worktree = code;
@@ -166,34 +166,67 @@ pub(crate) async fn diverged_tracked_content<F: FileStore, W: WorkDirFs, H: Hash
 	let index = wt.load_index().await?;
 	let mut out = Vec::new();
 	for entry in index.entries.iter().filter(|e| e.stage == 0) {
-		let Some(meta) = wt.work().lstat(&entry.path)? else {
-			continue; // absent — a deletion (status catches it) or an omitted sparse path; not content at risk
-		};
-		// Deliberately *no* `stat_matches` shortcut: hash the working file and compare oid + mode directly.
-		let diverged = match blob_of::<W, H>(wt.work(), &entry.path, &meta)? {
-			Some((oid, _))
-				if oid == entry.oid
-					&& modes_equivalent(effective_mode(&meta, entry.mode), entry.mode, file_mode) =>
-			{
-				// The working file matches the index — but it is only "reconstructable" (safe to delete) if the
-				// object store holds a *valid* copy. Existence alone is not enough: a present-but-corrupt loose
-				// object, or a pack naming an unreadable object, would leave the working file as the sole valid
-				// copy. Read the stored blob and confirm it hashes back to the indexed oid; a read failure or a
-				// hash mismatch means the checkout is not safe to delete, so treat it as diverged (preserve).
-				match wt.repository().read_blob(entry.oid).await {
-					Ok(bytes) => ObjectId::<H>::compute(ObjectKind::Blob, &bytes) != entry.oid,
-					Err(_) => true,
-				}
-			}
-			// Content or mode differs, or neither a regular file nor a symlink now sits at a tracked path (e.g. a
-			// directory replaced it) — a divergence from the tracked blob; not safe to delete blindly.
-			_ => true,
-		};
-		if diverged {
+		if matches!(
+			worktree_content_state(wt, entry, file_mode).await?,
+			WorktreeContent::Diverged
+		) {
 			out.push(entry.path.clone());
 		}
 	}
 	Ok(out)
+}
+
+/// The working-tree state of a tracked path relative to its index blob, established by **hashing** the
+/// present file rather than trusting the stat cache — the removal-safe classification shared by
+/// [`diverged_tracked_content`] and sparse reapply. Never uses the `stat_matches` fast path, which can
+/// hide a same-size / coarse-timestamp edit.
+pub(crate) enum WorktreeContent {
+	/// No file at the path — a deletion (`status` catches it) or an already-omitted sparse path.
+	Absent,
+	/// A present file that hashes back to the index blob (mode included) and is reconstructable from a
+	/// verified object-store copy — safe to remove or leave.
+	Reconstructable,
+	/// A present file whose bytes or mode differ from the index blob (or whose stored blob is
+	/// missing/corrupt) — content at risk that must not be overwritten or deleted.
+	Diverged,
+}
+
+/// Classify `entry`'s working-tree file (see [`WorktreeContent`]). Absent → `Absent`; present and equal
+/// to a verified stored blob → `Reconstructable`; otherwise → `Diverged`. Always hashes the present
+/// file, so a stat-preserving or coarse-timestamp edit is caught.
+pub(crate) async fn worktree_content_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+	entry: &IndexEntry<H>,
+	file_mode: bool,
+) -> Result<WorktreeContent, WorktreeError> {
+	let Some(meta) = wt.work().lstat(&entry.path)? else {
+		return Ok(WorktreeContent::Absent);
+	};
+	// Deliberately *no* `stat_matches` shortcut: hash the working file and compare oid + mode directly.
+	let diverged = match blob_of::<W, H>(wt.work(), &entry.path, &meta)? {
+		Some((oid, _))
+			if oid == entry.oid
+				&& modes_equivalent(effective_mode(&meta, entry.mode), entry.mode, file_mode) =>
+		{
+			// The working file matches the index — but it is only "reconstructable" (safe to delete) if the
+			// object store holds a *valid* copy. Existence alone is not enough: a present-but-corrupt loose
+			// object, or a pack naming an unreadable object, would leave the working file as the sole valid
+			// copy. Read the stored blob and confirm it hashes back to the indexed oid; a read failure or a
+			// hash mismatch means the checkout is not safe to delete, so treat it as diverged (preserve).
+			match wt.repository().read_blob(entry.oid).await {
+				Ok(bytes) => ObjectId::<H>::compute(ObjectKind::Blob, &bytes) != entry.oid,
+				Err(_) => true,
+			}
+		}
+		// Content or mode differs, or neither a regular file nor a symlink now sits at a tracked path (e.g. a
+		// directory replaced it) — a divergence from the tracked blob; not safe to delete blindly.
+		_ => true,
+	};
+	Ok(if diverged {
+		WorktreeContent::Diverged
+	} else {
+		WorktreeContent::Reconstructable
+	})
 }
 
 /// Whether the index carries any change relative to `HEAD` — a **staged** add/modify/delete, or an unmerged
@@ -247,7 +280,7 @@ pub(crate) async fn has_staged_changes<F: FileStore, W: WorkDirFs, H: HashAlgori
 /// config; an `include`/`includeIf` in the local config (which we do not process and which could override
 /// `core.fileMode`); an unparseable value; or a `config.worktree` that is present but unreadable / non-UTF-8
 /// / malformed. Only a genuinely-absent `config.worktree` (`NotFound`) falls back to the common value.
-async fn worktree_file_mode<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+pub(crate) async fn worktree_file_mode<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
 ) -> bool {
 	let Ok(common) = wt.repository().read_config().await else {
@@ -395,7 +428,7 @@ fn collect_untracked<W: WorkDirFs>(
 	Ok(())
 }
 
-fn worktree_change<W: WorkDirFs, H: HashAlgorithm>(
+pub(crate) fn worktree_change<W: WorkDirFs, H: HashAlgorithm>(
 	work: &W,
 	entry: &IndexEntry<H>,
 	path: &str,

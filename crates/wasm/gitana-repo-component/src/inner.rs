@@ -10,7 +10,8 @@ use wasip2::filesystem::types::Descriptor;
 
 use crate::bindings::exports::gitana::repo::porcelain::{
 	CommitInfo, FetchOutcome, HashKind, HeadState, ObjectInfo, PushOutcome, RefEntry, ReflogRequest,
-	RepackReport, RepoError, TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
+	RepackReport, RepoError, SparseOutcome, SparsePatterns, TagInfo, TreeBuildEntry, TreeEntry,
+	WorktreeStatus,
 };
 use crate::block_on::block_on;
 use crate::ops;
@@ -378,5 +379,29 @@ impl Inner {
 		committer: &str,
 	) -> Result<String, RepoError> {
 		dispatch!(self, held => block_on(ops::commit(held.worktree()?, message, author, committer)))
+	}
+
+	pub(crate) fn sparse_set(
+		&self,
+		patterns: Vec<String>,
+		cone: bool,
+	) -> Result<SparseOutcome, RepoError> {
+		dispatch!(self, held => block_on(ops::sparse_set(held.worktree()?, patterns, cone)))
+	}
+
+	pub(crate) fn sparse_add(&self, patterns: Vec<String>) -> Result<SparseOutcome, RepoError> {
+		dispatch!(self, held => block_on(ops::sparse_add(held.worktree()?, patterns)))
+	}
+
+	pub(crate) fn sparse_list(&self) -> Result<Option<SparsePatterns>, RepoError> {
+		dispatch!(self, held => block_on(ops::sparse_list(held.worktree()?)))
+	}
+
+	pub(crate) fn sparse_disable(&self) -> Result<SparseOutcome, RepoError> {
+		dispatch!(self, held => block_on(ops::sparse_disable(held.worktree()?)))
+	}
+
+	pub(crate) fn sparse_reapply(&self) -> Result<SparseOutcome, RepoError> {
+		dispatch!(self, held => block_on(ops::sparse_reapply(held.worktree()?)))
 	}
 }

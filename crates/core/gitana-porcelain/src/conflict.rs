@@ -46,7 +46,24 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 	theirs_tree: ObjectId<H>,
 	conflicts: &[String],
 ) -> Result<()> {
+	// A conflicted path is materialised regardless of the sparse patterns (below), which would overwrite
+	// local bytes the user has at that path — so refuse first, as git aborts a merge that would clobber
+	// local changes. An out-of-cone conflict path recreated/edited on disk diverges from the index; catch
+	// it before writing anything (an in-cone dirty conflict path is also refused by the checkout itself).
+	let diverged = wt.diverged_tracked_content_paths().await?;
+	let clobbered: Vec<&String> = conflicts.iter().filter(|p| diverged.contains(p)).collect();
+	if !clobbered.is_empty() {
+		bail!(
+			"your local changes to {clobbered:?} would be overwritten by the merge; commit or stash them first"
+		);
+	}
+
 	wt.checkout(merged_tree, false).await?;
+	// A conflict on an out-of-cone path would have been sparse-omitted by the checkout above, leaving the
+	// `UU` marker file unwritten and the conflict unresolvable. Conflicts are incompatible with
+	// skip-worktree, so vivify every conflicted path's merged (marker) content regardless of the sparse
+	// patterns, as git does (an in-cone path was already written, so this is idempotent for it).
+	wt.materialise_paths(merged_tree, conflicts).await?;
 
 	let repository = wt.repository();
 	let base = tree_entry_map(repository, base_tree).await?;

@@ -168,6 +168,14 @@ impl<H: HashAlgorithm> Index<H> {
 			.find(|entry| entry.path == path && entry.stage == 0)
 	}
 
+	/// Whether `path` has a stage-0 entry excluded from the working tree (`skip_worktree` set) — a
+	/// sparse-checkout path. Such entries are invisible to working-tree pathspec operations
+	/// (`add`/`restore`): their absent file is neither restaged as a modification nor recorded as a
+	/// deletion, matching git's sparse-checkout pathspec exclusion.
+	pub fn is_sparse(&self, path: &str) -> bool {
+		self.entry(path).is_some_and(|entry| entry.skip_worktree)
+	}
+
 	/// Insert or replace the entry for its path, keeping the entries sorted. Any other stages for the
 	/// path (a recorded conflict) are dropped, so staging a resolved file collapses it to stage 0.
 	pub fn upsert(&mut self, entry: IndexEntry<H>) {

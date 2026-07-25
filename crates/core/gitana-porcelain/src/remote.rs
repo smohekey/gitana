@@ -594,6 +594,7 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	deepen: &Deepen,
 	reflog: Option<CloneReflog<'_>>,
 	persist_url: &str,
+	sparse: bool,
 ) -> Result<()> {
 	repo.init().await?;
 
@@ -653,11 +654,22 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	gitana_remote::save_remote_origin(repo.objects().file_store(), persist_url).await?;
 
 	// Populate the working tree from HEAD (if the repo had any commits).
-	if let Some(commit) = repo.refs().resolve_head().await? {
-		let tree = repo.commit_tree(commit).await?;
-		// The `git_dir` a `WorkTree` carries is inert — the index and all git-dir files route through
-		// the `FileStore` — so a placeholder path suffices, as elsewhere in the worktree layer.
-		let worktree = WorkTree::new(repo, work, "");
+	let head = repo.refs().resolve_head().await?;
+	// The `git_dir` a `WorkTree` carries is inert — the index and all git-dir files route through the
+	// `FileStore` — so a placeholder path suffices, as elsewhere in the worktree layer.
+	let worktree = WorkTree::new(repo, work, "");
+	// `--sparse` (git's clone --sparse): initialise cone sparse-checkout with the default set (root files
+	// only) BEFORE any checkout, so only the in-cone paths are ever written — rather than materialising the
+	// whole tree and removing most of it. Written even for an empty remote (git's clone --sparse still lays
+	// down the config + pattern file so a later first checkout is sparse); with a HEAD the subsequent
+	// checkout honours the patterns just written (the index is still empty, so this reapply is a no-op).
+	if sparse {
+		worktree
+			.apply_sparse_set(&gitana_worktree::SparseSet::Cone(Vec::new()))
+			.await?;
+	}
+	if let Some(commit) = head {
+		let tree = worktree.repository().commit_tree(commit).await?;
 		worktree.checkout(tree, true).await?;
 	}
 	Ok(())

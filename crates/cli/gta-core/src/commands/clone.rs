@@ -25,6 +25,7 @@ pub async fn run(
 	depth: Option<u32>,
 	shallow_since: Option<String>,
 	shallow_exclude: Vec<String>,
+	sparse: bool,
 ) -> Result<()> {
 	// Fail fast on a bad `--shallow-since` before any network round-trip.
 	let deepen = build_deepen(depth, shallow_since.as_deref(), shallow_exclude)?;
@@ -88,6 +89,7 @@ pub async fn run(
 				&deepen,
 				&reflog_url,
 				&persist_url,
+				sparse,
 			)
 			.await?;
 		}
@@ -109,6 +111,7 @@ pub async fn run(
 				&deepen,
 				&reflog_url,
 				&persist_url,
+				sparse,
 			)
 			.await?;
 		}
@@ -135,6 +138,7 @@ fn create_skeleton(git_dir: &Path) -> Result<()> {
 
 /// Run the porcelain clone over `connection`, dispatching the repository's hash algorithm (negotiated
 /// from the advertisement) so the rest is generic over `H`.
+#[allow(clippy::too_many_arguments)]
 async fn clone_over(
 	connection: &mut impl Connection,
 	kind: HashKind,
@@ -143,17 +147,37 @@ async fn clone_over(
 	deepen: &Deepen,
 	reflog_url: &str,
 	persist_url: &str,
+	sparse: bool,
 ) -> Result<()> {
 	match kind {
 		HashKind::Sha1 => {
-			clone_as::<Sha1>(connection, git_dir, target, deepen, reflog_url, persist_url).await
+			clone_as::<Sha1>(
+				connection,
+				git_dir,
+				target,
+				deepen,
+				reflog_url,
+				persist_url,
+				sparse,
+			)
+			.await
 		}
 		HashKind::Sha256 => {
-			clone_as::<Sha256>(connection, git_dir, target, deepen, reflog_url, persist_url).await
+			clone_as::<Sha256>(
+				connection,
+				git_dir,
+				target,
+				deepen,
+				reflog_url,
+				persist_url,
+				sparse,
+			)
+			.await
 		}
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn clone_as<H: HashAlgorithm>(
 	connection: &mut impl Connection,
 	git_dir: &Path,
@@ -161,6 +185,7 @@ async fn clone_as<H: HashAlgorithm>(
 	deepen: &Deepen,
 	reflog_url: &str,
 	persist_url: &str,
+	sparse: bool,
 ) -> Result<()> {
 	let repo = repo::open_generic::<H>(git_dir, git_dir).await?;
 	// The committer falls back to a placeholder when unconfigured, as git's reflog writes do.
@@ -175,6 +200,7 @@ async fn clone_as<H: HashAlgorithm>(
 			url: reflog_url,
 		}),
 		persist_url,
+		sparse,
 	)
 	.await
 }

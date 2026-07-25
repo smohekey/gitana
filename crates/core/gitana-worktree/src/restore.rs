@@ -22,6 +22,7 @@ use crate::fsmeta::stat_of;
 use crate::pathspec::normalize;
 use crate::{IndexEntry, Stat, WorkTree, WorktreeError};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run<F, W, H>(
 	wt: &WorkTree<F, W, H>,
 	source: Option<ObjectId<H>>,
@@ -30,6 +31,7 @@ pub(crate) async fn run<F, W, H>(
 	pathspecs: &[&str],
 	prefix: &str,
 	require_match: bool,
+	exclude_sparse: bool,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
@@ -66,12 +68,31 @@ where
 	// nothing is an error (`restore`/`checkout`); without it, an unmatched pathspec is silently
 	// skipped (`reset`, which treats `reset -- <untracked-or-missing>` as a no-op, like git).
 	// Either way the pathspec is still normalised, so an unsafe/empty/absolute spec is rejected.
+	// Sparse-excluded paths are invisible to `restore`: git excludes them from pathspec matching, so an
+	// explicit `restore <sparse>` reports "did not match" and a broad `restore .` silently skips them.
+	// Only an omitted path that is **actually absent** is invisible, though: git clears the skip-worktree
+	// bit when a file reappears on disk and then restores it (probed vs git 2.50.1 — `restore .` replaces
+	// a recreated omitted file from the index), so a present skip-worktree entry is materialized and must
+	// stay selectable. Path-limited `reset` (`exclude_sparse` false) is different — git *does* update an
+	// explicitly named sparse entry's staged blob while keeping its bit — so it does not exclude them.
+	let mut sparse: BTreeSet<&str> = BTreeSet::new();
+	if exclude_sparse {
+		for entry in index
+			.entries
+			.iter()
+			.filter(|e| e.stage == 0 && e.skip_worktree)
+		{
+			if wt.work().lstat(&entry.path)?.is_none() {
+				sparse.insert(entry.path.as_str());
+			}
+		}
+	}
 	let mut selected: BTreeSet<&str> = BTreeSet::new();
 	for &spec in pathspecs {
 		let (normalized, dir_only) = normalize(spec, prefix)?;
 		let mut matched = false;
 		for &path in &universe {
-			if matches(path, &normalized, dir_only) {
+			if !sparse.contains(path) && matches(path, &normalized, dir_only) {
 				selected.insert(path);
 				matched = true;
 			}
@@ -100,6 +121,12 @@ where
 			match source_entries.iter().find(|(p, _, _)| p == path) {
 				// Present in the source: write the chosen targets from it.
 				Some((_, mode, oid)) => {
+					// Capture the prior entry's index-only flags before any rewrite: a path-limited `reset` of a
+					// sparse path keeps its skip-worktree bit (only its staged blob changes). A worktree restore
+					// only reaches non-sparse paths, whose bit is already clear.
+					let prior = index.entry(path);
+					let skip_worktree = !worktree && prior.is_some_and(|entry| entry.skip_worktree);
+					let assume_valid = prior.is_some_and(|entry| entry.assume_valid);
 					if staged {
 						// Drop entries whose shape conflicts with recording `path` as a file, the way
 						// `git add` rewrites the index for a type change.
@@ -125,8 +152,8 @@ where
 							mode: u32::from_str_radix(mode, 8).unwrap_or(0o100644),
 							oid: *oid,
 							stage: 0,
-							assume_valid: false,
-							skip_worktree: false,
+							assume_valid,
+							skip_worktree,
 							path: path.to_owned(),
 						});
 					}

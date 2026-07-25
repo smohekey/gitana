@@ -19,6 +19,9 @@ pub enum WorktreeError {
 	/// A repository (object/ref) error.
 	#[error("repository error: {0}")]
 	Repository(#[from] gitana_repository::RepositoryError),
+	/// A malformed or invalid config value (e.g. a non-boolean `core.sparseCheckout`).
+	#[error("config error: {0}")]
+	Config(#[from] gitana_config::ConfigError),
 	/// A checkout would overwrite uncommitted local changes (without `--force`).
 	#[error("checkout would overwrite local changes to {0}")]
 	Conflict(String),
@@ -31,6 +34,11 @@ pub enum WorktreeError {
 	/// A pathspec matched no entries in the restore source.
 	#[error("pathspec did not match any file(s): {0}")]
 	PathspecMatch(String),
+	/// `add` was given an explicit path outside the sparse-checkout definition (git advises `--sparse`).
+	#[error(
+		"'{0}' is outside the sparse-checkout; disable or modify the sparsity rules to update it in the index"
+	)]
+	SparsePathExcluded(String),
 	/// An empty pathspec (`""`) was given.
 	#[error("empty string is not a valid pathspec")]
 	EmptyPathspec,

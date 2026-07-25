@@ -7,6 +7,7 @@ use gitana_repository::Repository;
 
 use crate::fsmeta::{effective_mode, join_rel, mode_of, push_gitignore, stat_of};
 use crate::ignore::{self, DirIgnore};
+use crate::sparse::{SparseCheckout, SparseReapply, SparseSet};
 use crate::{Index, IndexEntry, Status, WorktreeError};
 
 /// A working directory paired with its repository.
@@ -150,6 +151,342 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		}
 	}
 
+	/// The active sparse-checkout matcher for this worktree, or `None` when sparse-checkout is disabled.
+	/// A tracked file the matcher does not [`include`](SparseCheckout::includes) is omitted from the
+	/// working tree (its index entry carries the skip-worktree bit).
+	///
+	/// `core.sparseCheckout` / `core.sparseCheckoutCone` are **per-worktree** settings: git turns on
+	/// `extensions.worktreeConfig` and stores them in `config.worktree` (even for an ordinary
+	/// repository — probed against git 2.50.1), so they are read from there first, falling back to the
+	/// merged effective config for a hand-set value. The patterns come from the per-worktree
+	/// `info/sparse-checkout`; an **absent** file means no narrowing — probed against git 2.50.1, a
+	/// `core.sparseCheckout=true` with no pattern file does a full checkout — so it is treated as
+	/// sparse-inactive (`None`), not an all-excluding matcher.
+	pub(crate) async fn sparse_checkout(&self) -> Result<Option<SparseCheckout>, WorktreeError> {
+		if !self.sparse_config_bool("sparsecheckout").await? {
+			return Ok(None);
+		}
+		let cone = self.sparse_config_bool("sparsecheckoutcone").await?;
+		// `core.ignoreCase` is a repository-global setting read from the standard config stack (not the
+		// per-worktree override): with it on, git matches sparse patterns case-insensitively — the norm on
+		// macOS/Windows, where `git init` sets it. Probed against git 2.50.1 for both cone and non-cone.
+		let ignorecase = self
+			.repo
+			.effective_config()
+			.await?
+			.get_bool_validated("core", None, "ignorecase")?
+			.unwrap_or(false);
+		let text = match self.files().read_path("info/sparse-checkout").await {
+			Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+			// No pattern file → no sparse narrowing (git does a full checkout), so sparse is inactive.
+			Err(FileStoreError::NotFound) => return Ok(None),
+			Err(error) => return Err(error.into()),
+		};
+		Ok(Some(SparseCheckout::parse(&text, cone, ignorecase)))
+	}
+
+	/// Read a per-worktree sparse `core.<name>` bool: the `config.worktree` override (where git and
+	/// `gta sparse-checkout` store it) if present, else the merged effective config; absent → `false`.
+	///
+	/// git honours `config.worktree` **only** when the common config enables `extensions.worktreeConfig`
+	/// (a repository-format extension); a stale or hand-written `config.worktree` without the extension is
+	/// ignored, and the value falls back to the merged config. This gates that override, matching
+	/// [`crate::status::worktree_file_mode`]'s handling of `core.fileMode`.
+	async fn sparse_config_bool(&self, name: &str) -> Result<bool, WorktreeError> {
+		let worktree_config_enabled = match self.repo.read_config().await {
+			Ok(common) => common
+				.get_bool_validated("extensions", None, "worktreeconfig")?
+				.unwrap_or(false),
+			// An unreadable common config cannot establish the extension; do not honour config.worktree.
+			Err(_) => false,
+		};
+		if worktree_config_enabled {
+			match self.files().read_path("config.worktree").await {
+				Ok(bytes) => {
+					// A non-UTF-8 `config.worktree` is pathological; skip the override rather than fail the read.
+					if let Ok(text) = String::from_utf8(bytes) {
+						let over = gitana_config::GitConfig::parse(&text)?;
+						if let Some(value) = over.get_bool_validated("core", None, name)? {
+							return Ok(value);
+						}
+					}
+				}
+				Err(FileStoreError::NotFound) => {}
+				Err(error) => return Err(error.into()),
+			}
+		}
+		Ok(
+			self
+				.repo
+				.effective_config()
+				.await?
+				.get_bool_validated("core", None, name)?
+				.unwrap_or(false),
+		)
+	}
+
+	/// Apply the current sparse-checkout patterns to the working tree and index — git's
+	/// `sparse-checkout reapply` (and the tail of `set`/`add`/`init`). For every stage-0 tracked file:
+	/// - **included but currently omitted** (skip-worktree set): materialise the blob and clear the bit;
+	/// - **excluded, present and clean**: remove it from the working tree and set the skip-worktree bit;
+	/// - **excluded, present and modified**: leave it (no data loss), do *not* set the bit, and record it
+	///   in [`SparseReapply::left_dirty`] — matching git, which warns and leaves such paths.
+	///
+	/// A no-op returning an empty outcome when sparse-checkout is disabled. Takes the index lock for the
+	/// whole update, committing on success (releasing it on error, leaving the tree unchanged).
+	pub async fn reapply_sparse(&self) -> Result<SparseReapply, WorktreeError> {
+		let Some(matcher) = self.sparse_checkout().await? else {
+			return Ok(SparseReapply::default());
+		};
+		let file_mode = crate::status::worktree_file_mode(self).await;
+		let lock = self.lock_index().await?;
+		match self.apply_sparse(&matcher, file_mode).await {
+			Ok((index, outcome)) => {
+				self.commit_index(lock, &index).await?;
+				Ok(outcome)
+			}
+			Err(error) => {
+				self.release_index_lock(lock).await;
+				Err(error)
+			}
+		}
+	}
+
+	/// The index-mutating core of [`reapply_sparse`](Self::reapply_sparse), run under the held index lock:
+	/// returns the updated index (for the caller to commit) and the reapply outcome.
+	async fn apply_sparse(
+		&self,
+		matcher: &SparseCheckout,
+		file_mode: bool,
+	) -> Result<(Index<H>, SparseReapply), WorktreeError> {
+		let mut index = self.load_index().await?;
+		let mut left_dirty = Vec::new();
+		let mut not_updated = Vec::new();
+		for entry in index.entries.iter_mut() {
+			if entry.stage != 0 {
+				continue;
+			}
+			// Classify the on-disk file by HASHING it (never the stat fast path), so a stat-preserving or
+			// coarse-timestamp edit cannot be mistaken for clean and destroyed. git preserves a modified file
+			// on both sides — it never overwrites or deletes local content to satisfy the patterns.
+			let state = crate::status::worktree_content_state(self, entry, file_mode).await?;
+			if matcher.includes(&entry.path) {
+				// Included: materialise it if it is currently omitted (skip-worktree set).
+				if entry.skip_worktree {
+					match state {
+						// A modified file already sits at the path: git keeps it and clears the bit — the path is
+						// now IN the cone, so its edit is an ordinary modification, NOT a "left despite sparse
+						// patterns" case (that list is reserved for excluded paths). Do not warn.
+						crate::status::WorktreeContent::Diverged => {}
+						// Absent: materialise from the blob — unless an untracked file occupies an ancestor slot,
+						// in which case git leaves that file, writes nothing, and reports the path as "not
+						// updated" (it still clears the bit below, so the path shows as deleted in status).
+						crate::status::WorktreeContent::Absent => {
+							if crate::checkout::ancestor_blocked(self.work(), &entry.path)? {
+								not_updated.push(entry.path.clone());
+							} else {
+								let mode = format!("{:o}", entry.mode);
+								let (path, oid) = (entry.path.clone(), entry.oid);
+								crate::checkout::write_worktree_file(self, &path, &mode, oid).await?;
+							}
+						}
+						crate::status::WorktreeContent::Reconstructable => {}
+					}
+					entry.skip_worktree = false;
+				}
+			} else {
+				// Excluded by the matcher. Reconcile the on-disk file regardless of the current bit, so a file
+				// recreated at an already-omitted path is not left hidden:
+				match state {
+					// Present and modified: git never hides it — clear the bit and record it (git's "left
+					// despite sparse patterns" warning), whether the bit was already set or newly excluded.
+					crate::status::WorktreeContent::Diverged => {
+						entry.skip_worktree = false;
+						left_dirty.push(entry.path.clone());
+					}
+					// Absent: omit it (set the bit; a no-op when already omitted).
+					crate::status::WorktreeContent::Absent => entry.skip_worktree = true,
+					// Present but reconstructable: remove the clean file and omit it.
+					crate::status::WorktreeContent::Reconstructable => {
+						crate::checkout::remove_worktree_path(self, &entry.path)?;
+						entry.skip_worktree = true;
+					}
+				}
+			}
+		}
+		Ok((
+			index,
+			SparseReapply {
+				left_dirty,
+				not_updated,
+			},
+		))
+	}
+
+	/// Persist and apply the sparse-checkout `set` (git's `sparse-checkout set`/`init`, and — after the
+	/// caller merges the current set — `add`): enable git's config (`extensions.worktreeConfig` in the
+	/// common config; `core.sparseCheckout` [+ `core.sparseCheckoutCone` in cone mode] per-worktree),
+	/// write `.git/info/sparse-checkout` in the mode's format, then reapply. Returns the reapply outcome
+	/// (paths left in the working tree because they had local modifications).
+	pub async fn apply_sparse_set(&self, set: &SparseSet) -> Result<SparseReapply, WorktreeError> {
+		// Take the index lock BEFORE writing any config or pattern file, so a held `index.lock` fails the
+		// whole operation before it changes anything — rather than leaving the new patterns/config on disk
+		// with the working tree and index still reflecting the old set (git rejects up front too).
+		let file_mode = crate::status::worktree_file_mode(self).await;
+		let lock = self.lock_index().await?;
+		let result: Result<(Index<H>, SparseReapply), WorktreeError> = async {
+			self.write_sparse_enabled(true, set.is_cone()).await?;
+			self
+				.files()
+				.write_path_replace("info/sparse-checkout", set.render().as_bytes())
+				.await?;
+			// Apply under the held lock. The set was just enabled, so the matcher is present; a defensive
+			// `None` (e.g. an empty file) is a no-op.
+			match self.sparse_checkout().await? {
+				Some(matcher) => self.apply_sparse(&matcher, file_mode).await,
+				None => Ok((self.load_index().await?, SparseReapply::default())),
+			}
+		}
+		.await;
+		match result {
+			Ok((index, outcome)) => {
+				self.commit_index(lock, &index).await?;
+				Ok(outcome)
+			}
+			Err(error) => {
+				self.release_index_lock(lock).await;
+				Err(error)
+			}
+		}
+	}
+
+	/// Materialise `paths` from `tree` into the working tree, **bypassing** sparse-checkout. Used to
+	/// vivify conflicted (unmerged) paths: git always makes a conflict visible and resolvable regardless
+	/// of the sparse patterns (skip-worktree is incompatible with an unmerged entry), so a merge whose
+	/// conflict falls on an out-of-cone path must still write its marker file. A path absent from `tree`
+	/// is skipped.
+	pub async fn materialise_paths(
+		&self,
+		tree: ObjectId<H>,
+		paths: &[String],
+	) -> Result<(), WorktreeError> {
+		let entries = self.repository().read_tree(tree).await?;
+		for (path, mode, oid) in &entries {
+			if paths.iter().any(|p| p == path) {
+				crate::checkout::write_worktree_file(self, path, mode, *oid).await?;
+			}
+		}
+		Ok(())
+	}
+
+	/// The currently-configured sparse-checkout set — the included directories (cone) or the pattern
+	/// lines (non-cone) — or `None` when sparse-checkout is not enabled. Drives `list` and the read half
+	/// of `add`.
+	pub async fn current_sparse_set(&self) -> Result<Option<SparseSet>, WorktreeError> {
+		let Some(matcher) = self.sparse_checkout().await? else {
+			return Ok(None);
+		};
+		let text = match self.files().read_path("info/sparse-checkout").await {
+			Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+			Err(FileStoreError::NotFound) => String::new(),
+			Err(error) => return Err(error.into()),
+		};
+		Ok(Some(match matcher {
+			// `list` recovers the directories; case-folding is irrelevant to `dirs()`, so pass `false`.
+			SparseCheckout::Cone(_) => SparseSet::Cone(crate::sparse::Cone::parse(&text, false).dirs()),
+			SparseCheckout::NonCone(_) => SparseSet::NonCone(text.lines().map(str::to_owned).collect()),
+		}))
+	}
+
+	/// Disable sparse-checkout (git's `sparse-checkout disable`): materialise every omitted
+	/// (skip-worktree) file and clear its bit, then set the config booleans false. `extensions.
+	/// worktreeConfig` and `.git/info/sparse-checkout` are left in place, exactly as git leaves them.
+	pub async fn disable_sparse(&self) -> Result<SparseReapply, WorktreeError> {
+		let file_mode = crate::status::worktree_file_mode(self).await;
+		let lock = self.lock_index().await?;
+		let outcome = match self.materialise_all_sparse(file_mode).await {
+			Ok((index, outcome)) => {
+				self.commit_index(lock, &index).await?;
+				outcome
+			}
+			Err(error) => {
+				self.release_index_lock(lock).await;
+				return Err(error);
+			}
+		};
+		self.write_sparse_enabled(false, false).await?;
+		Ok(outcome)
+	}
+
+	/// Materialise every stage-0 skip-worktree entry into the working tree and clear its bit, returning
+	/// the updated index and reapply outcome. Run under the held index lock by [`Self::disable_sparse`].
+	/// A file the user placed at an omitted path is preserved, not overwritten — git keeps it (the
+	/// omitted file is normally absent, so the common case writes the blob); an untracked file occupying
+	/// an ancestor slot blocks the write (recorded in `not_updated`), and the bit is cleared regardless.
+	async fn materialise_all_sparse(
+		&self,
+		file_mode: bool,
+	) -> Result<(Index<H>, SparseReapply), WorktreeError> {
+		let mut index = self.load_index().await?;
+		let mut not_updated = Vec::new();
+		for entry in index.entries.iter_mut() {
+			if entry.stage == 0 && entry.skip_worktree {
+				if matches!(
+					crate::status::worktree_content_state(self, entry, file_mode).await?,
+					crate::status::WorktreeContent::Absent
+				) {
+					if crate::checkout::ancestor_blocked(self.work(), &entry.path)? {
+						not_updated.push(entry.path.clone());
+					} else {
+						let mode = format!("{:o}", entry.mode);
+						let (path, oid) = (entry.path.clone(), entry.oid);
+						crate::checkout::write_worktree_file(self, &path, &mode, oid).await?;
+					}
+				}
+				entry.skip_worktree = false;
+			}
+		}
+		Ok((
+			index,
+			SparseReapply {
+				left_dirty: Vec::new(),
+				not_updated,
+			},
+		))
+	}
+
+	/// Write git's sparse-checkout config: `extensions.worktreeConfig = true` in the common config (git
+	/// honours the extension only from the local/common file, and never clears it on disable), and
+	/// `core.sparseCheckout` / `core.sparseCheckoutCone` per-worktree — plus `index.sparse = false` when
+	/// disabling, which git records (gitana has no sparse-index; the key is inert but kept for fidelity).
+	async fn write_sparse_enabled(&self, enabled: bool, cone: bool) -> Result<(), WorktreeError> {
+		let mut common = self.repository().read_config().await?;
+		common.set("extensions", None, "worktreeConfig", "true")?;
+		self.repository().write_config(&common).await?;
+
+		// `core.sparseCheckout`/`Cone` are per-worktree; read-modify-write to keep any other keys.
+		let mut over = match self.files().read_path("config.worktree").await {
+			Ok(bytes) => {
+				let text = String::from_utf8(bytes)
+					.map_err(|_| std::io::Error::other("config.worktree is not UTF-8"))?;
+				gitana_config::GitConfig::parse(&text)?
+			}
+			Err(FileStoreError::NotFound) => gitana_config::GitConfig::new(),
+			Err(error) => return Err(error.into()),
+		};
+		let flag = |value: bool| if value { "true" } else { "false" };
+		over.set("core", None, "sparseCheckout", flag(enabled))?;
+		over.set("core", None, "sparseCheckoutCone", flag(cone))?;
+		if !enabled {
+			over.set("index", None, "sparse", "false")?;
+		}
+		self
+			.files()
+			.write_path_replace("config.worktree", over.render().as_bytes())
+			.await?;
+		Ok(())
+	}
+
 	/// Write the index under the lock (acquire, write, release).
 	pub async fn save_index(&self, index: &Index<H>) -> Result<(), WorktreeError> {
 		let lock = self.lock_index().await?;
@@ -202,6 +539,9 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// longer exists is removed from the index (a staged deletion).
 	pub async fn add(&self, pathspecs: &[&str], prefix: &str) -> Result<(), WorktreeError> {
 		let mut index = self.load_index().await?;
+		// The active sparse matcher: `add` never stages a path outside it (git refuses an out-of-cone path,
+		// advising `--sparse`), whether or not the path already has a skip-worktree entry.
+		let sparse = self.sparse_checkout().await?;
 		let mut ignore_stack: Vec<DirIgnore> = Vec::new();
 		for &spec in pathspecs {
 			let (rel, dir_only) = crate::pathspec::normalize(spec, prefix)?;
@@ -210,46 +550,127 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				let mut files = Vec::new();
 				walk_files(self.work(), "", &mut ignore_stack, &mut files)?;
 				for file in files {
-					self.stage_file(&mut index, &file).await?;
+					self.stage_file(&mut index, &file, sparse.as_ref()).await?;
 				}
-				self.stage_deletions(&mut index, "")?;
+				self.stage_deletions(&mut index, "", sparse.as_ref())?;
 				continue;
 			}
 			match self.work().lstat(&rel)? {
 				Some(meta) if meta.kind.is_dir() => {
 					let mut files = Vec::new();
 					walk_files(self.work(), &rel, &mut ignore_stack, &mut files)?;
-					for file in files {
-						self.stage_file(&mut index, &file).await?;
+					// An explicitly-named directory whose matches are ALL out-of-cone is REFUSED (git reports
+					// it), unlike a broad `.` walk that silently skips such paths, or a directory with any
+					// in-cone content (which stages that and skips the out-of-cone siblings).
+					if self.only_out_of_cone_dir(&index, &rel, &files, sparse.as_ref()) {
+						return Err(WorktreeError::SparsePathExcluded(rel));
 					}
-					self.stage_deletions(&mut index, &rel)?;
+					for file in files {
+						self.stage_file(&mut index, &file, sparse.as_ref()).await?;
+					}
+					self.stage_deletions(&mut index, &rel, sparse.as_ref())?;
 				}
 				// A trailing-slash spec required a directory but resolved to a file.
 				Some(_) if dir_only => return Err(WorktreeError::PathspecMatch(spec.to_owned())),
-				Some(_) => self.stage_file(&mut index, &rel).await?,
+				Some(_) => {
+					// An explicitly-named out-of-cone file is REFUSED (git exits nonzero with sparse advice),
+					// unlike a broad pathspec whose walk silently skips such files.
+					if index.is_sparse(&rel)
+						|| sparse
+							.as_ref()
+							.is_some_and(|matcher| !matcher.includes(&rel))
+					{
+						return Err(WorktreeError::SparsePathExcluded(rel));
+					}
+					self.stage_file(&mut index, &rel, sparse.as_ref()).await?
+				}
 				// Absent from the working tree: stage the deletion of whatever tracked entries the
 				// pathspec covers — the exact path (a removed file) and any children (a removed
 				// directory, `rm -r dir && add dir`). A spec matching no tracked entry did not match
 				// anything; a trailing-slash spec additionally requires it to have named a directory.
 				None => {
+					// An explicitly-named out-of-cone path (absent by design) is REFUSED, like the present
+					// case: `git add x/h` on an omitted file exits nonzero with sparse advice, rather than
+					// silently succeeding without staging anything.
+					if index.is_sparse(&rel) || sparse.as_ref().is_some_and(|m| !m.includes(&rel)) {
+						return Err(WorktreeError::SparsePathExcluded(rel));
+					}
+					// A directory pathspec covering only out-of-cone (skip-worktree) tracked entries is
+					// REFUSED the same way (`add b` when the whole `b/` subtree is excluded and absent) —
+					// git reports it rather than silently staging nothing.
+					if self.only_out_of_cone_dir(&index, &rel, &[], sparse.as_ref()) {
+						return Err(WorktreeError::SparsePathExcluded(rel));
+					}
+					// A sparse-excluded path (or a directory whose only entries are excluded) is
+					// invisible to `add`: git treats it as outside the sparse-checkout definition, so it
+					// neither matches the pathspec nor has its entry dropped. Ignore sparse entries when
+					// deciding whether anything matched, and never remove a sparse entry here.
 					let child_prefix = format!("{rel}/");
-					let matched = index.entry(&rel).is_some()
-						|| index
-							.entries
-							.iter()
-							.any(|entry| entry.stage == 0 && entry.path.starts_with(&child_prefix));
+					let matched = index.entry(&rel).is_some_and(|entry| !entry.skip_worktree)
+						|| index.entries.iter().any(|entry| {
+							entry.stage == 0 && !entry.skip_worktree && entry.path.starts_with(&child_prefix)
+						});
 					if dir_only && !matched {
 						return Err(WorktreeError::PathspecMatch(spec.to_owned()));
 					}
-					index.remove(&rel);
-					self.stage_deletions(&mut index, &rel)?;
+					if !index.is_sparse(&rel) {
+						index.remove(&rel);
+					}
+					self.stage_deletions(&mut index, &rel, sparse.as_ref())?;
 				}
 			}
 		}
 		self.save_index(&index).await
 	}
 
-	async fn stage_file(&self, index: &mut Index<H>, path: &str) -> Result<(), WorktreeError> {
+	/// Whether the directory pathspec `rel` matches paths but **all** of them are out-of-cone under
+	/// active sparse-checkout — the case git refuses (reporting the pathspec) rather than staging
+	/// nothing. `walked` are the on-disk files the pathspec's walk found (empty for a directory absent
+	/// from the working tree). Returns `false` when sparse-checkout is inactive, when nothing is matched,
+	/// or when any matched path is in-cone (a mixed directory stages its in-cone content and never errors,
+	/// matching git). A matched path is a tracked entry at or under `rel` (in-cone iff not skip-worktree)
+	/// or an on-disk file under `rel` — both in-cone iff the matcher includes them. A tracked entry is
+	/// classified by the **matcher**, not its skip-worktree bit: a modified out-of-cone file that reapply
+	/// left in place has its bit cleared yet is still outside the sparse definition (probed vs git
+	/// 2.50.1 — git still refuses `add <dir>` there), so the bit would misclassify it as in-cone.
+	fn only_out_of_cone_dir(
+		&self,
+		index: &Index<H>,
+		rel: &str,
+		walked: &[String],
+		sparse: Option<&SparseCheckout>,
+	) -> bool {
+		let Some(matcher) = sparse else {
+			return false;
+		};
+		let child_prefix = format!("{rel}/");
+		let under = |path: &str| path == rel || path.starts_with(&child_prefix);
+		let covered =
+			!walked.is_empty() || index.entries.iter().any(|e| e.stage == 0 && under(&e.path));
+		if !covered {
+			return false;
+		}
+		let any_in_cone = index
+			.entries
+			.iter()
+			.any(|e| e.stage == 0 && under(&e.path) && matcher.includes(&e.path))
+			|| walked.iter().any(|f| matcher.includes(f));
+		!any_in_cone
+	}
+
+	async fn stage_file(
+		&self,
+		index: &mut Index<H>,
+		path: &str,
+		sparse: Option<&SparseCheckout>,
+	) -> Result<(), WorktreeError> {
+		// A path outside the sparse-checkout is invisible to `add`: git refuses to update the index for a
+		// path outside the sparse-checkout definition (advising `--sparse`), whether it already has a
+		// skip-worktree entry OR is a newly-created out-of-cone file. Leave it untouched — neither restaging
+		// a present-but-excluded file nor staging a new out-of-cone one.
+		if index.is_sparse(path) || sparse.is_some_and(|matcher| !matcher.includes(path)) {
+			return Ok(());
+		}
 		match self.work().lstat(path)? {
 			Some(meta) if meta.kind.is_symlink() => {
 				let target = self.work().read_link(path)?;
@@ -283,7 +704,12 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// are present, and this pass stages the removals of those that vanished, so `rm foo && add .`
 	/// records the deletion rather than silently keeping the stale entry. A single explicit pathspec
 	/// that is absent is handled directly by [`Self::add`]; this pass covers the directory case.
-	fn stage_deletions(&self, index: &mut Index<H>, dir_rel: &str) -> Result<(), WorktreeError> {
+	fn stage_deletions(
+		&self,
+		index: &mut Index<H>,
+		dir_rel: &str,
+		sparse: Option<&SparseCheckout>,
+	) -> Result<(), WorktreeError> {
 		let prefix = if dir_rel.is_empty() {
 			String::new()
 		} else {
@@ -293,7 +719,16 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		let candidates: Vec<String> = index
 			.entries
 			.iter()
-			.filter(|entry| entry.stage == 0 && entry.path.starts_with(&prefix))
+			// An out-of-cone entry's file is absent by design — its absence is not a deletion. Exclude it by
+			// the skip-worktree bit AND the active matcher: a dirty excluded file has its bit cleared (so it
+			// stays visible), yet it is still outside the sparse definition and its later absence must not be
+			// staged as a deletion (git leaves it unstaged).
+			.filter(|entry| {
+				entry.stage == 0
+					&& !entry.skip_worktree
+					&& entry.path.starts_with(&prefix)
+					&& sparse.is_none_or(|matcher| matcher.includes(&entry.path))
+			})
 			.map(|entry| entry.path.clone())
 			.collect();
 		for path in candidates {
@@ -380,7 +815,10 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		pathspecs: &[&str],
 		prefix: &str,
 	) -> Result<(), WorktreeError> {
-		crate::restore::run(self, source, worktree, staged, pathspecs, prefix, true).await
+		crate::restore::run(
+			self, source, worktree, staged, pathspecs, prefix, true, true,
+		)
+		.await
 	}
 
 	/// Reset the index to `tree`, replacing every entry with the tree's content (the index half
@@ -400,7 +838,17 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		pathspecs: &[&str],
 		prefix: &str,
 	) -> Result<(), WorktreeError> {
-		crate::restore::run(self, Some(tree), false, true, pathspecs, prefix, false).await
+		crate::restore::run(
+			self,
+			Some(tree),
+			false,
+			true,
+			pathspecs,
+			prefix,
+			false,
+			false,
+		)
+		.await
 	}
 
 	/// Remove the tracked paths matched by `pathspecs` from the index and — unless `cached` —

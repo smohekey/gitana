@@ -384,6 +384,9 @@ enum Command {
 		/// Shallow clone: do not deepen history past this ref or commit (may be given more than once).
 		#[arg(long, value_name = "ref")]
 		shallow_exclude: Vec<String>,
+		/// Initialise cone sparse-checkout (root files only); narrow with `gta sparse-checkout set`.
+		#[arg(long)]
+		sparse: bool,
 	},
 	/// Download new objects from the origin and update remote-tracking refs.
 	Fetch {
@@ -461,6 +464,43 @@ enum Command {
 		#[command(subcommand)]
 		action: WorktreeAction,
 	},
+	/// Restrict the working tree to a subset of paths (sparse-checkout).
+	SparseCheckout {
+		#[command(subcommand)]
+		action: SparseCheckoutAction,
+	},
+}
+
+/// A `sparse-checkout` sub-command.
+#[derive(Subcommand)]
+enum SparseCheckoutAction {
+	/// Enable sparse-checkout with the default set (cone: root files only).
+	Init {
+		/// Use full gitignore-style patterns instead of cone mode.
+		#[arg(long = "no-cone")]
+		no_cone: bool,
+	},
+	/// Replace the sparse-checkout set: cone directories, or (`--no-cone`) gitignore patterns.
+	Set {
+		/// Directories (cone) or patterns (`--no-cone`) to include.
+		#[arg(value_name = "pattern")]
+		patterns: Vec<String>,
+		/// Use full gitignore-style patterns instead of cone mode.
+		#[arg(long = "no-cone")]
+		no_cone: bool,
+	},
+	/// Extend the current sparse-checkout set, keeping the configured mode.
+	Add {
+		/// Directories (cone) or patterns (`--no-cone`) to add.
+		#[arg(value_name = "pattern")]
+		patterns: Vec<String>,
+	},
+	/// Print the current sparse-checkout set.
+	List,
+	/// Disable sparse-checkout, restoring the whole working tree.
+	Disable,
+	/// Re-apply the current sparse-checkout patterns to the working tree.
+	Reapply,
 }
 
 /// A `worktree` sub-command.
@@ -808,7 +848,8 @@ impl Cli {
 					depth,
 					shallow_since,
 					shallow_exclude,
-				} => commands::clone::run(url, path, depth, shallow_since, shallow_exclude).await,
+					sparse,
+				} => commands::clone::run(url, path, depth, shallow_since, shallow_exclude, sparse).await,
 				Command::Fetch {
 					tags,
 					no_tags,
@@ -862,9 +903,25 @@ impl Cli {
 				Command::Worktree { action } => {
 					commands::worktree::run(&cwd, worktree_action(action)).await
 				}
+				Command::SparseCheckout { action } => {
+					commands::sparse_checkout::run(&cwd, sparse_checkout_action(action)).await
+				}
 			}
 		})
 		.await
+	}
+}
+
+/// Map the clap `sparse-checkout` sub-command to the `gta-core` action.
+fn sparse_checkout_action(action: SparseCheckoutAction) -> commands::sparse_checkout::Action {
+	use commands::sparse_checkout::Action;
+	match action {
+		SparseCheckoutAction::Init { no_cone } => Action::Init { no_cone },
+		SparseCheckoutAction::Set { patterns, no_cone } => Action::Set { patterns, no_cone },
+		SparseCheckoutAction::Add { patterns } => Action::Add { patterns },
+		SparseCheckoutAction::List => Action::List,
+		SparseCheckoutAction::Disable => Action::Disable,
+		SparseCheckoutAction::Reapply => Action::Reapply,
 	}
 }
 

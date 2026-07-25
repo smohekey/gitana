@@ -28,15 +28,40 @@ where
 		validate_path(path)?;
 	}
 
+	// Carry the prior entries' index-only flags forward: git's `reset` preserves `skip_worktree`
+	// (a sparse path stays excluded) and `assume_valid` across the rebuild, so a reset must not
+	// silently un-sparse the repository.
+	let prior_flags: std::collections::HashMap<String, (bool, bool)> = wt
+		.load_index()
+		.await?
+		.entries
+		.into_iter()
+		.filter(|entry| entry.stage == 0)
+		.map(|entry| (entry.path, (entry.skip_worktree, entry.assume_valid)))
+		.collect();
+	// A path the reset introduces (no prior entry) derives its skip-worktree bit from the active sparse
+	// matcher: git's unpack-trees marks an out-of-cone path skip-worktree (probed — `reset --mixed` to a
+	// tree adding an excluded path leaves it `S` and absent), rather than reporting its absence a deletion.
+	let sparse = wt.sparse_checkout().await?;
+
 	let mut index = Index::new();
 	for (path, mode, oid) in entries {
+		let (skip_worktree, assume_valid) = match prior_flags.get(&path) {
+			Some(&flags) => flags,
+			None => (
+				sparse
+					.as_ref()
+					.is_some_and(|matcher| !matcher.includes(&path)),
+				false,
+			),
+		};
 		index.upsert(IndexEntry {
 			stat: Stat::default(),
 			mode: u32::from_str_radix(&mode, 8).unwrap_or(0o100644),
 			oid,
 			stage: 0,
-			assume_valid: false,
-			skip_worktree: false,
+			assume_valid,
+			skip_worktree,
 			path,
 		});
 	}

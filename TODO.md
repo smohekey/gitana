@@ -272,7 +272,7 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [ ] Add more complete `.gitignore` compatibility coverage.
 - [ ] Add attributes support where it affects working-tree behavior.
 - [ ] Add line-ending normalization support.
-- [ ] Add sparse checkout support.
+- [x] Add sparse checkout support. `gta sparse-checkout init/set/add/list/disable/reapply` and `clone --sparse`, matching git: omit part of the working tree via the skip-worktree bit while keeping the full index/history. Both cone (directories) and non-cone (gitignore patterns) modes, stored git's way (`extensions.worktreeConfig` + per-worktree `core.sparseCheckout`/`core.sparseCheckoutCone` + `.git/info/sparse-checkout`), so stock git reads/operates in a gta-sparsified worktree. An omitted path is invisible to the working-tree commands as git makes it — `checkout`/`reset` keep it omitted (preserving the bit), `add`/`restore` skip it (never restaging or deleting its absent file), and a `checkout` under active sparsity recomputes each path from the current patterns (materialising only in-cone paths). Exposed on the `gitana:repo` wasm component too (`sparse-set`/`sparse-add`/`sparse-list`/`sparse-disable`/`sparse-reapply`). Oracle-tested against stock git 2.50.1. Sparse-*index* (collapsed directory entries) and partial clone (`--filter`) remain out of scope.
 - [ ] Add submodule entry handling beyond tree mode representation.
 - [x] Operate correctly inside linked working trees (`git worktree add`): resolve the `.git`-file pointer and route per-worktree files (`HEAD`, `index`) vs. shared common-dir files (`objects`, `refs`, `config`).
 - [x] Add a `gta worktree` command (`add`/`list`/`remove`) to create and manage linked working trees.

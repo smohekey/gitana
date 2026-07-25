@@ -50,11 +50,24 @@ where
 {
 	let mut index = wt.load_index().await?;
 	// Tracked = stage-0 entries plus unmerged paths (which have only stage 1/2/3 entries); removing
-	// an unmerged path is a valid way to resolve its conflict.
+	// an unmerged path is a valid way to resolve its conflict. An **out-of-cone** entry is excluded from
+	// the tracked universe — git treats a path outside the sparse-checkout definition as outside the
+	// pathspec, so a broad `rm .` never stages its deletion, and an explicit `rm <sparse>` does not match
+	// (git refuses it unless `--sparse`). Filter by the active matcher, NOT just the skip-worktree bit:
+	// reapply CLEARS the bit on a modified out-of-cone file it leaves in place, yet that file is still
+	// outside the definition — probed vs git 2.50.1, `rm -r .` there preserves it (it would otherwise be
+	// deleted and staged, losing the local content).
+	let sparse = wt.sparse_checkout().await?;
 	let mut tracked: Vec<String> = index
 		.entries
 		.iter()
-		.filter(|e| e.stage == 0)
+		.filter(|e| {
+			e.stage == 0
+				&& !e.skip_worktree
+				&& sparse
+					.as_ref()
+					.is_none_or(|matcher| matcher.includes(&e.path))
+		})
 		.map(|e| e.path.clone())
 		.collect();
 	tracked.extend(index.unmerged_paths().map(str::to_owned));

@@ -233,6 +233,165 @@ async fn worktree_porcelain_round_trip<H: HashAlgorithm>() -> Result<()> {
 	Ok(())
 }
 
+/// The sparse-checkout surface over the component: `sparse-set`/`list`/`add`/`disable`, driving the
+/// engine through the granted descriptors and — crucially — writing git's config (the common-dir
+/// `config`'s `extensions.worktreeConfig`, and the per-worktree `config.worktree`) through them.
+async fn worktree_sparse_round_trip<H: HashAlgorithm>() -> Result<()> {
+	let git = tempfile::tempdir()?;
+	let git_dir = git.path();
+	seed_repo::<H>(git_dir).await?;
+	let work = tempfile::tempdir()?;
+	let work_dir = work.path();
+
+	let mut session = Session::open_worktree(git_dir, git_dir, work_dir).await?;
+	let porcelain = session.repo.gitana_repo_porcelain().repository();
+	let store = &mut session.store;
+	let handle = session.handle;
+
+	// -- full checkout first: the `dir/` subtree and the root files all materialise.
+	porcelain
+		.call_checkout(&mut *store, handle, "main", false)
+		.await?
+		.map_err(|error| anyhow!("checkout: {error:?}"))?;
+	assert!(work_dir.join("dir/inner.txt").exists());
+	assert!(work_dir.join("hello.txt").exists());
+
+	// -- sparse-set to the default cone (root files only): the out-of-cone `dir/` is omitted, roots stay.
+	let outcome = porcelain
+		.call_sparse_set(&mut *store, handle, &[], true)
+		.await?
+		.map_err(|error| anyhow!("sparse-set: {error:?}"))?;
+	assert!(outcome.left_dirty.is_empty());
+	assert!(
+		!work_dir.join("dir").exists(),
+		"the cone default (root files only) must omit dir/"
+	);
+	assert!(work_dir.join("hello.txt").exists(), "root files stay");
+
+	// -- the component wrote git's config through the granted descriptors: the extension in the common
+	//    `config`, the mode booleans in `config.worktree`, and the pattern file. (gitana renders config
+	//    variable names lowercased — git reads them case-insensitively — so match case-insensitively.)
+	assert!(
+		std::fs::read_to_string(git_dir.join("config"))?
+			.to_lowercase()
+			.contains("worktreeconfig"),
+		"extensions.worktreeConfig must be written to the common config"
+	);
+	assert!(
+		std::fs::read_to_string(git_dir.join("config.worktree"))?
+			.to_lowercase()
+			.contains("sparsecheckout"),
+		"core.sparseCheckout must be written to config.worktree"
+	);
+	assert_eq!(
+		std::fs::read_to_string(git_dir.join("info/sparse-checkout"))?,
+		"/*\n!/*/\n"
+	);
+
+	// -- list reflects the empty cone set.
+	let listed = porcelain
+		.call_sparse_list(&mut *store, handle)
+		.await?
+		.map_err(|error| anyhow!("sparse-list: {error:?}"))?
+		.ok_or_else(|| anyhow!("expected sparse-checkout enabled"))?;
+	assert!(listed.cone && listed.entries.is_empty(), "got {listed:?}");
+
+	// -- a cone `sparse-set` with a glob metacharacter is rejected as `invalid` (the component applies the
+	//    same literal-directory validation as the CLI, rather than rendering a broken `/*/` pattern file).
+	match porcelain
+		.call_sparse_set(&mut *store, handle, &["*".to_owned()], true)
+		.await?
+	{
+		Err(gitana_repo_host::exports::gitana::repo::porcelain::RepoError::Invalid(message)) => {
+			assert!(
+				message.contains("pattern character"),
+				"unexpected cone-metachar error: {message}"
+			);
+		}
+		other => anyhow::bail!("expected a cone glob to be refused as invalid, got {other:?}"),
+	}
+
+	// -- a cone `sparse-set` naming a tracked *file* (not a directory) is rejected as `invalid`, the same
+	//    index check the native CLI applies.
+	match porcelain
+		.call_sparse_set(&mut *store, handle, &["hello.txt".to_owned()], true)
+		.await?
+	{
+		Err(gitana_repo_host::exports::gitana::repo::porcelain::RepoError::Invalid(message)) => {
+			assert!(
+				message.contains("not a directory"),
+				"unexpected tracked-file cone error: {message}"
+			);
+		}
+		other => {
+			anyhow::bail!("expected a tracked-file cone entry to be refused as invalid, got {other:?}")
+		}
+	}
+
+	// -- adding the now-excluded `dir` is refused as `invalid` (the engine's SparsePathExcluded is mapped
+	//    to a precise WIT error, not a generic backend failure).
+	match porcelain
+		.call_add(&mut *store, handle, &["dir".to_owned()], "")
+		.await?
+	{
+		Err(gitana_repo_host::exports::gitana::repo::porcelain::RepoError::Invalid(message)) => {
+			assert!(
+				message.contains("sparse-checkout"),
+				"unexpected out-of-cone add error: {message}"
+			);
+		}
+		other => anyhow::bail!("expected an out-of-cone add to be refused as invalid, got {other:?}"),
+	}
+
+	// -- add `dir`: the subtree is materialised, and list now names it.
+	porcelain
+		.call_sparse_add(&mut *store, handle, &["dir".to_owned()])
+		.await?
+		.map_err(|error| anyhow!("sparse-add: {error:?}"))?;
+	assert_eq!(std::fs::read(work_dir.join("dir/inner.txt"))?, b"inner\n");
+	let listed = porcelain
+		.call_sparse_list(&mut *store, handle)
+		.await?
+		.map_err(|error| anyhow!("sparse-list: {error:?}"))?
+		.ok_or_else(|| anyhow!("expected sparse-checkout enabled"))?;
+	assert_eq!(listed.entries, vec!["dir".to_owned()]);
+
+	// -- disable: the whole tree is restored and list reports no set.
+	porcelain
+		.call_sparse_disable(&mut *store, handle)
+		.await?
+		.map_err(|error| anyhow!("sparse-disable: {error:?}"))?;
+	assert!(work_dir.join("dir/inner.txt").exists());
+	let listed = porcelain
+		.call_sparse_list(&mut *store, handle)
+		.await?
+		.map_err(|error| anyhow!("sparse-list: {error:?}"))?;
+	assert!(listed.is_none(), "disabled sparse-checkout has no set");
+
+	// -- an empty non-cone `sparse-set` applies git's non-cone default (root files only), not an empty
+	//    pattern file that would omit even root files.
+	porcelain
+		.call_sparse_set(&mut *store, handle, &[], false)
+		.await?
+		.map_err(|error| anyhow!("sparse-set non-cone default: {error:?}"))?;
+	assert!(
+		work_dir.join("hello.txt").exists(),
+		"root files stay under the non-cone default"
+	);
+	assert!(
+		!work_dir.join("dir").exists(),
+		"the non-cone default omits directories"
+	);
+	let listed = porcelain
+		.call_sparse_list(&mut *store, handle)
+		.await?
+		.map_err(|error| anyhow!("sparse-list: {error:?}"))?
+		.ok_or_else(|| anyhow!("expected sparse-checkout enabled"))?;
+	assert!(!listed.cone, "the empty set is non-cone, got {listed:?}");
+
+	Ok(())
+}
+
 #[tokio::test]
 async fn sha256_worktree_porcelain_round_trip() -> Result<()> {
 	worktree_porcelain_round_trip::<Sha256>().await
@@ -241,4 +400,14 @@ async fn sha256_worktree_porcelain_round_trip() -> Result<()> {
 #[tokio::test]
 async fn sha1_worktree_porcelain_round_trip() -> Result<()> {
 	worktree_porcelain_round_trip::<Sha1>().await
+}
+
+#[tokio::test]
+async fn sha256_worktree_sparse_round_trip() -> Result<()> {
+	worktree_sparse_round_trip::<Sha256>().await
+}
+
+#[tokio::test]
+async fn sha1_worktree_sparse_round_trip() -> Result<()> {
+	worktree_sparse_round_trip::<Sha1>().await
 }

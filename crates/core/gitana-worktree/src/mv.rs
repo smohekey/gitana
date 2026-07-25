@@ -38,6 +38,10 @@ where
 		.filter(|e| e.stage == 0)
 		.map(|e| e.path.clone())
 		.collect();
+	// git refuses to move a path to a destination outside the sparse-checkout definition (it would land
+	// out-of-cone content in the index without `--sparse`) — probed vs git 2.50.1. A sparse *source* is
+	// already handled: it is skip-worktree and absent, so its `lstat` below fails as a bad source.
+	let sparse = wt.sparse_checkout().await?;
 
 	let (dest_norm, dest_trailing_slash) = normalize(dest, prefix)?;
 	let dest_is_dir = matches!(wt.work().lstat(&dest_norm)?, Some(meta) if meta.kind.is_dir());
@@ -77,6 +81,23 @@ where
 			dest_norm.clone()
 		};
 		validate_path(&dst)?;
+		// Refuse a move that lands any resulting index path outside the sparse-checkout definition, as
+		// git does. A FILE source maps to `dst`; a DIRECTORY source maps each `src/rest` to `dst/rest`,
+		// so checking `dst` alone is not enough — `mv a/dir b` (default cone) makes `b` look like an
+		// included root file while `b/rest` is out of cone (probed vs git 2.50.1, which names the child).
+		if let Some(matcher) = sparse.as_ref() {
+			let lands_out = if is_file {
+				!matcher.includes(&dst)
+			} else {
+				tracked
+					.iter()
+					.filter_map(|path| path.strip_prefix(&dir_prefix))
+					.any(|rest| !matcher.includes(&format!("{dst}/{rest}")))
+			};
+			if lands_out {
+				return Err(WorktreeError::SparsePathExcluded(dst));
+			}
+		}
 		// Validate every index path the move will create under a directory source, before any
 		// filesystem change.
 		for path in &tracked {

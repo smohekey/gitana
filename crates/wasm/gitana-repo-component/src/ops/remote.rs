@@ -310,6 +310,8 @@ pub(crate) async fn clone<H: HashAlgorithm>(
 		&Deepen::default(),
 		None,
 		&origin.persisted_url(),
+		// Sparse clone is not exposed through the component surface yet (a later slice).
+		false,
 	)
 	.await
 	.map_err(remote_error)
@@ -376,6 +378,8 @@ pub(crate) async fn clone_ssh<H: HashAlgorithm>(
 		&Deepen::default(),
 		None,
 		&gitana_remote::redact_password(url),
+		// Sparse clone is not exposed through the component surface yet (a later slice).
+		false,
 	)
 	.await
 	.map_err(remote_error)

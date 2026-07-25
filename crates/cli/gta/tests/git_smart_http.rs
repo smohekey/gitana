@@ -184,6 +184,71 @@ async fn clone_checks_out_the_served_repo() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clone_sparse_materialises_only_root_files() {
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	std::fs::create_dir_all(&git_dir).unwrap();
+	let repo = open(&git_dir);
+	repo.init().await.unwrap();
+	// A root file plus a subdirectory file, so cone `--sparse` (root files only) excludes the subtree.
+	let root = repo.write_blob(b"r\n").await.unwrap();
+	let deep = repo.write_blob(b"d\n").await.unwrap();
+	let sub = repo
+		.write_tree(&[TreeBuildEntry {
+			path: "deep.txt".to_owned(),
+			mode: FileMode::Regular,
+			id: deep,
+		}])
+		.await
+		.unwrap();
+	let tree = repo
+		.write_tree(&[
+			TreeBuildEntry {
+				path: "root.txt".to_owned(),
+				mode: FileMode::Regular,
+				id: root,
+			},
+			TreeBuildEntry {
+				path: "sub".to_owned(),
+				mode: FileMode::Directory,
+				id: sub,
+			},
+		])
+		.await
+		.unwrap();
+	repo.commit_on_head(tree, WHO, WHO, "srv\n").await.unwrap();
+	let url = serve(git_dir).await;
+
+	let dst = TempDir::new().unwrap();
+	let target = dst.path().join("clone");
+	let t = target.to_str().unwrap();
+	ok(
+		&gta(&["clone", "--sparse", &url, t]).await,
+		"clone --sparse",
+	);
+
+	// The root file is materialised; the out-of-cone subtree is not written to the working tree.
+	assert_eq!(std::fs::read(target.join("root.txt")).unwrap(), b"r\n");
+	assert!(
+		!target.join("sub").exists(),
+		"sub/ should be excluded by --sparse"
+	);
+	// The omitted file is skip-worktree, so `status` does not report it deleted — proving the bit is set.
+	let status = stdout(&gta(&["-C", t, "status"]).await, "status");
+	assert!(
+		!status.contains("deep.txt"),
+		"an excluded (skip-worktree) file must not be reported by status: {status}"
+	);
+
+	// The sparse machinery is fully wired through clone: extending the set materialises the subtree.
+	ok(
+		&gta(&["-C", t, "sparse-checkout", "add", "sub"]).await,
+		"add",
+	);
+	assert_eq!(std::fs::read(target.join("sub/deep.txt")).unwrap(), b"d\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_updates_the_remote_tracking_ref() {
 	let srv = TempDir::new().unwrap();
 	let git_dir = srv.path().join("srv.git");

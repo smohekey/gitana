@@ -231,12 +231,21 @@ async fn clone_into<H: HashAlgorithm>(
 	let repository = open_repository::<H>(git_dir)?;
 	let work = open_work_dir(destination)?;
 	// A headless clone writes no reflog identity (`reflog: None`), as gitana's in-component clone does.
-	gitana_porcelain::clone(connection, repository, work, deepen, None, persist_url)
-		.await
-		.map_err(|source| CloneError::Clone {
-			destination: destination.to_owned(),
-			source: source.into(),
-		})
+	// Sparse clone is not yet exposed through the component surface (a later slice), so never sparse here.
+	gitana_porcelain::clone(
+		connection,
+		repository,
+		work,
+		deepen,
+		None,
+		persist_url,
+		false,
+	)
+	.await
+	.map_err(|source| CloneError::Clone {
+		destination: destination.to_owned(),
+		source: source.into(),
+	})
 }
 
 /// Open the freshly-skeletoned repository at `git_dir`. An ordinary (non-worktree) repository's common

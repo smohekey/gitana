@@ -17,6 +17,7 @@ mod pathspec;
 mod reset;
 mod restore;
 mod rm;
+mod sparse;
 mod status;
 mod worktree;
 
@@ -25,5 +26,7 @@ pub use entry::{IndexEntry, Stat};
 pub use error::WorktreeError;
 pub use index::{Conflict, Index};
 pub use rm::RmOutcome;
+pub(crate) use sparse::SparseCheckout;
+pub use sparse::{SparseReapply, SparseSet};
 pub use status::{Status, StatusEntry};
 pub use worktree::WorkTree;

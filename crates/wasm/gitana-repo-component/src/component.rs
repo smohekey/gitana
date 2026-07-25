@@ -4,8 +4,8 @@ use wasip2::filesystem::types::Descriptor;
 
 use crate::bindings::exports::gitana::repo::porcelain::{
 	CommitInfo, FetchOutcome, Guest, GuestRepository, HashKind, HeadState, ObjectInfo, PushOutcome,
-	RefEntry, ReflogRequest, RepackReport, RepoError, Repository, TagInfo, TreeBuildEntry, TreeEntry,
-	WorktreeStatus,
+	RefEntry, ReflogRequest, RepackReport, RepoError, Repository, SparseOutcome, SparsePatterns,
+	TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
 };
 use crate::inner::Inner;
 
@@ -187,5 +187,25 @@ impl GuestRepository for GitanaRepository {
 		committer: String,
 	) -> Result<String, RepoError> {
 		self.inner.commit(&message, &author, &committer)
+	}
+
+	fn sparse_set(&self, patterns: Vec<String>, cone: bool) -> Result<SparseOutcome, RepoError> {
+		self.inner.sparse_set(patterns, cone)
+	}
+
+	fn sparse_add(&self, patterns: Vec<String>) -> Result<SparseOutcome, RepoError> {
+		self.inner.sparse_add(patterns)
+	}
+
+	fn sparse_list(&self) -> Result<Option<SparsePatterns>, RepoError> {
+		self.inner.sparse_list()
+	}
+
+	fn sparse_disable(&self) -> Result<SparseOutcome, RepoError> {
+		self.inner.sparse_disable()
+	}
+
+	fn sparse_reapply(&self) -> Result<SparseOutcome, RepoError> {
+		self.inner.sparse_reapply()
 	}
 }

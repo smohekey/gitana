@@ -118,6 +118,10 @@ fn is_per_worktree(path: &str) -> bool {
 	path == "index"
 		|| path == "config.worktree"
 		|| path == "logs/HEAD"
+		// `info/sparse-checkout` is per-worktree (git stores it under `worktrees/<name>/info/`, and enabling
+		// sparse-checkout sets a per-worktree `core.sparseCheckout` via `extensions.worktreeConfig`) — unlike
+		// `info/exclude`, which stays shared in the common dir.
+		|| path == "info/sparse-checkout"
 		|| path.starts_with("REBASE_")
 		|| path.starts_with("refs/worktree/")
 		|| path.starts_with("refs/bisect/")

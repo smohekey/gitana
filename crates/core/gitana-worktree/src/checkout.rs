@@ -13,7 +13,7 @@ use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::fsmeta::{blob_of, effective_mode, join_rel, push_gitignore, stat_of};
 use crate::ignore::{self, DirIgnore};
-use crate::{IndexEntry, WorkTree, WorktreeError};
+use crate::{IndexEntry, SparseCheckout, WorkTree, WorktreeError};
 
 pub(crate) async fn run<F, W, H>(
 	wt: &WorkTree<F, W, H>,
@@ -31,6 +31,7 @@ where
 		.map(|(path, mode, oid)| (path.as_str(), (mode.as_str(), *oid)))
 		.collect();
 
+	let sparse = wt.sparse_checkout().await?;
 	let mut index = wt.load_index().await?;
 	let current: HashMap<String, (String, ObjectId<H>)> = index
 		.entries
@@ -45,6 +46,22 @@ where
 			let differs = current
 				.get(*path)
 				.is_none_or(|(cm, co)| cm != mode || co != oid);
+			// An excluded target path is not materialised. A *new* excluded addition cannot overwrite an
+			// in-the-way untracked file — git completes the checkout and leaves that file visible — so skip
+			// the preflight for it. But an excluded path that is a *prior tracked entry* being CHANGED still
+			// needs the cleanliness check: git refuses the checkout when its present working-tree file is
+			// locally modified, since re-omitting the path would discard that edit (probed vs git 2.50.1 —
+			// a dirty recreated omitted file refuses; a clean one is fine). Retaining the check here also
+			// stops a dirty checkout from silently absorbing an edit that happens to equal the target.
+			if sparse
+				.as_ref()
+				.is_some_and(|matcher| !matcher.includes(path))
+			{
+				if differs && current.contains_key(*path) {
+					ensure_no_overwrite(wt, path, current.get(*path))?;
+				}
+				continue;
+			}
 			if !differs {
 				continue;
 			}
@@ -109,7 +126,7 @@ where
 			{
 				continue;
 			}
-			write_entry(wt, path, mode, *oid, &mut index).await?;
+			write_entry(wt, path, mode, *oid, &mut index, sparse.as_ref(), force).await?;
 		}
 		// `remove_worktree_path` re-validates and declines to follow a symlinked ancestor (after a
 		// directory→symlink switch the stale child under the old directory is already gone), so the
@@ -160,6 +177,7 @@ where
 		.collect();
 	changed.sort_unstable();
 
+	let sparse = wt.sparse_checkout().await?;
 	let mut index = wt.load_index().await?;
 	let staged: HashMap<String, (String, ObjectId<H>)> = index
 		.entries
@@ -168,11 +186,23 @@ where
 		.map(|e| (e.path.clone(), (format!("{:o}", e.mode), e.oid)))
 		.collect();
 
-	// Refuse any changed path whose local state (index or work tree) would be overwritten.
+	// Refuse any changed path whose local state (index or work tree) would be overwritten. The work-tree
+	// cleanliness check is skipped only for a *new* excluded addition (present in `to`, not a current
+	// index entry): it is not materialised and there is no tracked content to protect, so an in-the-way
+	// untracked file is left alone. An excluded path that IS a current index entry keeps the check —
+	// git refuses the fast-forward when its present working-tree file is locally modified, since
+	// re-omitting the path would discard that edit (probed vs git 2.50.1). The staged check always
+	// applies — `write_entry` rewrites the index entry, and git refuses when it would discard divergent
+	// staged content — and an excluded path being DELETED (absent from `to`) keeps both checks too.
 	let mut would_overwrite = Vec::new();
 	for &path in &changed {
 		let current = staged.get(path);
-		if from.get(path) != current || !is_clean(wt, path, current)? {
+		let untracked_addition = to.contains_key(path)
+			&& !staged.contains_key(path)
+			&& sparse
+				.as_ref()
+				.is_some_and(|matcher| !matcher.includes(path));
+		if from.get(path) != current || (!untracked_addition && !is_clean(wt, path, current)?) {
 			would_overwrite.push(path.to_owned());
 		}
 	}
@@ -183,7 +213,10 @@ where
 	// Apply only the diff; everything else (unrelated staged/dirty entries) is left as-is.
 	for &path in &changed {
 		match to.get(path) {
-			Some((mode, oid)) => write_entry(wt, path, mode, *oid, &mut index).await?,
+			// A fast-forward is non-destructive, so an out-of-cone path with an in-the-way file is preserved.
+			Some((mode, oid)) => {
+				write_entry(wt, path, mode, *oid, &mut index, sparse.as_ref(), false).await?
+			}
 			None => {
 				remove_worktree_file(wt, path)?;
 				index.remove(path);
@@ -243,12 +276,60 @@ pub(crate) async fn write_entry<F, W, H>(
 	mode: &str,
 	oid: ObjectId<H>,
 	index: &mut crate::Index<H>,
+	sparse: Option<&SparseCheckout>,
+	force: bool,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
 	W: WorkDirFs,
 	H: HashAlgorithm,
 {
+	// Decide whether this path is excluded from the working tree. With an active sparse-checkout the
+	// current patterns decide — git recomputes `skip_worktree` on checkout, so a newly introduced
+	// excluded path is added skip-worktree and NOT materialised, an included one is written. With no
+	// sparse matcher, an existing entry's `skip_worktree` bit is carried forward unchanged (a rebuild
+	// must not silently clear it). `assume_valid` is always preserved.
+	let prior = index.entry(path);
+	let assume_valid = prior.is_some_and(|entry| entry.assume_valid);
+	let excluded = match sparse {
+		Some(matcher) => !matcher.includes(path),
+		None => prior.is_some_and(|entry| entry.skip_worktree),
+	};
+	if excluded {
+		// A file present at an excluded path is handled by the checkout's destructiveness (probed against
+		// git 2.50.1):
+		// - a present file with NO prior tracked entry (an untracked file, or a new excluded addition) is
+		//   PRESERVED on a non-force checkout — untracked data is never destroyed to satisfy the patterns —
+		//   leaving the bit CLEAR and the file reported modified;
+		// - a present file at a PRIOR tracked entry is reconstructable here (the cleanliness preflight in
+		//   `run`/`twoway_merge` already refused a dirty one), so a non-force checkout REMOVES it and omits
+		//   the path, exactly as git re-omits a clean recreated file rather than leaving a spurious change;
+		// - a FORCE checkout (`reset --hard`, a merge/rebase/cherry-pick/revert `--abort`, or `checkout -f`)
+		//   REMOVES any present file and omits the path, as git's `-f` discards in-the-way content.
+		// An absent path is simply omitted. A retained present file gets a *default* stat (never the prior
+		// one), so `status`'s fast path re-hashes it against the new blob id rather than calling it clean.
+		let present = wt.work().lstat(path)?.is_some();
+		let preserve = present && !force && prior.is_none();
+		if present && !preserve {
+			remove_worktree_path(wt, path)?;
+		}
+		let stat = if preserve {
+			crate::Stat::default()
+		} else {
+			prior.map(|entry| entry.stat).unwrap_or_default()
+		};
+		index.upsert(IndexEntry {
+			stat,
+			mode: u32::from_str_radix(mode, 8).unwrap_or(0o100644),
+			oid,
+			stage: 0,
+			assume_valid,
+			skip_worktree: !preserve,
+			path: path.to_owned(),
+		});
+		return Ok(());
+	}
+
 	write_worktree_file(wt, path, mode, oid).await?;
 	let meta = wt.work().lstat(path)?.ok_or_else(|| {
 		std::io::Error::new(
@@ -261,7 +342,7 @@ where
 		mode: u32::from_str_radix(mode, 8).unwrap_or(0o100644),
 		oid,
 		stage: 0,
-		assume_valid: false,
+		assume_valid,
 		skip_worktree: false,
 		path: path.to_owned(),
 	});
@@ -429,6 +510,30 @@ pub(crate) fn validate_path(path: &str) -> Result<(), WorktreeError> {
 		}
 	}
 	Ok(())
+}
+
+/// Whether a non-directory (a regular file **or a symlink**) occupies one of `path`'s ancestor slots,
+/// so materialising `path` would force [`ensure_parents`] to delete or write through it. git never
+/// destroys such an untracked entry: it leaves it, writes nothing, and warns "already present ... not
+/// updated despite sparse patterns" — probed against git 2.50.1 for both a regular file and a symlink.
+/// A free (absent) ancestor needs no directory yet, so it is not a blocker. Skipping the write here is
+/// also strictly safer than [`ensure_parents`]' `UnsafePath` error on a symlinked ancestor, which
+/// would otherwise abort the reapply *after* the new config and pattern file were already persisted.
+pub(crate) fn ancestor_blocked<W: WorkDirFs>(work: &W, path: &str) -> Result<bool, WorktreeError> {
+	let parts: Vec<&str> = path.split('/').collect();
+	let mut ancestor = String::new();
+	for part in &parts[..parts.len().saturating_sub(1)] {
+		if !ancestor.is_empty() {
+			ancestor.push('/');
+		}
+		ancestor.push_str(part);
+		match work.lstat(&ancestor)? {
+			Some(meta) if meta.kind.is_dir() => {}
+			Some(_) => return Ok(true),
+			None => return Ok(false),
+		}
+	}
+	Ok(false)
 }
 
 /// Create the parent directories of `path`, refusing to traverse a symlinked ancestor. A regular

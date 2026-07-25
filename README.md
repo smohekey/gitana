@@ -38,7 +38,9 @@ What works today:
 - A `wasm32-wasip2` component (`gitana:repo`, `crates/wasm/gitana-repo-component`)
   exporting the repo-level plumbing set — object reads/writes, revisions, refs
   (CAS updates), `repack`, and `init` — plus the working-tree porcelain
-  (`status`, `add`, `checkout`, `commit`) over a repository opened with its
+  (`status`, `add`, `checkout`, `commit`, and sparse-checkout
+  `sparse-set`/`sparse-add`/`sparse-list`/`sparse-disable`/`sparse-reapply`) over a
+  repository opened with its
   working tree (`open-worktree`, which grants a third `work-dir` descriptor), and
   the remote operations (`fetch`, `push`, and `clone`) over both transports: Smart
   HTTP over a host-granted `wasi:http` capability, and **SSH** over a host-granted
@@ -89,10 +91,20 @@ Major gaps:
 - `gta rebase <upstream> [--onto <newbase>]` replays the branch's commits onto a
   new base (linear histories only), with `--continue` / `--skip` / `--abort`.
   Non-interactive: no `-i`, autosquash, or `--rebase-merges`.
-- There is no interactive rebase, stash, blame, bisect, submodule, hook, or
-  sparse-checkout support.
+- There is no interactive rebase, stash, blame, bisect, submodule, or hook
+  support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
+- Sparse-checkout (`gta sparse-checkout init/set/add/list/disable/reapply`, and `clone --sparse`),
+  matching git: omit part of the working tree while keeping the full index and history, via the
+  skip-worktree bit. Both **cone** (directories) and **non-cone** (gitignore-style patterns) modes are
+  supported, stored git's way (`extensions.worktreeConfig` + a per-worktree `core.sparseCheckout` and
+  `.git/info/sparse-checkout`), so stock git reads and operates in a gta-sparsified worktree. An omitted
+  path is invisible to the working-tree commands the git way — `checkout`/`reset` keep it omitted,
+  `add`/`restore` skip it (never restaging or deleting its absent file) — and a `checkout` under active
+  sparsity materialises only in-cone paths. Sparse-*index* (collapsed directory entries) and partial
+  clone (`--filter`) are out of scope. The `gitana:repo` wasm component exposes the same operations
+  (`sparse-set`/`sparse-add`/`sparse-list`/`sparse-disable`/`sparse-reapply`) over an opened worktree.
 - Trust signing produces and verifies both SSHSIG and OpenPGP signatures (git's `gpg.format`), but
   not yet OpenPGP's other forms (e.g. X.509/`gpgsm`). Trust-root updates are SSHSIG-only.
 - Remote transport supports HTTP(S) Smart HTTP remotes and **SSH** —
@@ -154,7 +166,9 @@ Implemented command groups:
   `merge-base`, `ls-files`.
 - Ref operations: `update-ref`, `symbolic-ref`, `branch`, `tag`.
 - Working-tree porcelain: `add`, `rm`, `mv`, `status`, `commit`, `merge`, `log`,
-  `show`, `switch`, `checkout`, `restore`, `reset`, `diff`.
+  `show`, `switch`, `checkout`, `restore`, `reset`, `diff`, `sparse-checkout`
+  (`init`, `set`, `add`, `list`, `disable`, `reapply`; cone by default, `--no-cone`
+  for full patterns).
 - Linked working trees: `worktree` (`add`, `list [--porcelain]`, `remove [--force]`,
   `lock`/`unlock`, `prune`, `move`, `repair`). `add` creates git's admin layout and materialises the
   checkout — DWIMing a new branch named after the path's basename by default, with `-b`/`-B <name>`,

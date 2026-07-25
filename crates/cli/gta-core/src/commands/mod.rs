@@ -31,6 +31,7 @@ pub mod rev_parse;
 pub mod revert;
 pub mod rm;
 pub mod show;
+pub mod sparse_checkout;
 pub mod status;
 pub mod switch;
 pub mod symbolic_ref;
