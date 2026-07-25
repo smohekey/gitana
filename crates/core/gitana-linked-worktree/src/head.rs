@@ -62,8 +62,9 @@ pub(crate) fn read_head<H: HashAlgorithm>(
 ///   *link target* names a ref. The symlink's target is read with `read_link` — never followed to the
 ///   pointed-at file — so a crafted `HEAD -> refs/...` cannot disclose an external file's contents, and the
 ///   ref is never resolved (a corrupt/cyclic branch still validates, as `git -f` removes such a worktree).
-/// - `Some(None)` — a **valid detached** HEAD: a bare, well-formed object id (40-hex SHA-1 or 64-hex
-///   SHA-256). Checked length/charset only, so it is object-format-agnostic and reads no object store.
+/// - `Some(None)` — a **valid but unnameable** HEAD: a detached one (a bare, well-formed object id, 40-hex
+///   SHA-1 or 64-hex SHA-256, checked length/charset only, no object-store read) **or** a symbolic HEAD
+///   naming a non-UTF-8 ref (valid, but no `String` branch to return — and never lossily collapsed).
 /// - `None` — **structurally invalid**: an absent/unreadable/empty/malformed HEAD, a directory, a non-ref
 ///   symlink, a `ref:` target not under `refs/`, or a hex string of the wrong length. git refuses these
 ///   under `-f -f`, so the forced path must not delete such a worktree.
@@ -127,13 +128,17 @@ fn structural_head_branch_with(
 				// target — but it is valid only when it then names a full ref (`refs/...`); `ref: main`, an empty
 				// target, or a non-space/tab separator left in the target is not a HEAD to force past. `refs/` is
 				// checked on **bytes**: a Unix ref name may be non-UTF-8, which git moves/removes, so requiring
-				// UTF-8 here would wrongly reject it. The branch is surfaced as a `String` via a lossy decode
-				// (matching the symlink branch's `to_string_lossy`); that value only feeds an `expected_branch`
-				// name compare, never identity.
+				// UTF-8 here would wrongly reject it. The branch is *named* only when the ref is representable as
+				// UTF-8; a valid non-UTF-8 ref is a **valid but unnameable** HEAD (`Some(None)`) — still
+				// movable/removable, but never lossily collapsed into a `String` (which would let, e.g., an
+				// `expected_branch` of `U+FFFD` spuriously match `refs/heads/\xff` and bypass the pin). A
+				// non-UTF-8 branch cannot equal a UTF-8 pin, so an unnamed HEAD reads as a mismatch.
 				let target = trim_spaces_and_tabs(rest);
-				target
-					.starts_with(b"refs/")
-					.then(|| Some(String::from_utf8_lossy(target).into_owned()))
+				if target.starts_with(b"refs/") {
+					Some(std::str::from_utf8(target).ok().map(str::to_owned))
+				} else {
+					None
+				}
 			} else {
 				is_valid_detached(raw).then_some(None)
 			}

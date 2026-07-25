@@ -1476,3 +1476,89 @@ async fn relocate_moves_a_worktree_with_a_non_utf8_symbolic_head() {
 		"moved checkout has a valid gitfile",
 	);
 }
+
+#[tokio::test]
+async fn relocate_does_not_let_a_replacement_char_pin_match_a_non_utf8_branch() {
+	// A worktree HEAD on `refs/heads/<0xFF>` must not be matched by an `expected_branch` of U+FFFD (what a
+	// lossy decode of that byte would produce): the non-UTF-8 branch is unnameable, so the pin is a mismatch
+	// and the move is refused — never a silent relocation of a worktree on a different branch.
+	let base = unique_tmp("relocate-utf8-pin-bypass");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+	let admin = work.join(".git").join("worktrees").join("from");
+	let mut head_bytes = b"ref: refs/heads/".to_vec();
+	head_bytes.push(0xFF);
+	head_bytes.push(b'\n');
+	std::fs::write(admin.join("HEAD"), &head_bytes).unwrap();
+
+	let to = base.join("to");
+	let err = relocate(&req(&work, &from, &to, Some("\u{FFFD}")))
+		.await
+		.expect_err("a replacement-char pin must not match the non-UTF-8 branch");
+	assert!(
+		matches!(
+			err,
+			RelocateError::Refused(WorktreeClassification::IdentityConflict { .. })
+		),
+		"got {err:?}"
+	);
+	assert!(from.exists() && !to.exists(), "the worktree stays put");
+}
+
+#[tokio::test]
+async fn relocate_force_overridden_lock_reports_the_real_defect() {
+	// A locked source whose HEAD is also invalid, moved with `-f -f`: the overridden lock must not resurface
+	// as `Locked` (which would tell the user to supply `-f -f` they already gave). The refusal reports the
+	// real invalid-source state instead.
+	let base = unique_tmp("relocate-force-lock-invalid");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"lock",
+		from.to_str().unwrap(),
+	]);
+	// Make the source invalid too: remove its admin HEAD.
+	let admin = work.join(".git").join("worktrees").join("from");
+	std::fs::remove_file(admin.join("HEAD")).unwrap();
+
+	let to = base.join("to");
+	let err = relocate(&req_force(&work, &from, &to, None, 2))
+		.await
+		.expect_err("an invalid locked source is refused even with -f -f");
+	assert!(matches!(err, RelocateError::Refused(_)), "got {err:?}");
+	assert!(
+		!matches!(
+			err,
+			RelocateError::Refused(WorktreeClassification::ProtectedWithReason {
+				reason: ProtectionReason::Locked { .. }
+			})
+		),
+		"a force-overridden lock must not resurface as Locked: {err:?}"
+	);
+	assert!(from.exists() && !to.exists(), "the worktree stays put");
+}

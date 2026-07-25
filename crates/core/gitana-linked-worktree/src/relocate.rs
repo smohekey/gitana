@@ -200,7 +200,22 @@ mod native {
 			{
 				admin_dir
 			}
-			_ => return Err(RelocateError::Refused(classify(&inspection))),
+			// Refuse with `classify`'s reading — but a lock the caller already **overrode** with `force >= 2`
+			// (the gate above let validation continue) must not resurface here as `Locked`: a HEAD-less/partial
+			// source that happens to be locked would otherwise tell a user who already supplied `-f -f` to
+			// supply `-f -f` again, hiding the real defect. Reclassify such a source as if unlocked so it reports
+			// the actual invalid state.
+			_ => {
+				let reading = if request.force >= 2 && matches!(inspection.lock, LockState::Locked { .. }) {
+					classify(&WorktreeInspection {
+						lock: LockState::Unlocked,
+						..inspection.clone()
+					})
+				} else {
+					classify(&inspection)
+				};
+				return Err(RelocateError::Refused(reading));
+			}
 		};
 		// Refuse when the checkout equals or contains its own admin directory — a checkout placed directly at
 		// `<common>/worktrees/<id>`. Moving it would relocate the admin out of the repository, so the backlink
