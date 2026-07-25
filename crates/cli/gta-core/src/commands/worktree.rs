@@ -11,9 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow, bail};
 use gitana_linked_worktree::{
 	BranchName, CheckoutTarget, CreateError, CreateRequest, LockState, ProtectionReason,
-	RelocateError, RelocateRequest, RemoveError, RemoveOutcome, RemovePolicy, RemoveRequest,
-	RepositoryId, WorktreeClassification, WorktreeContext, WorktreeEntry, WorktreeObjectId,
-	WorktreeRole, relocate,
+	RelocateError, RelocateOutcome, RelocateRequest, RemoveError, RemoveOutcome, RemovePolicy,
+	RemoveRequest, RepositoryId, WorktreeClassification, WorktreeContext, WorktreeEntry,
+	WorktreeObjectId, WorktreeRole, relocate,
 };
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 use gitana_porcelain::Identity;
@@ -1099,8 +1099,11 @@ async fn move_worktree(cwd: &Path, worktree: &Path, new_path: &Path, force: u8) 
 	};
 	use WorktreeClassification as C;
 	match relocate(&request).await {
-		// Moved, or already at the destination (idempotent) — git prints nothing on a successful move.
-		Ok(_) => Ok(()),
+		// Moved — git prints nothing on a successful move.
+		Ok(RelocateOutcome::Relocated { .. }) => Ok(()),
+		// `from == to` (e.g. moving into the worktree's own parent, which DWIMs back to itself): the library
+		// is idempotent, but git and the prior CLI report the destination already exists.
+		Ok(RelocateOutcome::AlreadyAt { .. }) => bail!("'{display}' already exists"),
 		// A locked source needs a second `-f` (git's `move -f -f`), echoing the reason as git does.
 		Err(RelocateError::Refused(C::ProtectedWithReason {
 			reason: ProtectionReason::Locked { reason },

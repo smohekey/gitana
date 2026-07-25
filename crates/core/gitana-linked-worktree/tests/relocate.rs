@@ -471,6 +471,39 @@ async fn relocate_from_equals_to_still_validates_the_source() {
 }
 
 #[tokio::test]
+async fn relocate_refuses_a_destination_with_a_malformed_git_file() {
+	// A non-empty destination holding a malformed regular `.git` is occupied — reported as DestinationOccupied
+	// (git's "already exists"), not a metadata-parse Failed. Occupancy must not parse the target `.git`.
+	let base = unique_tmp("relocate-malformed-dest");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	let to = base.join("to");
+	std::fs::create_dir_all(&to).unwrap();
+	std::fs::write(to.join(".git"), "garbage not a gitfile\n").unwrap();
+
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("occupied, not failed");
+	assert!(
+		matches!(err, RelocateError::DestinationOccupied { .. }),
+		"got {err:?}"
+	);
+	assert!(from.exists(), "the source is untouched");
+}
+
+#[tokio::test]
 async fn relocate_refuses_an_absent_source() {
 	let base = unique_tmp("relocate-absent");
 	let work = base.join("repo");

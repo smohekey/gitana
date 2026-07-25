@@ -30,8 +30,7 @@ mod native {
 	use crate::facts::LockState;
 	use crate::head::read_lock_reason;
 	use crate::inspect::{
-		CrossPointerHealth, DestinationKind, Registration, WorktreeInspection, classify_destination,
-		inspect,
+		CrossPointerHealth, DestinationKind, Registration, WorktreeInspection, inspect,
 	};
 	use crate::pointers::{
 		admin_dirs_for, canonical, canonical_eq, ensure_representable_path, is_bare, is_leaf_symlink,
@@ -202,7 +201,7 @@ mod native {
 		common: &Path,
 		source_admin: &Path,
 	) -> Result<Vec<PathBuf>, RelocateError> {
-		let kind = classify_destination(&request.to)?;
+		let kind = destination_occupancy(&request.to)?;
 		if !matches!(kind, DestinationKind::Absent | DestinationKind::EmptyDir) {
 			return Err(RelocateError::DestinationOccupied {
 				path: request.to.clone(),
@@ -228,6 +227,31 @@ mod native {
 			}
 		}
 		Ok(stale)
+	}
+
+	/// A shallow, no-follow occupancy classification of the destination — enough to decide free (absent or an
+	/// empty directory) vs occupied, **without parsing a target `.git`**. `classify_destination` would parse
+	/// it (to tell a linked-worktree checkout from unrelated content), so a non-empty directory holding a
+	/// *malformed* `.git` would surface as a `Failed` rather than the "already exists" occupancy git reports —
+	/// this only distinguishes empty from non-empty. A leaf symlink is seen (the trailing separator is
+	/// stripped so POSIX does not resolve it) and classified as a non-directory occupant.
+	fn destination_occupancy(to: &Path) -> Result<DestinationKind, LinkedWorktreeError> {
+		let leaf = to.components().as_path();
+		match std::fs::symlink_metadata(leaf) {
+			Ok(meta) if meta.is_dir() => {
+				let mut entries = std::fs::read_dir(to)
+					.map_err(|e| LinkedWorktreeError::io("reading destination", to, e))?;
+				if entries.next().is_some() {
+					Ok(DestinationKind::UnrelatedContent)
+				} else {
+					Ok(DestinationKind::EmptyDir)
+				}
+			}
+			// A file, symlink, fifo, … — an occupant that is never replaced.
+			Ok(_) => Ok(DestinationKind::OtherFsObject),
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DestinationKind::Absent),
+			Err(e) => Err(LinkedWorktreeError::io("stat destination", to, e)),
+		}
 	}
 
 	/// Whether the inspected destination is the repository's **primary/main** worktree — never moved by this
@@ -297,7 +321,7 @@ mod native {
 		// restore it (best-effort) if the rename then fails, so a failed move never deletes the caller's
 		// (empty) directory.
 		let dest_was_empty_dir = matches!(
-			classify_destination(&request.to),
+			destination_occupancy(&request.to),
 			Ok(DestinationKind::EmptyDir)
 		);
 		if dest_was_empty_dir {
