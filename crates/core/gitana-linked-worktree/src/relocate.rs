@@ -36,7 +36,6 @@ mod native {
 		admin_dirs_for, canonical, canonical_eq, ensure_representable_path, is_bare, is_leaf_symlink,
 		is_listed_admin, main_checkout_identifies_common, path_from_bytes, path_to_bytes,
 		read_worktree_admins, strip_eol_bytes, update_file_in_place, worktree_path_of,
-		write_file_atomic,
 	};
 	use crate::query::WorktreeQuery;
 	use crate::registration_lock::RegistrationLock;
@@ -419,12 +418,15 @@ mod native {
 		let backlink = admin.join("gitdir");
 
 		// admin `gitdir` → the checkout's new `.git`, byte-clean, its original relative/absolute style.
-		// Published atomically (temp + rename): a short write (ENOSPC/EFBIG) then leaves the *old* pointer
-		// intact rather than an empty/partial one, so the post-rename re-inspection sees a coherent (if stale)
-		// state and reports `Incomplete`, not a `Failed` from a malformed pointer.
+		// Updated **in place**, exactly as stock `git worktree move` does (verified: git rewrites this file
+		// keeping its inode and mode, succeeds with the admin directory read-only, and refuses a read-only
+		// `gitdir`). A temp + rename would instead fail when the admin directory is read-only — *after* the
+		// checkout had already moved — and would silently reset the backlink's permissions/ACLs/xattrs when it
+		// is not. The in-place write needs only file-write, preserves the file's metadata, and refuses a
+		// read-only backlink. See [`update_file_in_place`] for the atomicity trade.
 		let mut admin_bytes = path_to_bytes(&pointer(admin, &gitfile, admin_relative));
 		admin_bytes.push(b'\n');
-		write_file_atomic(&backlink, &admin_bytes)?;
+		update_file_in_place(&backlink, &admin_bytes)?;
 
 		// Always rewrite the checkout's `.git` to name the (unmoved) admin, preserving its representation: a
 		// relative pointer recomputed for the new depth, an absolute one rewritten to the canonical admin.

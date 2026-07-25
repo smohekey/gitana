@@ -905,16 +905,23 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), Link
 }
 
 /// Rewrite the contents of an **existing** pointer file in place, preserving its permissions and metadata —
-/// as stock `git worktree move` rewrites a checkout's `.git`. Unlike [`write_file_atomic`], this opens the
-/// existing file for truncating write rather than renaming a fresh temp over it, so it (a) needs only
-/// *file*-write permission and succeeds even when the containing directory is read-only (mode `0555`), where
-/// the temp-sibling approach would fail *after* the checkout was already renamed and wrongly report the move
-/// incomplete; and (b) refuses a read-only pointer (mode `0444`) with `EACCES` — matching git and the prior
-/// CLI — rather than replacing it and silently clearing its read-only bit. `create: false` never creates the
-/// file, so a genuinely absent pointer surfaces as an error, not a stray new file in a read-only tree. The
-/// trade against `write_file_atomic` is atomicity: a torn write (ENOSPC mid-write) can leave a partial
-/// pointer. That is acceptable only for the *checkout* `.git`, which is repairable (`git worktree repair`)
-/// and not the registration of record; the admin `gitdir` backlink keeps the atomic publish.
+/// exactly as stock `git worktree move` rewrites both worktree pointers (verified: git keeps each file's
+/// inode and mode, succeeds when the containing directory is read-only, and refuses a read-only pointer).
+/// Unlike [`write_file_atomic`], this opens the existing file for truncating write rather than renaming a
+/// fresh temp over it, so it (a) needs only *file*-write permission and succeeds even when the containing
+/// directory is read-only (mode `0555`), where the temp-sibling approach would fail *after* the checkout was
+/// already renamed and wrongly report the move incomplete; and (b) refuses a read-only pointer (mode `0444`)
+/// with `EACCES` — matching git and the prior CLI — rather than replacing it and silently clearing its
+/// read-only bit (and its ACLs/xattrs). `create: false` never creates the file, so a genuinely absent
+/// pointer surfaces as an error, not a stray new file in a read-only tree.
+///
+/// The trade against `write_file_atomic` is atomicity: a torn write (ENOSPC mid-write) can leave a partial
+/// pointer rather than the prior contents. Both relocate pointers accept it because stock git does — git
+/// truncates and rewrites these files in place too, so matching its permission and metadata semantics
+/// (the divergence the review flagged) outweighs a torn-write guarantee git itself does not provide; a
+/// partial pointer is in any case repairable with `git worktree repair`. `write_file_atomic` remains for
+/// `create`, which publishes a *new* registration where the temp + rename (never clobbering an existing
+/// file) is the right primitive.
 pub(crate) fn update_file_in_place(
 	path: &Path,
 	contents: &[u8],

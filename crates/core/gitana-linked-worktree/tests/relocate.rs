@@ -740,6 +740,67 @@ async fn relocate_completes_when_the_checkout_directory_is_read_only() {
 }
 
 #[tokio::test]
+async fn relocate_completes_when_the_admin_directory_is_read_only() {
+	// Mirror of the read-only-checkout-dir case for the admin backlink: a read-only admin *directory* (0555)
+	// whose `gitdir` file is writable must still move — the backlink is rewritten in place (as stock git does,
+	// verified keeping the file's inode and mode), not via a temp sibling that would need the admin directory
+	// writable and wrongly report the move Incomplete after the rename.
+	use std::os::unix::fs::{MetadataExt, PermissionsExt};
+	let base = unique_tmp("relocate-ro-admin");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	let head = commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	let admin = work.join(".git").join("worktrees").join(admin_id(&work));
+	let backlink = admin.join("gitdir");
+	let ino_before = std::fs::metadata(&backlink).unwrap().ino();
+	std::fs::set_permissions(&backlink, std::fs::Permissions::from_mode(0o644)).unwrap();
+	std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+	let to = base.join("to");
+	let outcome = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect("relocate completes despite the read-only admin directory");
+	assert_eq!(
+		outcome,
+		RelocateOutcome::Relocated {
+			from: from.clone(),
+			to: to.clone(),
+		}
+	);
+
+	// The backlink was rewritten in place: same inode, mode preserved — not replaced by a fresh temp.
+	std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o755)).unwrap();
+	let meta = std::fs::metadata(&backlink).unwrap();
+	assert_eq!(
+		meta.ino(),
+		ino_before,
+		"admin gitdir updated in place (same inode)"
+	);
+	assert_eq!(
+		meta.permissions().mode() & 0o777,
+		0o644,
+		"admin gitdir mode preserved"
+	);
+
+	assert_eq!(g(&["-C", to.to_str().unwrap(), "rev-parse", "HEAD"]), head);
+	assert!(
+		git_listed_paths(&work).contains(&canonical(&to).to_string_lossy().into_owned()),
+		"new path listed",
+	);
+}
+
+#[tokio::test]
 async fn relocate_refuses_a_source_with_no_head() {
 	// A registered, cross-pointer-consistent worktree whose `<admin>/HEAD` is absent is an invalid partial:
 	// stock `git worktree move` rejects it, and so must relocate — reporting Refused, not Relocated.
