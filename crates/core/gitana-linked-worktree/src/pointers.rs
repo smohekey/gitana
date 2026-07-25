@@ -947,12 +947,24 @@ pub(crate) fn update_file_in_place(
 
 	// No `.truncate(true)`: truncation must wait until the opened descriptor is confirmed to be the very
 	// regular file just `lstat`ed, so a symlink swapped in after the `lstat` cannot have its target clobbered.
-	let mut file = std::fs::OpenOptions::new()
-		.write(true)
-		.create(false)
+	let mut opts = std::fs::OpenOptions::new();
+	opts.write(true).create(false);
+	// On **Windows** there is no post-open inode identity check (no stable `ino`), so close the swap race at
+	// open time: `FILE_FLAG_OPEN_REPARSE_POINT` opens a reparse point (symlink/junction) *itself* rather than
+	// following it, so a symlink swapped in is never dereferenced and its target cannot be truncated. A plain
+	// regular file opens normally. WTF-8 pointer I/O on Windows remains a deferred follow-up.
+	#[cfg(windows)]
+	{
+		use std::os::windows::fs::OpenOptionsExt as _;
+		const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+		opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+	}
+	let mut file = opts
 		.open(path)
 		.map_err(|e| LinkedWorktreeError::io("opening pointer file for update", path, e))?;
 
+	// On **Unix**, close the swap race after the fact: a symlink dropped in between the `lstat` and the open
+	// is followed to a *different* inode, so an identity mismatch here catches it before any truncation.
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::MetadataExt as _;

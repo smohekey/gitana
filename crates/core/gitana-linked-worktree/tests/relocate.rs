@@ -1408,3 +1408,71 @@ async fn relocate_moves_a_detached_head_with_a_non_utf8_trailing_byte() {
 		"new path listed",
 	);
 }
+
+#[tokio::test]
+async fn relocate_moves_a_worktree_with_a_non_utf8_symbolic_head() {
+	// On Unix a ref name may be non-UTF-8, so `<admin>/HEAD` can be `ref: refs/heads/<byte>`. Stock git moves
+	// such a worktree; relocate validates the symbolic target on bytes (not a UTF-8 decode), so it does too.
+	let base = unique_tmp("relocate-non-utf8-symref");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// A symbolic HEAD naming a ref with a non-UTF-8 byte in its name.
+	let admin = work.join(".git").join("worktrees").join("from");
+	let mut head_bytes = b"ref: refs/heads/".to_vec();
+	head_bytes.push(0xFF);
+	head_bytes.push(b'\n');
+	std::fs::write(admin.join("HEAD"), &head_bytes).unwrap();
+
+	// Oracle: stock git moves it (to a throwaway path, then back). `git_ok` throughout — git echoes the
+	// non-UTF-8 branch name on stdout, which the UTF-8-decoding `git()` helper cannot handle.
+	let probe = base.join("probe");
+	assert!(
+		git_ok(&[
+			"-C",
+			work.to_str().unwrap(),
+			"worktree",
+			"move",
+			from.to_str().unwrap(),
+			probe.to_str().unwrap(),
+		]),
+		"stock git moves a non-UTF-8 symbolic-HEAD worktree",
+	);
+	assert!(
+		git_ok(&[
+			"-C",
+			work.to_str().unwrap(),
+			"worktree",
+			"move",
+			probe.to_str().unwrap(),
+			from.to_str().unwrap(),
+		]),
+		"move back to restore the source path",
+	);
+
+	let to = base.join("to");
+	relocate(&req(&work, &from, &to, None))
+		.await
+		.expect("relocate moves the non-UTF-8 symbolic-HEAD worktree");
+	// `git worktree list --porcelain` would emit the non-UTF-8 branch name on stdout, which the UTF-8
+	// `git()` helper cannot decode — so verify the move on the filesystem: the checkout moved and its
+	// `.git` is a valid gitfile.
+	assert!(!from.exists(), "old checkout path gone");
+	assert!(
+		std::fs::read(to.join(".git"))
+			.unwrap()
+			.starts_with(b"gitdir: "),
+		"moved checkout has a valid gitfile",
+	);
+}

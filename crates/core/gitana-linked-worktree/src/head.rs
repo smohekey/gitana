@@ -125,10 +125,15 @@ fn structural_head_branch_with(
 			if let Some(rest) = raw.strip_prefix(b"ref:".as_slice()) {
 				// git accepts space/tab (only) between `ref:` and the target, so trim those from the *symbolic*
 				// target — but it is valid only when it then names a full ref (`refs/...`); `ref: main`, an empty
-				// target, or a non-space/tab separator left in the target is not a HEAD to force past.
+				// target, or a non-space/tab separator left in the target is not a HEAD to force past. `refs/` is
+				// checked on **bytes**: a Unix ref name may be non-UTF-8, which git moves/removes, so requiring
+				// UTF-8 here would wrongly reject it. The branch is surfaced as a `String` via a lossy decode
+				// (matching the symlink branch's `to_string_lossy`); that value only feeds an `expected_branch`
+				// name compare, never identity.
 				let target = trim_spaces_and_tabs(rest);
-				let target = std::str::from_utf8(target).ok()?;
-				target.starts_with("refs/").then(|| Some(target.to_owned()))
+				target
+					.starts_with(b"refs/")
+					.then(|| Some(String::from_utf8_lossy(target).into_owned()))
 			} else {
 				is_valid_detached(raw).then_some(None)
 			}
