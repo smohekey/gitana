@@ -50,6 +50,24 @@ pub enum RelocateError {
 		required_force: u8,
 	},
 
+	/// An admin entry under `<common>/worktrees/` that git would list is a **symlink** (or otherwise cannot be
+	/// evaluated without dereferencing it). It might name `to`, but reading it would breach the no-follow
+	/// boundary, so the destination's registration state cannot be established safely and the move is refused
+	/// rather than risk leaving a duplicate. The corrupt entry must be cleaned up first. Carries the admin.
+	#[error("relocate refused: untrusted (symlinked) worktree registration: {}", .0.display())]
+	UntrustedRegistration(PathBuf),
+
+	/// A stale registration whose admin directory **encloses** the destination `to` (it is an ancestor of
+	/// `to`). Dropping it would recursively delete the just-moved checkout inside it, so the overlapping move
+	/// is refused before renaming (no `force` overrides it). Carries the destination and the enclosing admin.
+	#[error("relocate refused: destination {} is inside the registration admin {}", .path.display(), .admin_dir.display())]
+	DestinationInsideRegistration {
+		/// The destination that lies inside a registration admin dir.
+		path: PathBuf,
+		/// The admin directory that encloses it.
+		admin_dir: PathBuf,
+	},
+
 	/// `from` **encloses the repository's own git storage** (its shared common dir lives inside the checkout —
 	/// a `--separate-git-dir`/relocated-bare topology). Moving `from` would relocate the repository, the admin
 	/// directory, and the held registration lock along with it, stranding them and failing the pointer rewrite

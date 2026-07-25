@@ -1141,6 +1141,15 @@ async fn move_worktree(cwd: &Path, worktree: &Path, new_path: &Path, force: u8) 
 			"validation failed, cannot move working tree: '{}' is not a valid working tree",
 			gitfile.display()
 		),
+		// A destination whose registration state cannot be reconciled safely.
+		Err(RelocateError::UntrustedRegistration(admin)) => bail!(
+			"cannot move working tree: an untrusted (symlinked) worktree registration exists at '{}'; clean it up first",
+			admin.display()
+		),
+		Err(RelocateError::DestinationInsideRegistration { admin_dir, .. }) => bail!(
+			"'{display}' is inside the worktree registration '{}'",
+			admin_dir.display()
+		),
 		// The rename landed but the administration was not fully repointed — recoverable with `repair`.
 		Err(RelocateError::Incomplete(_)) => {
 			bail!("move did not complete cleanly; run 'gta worktree repair {display}'")

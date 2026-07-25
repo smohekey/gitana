@@ -210,19 +210,38 @@ mod native {
 			});
 		}
 
-		// Scan **all** admin registrations git would list, matched by their recorded checkout path (git's own
-		// listing criterion), excluding the source's own admin — so leaving a duplicate registration for the
-		// moved checkout is impossible. This uses the **fail-closed** `read_worktree_admins` (as create/remove
-		// do), which — unlike the enumeration helper — includes a *symlinked* admin leaf, and it does not
-		// filter by ownership, so a *foreign* admin (broken/retargeted `commondir`) whose `gitdir` still names
-		// `to` is caught too. (`admin_dirs_for`, used for the source's lock probe, applies both filters.)
-		let stale: Vec<PathBuf> = read_worktree_admins(common)?
-			.into_iter()
-			.filter(|admin| !canonical_eq(admin, source_admin))
-			.filter(|admin| {
-				worktree_path_of(admin).is_ok_and(|recorded| canonical_eq(&recorded, &request.to))
-			})
-			.collect();
+		// Scan **every** admin registration git would list, matched by its recorded checkout path (git's own
+		// listing criterion), so leaving a duplicate registration for the moved checkout is impossible. The
+		// scan is fail-closed and no-follow, and ownership-agnostic:
+		//   * `read_worktree_admins` (as create/remove use) includes a *symlinked* admin leaf — but such an
+		//     entry cannot be read no-follow, so it is refused (`UntrustedRegistration`) rather than
+		//     dereferenced or silently ignored: it might name `to`.
+		//   * a physical admin's recorded path is read with `worktree_path_of`, whose error propagates (a
+		//     malformed registration is a hard failure, never a silent "no match").
+		//   * no ownership filter, so a *foreign* admin (broken/retargeted `commondir`) whose `gitdir` still
+		//     names `to` is caught. (`admin_dirs_for`, used for the source's lock probe, applies both filters.)
+		let mut stale: Vec<PathBuf> = Vec::new();
+		for admin in read_worktree_admins(common)? {
+			if canonical_eq(&admin, source_admin) {
+				continue;
+			}
+			if is_leaf_symlink(&admin) {
+				return Err(RelocateError::UntrustedRegistration(admin));
+			}
+			if canonical_eq(&worktree_path_of(&admin)?, &request.to) {
+				stale.push(admin);
+			}
+		}
+
+		// A stale admin that *encloses* the destination cannot be dropped: recursively removing it after the
+		// rename would delete the just-moved checkout inside it. Refuse the overlapping move outright.
+		if let Some(enclosing) = stale.iter().find(|admin| contains(admin, &request.to)) {
+			return Err(RelocateError::DestinationInsideRegistration {
+				path: request.to.clone(),
+				admin_dir: enclosing.clone(),
+			});
+		}
+
 		if !stale.is_empty() {
 			let any_locked = stale
 				.iter()

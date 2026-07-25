@@ -522,6 +522,91 @@ async fn relocate_refuses_a_foreign_registration_at_the_destination() {
 }
 
 #[tokio::test]
+async fn relocate_refuses_an_untrusted_symlinked_registration() {
+	// A symlinked admin leaf under worktrees/ is git-listed but cannot be read no-follow — it might name the
+	// destination, so relocate fails closed rather than dereference it or ignore it.
+	let base = unique_tmp("relocate-untrusted");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// Plant a symlinked admin under worktrees/.
+	std::os::unix::fs::symlink(base.join("elsewhere"), work.join(".git/worktrees/planted")).unwrap();
+
+	let to = base.join("to");
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("refuses untrusted registration");
+	assert!(
+		matches!(err, RelocateError::UntrustedRegistration(_)),
+		"got {err:?}"
+	);
+	assert!(from.exists() && !to.exists(), "nothing was moved");
+}
+
+#[tokio::test]
+async fn relocate_refuses_a_destination_inside_a_registration_admin() {
+	// A stale registration whose admin dir encloses the destination cannot be dropped — doing so would delete
+	// the just-moved checkout. Refused before renaming, no force overrides.
+	let base = unique_tmp("relocate-enclosed-dest");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+
+	let victim = base.join("victim");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"victim",
+		victim.to_str().unwrap(),
+	]);
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// Point victim's gitdir at a path *inside* its own admin dir, and remove its checkout (prunable).
+	let victim_admin = work.join(".git/worktrees/victim");
+	let enclosed_to = victim_admin.join("nested");
+	// The *admin's* gitdir holds a bare path to the checkout's `.git` (no `gitdir: ` prefix — that is on the
+	// checkout side).
+	std::fs::write(
+		victim_admin.join("gitdir"),
+		format!("{}/.git\n", enclosed_to.display()),
+	)
+	.unwrap();
+	std::fs::remove_dir_all(&victim).unwrap();
+
+	let err = relocate(&req_force(&work, &from, &enclosed_to, None, 2))
+		.await
+		.expect_err("refuses enclosing registration");
+	assert!(
+		matches!(err, RelocateError::DestinationInsideRegistration { .. }),
+		"got {err:?}"
+	);
+	assert!(from.exists(), "the source is untouched");
+}
+
+#[tokio::test]
 async fn relocate_refuses_a_destination_with_a_malformed_git_file() {
 	// A non-empty destination holding a malformed regular `.git` is occupied — reported as DestinationOccupied
 	// (git's "already exists"), not a metadata-parse Failed. Occupancy must not parse the target `.git`.
