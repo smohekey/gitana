@@ -71,11 +71,17 @@ mod native {
 		//     `Failed` instead of `Locked`. `rename` also rejects a `..`-terminated source with `EINVAL`, so
 		//     the rename must act on the resolved path regardless.
 		//   * `to` is resolved via `resolve_destination` (its existing parent canonicalized, final component
-		//     re-attached). Resolving it *here*, before the occupancy/stale-registration checks rather than
-		//     between them and the rename, closes a TOCTOU window: were `to`'s parent a symlink retargeted
-		//     mid-operation, the checks and the rename would otherwise apply to different targets, letting a
-		//     stale registration at the new target slip past the force gate. The resolved path is symlink-free,
-		//     so a later retarget cannot move it.
+		//     re-attached), so the occupancy/stale-registration checks and the rename act on **one** symlink-
+		//     free pathname rather than re-resolving `request.to` at each step — which alone could let a
+		//     retargeted parent point the checks and the rename at different targets. **Deferred hardening
+		//     limitation** (like the Windows rename and WTF-8 pointer I/O below): a canonical *pathname* does
+		//     not *pin* the parent directory, so a hostile local process that renames `to`'s parent and
+		//     installs a symlink in its place, in the instant between the final check and the `rename`, can
+		//     still redirect the move to an unchecked target. Fully closing it needs a held parent directory
+		//     handle with `renameat`/`openat` (a `rustix` dependency and a departure from this layer's ambient
+		//     `std::fs`); code-henge never exposes an attacker-writable destination parent, so it is left as a
+		//     documented gap. The pointer writes carry their own no-follow/identity defense (see
+		//     `update_file_in_place`).
 		// The public outcome still reports the caller's requested paths.
 		let normalized = RelocateRequest {
 			from: request
@@ -563,7 +569,9 @@ mod native {
 	/// parent still resolves, then reused for the rename and every pointer write, none of which can then
 	/// dangle once `from` is gone. Falls back to `to` unchanged when it has no parent/final component (a root
 	/// or `..`-terminated path — never a real worktree destination) or its parent cannot be canonicalized (an
-	/// absent parent, which the rename itself will then reject).
+	/// absent parent, which the rename itself will then reject). This yields a symlink-free *pathname*, not a
+	/// pinned directory handle: it does not defend against a hostile concurrent re-symlinking of the parent
+	/// after resolution — a documented deferred hardening gap (see the pinning note in `relocate`).
 	fn resolve_destination(to: &Path) -> PathBuf {
 		match (to.parent(), to.file_name()) {
 			(Some(parent), Some(name)) => match parent.canonicalize() {
