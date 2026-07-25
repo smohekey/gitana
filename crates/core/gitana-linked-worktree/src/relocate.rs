@@ -229,6 +229,24 @@ mod native {
 		if contains(&request.from, admin_dir) {
 			return Err(RelocateError::EnclosesRepository(canonical(admin_dir)));
 		}
+
+		// Refuse a source whose **pointer files are symlinks**, *before* any rename. Read-side inspection
+		// follows a symlinked checkout `.git` / admin `gitdir` (git does), but relocate must rewrite them in
+		// place, and following a symlink there would truncate an external target. `update_file_in_place`
+		// refuses that at write time — but only *after* the checkout has moved, leaving a partial move whose
+		// suggested `gta worktree repair` (a plain follow-the-symlink write) would then clobber the target. So
+		// reject them here (checked on both the initial pass and the pre-move re-verification), turning a
+		// deterministic partial-move-and-clobber into a clean up-front refusal. A deliberate divergence from
+		// git's follow-on-write, matching the crate's no-follow write posture.
+		let checkout_gitfile = request.from.join(".git");
+		if is_leaf_symlink(&checkout_gitfile) {
+			return Err(RelocateError::UntrustedRegistration(checkout_gitfile));
+		}
+		let admin_gitdir = admin_dir.join("gitdir");
+		if is_leaf_symlink(&admin_gitdir) {
+			return Err(RelocateError::UntrustedRegistration(admin_gitdir));
+		}
+
 		Ok(admin_dir.clone())
 	}
 

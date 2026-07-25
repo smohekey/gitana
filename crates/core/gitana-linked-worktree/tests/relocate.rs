@@ -1308,8 +1308,8 @@ async fn relocate_refuses_a_destination_that_is_a_new_worktrees_child() {
 
 #[tokio::test]
 async fn relocate_refuses_to_write_through_a_symlinked_backlink() {
-	// If the admin `gitdir` is a symlink, rewriting it must NOT follow the link and truncate its target
-	// (an arbitrary-file-truncation vector). relocate refuses the in-place write; the target is untouched.
+	// If the admin `gitdir` is a symlink, relocate refuses **before the rename** — no partial move, and the
+	// symlink target is never followed/truncated (an arbitrary-file-truncation vector).
 	use std::os::unix::fs::symlink;
 	let base = unique_tmp("relocate-symlinked-backlink");
 	let work = base.join("repo");
@@ -1339,10 +1339,12 @@ async fn relocate_refuses_to_write_through_a_symlinked_backlink() {
 	let to = base.join("to");
 	let result = relocate(&req(&work, &from, &to, None)).await;
 	assert!(
-		result.is_err(),
-		"the move must not succeed by writing through the symlink: {result:?}"
+		matches!(result, Err(RelocateError::UntrustedRegistration(_))),
+		"a symlinked backlink is refused up front: {result:?}"
 	);
-	// The symlink target was never followed/truncated: it still holds the original backlink bytes.
+	// Refused before the rename — the source is untouched (no partial move) …
+	assert!(from.exists() && !to.exists(), "no partial move");
+	// … and the symlink target was never followed/truncated.
 	assert_eq!(
 		std::fs::read(&victim).unwrap(),
 		original,
