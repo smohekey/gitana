@@ -904,6 +904,36 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), Link
 	})
 }
 
+/// Rewrite the contents of an **existing** pointer file in place, preserving its permissions and metadata —
+/// as stock `git worktree move` rewrites a checkout's `.git`. Unlike [`write_file_atomic`], this opens the
+/// existing file for truncating write rather than renaming a fresh temp over it, so it (a) needs only
+/// *file*-write permission and succeeds even when the containing directory is read-only (mode `0555`), where
+/// the temp-sibling approach would fail *after* the checkout was already renamed and wrongly report the move
+/// incomplete; and (b) refuses a read-only pointer (mode `0444`) with `EACCES` — matching git and the prior
+/// CLI — rather than replacing it and silently clearing its read-only bit. `create: false` never creates the
+/// file, so a genuinely absent pointer surfaces as an error, not a stray new file in a read-only tree. The
+/// trade against `write_file_atomic` is atomicity: a torn write (ENOSPC mid-write) can leave a partial
+/// pointer. That is acceptable only for the *checkout* `.git`, which is repairable (`git worktree repair`)
+/// and not the registration of record; the admin `gitdir` backlink keeps the atomic publish.
+pub(crate) fn update_file_in_place(
+	path: &Path,
+	contents: &[u8],
+) -> Result<(), LinkedWorktreeError> {
+	use std::io::Write as _;
+	let mut file = std::fs::OpenOptions::new()
+		.write(true)
+		.create(false)
+		.truncate(true)
+		.open(path)
+		.map_err(|e| LinkedWorktreeError::io("opening pointer file for update", path, e))?;
+	file
+		.write_all(contents)
+		.map_err(|e| LinkedWorktreeError::io("updating pointer file", path, e))?;
+	file
+		.sync_all()
+		.map_err(|e| LinkedWorktreeError::io("syncing pointer file", path, e))
+}
+
 /// Ensure a path can round-trip the (byte-clean) pointer I/O before any state is written. On **Unix** the
 /// pointers are byte-clean, so this is a no-op — a non-UTF-8 path is accepted. On **non-Unix**, where
 /// [`path_to_bytes`] still falls back to a *lossy* UTF-8 rendering, a non-UTF-8 path would serialize to a

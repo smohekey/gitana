@@ -684,3 +684,103 @@ async fn relocate_refuses_an_absent_source() {
 	assert!(matches!(err, RelocateError::Refused(_)));
 	assert!(!to.exists(), "nothing was moved");
 }
+
+#[tokio::test]
+async fn relocate_completes_when_the_checkout_directory_is_read_only() {
+	// A read-only checkout *directory* (mode 0555) whose `.git` file is writable (0644) must still move — the
+	// checkout `.git` is rewritten in place (file-write only), not via a temp sibling that would need the
+	// directory writable and wrongly report the move Incomplete *after* the rename. Matches stock git, which
+	// completes the move. The `.git`'s own permissions are preserved.
+	use std::os::unix::fs::PermissionsExt;
+	let base = unique_tmp("relocate-ro-dir");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	let head = commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// Pin the `.git` file to 0644 and lock the checkout directory to read-only+execute (0555).
+	std::fs::set_permissions(from.join(".git"), std::fs::Permissions::from_mode(0o644)).unwrap();
+	std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+	let to = base.join("to");
+	let outcome = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect("relocate completes despite the read-only checkout directory");
+	assert_eq!(
+		outcome,
+		RelocateOutcome::Relocated {
+			from: from.clone(),
+			to: to.clone(),
+		}
+	);
+
+	// The `.git` pointer's permissions survived the in-place rewrite (not reset by a replacing rename).
+	let mode = std::fs::metadata(to.join(".git"))
+		.unwrap()
+		.permissions()
+		.mode();
+	assert_eq!(mode & 0o777, 0o644, "checkout .git mode preserved");
+
+	// Restore write so stock git can operate, then confirm the moved pointer is valid and listed.
+	std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o755)).unwrap();
+	assert_eq!(g(&["-C", to.to_str().unwrap(), "rev-parse", "HEAD"]), head);
+	assert!(
+		git_listed_paths(&work).contains(&canonical(&to).to_string_lossy().into_owned()),
+		"new path listed",
+	);
+}
+
+#[tokio::test]
+async fn relocate_refuses_a_source_with_no_head() {
+	// A registered, cross-pointer-consistent worktree whose `<admin>/HEAD` is absent is an invalid partial:
+	// stock `git worktree move` rejects it, and so must relocate — reporting Refused, not Relocated.
+	let base = unique_tmp("relocate-no-head");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// Delete the admin HEAD, leaving the registration and cross-pointers intact but the source HEAD-less.
+	let admin = work.join(".git").join("worktrees").join(admin_id(&work));
+	std::fs::remove_file(admin.join("HEAD")).unwrap();
+
+	// Oracle: stock git also refuses to move this source.
+	let to = base.join("to");
+	assert!(
+		!git_ok(&[
+			"-C",
+			work.to_str().unwrap(),
+			"worktree",
+			"move",
+			from.to_str().unwrap(),
+			to.to_str().unwrap(),
+		]),
+		"stock git refuses the HEAD-less move",
+	);
+	assert!(!to.exists(), "the oracle moved nothing");
+
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("refuses a HEAD-less source");
+	assert!(matches!(err, RelocateError::Refused(_)), "got {err:?}");
+	assert!(from.exists(), "the source is untouched");
+	assert!(!to.exists(), "nothing was moved");
+}

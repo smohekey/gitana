@@ -35,7 +35,8 @@ mod native {
 	use crate::pointers::{
 		admin_dirs_for, canonical, canonical_eq, ensure_representable_path, is_bare, is_leaf_symlink,
 		is_listed_admin, main_checkout_identifies_common, path_from_bytes, path_to_bytes,
-		read_worktree_admins, strip_eol_bytes, worktree_path_of, write_file_atomic,
+		read_worktree_admins, strip_eol_bytes, update_file_in_place, worktree_path_of,
+		write_file_atomic,
 	};
 	use crate::query::WorktreeQuery;
 	use crate::registration_lock::RegistrationLock;
@@ -161,12 +162,16 @@ mod native {
 				},
 			));
 		}
-		// Movable = a present, cross-pointer-consistent linked worktree of this repository. Keyed off the
-		// inspection directly (not `classify`, which reports a force-overridden lock as `Locked`). Anything
-		// else — absent, prunable, foreign, or unrelated content — is refused with `classify`'s reading.
+		// Movable = a present, cross-pointer-consistent linked worktree of this repository **with a readable
+		// HEAD**. Keyed off the inspection directly (not `classify`, which reports a force-overridden lock as
+		// `Locked`). The `head.is_some()` guard matches stock `git worktree move`, which rejects a source whose
+		// `<admin>/HEAD` is absent as invalid even though its cross-pointers are consistent — without it such a
+		// partial would be reported `Relocated`. Anything else — absent, prunable, HEAD-less, foreign, or
+		// unrelated content — is refused with `classify`'s reading.
 		let admin_dir = match &inspection.registration {
 			Registration::Present { admin_dir }
-				if inspection.cross_pointers == CrossPointerHealth::Consistent =>
+				if inspection.cross_pointers == CrossPointerHealth::Consistent
+					&& inspection.head.is_some() =>
 			{
 				admin_dir
 			}
@@ -426,6 +431,11 @@ mod native {
 		// Rewriting even an absolute pointer matters — a valid absolute pointer that reached the admin *through
 		// a path inside `from`* (via a symlink or `..`) would dangle once `from` is gone; the canonical admin
 		// path never routes through the moved directory.
+		//
+		// Updated **in place** (not temp + rename): the checkout `.git` already exists at `to` (it moved with
+		// the directory), and rewriting it in place both preserves its permissions and needs only file-write —
+		// so the move completes even in a read-only checkout directory (as git does) and a read-only `.git` is
+		// refused rather than silently replaced. See [`update_file_in_place`] for the atomicity trade.
 		let mut checkout_bytes = b"gitdir: ".to_vec();
 		checkout_bytes.extend_from_slice(&path_to_bytes(&pointer(
 			&request.to,
@@ -433,7 +443,7 @@ mod native {
 			checkout_relative,
 		)));
 		checkout_bytes.push(b'\n');
-		write_file_atomic(&gitfile, &checkout_bytes)?;
+		update_file_in_place(&gitfile, &checkout_bytes)?;
 		Ok(())
 	}
 
