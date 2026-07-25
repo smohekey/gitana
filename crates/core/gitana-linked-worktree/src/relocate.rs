@@ -34,8 +34,8 @@ mod native {
 	};
 	use crate::pointers::{
 		admin_dirs_for, canonical, canonical_eq, ensure_representable_path, is_bare, is_leaf_symlink,
-		is_listed_admin, main_checkout_identifies_common, os_string_from_bytes, path_to_bytes,
-		read_worktree_admins, temp_sibling, worktree_path_of, write_file_atomic,
+		is_listed_admin, main_checkout_identifies_common, path_from_bytes, path_to_bytes,
+		read_worktree_admins, strip_eol_bytes, worktree_path_of, write_file_atomic,
 	};
 	use crate::query::WorktreeQuery;
 	use crate::registration_lock::RegistrationLock;
@@ -351,33 +351,35 @@ mod native {
 		ensure_representable_path(&request.to)?;
 		ensure_representable_path(admin)?;
 
-		// POSIX `rename` replaces an empty destination directory; Windows `rename` cannot. `prepare_destination`
-		// validated `to` as absent or empty, so an existing empty directory is **staged aside** first (a
-		// reversible rename to a temp sibling) rather than deleted — preserving its mode/ACLs/xattrs. On a
-		// failed move it is renamed back, restoring the original directory exactly; on success the staged
-		// (empty) directory is dropped.
-		let dest_was_empty_dir = matches!(
-			destination_occupancy(&request.to),
-			Ok(DestinationKind::EmptyDir)
-		);
-		let staged = if dest_was_empty_dir {
-			let staged = temp_sibling(&request.to);
-			std::fs::rename(&request.to, &staged)
-				.map_err(|e| LinkedWorktreeError::io("staging the empty destination", &request.to, e))?;
-			Some(staged)
-		} else {
-			None
-		};
-		if let Err(e) = std::fs::rename(&request.from, &request.to) {
-			if let Some(staged) = &staged {
-				// Restore the original empty directory exactly (metadata intact).
-				let _ = std::fs::rename(staged, &request.to);
+		// Move the checkout onto the destination.
+		//
+		// On **Unix**, `rename` atomically **replaces an empty destination directory** — and fails
+		// `ENOTEMPTY` if a concurrent write made it non-empty, so that content is never moved aside — leaving
+		// `to` untouched (metadata intact) on any failure. Nothing is pre-removed or staged.
+		#[cfg(unix)]
+		std::fs::rename(&request.from, &request.to)
+			.map_err(|e| LinkedWorktreeError::io("moving worktree checkout", &request.to, e))?;
+
+		// On **non-Unix**, `rename` cannot replace a directory, so a validated-empty destination is removed
+		// first (its `remove_dir` fails `ENOTEMPTY` on a raced non-empty one, refusing rather than clobbering)
+		// and restored best-effort if the rename then fails. Its metadata is not preserved across a failed
+		// move — a deferred Windows limitation, alongside WTF-8 pointer I/O.
+		#[cfg(not(unix))]
+		{
+			let removed_empty = matches!(
+				destination_occupancy(&request.to),
+				Ok(DestinationKind::EmptyDir)
+			);
+			if removed_empty {
+				std::fs::remove_dir(&request.to)
+					.map_err(|e| LinkedWorktreeError::io("clearing empty destination", &request.to, e))?;
 			}
-			return Err(LinkedWorktreeError::io("moving worktree checkout", &request.to, e).into());
-		}
-		if let Some(staged) = &staged {
-			// The move succeeded onto the destination; drop the now-detached empty directory.
-			let _ = std::fs::remove_dir(staged);
+			if let Err(e) = std::fs::rename(&request.from, &request.to) {
+				if removed_empty {
+					let _ = std::fs::create_dir(&request.to);
+				}
+				return Err(LinkedWorktreeError::io("moving worktree checkout", &request.to, e).into());
+			}
 		}
 
 		// Past the rename the checkout has moved: a failure now is a *partial* move — re-inspect `from` and
@@ -468,26 +470,29 @@ mod native {
 		Some(result)
 	}
 
-	/// Whether a pointer file records a **relative** path, read byte-clean from its raw first line (a
-	/// `.git` gitfile with `strip_gitdir_prefix` true carries a `gitdir: ` prefix; an admin `gitdir` file
-	/// carries the bare path). The raw path is inspected without resolving it, so a relative pointer is seen
-	/// as relative regardless of where it points, and a non-UTF-8 byte in it does not make the read fail (and
-	/// wrongly report absolute). A missing/empty/malformed pointer reads as not-relative (absolute default).
+	/// Whether a pointer file records a **relative** path, parsed exactly as git and the crate's readers do
+	/// (a `.git` gitfile with `strip_gitdir_prefix` true carries the `gitdir: ` prefix; an admin `gitdir` file
+	/// carries the bare path). Only the format prefix and the **trailing** line terminator are stripped —
+	/// leading and interior whitespace is *significant* (part of the path), so a relative pointer beginning
+	/// with a space is not mis-stripped into an absolute one. The raw path is inspected without resolving it,
+	/// byte-clean, so a relative pointer is seen as relative wherever it points. A missing/empty/malformed
+	/// pointer reads as not-relative (the absolute default — the pointer is rewritten absolute).
 	fn raw_pointer_is_relative(path: &Path, strip_gitdir_prefix: bool) -> bool {
 		let Ok(bytes) = std::fs::read(path) else {
 			return false;
 		};
-		let line = bytes.split(|&byte| byte == b'\n').next().unwrap_or(&[]);
 		let raw = if strip_gitdir_prefix {
-			match line.strip_prefix(b"gitdir:") {
+			match bytes.strip_prefix(b"gitdir: ".as_slice()) {
 				Some(rest) => rest,
 				None => return false,
 			}
 		} else {
-			line
+			&bytes
+		};
+		match path_from_bytes(strip_eol_bytes(raw)) {
+			Some(pointer) => !pointer.as_os_str().is_empty() && pointer.is_relative(),
+			None => false,
 		}
-		.trim_ascii();
-		!raw.is_empty() && Path::new(&os_string_from_bytes(raw)).is_relative()
 	}
 }
 

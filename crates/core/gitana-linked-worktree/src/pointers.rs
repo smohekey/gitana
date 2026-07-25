@@ -805,7 +805,7 @@ fn strip_eol(s: &str) -> &str {
 
 /// Strip a trailing line terminator (`\n`/`\r`) from raw pointer-file bytes — the byte-level counterpart of
 /// [`strip_eol`], so a pointer path is parsed without a lossy UTF-8 round-trip.
-fn strip_eol_bytes(bytes: &[u8]) -> &[u8] {
+pub(crate) fn strip_eol_bytes(bytes: &[u8]) -> &[u8] {
 	let mut end = bytes.len();
 	while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
 		end -= 1;
