@@ -111,12 +111,21 @@ fn structural_head_branch_with(
 	match std::fs::symlink_metadata(&path) {
 		// A legacy symbolic-ref HEAD is a filesystem symlink whose *link target* names a ref. Read the link
 		// (no follow), so the target string is the ref name, never the pointed-at ref file's object-id content.
+		// The target is compared **byte-exact** (never `to_string_lossy`, which would collapse a non-UTF-8 ref
+		// into a replacement char and let a `U+FFFD` pin match it), naming the branch only when it is UTF-8.
 		Ok(meta) if meta.file_type().is_symlink() => {
-			let target = std::fs::read_link(&path).ok()?;
-			let target = target.to_string_lossy();
-			target
-				.starts_with("refs/")
-				.then(|| Some(target.into_owned()))
+			let link = std::fs::read_link(&path).ok()?;
+			#[cfg(unix)]
+			{
+				use std::os::unix::ffi::OsStrExt as _;
+				symbolic_branch(link.as_os_str().as_bytes())
+			}
+			// WTF-8 pointer I/O on non-Unix is a deferred follow-up: a non-UTF-8 link is treated as invalid
+			// (`?`) rather than lossily decoded, so it still cannot spuriously match a pin.
+			#[cfg(not(unix))]
+			{
+				symbolic_branch(link.to_str()?.as_bytes())
+			}
 		}
 		Ok(meta) if meta.is_file() => {
 			let bytes = std::fs::read(&path).ok()?;
@@ -134,11 +143,7 @@ fn structural_head_branch_with(
 				// `expected_branch` of `U+FFFD` spuriously match `refs/heads/\xff` and bypass the pin). A
 				// non-UTF-8 branch cannot equal a UTF-8 pin, so an unnamed HEAD reads as a mismatch.
 				let target = trim_spaces_and_tabs(rest);
-				if target.starts_with(b"refs/") {
-					Some(std::str::from_utf8(target).ok().map(str::to_owned))
-				} else {
-					None
-				}
+				symbolic_branch(target)
 			} else {
 				is_valid_detached(raw).then_some(None)
 			}
@@ -146,6 +151,17 @@ fn structural_head_branch_with(
 		// Absent, a directory, or any stat/read failure — structurally invalid.
 		_ => None,
 	}
+}
+
+/// Classify a symbolic-HEAD target (raw ref bytes, from either the `ref:` file body or a legacy HEAD
+/// symlink): `None` when it does not name a full ref (`refs/...`); `Some(Some(branch))` when the ref is
+/// valid UTF-8; `Some(None)` when it is a valid **non-UTF-8** ref — a valid but unnameable HEAD, never
+/// lossily decoded, so a UTF-8 `expected_branch` pin cannot spuriously match it. Checked on bytes so a
+/// non-UTF-8 Unix ref name is recognised as a ref.
+fn symbolic_branch(target: &[u8]) -> Option<Option<String>> {
+	target
+		.starts_with(b"refs/")
+		.then(|| std::str::from_utf8(target).ok().map(str::to_owned))
 }
 
 /// Trim leading and trailing space/tab bytes only (not other whitespace), matching git's `ref:` separator

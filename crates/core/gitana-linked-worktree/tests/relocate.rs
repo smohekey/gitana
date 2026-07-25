@@ -1562,3 +1562,94 @@ async fn relocate_force_overridden_lock_reports_the_real_defect() {
 	);
 	assert!(from.exists() && !to.exists(), "the worktree stays put");
 }
+
+#[tokio::test]
+async fn relocate_does_not_let_a_pin_match_a_non_utf8_symlink_head() {
+	// A *legacy symlink* HEAD whose target is `refs/heads/<0xFF>` must be treated byte-exact: an
+	// `expected_branch` of U+FFFD must not match it (the symlink arm previously used `to_string_lossy`).
+	use std::os::unix::ffi::OsStrExt;
+	use std::os::unix::fs::symlink;
+	let base = unique_tmp("relocate-non-utf8-symlink-head");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// Replace the admin HEAD with a symlink whose link target names a non-UTF-8 ref.
+	let admin = work.join(".git").join("worktrees").join("from");
+	let head = admin.join("HEAD");
+	std::fs::remove_file(&head).unwrap();
+	let target = std::path::Path::new(std::ffi::OsStr::from_bytes(b"refs/heads/\xff"));
+	symlink(target, &head).unwrap();
+
+	let to = base.join("to");
+	let err = relocate(&req(&work, &from, &to, Some("\u{FFFD}")))
+		.await
+		.expect_err("a replacement-char pin must not match the non-UTF-8 symlink HEAD");
+	assert!(
+		matches!(
+			err,
+			RelocateError::Refused(WorktreeClassification::IdentityConflict { .. })
+		),
+		"got {err:?}"
+	);
+	assert!(from.exists() && !to.exists(), "the worktree stays put");
+}
+
+#[tokio::test]
+async fn relocate_reports_lock_first_through_a_symlinked_source() {
+	// A leaf-symlink alias for a *locked* source whose checkout `.git` is also malformed must still report the
+	// lock first (the documented lock-first classification), not a metadata `Failed`. The source is resolved
+	// before the lock probe, so `admin_dirs_for` finds the registration.
+	use std::os::unix::fs::symlink;
+	let base = unique_tmp("relocate-symlink-source-lock");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let real = base.join("real");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		real.to_str().unwrap(),
+	]);
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"lock",
+		real.to_str().unwrap(),
+	]);
+	// Corrupt the checkout `.git` so a non-lock-first path would surface `Failed`.
+	std::fs::write(real.join(".git"), "garbage not a gitfile\n").unwrap();
+
+	// A leaf symlink aliasing the real checkout.
+	let from = base.join("from");
+	symlink(&real, &from).unwrap();
+
+	let to = base.join("to");
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("a locked source is refused lock-first even via a symlink alias");
+	assert!(
+		matches!(
+			err,
+			RelocateError::Refused(WorktreeClassification::ProtectedWithReason {
+				reason: ProtectionReason::Locked { .. }
+			})
+		),
+		"got {err:?}"
+	);
+}

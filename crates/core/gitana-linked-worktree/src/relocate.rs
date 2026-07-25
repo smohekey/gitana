@@ -62,26 +62,14 @@ mod native {
 		// Released on any return (and on cancellation).
 		let _lock = RegistrationLock::acquire(common).await?;
 
-		// Lock-first, even under corrupted administration: read the source's lock file **directly** — no
-		// HEAD/index parse — so a locked worktree with a malformed `HEAD` still returns the structured `Locked`
-		// refusal rather than a `Failed` from `inspect`, exactly as stock git and `remove` report the lock
-		// first. `force >= 2` overrides the lock (git's `move -f -f`).
-		if request.force < 2
-			&& let [admin] = admin_dirs_for(common, &request.from)?.as_slice()
-			&& let LockState::Locked { reason } = read_lock_reason(admin)
-		{
-			return Err(RelocateError::Refused(
-				WorktreeClassification::ProtectedWithReason {
-					reason: ProtectionReason::Locked { reason },
-				},
-			));
-		}
-
 		// **Pin both paths once, under the lock, before any validation or effect** — then use the pinned
-		// request for every check, the rename, and the pointer writes:
-		//   * `from` is canonicalized (it exists). A dot-segment/symlink alias — `/wt/sub/..`, which the
-		//     removal path and git accept — is identified correctly by the checks either way, but `rename`
-		//     rejects a `..`-terminated source with `EINVAL`, so the rename must act on the resolved path.
+		// request for every check, the lock probe, the rename, and the pointer writes:
+		//   * `from` is canonicalized (it exists). A dot-segment/symlink alias — `/wt/sub/..`, or a leaf
+		//     symlink to the checkout, which the removal path and git accept — must be resolved *before* the
+		//     lock probe below: `admin_dirs_for` returns no registration for an unresolved alias, so the
+		//     lock-first classification would otherwise be skipped and a malformed-checkout source misreport
+		//     `Failed` instead of `Locked`. `rename` also rejects a `..`-terminated source with `EINVAL`, so
+		//     the rename must act on the resolved path regardless.
 		//   * `to` is resolved via `resolve_destination` (its existing parent canonicalized, final component
 		//     re-attached). Resolving it *here*, before the occupancy/stale-registration checks rather than
 		//     between them and the rename, closes a TOCTOU window: were `to`'s parent a symlink retargeted
@@ -97,6 +85,22 @@ mod native {
 			to: resolve_destination(&request.to),
 			..request.clone()
 		};
+
+		// Lock-first, even under corrupted administration: read the source's lock file **directly** — no
+		// HEAD/index parse — so a locked worktree with a malformed `HEAD` still returns the structured `Locked`
+		// refusal rather than a `Failed` from `inspect`, exactly as stock git and `remove` report the lock
+		// first. Probed on the **resolved** `from` so a supported alias still finds the registration.
+		// `force >= 2` overrides the lock (git's `move -f -f`).
+		if normalized.force < 2
+			&& let [admin] = admin_dirs_for(common, &normalized.from)?.as_slice()
+			&& let LockState::Locked { reason } = read_lock_reason(admin)
+		{
+			return Err(RelocateError::Refused(
+				WorktreeClassification::ProtectedWithReason {
+					reason: ProtectionReason::Locked { reason },
+				},
+			));
+		}
 
 		// Validate that `from` is a movable worktree (identity, pinned branch, primary, enclosure, lock)
 		// **before** the idempotent short-circuit, so `from == to` only reports a no-op for a genuine,
