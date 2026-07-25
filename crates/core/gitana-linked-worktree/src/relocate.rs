@@ -348,11 +348,19 @@ mod native {
 		let checkout_relative = raw_pointer_is_relative(&request.from.join(".git"), true);
 		let admin_relative = raw_pointer_is_relative(&admin.join("gitdir"), false);
 
+		// Pin the destination to a **stable absolute path** before the rename. A `to` that reaches its parent
+		// *through* the source — `<from>/../moved`, exactly what the CLI forms when invoked inside the worktree
+		// with a relative `../moved` — resolves correctly for the rename (while `from` still exists) but
+		// dangles the instant `from` is gone; the post-rename pointer writes would then target an unresolvable
+		// path and strand the registration. Canonicalizing its existing parent here (while `from` is still in
+		// place) and using the result throughout keeps every post-rename write valid.
+		let to = resolve_destination(&request.to);
+
 		// Before any effect, reject a destination (or admin) the pointer files cannot serialise byte-clean —
 		// a non-representable path on a non-Unix platform, where `path_to_bytes` is lossy. A no-op on Unix
 		// (pointers are byte-clean there), matching `create`, so the move never renames-then-corrupts a
 		// backlink it cannot faithfully write.
-		ensure_representable_path(&request.to)?;
+		ensure_representable_path(&to)?;
 		ensure_representable_path(admin)?;
 
 		// Move the checkout onto the destination.
@@ -361,8 +369,8 @@ mod native {
 		// `ENOTEMPTY` if a concurrent write made it non-empty, so that content is never moved aside — leaving
 		// `to` untouched (metadata intact) on any failure. Nothing is pre-removed or staged.
 		#[cfg(unix)]
-		std::fs::rename(&request.from, &request.to)
-			.map_err(|e| LinkedWorktreeError::io("moving worktree checkout", &request.to, e))?;
+		std::fs::rename(&request.from, &to)
+			.map_err(|e| LinkedWorktreeError::io("moving worktree checkout", &to, e))?;
 
 		// On **non-Unix**, `rename` cannot replace a directory, so a validated-empty destination is removed
 		// first (its `remove_dir` fails `ENOTEMPTY` on a raced non-empty one, refusing rather than clobbering)
@@ -370,25 +378,22 @@ mod native {
 		// move — a deferred Windows limitation, alongside WTF-8 pointer I/O.
 		#[cfg(not(unix))]
 		{
-			let removed_empty = matches!(
-				destination_occupancy(&request.to),
-				Ok(DestinationKind::EmptyDir)
-			);
+			let removed_empty = matches!(destination_occupancy(&to), Ok(DestinationKind::EmptyDir));
 			if removed_empty {
-				std::fs::remove_dir(&request.to)
-					.map_err(|e| LinkedWorktreeError::io("clearing empty destination", &request.to, e))?;
+				std::fs::remove_dir(&to)
+					.map_err(|e| LinkedWorktreeError::io("clearing empty destination", &to, e))?;
 			}
-			if let Err(e) = std::fs::rename(&request.from, &request.to) {
+			if let Err(e) = std::fs::rename(&request.from, &to) {
 				if removed_empty {
-					let _ = std::fs::create_dir(&request.to);
+					let _ = std::fs::create_dir(&to);
 				}
-				return Err(LinkedWorktreeError::io("moving worktree checkout", &request.to, e).into());
+				return Err(LinkedWorktreeError::io("moving worktree checkout", &to, e).into());
 			}
 		}
 
 		// Past the rename the checkout has moved: a failure now is a *partial* move — re-inspect `from` and
 		// report `Incomplete` (falling back to the underlying error only if even the re-inspection fails).
-		match finish_relocate(request, admin, stale, checkout_relative, admin_relative) {
+		match finish_relocate(&to, admin, stale, checkout_relative, admin_relative) {
 			Ok(()) => Ok(()),
 			Err(err) => match inspect(&from_query(request)).await {
 				Ok(post) => Err(RelocateError::Incomplete(Box::new(post))),
@@ -402,7 +407,7 @@ mod native {
 	/// depth. Pointers are written **byte-clean** (as `create` does). Direct writes — no temp file, so nothing
 	/// in the moved checkout can be clobbered.
 	fn finish_relocate(
-		request: &RelocateRequest,
+		to: &Path,
 		admin: &Path,
 		stale: &[PathBuf],
 		checkout_relative: bool,
@@ -414,7 +419,7 @@ mod native {
 			})?;
 		}
 
-		let gitfile = request.to.join(".git");
+		let gitfile = to.join(".git");
 		let backlink = admin.join("gitdir");
 
 		// admin `gitdir` → the checkout's new `.git`, byte-clean, its original relative/absolute style.
@@ -439,14 +444,27 @@ mod native {
 		// so the move completes even in a read-only checkout directory (as git does) and a read-only `.git` is
 		// refused rather than silently replaced. See [`update_file_in_place`] for the atomicity trade.
 		let mut checkout_bytes = b"gitdir: ".to_vec();
-		checkout_bytes.extend_from_slice(&path_to_bytes(&pointer(
-			&request.to,
-			admin,
-			checkout_relative,
-		)));
+		checkout_bytes.extend_from_slice(&path_to_bytes(&pointer(to, admin, checkout_relative)));
 		checkout_bytes.push(b'\n');
 		update_file_in_place(&gitfile, &checkout_bytes)?;
 		Ok(())
+	}
+
+	/// A **stable absolute** spelling of `to` that never routes through the source: its existing parent
+	/// canonicalized (resolving any `..`/symlink segments, including a `<from>/..` that only resolves while
+	/// `from` is present) with the final component re-attached lexically. Called **before** the rename so the
+	/// parent still resolves, then reused for the rename and every pointer write, none of which can then
+	/// dangle once `from` is gone. Falls back to `to` unchanged when it has no parent/final component (a root
+	/// or `..`-terminated path — never a real worktree destination) or its parent cannot be canonicalized (an
+	/// absent parent, which the rename itself will then reject).
+	fn resolve_destination(to: &Path) -> PathBuf {
+		match (to.parent(), to.file_name()) {
+			(Some(parent), Some(name)) => match parent.canonicalize() {
+				Ok(resolved) => resolved.join(name),
+				Err(_) => to.to_path_buf(),
+			},
+			_ => to.to_path_buf(),
+		}
 	}
 
 	/// `target` from `from_dir`, relative when `prefer_relative` and a relative form exists, else absolute —

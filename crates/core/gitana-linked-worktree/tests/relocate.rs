@@ -740,6 +740,56 @@ async fn relocate_completes_when_the_checkout_directory_is_read_only() {
 }
 
 #[tokio::test]
+async fn relocate_handles_a_destination_that_routes_through_the_source() {
+	// The CLI, invoked *inside* the worktree with a relative `../moved`, forms `<from>/../moved` — a path that
+	// resolves only while `from` exists. relocate must pin the destination before the rename and leave a valid
+	// registration, not a broken one pointing through the vanished source.
+	let base = unique_tmp("relocate-through-source");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	let head = commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// `<from>/../moved` — absolute, but reaching its parent through `from`.
+	let through = from.join("..").join("moved");
+	let landing = base.join("moved");
+	let outcome = relocate(&req(&work, &from, &through, None))
+		.await
+		.expect("relocate resolves the destination and completes");
+	assert_eq!(
+		outcome,
+		RelocateOutcome::Relocated {
+			from: from.clone(),
+			to: through.clone(),
+		}
+	);
+
+	// The checkout landed where the path resolves, with a valid (resolvable) registration — stock git agrees.
+	assert!(!from.exists(), "old checkout path gone");
+	assert_eq!(
+		g(&["-C", landing.to_str().unwrap(), "rev-parse", "HEAD"]),
+		head
+	);
+	assert_eq!(
+		g(&["-C", landing.to_str().unwrap(), "status", "--porcelain"]),
+		""
+	);
+	assert!(
+		git_listed_paths(&work).contains(&canonical(&landing).to_string_lossy().into_owned()),
+		"new path listed and resolvable",
+	);
+}
+
+#[tokio::test]
 async fn relocate_completes_when_the_admin_directory_is_read_only() {
 	// Mirror of the read-only-checkout-dir case for the admin backlink: a read-only admin *directory* (0555)
 	// whose `gitdir` file is writable must still move — the backlink is rewritten in place (as stock git does,
