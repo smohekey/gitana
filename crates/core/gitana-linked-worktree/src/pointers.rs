@@ -47,7 +47,7 @@ fn read_worktree_admin_entries(dir: &Path) -> Result<Vec<PathBuf>, LinkedWorktre
 /// **Enumeration takes the softer stance** — see [`list_worktree_admins`]: a listing has no conflict to
 /// miss, so it *skips* the symlinked container (listing only the honest worktrees) rather than erroring,
 /// matching how a symlinked admin *leaf* is skipped.
-fn read_worktree_admins(common: &Path) -> Result<Vec<PathBuf>, LinkedWorktreeError> {
+pub(crate) fn read_worktree_admins(common: &Path) -> Result<Vec<PathBuf>, LinkedWorktreeError> {
 	let dir = common.join("worktrees");
 	if is_leaf_symlink(&dir) {
 		return Err(LinkedWorktreeError::MalformedPointer {

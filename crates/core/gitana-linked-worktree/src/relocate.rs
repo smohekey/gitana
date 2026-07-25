@@ -12,10 +12,10 @@
 //!
 //! It **preserves each pointer's representation**: a worktree created with `worktree.useRelativePaths`
 //! records *relative* cross-pointers so the tree can be relocated as a unit; the relative/absolute style of
-//! each side is captured before the rename and re-emitted after, recomputing a relative checkout pointer for
-//! the new depth. An absolute checkout pointer moves with the directory and still names the (unmoved) admin,
-//! so it is left untouched. Pointers are read and written **byte-clean** (as `create` does), so a non-UTF-8
-//! path round-trips exactly. A **dirty** worktree moves intact (a move relocates files, not a cleanliness
+//! each side is captured before the rename and re-emitted after — a relative checkout pointer recomputed for
+//! the new depth, an absolute one rewritten to the canonical admin (so a pointer that reached the admin
+//! through the old `from` path does not dangle). Pointers are read and written **byte-clean** (as `create`
+//! does), so a non-UTF-8 path round-trips exactly. A **dirty** worktree moves intact (a move relocates files, not a cleanliness
 //! decision), matching stock git.
 //!
 //! **Submodules are out of scope here**, exactly as for [`remove`](crate::remove): the library has no
@@ -34,7 +34,7 @@ mod native {
 	};
 	use crate::pointers::{
 		admin_dirs_for, canonical, canonical_eq, ensure_representable_path, is_bare, is_leaf_symlink,
-		linked_admin_dirs, main_checkout_identifies_common, os_string_from_bytes, path_to_bytes,
+		main_checkout_identifies_common, os_string_from_bytes, path_to_bytes, read_worktree_admins,
 		worktree_path_of,
 	};
 	use crate::query::WorktreeQuery;
@@ -210,12 +210,13 @@ mod native {
 			});
 		}
 
-		// Scan **all** admin registrations, not only those this repository currently owns: an admin whose
-		// `gitdir` names `to` but whose `commondir` is missing or retargeted is still listed by git, so leaving
-		// it would duplicate the registration for the moved checkout. Match by the recorded checkout path
-		// (git's own listing criterion), excluding the source's own admin. (`admin_dirs_for`, used for the
-		// source, filters by ownership — appropriate there, but it would miss these foreign registrations.)
-		let stale: Vec<PathBuf> = linked_admin_dirs(common)?
+		// Scan **all** admin registrations git would list, matched by their recorded checkout path (git's own
+		// listing criterion), excluding the source's own admin — so leaving a duplicate registration for the
+		// moved checkout is impossible. This uses the **fail-closed** `read_worktree_admins` (as create/remove
+		// do), which — unlike the enumeration helper — includes a *symlinked* admin leaf, and it does not
+		// filter by ownership, so a *foreign* admin (broken/retargeted `commondir`) whose `gitdir` still names
+		// `to` is caught too. (`admin_dirs_for`, used for the source's lock probe, applies both filters.)
+		let stale: Vec<PathBuf> = read_worktree_admins(common)?
 			.into_iter()
 			.filter(|admin| !canonical_eq(admin, source_admin))
 			.filter(|admin| {
@@ -381,15 +382,20 @@ mod native {
 		std::fs::write(&backlink, admin_bytes)
 			.map_err(|e| LinkedWorktreeError::io("updating admin gitdir", &backlink, e))?;
 
-		// An absolute checkout pointer moved with the directory and still names the (unmoved) admin. A
-		// relative one is now wrong at the new depth, so recompute and rewrite it byte-clean.
-		if checkout_relative {
-			let mut checkout_bytes = b"gitdir: ".to_vec();
-			checkout_bytes.extend_from_slice(&path_to_bytes(&pointer(&request.to, admin, true)));
-			checkout_bytes.push(b'\n');
-			std::fs::write(&gitfile, checkout_bytes)
-				.map_err(|e| LinkedWorktreeError::io("updating checkout .git", &gitfile, e))?;
-		}
+		// Always rewrite the checkout's `.git` to name the (unmoved) admin, preserving its representation: a
+		// relative pointer recomputed for the new depth, an absolute one rewritten to the canonical admin.
+		// Rewriting even an absolute pointer matters — a valid absolute pointer that reached the admin *through
+		// a path inside `from`* (via a symlink or `..`) would dangle once `from` is gone; the canonical admin
+		// path never routes through the moved directory.
+		let mut checkout_bytes = b"gitdir: ".to_vec();
+		checkout_bytes.extend_from_slice(&path_to_bytes(&pointer(
+			&request.to,
+			admin,
+			checkout_relative,
+		)));
+		checkout_bytes.push(b'\n');
+		std::fs::write(&gitfile, checkout_bytes)
+			.map_err(|e| LinkedWorktreeError::io("updating checkout .git", &gitfile, e))?;
 		Ok(())
 	}
 
