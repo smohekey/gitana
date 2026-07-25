@@ -209,9 +209,6 @@ mod native {
 			expected_branch: request.expected_branch.clone(),
 			start: None,
 			with_status,
-			// Removal reasons about the worktree's HEAD object (the branch-reachability safety gate), so HEAD
-			// is fully resolved.
-			resolve_head: true,
 		}
 	}
 

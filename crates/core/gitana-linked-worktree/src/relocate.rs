@@ -30,7 +30,7 @@ mod native {
 	use crate::facts::LockState;
 	use crate::head::read_lock_reason;
 	use crate::inspect::{
-		CrossPointerHealth, DestinationKind, Registration, WorktreeInspection, inspect,
+		CrossPointerHealth, DestinationKind, Registration, WorktreeInspection, inspect_structural_head,
 	};
 	use crate::pointers::{
 		admin_dirs_for, canonical, canonical_eq, ensure_representable_path, is_bare, is_leaf_symlink,
@@ -77,33 +77,54 @@ mod native {
 			));
 		}
 
+		// **Pin both paths once, under the lock, before any validation or effect** — then use the pinned
+		// request for every check, the rename, and the pointer writes:
+		//   * `from` is canonicalized (it exists). A dot-segment/symlink alias — `/wt/sub/..`, which the
+		//     removal path and git accept — is identified correctly by the checks either way, but `rename`
+		//     rejects a `..`-terminated source with `EINVAL`, so the rename must act on the resolved path.
+		//   * `to` is resolved via `resolve_destination` (its existing parent canonicalized, final component
+		//     re-attached). Resolving it *here*, before the occupancy/stale-registration checks rather than
+		//     between them and the rename, closes a TOCTOU window: were `to`'s parent a symlink retargeted
+		//     mid-operation, the checks and the rename would otherwise apply to different targets, letting a
+		//     stale registration at the new target slip past the force gate. The resolved path is symlink-free,
+		//     so a later retarget cannot move it.
+		// The public outcome still reports the caller's requested paths.
+		let normalized = RelocateRequest {
+			from: request
+				.from
+				.canonicalize()
+				.unwrap_or_else(|_| request.from.clone()),
+			to: resolve_destination(&request.to),
+			..request.clone()
+		};
+
 		// Validate that `from` is a movable worktree (identity, pinned branch, primary, enclosure, lock)
 		// **before** the idempotent short-circuit, so `from == to` only reports a no-op for a genuine,
 		// movable worktree — not for an absent, foreign, primary, or (without enough force) locked source.
-		let admin = decide_relocate(request, common).await?;
+		let admin = decide_relocate(&normalized, common).await?;
 
 		// Idempotent no-op: the (validated) worktree is already where the request asks. Compare by filesystem
 		// identity (`canonical_eq`) so a case-only or symlinked re-spelling of the same directory is equal.
-		if canonical_eq(&request.from, &request.to) {
+		if canonical_eq(&normalized.from, &normalized.to) {
 			return Ok(RelocateOutcome::AlreadyAt {
 				to: request.to.clone(),
 			});
 		}
 
 		// Fail fast on an occupied or force-insufficient destination.
-		prepare_destination(request, common, &admin)?;
+		prepare_destination(&normalized, common, &admin)?;
 
 		// Re-verify **both** sides immediately before the move: a race that changed `from`'s registration, or
 		// (via a concurrent `lock`) the protection of a stale destination admin, aborts without moving. The
 		// destination's stale set is recomputed here so the move acts on the just-verified state.
-		let recheck_admin = decide_relocate(request, common).await?;
+		let recheck_admin = decide_relocate(&normalized, common).await?;
 		if recheck_admin != admin {
-			let post = inspect(&from_query(request)).await?;
+			let post = inspect_structural_head(&from_query(&normalized)).await?;
 			return Err(RelocateError::Incomplete(Box::new(post)));
 		}
-		let stale = prepare_destination(request, common, &admin)?;
+		let stale = prepare_destination(&normalized, common, &admin)?;
 
-		perform_relocate(request, &admin, &stale).await?;
+		perform_relocate(&normalized, &admin, &stale).await?;
 		Ok(RelocateOutcome::Relocated {
 			from: request.from.clone(),
 			to: request.to.clone(),
@@ -111,9 +132,10 @@ mod native {
 	}
 
 	/// A read query for the worktree at `from`, pinned to the request's `expected_branch`. No status walk is
-	/// needed — a move is not a cleanliness decision — and HEAD is read **structurally** (`resolve_head:
-	/// false`): a move validates HEAD's structure and matches its branch without following the symref chain,
-	/// so a worktree whose HEAD chain is cyclic/unreadable is still movable, exactly as stock git moves it.
+	/// needed — a move is not a cleanliness decision. Always paired with [`inspect_structural_head`], which
+	/// reads HEAD **structurally**: a move validates HEAD's structure and matches its (unpeeled) branch without
+	/// following the symref chain, so a worktree whose HEAD chain is cyclic/unreadable is still movable,
+	/// exactly as stock git moves it.
 	fn from_query(request: &RelocateRequest) -> WorktreeQuery {
 		WorktreeQuery {
 			repo: request.repo.clone(),
@@ -121,7 +143,6 @@ mod native {
 			expected_branch: request.expected_branch.clone(),
 			start: None,
 			with_status: false,
-			resolve_head: false,
 		}
 	}
 
@@ -132,7 +153,7 @@ mod native {
 		request: &RelocateRequest,
 		common: &Path,
 	) -> Result<PathBuf, RelocateError> {
-		let inspection = inspect(&from_query(request)).await?;
+		let inspection = inspect_structural_head(&from_query(request)).await?;
 		if is_primary_worktree(&inspection, common)? {
 			return Err(RelocateError::IsPrimaryWorktree(request.from.clone()));
 		}
@@ -166,8 +187,9 @@ mod native {
 		}
 		// Movable = a present, cross-pointer-consistent linked worktree of this repository **with a
 		// structurally valid HEAD**. Keyed off the inspection directly (not `classify`, which reports a
-		// force-overridden lock as `Locked`). `from_query` reads HEAD structurally (`resolve_head: false`), so
-		// `head.is_some()` here means HEAD is present and well-formed *without* its ref chain being resolved:
+		// force-overridden lock as `Locked`). The inspection reads HEAD structurally (via
+		// `inspect_structural_head`), so `head.is_some()` here means HEAD is present and well-formed *without*
+		// its ref chain being resolved:
 		// it matches stock `git worktree move`, which refuses a source whose `<admin>/HEAD` is absent/malformed
 		// yet moves one whose HEAD symref chain is merely cyclic or unreadable. Anything else — absent,
 		// prunable, HEAD-less, foreign, or unrelated content — is refused with `classify`'s reading.
@@ -352,13 +374,11 @@ mod native {
 		let checkout_relative = raw_pointer_is_relative(&request.from.join(".git"), true);
 		let admin_relative = raw_pointer_is_relative(&admin.join("gitdir"), false);
 
-		// Pin the destination to a **stable absolute path** before the rename. A `to` that reaches its parent
-		// *through* the source — `<from>/../moved`, exactly what the CLI forms when invoked inside the worktree
-		// with a relative `../moved` — resolves correctly for the rename (while `from` still exists) but
-		// dangles the instant `from` is gone; the post-rename pointer writes would then target an unresolvable
-		// path and strand the registration. Canonicalizing its existing parent here (while `from` is still in
-		// place) and using the result throughout keeps every post-rename write valid.
-		let to = resolve_destination(&request.to);
+		// `request` is the caller's request **already normalized** by `relocate` — `from` canonicalized (so the
+		// rename never sees a `..`-terminated source) and `to` resolved to a stable, symlink-free absolute path
+		// (pinned before the occupancy/stale checks). So the rename and pointer writes below act on paths that
+		// cannot dangle once `from` is gone, without re-resolving here.
+		let to = request.to.clone();
 
 		// Before any effect, reject a destination (or admin) the pointer files cannot serialise byte-clean —
 		// a non-representable path on a non-Unix platform, where `path_to_bytes` is lossy. A no-op on Unix
@@ -399,7 +419,7 @@ mod native {
 		// report `Incomplete` (falling back to the underlying error only if even the re-inspection fails).
 		match finish_relocate(&to, admin, stale, checkout_relative, admin_relative) {
 			Ok(()) => Ok(()),
-			Err(err) => match inspect(&from_query(request)).await {
+			Err(err) => match inspect_structural_head(&from_query(request)).await {
 				Ok(post) => Err(RelocateError::Incomplete(Box::new(post))),
 				Err(_) => Err(RelocateError::Failed(err)),
 			},

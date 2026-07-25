@@ -963,6 +963,88 @@ async fn relocate_moves_a_source_with_a_cyclic_head_symref() {
 }
 
 #[tokio::test]
+async fn relocate_accepts_a_dot_segment_source_alias() {
+	// A caller (or the CLI) may pass an absolute dot-segment alias for the source — `<from>/sub/..`, which
+	// resolves to `<from>`. Inspection accepts it by filesystem identity, but `rename` rejects a
+	// `..`-terminated source with EINVAL, so relocate must canonicalize the source before renaming it. Stock
+	// git and this crate's removal path accept the same alias.
+	let base = unique_tmp("relocate-source-alias");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	let head = commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+	std::fs::create_dir(from.join("sub")).unwrap();
+
+	// `<from>/sub/..` — an absolute alias of `from` ending in `..`.
+	let alias = from.join("sub").join("..");
+	let to = base.join("to");
+	let outcome = relocate(&req(&work, &alias, &to, None))
+		.await
+		.expect("relocate resolves the dot-segment source and completes");
+	assert_eq!(
+		outcome,
+		RelocateOutcome::Relocated {
+			from: alias.clone(),
+			to: to.clone(),
+		}
+	);
+	assert!(!from.exists(), "the real source moved");
+	assert_eq!(g(&["-C", to.to_str().unwrap(), "rev-parse", "HEAD"]), head);
+	assert!(
+		git_listed_paths(&work).contains(&canonical(&to).to_string_lossy().into_owned()),
+		"new path listed",
+	);
+}
+
+#[tokio::test]
+async fn relocate_matches_a_symbolic_alias_expected_branch_unpeeled() {
+	// When HEAD directly names a symbolic alias and the pinned `expected_branch` is that same alias, structural
+	// mode compares both **unpeeled** — so the pin matches and the move proceeds. Peeling only the expected
+	// side (to the alias's target) would falsely report a branch mismatch.
+	let base = unique_tmp("relocate-alias-branch");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// A symbolic alias `refs/heads/alias -> refs/heads/feature`, with the worktree HEAD naming the alias.
+	std::fs::write(
+		work.join(".git/refs/heads/alias"),
+		"ref: refs/heads/feature\n",
+	)
+	.unwrap();
+	let admin = work.join(".git").join("worktrees").join(admin_id(&work));
+	std::fs::write(admin.join("HEAD"), "ref: refs/heads/alias\n").unwrap();
+
+	let to = base.join("to");
+	relocate(&req(&work, &from, &to, Some("alias")))
+		.await
+		.expect("the unpeeled alias pin matches and moves");
+	assert!(
+		git_listed_paths(&work).contains(&canonical(&to).to_string_lossy().into_owned()),
+		"new path listed",
+	);
+}
+
+#[tokio::test]
 async fn relocate_matches_the_expected_branch_structurally() {
 	// The move validates its pinned `expected_branch` against the worktree's HEAD branch read *structurally*
 	// (no chain resolution): a mismatch is refused as an identity conflict; the exact branch moves.

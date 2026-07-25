@@ -271,9 +271,6 @@ mod native {
 			// Create decides from registration/destination/branch facts; a worktree's cleanliness never gates a
 			// create (it either reconciles an exact match or refuses a conflict), so skip the status scan.
 			with_status: false,
-			// Create reconciles against the worktree's resolved branch/object (an exact-match retry), so HEAD
-			// is fully resolved.
-			resolve_head: true,
 		}
 	}
 

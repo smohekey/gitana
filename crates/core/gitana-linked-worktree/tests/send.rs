@@ -44,7 +44,6 @@ fn public_op_futures_are_send() {
 		expected_branch: None,
 		start: None,
 		with_status: false,
-		resolve_head: true,
 	};
 	let context = WorktreeContext::new(repo.clone());
 
