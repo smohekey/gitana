@@ -1712,3 +1712,119 @@ async fn relocate_refuses_a_repository_with_an_unknown_extension() {
 	);
 	assert!(from.exists() && !to.exists(), "nothing was moved");
 }
+
+#[tokio::test]
+async fn relocate_refuses_a_subsection_extension() {
+	// A config *subsection* extension `[extensions "foo"] bar = true` renders as `extensions.foo.bar`; git
+	// aborts on the unknown `foo.bar` (verified). The gate must match the full dotted remainder — not skip it
+	// as "not an extension" — so relocate fails closed exactly as git does.
+	let base = unique_tmp("relocate-subsection-extension");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	let config_path = work.join(".git").join("config");
+	let config = std::fs::read_to_string(&config_path)
+		.unwrap()
+		.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+	std::fs::write(
+		&config_path,
+		format!("{config}\n[extensions \"foo\"]\n\tbar = true\n"),
+	)
+	.unwrap();
+
+	// Oracle: stock git refuses.
+	let to = base.join("to");
+	assert!(
+		!git_ok(&[
+			"-C",
+			work.to_str().unwrap(),
+			"worktree",
+			"move",
+			from.to_str().unwrap(),
+			to.to_str().unwrap(),
+		]),
+		"stock git refuses a subsection-extension repo",
+	);
+
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("relocate fails closed on a subsection extension");
+	assert!(
+		matches!(
+			err,
+			RelocateError::Failed(LinkedWorktreeError::UnsupportedObjectFormat(_))
+		),
+		"got {err:?}"
+	);
+	assert!(from.exists() && !to.exists(), "nothing was moved");
+}
+
+#[tokio::test]
+async fn relocate_moves_a_repository_with_a_safe_object_policy_extension() {
+	// git-recognized object-store *policy* extensions — `partialClone`, `preciousObjects` — do not affect a
+	// structural pointer move (git moves such repos, verified). relocate must not reject them.
+	for ext in ["partialClone = origin", "preciousObjects = true"] {
+		let base = unique_tmp("relocate-safe-extension");
+		let work = base.join("repo");
+		init_repo(&work, "sha1");
+		commit_file(&work, "a.txt", "1\n", "init");
+		let from = base.join("from");
+		git(&[
+			"-C",
+			work.to_str().unwrap(),
+			"worktree",
+			"add",
+			"-b",
+			"feature",
+			from.to_str().unwrap(),
+		]);
+
+		let config_path = work.join(".git").join("config");
+		let config = std::fs::read_to_string(&config_path)
+			.unwrap()
+			.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+		std::fs::write(&config_path, format!("{config}\n[extensions]\n\t{ext}\n")).unwrap();
+
+		// Oracle: stock git moves it.
+		let to = base.join("to");
+		assert!(
+			git_ok(&[
+				"-C",
+				work.to_str().unwrap(),
+				"worktree",
+				"move",
+				from.to_str().unwrap(),
+				to.to_str().unwrap(),
+			]),
+			"stock git moves a {ext} repo",
+		);
+		// Move it back so relocate acts on the same starting state git did.
+		git(&[
+			"-C",
+			work.to_str().unwrap(),
+			"worktree",
+			"move",
+			to.to_str().unwrap(),
+			from.to_str().unwrap(),
+		]);
+
+		relocate(&req(&work, &from, &to, None))
+			.await
+			.unwrap_or_else(|e| panic!("relocate must move a {ext} repo: {e:?}"));
+		assert!(
+			git_listed_paths(&work).contains(&canonical(&to).to_string_lossy().into_owned()),
+			"new path listed for {ext}",
+		);
+	}
+}
