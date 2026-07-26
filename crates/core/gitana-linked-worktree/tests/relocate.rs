@@ -6,8 +6,8 @@ mod common;
 
 use common::*;
 use gitana_linked_worktree::{
-	BranchName, DestinationKind, ProtectionReason, RelocateError, RelocateOutcome, RelocateRequest,
-	WorktreeClassification, relocate,
+	BranchName, DestinationKind, LinkedWorktreeError, ProtectionReason, RelocateError,
+	RelocateOutcome, RelocateRequest, WorktreeClassification, relocate,
 };
 
 /// `git`, trimmed — the shared `common::git` returns raw stdout (trailing newline), so trim for value
@@ -1654,4 +1654,61 @@ async fn relocate_reports_lock_first_through_a_symlinked_source() {
 		),
 		"got {err:?}"
 	);
+}
+
+#[tokio::test]
+async fn relocate_refuses_a_repository_with_an_unknown_extension() {
+	// git reads `extensions.*` at repositoryformatversion >= 1 and aborts on any it does not recognize, so it
+	// never moves a worktree in such a repo. relocate fails closed the same way (verified against stock git).
+	let base = unique_tmp("relocate-unknown-extension");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	commit_file(&work, "a.txt", "1\n", "init");
+	let from = base.join("from");
+	git(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"add",
+		"-b",
+		"feature",
+		from.to_str().unwrap(),
+	]);
+
+	// Declare an unknown extension at format version 1 (set up *after* `worktree add`, which git would refuse).
+	let config_path = work.join(".git").join("config");
+	let config = std::fs::read_to_string(&config_path)
+		.unwrap()
+		.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+	std::fs::write(
+		&config_path,
+		format!("{config}\n[extensions]\n\tfrobnicate = true\n"),
+	)
+	.unwrap();
+
+	// Oracle: stock git refuses to move a worktree in this repo.
+	let to = base.join("to");
+	assert!(
+		!git_ok(&[
+			"-C",
+			work.to_str().unwrap(),
+			"worktree",
+			"move",
+			from.to_str().unwrap(),
+			to.to_str().unwrap(),
+		]),
+		"stock git refuses an unknown-extension repo",
+	);
+
+	let err = relocate(&req(&work, &from, &to, None))
+		.await
+		.expect_err("relocate fails closed on an unknown extension");
+	assert!(
+		matches!(
+			err,
+			RelocateError::Failed(LinkedWorktreeError::UnsupportedObjectFormat(_))
+		),
+		"got {err:?}"
+	);
+	assert!(from.exists() && !to.exists(), "nothing was moved");
 }

@@ -42,6 +42,7 @@ mod native {
 	use crate::relocate_error::RelocateError;
 	use crate::relocate_outcome::RelocateOutcome;
 	use crate::relocate_request::RelocateRequest;
+	use crate::repo_id::reject_unknown_extensions;
 	use crate::{LinkedWorktreeError, ProtectionReason, WorktreeClassification, classify};
 
 	/// Move the linked worktree at `request.from` to `request.to`. See the module docs for the safety
@@ -61,6 +62,12 @@ mod native {
 		// overwrite**: hold the per-repository lock across the whole decide → re-verify → move section.
 		// Released on any return (and on cancellation).
 		let _lock = RegistrationLock::acquire(common).await?;
+
+		// Fail closed on a repository format gitana does not fully understand: git reads `extensions.*` at
+		// `repositoryformatversion >= 1` and **aborts on any it does not recognize**, so it never moves a
+		// worktree in such a repo. Checked before any effect — an unknown extension could change worktree or
+		// ref semantics the move touches — matching the forced-removal path's gate.
+		reject_unknown_extensions(common)?;
 
 		// **Pin both paths once, under the lock, before any validation or effect** — then use the pinned
 		// request for every check, the lock probe, the rename, and the pointer writes:

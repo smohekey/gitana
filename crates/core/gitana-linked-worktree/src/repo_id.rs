@@ -151,7 +151,51 @@ mod native {
 			.map_err(|e| LinkedWorktreeError::io("opening work tree", work, e))?;
 		Ok(CapWorkDir::from_dir(dir))
 	}
+
+	/// Reject a repository whose common `config` declares an **unknown repository extension** — git reads
+	/// `extensions.*` only at `repositoryformatversion >= 1` and aborts on any it does not recognize, so any
+	/// destructive op on such a repo would risk a format gitana does not fully understand (requirements
+	/// 257-258). `objectformat` (validated by [`detect_kind`]) plus the extensions that do not change how
+	/// gitana must read this repo for a *structural* mutation are honoured; anything else refuses. Config-only
+	/// — reads no object store. A missing/unparseable config is left to `detect_kind`'s
+	/// `UnsupportedObjectFormat`. Shared by the destructive entry points (`remove`, `relocate`).
+	pub(crate) fn reject_unknown_extensions(common: &Path) -> Result<(), LinkedWorktreeError> {
+		// git tolerates these at v1 without special handling of the object/ref layout a structural op touches.
+		const KNOWN: &[&str] = &[
+			"objectformat",
+			"worktreeconfig",
+			"relativeworktrees",
+			"noop",
+		];
+		let Ok(text) = std::fs::read_to_string(common.join("config")) else {
+			return Ok(());
+		};
+		let Ok(config) = gitana_config::GitConfig::parse(&text) else {
+			return Ok(());
+		};
+		// Extensions are read only at repositoryformatversion >= 1 (git ignores them at version 0).
+		let version = config
+			.get_int("core", None, "repositoryformatversion")
+			.ok()
+			.flatten()
+			.unwrap_or(0);
+		if version < 1 {
+			return Ok(());
+		}
+		for (key, _) in config.entries() {
+			// A dotted key `extensions.<name>` (git's extensions carry no subsection, so a further dot is not one).
+			if let Some(name) = key.strip_prefix("extensions.")
+				&& !name.contains('.')
+				&& !KNOWN.contains(&name.to_ascii_lowercase().as_str())
+			{
+				return Err(LinkedWorktreeError::UnsupportedObjectFormat(format!(
+					"unknown repository extension: extensions.{name}"
+				)));
+			}
+		}
+		Ok(())
+	}
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::{detect_kind, open_store_raw, open_work_dir};
+pub(crate) use native::{detect_kind, open_store_raw, open_work_dir, reject_unknown_extensions};
