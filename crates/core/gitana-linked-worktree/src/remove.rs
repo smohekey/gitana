@@ -35,7 +35,7 @@ mod native {
 	use crate::remove_error::RemoveError;
 	use crate::remove_outcome::RemoveOutcome;
 	use crate::remove_request::RemoveRequest;
-	use crate::repo_id::{detect_kind, open_store_raw, reject_unknown_extensions};
+	use crate::repo_id::{detect_kind, open_store_raw, reject_unsupported_repository_format};
 	use crate::{LinkedWorktreeError, ProtectionReason, RemovePolicy, WorktreeClassification};
 
 	/// What a removal should do, decided from the inspection.
@@ -898,11 +898,11 @@ mod native {
 		// free from `inspect` opening the repo, but the lean forced path skips `inspect`, so it must do the same
 		// config-only check here (never opening the object store). `detect_kind` is the exact primitive the
 		// conservative `inspect` path uses (object format + `repositoryformatversion`), returning the same
-		// `UnsupportedObjectFormat` refusal; `reject_unknown_extensions` adds git's abort on an unknown
+		// `UnsupportedObjectFormat` refusal; `reject_unsupported_repository_format` adds git's abort on an unknown
 		// `extensions.*`. A repo gitana does not fully understand is never force-mutated (requirements 257-258),
 		// matching stock `git worktree remove -f -f`, which aborts too. Nothing is deleted on a format refusal.
 		detect_kind(&open_store_raw(common, common)?).await?;
-		reject_unknown_extensions(common)?;
+		reject_unsupported_repository_format(common)?;
 
 		// Decide from the current state, failing fast on a refusal before the destructive re-check.
 		let action = decide_git_forced(&inspect_git_forced(request)?, force)?;

@@ -1097,7 +1097,7 @@ pub(crate) fn interpret_bool(value: Option<&str>) -> Result<bool, ConfigError> {
 	}
 }
 
-fn interpret_int(value: &str) -> Result<i64, ConfigError> {
+pub(crate) fn interpret_int(value: &str) -> Result<i64, ConfigError> {
 	// git parses this as `strtoimax` (base 0) followed by a *unit factor* on whatever immediately trails the
 	// digits. `strtoimax` skips only *leading* ASCII whitespace, and `get_unit_factor` rejects any residue after
 	// the number/suffix — so `0 k` (space before the multiplier) and a quoted trailing space (`"0 "`) are both

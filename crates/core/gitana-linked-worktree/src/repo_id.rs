@@ -152,29 +152,43 @@ mod native {
 		Ok(CapWorkDir::from_dir(dir))
 	}
 
-	/// Reject a repository whose common `config` declares an **unknown repository extension** — git reads
-	/// `extensions.*` only at `repositoryformatversion >= 1` and aborts on any it does not recognize, so any
-	/// destructive op on such a repo would risk a format gitana does not fully understand (requirements
-	/// 257-258). The allowlist is exactly the git-recognized extensions that **do not change how gitana must
-	/// read this repo for a *structural* pointer op** (verified against stock git `worktree move`):
+	/// Reject a repository whose common `config` declares a **format gitana cannot safely mutate** — git's
+	/// own `check_repository_format` refuses to operate on such a repo, so a destructive op must fail closed
+	/// the same way (requirements 257-258). Reproduces git's format grammar exactly (each rule verified
+	/// against stock `git worktree move`), reading only the config (no object store):
 	///
-	/// - `objectformat` — the object hash, already validated by [`detect_kind`].
-	/// - `worktreeconfig`, `relativeworktrees` — worktree admin layout gitana already handles.
-	/// - `partialclone`, `preciousobjects` — object-store *policy* (promisor objects; never-prune); a move or
-	///   removal touches no objects, so these are safe. git moves such repos; refusing them blocked a
-	///   supported move (e.g. any partial clone).
-	/// - `noop` — git's test extension.
+	/// - **`core.repositoryformatversion`** — validated at *every* occurrence (git parses it eagerly and
+	///   aborts on any malformed value, even one a later valid value shadows, and even at version 0); then the
+	///   effective version must be `<= 1` (git: "Expected git repo version <= 1").
+	/// - **`extensions.*`** — read only at version `>= 1` (git ignores them at version 0). The allowlist is
+	///   exactly the git-recognized extensions that do not change how gitana must read this repo for a
+	///   *structural* pointer op:
+	///   - `objectformat` — the object hash (the effective value is also validated by [`detect_kind`]).
+	///   - `worktreeconfig`, `relativeworktrees` — worktree admin layout gitana already handles.
+	///   - `partialclone`, `preciousobjects` — object-store *policy* (promisor objects; never-prune); a move
+	///     or removal touches no objects, so these are safe. git moves such repos; refusing them blocked a
+	///     supported move (e.g. any partial clone).
+	///   - `noop` — git's test extension.
 	///
-	/// Deliberately **excluded** (so still refused, a fail-closed divergence from git, which does move them):
+	///   Any other extension name is refused. The whole remainder after `extensions.` is git's extension name
+	///   — a config *subsection* is part of it (`[extensions "foo"] bar` → `extensions.foo.bar`, which git
+	///   rejects as unknown `foo.bar`), so a dotted remainder is matched, not skipped.
+	///
+	///   The *value* of each known extension is validated at every occurrence, exactly as git does: the bool
+	///   extensions (`worktreeconfig`, `relativeworktrees`, `preciousobjects`) must be git booleans;
+	///   `partialclone`/`objectformat` must carry a value (a valueless occurrence is "missing value"); and
+	///   each `objectformat` value must name a git-recognized format (case-sensitive `sha1`/`sha256`). `noop`
+	///   takes any value.
+	///
+	/// Deliberately **excluded** (so still refused, a fail-closed divergence from git, which does move it):
 	/// `refstorage` — reftable changes the **ref backend**, which gitana's structural HEAD/ref reads assume is
 	/// the files format; that is precisely a format gitana does not fully understand, so it fails closed.
 	///
-	/// The whole remainder after `extensions.` is the extension name git checks — including a config
-	/// *subsection*, which `entries()` renders dotted (`[extensions "foo"] bar` → `extensions.foo.bar`) and
-	/// git aborts on as unknown `foo.bar`; so a dotted remainder is matched (never skipped), not excluded.
-	/// Config-only — reads no object store. A missing/unparseable config is left to `detect_kind`'s
-	/// `UnsupportedObjectFormat`. Shared by the destructive entry points (`remove`, `relocate`).
-	pub(crate) fn reject_unknown_extensions(common: &Path) -> Result<(), LinkedWorktreeError> {
+	/// A missing/unparseable config is left to `detect_kind`'s `UnsupportedObjectFormat`. Shared by the
+	/// destructive entry points (`remove`, `relocate`).
+	pub(crate) fn reject_unsupported_repository_format(
+		common: &Path,
+	) -> Result<(), LinkedWorktreeError> {
 		const KNOWN: &[&str] = &[
 			"objectformat",
 			"worktreeconfig",
@@ -183,29 +197,66 @@ mod native {
 			"preciousobjects",
 			"noop",
 		];
+		// git parses each of these as a boolean at every occurrence.
+		const BOOL: &[&str] = &["worktreeconfig", "relativeworktrees", "preciousobjects"];
+		// git requires a value for each of these (a valueless occurrence is an error).
+		const VALUE_REQUIRED: &[&str] = &["partialclone", "objectformat"];
+
 		let Ok(text) = std::fs::read_to_string(common.join("config")) else {
 			return Ok(());
 		};
 		let Ok(config) = gitana_config::GitConfig::parse(&text) else {
 			return Ok(());
 		};
-		// Extensions are read only at repositoryformatversion >= 1 (git ignores them at version 0).
+		let bad = LinkedWorktreeError::UnsupportedObjectFormat;
+
+		// Validate every `repositoryformatversion` occurrence (eager, even at v0), then bound the effective one.
 		let version = config
-			.get_int("core", None, "repositoryformatversion")
-			.ok()
-			.flatten()
+			.get_int_validated("core", None, "repositoryformatversion")
+			.map_err(|e| bad(format!("invalid core.repositoryformatversion: {e}")))?
 			.unwrap_or(0);
+		if version > 1 {
+			return Err(bad(format!(
+				"unsupported repository format version {version}"
+			)));
+		}
 		if version < 1 {
 			return Ok(());
 		}
+
+		// Reject an unknown extension name (the whole dotted remainder).
 		for (key, _) in config.entries() {
-			// The full remainder after `extensions.` is git's extension name — a config subsection is part of
-			// it (`extensions.foo.bar`), which git rejects as unknown, so a dotted remainder is matched too.
 			if let Some(name) = key.strip_prefix("extensions.")
 				&& !KNOWN.contains(&name.to_ascii_lowercase().as_str())
 			{
-				return Err(LinkedWorktreeError::UnsupportedObjectFormat(format!(
+				return Err(bad(format!(
 					"unknown repository extension: extensions.{name}"
+				)));
+			}
+		}
+
+		// Validate the *value* of each known extension at every occurrence, as git does.
+		for name in BOOL {
+			config
+				.get_bool_validated("extensions", None, name)
+				.map_err(|e| bad(format!("invalid value for extensions.{name}: {e}")))?;
+		}
+		for name in VALUE_REQUIRED {
+			if config
+				.get_all_raw("extensions", None, name)
+				.iter()
+				.any(Option::is_none)
+			{
+				return Err(bad(format!("missing value for extensions.{name}")));
+			}
+		}
+		for raw in config.get_all_raw("extensions", None, "objectformat") {
+			if let Some(value) = raw
+				&& value != "sha1"
+				&& value != "sha256"
+			{
+				return Err(bad(format!(
+					"invalid value for extensions.objectformat: {value}"
 				)));
 			}
 		}
@@ -214,4 +265,6 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::{detect_kind, open_store_raw, open_work_dir, reject_unknown_extensions};
+pub(crate) use native::{
+	detect_kind, open_store_raw, open_work_dir, reject_unsupported_repository_format,
+};
