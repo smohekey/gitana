@@ -534,9 +534,21 @@ mod native {
 		admin_relative: bool,
 	) -> Result<(), LinkedWorktreeError> {
 		for other in stale {
-			std::fs::remove_dir_all(other).map_err(|e| {
-				LinkedWorktreeError::io("removing stale destination registration", other, e)
-			})?;
+			// Drop the stale registration. A concurrent `git worktree prune` / `gta worktree prune` may have
+			// already removed it between the pre-move re-verification and here — a `NotFound` means the desired
+			// end state (the stale admin gone) already holds, so treat it as idempotent success rather than
+			// failing the (already-renamed) move into `Incomplete`. Mirrors `deregister_admin`.
+			match std::fs::remove_dir_all(other) {
+				Ok(()) => {}
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+				Err(e) => {
+					return Err(LinkedWorktreeError::io(
+						"removing stale destination registration",
+						other,
+						e,
+					));
+				}
+			}
 		}
 
 		let gitfile = to.join(".git");
