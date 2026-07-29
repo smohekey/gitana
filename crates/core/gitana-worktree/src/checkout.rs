@@ -643,7 +643,10 @@ fn untracked_file_ancestor<W: WorkDirFs>(
 
 /// Build the ignore stack for the ancestors of `dir_rel` — the work-tree root's `.gitignore`
 /// and that of each directory strictly above `dir_rel` — ready for matching paths at `dir_rel`.
-fn ignore_prefix<W: WorkDirFs>(work: &W, dir_rel: &str) -> Result<Vec<DirIgnore>, WorktreeError> {
+pub(crate) fn ignore_prefix<W: WorkDirFs>(
+	work: &W,
+	dir_rel: &str,
+) -> Result<Vec<DirIgnore>, WorktreeError> {
 	let mut stack = Vec::new();
 	push_gitignore(work, "", &mut stack)?;
 	let components: Vec<&str> = dir_rel.split('/').filter(|part| !part.is_empty()).collect();

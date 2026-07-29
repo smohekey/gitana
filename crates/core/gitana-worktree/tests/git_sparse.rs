@@ -15,7 +15,7 @@ use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
-use gitana_worktree::{SparseSet, WorkTree};
+use gitana_worktree::{SparseSet, WorkTree, WorktreeError};
 
 fn open_dir(path: impl AsRef<Path>) -> cap_std::fs::Dir {
 	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
@@ -813,8 +813,10 @@ async fn widening_preserves_a_present_modified_excluded_file() {
 	);
 }
 
-/// `add` must not stage a *new* untracked file that is outside the active sparse cone — git refuses an
-/// out-of-cone path (advising `--sparse`), not only paths that already carry a skip-worktree entry.
+/// `add` must not stage a *new* untracked file that is outside the active sparse cone. git stages the
+/// in-cone work, writes the index, and THEN exits nonzero with its "outside sparse-checkout" advice when
+/// a broad pathspec swept up an untracked out-of-cone file (probed vs git 2.50.1) — so `add .` here
+/// returns the deferred `SparsePathExcluded` while leaving `x/new` unstaged.
 #[tokio::test]
 async fn add_refuses_a_new_out_of_cone_file() {
 	if !git_supports_sha256() {
@@ -830,7 +832,11 @@ async fn add_refuses_a_new_out_of_cone_file() {
 	// A brand-new untracked file outside the cone.
 	std::fs::create_dir_all(work.join("x")).unwrap();
 	std::fs::write(work.join("x/new"), b"n\n").unwrap();
-	make_repo(&work).add(&["."], "").await.unwrap();
+	let result = make_repo(&work).add(&["."], "").await;
+	assert!(
+		matches!(result, Err(WorktreeError::SparsePathExcluded(_))),
+		"a new out-of-cone file must yield the deferred sparse error, got {result:?}"
+	);
 
 	assert!(
 		!git(&["-C", w, "ls-files"])

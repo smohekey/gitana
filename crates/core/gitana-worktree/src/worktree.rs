@@ -537,50 +537,178 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// subdirectory, empty at the root). A file is staged directly; a directory (or `.`) is
 	/// walked, applying `.gitignore`, and its non-ignored files are staged; a path that no
 	/// longer exists is removed from the index (a staged deletion).
+	///
+	/// Two DELIBERATE divergences from stock git (the staged index otherwise matches git byte-for-byte
+	/// across a differential fuzz of the pathspec surface):
+	///
+	/// 1. **Exclude + non-root positive.** git has a quirk where a *non-root* positive pathspec (a glob or
+	///    named directory, e.g. `new/*.rs`) combined with ANY negative pathspec suppresses staging of the
+	///    *untracked* files that positive matches — `add 'new/*.rs' ':!nope'` stages nothing, and
+	///    `add 'new/*.rs' ':!new/*.rs'` even reports the positive unmatched. A broad `.` positive is exempt.
+	///    gitana instead stages those untracked files (the intuitive result), a documented choice.
+	/// 2. **Ignored-path advice.** For an explicitly-named ignored path (`add ignored`,
+	///    `add 'ignored/*.rs'`), git stages the tracked modifications but exits non-zero with its "paths are
+	///    ignored, use -f" advice. gitana stages the same result and exits 0 — it has no `add -f` /
+	///    ignored-path advisory mechanism yet (a separate follow-up).
 	pub async fn add(&self, pathspecs: &[&str], prefix: &str) -> Result<(), WorktreeError> {
 		let mut index = self.load_index().await?;
 		// The active sparse matcher: `add` never stages a path outside it (git refuses an out-of-cone path,
 		// advising `--sparse`), whether or not the path already has a skip-worktree entry.
 		let sparse = self.sparse_checkout().await?;
+		// git stages every in-cone change, writes the index, and only THEN exits nonzero with its
+		// "outside sparse-checkout" advice when a pathspec matched an out-of-cone path it could not add
+		// (probed vs git 2.50.1). So collect the first such omission and, after saving, surface it — rather
+		// than aborting before the in-cone work is persisted. The trigger is an *untracked* out-of-cone
+		// file matched by any pathspec, or an out-of-cone path named *explicitly* (a literal, or a glob
+		// rooted out-of-cone); a broad pathspec that merely sweeps over a tracked skip-worktree entry skips
+		// it silently.
+		let mut sparse_omitted: Option<String> = None;
+		// A `:(exclude)` pathspec subtracts from what the positives stage; a set with only negatives stages
+		// the whole tree minus them, exactly like `add .` with the exclusions applied.
+		let set = crate::pathspec::PathspecSet::parse(pathspecs, prefix)?;
 		let mut ignore_stack: Vec<DirIgnore> = Vec::new();
-		for &spec in pathspecs {
-			let (rel, dir_only) = crate::pathspec::normalize(spec, prefix)?;
+		if set.is_positive_empty() {
+			// No pathspec at all is a no-op (git's "Nothing specified, nothing added"); a set of *only*
+			// negatives stages the whole tree minus them, like `add .` with the exclusions applied.
+			if pathspecs.is_empty() {
+				return self.save_index(&index).await;
+			}
+			let mut files = Vec::new();
+			walk_files(self.work(), "", &mut ignore_stack, &mut files)?;
+			let walked: std::collections::HashSet<String> = files.iter().cloned().collect();
+			for file in &files {
+				if !set.is_excluded(file) {
+					self
+						.stage_walked(&mut index, file, sparse.as_ref(), &mut sparse_omitted)
+						.await?;
+				}
+			}
+			self
+				.stage_tracked_outside_walk(&mut index, "", sparse.as_ref(), &set, &walked)
+				.await?;
+			self.save_index(&index).await?;
+			return sparse_result(sparse_omitted);
+		}
+		// git decides whether each positive matched a tracked path against the index *as it was before any
+		// staging* — so overlapping specs such as `add gone gone` or `add . gone` (where the first occurrence
+		// stages `gone`'s deletion, removing the entry) do not make the later occurrence report "did not
+		// match". Snapshot the initially-tracked (non-sparse) and unmerged paths for the match check below.
+		let initial_tracked: std::collections::HashSet<String> = index
+			.entries
+			.iter()
+			.filter(|entry| entry.stage == 0 && !entry.skip_worktree)
+			.map(|entry| entry.path.clone())
+			.chain(index.unmerged_paths().map(str::to_owned))
+			.collect();
+		// The same snapshot including **out-of-cone (skip-worktree)** entries — a glob matches those too
+		// (they feed the sparse advice), and a repeated glob matches a path an earlier spec removed.
+		let initial_tracked_all: std::collections::HashSet<String> = index
+			.entries
+			.iter()
+			.filter(|entry| entry.stage == 0)
+			.map(|entry| entry.path.clone())
+			.chain(index.unmerged_paths().map(str::to_owned))
+			.collect();
+		for (spec, pathspec) in set.positives() {
+			// A positive that can never match (a magic path resolving to root, `:/.`) is a no-op for `add`
+			// (git stages nothing; `rm`/`restore` instead report it unmatched, via `matches` returning false).
+			if pathspec.is_never_matching() {
+				continue;
+			}
+			// A glob pathspec (and an `:(icase)` one, whose match must resolve to the actual worktree path
+			// rather than the spec's spelling) walks its base directory and stages every present file it
+			// matches, plus the deletion of any matching tracked entry whose file is gone. Unlike an
+			// explicitly-named directory it silently skips out-of-cone matches (like a broad `.` walk) and
+			// never triggers the out-of-cone-directory refusal — probed vs git 2.50.1.
+			if !pathspec.is_literal() || pathspec.is_icase() {
+				self
+					.add_glob(
+						&mut index,
+						pathspec,
+						spec,
+						sparse.as_ref(),
+						&set,
+						&initial_tracked_all,
+						&mut sparse_omitted,
+					)
+					.await?;
+				continue;
+			}
+			let rel = pathspec.as_str().to_owned();
+			let dir_only = pathspec.dir_only();
 			// The empty spec (`.` at the work-tree root) always names the root directory to walk.
 			if rel.is_empty() {
 				let mut files = Vec::new();
 				walk_files(self.work(), "", &mut ignore_stack, &mut files)?;
-				for file in files {
-					self.stage_file(&mut index, &file, sparse.as_ref()).await?;
+				let walked: std::collections::HashSet<String> = files.iter().cloned().collect();
+				for file in &files {
+					if !set.is_excluded(file) {
+						self
+							.stage_walked(&mut index, file, sparse.as_ref(), &mut sparse_omitted)
+							.await?;
+					}
 				}
-				self.stage_deletions(&mut index, "", sparse.as_ref())?;
+				self
+					.stage_tracked_outside_walk(&mut index, "", sparse.as_ref(), &set, &walked)
+					.await?;
 				continue;
 			}
 			match self.work().lstat(&rel)? {
 				Some(meta) if meta.kind.is_dir() => {
 					let mut files = Vec::new();
-					walk_files(self.work(), &rel, &mut ignore_stack, &mut files)?;
-					// An explicitly-named directory whose matches are ALL out-of-cone is REFUSED (git reports
-					// it), unlike a broad `.` walk that silently skips such paths, or a directory with any
-					// in-cone content (which stages that and skips the out-of-cone siblings).
+					// Seed the ignore stack with the ancestor `.gitignore`s (root down to `rel`'s parent)
+					// so a rule above the named directory still applies to its walk.
+					let mut stack = crate::checkout::ignore_prefix(self.work(), &rel)?;
+					// Don't stage *untracked* files from an explicitly-named ignored directory: git refuses
+					// them (its "paths are ignored, use -f" advice), staging only the tracked modifications
+					// beneath it (handled by `stage_tracked_outside_walk` below). Probed vs git 2.50.1:
+					// `add ignored` on an ignored `ignored/` stages a modified tracked child but not an
+					// untracked sibling. gitana does not yet emit the advisory exit code (a separate follow-up).
+					if !ignore::is_ignored(&rel, true, &stack) {
+						walk_files(self.work(), &rel, &mut stack, &mut files)?;
+					}
+					files.retain(|file| !set.is_excluded(file));
+					// An explicitly-named directory whose matches are ALL out-of-cone is one git reports (the
+					// deferred sparse advice), unlike a broad `.` walk that silently skips such paths, or a
+					// directory with any in-cone content (which stages that and skips the out-of-cone siblings).
 					if self.only_out_of_cone_dir(&index, &rel, &files, sparse.as_ref()) {
-						return Err(WorktreeError::SparsePathExcluded(rel));
+						sparse_omitted.get_or_insert_with(|| rel.clone());
 					}
-					for file in files {
-						self.stage_file(&mut index, &file, sparse.as_ref()).await?;
+					let walked: std::collections::HashSet<String> = files.iter().cloned().collect();
+					for file in &files {
+						self
+							.stage_walked(&mut index, file, sparse.as_ref(), &mut sparse_omitted)
+							.await?;
 					}
-					self.stage_deletions(&mut index, &rel, sparse.as_ref())?;
+					self
+						.stage_tracked_outside_walk(&mut index, &rel, sparse.as_ref(), &set, &walked)
+						.await?;
 				}
 				// A trailing-slash spec required a directory but resolved to a file.
 				Some(_) if dir_only => return Err(WorktreeError::PathspecMatch(spec.to_owned())),
 				Some(_) => {
-					// An explicitly-named out-of-cone file is REFUSED (git exits nonzero with sparse advice),
-					// unlike a broad pathspec whose walk silently skips such files.
-					if index.is_sparse(&rel)
+					let out_of_cone = index.is_sparse(&rel)
 						|| sparse
 							.as_ref()
-							.is_some_and(|matcher| !matcher.includes(&rel))
-					{
-						return Err(WorktreeError::SparsePathExcluded(rel));
+							.is_some_and(|matcher| !matcher.includes(&rel));
+					if out_of_cone {
+						// A TRACKED out-of-cone path (any stage) explicitly named is reported BEFORE the
+						// exclusion is subtracted — `add out/f :!out/f` still reports the sparse path (probed vs
+						// git 2.50.1). An UNTRACKED out-of-cone file instead has the exclusion applied first, so
+						// `add out/new.rs :!out/new.rs` is an empty selection and succeeds.
+						if index.entry(&rel).is_some() {
+							sparse_omitted.get_or_insert_with(|| rel.clone());
+							continue;
+						}
+						if set.is_excluded(&rel) {
+							continue;
+						}
+						sparse_omitted.get_or_insert_with(|| rel.clone());
+						continue;
+					}
+					// An in-cone file the negatives exclude is skipped (git: `add foo :!foo` stages nothing).
+					if set.is_excluded(&rel) {
+						continue;
 					}
 					self.stage_file(&mut index, &rel, sparse.as_ref()).await?
 				}
@@ -589,38 +717,185 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				// directory, `rm -r dir && add dir`). A spec matching no tracked entry did not match
 				// anything; a trailing-slash spec additionally requires it to have named a directory.
 				None => {
-					// An explicitly-named out-of-cone path (absent by design) is REFUSED, like the present
-					// case: `git add x/h` on an omitted file exits nonzero with sparse advice, rather than
-					// silently succeeding without staging anything.
-					if index.is_sparse(&rel) || sparse.as_ref().is_some_and(|m| !m.includes(&rel)) {
-						return Err(WorktreeError::SparsePathExcluded(rel));
+					// An explicitly-named out-of-cone path (absent by design) is one git reports, like the
+					// present case: `git add x/h` on an omitted file exits nonzero with sparse advice, rather
+					// than silently succeeding without staging anything. This out-of-cone case takes precedence
+					// over both the exclusion skip and the did-not-match check below.
+					// Keyed on an actual skip-worktree ENTRY, not the matcher: an absent path that is not tracked
+					// (`add out/new.rs`, `out/` out-of-cone, no such entry) is git's "did not match", not the
+					// sparse advice (probed vs git 2.50.1). A tracked skip-worktree entry absent by design is.
+					if index.is_sparse(&rel) {
+						sparse_omitted.get_or_insert_with(|| rel.clone());
+						continue;
 					}
 					// A directory pathspec covering only out-of-cone (skip-worktree) tracked entries is
-					// REFUSED the same way (`add b` when the whole `b/` subtree is excluded and absent) —
+					// reported the same way (`add b` when the whole `b/` subtree is excluded and absent) —
 					// git reports it rather than silently staging nothing.
 					if self.only_out_of_cone_dir(&index, &rel, &[], sparse.as_ref()) {
-						return Err(WorktreeError::SparsePathExcluded(rel));
+						sparse_omitted.get_or_insert_with(|| rel.clone());
+						continue;
 					}
 					// A sparse-excluded path (or a directory whose only entries are excluded) is
 					// invisible to `add`: git treats it as outside the sparse-checkout definition, so it
 					// neither matches the pathspec nor has its entry dropped. Ignore sparse entries when
 					// deciding whether anything matched, and never remove a sparse entry here.
 					let child_prefix = format!("{rel}/");
-					let matched = index.entry(&rel).is_some_and(|entry| !entry.skip_worktree)
-						|| index.entries.iter().any(|entry| {
-							entry.stage == 0 && !entry.skip_worktree && entry.path.starts_with(&child_prefix)
-						});
-					if dir_only && !matched {
+					// Matched against the pre-staging snapshot (see `initial_tracked`), so an earlier positive
+					// that already removed this entry does not turn a later occurrence into "did not match". The
+					// snapshot already covers both stage-0 tracked paths and **unmerged** paths (only stages
+					// 1/2/3) — `add conflict` on a deleted unmerged path clears its higher stages and records
+					// the deletion rather than reporting "did not match" (probed vs git 2.50.1).
+					let matched = initial_tracked.contains(&rel)
+						|| initial_tracked
+							.iter()
+							.any(|path| path.starts_with(&child_prefix));
+					// A positive matching no tracked path is git's "did not match" — and a negative pathspec
+					// does NOT suppress that error (probed vs git 2.50.1: `add missing/ :!missing` and even
+					// `add missing` both fail). So the match check precedes the exclusion skip.
+					if !matched {
 						return Err(WorktreeError::PathspecMatch(spec.to_owned()));
+					}
+					// Matched a tracked path the negatives exclude — nothing to stage or drop.
+					if set.is_excluded(&rel) {
+						continue;
 					}
 					if !index.is_sparse(&rel) {
 						index.remove(&rel);
 					}
-					self.stage_deletions(&mut index, &rel, sparse.as_ref())?;
+					// The named path is absent, so nothing was walked — every tracked entry under it is a
+					// deletion candidate.
+					self
+						.stage_tracked_outside_walk(
+							&mut index,
+							&rel,
+							sparse.as_ref(),
+							&set,
+							&std::collections::HashSet::new(),
+						)
+						.await?;
 				}
 			}
 		}
-		self.save_index(&index).await
+		self.save_index(&index).await?;
+		sparse_result(sparse_omitted)
+	}
+
+	/// Stage a glob pathspec: walk its literal base directory and stage every present working-tree file
+	/// it matches, then stage the deletion of any matching tracked entry whose file is gone (git 2.0
+	/// `add`). Errors with `PathspecMatch` if the glob matched no path at all (git's "did not match any
+	/// files"). Out-of-cone matches feed the caller's deferred sparse advice via `omitted`: an untracked
+	/// out-of-cone file the walk swept up, or (via `in_cone`) a glob rooted out-of-cone whose every match
+	/// lies outside the cone. A sparse (skip-worktree / out-of-cone) entry is never dropped — matching
+	/// [`Self::stage_tracked_outside_walk`].
+	// The parameters are all distinct inputs the glob path genuinely needs (index, matcher, sparse
+	// state, the initial-tracked snapshot, and the omission accumulator); bundling them would obscure more
+	// than it helps.
+	#[allow(clippy::too_many_arguments)]
+	async fn add_glob(
+		&self,
+		index: &mut Index<H>,
+		pathspec: &crate::pathspec::Pathspec,
+		spec: &str,
+		sparse: Option<&SparseCheckout>,
+		set: &crate::pathspec::PathspecSet,
+		initial_tracked: &std::collections::HashSet<String>,
+		omitted: &mut Option<String>,
+	) -> Result<(), WorktreeError> {
+		let base = pathspec.base_dir();
+		let mut files = Vec::new();
+		// Walk only when the base directory exists — a glob under a missing directory matches no present
+		// file, though it may still match a tracked deletion below. Seed the ignore stack with the
+		// ancestor `.gitignore`s (root down to `base`'s parent) so a rule above `base` still applies.
+		if base.is_empty() || matches!(self.work().lstat(base)?, Some(meta) if meta.kind.is_dir()) {
+			let mut stack = crate::checkout::ignore_prefix(self.work(), base)?;
+			// Don't walk into an ignored base directory: git stages no *untracked* file from it, so a glob
+			// like `add 'ignored/*.rs'` (with `.gitignore` containing `ignored/`) "did not match" — unless a
+			// tracked entry beneath it matches, which the tracked-entry loop below still handles.
+			if base.is_empty() || !ignore::is_ignored(base, true, &stack) {
+				walk_files(self.work(), base, &mut stack, &mut files)?;
+			}
+		}
+		let mut matched = false;
+		let mut staged: std::collections::HashSet<String> = std::collections::HashSet::new();
+		for file in files {
+			// git decides whether the glob matched *before* subtracting negatives (so `add '*.rs' :!*.rs`
+			// is a no-op success); only the actual staging is gated by the exclusions.
+			if pathspec.matches(&file) {
+				matched = true;
+				if !set.is_excluded(&file) {
+					// An untracked out-of-cone file the glob swept up feeds the deferred sparse advice.
+					self.stage_walked(index, &file, sparse, omitted).await?;
+					staged.insert(file);
+				}
+			}
+		}
+		// A glob also "matched" if it hits a path tracked in the index *as it was before any staging*
+		// (`initial_tracked` includes out-of-cone skip-worktree entries) — so a repeated glob still matches a
+		// path an earlier spec removed (`add '*.rs' '*.rs'` on a deleted `a.rs`), and a tracked out-of-cone
+		// entry counts. Track whether any such tracked match is genuinely out-of-cone (by the matcher, not
+		// the skip-worktree bit — a bit-cleared dirty entry is still tracked) for the sparse advice below.
+		// Accounting only; the actual staging works on the live index.
+		let mut out_of_cone_tracked = false;
+		for path in initial_tracked {
+			if pathspec.matches(path) {
+				matched = true;
+				if sparse.is_some_and(|matcher| !matcher.includes(path)) {
+					out_of_cone_tracked = true;
+				}
+			}
+		}
+		// Stage the IN-CONE tracked matches against the LIVE index — a present file/symlink the walk skipped
+		// (a `.gitignore`d one) is restaged (git stages the modification), an absent one (or a file->directory
+		// change) is a deletion. Unmerged (conflict) paths, which have no stage-0 entry, resolve the same way.
+		// Snapshot first, since the removal loop mutates the index.
+		let child = |path: &str| {
+			(index
+				.entry(path)
+				.is_some_and(|entry| entry.stage == 0 && !entry.skip_worktree)
+				|| index.unmerged_paths().any(|unmerged| unmerged == path))
+				&& sparse.is_none_or(|matcher| matcher.includes(path))
+				&& pathspec.matches(path)
+		};
+		let tracked: Vec<String> = index
+			.entries
+			.iter()
+			.filter(|entry| entry.stage != 0 || !entry.skip_worktree)
+			.map(|entry| entry.path.clone())
+			.collect::<std::collections::BTreeSet<_>>()
+			.into_iter()
+			.filter(|path| child(path))
+			.collect();
+		for path in tracked {
+			// Only the staging/removal is gated by the exclusions (so `add '*.rs' :!*.rs` on a deleted `a.rs`
+			// is a no-op success).
+			if set.is_excluded(&path) {
+				continue;
+			}
+			match self.work().lstat(&path)? {
+				Some(meta) if meta.kind.is_file() || meta.kind.is_symlink() => {
+					if !staged.contains(&path) {
+						self.stage_file(index, &path, sparse).await?;
+					}
+				}
+				// Absent, or now a directory (a file->directory change): the tracked entry is a deletion.
+				_ => index.remove(&path),
+			}
+		}
+		if !matched {
+			return Err(WorktreeError::PathspecMatch(spec.to_owned()));
+		}
+		// A glob rooted at a named directory (a non-empty literal base) EXPLICITLY targets that path, so a
+		// tracked out-of-cone match there is the deferred sparse advice — reported BEFORE exclusions, so
+		// `add 'out/*'` and `add 'out/*' :!out/*` both advise. A broad glob (empty base) silently skips a
+		// tracked out-of-cone match it merely sweeps over (`add '*.rs'` matching only a tracked out-of-cone
+		// file exits 0). Keying on the actual matches' cone state — not on whether the base *directory* tests
+		// out-of-cone — is what keeps a non-cone glob that matches an included file from spuriously erroring.
+		// (An untracked out-of-cone file swept by any glob is already recorded by `stage_walked`.) Probed vs
+		// git 2.50.1.
+		if !base.is_empty() && out_of_cone_tracked {
+			omitted.get_or_insert_with(|| spec.to_owned());
+		}
+		Ok(())
 	}
 
 	/// Whether the directory pathspec `rel` matches paths but **all** of them are out-of-cone under
@@ -656,6 +931,28 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			.any(|e| e.stage == 0 && under(&e.path) && matcher.includes(&e.path))
 			|| walked.iter().any(|f| matcher.includes(f));
 		!any_in_cone
+	}
+
+	/// Stage a file discovered by a **walk** (a broad `.`/`<dir>`/glob traversal), recording it as a
+	/// sparse omission first if git would advise about it. A walk silently skips a tracked skip-worktree
+	/// entry that happens to be back on disk, but an *untracked* out-of-cone file it swept up is one git
+	/// reports (probed vs git 2.50.1) — so only that case sets `omitted`. Staging itself is a no-op for any
+	/// out-of-cone path.
+	async fn stage_walked(
+		&self,
+		index: &mut Index<H>,
+		path: &str,
+		sparse: Option<&SparseCheckout>,
+		omitted: &mut Option<String>,
+	) -> Result<(), WorktreeError> {
+		// "Untracked" means *no index entry at all* — NOT merely a cleared skip-worktree bit. A modified
+		// out-of-cone tracked file whose bit reapply cleared is still tracked, and a broad walk skips it
+		// silently (probed vs git 2.50.1); only a genuinely untracked out-of-cone file is a reported
+		// omission.
+		if index.entry(path).is_none() && sparse.is_some_and(|matcher| !matcher.includes(path)) {
+			omitted.get_or_insert_with(|| path.to_owned());
+		}
+		self.stage_file(index, path, sparse).await
 	}
 
 	async fn stage_file(
@@ -698,42 +995,74 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		Ok(())
 	}
 
-	/// Stage deletions for a directory pathspec: any tracked entry under `dir_rel` (the empty string
-	/// is the work-tree root, matching everything) whose working-tree file no longer exists is removed
-	/// from the index. This is git 2.0+ `add <dir>` / `add .` behaviour — a walk stages the files that
-	/// are present, and this pass stages the removals of those that vanished, so `rm foo && add .`
-	/// records the deletion rather than silently keeping the stale entry. A single explicit pathspec
-	/// that is absent is handled directly by [`Self::add`]; this pass covers the directory case.
-	fn stage_deletions(
+	/// Reconcile the index for tracked entries under `dir_rel` (the empty string is the work-tree root,
+	/// matching everything) that the working-tree walk did not already stage (`walked`). The walk
+	/// (`walk_files`) stages present, non-ignored files and prunes ignored directories with no knowledge
+	/// of the index, so this pass covers what it misses, matching git 2.0+ `add <dir>` / `add .`:
+	///
+	/// - a tracked entry whose working-tree file **vanished** is staged as a deletion, so `rm foo && add
+	///   .` records the removal rather than keeping the stale entry;
+	/// - a tracked entry that is **present but under an ignored directory** — which the walk pruned — is
+	///   restaged, since ignore rules never apply to an already-tracked path, so a modification to
+	///   `ignored/tracked.rs` is picked up (probed vs git 2.50.1).
+	///
+	/// Entries the walk already staged are skipped, so `add .` does not re-hash every file twice. A
+	/// sparse/out-of-cone or `:(exclude)`d entry is left untouched. A single explicit absent pathspec is
+	/// handled directly by [`Self::add`]; this pass covers the directory case.
+	async fn stage_tracked_outside_walk(
 		&self,
 		index: &mut Index<H>,
 		dir_rel: &str,
 		sparse: Option<&SparseCheckout>,
+		set: &crate::pathspec::PathspecSet,
+		walked: &std::collections::HashSet<String>,
 	) -> Result<(), WorktreeError> {
 		let prefix = if dir_rel.is_empty() {
 			String::new()
 		} else {
 			format!("{dir_rel}/")
 		};
-		// Snapshot the candidate paths first, since the `lstat` loop mutates the index.
-		let candidates: Vec<String> = index
+		let admissible = |path: &str| {
+			// The exact `dir_rel` is admissible too, not just its `dir_rel/` children: when a tracked *file*
+			// `dir` is replaced by a directory, its stale file entry must be reconciled (staged as a
+			// deletion) even though it does not lie under `dir/` (probed vs git 2.50.1).
+			(path == dir_rel || path.starts_with(&prefix))
+				&& sparse.is_none_or(|matcher| matcher.includes(path))
+				&& !set.is_excluded(path)
+				&& !walked.contains(path)
+		};
+		// Snapshot the candidate paths first, since the `lstat`/stage loop mutates the index.
+		let mut candidates: Vec<String> = index
 			.entries
 			.iter()
 			// An out-of-cone entry's file is absent by design — its absence is not a deletion. Exclude it by
 			// the skip-worktree bit AND the active matcher: a dirty excluded file has its bit cleared (so it
 			// stays visible), yet it is still outside the sparse definition and its later absence must not be
-			// staged as a deletion (git leaves it unstaged).
-			.filter(|entry| {
-				entry.stage == 0
-					&& !entry.skip_worktree
-					&& entry.path.starts_with(&prefix)
-					&& sparse.is_none_or(|matcher| matcher.includes(&entry.path))
-			})
+			// staged as a deletion (git leaves it unstaged). A `:(exclude)`d path is likewise left alone. A
+			// path the walk already staged needs no second look.
+			.filter(|entry| entry.stage == 0 && !entry.skip_worktree && admissible(&entry.path))
 			.map(|entry| entry.path.clone())
 			.collect();
+		// An **unmerged** path (only stage 1/2/3 entries) is also a candidate: `add` resolves the conflict
+		// by staging its present content, or — when its file is gone — recording the deletion, exactly as a
+		// broad `add .` / `add :!x` does (probed vs git 2.50.1: `add :!nope` clears a deleted unmerged path's
+		// higher-stage entries). Only reachable when the walk did not already stage it.
+		candidates.extend(
+			index
+				.unmerged_paths()
+				.filter(|path| admissible(path))
+				.map(str::to_owned),
+		);
 		for path in candidates {
-			if self.work().lstat(&path)?.is_none() {
-				index.remove(&path);
+			match self.work().lstat(&path)? {
+				// Present as a file/symlink but unwalked — a tracked file the walk pruned as ignored. Restage
+				// it (git stages modifications to tracked files regardless of ignore rules).
+				Some(meta) if meta.kind.is_file() || meta.kind.is_symlink() => {
+					self.stage_file(index, &path, sparse).await?
+				}
+				// Gone from the working tree, or replaced by a directory (a tracked file `dir` now a `dir/`
+				// tree): the stale file entry is a deletion.
+				_ => index.remove(&path),
 			}
 		}
 		Ok(())
@@ -906,6 +1235,16 @@ pub(crate) fn stat_matches<H: HashAlgorithm>(entry: &IndexEntry<H>, meta: &Meta)
 
 /// Collect all non-ignored files under `dir_rel` (recursively), applying `.gitignore` and skipping
 /// `.git`. Used to expand a directory pathspec for `add`.
+/// Turn a collected sparse omission into `add`'s deferred result: `Ok(())` when nothing was omitted, or
+/// the "outside sparse-checkout" error once the in-cone work has already been saved (git's exit-nonzero
+/// advice after a partial add).
+fn sparse_result(omitted: Option<String>) -> Result<(), WorktreeError> {
+	match omitted {
+		Some(path) => Err(WorktreeError::SparsePathExcluded(path)),
+		None => Ok(()),
+	}
+}
+
 fn walk_files<W: WorkDirFs>(
 	work: &W,
 	dir_rel: &str,

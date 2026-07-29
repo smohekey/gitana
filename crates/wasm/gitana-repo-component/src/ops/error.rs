@@ -66,6 +66,7 @@ pub(crate) fn worktree_error(error: WorktreeError) -> RepoError {
 		// An explicit out-of-cone `add` (component `sparse-add`/`add`) and a malformed sparse config
 		// value are caller/state errors, not backend failures — surface them as `invalid`.
 		| WorktreeError::SparsePathExcluded(_)
+		| WorktreeError::InvalidPathspecMagic(_)
 		| WorktreeError::Config(_)) => RepoError::Invalid(invalid.to_string()),
 		other => RepoError::Backend(other.to_string()),
 	}

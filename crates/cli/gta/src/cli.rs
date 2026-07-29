@@ -102,7 +102,7 @@ enum Command {
 	},
 	/// Stage file contents into the index.
 	Add {
-		/// Pathspecs to stage (files, directories, or `.`).
+		/// Pathspecs to stage: files, directories, `.`, globs (`*.rs`), and magic (`:(exclude)`/`:!`, `:/`, `:(icase)`, `:(literal)`, `:(glob)`).
 		#[arg(required = true)]
 		pathspecs: Vec<String>,
 	},

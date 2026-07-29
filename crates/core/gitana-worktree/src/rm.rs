@@ -19,7 +19,7 @@ use gitana_object::HashAlgorithm;
 
 use crate::checkout::{remove_worktree_file, validate_path};
 use crate::fsmeta::blob_of;
-use crate::pathspec::normalize;
+use crate::pathspec::PathspecSet;
 use crate::status::head_entries;
 use crate::worktree::stat_matches;
 use crate::{WorkTree, WorktreeError};
@@ -73,26 +73,73 @@ where
 	tracked.extend(index.unmerged_paths().map(str::to_owned));
 
 	// Match each pathspec against tracked paths: an exact file, or — needing `recursive` — the
-	// contents of a directory (the empty spec from `.` matches every tracked path).
+	// contents of a directory (the empty spec from `.` matches every tracked path). A `:(exclude)`
+	// pathspec subtracts from what the positives select.
+	let set = PathspecSet::parse(pathspecs, prefix)?;
 	let mut selected: BTreeSet<&str> = BTreeSet::new();
-	for &spec in pathspecs {
-		let (normalized, dir_only) = normalize(spec, prefix)?;
-		let mut exact = false;
-		let mut under_dir = false;
+	for (spec, pathspec) in set.positives() {
+		let mut matched = false;
+		// A pathspec requires `-r` only when every match was a leading-directory expansion; if it also
+		// matched a path as a plain file (exact or glob), `-r` is waived. `rm 'a?'` with tracked `a?/f`
+		// AND `aa` removes both without `-r`, while `rm 'a?'` matching only the directory `a?/` requires it
+		// (probed vs git 2.50.1).
+		let mut has_dir_expansion = false;
+		let mut has_file_match = false;
 		for path in &tracked {
-			if !dir_only && path.as_str() == normalized {
-				selected.insert(path);
-				exact = true;
-			} else if normalized.is_empty() || path.starts_with(&format!("{normalized}/")) {
-				selected.insert(path);
-				under_dir = true;
+			if pathspec.matches(path) {
+				// git decides whether a positive matched, and whether it names a recursive directory,
+				// *before* subtracting exclusions — so `rm -r a :!a` is a no-op success, not "did not
+				// match". Only the actual selection is gated by the negatives.
+				matched = true;
+				// A pathspec that expands a leading directory to its contents requires `-r`; an exact file
+				// match or a glob file match does not. This holds for a literal *and* a wildcard spec whose
+				// literal spelling names a directory — `rm 'a?'` on the directory `a?/` needs `-r`, `rm 'a?/f'`
+				// selecting `ax/f` does not (probed vs git 2.50.1).
+				if pathspec.expands_directory(path) {
+					has_dir_expansion = true;
+				} else {
+					has_file_match = true;
+				}
+				if !set.is_excluded(path) {
+					selected.insert(path);
+				}
 			}
 		}
-		if !exact && !under_dir {
+		if !matched {
 			return Err(WorktreeError::PathspecMatch(spec.to_owned()));
 		}
-		if under_dir && !recursive {
+		if has_dir_expansion && !has_file_match && !recursive {
 			return Err(WorktreeError::RecursiveRequired(spec.to_owned()));
+		}
+	}
+	// With only negative pathspecs (`rm :!keep`), git applies them to an implicit `.` *relative to the
+	// invocation prefix* — so it selects every tracked path under `prefix` that is not excluded, and
+	// still requires `-r`, exactly as `rm .` does. A *truly* empty pathspec list is not this case: it
+	// specifies nothing to remove, so it is a no-op (never the implicit `.`).
+	if set.is_positive_empty() && !pathspecs.is_empty() {
+		let under_prefix =
+			|path: &str| prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/"));
+		// The implicit `.` matches every tracked path under the prefix *before* exclusions, so recursion is
+		// required whenever any such path exists — even if the negatives exclude them all (`rm :!a` in a
+		// repo tracking only `a` still needs `-r`).
+		let mut implicit_matched = false;
+		for path in &tracked {
+			if under_prefix(path) {
+				implicit_matched = true;
+				if !set.is_excluded(path) {
+					selected.insert(path.as_str());
+				}
+			}
+		}
+		// The implicit `.` matched nothing — an empty repository, or `-C sub` with every tracked path
+		// elsewhere. git reports the (first) negative pathspec as unmatched rather than succeeding as a
+		// no-op (probed vs git 2.50.1: `rm :!x` in an empty repo → "did not match any files").
+		if !implicit_matched {
+			let spec = pathspecs.first().copied().unwrap_or(".").to_owned();
+			return Err(WorktreeError::PathspecMatch(spec));
+		}
+		if !recursive {
+			return Err(WorktreeError::RecursiveRequired(".".to_owned()));
 		}
 	}
 

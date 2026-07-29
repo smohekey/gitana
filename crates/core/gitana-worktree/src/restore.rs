@@ -19,7 +19,7 @@ use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::checkout::{remove_worktree_path, validate_path, write_worktree_file};
 use crate::fsmeta::stat_of;
-use crate::pathspec::normalize;
+use crate::pathspec::PathspecSet;
 use crate::{IndexEntry, Stat, WorkTree, WorktreeError};
 
 #[allow(clippy::too_many_arguments)]
@@ -87,17 +87,38 @@ where
 			}
 		}
 	}
+	let set = PathspecSet::parse(pathspecs, prefix)?;
+	// A *truly* empty pathspec list specifies nothing and is a no-op — distinct from an all-negative set,
+	// which git treats as an implicit repository-root `.` minus the exclusions. Without this guard a
+	// direct `restore(…, &[], …)` (or `reset_index_paths(…, &[], …)`) would select the whole universe.
+	let negative_only = set.is_positive_empty() && !pathspecs.is_empty();
 	let mut selected: BTreeSet<&str> = BTreeSet::new();
-	for &spec in pathspecs {
-		let (normalized, dir_only) = normalize(spec, prefix)?;
-		let mut matched = false;
-		for &path in &universe {
-			if !sparse.contains(path) && matches(path, &normalized, dir_only) {
-				selected.insert(path);
-				matched = true;
-			}
+	// A negative-only set selects the *whole* repo minus the exclusions — git's implicit positive for an
+	// all-negative set is the repo-root `.`, NOT prefix-scoped (probed vs git 2.50.1: from a subdir,
+	// `restore :!nope` restores paths outside that subdir too). Track whether any candidate existed at
+	// all; that implicit root `.` "matches" iff the universe (after the sparse filter) is non-empty — the
+	// exclusions do not affect the match check (`:!a` excluding the only file is still a success), only
+	// what ends up selected.
+	let mut had_candidate = false;
+	for &path in &universe {
+		if sparse.contains(path) {
+			continue;
 		}
-		if require_match && !matched {
+		had_candidate = true;
+		// An empty pathspec list matches nothing; anything else uses the set (positives, or the negative-
+		// only implicit `.`, both minus exclusions).
+		if !pathspecs.is_empty() && set.matches(path) {
+			selected.insert(path);
+		}
+	}
+	if require_match {
+		if negative_only {
+			// The implicit root `.` fails to match only when there is nothing to match against — an empty
+			// repo, or one whose every path is sparse-excluded (git then reports both `:!<spec>` and `.`).
+			if !had_candidate {
+				return Err(WorktreeError::PathspecMatch(".".to_owned()));
+			}
+		} else if let Some(spec) = set.unmatched() {
 			return Err(WorktreeError::PathspecMatch(spec.to_owned()));
 		}
 	}
@@ -179,14 +200,4 @@ where
 			Err(error)
 		}
 	}
-}
-
-/// Whether `path` is matched by an already-normalised `spec`. The empty spec matches
-/// everything; otherwise it matches any path beneath it as a directory, and — unless the spec
-/// required a directory (`dir_only`, a trailing slash) — the path exactly.
-fn matches(path: &str, spec: &str, dir_only: bool) -> bool {
-	if spec.is_empty() {
-		return true;
-	}
-	(!dir_only && path == spec) || path.starts_with(&format!("{spec}/"))
 }

@@ -83,6 +83,125 @@ async fn restore_from_index_discards_worktree_changes() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// `restore` selects a glob pathspec the git way (`*` crosses `/`): `restore '*.rs'` recovers every
+/// `.rs` at any depth from the index and leaves a non-matching `.txt` dirty.
+#[tokio::test]
+async fn restore_matches_a_glob() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("restore-glob");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::create_dir_all(work.join("src")).unwrap();
+	std::fs::write(work.join("src/a.rs"), b"A\n").unwrap();
+	std::fs::write(work.join("top.rs"), b"T\n").unwrap();
+	std::fs::write(work.join("keep.txt"), b"K\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+
+	// Dirty all three; a glob `*.rs` restore recovers only the `.rs` files.
+	std::fs::write(work.join("src/a.rs"), b"dirty\n").unwrap();
+	std::fs::write(work.join("top.rs"), b"dirty\n").unwrap();
+	std::fs::write(work.join("keep.txt"), b"dirty\n").unwrap();
+
+	make_repo(&work)
+		.restore(None, true, false, &["*.rs"], "")
+		.await
+		.unwrap();
+
+	assert_eq!(std::fs::read(work.join("src/a.rs")).unwrap(), b"A\n");
+	assert_eq!(std::fs::read(work.join("top.rs")).unwrap(), b"T\n");
+	assert_eq!(std::fs::read(work.join("keep.txt")).unwrap(), b"dirty\n");
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// A *truly* empty pathspec list is a no-op — it specifies nothing, so it must not be treated like a
+/// negative-only set (an implicit repo-root `.`) and discard working-tree changes.
+#[tokio::test]
+async fn restore_empty_pathspec_list_is_a_noop() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("restore-empty-list");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"A\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+	std::fs::write(work.join("a.txt"), b"dirty\n").unwrap();
+
+	make_repo(&work)
+		.restore(None, true, false, &[], "")
+		.await
+		.unwrap();
+
+	// The dirty change survives — an empty list restored nothing.
+	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"dirty\n");
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// A negative-only `restore ':!keep'` applies the exclusion to an implicit *repo-root* `.` — NOT
+/// prefix-scoped like `rm` — so from a subdirectory it restores paths outside that subdirectory too
+/// (probed vs git 2.50.1: `git -C sub restore ':!nope'` recovers `other/b`).
+#[tokio::test]
+async fn restore_negative_only_is_whole_repo_not_prefix_scoped() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("restore-negonly-scope");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::create_dir_all(work.join("sub")).unwrap();
+	std::fs::create_dir_all(work.join("other")).unwrap();
+	std::fs::write(work.join("sub/a"), b"A\n").unwrap();
+	std::fs::write(work.join("other/b"), b"B\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+
+	// Dirty both, then restore from the `sub` prefix with a negative that excludes nothing.
+	std::fs::write(work.join("sub/a"), b"dirty\n").unwrap();
+	std::fs::write(work.join("other/b"), b"dirty\n").unwrap();
+
+	make_repo(&work)
+		.restore(None, true, false, &[":!nope"], "sub")
+		.await
+		.unwrap();
+
+	// Both are restored — the implicit `.` is repo-root, so `other/b` (outside `sub`) is recovered too.
+	assert_eq!(std::fs::read(work.join("sub/a")).unwrap(), b"A\n");
+	assert_eq!(std::fs::read(work.join("other/b")).unwrap(), b"B\n");
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// The implicit root `.` of a negative-only `restore` fails to match only when there is nothing to
+/// match against: in an empty repo, `restore ':!nope'` is the "did not match" error (probed vs git
+/// 2.50.1, which reports both `:!nope` and `.`). A non-empty universe succeeds even if the negative
+/// excludes every path — that is covered by the whole-repo scope test above.
+#[tokio::test]
+async fn restore_negative_only_empty_repo_errors() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("restore-negonly-empty");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	git(&["-C", w, "commit", "-q", "--allow-empty", "-m", "empty"]);
+
+	let result = make_repo(&work)
+		.restore(None, true, false, &[":!nope"], "")
+		.await;
+	assert!(
+		matches!(result, Err(WorktreeError::PathspecMatch(_))),
+		"expected PathspecMatch, got {result:?}"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 #[tokio::test]
 async fn restore_from_tree_updates_index_and_worktree() {
 	if !git_supports_sha256() {

@@ -46,6 +46,9 @@ pub enum WorktreeError {
 	/// supported (unlike git, which relativises absolute paths that point inside the work tree).
 	#[error("absolute pathspecs are not supported: {0}")]
 	AbsolutePathspec(String),
+	/// A pathspec's magic prefix (`:(...)`) named an unknown or unsupported keyword.
+	#[error("invalid pathspec magic in '{0}'")]
+	InvalidPathspecMagic(String),
 	/// An index revision spec (`:<path>` / `:<n>:<path>`) named a path/stage not in the index.
 	#[error("path '{0}' is not in the index{1}")]
 	IndexPathMissing(String, String),
