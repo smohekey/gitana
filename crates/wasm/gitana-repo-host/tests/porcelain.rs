@@ -143,7 +143,7 @@ async fn worktree_porcelain_round_trip<H: HashAlgorithm>() -> Result<()> {
 
 	// -- add: stage everything under the work-tree root (`.`, as `gta add .` does).
 	porcelain
-		.call_add(&mut *store, handle, &[".".to_owned()], "")
+		.call_add(&mut *store, handle, &[".".to_owned()], "", false)
 		.await?
 		.map_err(|error| anyhow!("add: {error:?}"))?;
 
@@ -198,7 +198,7 @@ async fn worktree_porcelain_round_trip<H: HashAlgorithm>() -> Result<()> {
 	//    as a staged removal, and committing drops it from the tree.
 	std::fs::remove_file(work_dir.join("hello.txt"))?;
 	porcelain
-		.call_add(&mut *store, handle, &[".".to_owned()], "")
+		.call_add(&mut *store, handle, &[".".to_owned()], "", false)
 		.await?
 		.map_err(|error| anyhow!("add: {error:?}"))?;
 	let deleted = porcelain
@@ -328,10 +328,10 @@ async fn worktree_sparse_round_trip<H: HashAlgorithm>() -> Result<()> {
 		}
 	}
 
-	// -- adding the now-excluded `dir` is refused as `invalid` (the engine's SparsePathExcluded is mapped
+	// -- adding the now-excluded `dir` is refused as `invalid` (the engine's PathspecAdvisory is mapped
 	//    to a precise WIT error, not a generic backend failure).
 	match porcelain
-		.call_add(&mut *store, handle, &["dir".to_owned()], "")
+		.call_add(&mut *store, handle, &["dir".to_owned()], "", false)
 		.await?
 	{
 		Err(gitana_repo_host::exports::gitana::repo::porcelain::RepoError::Invalid(message)) => {

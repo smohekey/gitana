@@ -18,7 +18,7 @@ mod ssh;
 mod url_rewrite;
 
 pub use credential::{CliCredentialProvider, transport_for};
-pub use error::{MergeConflict, SilentExit};
+pub use error::{AddAdvisory, MergeConflict, SilentExit};
 pub use git_config::with_command_cwd;
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
 pub use prompt::with_terminal_prompts_disabled;

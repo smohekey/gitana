@@ -1,4 +1,4 @@
-package gitana:repo@0.11.0;
+package gitana:repo@0.12.0;
 
 /// HTTP credential resolution, granted by the host.
 ///
@@ -539,8 +539,11 @@ interface porcelain {
 		/// separators) interpreted relative to `prefix` (a `/`-joined work-tree
 		/// subdirectory, empty at the root); `.` or a directory is walked (applying
 		/// `.gitignore`) and its files staged, and a path that no longer exists is
-		/// staged as a deletion — `git add`.
-		add: func(pathspecs: list<string>, prefix: string) -> result<_, repo-error>;
+		/// staged as a deletion — `git add`. An explicitly-named ignored path is
+		/// refused with an `invalid` error (git's "paths are ignored, use -f"),
+		/// staging any tracked modifications beneath it; `force` (git's `-f`) stages
+		/// the ignored content too.
+		add: func(pathspecs: list<string>, prefix: string, force: bool) -> result<_, repo-error>;
 
 		/// Materialise the tree that `tree-ish` peels to (a commit, tag, or tree
 		/// spec) into the working tree and index. Does not move `HEAD`. Without

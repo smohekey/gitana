@@ -364,8 +364,13 @@ impl Inner {
 		dispatch!(self, held => block_on(ops::status(held.worktree()?)))
 	}
 
-	pub(crate) fn add(&self, pathspecs: &[String], prefix: &str) -> Result<(), RepoError> {
-		dispatch!(self, held => block_on(ops::add(held.worktree()?, pathspecs, prefix)))
+	pub(crate) fn add(
+		&self,
+		pathspecs: &[String],
+		prefix: &str,
+		force: bool,
+	) -> Result<(), RepoError> {
+		dispatch!(self, held => block_on(ops::add(held.worktree()?, pathspecs, prefix, force)))
 	}
 
 	pub(crate) fn checkout(&self, tree_ish: &str, force: bool) -> Result<(), RepoError> {

@@ -577,7 +577,7 @@ async fn a_successful_index_write_releases_the_lock() {
 	let wt = WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir);
 
 	std::fs::write(work.join("f.txt"), b"hi\n").unwrap();
-	wt.add(&["f.txt"], "").await.unwrap();
+	wt.add(&["f.txt"], "", false).await.unwrap();
 
 	// The lock is released and the atomic-replace temp is cleaned up.
 	assert!(
@@ -604,7 +604,7 @@ async fn a_successful_index_write_releases_the_lock() {
 			.iter()
 			.any(|entry| entry.path == "f.txt")
 	);
-	wt.add(&["f.txt"], "").await.unwrap();
+	wt.add(&["f.txt"], "", false).await.unwrap();
 
 	std::fs::remove_dir_all(&work).ok();
 }

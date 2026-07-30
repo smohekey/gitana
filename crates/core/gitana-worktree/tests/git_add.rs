@@ -40,7 +40,7 @@ async fn add_stages_like_git() {
 		open_dir(&git_dir),
 	)));
 	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-		.add(&paths, "")
+		.add(&paths, "", false)
 		.await
 		.unwrap();
 	let ours = ls_files(w);
@@ -90,7 +90,7 @@ async fn add_stages_a_glob_like_git() {
 		open_dir(&git_dir),
 	)));
 	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-		.add(&["*.rs"], "")
+		.add(&["*.rs"], "", false)
 		.await
 		.unwrap();
 	let ours = ls_files(w);
@@ -128,7 +128,7 @@ async fn add_excludes_a_negative_pathspec_like_git() {
 		open_dir(&git_dir),
 	)));
 	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-		.add(&[".", ":(exclude)vendor"], "")
+		.add(&[".", ":(exclude)vendor"], "", false)
 		.await
 		.unwrap();
 	let ours = ls_files(w);
@@ -166,7 +166,7 @@ async fn add_icase_resolves_to_the_actual_worktree_path() {
 		open_dir(&git_dir),
 	)));
 	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-		.add(&[":(icase)SRC/B.RS"], "")
+		.add(&[":(icase)SRC/B.RS"], "", false)
 		.await
 		.unwrap();
 	let ours = ls_files(w);
@@ -200,7 +200,7 @@ async fn add_glob_applies_ancestor_gitignore() {
 		open_dir(&git_dir),
 	)));
 	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-		.add(&["src/*.rs"], "")
+		.add(&["src/*.rs"], "", false)
 		.await
 		.unwrap();
 	let ours = ls_files(w);
@@ -233,7 +233,7 @@ async fn add_positive_then_excluded_is_a_noop() {
 		open_dir(&git_dir),
 	)));
 	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-		.add(&["*.rs", ":!*.rs"], "")
+		.add(&["*.rs", ":!*.rs"], "", false)
 		.await
 		.unwrap();
 	assert!(ls_files(w).is_empty(), "nothing staged, but no error");
@@ -263,10 +263,10 @@ async fn add_glob_tracked_deletion_then_excluded_is_a_noop() {
 		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
 	};
 	// Stage a.rs, then delete it: it is now a tracked (stage-0) candidate with no on-disk file.
-	open().add(&["a.rs"], "").await.unwrap();
+	open().add(&["a.rs"], "", false).await.unwrap();
 	std::fs::remove_file(work.join("a.rs")).unwrap();
 
-	open().add(&["*.rs", ":!*.rs"], "").await.unwrap();
+	open().add(&["*.rs", ":!*.rs"], "", false).await.unwrap();
 	// The deletion must NOT be staged — a.rs remains a tracked entry, exactly as git leaves it.
 	assert!(
 		ls_files(w).iter().any(|l| l.ends_with("\ta.rs")),
@@ -297,10 +297,10 @@ async fn add_glob_under_ignored_base_does_not_match() {
 		open_dir(&git_dir),
 	)));
 	let result = WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-		.add(&["ignored/*.rs"], "")
+		.add(&["ignored/*.rs"], "", false)
 		.await;
 	assert!(
-		matches!(result, Err(WorktreeError::PathspecMatch(_))),
+		matches!(&result, Err(WorktreeError::PathspecMatch(_))),
 		"expected PathspecMatch, got {result:?}"
 	);
 	assert!(ls_files(w).is_empty(), "nothing staged");
@@ -312,7 +312,7 @@ async fn add_glob_under_ignored_base_does_not_match() {
 /// walk-based `add` forms — `add .` and a negative-only `add :!x` — exactly like git, which never
 /// applies ignore rules to a tracked path. Each form is checked against a fresh `git add` of the same
 /// pathspec as the oracle. (Explicitly naming the ignored directory, `add ignored`, is git's
-/// ignored-path advice path — exit 1 — which gitana does not yet implement, so it is out of scope.)
+/// ignored-path advice path — exit 1 — covered by `add_explicit_ignored_dir_stages_only_tracked`.)
 #[tokio::test]
 async fn add_restages_tracked_file_under_ignored_dir_like_git() {
 	if !git_supports_sha256() {
@@ -347,7 +347,7 @@ async fn add_restages_tracked_file_under_ignored_dir_like_git() {
 			open_dir(&git_dir),
 		)));
 		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-			.add(&[spec], "")
+			.add(&[spec], "", false)
 			.await
 			.unwrap();
 		let ours = ls_files(w);
@@ -421,7 +421,7 @@ async fn add_negative_only_resolves_deleted_unmerged_path() {
 	}
 	wt.save_index(&index).await.unwrap();
 
-	wt.add(&[":!nope"], "").await.unwrap();
+	wt.add(&[":!nope"], "", false).await.unwrap();
 
 	// The deletion is resolved: no `conflict` entry of any stage remains.
 	let after = wt.load_index().await.unwrap();
@@ -480,7 +480,7 @@ async fn add_literal_resolves_deleted_unmerged_path() {
 	wt.save_index(&index).await.unwrap();
 
 	// A literal add of the unmerged path (absent on disk) resolves it, not a PathspecMatch error.
-	wt.add(&["conflict"], "").await.unwrap();
+	wt.add(&["conflict"], "", false).await.unwrap();
 	let after = wt.load_index().await.unwrap();
 	assert!(!after.entries.iter().any(|e| e.path == "conflict"));
 
@@ -489,8 +489,9 @@ async fn add_literal_resolves_deleted_unmerged_path() {
 
 /// Explicitly naming an ignored directory (`add ignored`) stages the modified TRACKED child but NOT the
 /// untracked ignored sibling — git refuses untracked ignored files (its "paths are ignored, use -f"
-/// advice), staging only the tracked modifications (probed vs git 2.50.1). gitana does not yet emit the
-/// advisory exit code (a documented follow-up), but its staged result must match git's.
+/// advice), staging only the tracked modifications (probed vs git 2.50.1). The refusal surfaces as
+/// [`WorktreeError::PathspecAdvisory`] reporting the ignored directory `ignored`, AFTER the in-cone/tracked
+/// work has been saved — so the staged result matches git's while the exit is non-zero.
 #[tokio::test]
 async fn add_explicit_ignored_dir_stages_only_tracked() {
 	if !git_supports_sha256() {
@@ -524,10 +525,13 @@ async fn add_explicit_ignored_dir_stages_only_tracked() {
 	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
 		open_dir(&git_dir),
 	)));
-	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-		.add(&["ignored"], "")
-		.await
-		.unwrap();
+	let result = WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+		.add(&["ignored"], "", false)
+		.await;
+	assert!(
+		matches!(&result, Err(WorktreeError::PathspecAdvisory { ignored, .. }) if ignored == &["ignored".to_owned()]),
+		"expected PathspecAdvisory ignored==[ignored], got {result:?}"
+	);
 
 	// The tracked modification is staged; the untracked ignored file is NOT (git refuses it).
 	let staged = git(&["-C", w, "diff", "--cached", "--name-only"]);
@@ -541,6 +545,424 @@ async fn add_explicit_ignored_dir_stages_only_tracked() {
 			.lines()
 			.any(|l| l == "ignored/new.rs"),
 		"untracked ignored file must not be staged"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// `add` on an explicitly-named UNTRACKED ignored file refuses it with [`WorktreeError::PathspecAdvisory`],
+/// reporting where the ignore rule matched — `ign/new` under a directory rule `ign/` reports the
+/// directory `ign`, while `root.log` matched by `*.log` reports the file itself. A non-ignored path
+/// named in the same invocation is still staged (the deferred advisory fires after the save), and
+/// `--force` stages the ignored file. Probed vs git 2.50.1.
+#[tokio::test]
+async fn add_explicit_ignored_file_refused_reported_and_forceable() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("add-ignored-file");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join(".gitignore"), b"ign/\n*.log\n").unwrap();
+	std::fs::create_dir_all(work.join("ign")).unwrap();
+	std::fs::write(work.join("ign/new"), b"n\n").unwrap();
+	std::fs::write(work.join("root.log"), b"l\n").unwrap();
+	std::fs::write(work.join("keep"), b"k\n").unwrap();
+
+	let open = || {
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			open_dir(&git_dir),
+		)));
+		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+	};
+
+	// `add ign/new root.log keep`: reports both ignored paths (collapsed), stages `keep`, refuses the rest.
+	let result = open()
+		.add(&["ign/new", "root.log", "keep"], "", false)
+		.await;
+	assert!(
+		matches!(&result, Err(WorktreeError::PathspecAdvisory { ignored, .. }) if ignored == &["ign".to_owned(), "root.log".to_owned()]),
+		"expected PathspecAdvisory ignored==[ign, root.log], got {result:?}"
+	);
+	assert!(
+		ls_files(w).iter().any(|l| l.ends_with("\tkeep")),
+		"the non-ignored path is staged"
+	);
+	assert!(
+		!ls_files(w).iter().any(|l| l.ends_with("\tign/new")),
+		"the ignored file is not staged"
+	);
+
+	// `--force` stages the ignored file.
+	open().add(&["ign/new"], "", true).await.unwrap();
+	assert!(
+		ls_files(w).iter().any(|l| l.ends_with("\tign/new")),
+		"--force stages the ignored file"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// A glob rooted at an ignored base advises (reporting the base) only when it also matches a tracked
+/// entry; a glob whose sole candidates are ignored+untracked is git's "did not match", regardless of
+/// the untracked content. `--force` stages the untracked content instead. Probed vs git 2.50.1.
+#[tokio::test]
+async fn add_glob_ignored_base_advises_only_with_a_tracked_match() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("add-glob-ignored-base-tracked");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::create_dir_all(work.join("ign")).unwrap();
+	std::fs::write(work.join("ign/t.rs"), b"1\n").unwrap();
+	git(&["-C", w, "add", "-f", "ign/t.rs"]);
+	std::fs::write(work.join(".gitignore"), b"ign/\n").unwrap();
+	git(&["-C", w, "add", ".gitignore"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"base",
+	]);
+	std::fs::write(work.join("ign/t.rs"), b"changed\n").unwrap();
+	std::fs::write(work.join("ign/new.rs"), b"n\n").unwrap();
+
+	let open = || {
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			open_dir(&git_dir),
+		)));
+		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+	};
+
+	// Matches the tracked `ign/t.rs` → advises `ign` and stages that tracked modification.
+	let matched = open().add(&["ign/*"], "", false).await;
+	assert!(
+		matches!(&matched, Err(WorktreeError::PathspecAdvisory { ignored, .. }) if ignored == &["ign".to_owned()]),
+		"glob matching a tracked entry advises, got {matched:?}"
+	);
+	assert!(
+		git(&["-C", w, "diff", "--cached", "--name-only"]).trim() == "ign/t.rs",
+		"the tracked modification is staged"
+	);
+
+	// Matches no tracked entry (`ign/t.rs` is not `*.log`) → git's "did not match", not the advisory.
+	git(&["-C", w, "reset", "-q"]);
+	let unmatched = open().add(&["ign/*.log"], "", false).await;
+	assert!(
+		matches!(unmatched, Err(WorktreeError::PathspecMatch(_))),
+		"a glob matching only ignored/untracked paths did not match, got {unmatched:?}"
+	);
+
+	// `--force` walks the ignored base and stages the untracked content.
+	open().add(&["ign/*"], "", true).await.unwrap();
+	assert!(
+		ls_files(w).iter().any(|l| l.ends_with("\tign/new.rs")),
+		"--force stages the untracked ignored file under the glob"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// git's ignored-path advisory is a pathspec-LEVEL diagnostic, independent of staging: an excluded
+/// ignored path, a tracked-but-ignored file, and an ignored path named in a *negative* pathspec all
+/// report the ignored directory, while a negative naming a non-ignored path is silent. Probed vs git
+/// 2.50.1.
+#[tokio::test]
+async fn add_ignored_advisory_is_pathspec_level() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("add-ignored-element");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::create_dir_all(work.join("ign")).unwrap();
+	std::fs::write(work.join("ign/tracked"), b"1\n").unwrap();
+	git(&["-C", w, "add", "-f", "ign/tracked"]);
+	std::fs::write(work.join(".gitignore"), b"ign/\n").unwrap();
+	git(&["-C", w, "add", ".gitignore"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"base",
+	]);
+	std::fs::write(work.join("ign/tracked"), b"changed\n").unwrap();
+	std::fs::write(work.join("ign/new"), b"n\n").unwrap();
+	std::fs::write(work.join("keep"), b"k\n").unwrap();
+
+	let open = || {
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			open_dir(&git_dir),
+		)));
+		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+	};
+	let is_ign_advisory = |result: &Result<(), WorktreeError>| matches!(result, Err(WorktreeError::PathspecAdvisory { ignored, .. }) if ignored == &["ign".to_owned()]);
+
+	// Excluded by `:!.` — still advises.
+	let excluded = open().add(&["ign/new", ":!."], "", false).await;
+	assert!(
+		is_ign_advisory(&excluded),
+		"excluded ignored path: {excluded:?}"
+	);
+
+	// A tracked-but-ignored file explicitly named — advises AND stages its modification.
+	let tracked = open().add(&["ign/tracked"], "", false).await;
+	assert!(
+		is_ign_advisory(&tracked),
+		"tracked ignored file: {tracked:?}"
+	);
+	assert_eq!(
+		git(&["-C", w, "diff", "--cached", "--name-only"]).trim(),
+		"ign/tracked",
+		"the tracked modification is staged despite the advisory"
+	);
+	git(&["-C", w, "reset", "-q"]);
+
+	// An ignored path named in a NEGATIVE pathspec — advises, and the positive still stages `keep`.
+	let negative = open().add(&["keep", ":!ign/new"], "", false).await;
+	assert!(
+		is_ign_advisory(&negative),
+		"negative ignored path: {negative:?}"
+	);
+	assert!(
+		ls_files(w).iter().any(|l| l.ends_with("\tkeep")),
+		"the positive `keep` is staged"
+	);
+	git(&["-C", w, "reset", "-q"]);
+
+	// A negative naming a NON-ignored path is silent (no advisory).
+	let benign = open().add(&["keep", ":!nope"], "", false).await;
+	assert!(
+		benign.is_ok(),
+		"negative naming a non-ignored path: {benign:?}"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// Two corners of the pathspec-level advisory, matching git 2.50.1: (1) a tracked file ignored only by
+/// a LEAF pattern (`root.log` under `*.log`) stages its modification with NO advisory (only an ignored
+/// ancestor *directory* advises for a tracked descendant); (2) a pathspec whose ancestor is a regular
+/// FILE (`add keep :!file/sub`) does not abort probing the ignore stack — it stages `keep` and succeeds.
+#[tokio::test]
+async fn add_ignored_advisory_leaf_tracked_and_nondir_ancestor() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("add-ignored-corners");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join(".gitignore"), b"*.log\n").unwrap();
+	std::fs::write(work.join("root.log"), b"1\n").unwrap();
+	git(&["-C", w, "add", "-f", "root.log", ".gitignore"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"base",
+	]);
+	std::fs::write(work.join("root.log"), b"changed\n").unwrap();
+	std::fs::write(work.join("file"), b"f\n").unwrap();
+	std::fs::write(work.join("keep"), b"k\n").unwrap();
+
+	let open = || {
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			open_dir(&git_dir),
+		)));
+		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+	};
+
+	// (1) A tracked, leaf-ignored file: staged, no advisory.
+	open().add(&["root.log"], "", false).await.unwrap();
+	assert!(
+		ls_files(w).iter().any(|l| l.ends_with("\troot.log")),
+		"the tracked leaf-ignored modification is staged"
+	);
+	git(&["-C", w, "reset", "-q"]);
+
+	// (2) An exclusion whose ancestor `file` is a regular file: does not abort, stages `keep`.
+	open()
+		.add(&["keep", ":!file/sub"], "", false)
+		.await
+		.unwrap();
+	assert!(
+		ls_files(w).iter().any(|l| l.ends_with("\tkeep")),
+		"`keep` is staged despite the non-directory ancestor in the exclusion"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// Magic-prefix pathspecs interact with the ignored advisory exactly as git 2.50.1 does. `:(glob)` is a
+/// glob even without metacharacters, so `:(glob)ign/new` naming an untracked ignored file is git's "did
+/// not match" (not the advisory a plain literal `ign/new` gets), while `:(glob)ign/tracked` (a tracked
+/// file) advises. `:(icase)` is resolved to the actual worktree path first, so a differently-cased
+/// spelling — literal or glob — still reports the ignored directory.
+#[tokio::test]
+async fn add_ignored_advisory_glob_and_icase_magic() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("add-ignored-magic");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::create_dir_all(work.join("ign")).unwrap();
+	std::fs::write(work.join("ign/tracked"), b"1\n").unwrap();
+	git(&["-C", w, "add", "-f", "ign/tracked"]);
+	std::fs::write(work.join(".gitignore"), b"ign/\n").unwrap();
+	git(&["-C", w, "add", ".gitignore"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"base",
+	]);
+	std::fs::write(work.join("ign/tracked"), b"changed\n").unwrap();
+	std::fs::write(work.join("ign/new"), b"n\n").unwrap();
+
+	let open = || {
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			open_dir(&git_dir),
+		)));
+		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+	};
+	let advises_ign = |result: &Result<(), WorktreeError>| matches!(result, Err(WorktreeError::PathspecAdvisory { ignored, .. }) if ignored == &["ign".to_owned()]);
+
+	// `:(glob)ign/new`: a glob whose only candidate is untracked+ignored — git's "did not match".
+	let glob_new = open().add(&[":(glob)ign/new"], "", false).await;
+	assert!(
+		matches!(glob_new, Err(WorktreeError::PathspecMatch(_))),
+		":(glob)ign/new did not match: {glob_new:?}"
+	);
+	// `:(glob)ign/tracked`: matches the tracked file — advises `ign` and stages the modification.
+	let glob_tracked = open().add(&[":(glob)ign/tracked"], "", false).await;
+	assert!(
+		advises_ign(&glob_tracked),
+		":(glob)ign/tracked: {glob_tracked:?}"
+	);
+	git(&["-C", w, "reset", "-q"]);
+
+	// `:(icase)` — a differently-cased literal and a glob both resolve to `ign` and advise.
+	let icase_literal = open().add(&[":(icase)IGN/TRACKED"], "", false).await;
+	assert!(
+		advises_ign(&icase_literal),
+		":(icase)IGN/TRACKED: {icase_literal:?}"
+	);
+	git(&["-C", w, "reset", "-q"]);
+	let icase_glob = open().add(&[":(icase)IGN/*"], "", false).await;
+	assert!(advises_ign(&icase_glob), ":(icase)IGN/*: {icase_glob:?}");
+
+	// An `:(icase)` spec whose ancestor resolves to a regular file must not abort with an IO error while
+	// resolving the case — it simply matches nothing (git's "did not match"), not the ignore stack.
+	std::fs::write(work.join("file"), b"f\n").unwrap();
+	let icase_nondir = open().add(&[":(icase)FILE/sub"], "", false).await;
+	assert!(
+		matches!(icase_nondir, Err(WorktreeError::PathspecMatch(_))),
+		":(icase)FILE/sub over a non-directory ancestor: {icase_nondir:?}"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// Deep ancestor corners of the ignored advisory, matching git 2.50.1: an ignored *regular-file*
+/// ancestor (`.gitignore` = `file`, `:!file/sub` → reports `file`); an `:(icase)` spec with a missing
+/// leaf under an existing ignored directory (`:(exclude,icase)IGN/MISSING` → `ign`); and an escaped
+/// separator (`dir\/foo` under an ignored `dir/`, tracked+modified → reports `dir` and stages the mod).
+#[tokio::test]
+async fn add_ignored_advisory_ancestor_corners() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("add-ignored-ancestors");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join(".gitignore"), b"ign/\nfile\ndir/\n").unwrap();
+	std::fs::create_dir_all(work.join("ign")).unwrap();
+	std::fs::create_dir_all(work.join("dir")).unwrap();
+	std::fs::write(work.join("ign/tracked"), b"1\n").unwrap();
+	std::fs::write(work.join("dir/foo"), b"1\n").unwrap();
+	git(&["-C", w, "add", "-f", "ign/tracked", "dir/foo", ".gitignore"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"base",
+	]);
+	std::fs::write(work.join("dir/foo"), b"changed\n").unwrap();
+	std::fs::write(work.join("file"), b"f\n").unwrap();
+	std::fs::write(work.join("keep"), b"k\n").unwrap();
+
+	let open = || {
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			open_dir(&git_dir),
+		)));
+		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+	};
+	let reports = |result: &Result<(), WorktreeError>, want: &str| matches!(result, Err(WorktreeError::PathspecAdvisory { ignored, .. }) if ignored == &[want.to_owned()]);
+
+	// R4#1: an ignored regular-file ancestor is reported; the positive `keep` still stages.
+	let file_ancestor = open().add(&["keep", ":!file/sub"], "", false).await;
+	assert!(
+		reports(&file_ancestor, "file"),
+		"file ancestor: {file_ancestor:?}"
+	);
+	assert!(ls_files(w).iter().any(|l| l.ends_with("\tkeep")));
+	git(&["-C", w, "reset", "-q"]);
+
+	// R4#2: an icase spec with a missing leaf under an existing ignored dir reports the dir.
+	let icase_missing = open()
+		.add(&["keep", ":(exclude,icase)IGN/MISSING"], "", false)
+		.await;
+	assert!(
+		reports(&icase_missing, "ign"),
+		"icase missing leaf: {icase_missing:?}"
+	);
+	git(&["-C", w, "reset", "-q"]);
+
+	// R4#3: an escaped separator resolves to the literal path, reporting the ignored ancestor + staging.
+	let escaped = open().add(&["dir\\/foo"], "", false).await;
+	assert!(reports(&escaped, "dir"), "escaped separator: {escaped:?}");
+	assert_eq!(
+		git(&["-C", w, "diff", "--cached", "--name-only"]).trim(),
+		"dir/foo",
+		"the tracked modification is staged"
 	);
 
 	std::fs::remove_dir_all(&work).ok();
@@ -581,13 +1003,13 @@ async fn add_absent_positive_still_errors_despite_exclusion() {
 		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
 	};
 	// Excluded absent positive still errors.
-	let excluded = open().add(&["missing/", ":!missing"], "").await;
+	let excluded = open().add(&["missing/", ":!missing"], "", false).await;
 	assert!(
 		matches!(excluded, Err(WorktreeError::PathspecMatch(_))),
 		"got {excluded:?}"
 	);
 	// A bare absent-untracked positive errors too.
-	let bare = open().add(&["missing"], "").await;
+	let bare = open().add(&["missing"], "", false).await;
 	assert!(
 		matches!(bare, Err(WorktreeError::PathspecMatch(_))),
 		"got {bare:?}"
@@ -663,16 +1085,16 @@ async fn add_out_of_cone_matches_are_refused() {
 	// A glob whose only matches are out-of-cone is refused.
 	assert!(
 		matches!(
-			open().add(&["out/*"], "").await,
-			Err(WorktreeError::SparsePathExcluded(_))
+			open().add(&["out/*"], "", false).await,
+			Err(WorktreeError::PathspecAdvisory { sparse, .. }) if !sparse.is_empty()
 		),
 		"add 'out/*' should be refused"
 	);
 	// An excluded explicit out-of-cone file is still refused (sparse check precedes exclusion).
 	assert!(
 		matches!(
-			open().add(&["out/f", ":!out/f"], "").await,
-			Err(WorktreeError::SparsePathExcluded(_))
+			open().add(&["out/f", ":!out/f"], "", false).await,
+			Err(WorktreeError::PathspecAdvisory { sparse, .. }) if !sparse.is_empty()
 		),
 		"add out/f :!out/f should be refused"
 	);
@@ -714,7 +1136,7 @@ async fn add_overlapping_globs_for_a_deleted_file_succeed() {
 		open_dir(&git_dir),
 	)));
 	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-		.add(&["*.rs", "*.rs"], "")
+		.add(&["*.rs", "*.rs"], "", false)
 		.await
 		.unwrap();
 	let files = ls_files(w);
@@ -790,7 +1212,7 @@ async fn add_sparse_advice_keys_on_the_glob_base() {
 	std::fs::write(work.join("out/b.rs"), b"2\n").unwrap();
 
 	// Broad glob: succeeds (out/b.rs is a tracked skip-worktree entry, silently skipped), stages in/a.rs.
-	open().add(&["*.rs"], "").await.unwrap();
+	open().add(&["*.rs"], "", false).await.unwrap();
 	let staged = git(&["-C", w, "diff", "--cached", "--name-only"]);
 	assert!(
 		staged.lines().any(|l| l == "in/a.rs"),
@@ -803,9 +1225,9 @@ async fn add_sparse_advice_keys_on_the_glob_base() {
 
 	// Out-of-cone-based glob advises even when everything it matches is excluded.
 	git(&["-C", w, "reset", "-q"]);
-	let excl = open().add(&["out/*", ":!out/*"], "").await;
+	let excl = open().add(&["out/*", ":!out/*"], "", false).await;
 	assert!(
-		matches!(excl, Err(WorktreeError::SparsePathExcluded(_))),
+		matches!(&excl, Err(WorktreeError::PathspecAdvisory { sparse, .. }) if !sparse.is_empty()),
 		"got {excl:?}"
 	);
 
@@ -875,7 +1297,7 @@ async fn add_sparse_untracked_and_dirty_tracked_refinements() {
 	std::fs::write(work.join("in/a.rs"), b"changed\n").unwrap();
 	std::fs::create_dir_all(work.join("out")).unwrap();
 	std::fs::write(work.join("out/f.rs"), b"dirty\n").unwrap();
-	open().add(&["."], "").await.unwrap();
+	open().add(&["."], "", false).await.unwrap();
 	let staged = git(&["-C", w, "diff", "--cached", "--name-only"]);
 	assert!(
 		staged.lines().any(|l| l == "in/a.rs"),
@@ -890,7 +1312,7 @@ async fn add_sparse_untracked_and_dirty_tracked_refinements() {
 	// (2) An untracked out-of-cone file removed by a negative is an empty selection -> success.
 	std::fs::write(work.join("out/new.rs"), b"n\n").unwrap();
 	open()
-		.add(&["out/new.rs", ":!out/new.rs"], "")
+		.add(&["out/new.rs", ":!out/new.rs"], "", false)
 		.await
 		.unwrap();
 
@@ -960,17 +1382,17 @@ async fn add_glob_matching_only_out_of_cone_tracked_reports_sparse() {
 	// The glob matches only the tracked, out-of-cone (absent) out/f.rs -> sparse advice, not "did not match".
 	assert!(
 		matches!(
-			open().add(&["out/*"], "").await,
-			Err(WorktreeError::SparsePathExcluded(_))
+			open().add(&["out/*"], "", false).await,
+			Err(WorktreeError::PathspecAdvisory { sparse, .. }) if !sparse.is_empty()
 		),
 		"add 'out/*' should report the sparse path"
 	);
 
 	// `add 'in/*' 'out/*'`: the in-cone glob's modification is staged (saved) before the deferred error.
 	std::fs::write(work.join("in/a.rs"), b"changed\n").unwrap();
-	let result = open().add(&["in/*", "out/*"], "").await;
+	let result = open().add(&["in/*", "out/*"], "", false).await;
 	assert!(
-		matches!(result, Err(WorktreeError::SparsePathExcluded(_))),
+		matches!(&result, Err(WorktreeError::PathspecAdvisory { sparse, .. }) if !sparse.is_empty()),
 		"got {result:?}"
 	);
 	assert!(
@@ -1043,9 +1465,9 @@ async fn add_mixed_sparse_stages_in_cone_then_defers_error() {
 	std::fs::write(work.join("out/new.rs"), b"n\n").unwrap();
 
 	// A broad glob: the in-cone modification is staged (saved), and the error is still surfaced.
-	let result = open().add(&["*.rs"], "").await;
+	let result = open().add(&["*.rs"], "", false).await;
 	assert!(
-		matches!(result, Err(WorktreeError::SparsePathExcluded(_))),
+		matches!(&result, Err(WorktreeError::PathspecAdvisory { sparse, .. }) if !sparse.is_empty()),
 		"got {result:?}"
 	);
 	let staged = git(&["-C", w, "diff", "--cached", "--name-only"]);
@@ -1057,9 +1479,9 @@ async fn add_mixed_sparse_stages_in_cone_then_defers_error() {
 
 	// A negative-only pathspec reports the omission too (nothing out-of-cone staged).
 	git(&["-C", w, "reset", "-q"]);
-	let neg = open().add(&[":!in"], "").await;
+	let neg = open().add(&[":!in"], "", false).await;
 	assert!(
-		matches!(neg, Err(WorktreeError::SparsePathExcluded(_))),
+		matches!(&neg, Err(WorktreeError::PathspecAdvisory { sparse, .. }) if !sparse.is_empty()),
 		"got {neg:?}"
 	);
 	assert!(
@@ -1106,7 +1528,7 @@ async fn add_overlapping_specs_for_a_deleted_file_succeed() {
 			open_dir(&git_dir),
 		)));
 		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-			.add(&specs, "")
+			.add(&specs, "", false)
 			.await
 			.unwrap_or_else(|e| panic!("add {specs:?} should succeed: {e:?}"));
 		// The deletion is staged (gone no longer tracked); keep survives.
@@ -1156,7 +1578,7 @@ async fn add_reconciles_file_replaced_by_directory_with_excluded_child() {
 		open_dir(&git_dir),
 	)));
 	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-		.add(&["dir", ":!dir/child"], "")
+		.add(&["dir", ":!dir/child"], "", false)
 		.await
 		.unwrap();
 	// The old `dir` file entry is deleted; the excluded child stays untracked.
@@ -1191,7 +1613,7 @@ async fn add_glob_with_escaped_separator_stages_the_file() {
 		open_dir(&git_dir),
 	)));
 	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-		.add(&["dir\\/foo"], "")
+		.add(&["dir\\/foo"], "", false)
 		.await
 		.unwrap();
 	let ours = ls_files(w);
@@ -1224,7 +1646,7 @@ async fn add_with_prefix_is_relative_to_subdirectory() {
 		open_dir(&git_dir),
 	)));
 	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-		.add(&["a.txt"], "sub")
+		.add(&["a.txt"], "sub", false)
 		.await
 		.unwrap();
 	let ours = ls_files(w);
@@ -1248,7 +1670,7 @@ async fn add_with_prefix_is_relative_to_subdirectory() {
 		open_dir(&git_dir),
 	)));
 	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-		.add(&["../a.txt"], "sub")
+		.add(&["../a.txt"], "sub", false)
 		.await
 		.unwrap();
 	let ours = ls_files(w);
@@ -1287,7 +1709,7 @@ async fn add_trailing_slash_requires_a_directory() {
 	// `a.txt/` and `a.txt/.` name a file as a directory: git rejects them, and so do we.
 	for spec in ["a.txt/", "a.txt/."] {
 		assert!(matches!(
-			wt.add(&[spec], "").await,
+			wt.add(&[spec], "", false).await,
 			Err(gitana_worktree::WorktreeError::PathspecMatch(_))
 		));
 		let git_ok = Command::new("git")
@@ -1301,7 +1723,7 @@ async fn add_trailing_slash_requires_a_directory() {
 	assert!(ls_files(w).is_empty(), "nothing was staged");
 
 	// A trailing slash on an actual directory still works.
-	wt.add(&["sub/"], "").await.unwrap();
+	wt.add(&["sub/"], "", false).await.unwrap();
 	assert!(ls_files(w).iter().any(|l| l.ends_with("\tsub/x.txt")));
 
 	std::fs::remove_dir_all(&work).ok();
@@ -1323,7 +1745,7 @@ async fn add_rewrites_index_on_file_directory_type_change() {
 
 	// Stage `thing` as a file.
 	std::fs::write(work.join("thing"), b"FILE\n").unwrap();
-	wt.add(&["."], "").await.unwrap();
+	wt.add(&["."], "", false).await.unwrap();
 	let files = ls_files(w);
 	assert_eq!(files.len(), 1);
 	assert!(files[0].ends_with("\tthing"));
@@ -1332,7 +1754,7 @@ async fn add_rewrites_index_on_file_directory_type_change() {
 	std::fs::remove_file(work.join("thing")).unwrap();
 	std::fs::create_dir(work.join("thing")).unwrap();
 	std::fs::write(work.join("thing/child.txt"), b"CHILD\n").unwrap();
-	wt.add(&["."], "").await.unwrap();
+	wt.add(&["."], "", false).await.unwrap();
 	let files = ls_files(w);
 	assert_eq!(files.len(), 1, "no stale `thing` file entry remains");
 	assert!(files[0].ends_with("\tthing/child.txt"));
@@ -1340,7 +1762,7 @@ async fn add_rewrites_index_on_file_directory_type_change() {
 	// And the reverse: directory back to a file drops the `thing/child.txt` entry.
 	std::fs::remove_dir_all(work.join("thing")).unwrap();
 	std::fs::write(work.join("thing"), b"FILE2\n").unwrap();
-	wt.add(&["."], "").await.unwrap();
+	wt.add(&["."], "", false).await.unwrap();
 	let files = ls_files(w);
 	assert_eq!(files.len(), 1);
 	assert!(files[0].ends_with("\tthing"));
@@ -1371,10 +1793,10 @@ async fn add_stages_deletions_under_a_directory_like_git() {
 		)));
 		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
 	};
-	open().add(&["."], "").await.unwrap();
+	open().add(&["."], "", false).await.unwrap();
 	std::fs::remove_file(work.join("gone.txt")).unwrap();
 	std::fs::remove_file(work.join("dir/leaf.txt")).unwrap();
-	open().add(&["."], "").await.unwrap();
+	open().add(&["."], "", false).await.unwrap();
 	let ours = ls_files(w);
 
 	// git, staging the same on-disk state from an empty index, records exactly the survivor.
@@ -1413,9 +1835,9 @@ async fn add_directory_pathspec_stages_a_removed_subtree_like_git() {
 	};
 	// Stage everything, then remove the whole `pkg` directory and `add pkg` (a directory pathspec
 	// that no longer resolves on disk): its tracked children must be staged as deletions.
-	open().add(&["."], "").await.unwrap();
+	open().add(&["."], "", false).await.unwrap();
 	std::fs::remove_dir_all(work.join("pkg")).unwrap();
-	open().add(&["pkg"], "").await.unwrap();
+	open().add(&["pkg"], "", false).await.unwrap();
 	let ours = ls_files(w);
 
 	// git, staging the same on-disk state (only `top.txt` remains) from an empty index.

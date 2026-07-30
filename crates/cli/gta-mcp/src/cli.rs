@@ -144,6 +144,9 @@ enum Command {
 	},
 	/// Stage file contents into the index.
 	Add {
+		/// Allow adding otherwise-ignored files.
+		#[arg(short = 'f', long = "force")]
+		force: bool,
 		/// Pathspecs to stage: files, directories, `.`, globs (`*.rs`), and magic (`:(exclude)`/`:!`, `:/`, `:(icase)`, `:(literal)`, `:(glob)`).
 		#[arg(required = true)]
 		pathspecs: Vec<String>,
@@ -792,7 +795,7 @@ impl Cli {
 				Command::SymbolicRef { name, target } => {
 					commands::symbolic_ref::run(&cwd, &name, target).await
 				}
-				Command::Add { pathspecs } => commands::add::run(&cwd, &pathspecs).await,
+				Command::Add { force, pathspecs } => commands::add::run(&cwd, &pathspecs, force).await,
 				Command::Status => commands::status::run(&cwd).await,
 				Command::Commit {
 					message,

@@ -449,7 +449,7 @@ async fn add_does_not_delete_a_sparse_entry() {
 	let (work, _base, _other) = sparse_two_branches("sparse-add").await;
 	let w = work.to_str().unwrap();
 
-	make_repo(&work).add(&["."], "").await.unwrap();
+	make_repo(&work).add(&["."], "", false).await.unwrap();
 
 	// `status_of` panics if `x/h` is gone from the index — so this asserts the entry survived — and
 	// it must still be skip-worktree, with its file still absent.
@@ -816,7 +816,7 @@ async fn widening_preserves_a_present_modified_excluded_file() {
 /// `add` must not stage a *new* untracked file that is outside the active sparse cone. git stages the
 /// in-cone work, writes the index, and THEN exits nonzero with its "outside sparse-checkout" advice when
 /// a broad pathspec swept up an untracked out-of-cone file (probed vs git 2.50.1) — so `add .` here
-/// returns the deferred `SparsePathExcluded` while leaving `x/new` unstaged.
+/// returns the deferred `PathspecAdvisory` while leaving `x/new` unstaged.
 #[tokio::test]
 async fn add_refuses_a_new_out_of_cone_file() {
 	if !git_supports_sha256() {
@@ -832,9 +832,9 @@ async fn add_refuses_a_new_out_of_cone_file() {
 	// A brand-new untracked file outside the cone.
 	std::fs::create_dir_all(work.join("x")).unwrap();
 	std::fs::write(work.join("x/new"), b"n\n").unwrap();
-	let result = make_repo(&work).add(&["."], "").await;
+	let result = make_repo(&work).add(&["."], "", false).await;
 	assert!(
-		matches!(result, Err(WorktreeError::SparsePathExcluded(_))),
+		matches!(&result, Err(WorktreeError::PathspecAdvisory { sparse, .. }) if !sparse.is_empty()),
 		"a new out-of-cone file must yield the deferred sparse error, got {result:?}"
 	);
 
@@ -908,7 +908,7 @@ async fn explicit_add_of_an_out_of_cone_path_is_refused() {
 	// A new out-of-cone file, named explicitly.
 	std::fs::create_dir_all(work.join("x")).unwrap();
 	std::fs::write(work.join("x/new"), b"n\n").unwrap();
-	let result = make_repo(&work).add(&["x/new"], "").await;
+	let result = make_repo(&work).add(&["x/new"], "", false).await;
 	assert!(
 		result.is_err(),
 		"explicit add of an out-of-cone path must error"
@@ -932,14 +932,14 @@ async fn explicit_add_of_an_out_of_cone_directory_is_refused() {
 	// (d) the excluded directory is absent from the working tree.
 	assert!(!work.join("x").exists());
 	assert!(
-		make_repo(&work).add(&["x"], "").await.is_err(),
+		make_repo(&work).add(&["x"], "", false).await.is_err(),
 		"add of an absent out-of-cone directory must error"
 	);
 	// (g) recreate it on disk with content — still refused.
 	std::fs::create_dir_all(work.join("x")).unwrap();
 	std::fs::write(work.join("x/h"), b"X\n").unwrap();
 	assert!(
-		make_repo(&work).add(&["x"], "").await.is_err(),
+		make_repo(&work).add(&["x"], "", false).await.is_err(),
 		"add of a present out-of-cone directory must error"
 	);
 	// Nothing was staged: the index keeps x/h's original content, not the recreated bytes. (git also
@@ -961,7 +961,7 @@ async fn add_of_an_in_cone_directory_stages_it() {
 		.unwrap();
 	std::fs::write(work.join("a/f"), b"CHANGED\n").unwrap();
 
-	make_repo(&work).add(&["a"], "").await.unwrap();
+	make_repo(&work).add(&["a"], "", false).await.unwrap();
 	assert_eq!(git(&["-C", w, "cat-file", "blob", ":a/f"]), "CHANGED\n");
 }
 
@@ -995,7 +995,7 @@ async fn add_of_a_mixed_noncone_directory_stages_only_in_cone() {
 	assert_eq!(status_of(&git(&["-C", w, "ls-files", "-t"]), "d/out"), 'S');
 
 	std::fs::write(work.join("d/in"), b"CHANGED\n").unwrap();
-	make_repo(&work).add(&["d"], "").await.unwrap();
+	make_repo(&work).add(&["d"], "", false).await.unwrap();
 	assert_eq!(git(&["-C", w, "cat-file", "blob", ":d/in"]), "CHANGED\n");
 	// The excluded sibling stays out-of-cone and unstaged.
 	assert_eq!(status_of(&git(&["-C", w, "ls-files", "-t"]), "d/out"), 'S');
@@ -1028,7 +1028,7 @@ async fn add_of_a_directory_with_only_a_dirty_excluded_file_is_refused() {
 
 	// `add x` is still refused (x is out-of-cone per the matcher), and the modification is not staged.
 	assert!(
-		make_repo(&work).add(&["x"], "").await.is_err(),
+		make_repo(&work).add(&["x"], "", false).await.is_err(),
 		"add of a dir with only a dirty excluded file must still error"
 	);
 	assert_eq!(git(&["-C", w, "cat-file", "blob", ":x/h"]), "xh\n");

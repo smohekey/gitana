@@ -20,6 +20,11 @@ async fn main() -> ExitCode {
 				// A materialised merge conflict is an expected non-zero outcome, not an internal error:
 				// the conflicts were already reported, so print git's summary without the `gta:` prefix.
 				println!("{conflict}");
+			} else if let Some(advisory) = error.downcast_ref::<gta_core::AddAdvisory>() {
+				// `add` could not fully stage some pathspecs (out-of-cone and/or ignored): an expected
+				// non-zero outcome. Print git's advisory verbatim to stderr — no `gta:` prefix — matching git
+				// byte-for-byte.
+				eprintln!("{advisory}");
 			} else {
 				eprintln!("gta: {error:#}");
 			}

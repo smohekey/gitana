@@ -34,11 +34,26 @@ pub enum WorktreeError {
 	/// A pathspec matched no entries in the restore source.
 	#[error("pathspec did not match any file(s): {0}")]
 	PathspecMatch(String),
-	/// `add` was given an explicit path outside the sparse-checkout definition (git advises `--sparse`).
+	/// A single path outside the sparse-checkout definition (git advises `--sparse`). Used by `mv` for an
+	/// out-of-cone destination; `add` uses the richer [`WorktreeError::PathspecAdvisory`].
 	#[error(
 		"'{0}' is outside the sparse-checkout; disable or modify the sparsity rules to update it in the index"
 	)]
 	SparsePathExcluded(String),
+	/// `add` could not fully stage some pathspecs and defers git's advisory (exit non-zero) after saving
+	/// the work it could stage. `sparse` are the pathspecs that matched paths outside the sparse-checkout
+	/// definition (git's `--sparse` advice, in argument/discovery order); `ignored` are the reported
+	/// ignored paths (git's `-f` advice, collapsed to where each rule matched and sorted lexicographically).
+	/// Either or both may be non-empty; a front-end renders git's corresponding block(s).
+	#[error(
+		"some pathspecs could not be staged — outside the sparse-checkout: [{}]; ignored (use -f to add): [{}]",
+		.sparse.join(", "),
+		.ignored.join(", ")
+	)]
+	PathspecAdvisory {
+		sparse: Vec<String>,
+		ignored: Vec<String>,
+	},
 	/// An empty pathspec (`""`) was given.
 	#[error("empty string is not a valid pathspec")]
 	EmptyPathspec,

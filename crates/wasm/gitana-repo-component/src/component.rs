@@ -172,8 +172,8 @@ impl GuestRepository for GitanaRepository {
 		self.inner.status()
 	}
 
-	fn add(&self, pathspecs: Vec<String>, prefix: String) -> Result<(), RepoError> {
-		self.inner.add(&pathspecs, &prefix)
+	fn add(&self, pathspecs: Vec<String>, prefix: String, force: bool) -> Result<(), RepoError> {
+		self.inner.add(&pathspecs, &prefix, force)
 	}
 
 	fn checkout(&self, tree_ish: String, force: bool) -> Result<(), RepoError> {

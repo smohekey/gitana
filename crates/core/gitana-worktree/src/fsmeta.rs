@@ -34,7 +34,18 @@ pub(crate) fn push_gitignore<W: WorkDirFs>(
 			stack.push(ignore::parse(&String::from_utf8_lossy(&bytes), dir_rel));
 			Ok(true)
 		}
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+		// No ignore file here: either the directory has none (`NotFound`), or `dir_rel` is not a directory
+		// at all (`NotADirectory`, ENOTDIR) — a pathspec ancestor that is a regular file (`add x :!file/sub`
+		// where `file` is a file). git treats such an ancestor as matching no ignore rule and proceeds; so do
+		// we, rather than aborting the whole operation. Probed vs git 2.50.1.
+		Err(error)
+			if matches!(
+				error.kind(),
+				std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+			) =>
+		{
+			Ok(false)
+		}
 		Err(error) => Err(error.into()),
 	}
 }

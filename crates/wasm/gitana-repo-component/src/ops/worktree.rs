@@ -38,9 +38,10 @@ pub(crate) async fn add<H: HashAlgorithm>(
 	wt: &Tree<H>,
 	pathspecs: &[String],
 	prefix: &str,
+	force: bool,
 ) -> Result<(), RepoError> {
 	let specs: Vec<&str> = pathspecs.iter().map(String::as_str).collect();
-	wt.add(&specs, prefix).await.map_err(worktree_error)
+	wt.add(&specs, prefix, force).await.map_err(worktree_error)
 }
 
 pub(crate) async fn checkout<H: HashAlgorithm>(

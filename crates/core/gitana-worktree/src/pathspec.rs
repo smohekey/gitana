@@ -237,6 +237,14 @@ impl Pathspec {
 		self.icase
 	}
 
+	/// Whether this pathspec carries `:(glob)` magic (FNM_PATHNAME wildmatch). git treats a `:(glob)`
+	/// pathspec as a glob even without metacharacters, so `:(glob)ign/new` naming an untracked ignored
+	/// file is git's "did not match", NOT the literal path it would otherwise resolve to (probed vs git
+	/// 2.50.1). `add` uses this to distinguish it from a plain literal.
+	pub(crate) fn is_glob(&self) -> bool {
+		self.pathname
+	}
+
 	/// The canonical worktree-relative pattern (empty = the root).
 	pub(crate) fn as_str(&self) -> &str {
 		&self.normalized
@@ -388,6 +396,17 @@ impl PathspecSet {
 			.iter()
 			.find(|(_, _, matched)| !matched.load(std::sync::atomic::Ordering::Relaxed))
 			.map(|(spec, _, _)| spec.as_str())
+	}
+
+	/// Every pathspec in the set — positives then negatives — for consumers that inspect each element
+	/// regardless of polarity. git's ignored-path advisory fires for a *negative* pathspec too (`add
+	/// :!ign/x` advises `ign`), so the advisory pass walks all elements, not just the positives.
+	pub(crate) fn all(&self) -> impl Iterator<Item = &Pathspec> {
+		self
+			.positive
+			.iter()
+			.map(|(_, pathspec, _)| pathspec)
+			.chain(self.negative.iter())
 	}
 
 	/// The positive pathspecs paired with their original spec text — for consumers (like `rm`) that need
