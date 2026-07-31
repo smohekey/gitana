@@ -587,10 +587,7 @@ mod native {
 			if crate::pointers::canonical_eq(ancestor, destination) {
 				return Some(common_real.clone());
 			}
-			match ancestor.parent() {
-				Some(parent) => ancestor = parent,
-				None => return None,
-			}
+			ancestor = ancestor.parent()?;
 		}
 	}
 
