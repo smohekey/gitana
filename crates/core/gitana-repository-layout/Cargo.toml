@@ -1,11 +1,11 @@
 [package]
+description = "Native Git repository discovery and canonical layout resolution."
 edition.workspace = true
 license.workspace = true
 name = "gitana-repository-layout"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 

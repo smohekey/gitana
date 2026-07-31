@@ -1,11 +1,11 @@
 [package]
+description = "Git repository semantics over gitana's object and ref layers."
 edition.workspace = true
 license.workspace = true
 name = "gitana-repository"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 

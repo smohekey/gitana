@@ -1,11 +1,11 @@
 [package]
+description = "In-memory file store for gitana tests and protocol state machines."
 edition.workspace = true
 license.workspace = true
 name = "gitana-file-store-memory"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [dependencies]
 gitana-file-store.workspace = true
 tokio = { workspace = true, features = ["io-util"] }

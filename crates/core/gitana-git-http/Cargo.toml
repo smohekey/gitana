@@ -1,11 +1,11 @@
 [package]
+description = "Transport-agnostic Git Smart HTTP protocol helpers."
 edition.workspace = true
 license.workspace = true
 name = "gitana-git-http"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 

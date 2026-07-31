@@ -1,11 +1,11 @@
 [package]
+description = "Content-addressed Git object storage over a file-store backend."
 edition.workspace = true
 license.workspace = true
 name = "gitana-object-store"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 

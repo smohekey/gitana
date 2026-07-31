@@ -1,11 +1,11 @@
 [package]
+description = "Trust core verifying SSHSIG and OpenPGP signatures on Git commits and tags."
 edition.workspace = true
 license.workspace = true
 name = "gitana-trust"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 

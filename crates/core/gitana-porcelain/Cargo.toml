@@ -1,11 +1,11 @@
 [package]
+description = "Porcelain Git operations returning structured data, over gitana's core crates."
 edition.workspace = true
 license.workspace = true
 name = "gitana-porcelain"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 

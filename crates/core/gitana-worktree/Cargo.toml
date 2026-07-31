@@ -1,11 +1,11 @@
 [package]
+description = "Git index, working-tree scanning, status, add, checkout, and diff support."
 edition.workspace = true
 license.workspace = true
 name = "gitana-worktree"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 

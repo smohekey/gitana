@@ -1,12 +1,12 @@
 [package]
+description = "Demo: gitana's object database running as a WASI component."
 edition.workspace = true
 license.workspace = true
 name = "wasm-object-db"
 publish = false
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 

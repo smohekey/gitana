@@ -1,11 +1,11 @@
 [package]
+description = "Git HTTP credential resolution shared by gitana's CLI and libraries."
 edition.workspace = true
 license.workspace = true
 name = "gitana-credential"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 

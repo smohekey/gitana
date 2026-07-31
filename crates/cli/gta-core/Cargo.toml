@@ -1,11 +1,11 @@
 [package]
+description = "Shared command implementations behind the gta Git CLI and gta-mcp."
 edition.workspace = true
 license.workspace = true
 name = "gta-core"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 
