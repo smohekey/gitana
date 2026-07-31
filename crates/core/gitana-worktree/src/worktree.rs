@@ -1308,6 +1308,21 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		crate::status::compute(self).await
 	}
 
+	/// git `ls-files`: list index and/or working-tree paths selected by `opts` and filtered by
+	/// `pathspecs` (relative to `prefix`), rendered git's way (cwd-relative and C-quoted by default).
+	/// `config` carries the values the caller resolves from git's full config stack (see
+	/// [`LsFilesConfig`](crate::LsFilesConfig)). Returns the output text plus any unmatched-pathspec
+	/// report.
+	pub async fn ls_files(
+		&self,
+		pathspecs: &[&str],
+		prefix: &str,
+		opts: &crate::LsFilesOptions,
+		config: &crate::LsFilesConfig<'_>,
+	) -> Result<crate::LsFilesOutput, WorktreeError> {
+		crate::ls_files::run(self, pathspecs, prefix, opts, config).await
+	}
+
 	/// Stage-0 tracked paths present on disk whose content or mode diverges from the index, verified by
 	/// **always hashing** the working file rather than trusting the index stat cache. A removal-safety
 	/// re-verification that catches edits `status()` can miss (a stat-preserving/same-size rewrite, a

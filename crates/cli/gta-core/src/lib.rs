@@ -21,6 +21,7 @@ pub use credential::{CliCredentialProvider, transport_for};
 pub use error::{AddAdvisory, MergeConflict, SilentExit};
 pub use git_config::with_command_cwd;
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
+pub use gitana_worktree::LsFilesOptions;
 pub use prompt::with_terminal_prompts_disabled;
 
 /// The local file-store backend every command operates over: a [`WorktreeFileStore`], which routes

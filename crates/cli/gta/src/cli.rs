@@ -84,8 +84,38 @@ enum Command {
 		#[arg(required = true)]
 		commits: Vec<String>,
 	},
-	/// List the paths tracked in the index.
-	LsFiles,
+	/// List the paths in the index and/or working tree, filtered by pathspec.
+	LsFiles {
+		/// Show cached (tracked) paths — the default when no other set is selected.
+		#[arg(short = 'c', long = "cached")]
+		cached: bool,
+		/// Show staged contents: `<mode> <object> <stage>` before each path.
+		#[arg(short = 's', long = "stage")]
+		stage: bool,
+		/// Show untracked (other) files, ignored ones included unless `--exclude-standard`.
+		#[arg(short = 'o', long = "others")]
+		others: bool,
+		/// Show tracked paths whose working-tree file differs from the index (or is absent).
+		#[arg(short = 'm', long = "modified")]
+		modified: bool,
+		/// Show tracked paths missing from the working tree.
+		#[arg(short = 'd', long = "deleted")]
+		deleted: bool,
+		/// With `--others`, skip files ignored by `.gitignore`.
+		#[arg(long = "exclude-standard")]
+		exclude_standard: bool,
+		/// Exit with a non-zero status if any listed pathspec matched nothing.
+		#[arg(long = "error-unmatch")]
+		error_unmatch: bool,
+		/// Print repository-relative paths rather than paths relative to the current directory.
+		#[arg(long = "full-name")]
+		full_name: bool,
+		/// `\0`-terminate output lines and do not quote paths.
+		#[arg(short = 'z')]
+		z: bool,
+		/// Pathspecs to filter by: files, directories, globs (`*.rs`), and magic (`:(exclude)`/`:!`, `:/`, `:(icase)`, `:(literal)`, `:(glob)`).
+		pathspecs: Vec<String>,
+	},
 	/// Point a ref at an object.
 	UpdateRef {
 		/// The ref name (e.g. `refs/heads/main`).
@@ -709,7 +739,35 @@ impl Cli {
 					is_ancestor,
 					commits,
 				} => commands::merge_base::run(&cwd, all, is_ancestor, commits).await,
-				Command::LsFiles => commands::ls_files::run(&cwd).await,
+				Command::LsFiles {
+					cached,
+					stage,
+					others,
+					modified,
+					deleted,
+					exclude_standard,
+					error_unmatch,
+					full_name,
+					z,
+					pathspecs,
+				} => {
+					commands::ls_files::run(
+						&cwd,
+						&pathspecs,
+						gta_core::LsFilesOptions {
+							cached,
+							stage,
+							others,
+							modified,
+							deleted,
+							exclude_standard,
+							error_unmatch,
+							z,
+							full_name,
+						},
+					)
+					.await
+				}
 				Command::UpdateRef { name, value } => commands::update_ref::run(&cwd, &name, &value).await,
 				Command::SymbolicRef { name, target } => {
 					commands::symbolic_ref::run(&cwd, &name, target).await

@@ -48,7 +48,11 @@ pub async fn open_generic<H: HashAlgorithm>(
 	let git = Dir::open_ambient_dir(git_dir, ambient_authority())
 		.map_err(|error| anyhow!("opening {}: {error}", git_dir.display()))?;
 	let mut repo = Repository::new(ObjectStore::new(WorktreeFileStore::new(common, git)));
-	repo.set_effective_config(crate::git_config::from_repo(git_dir, common_dir).await?);
+	// The effective config includes this worktree's `config.worktree` layer when
+	// `extensions.worktreeConfig` is set, matching git's precedence (system < global < local <
+	// config.worktree). `for_worktree` degrades to `from_repo` when the extension is off or the file is
+	// absent, so an ordinary repository is unaffected.
+	repo.set_effective_config(crate::git_config::for_worktree(common_dir, git_dir).await?);
 	Ok(repo)
 }
 

@@ -5,7 +5,9 @@
 //! matching for unanchored patterns, the `*` `?` `[...]` `**` globs, and backslash
 //! escapes (a leading `\#`/`\!`, and `\*`/`\?`/`\[`/escaped-trailing-space to match
 //! a metacharacter literally). Last matching pattern (deepest file, then last line)
-//! wins. Not handled: `.git/info/exclude` and the global excludes file.
+//! wins. `.git/info/exclude` and the global excludes file are not read here; a caller
+//! that wants git's full "standard" excludes (e.g. `ls-files --exclude-standard`) seeds
+//! them into the `stack` as lower-priority [`DirIgnore`] levels — see `ls_files`.
 
 /// One ignore pattern.
 struct Pattern {
@@ -83,8 +85,15 @@ fn trim_trailing_spaces(line: &str) -> &str {
 }
 
 /// Whether `path` (relative to root) is ignored by the accumulated ignore files in
-/// `stack` (root first). Last matching pattern wins; a negated match re-includes.
+/// `stack` (root first). Last matching pattern wins; a negated match re-includes. Case-sensitive;
+/// see [`is_ignored_fold`] for `core.ignoreCase`.
 pub(crate) fn is_ignored(path: &str, is_dir: bool, stack: &[DirIgnore]) -> bool {
+	is_ignored_fold(path, is_dir, stack, false)
+}
+
+/// [`is_ignored`], but folding ASCII case when `fold` (git's `core.ignoreCase`, the default on
+/// case-insensitive filesystems such as macOS) — then a pattern like `*.LOG` also matches `x.log`.
+pub(crate) fn is_ignored_fold(path: &str, is_dir: bool, stack: &[DirIgnore], fold: bool) -> bool {
 	let mut ignored = false;
 	for level in stack {
 		let Some(rel) = strip_dir(path, &level.dir) else {
@@ -99,7 +108,7 @@ pub(crate) fn is_ignored(path: &str, is_dir: bool, stack: &[DirIgnore]) -> bool 
 			} else {
 				rel.rsplit('/').next().unwrap_or(rel)
 			};
-			if glob_match(pattern.glob.as_bytes(), subject.as_bytes(), false, true) {
+			if glob_match(pattern.glob.as_bytes(), subject.as_bytes(), fold, true) {
 				ignored = !pattern.negated;
 			}
 		}

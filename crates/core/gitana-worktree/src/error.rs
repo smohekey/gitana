@@ -34,6 +34,10 @@ pub enum WorktreeError {
 	/// A pathspec matched no entries in the restore source.
 	#[error("pathspec did not match any file(s): {0}")]
 	PathspecMatch(String),
+	/// A standard excludes source (`.git/info/exclude`, or a configured/global excludes file) is a
+	/// directory or is otherwise unusable — git's fatal "cannot use … as an exclude file".
+	#[error("cannot use {0} as an exclude file")]
+	ExcludeFile(String),
 	/// A single path outside the sparse-checkout definition (git advises `--sparse`). Used by `mv` for an
 	/// out-of-cone destination; `add` uses the richer [`WorktreeError::PathspecAdvisory`].
 	#[error(
