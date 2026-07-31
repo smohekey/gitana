@@ -179,6 +179,25 @@ impl GitConfig {
 		}
 	}
 
+	/// Interpret the effective (highest-precedence) value as a git integer, **validating every occurrence**
+	/// across all sources — the integer counterpart of [`get_bool_validated`](Self::get_bool_validated). git
+	/// reads its startup integers (e.g. `core.repositoryformatversion`) eagerly and aborts on *any* malformed
+	/// value, even one a higher-precedence occurrence shadows; this reproduces that. `None` if unset anywhere.
+	pub fn get_int_validated(
+		&self,
+		section: &str,
+		subsection: Option<&str>,
+		name: &str,
+	) -> Result<Option<i64>, ConfigError> {
+		// Every value in read order (lowest precedence first): validate each, so a malformed shadowed value
+		// still errors, and keep the last (highest-precedence) as the effective result.
+		let mut effective = None;
+		for raw in self.get_all_raw(section, subsection, name) {
+			effective = Some(crate::source::interpret_int(raw.unwrap_or(""))?);
+		}
+		Ok(effective)
+	}
+
 	/// The distinct subsection names with at least one variable under `section`, in first-seen order
 	/// across the sources in read order.
 	pub fn subsections(&self, section: &str) -> Vec<&str> {
@@ -370,6 +389,48 @@ mod tests {
 		assert_eq!(
 			layered("", "", "")
 				.get_bool_validated("core", None, "ignorecase")
+				.unwrap(),
+			None
+		);
+	}
+
+	#[test]
+	fn get_int_validated_checks_every_source_not_just_the_winner() {
+		// A malformed *shadowed* (lower-precedence) integer still aborts — git validates every occurrence of a
+		// startup `core.*` int (e.g. `repositoryformatversion`) — while the lazy `get_int` accepts it.
+		let shadowed = layered(
+			"[core]\n\trepositoryformatversion = notanint\n", // system: malformed
+			"",
+			"[core]\n\trepositoryformatversion = 1\n", // local: valid, wins
+		);
+		assert_eq!(
+			shadowed
+				.get_int("core", None, "repositoryformatversion")
+				.unwrap(),
+			Some(1)
+		);
+		assert!(
+			shadowed
+				.get_int_validated("core", None, "repositoryformatversion")
+				.is_err()
+		);
+
+		// Every value valid: returns the winner (highest-precedence).
+		let ok = layered(
+			"[core]\n\trepositoryformatversion = 0\n",
+			"",
+			"[core]\n\trepositoryformatversion = 1\n",
+		);
+		assert_eq!(
+			ok.get_int_validated("core", None, "repositoryformatversion")
+				.unwrap(),
+			Some(1)
+		);
+
+		// Unset anywhere: None.
+		assert_eq!(
+			layered("", "", "")
+				.get_int_validated("core", None, "repositoryformatversion")
 				.unwrap(),
 			None
 		);

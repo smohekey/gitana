@@ -35,7 +35,7 @@ mod native {
 	use crate::remove_error::RemoveError;
 	use crate::remove_outcome::RemoveOutcome;
 	use crate::remove_request::RemoveRequest;
-	use crate::repo_id::{detect_kind, open_store_raw};
+	use crate::repo_id::{detect_kind, open_store_raw, reject_unsupported_repository_format};
 	use crate::{LinkedWorktreeError, ProtectionReason, RemovePolicy, WorktreeClassification};
 
 	/// What a removal should do, decided from the inspection.
@@ -694,52 +694,6 @@ mod native {
 		}
 	}
 
-	/// Reject a repository whose common `config` declares an **unknown repository extension** — git reads
-	/// `extensions.*` only at `repositoryformatversion >= 1` and aborts on any it does not recognize, so a
-	/// forced destructive op on such a repo would risk a format gitana does not fully understand (requirements
-	/// 257-258). `objectformat` (validated by `detect_kind`) plus the extensions that do not change how gitana
-	/// must read this repo for a *structural* removal are honoured; anything else refuses. Config-only — reads
-	/// no object store. A missing/unparseable config is left to `detect_kind`'s `UnsupportedObjectFormat`.
-	fn reject_unknown_extensions(common: &Path) -> Result<(), RemoveError> {
-		// git tolerates these at v1 without special handling of the object/ref layout a structural remove touches.
-		const KNOWN: &[&str] = &[
-			"objectformat",
-			"worktreeconfig",
-			"relativeworktrees",
-			"noop",
-		];
-		let Ok(text) = std::fs::read_to_string(common.join("config")) else {
-			return Ok(());
-		};
-		let Ok(config) = gitana_config::GitConfig::parse(&text) else {
-			return Ok(());
-		};
-		// Extensions are read only at repositoryformatversion >= 1 (git ignores them at version 0).
-		let version = config
-			.get_int("core", None, "repositoryformatversion")
-			.ok()
-			.flatten()
-			.unwrap_or(0);
-		if version < 1 {
-			return Ok(());
-		}
-		for (key, _) in config.entries() {
-			// A dotted key `extensions.<name>` (git's extensions carry no subsection, so a further dot is not one).
-			if let Some(name) = key.strip_prefix("extensions.")
-				&& !name.contains('.')
-				&& !KNOWN.contains(&name.to_ascii_lowercase().as_str())
-			{
-				return Err(
-					LinkedWorktreeError::UnsupportedObjectFormat(format!(
-						"unknown repository extension: extensions.{name}"
-					))
-					.into(),
-				);
-			}
-		}
-		Ok(())
-	}
-
 	/// A lean structural inspection for the forced path — composes the pointer primitives, never calling
 	/// `inspect()` and never opening the object store. Classifies the destination with a no-follow stat and
 	/// resolves the owned registration, its structural validity, admin-`HEAD` existence, lock, and direct HEAD.
@@ -944,11 +898,11 @@ mod native {
 		// free from `inspect` opening the repo, but the lean forced path skips `inspect`, so it must do the same
 		// config-only check here (never opening the object store). `detect_kind` is the exact primitive the
 		// conservative `inspect` path uses (object format + `repositoryformatversion`), returning the same
-		// `UnsupportedObjectFormat` refusal; `reject_unknown_extensions` adds git's abort on an unknown
+		// `UnsupportedObjectFormat` refusal; `reject_unsupported_repository_format` adds git's abort on an unknown
 		// `extensions.*`. A repo gitana does not fully understand is never force-mutated (requirements 257-258),
 		// matching stock `git worktree remove -f -f`, which aborts too. Nothing is deleted on a format refusal.
 		detect_kind(&open_store_raw(common, common)?).await?;
-		reject_unknown_extensions(common)?;
+		reject_unsupported_repository_format(common)?;
 
 		// Decide from the current state, failing fast on a refusal before the destructive re-check.
 		let action = decide_git_forced(&inspect_git_forced(request)?, force)?;

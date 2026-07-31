@@ -10,9 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use gitana_linked_worktree::{
-	BranchName, CheckoutTarget, CreateError, CreateRequest, LockState, ProtectionReason, RemoveError,
-	RemoveOutcome, RemovePolicy, RemoveRequest, RepositoryId, WorktreeClassification,
-	WorktreeContext, WorktreeEntry, WorktreeObjectId, WorktreeRole,
+	BranchName, CheckoutTarget, CreateError, CreateRequest, LockState, ProtectionReason,
+	RelocateError, RelocateOutcome, RelocateRequest, RemoveError, RemoveOutcome, RemovePolicy,
+	RemoveRequest, RepositoryId, WorktreeClassification, WorktreeContext, WorktreeEntry,
+	WorktreeObjectId, WorktreeRole, relocate,
 };
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 use gitana_porcelain::Identity;
@@ -1062,18 +1063,6 @@ async fn move_worktree(cwd: &Path, worktree: &Path, new_path: &Path, force: u8) 
 		bail!("working trees containing submodules cannot be moved or removed");
 	}
 
-	// A locked worktree needs two `-f` to move (one is not enough), echoing the reason as git does.
-	if let Some(reason) = read_lock_reason(&admin)
-		&& force < 2
-	{
-		if reason.is_empty() {
-			bail!("cannot move a locked working tree;\nuse 'move -f -f' to override or unlock first");
-		}
-		bail!(
-			"cannot move a locked working tree, lock reason: {reason}\nuse 'move -f -f' to override or unlock first"
-		);
-	}
-
 	// The destination, computed git's way: into an existing directory under the source's basename, else
 	// the literal path. `display` mirrors what git prints (the argument, with the basename appended when
 	// moving into a directory).
@@ -1097,73 +1086,80 @@ async fn move_worktree(cwd: &Path, worktree: &Path, new_path: &Path, force: u8) 
 		(raw, new_path.to_string_lossy().into_owned())
 	};
 
-	// An occupied destination (a non-empty directory or a file) is refused; an empty directory is fine,
-	// as git moves onto one.
-	if dest.exists() && dir_non_empty(&dest)? {
-		bail!("'{display}' already exists");
-	}
-	// A destination still registered to another — since-deleted — worktree needs a force; with it, that
-	// stale admin entry is dropped (as git does) so the repository never ends up with two admin dirs for
-	// one checkout path. A *locked* stale registration is protected: like `remove`, it takes a second
-	// `-f` (git refuses one), so a lock set to prevent cleanup is not discarded by a single force.
-	let stale_registration =
-		admin_dir_for(common, &canonical(&dest)).filter(|other| !canonical_eq(other, &admin));
-	if let Some(other) = &stale_registration {
-		if read_lock_reason(other).is_some() {
-			if force < 2 {
+	// Delegate the effect to the library `relocate`: it owns the lock / identity / occupied-and-stale
+	// destination / pointer-style-preserving rewrite decisions and the rename (with a pre-move re-verify),
+	// exactly as `remove` delegates its removal. The CLI maps the structured outcome to git's messages. The
+	// admin/source/submodule DWIM above stays CLI-side (the library has no submodule concept).
+	let request = RelocateRequest {
+		repo: RepositoryId::at_common_dir(common.clone())?,
+		from: source.clone(),
+		to: dest.clone(),
+		expected_branch: None,
+		force,
+	};
+	use WorktreeClassification as C;
+	match relocate(&request).await {
+		// Moved — git prints nothing on a successful move.
+		Ok(RelocateOutcome::Relocated { .. }) => Ok(()),
+		// `from == to` (e.g. moving into the worktree's own parent, which DWIMs back to itself): the library
+		// is idempotent, but git and the prior CLI report the destination already exists.
+		Ok(RelocateOutcome::AlreadyAt { .. }) => bail!("'{display}' already exists"),
+		// A locked source needs a second `-f` (git's `move -f -f`), echoing the reason as git does.
+		Err(RelocateError::Refused(C::ProtectedWithReason {
+			reason: ProtectionReason::Locked { reason },
+		})) => match reason {
+			Some(r) if !r.is_empty() => bail!(
+				"cannot move a locked working tree, lock reason: {r}\nuse 'move -f -f' to override or unlock first"
+			),
+			_ => {
+				bail!("cannot move a locked working tree;\nuse 'move -f -f' to override or unlock first")
+			}
+		},
+		// An occupied destination (a non-empty directory or a file).
+		Err(RelocateError::DestinationOccupied { .. }) => bail!("'{display}' already exists"),
+		// A destination still registered to another — since-deleted — worktree: a *locked* stale
+		// registration needs a second `-f`, a plain one a single `-f` (as `remove`). The library reports the
+		// required force (computed with its byte-clean, no-follow lock reader over all stale admins), so no
+		// re-probe of a possibly non-UTF-8 or symlinked lock file is needed here.
+		Err(RelocateError::DestinationRegistered { required_force, .. }) => {
+			if required_force >= 2 {
 				bail!(
 					"'{display}' is a missing but locked worktree;\nuse 'move -f -f' to override, or 'unlock' and 'prune' or 'remove' to clear"
-				);
+				)
+			} else {
+				bail!(
+					"'{display}' is a missing but already registered worktree;\nuse 'move -f' to override, or 'prune' or 'remove' to clear"
+				)
 			}
-		} else if force < 1 {
-			bail!(
-				"'{display}' is a missing but already registered worktree;\nuse 'move -f' to override, or 'prune' or 'remove' to clear"
-			);
 		}
-	}
-
-	// Preserve each pointer's representation across the move: a git `worktree.useRelativePaths` worktree
-	// records relative pointers so the tree can be relocated as a unit, and forcing them to absolute would
-	// defeat that. Capture whether each side is relative *before* the rename (source still in place).
-	let checkout_relative = gitfile_is_relative(&gitfile);
-	let admin_relative = admin_gitdir_is_relative(&admin.join("gitdir"));
-
-	// An empty directory left at the destination would block `rename`; clear it first (validated empty).
-	if dest.is_dir() {
-		std::fs::remove_dir(&dest).map_err(|error| anyhow!("removing {}: {error}", dest.display()))?;
-	}
-	std::fs::rename(&source, &dest).map_err(|error| {
-		anyhow!(
+		// `find_worktree` already rejects the main worktree, but keep git's message if the library reports it.
+		Err(RelocateError::IsPrimaryWorktree(_)) => {
+			bail!("'{}' is a main working tree", worktree.display())
+		}
+		// A broken/foreign source, or a relocated-bare enclosure — git's structural "validation failed".
+		Err(RelocateError::EnclosesRepository(_) | RelocateError::Refused(_)) => bail!(
+			"validation failed, cannot move working tree: '{}' is not a valid working tree",
+			gitfile.display()
+		),
+		// A destination whose registration state cannot be reconciled safely.
+		Err(RelocateError::UntrustedRegistration(admin)) => bail!(
+			"cannot move working tree: an untrusted (symlinked) worktree registration exists at '{}'; clean it up first",
+			admin.display()
+		),
+		Err(RelocateError::DestinationInsideRegistration { admin_dir, .. }) => bail!(
+			"'{display}' is inside the worktree registration '{}'",
+			admin_dir.display()
+		),
+		// The rename landed but the administration was not fully repointed — recoverable with `repair`.
+		Err(RelocateError::Incomplete(_)) => {
+			bail!("move did not complete cleanly; run 'gta worktree repair {display}'")
+		}
+		Err(RelocateError::Failed(error)) => bail!(
 			"failed to move '{}' to '{}': {error}",
 			source.display(),
 			new_path.display()
-		)
-	})?;
-	// Drop the stale destination registration only *after* the move succeeds, so a failed rename leaves
-	// that (recoverable) admin entry intact rather than discarding it, as git does.
-	if let Some(other) = &stale_registration {
-		std::fs::remove_dir_all(other)
-			.map_err(|error| anyhow!("removing {}: {error}", other.display()))?;
+		),
 	}
-
-	// Repoint the admin's backlink at the checkout's new `.git` file, and — only when the checkout used a
-	// relative pointer, now wrong at the new depth — rewrite the checkout's own `.git` file too. An
-	// absolute checkout pointer moved with the directory and still names the (unmoved) admin directory.
-	let git_file = dest.join(".git");
-	let backlink = admin.join("gitdir");
-	std::fs::write(
-		&backlink,
-		format!("{}\n", pointer(&admin, &git_file, admin_relative)),
-	)
-	.map_err(|error| anyhow!("updating {}: {error}", backlink.display()))?;
-	if checkout_relative {
-		std::fs::write(
-			&git_file,
-			format!("gitdir: {}\n", pointer(&dest, &admin, true)),
-		)
-		.map_err(|error| anyhow!("updating {}: {error}", git_file.display()))?;
-	}
-	Ok(())
 }
 
 // ---------------------------------------------------------------------------

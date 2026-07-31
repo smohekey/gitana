@@ -12,6 +12,7 @@ use gitana_repository::HeadState;
 use crate::LinkedWorktreeError;
 use crate::error::PointerKind;
 use crate::facts::LockState;
+use crate::pointers::strip_eol_bytes;
 
 /// Parse `<git_dir>/HEAD`. `Ok(None)` when the file is absent (no checkout / not a git dir). A **legacy
 /// symlink** HEAD (`.git/HEAD -> refs/heads/main`) is symbolic — git resolves it that way — so its link
@@ -61,48 +62,126 @@ pub(crate) fn read_head<H: HashAlgorithm>(
 ///   *link target* names a ref. The symlink's target is read with `read_link` — never followed to the
 ///   pointed-at file — so a crafted `HEAD -> refs/...` cannot disclose an external file's contents, and the
 ///   ref is never resolved (a corrupt/cyclic branch still validates, as `git -f` removes such a worktree).
-/// - `Some(None)` — a **valid detached** HEAD: a bare, well-formed object id (40-hex SHA-1 or 64-hex
-///   SHA-256). Checked length/charset only, so it is object-format-agnostic and reads no object store.
+/// - `Some(None)` — a **valid but unnameable** HEAD: a detached one (a bare, well-formed object id, 40-hex
+///   SHA-1 or 64-hex SHA-256, checked length/charset only, no object-store read) **or** a symbolic HEAD
+///   naming a non-UTF-8 ref (valid, but no `String` branch to return — and never lossily collapsed).
 /// - `None` — **structurally invalid**: an absent/unreadable/empty/malformed HEAD, a directory, a non-ref
 ///   symlink, a `ref:` target not under `refs/`, or a hex string of the wrong length. git refuses these
 ///   under `-f -f`, so the forced path must not delete such a worktree.
 pub(crate) fn structural_head_branch(git_dir: &std::path::Path) -> Option<Option<String>> {
+	// A detached HEAD is a bare object id with NO surrounding whitespace — git rejects a space/tab-padded one
+	// under `-f -f`. `text` is already stripped of trailing line terminators; do *not* additionally trim, so
+	// `"  <hex>  "` fails the exact length/charset check and is invalid.
+	structural_head_branch_with(git_dir, |raw| {
+		matches!(raw.len(), 40 | 64) && raw.iter().all(u8::is_ascii_hexdigit)
+	})
+}
+
+/// Like [`structural_head_branch`], but with the **looser detached grammar `git worktree move` accepts**:
+/// a valid object-id *prefix* of the repository's hash width (`hexsz` hex chars — 40 for SHA-1, 64 for
+/// SHA-256), with any trailing content ignored — where the force-removal gate requires the *exact*,
+/// unpadded id. Probed against git 2.50.1: `move` accepts `<40 hex> trailing`, `<40 hex>AA…` (overlong), and
+/// the bare id, but refuses an absent/empty/garbage/short/whitespace-padded HEAD, and a symbolic HEAD only
+/// when it names a full `refs/...`. Symbolic-HEAD handling is identical to [`structural_head_branch`].
+pub(crate) fn structural_head_branch_for_move(
+	git_dir: &std::path::Path,
+	hexsz: usize,
+) -> Option<Option<String>> {
+	structural_head_branch_with(git_dir, move |raw| {
+		// git parses the leading object-id of the repository's width and ignores whatever follows — even a
+		// non-UTF-8 trailing byte, so the detached form is matched on **raw bytes**, never a UTF-8 decode of
+		// the whole file. A shorter run, or any non-hex within the first `hexsz` bytes (e.g. leading
+		// whitespace), is not a valid id.
+		raw
+			.get(..hexsz)
+			.is_some_and(|prefix| prefix.iter().all(u8::is_ascii_hexdigit))
+	})
+}
+
+/// Shared structural HEAD read; `is_valid_detached` decides which non-`ref:` (detached) **raw byte** texts
+/// are accepted, the only axis on which the force-removal and move gates differ. The detached form is
+/// matched on bytes (never a UTF-8 decode of the whole file) so a valid hex id with a non-UTF-8 trailing
+/// byte — which git's fixed-width parse accepts — is not lost; only a *symbolic* target is decoded (a ref
+/// name that must be valid UTF-8 to return as a `String`).
+fn structural_head_branch_with(
+	git_dir: &std::path::Path,
+	is_valid_detached: impl Fn(&[u8]) -> bool,
+) -> Option<Option<String>> {
 	let path = git_dir.join("HEAD");
 	match std::fs::symlink_metadata(&path) {
 		// A legacy symbolic-ref HEAD is a filesystem symlink whose *link target* names a ref. Read the link
 		// (no follow), so the target string is the ref name, never the pointed-at ref file's object-id content.
+		// The target is compared **byte-exact** (never `to_string_lossy`, which would collapse a non-UTF-8 ref
+		// into a replacement char and let a `U+FFFD` pin match it), naming the branch only when it is UTF-8.
 		Ok(meta) if meta.file_type().is_symlink() => {
-			let target = std::fs::read_link(&path).ok()?;
-			let target = target.to_string_lossy();
-			target
-				.starts_with("refs/")
-				.then(|| Some(target.into_owned()))
+			let link = std::fs::read_link(&path).ok()?;
+			#[cfg(unix)]
+			{
+				use std::os::unix::ffi::OsStrExt as _;
+				symbolic_branch(link.as_os_str().as_bytes())
+			}
+			// WTF-8 pointer I/O on non-Unix is a deferred follow-up: a non-UTF-8 link is treated as invalid
+			// (`?`) rather than lossily decoded, so it still cannot spuriously match a pin.
+			#[cfg(not(unix))]
+			{
+				symbolic_branch(link.to_str()?.as_bytes())
+			}
 		}
 		Ok(meta) if meta.is_file() => {
 			let bytes = std::fs::read(&path).ok()?;
 			// Parse the HEAD file's own bytes structurally — the same grammar as `HeadState::parse` (trim only
-			// trailing line terminators; `ref:` then space/tab), but algorithm-agnostic for the detached case so
-			// a 40-hex SHA-1 id is accepted as readily as a 64-hex SHA-256 one, without an object-store read.
-			let text = std::str::from_utf8(&bytes)
-				.ok()?
-				.trim_end_matches(['\n', '\r']);
-			if let Some(target) = text.strip_prefix("ref:") {
+			// trailing line terminators; `ref:` then space/tab), without an object-store read.
+			let raw = strip_eol_bytes(&bytes);
+			if let Some(rest) = raw.strip_prefix(b"ref:".as_slice()) {
 				// git accepts space/tab (only) between `ref:` and the target, so trim those from the *symbolic*
 				// target — but it is valid only when it then names a full ref (`refs/...`); `ref: main`, an empty
-				// target, or a non-space/tab separator left in the target is not a HEAD to force past.
-				let target = target.trim_matches([' ', '\t']);
-				target.starts_with("refs/").then(|| Some(target.to_owned()))
+				// target, or a non-space/tab separator left in the target is not a HEAD to force past. `refs/` is
+				// checked on **bytes**: a Unix ref name may be non-UTF-8, which git moves/removes, so requiring
+				// UTF-8 here would wrongly reject it. The branch is *named* only when the ref is representable as
+				// UTF-8; a valid non-UTF-8 ref is a **valid but unnameable** HEAD (`Some(None)`) — still
+				// movable/removable, but never lossily collapsed into a `String` (which would let, e.g., an
+				// `expected_branch` of `U+FFFD` spuriously match `refs/heads/\xff` and bypass the pin). A
+				// non-UTF-8 branch cannot equal a UTF-8 pin, so an unnamed HEAD reads as a mismatch.
+				let target = trim_spaces_and_tabs(rest);
+				symbolic_branch(target)
 			} else {
-				// A detached HEAD is a bare object id with NO surrounding whitespace — git rejects a space/tab-
-				// padded one under `-f -f`. `text` is already stripped of trailing line terminators; do *not*
-				// additionally trim spaces/tabs, so `"  <hex>  "` fails the length/charset check and is invalid.
-				let is_oid = matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit());
-				is_oid.then_some(None)
+				is_valid_detached(raw).then_some(None)
 			}
 		}
 		// Absent, a directory, or any stat/read failure — structurally invalid.
 		_ => None,
 	}
+}
+
+/// Classify a symbolic-HEAD target (raw ref bytes, from either the `ref:` file body or a legacy HEAD
+/// symlink): `None` when it does not name a full ref (`refs/...`); `Some(Some(branch))` when the ref is
+/// valid UTF-8; `Some(None)` when it is a valid **non-UTF-8** ref — a valid but unnameable HEAD, never
+/// lossily decoded, so a UTF-8 `expected_branch` pin cannot spuriously match it. Checked on bytes so a
+/// non-UTF-8 Unix ref name is recognised as a ref.
+fn symbolic_branch(target: &[u8]) -> Option<Option<String>> {
+	target
+		.starts_with(b"refs/")
+		.then(|| std::str::from_utf8(target).ok().map(str::to_owned))
+}
+
+/// Trim leading and trailing space/tab bytes only (not other whitespace), matching git's `ref:` separator
+/// grammar, on a raw byte slice.
+fn trim_spaces_and_tabs(mut bytes: &[u8]) -> &[u8] {
+	while let [first, rest @ ..] = bytes {
+		if matches!(first, b' ' | b'\t') {
+			bytes = rest;
+		} else {
+			break;
+		}
+	}
+	while let [rest @ .., last] = bytes {
+		if matches!(last, b' ' | b'\t') {
+			bytes = rest;
+		} else {
+			break;
+		}
+	}
+	bytes
 }
 
 /// The lock state of a worktree whose git directory may hold a `locked` file. git writes the reason

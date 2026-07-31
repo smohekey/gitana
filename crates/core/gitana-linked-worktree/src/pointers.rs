@@ -47,7 +47,7 @@ fn read_worktree_admin_entries(dir: &Path) -> Result<Vec<PathBuf>, LinkedWorktre
 /// **Enumeration takes the softer stance** — see [`list_worktree_admins`]: a listing has no conflict to
 /// miss, so it *skips* the symlinked container (listing only the honest worktrees) rather than erroring,
 /// matching how a symlinked admin *leaf* is skipped.
-fn read_worktree_admins(common: &Path) -> Result<Vec<PathBuf>, LinkedWorktreeError> {
+pub(crate) fn read_worktree_admins(common: &Path) -> Result<Vec<PathBuf>, LinkedWorktreeError> {
 	let dir = common.join("worktrees");
 	if is_leaf_symlink(&dir) {
 		return Err(LinkedWorktreeError::MalformedPointer {
@@ -88,7 +88,7 @@ fn list_worktree_admins(common: &Path) -> Result<Vec<PathBuf>, LinkedWorktreeErr
 /// This is git's worktree-list membership — deliberately **independent of `commondir` ownership**: git
 /// lists (and refuses another checkout of the branch of) an admin whose `commondir` is missing or points
 /// elsewhere. Ownership of a *destination's registration* is a stricter, separate test ([`is_registration`]).
-fn is_listed_admin(admin: &Path) -> Result<bool, LinkedWorktreeError> {
+pub(crate) fn is_listed_admin(admin: &Path) -> Result<bool, LinkedWorktreeError> {
 	match std::fs::metadata(admin) {
 		Ok(meta) if meta.is_dir() => {}
 		Ok(_) => return Ok(false), // a stray file / a symlink to a non-directory
@@ -805,7 +805,7 @@ fn strip_eol(s: &str) -> &str {
 
 /// Strip a trailing line terminator (`\n`/`\r`) from raw pointer-file bytes — the byte-level counterpart of
 /// [`strip_eol`], so a pointer path is parsed without a lossy UTF-8 round-trip.
-fn strip_eol_bytes(bytes: &[u8]) -> &[u8] {
+pub(crate) fn strip_eol_bytes(bytes: &[u8]) -> &[u8] {
 	let mut end = bytes.len();
 	while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
 		end -= 1;
@@ -858,6 +858,191 @@ pub(crate) fn path_to_bytes(path: &Path) -> Vec<u8> {
 	{
 		path.to_string_lossy().into_owned().into_bytes()
 	}
+}
+
+/// A unique temp sibling of `path` (`<name>.tmp.<pid>.<seq>`) for a write-then-rename publish. Unique per
+/// process and per call (a monotonic counter), so concurrent writes never collide on the same temp name.
+pub(crate) fn temp_sibling(path: &Path) -> PathBuf {
+	use std::sync::atomic::{AtomicU64, Ordering};
+	static SEQ: AtomicU64 = AtomicU64::new(0);
+	let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+	let mut name = path
+		.file_name()
+		.map(|n| n.to_os_string())
+		.unwrap_or_default();
+	name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+	path.with_file_name(name)
+}
+
+/// Create `path` **exclusively** (`O_CREAT | O_EXCL`, never clobbering an existing file), write `contents`,
+/// and `fsync` — so a torn write is never published and the bytes are durable before the rename.
+fn write_and_sync(path: &Path, contents: &[u8]) -> Result<(), LinkedWorktreeError> {
+	use std::io::Write as _;
+	let mut file = std::fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(path)
+		.map_err(|e| LinkedWorktreeError::io("creating temp file", path, e))?;
+	file
+		.write_all(contents)
+		.map_err(|e| LinkedWorktreeError::io("writing temp file", path, e))?;
+	file
+		.sync_all()
+		.map_err(|e| LinkedWorktreeError::io("syncing temp file", path, e))
+}
+
+/// Publish `contents` at `path` atomically: fully write an exclusive temp sibling, then `rename` it onto
+/// `path` (replacing) — a reader never observes a torn pointer, and a crash leaves the target absent (a
+/// classifiable partial state) rather than a half-written file (a malformed-pointer hard error). Shared by
+/// `create` and `relocate`, which both publish pointer files.
+pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), LinkedWorktreeError> {
+	let tmp = temp_sibling(path);
+	write_and_sync(&tmp, contents)?;
+	std::fs::rename(&tmp, path).map_err(|e| {
+		let _ = std::fs::remove_file(&tmp);
+		LinkedWorktreeError::io("publishing admin file", path, e)
+	})
+}
+
+/// Rewrite the contents of an **existing** pointer file in place, preserving its permissions and metadata —
+/// exactly as stock `git worktree move` rewrites both worktree pointers (verified: git keeps each file's
+/// inode and mode, succeeds when the containing directory is read-only, and refuses a read-only pointer).
+/// Unlike [`write_file_atomic`], this opens the existing file for truncating write rather than renaming a
+/// fresh temp over it, so it (a) needs only *file*-write permission and succeeds even when the containing
+/// directory is read-only (mode `0555`), where the temp-sibling approach would fail *after* the checkout was
+/// already renamed and wrongly report the move incomplete; and (b) refuses a read-only pointer (mode `0444`)
+/// with `EACCES` — matching git and the prior CLI — rather than replacing it and silently clearing its
+/// read-only bit (and its ACLs/xattrs). `create: false` never creates the file, so a genuinely absent
+/// pointer surfaces as an error, not a stray new file in a read-only tree.
+///
+/// The trade against `write_file_atomic` is atomicity: a torn write (ENOSPC mid-write) can leave a partial
+/// pointer rather than the prior contents. Both relocate pointers accept it because stock git does — git
+/// truncates and rewrites these files in place too, so matching its permission and metadata semantics
+/// (the divergence the review flagged) outweighs a torn-write guarantee git itself does not provide; a
+/// partial pointer is in any case repairable with `git worktree repair`. `write_file_atomic` remains for
+/// `create`, which publishes a *new* registration where the temp + rename (never clobbering an existing
+/// file) is the right primitive.
+///
+/// **Never follows a symlinked pointer.** git writes these as regular files; a symlink in their place is
+/// corruption or an attack, and following it would truncate and rewrite a file *outside* the admin. Because
+/// a plain pre-check races a concurrent swap (and this crate carries no `O_NOFOLLOW` binding), the file is
+/// opened **without** `O_TRUNC` and the opened descriptor's identity is compared against the pre-open
+/// `lstat`: a symlink swapped in between is followed to a *different* inode, so the mismatch is caught and
+/// the write refused **before** any truncation — a redirected pointer can never clobber its target.
+pub(crate) fn update_file_in_place(
+	path: &Path,
+	contents: &[u8],
+) -> Result<(), LinkedWorktreeError> {
+	use std::io::Write as _;
+
+	let pre = std::fs::symlink_metadata(path)
+		.map_err(|e| LinkedWorktreeError::io("stat pointer file for update", path, e))?;
+	if pre.file_type().is_symlink() {
+		return Err(LinkedWorktreeError::io(
+			"refusing to update a symlinked pointer file",
+			path,
+			std::io::Error::from(std::io::ErrorKind::InvalidInput),
+		));
+	}
+
+	// No `.truncate(true)`: truncation must wait until the opened descriptor is confirmed to be the very
+	// regular file just `lstat`ed, so a symlink swapped in after the `lstat` cannot have its target clobbered.
+	let mut opts = std::fs::OpenOptions::new();
+	opts.write(true).create(false);
+	// On **Windows** there is no post-open inode identity check (no stable `ino`), so close the swap race at
+	// open time: `FILE_FLAG_OPEN_REPARSE_POINT` opens a reparse point (symlink/junction) *itself* rather than
+	// following it, so a symlink swapped in is never dereferenced and its target cannot be truncated. A plain
+	// regular file opens normally. WTF-8 pointer I/O on Windows remains a deferred follow-up.
+	#[cfg(windows)]
+	{
+		use std::os::windows::fs::OpenOptionsExt as _;
+		const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+		opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+	}
+	let mut file = opts
+		.open(path)
+		.map_err(|e| LinkedWorktreeError::io("opening pointer file for update", path, e))?;
+
+	// On **Unix**, close the swap race after the fact: a symlink dropped in between the `lstat` and the open
+	// is followed to a *different* inode, so an identity mismatch here catches it before any truncation.
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt as _;
+		let opened = file
+			.metadata()
+			.map_err(|e| LinkedWorktreeError::io("stat opened pointer file", path, e))?;
+		if !opened.file_type().is_file() || opened.dev() != pre.dev() || opened.ino() != pre.ino() {
+			return Err(LinkedWorktreeError::io(
+				"pointer file changed identity during update",
+				path,
+				std::io::Error::from(std::io::ErrorKind::InvalidInput),
+			));
+		}
+	}
+
+	file
+		.set_len(0)
+		.map_err(|e| LinkedWorktreeError::io("truncating pointer file", path, e))?;
+	file
+		.write_all(contents)
+		.map_err(|e| LinkedWorktreeError::io("updating pointer file", path, e))?;
+	file
+		.sync_all()
+		.map_err(|e| LinkedWorktreeError::io("syncing pointer file", path, e))
+}
+
+/// Ensure a path can round-trip the (byte-clean) pointer I/O before any state is written. On **Unix** the
+/// pointers are byte-clean, so this is a no-op — a non-UTF-8 path is accepted. On **non-Unix**, where
+/// [`path_to_bytes`] still falls back to a *lossy* UTF-8 rendering, a non-UTF-8 path would serialize to a
+/// back-pointer that no longer identifies the destination; reject it here (before any state is written) so
+/// the caller never mutates state it would then fail to establish. Shared by `create` and `relocate`, which
+/// both write these pointers. Windows WTF-8 pointer I/O is a deferred follow-up.
+#[cfg(unix)]
+pub(crate) fn ensure_representable_path(_path: &Path) -> Result<(), LinkedWorktreeError> {
+	Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_representable_path(path: &Path) -> Result<(), LinkedWorktreeError> {
+	// Check the **resolved** form the pointer files will actually record — a symlink/junction can resolve a
+	// UTF-8 lexical path to a non-representable one, which would then serialize lossily *after* the writes.
+	// Rejecting it here keeps the operation side-effect-free on failure.
+	if resolved_for_pointers(path).to_str().is_some() {
+		Ok(())
+	} else {
+		Err(LinkedWorktreeError::io(
+			"non-UTF-8 path is unsupported on this platform (byte-clean pointer I/O is Unix-only)",
+			path,
+			std::io::Error::from(std::io::ErrorKind::InvalidInput),
+		))
+	}
+}
+
+/// The form of `path` the pointer files will actually record — its deepest existing ancestor canonicalized
+/// (so a symlinked parent is resolved to its real target, exactly as `create_dir_all` + `canonicalize`
+/// would), with the still-absent tail appended lexically. Used only by the non-Unix representability
+/// preflight; on Unix the pointers are byte-clean so no such check is needed.
+#[cfg(not(unix))]
+fn resolved_for_pointers(path: &Path) -> PathBuf {
+	use std::path::Component;
+	let mut resolved = PathBuf::new();
+	for component in path.components() {
+		match component {
+			Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+			Component::RootDir => resolved.push(Component::RootDir.as_os_str()),
+			Component::CurDir => {}
+			Component::ParentDir => {
+				resolved.pop();
+			}
+			Component::Normal(name) => {
+				resolved.push(name);
+				if let Ok(canonical) = resolved.canonicalize() {
+					resolved = canonical;
+				}
+			}
+		}
+	}
+	resolved
 }
 
 /// A pointer path (already stripped of its line terminator) resolved against `base` when relative, else

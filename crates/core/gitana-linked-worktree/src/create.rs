@@ -26,7 +26,7 @@ mod native {
 		CrossPointerHealth, DestinationKind, Registration, RequestedBranch, inspect,
 	};
 	use crate::object_id::IntoWorktreeObjectId;
-	use crate::pointers::is_valid_refname;
+	use crate::pointers::{is_valid_refname, write_file_atomic};
 	use crate::query::WorktreeQuery;
 	use crate::registration_lock::RegistrationLock;
 	use crate::repo_id::{detect_kind, open_store_raw, open_work_dir};
@@ -426,8 +426,8 @@ mod native {
 		// On a platform without byte-clean pointer I/O (non-Unix), a non-representable path can't round-trip
 		// the pointers, so reject it **up front** — before the branch/admin/checkout are written — rather than
 		// mutate then fail the post-write inspection. A no-op on Unix (the pointers are byte-clean there).
-		ensure_representable_path(destination)?;
-		ensure_representable_path(&admin)?;
+		crate::pointers::ensure_representable_path(destination)?;
+		crate::pointers::ensure_representable_path(&admin)?;
 
 		// Create the branch through the transactional ref layer. Strict `-b` requires the ref be absent
 		// (`expected: None`, git's create CAS). git `-B` (`force_reset`) resets an existing *direct* branch:
@@ -612,59 +612,8 @@ mod native {
 		})
 	}
 
-	/// Ensure a path can round-trip the (byte-clean) pointer I/O before any state is written. On **Unix**
-	/// the pointers are byte-clean, so this is a no-op — a non-UTF-8 path is accepted. On **non-Unix**, where
-	/// `path_to_bytes` still falls back to a *lossy* UTF-8 rendering, a non-UTF-8 path would serialize to a
-	/// back-pointer that no longer identifies the destination; reject it here (before the branch/admin/
-	/// checkout are written) so `create` never mutates state it would then fail to establish. Windows WTF-8
-	/// pointer I/O is a deferred follow-up.
-	#[cfg(unix)]
-	fn ensure_representable_path(_path: &Path) -> Result<(), LinkedWorktreeError> {
-		Ok(())
-	}
-
-	#[cfg(not(unix))]
-	fn ensure_representable_path(path: &Path) -> Result<(), LinkedWorktreeError> {
-		// Check the **resolved** form the pointer files will actually record — a symlink/junction can resolve
-		// a UTF-8 lexical path to a non-representable one, which would then serialize lossily *after* the
-		// branch/admin/checkout are written. Rejecting it here keeps `create` side-effect-free on failure.
-		if resolved_for_pointers(path).to_str().is_some() {
-			Ok(())
-		} else {
-			Err(LinkedWorktreeError::io(
-				"non-UTF-8 path is unsupported on this platform (byte-clean pointer I/O is Unix-only)",
-				path,
-				std::io::Error::from(std::io::ErrorKind::InvalidInput),
-			))
-		}
-	}
-
-	/// The form of `path` the pointer files will actually record — its deepest existing ancestor
-	/// canonicalized (so a symlinked parent is resolved to its real target, exactly as `create_dir_all` +
-	/// `canonicalize` would), with the still-absent tail appended lexically. Used only by the non-Unix
-	/// representability preflight; on Unix the pointers are byte-clean so no such check is needed.
-	#[cfg(not(unix))]
-	fn resolved_for_pointers(path: &Path) -> PathBuf {
-		use std::path::Component;
-		let mut resolved = PathBuf::new();
-		for component in path.components() {
-			match component {
-				Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
-				Component::RootDir => resolved.push(Component::RootDir.as_os_str()),
-				Component::CurDir => {}
-				Component::ParentDir => {
-					resolved.pop();
-				}
-				Component::Normal(name) => {
-					resolved.push(name);
-					if let Ok(canonical) = resolved.canonicalize() {
-						resolved = canonical;
-					}
-				}
-			}
-		}
-		resolved
-	}
+	// The representability preflight (`ensure_representable_path`) lives in `crate::pointers`, shared with
+	// `relocate`, since both write the byte-clean pointer files this guards.
 
 	/// Sanitize a destination basename into a worktree admin-directory name, mirroring git (probed against
 	/// git 2.50.1). git reuses the admin name as a per-worktree ref namespace, so it must be a valid refname
@@ -711,48 +660,8 @@ mod native {
 		out
 	}
 
-	/// A unique temp sibling of `path` (`<name>.tmp.<pid>.<seq>`) for the write-then-rename dance. Unique per
-	/// process + call so two creates targeting the same directory never collide on the staging file.
-	fn temp_sibling(path: &Path) -> PathBuf {
-		use std::sync::atomic::{AtomicU64, Ordering};
-		static SEQ: AtomicU64 = AtomicU64::new(0);
-		let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-		let mut name = path
-			.file_name()
-			.map(|n| n.to_os_string())
-			.unwrap_or_default();
-		name.push(format!(".tmp.{}.{}", std::process::id(), seq));
-		path.with_file_name(name)
-	}
-
-	/// Create `path` exclusively, write `contents`, and `fsync` — so the file's bytes are durable before it
-	/// is published. The caller then links/renames it into its final name.
-	fn write_and_sync(path: &Path, contents: &[u8]) -> Result<(), LinkedWorktreeError> {
-		use std::io::Write as _;
-		let mut file = std::fs::OpenOptions::new()
-			.write(true)
-			.create_new(true)
-			.open(path)
-			.map_err(|e| LinkedWorktreeError::io("creating temp file", path, e))?;
-		file
-			.write_all(contents)
-			.map_err(|e| LinkedWorktreeError::io("writing temp file", path, e))?;
-		file
-			.sync_all()
-			.map_err(|e| LinkedWorktreeError::io("syncing temp file", path, e))
-	}
-
-	/// Publish `contents` at `path` atomically: fully write a temp sibling, then `rename` it onto `path`
-	/// (replacing) — a reader never observes a torn pointer, and a crash leaves the target absent (a
-	/// classifiable partial state) rather than a half-written file (a malformed-pointer hard error).
-	fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), LinkedWorktreeError> {
-		let tmp = temp_sibling(path);
-		write_and_sync(&tmp, contents)?;
-		std::fs::rename(&tmp, path).map_err(|e| {
-			let _ = std::fs::remove_file(&tmp);
-			LinkedWorktreeError::io("publishing admin file", path, e)
-		})
-	}
+	// `write_file_atomic` (and its `temp_sibling`/`write_and_sync` helpers) live in `crate::pointers`, shared
+	// with `relocate`, since both publish pointer files atomically.
 
 	/// Write git's admin layout for the new worktree — the admin's `gitdir` back-pointer, `commondir`,
 	/// `HEAD`, and (for a non-orphan) `ORIG_HEAD` plus a seeded `logs/HEAD` — returning the canonical admin

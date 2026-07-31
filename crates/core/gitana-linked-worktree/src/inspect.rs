@@ -276,7 +276,7 @@ mod native {
 	use gitana_repository::{HeadState, Repository};
 
 	use crate::LinkedWorktreeError;
-	use crate::head::{read_head, read_lock_reason};
+	use crate::head::{read_head, read_lock_reason, structural_head_branch_for_move};
 	use crate::object_id::IntoWorktreeObjectId;
 	use crate::pointers::{
 		RefSource, SYMREF_MAXDEPTH, admin_dirs_for, admin_gitdir_target, admin_owned_by,
@@ -289,6 +289,28 @@ mod native {
 	/// Inspect one destination. Opens the repository store (native mint), detects the object format, and
 	/// dispatches to the monomorphized body.
 	pub async fn inspect(query: &WorktreeQuery) -> Result<WorktreeInspection, LinkedWorktreeError> {
+		inspect_impl(query, true).await
+	}
+
+	/// Like [`inspect`] but reads HEAD **structurally** — the branch HEAD directly names, without following the
+	/// symref chain to a terminal branch or resolving it to an object ([`HeadFacts::object`] is `None`,
+	/// [`HeadFacts::branch`] is the unpeeled ref). This is what `git worktree move` needs: it validates HEAD's
+	/// structure and matches its (unpeeled) branch, but never resolves the chain, so a worktree whose HEAD
+	/// chain is cyclic or unreadable is still classifiable and movable. Kept **internal** so the public
+	/// [`WorktreeQuery`] construction API is unchanged — the mode is a `relocate` concern, not a query field.
+	pub(crate) async fn inspect_structural_head(
+		query: &WorktreeQuery,
+	) -> Result<WorktreeInspection, LinkedWorktreeError> {
+		inspect_impl(query, false).await
+	}
+
+	/// The shared inspection. `resolve_head` selects the resolving (default, via [`inspect`]) or structural
+	/// (via [`inspect_structural_head`]) HEAD read; it also governs whether a pinned `expected_branch` is
+	/// peeled to its terminal before the identity compare — in structural mode neither side is peeled.
+	async fn inspect_impl(
+		query: &WorktreeQuery,
+		resolve_head: bool,
+	) -> Result<WorktreeInspection, LinkedWorktreeError> {
 		// Identity paths must be absolute — a relative destination would resolve against the process CWD.
 		if !query.destination.is_absolute() {
 			return Err(LinkedWorktreeError::RelativePath(query.destination.clone()));
@@ -312,10 +334,20 @@ mod native {
 		}
 		match kind {
 			HashKind::Sha1 => {
-				inspect_generic::<Sha1>(Repository::new(ObjectStore::new(store)), query).await
+				inspect_generic::<Sha1>(
+					Repository::new(ObjectStore::new(store)),
+					query,
+					resolve_head,
+				)
+				.await
 			}
 			HashKind::Sha256 => {
-				inspect_generic::<Sha256>(Repository::new(ObjectStore::new(store)), query).await
+				inspect_generic::<Sha256>(
+					Repository::new(ObjectStore::new(store)),
+					query,
+					resolve_head,
+				)
+				.await
 			}
 		}
 	}
@@ -323,6 +355,7 @@ mod native {
 	async fn inspect_generic<H: HashAlgorithm>(
 		repo: Repository<gitana_file_store_local::WorktreeFileStore, H>,
 		query: &WorktreeQuery,
+		resolve_head: bool,
 	) -> Result<WorktreeInspection, LinkedWorktreeError>
 	where
 		ObjectId<H>: IntoWorktreeObjectId,
@@ -395,6 +428,25 @@ mod native {
 
 		let head = match &head_dir {
 			None => None,
+			// Structural (no-resolve) HEAD, as `git worktree move` reads it: name the branch HEAD *directly*
+			// carries without following the symref chain or touching the object store, so a cyclic/unreadable
+			// chain still yields a movable worktree. `object` is unknown here (`None`); `branch` is the unpeeled
+			// ref. A structurally invalid HEAD (absent/malformed) is `None`, which the move refuses as invalid.
+			// The detached grammar is `git worktree move`'s (a leading object-id of this repo's width, trailing
+			// ignored), not the stricter force-removal one.
+			Some(dir) if !resolve_head => match structural_head_branch_for_move(dir, H::RAW_LEN * 2) {
+				None => None,
+				Some(Some(branch)) => Some(HeadFacts {
+					state: HeadKind::Symbolic,
+					branch: Some(branch),
+					object: None,
+				}),
+				Some(None) => Some(HeadFacts {
+					state: HeadKind::Detached,
+					branch: None,
+					object: None,
+				}),
+			},
 			Some(dir) => match read_head::<H>(dir)? {
 				None => None,
 				Some(HeadState::Symbolic(refname)) => {
@@ -432,9 +484,14 @@ mod native {
 			},
 		};
 
-		let requested_branch = match &query.expected_branch {
-			None => RequestedBranch::NotRequested,
-			Some(branch) => {
+		// In **structural** mode (a move) the requested-branch *facts* are never computed: doing so would
+		// resolve the pin's terminal ref, scan other worktrees, and read the object store — the very chain
+		// resolution the move avoids, which would fail a move git allows when the pin names a cyclic/malformed
+		// symref. The move needs no requested-branch facts; its only branch check is the unpeeled name compare
+		// in `registered_to_different_branch` below. `NotRequested` keeps that resolution off entirely.
+		let requested_branch = match (&query.expected_branch, resolve_head) {
+			(None, _) | (Some(_), false) => RequestedBranch::NotRequested,
+			(Some(branch), true) => {
 				let refname = branch.refname();
 				// Resolve the requested branch's *terminal* ref FIRST — before the occupancy scan below — a
 				// legacy *symlink* symref (`refs/heads/alias -> refs/heads/feature`) is symbolic to git, but
@@ -500,18 +557,24 @@ mod native {
 			.unwrap_or(LockState::Unlocked);
 
 		// Compare branch identity by *terminal* ref (a symbolic alias matches its target), so an exact
-		// retry of an `alias`-created worktree is not a false conflict.
+		// retry of an `alias`-created worktree is not a false conflict. In **structural** mode neither side is
+		// peeled: the worktree branch above is the unpeeled ref HEAD names, so the expected pin must stay
+		// unpeeled too — peeling only one side would report a genuine match as `RegisteredToDifferentBranch`.
 		let registered = !matches!(registration, Registration::None);
 		let registered_to_different_branch = match (&query.expected_branch, registered) {
 			(Some(expected), true) => {
-				// A *direct* ref (the requested branch, not reached via `HEAD`) — the full symref budget applies.
-				let expected_terminal = resolve_ref_terminal(
-					common,
-					common,
-					&expected.refname(),
-					RefSource::RequestedBranch(expected.short()),
-					SYMREF_MAXDEPTH,
-				)?;
+				let expected_terminal = if resolve_head {
+					// A *direct* ref (the requested branch, not reached via `HEAD`) — the full symref budget applies.
+					resolve_ref_terminal(
+						common,
+						common,
+						&expected.refname(),
+						RefSource::RequestedBranch(expected.short()),
+						SYMREF_MAXDEPTH,
+					)?
+				} else {
+					expected.refname()
+				};
 				let worktree_terminal = head.as_ref().and_then(|h| h.branch.clone());
 				(worktree_terminal.as_deref() != Some(expected_terminal.as_str()))
 					.then_some(worktree_terminal)
@@ -618,3 +681,5 @@ mod native {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::inspect;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use native::inspect_structural_head;
