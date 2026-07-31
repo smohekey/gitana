@@ -1,0 +1,45 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+#
+# `cargo deny check` gates the dependency tree on:
+#   - licenses   — every dependency must carry a license from the allow-list below
+#   - advisories — no dependency with a known RustSec security advisory
+#   - bans       — no explicitly banned crates (none yet)
+#   - sources    — crates only from crates.io
+
+[graph]
+# Check every target the workspace builds for (host CLI + the wasm component).
+all-features = true
+
+[licenses]
+# Permissive licenses only — compatible with this project's own `MIT OR Apache-2.0`.
+allow = [
+	"MIT",
+	"Apache-2.0",
+	"Apache-2.0 WITH LLVM-exception",
+	"BSD-2-Clause",
+	"BSD-3-Clause",
+	"ISC",
+	"Unicode-3.0",
+	"Zlib",
+	"BSL-1.0",              # ryu (via `Apache-2.0 OR BSL-1.0`)
+	"CDLA-Permissive-2.0", # webpki-roots (the trusted-root cert bundle)
+]
+# A confidence threshold for detecting a license from text (1.0 = exact match).
+confidence-threshold = 0.9
+
+[advisories]
+# Fail on any crate with an active RustSec security advisory or a yanked version.
+yanked = "deny"
+ignore = []
+
+[bans]
+# Warn on multiple versions of the same crate (common and mostly harmless); tighten later if desired.
+multiple-versions = "warn"
+# The wildcard check is left off: the only "wildcards" here are the workspace's own intentional
+# versionless `{ path = … }` crates, which cargo-deny cannot waive while they lack `publish = false`.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
