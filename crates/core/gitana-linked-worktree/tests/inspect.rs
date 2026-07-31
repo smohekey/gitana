@@ -972,7 +972,10 @@ async fn a_corrupt_requested_branch_that_is_checked_out_is_classified_by_the_bra
 			"refs/heads/main",
 		]);
 		let wt = base.join("wt");
-		git(&["-C", w, "worktree", "add", wt.to_str().unwrap(), "alias"]);
+		// Create the worktree detached; its admin `HEAD` is rewritten to `alias` just below, so the
+		// checkout branch here is immaterial. (git 2.54 refuses `worktree add <symref-branch>` with
+		// "ignoring dangling symref", which git 2.50 allowed — naming `alias` here is git-version fragile.)
+		git(&["-C", w, "worktree", "add", "--detach", wt.to_str().unwrap()]);
 		let admin_name = std::fs::read_dir(work.join(".git/worktrees"))
 			.unwrap()
 			.next()
