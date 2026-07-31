@@ -30,7 +30,13 @@ confidence-threshold = 0.9
 [advisories]
 # Fail on any crate with an active RustSec security advisory or a yanked version.
 yanked = "deny"
-ignore = []
+ignore = [
+	# RUSTSEC-2023-0071 — the `rsa` crate's "Marvin Attack" timing sidechannel. No patched version
+	# exists (open upstream since 2023); it reaches us transitively via `pgp` (OpenPGP). gitana uses RSA
+	# only for signature *verification*, which does not exercise the private-key decryption path the
+	# attack targets, so the exposure is minimal. Reviewed 2026-08-01; drop this once a fixed `rsa` ships.
+	"RUSTSEC-2023-0071",
+]
 
 [bans]
 # Warn on multiple versions of the same crate (common and mostly harmless); tighten later if desired.
