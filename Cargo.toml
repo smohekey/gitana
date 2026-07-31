@@ -4,6 +4,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
+version = "0.1.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/smohekey/gitana"
 rust-version = "1.96.0"
@@ -16,28 +17,28 @@ cap-std = "4.0.2"
 clap = { version = "4.6.1", features = ["derive"] }
 clap-mcp = "0.0.5"
 flate2 = "1.1.9"
-gitana-clone = { path = "crates/core/gitana-clone" }
-gitana-config = { path = "crates/core/gitana-config" }
-gitana-config-native = { path = "crates/core/gitana-config-native" }
-gitana-credential = { path = "crates/core/gitana-credential" }
-gitana-diff = { path = "crates/core/gitana-diff" }
-gitana-file-store = { path = "crates/core/gitana-file-store" }
-gitana-file-store-conformance = { path = "crates/core/gitana-file-store-conformance" }
-gitana-file-store-local = { path = "crates/core/gitana-file-store-local" }
-gitana-file-store-memory = { path = "crates/core/gitana-file-store-memory" }
-gitana-git-http = { path = "crates/core/gitana-git-http" }
-gitana-identity = { path = "crates/core/gitana-identity" }
-gitana-linked-worktree = { path = "crates/core/gitana-linked-worktree" }
-gitana-object = { path = "crates/core/gitana-object" }
-gitana-object-store = { path = "crates/core/gitana-object-store" }
-gitana-porcelain = { path = "crates/core/gitana-porcelain", default-features = false }
-gitana-remote = { path = "crates/core/gitana-remote", default-features = false }
-gitana-repository-layout = { path = "crates/core/gitana-repository-layout" }
-gitana-repository = { path = "crates/core/gitana-repository" }
-gitana-trust = { path = "crates/core/gitana-trust" }
-gitana-worktree = { path = "crates/core/gitana-worktree" }
-gta-core = { path = "crates/cli/gta-core" }
-gta-mcp = { path = "crates/cli/gta-mcp" }
+gitana-clone = { version = "0.1.0", path = "crates/core/gitana-clone" }
+gitana-config = { version = "0.1.0", path = "crates/core/gitana-config" }
+gitana-config-native = { version = "0.1.0", path = "crates/core/gitana-config-native" }
+gitana-credential = { version = "0.1.0", path = "crates/core/gitana-credential" }
+gitana-diff = { version = "0.1.0", path = "crates/core/gitana-diff" }
+gitana-file-store = { version = "0.1.0", path = "crates/core/gitana-file-store" }
+gitana-file-store-conformance = { version = "0.1.0", path = "crates/core/gitana-file-store-conformance" }
+gitana-file-store-local = { version = "0.1.0", path = "crates/core/gitana-file-store-local" }
+gitana-file-store-memory = { version = "0.1.0", path = "crates/core/gitana-file-store-memory" }
+gitana-git-http = { version = "0.1.0", path = "crates/core/gitana-git-http" }
+gitana-identity = { version = "0.1.0", path = "crates/core/gitana-identity" }
+gitana-linked-worktree = { version = "0.1.0", path = "crates/core/gitana-linked-worktree" }
+gitana-object = { version = "0.1.0", path = "crates/core/gitana-object" }
+gitana-object-store = { version = "0.1.0", path = "crates/core/gitana-object-store" }
+gitana-porcelain = { version = "0.1.0", path = "crates/core/gitana-porcelain", default-features = false }
+gitana-remote = { version = "0.1.0", path = "crates/core/gitana-remote", default-features = false }
+gitana-repository-layout = { version = "0.1.0", path = "crates/core/gitana-repository-layout" }
+gitana-repository = { version = "0.1.0", path = "crates/core/gitana-repository" }
+gitana-trust = { version = "0.1.0", path = "crates/core/gitana-trust" }
+gitana-worktree = { version = "0.1.0", path = "crates/core/gitana-worktree" }
+gta-core = { version = "0.1.0", path = "crates/cli/gta-core" }
+gta-mcp = { version = "0.1.0", path = "crates/cli/gta-mcp" }
 hmac = "0.12"
 # Pure-Rust OpenPGP (rpgp). `default-features = false` drops the bzip2 C dependency; the verify path
 # needs no compression. Chosen over sequoia-openpgp for the wasm32-wasip2 build and clean-room story.

@@ -1,0 +1,35 @@
+# Supply-chain gate: `cargo deny` checks every dependency's license, security
+# advisories (RustSec), banned/duplicate crates, and source registry. Config: deny.toml.
+name: cargo-deny
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cargo-deny-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    name: check ${{ matrix.checks }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `advisories` is split out and non-blocking (see continue-on-error): a newly-published
+        # upstream CVE must be visible without red-X'ing every unrelated PR. The deterministic
+        # `licenses bans sources` group is blocking.
+        checks:
+          - licenses bans sources
+          - advisories
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}

@@ -628,14 +628,11 @@ fn parse_class(pattern: &[u8], start: usize) -> Option<(Class, usize)> {
 			if close > name_start && pattern[close - 1] == b':' {
 				// Terminated `[:name:]`: a known name is the class; an unknown one aborts the match.
 				let name = &pattern[name_start..close - 1];
-				match PosixClass::from_name(name) {
-					Some(class) => {
-						items.push(ClassItem::Posix(class));
-						i = close + 1; // skip past the closing `]`
-						continue;
-					}
-					None => return None,
-				}
+				// A known name is the class; an unknown one aborts the match.
+				let class = PosixClass::from_name(name)?;
+				items.push(ClassItem::Posix(class));
+				i = close + 1; // skip past the closing `]`
+				continue;
 			}
 			// Not a `…:]` terminator: treat the `[` as an ordinary member and resume from the `:`.
 			items.push(ClassItem::Char(b'['));

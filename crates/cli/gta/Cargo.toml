@@ -1,11 +1,11 @@
 [package]
+description = "A clean-room Git command-line client."
 edition.workspace = true
 license.workspace = true
 name = "gta"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 

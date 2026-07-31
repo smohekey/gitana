@@ -1,11 +1,11 @@
 [package]
+description = "MCP server exposing the gta Git command surface as tools."
 edition.workspace = true
 license.workspace = true
 name = "gta-mcp"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 

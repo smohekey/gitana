@@ -1,11 +1,11 @@
 [package]
+description = "Native discovery of Git configuration files and their precedence."
 edition.workspace = true
 license.workspace = true
 name = "gitana-config-native"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 

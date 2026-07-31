@@ -5,14 +5,14 @@
 # the workspace forbid.
 
 [package]
+description = "wasm32-wasip2 component exposing gitana repository operations."
 name = "gitana-repo-component"
 edition.workspace = true
 license.workspace = true
 publish = false
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lib]
 crate-type = ["cdylib"]
 

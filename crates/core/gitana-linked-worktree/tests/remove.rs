@@ -402,9 +402,10 @@ async fn removes_a_worktree_with_a_skip_worktree_entry() {
 #[tokio::test]
 async fn preserves_a_present_modified_skip_worktree_file() {
 	// Data-preservation regression (codex round 19): a tracked file marked `--skip-worktree` and then edited in
-	// place is invisible to `git status` (git ignores the working tree for skip-worktree entries), so both the
-	// tracked-changes gate and the residual scan pass it — yet removing the worktree would discard the edit.
-	// Removal must detect the present, content-diverged skip-worktree file and refuse, preserving the edit.
+	// place is invisible to `git status` (git ignores the working tree for skip-worktree entries), so a naive
+	// removal that trusted git would discard the edit. gitana's own `status` *does* report such a present,
+	// content-diverged file as modified, so the tracked-side `Dirty` gate catches it; the residual-content scan
+	// (`ModifiedTrackedContent`) is the backstop. Either way removal must refuse, preserving the edit.
 	for (fmt, _kind) in formats() {
 		let base = unique_tmp(&format!("remove-skipwt-modified-{fmt}"));
 		let work = base.join("repo");
@@ -428,10 +429,10 @@ async fn preserves_a_present_modified_skip_worktree_file() {
 			matches!(
 				err,
 				RemoveError::Refused(WorktreeClassification::ProtectedWithReason {
-					reason: ProtectionReason::ModifiedTrackedContent { .. }
+					reason: ProtectionReason::ModifiedTrackedContent { .. } | ProtectionReason::Dirty(_)
 				})
 			),
-			"{fmt}: a present, modified skip-worktree file must refuse removal, got {err:?}"
+			"{fmt}: a present, modified skip-worktree file must refuse removal (preserving the edit), got {err:?}"
 		);
 		assert_eq!(
 			std::fs::read_to_string(wt.join("a.txt")).unwrap(),

@@ -1,11 +1,11 @@
 [package]
+description = "Git remote operations (fetch, push, clone) over the Smart HTTP codec."
 edition.workspace = true
 license.workspace = true
 name = "gitana-remote"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
-
+version.workspace = true
 [lints]
 workspace = true
 
