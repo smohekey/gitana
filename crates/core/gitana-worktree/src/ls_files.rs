@@ -126,16 +126,13 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			}
 		}
 		let mut others = Vec::new();
-		collect_others(
-			wt.work(),
-			"",
-			&tracked,
-			&gitlinks,
-			opts.exclude_standard,
-			config.ignore_case,
-			&mut stack,
-			&mut others,
-		)?;
+		let walk = OthersWalk {
+			tracked: &tracked,
+			gitlinks: &gitlinks,
+			exclude_standard: opts.exclude_standard,
+			ignore_case: config.ignore_case,
+		};
+		collect_others(wt.work(), "", &walk, &mut stack, &mut others)?;
 		others.sort();
 		for path in &others {
 			if set.matches(path) {
@@ -204,10 +201,8 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 						'M'
 					}
 				} else {
-					match worktree_change(wt.work(), entry, &entry.path, config.file_mode) {
-						Ok(code) => code, // present → `M` or ` `
-						Err(_) => 'M',
-					}
+					// Present → `M` or ` `; a read failure (e.g. an unreadable file) counts as modified.
+					worktree_change(wt.work(), entry, &entry.path, config.file_mode).unwrap_or('M')
 				};
 				// An absent file (`D`) is reported by both `-d` and `-m`. A present, diverged file (`M`) is
 				// reported only by `-m` (assume-valid already collapsed to ` ` above).
@@ -311,18 +306,25 @@ fn render<H: HashAlgorithm>(
 	}
 }
 
+/// The read-only context of the `-o` working-tree walk — everything that stays constant across the
+/// recursion: the tracked / gitlink path sets (keys already folded per `core.ignoreCase`), whether
+/// `--exclude-standard` is applying the ignore stack, and the `core.ignoreCase` fold flag.
+struct OthersWalk<'a> {
+	tracked: &'a HashSet<String>,
+	gitlinks: &'a HashSet<String>,
+	exclude_standard: bool,
+	ignore_case: bool,
+}
+
 /// Recursively collect the working-tree files not present in the index (at any stage). With
-/// `exclude_standard`, apply the accumulated ignore rules per directory and skip ignored entries;
-/// otherwise list ignored files too. Never collapses a directory — git's `-o` lists every file
-/// individually — except an untracked embedded git repository, which git emits as the single opaque
-/// directory entry (`inner/`) rather than descending into its contents.
+/// `walk.exclude_standard`, apply the accumulated ignore rules per directory and skip ignored
+/// entries; otherwise list ignored files too. Never collapses a directory — git's `-o` lists every
+/// file individually — except an untracked embedded git repository, which git emits as the single
+/// opaque directory entry (`inner/`) rather than descending into its contents.
 fn collect_others<W: WorkDirFs>(
 	work: &W,
 	dir_rel: &str,
-	tracked: &HashSet<String>,
-	gitlinks: &HashSet<String>,
-	exclude_standard: bool,
-	ignore_case: bool,
+	walk: &OthersWalk<'_>,
 	stack: &mut Vec<DirIgnore>,
 	out: &mut Vec<String>,
 ) -> Result<(), WorktreeError> {
@@ -334,7 +336,7 @@ fn collect_others<W: WorkDirFs>(
 
 	// An unusable per-directory `.gitignore` (permission-denied, or a directory at that path) is
 	// non-fatal — git warns and continues — so a load failure just contributes no rules here.
-	let pushed = exclude_standard && push_gitignore(work, dir_rel, stack).unwrap_or(false);
+	let pushed = walk.exclude_standard && push_gitignore(work, dir_rel, stack).unwrap_or(false);
 
 	for entry in entries {
 		if entry.name == ".git" {
@@ -343,20 +345,20 @@ fn collect_others<W: WorkDirFs>(
 		let rel = join_rel(dir_rel, &entry.name);
 		// The membership key mirrors `core.ignoreCase`: ASCII-case-folded when set, so a disk `foo` matches
 		// the tracked/gitlink `Foo`.
-		let rel_key = if ignore_case {
+		let rel_key = if walk.ignore_case {
 			rel.to_ascii_lowercase()
 		} else {
 			rel.clone()
 		};
 		// The kind is an `lstat`: a symlinked directory is a symlink (a file), not a directory.
 		let is_dir = entry.kind.is_dir();
-		if exclude_standard && ignore::is_ignored_fold(&rel, is_dir, stack, ignore_case) {
+		if walk.exclude_standard && ignore::is_ignored_fold(&rel, is_dir, stack, walk.ignore_case) {
 			continue;
 		}
 		if is_dir {
 			// A tracked gitlink (submodule) directory is never listed under `-o`. An ordinary tracked path
 			// that is now a directory (a file→dir replacement) is not a gitlink, so it is still descended.
-			if gitlinks.contains(&rel_key) {
+			if walk.gitlinks.contains(&rel_key) {
 				continue;
 			}
 			// An untracked *valid* embedded repository is opaque: git lists the single `dir/` entry and
@@ -364,18 +366,10 @@ fn collect_others<W: WorkDirFs>(
 			if is_embedded_repo(work, &rel) {
 				out.push(format!("{rel}/"));
 			} else {
-				collect_others(
-					work,
-					&rel,
-					tracked,
-					gitlinks,
-					exclude_standard,
-					ignore_case,
-					stack,
-					out,
-				)?;
+				collect_others(work, &rel, walk, stack, out)?;
 			}
-		} else if (entry.kind.is_file() || entry.kind.is_symlink()) && !tracked.contains(&rel_key) {
+		} else if (entry.kind.is_file() || entry.kind.is_symlink()) && !walk.tracked.contains(&rel_key)
+		{
 			// git's `-o` lists regular files and symlinks; a socket / FIFO / device is never tracked and
 			// never listed.
 			out.push(rel);
