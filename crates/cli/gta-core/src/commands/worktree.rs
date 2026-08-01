@@ -587,16 +587,17 @@ fn zero_hex(kind: HashKind) -> String {
 	"0".repeat(raw_len * 2)
 }
 
-/// `git worktree list` default form: `<path>  <short-oid> <marker>`, path column padded to align; a
-/// bare repository renders as `<path>  (bare)`.
+/// `git worktree list` default form: `<path> <short-oid> <marker>`, path column padded to align; a
+/// bare repository renders as `<path> (bare)`.
 fn render_default(entries: &[WorktreeInfo]) -> String {
-	// git pads the path column to the longest path plus one, then a single space before the oid.
+	// git pads the path column to the longest path, then a single space before the oid — so the
+	// widest row has a one-space gap. (git 2.50 and earlier used an extra space here; 2.5x tightened
+	// it to one, which is the reference this suite tracks.)
 	let width = entries
 		.iter()
 		.map(|entry| entry.path.to_string_lossy().len())
 		.max()
-		.unwrap_or(0)
-		+ 1;
+		.unwrap_or(0);
 	let mut out = String::new();
 	for entry in entries {
 		let path = entry.path.to_string_lossy();

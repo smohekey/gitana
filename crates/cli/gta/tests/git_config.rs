@@ -1806,10 +1806,16 @@ fn command_scope_dot_gitdir_condition_never_matches() {
 	if !git_supports_sha256() {
 		return;
 	}
-	// A `gitdir:./` condition in command-scope config has no file to resolve against; git prints a
-	// non-fatal warning and treats it as unmatched. gta agrees (returning non-matching rather than
-	// rooting the pattern at `/`, which would match unrelated repositories): the include is skipped and
-	// `user.email` stays unset, so the read exits non-zero — as git's does.
+	// A `gitdir:./` condition in command-scope config has no file to resolve against. gta returns
+	// non-matching (rather than rooting the pattern at `/`, which would match unrelated repositories):
+	// the include is skipped and `user.email` stays unset, so the read exits non-zero.
+	//
+	// DOCUMENTED DIVERGENCE — stock git's behaviour here is version-dependent, so this case is not
+	// oracle-checked against the installed git. Both git 2.50 and gta print the "relative config
+	// include conditionals must come from files" error and skip the include (read exits non-zero).
+	// git 2.5x prints the *same* error but then applies the include anyway (`user.email` becomes set,
+	// read exits zero) — evaluating a conditional it just reported it could not evaluate, which looks
+	// like a git regression. gta keeps the safer skip; we assert only gta's behaviour.
 	let work = init("gta-c-dotgitdir");
 	let w = work.to_str().unwrap();
 	let cfgdir = unique_tmp("gta-c-dotgitdir-inc");
@@ -1825,7 +1831,6 @@ fn command_scope_dot_gitdir_condition_never_matches() {
 		!gta_env(w, &["config", "user.email"], &env).status.success(),
 		"gta matched a `gitdir:./` condition in command-scope config"
 	);
-	assert!(!git_env(w, &["config", "user.email"], &env).status.success());
 	std::fs::remove_dir_all(&work).ok();
 	std::fs::remove_dir_all(&cfgdir).ok();
 }
