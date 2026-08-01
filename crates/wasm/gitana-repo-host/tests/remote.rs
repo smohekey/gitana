@@ -30,12 +30,12 @@ use gitana_git_http::{
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 use gitana_repo_host::exports::gitana::repo::porcelain::PushOutcome;
 use gitana_repo_host::{
-	StoreFileCredentials, engine, grant_dir, instantiate, store, store_with_credentials,
+	StoreFileCredentials, grant_dir, instantiate_component, store, store_with_credentials,
 };
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 use tokio::net::TcpListener;
 
-use self::support::{Session, build_component, native_repo};
+use self::support::{Session, native_repo, shared};
 
 /// A fixed identity for server-side commits (`Name <email> seconds ±hhmm`).
 const WHO: &str = "A U Thor <a@example.com> 0 +0000";
@@ -331,9 +331,9 @@ async fn clone_populates_checkout<H: HashAlgorithm>() -> Result<()> {
 
 	// Clone through the component, over wasi:http. `clone` is a static func that consumes the two
 	// granted descriptors and returns unit (a clone populates directories, it does not open one).
-	let engine = engine()?;
-	let mut store = store(&engine);
-	let repo = instantiate(&engine, &mut store, build_component()).await?;
+	let (engine, component) = shared();
+	let mut store = store(engine);
+	let repo = instantiate_component(engine, &mut store, component).await?;
 	let git_desc = grant_dir(&mut store, &git)?;
 	let work_desc = grant_dir(&mut store, &work)?;
 	repo
@@ -630,10 +630,10 @@ async fn clone_authenticates_via_host_credentials<H: HashAlgorithm>() -> Result<
 	std::fs::create_dir_all(&git)?;
 
 	// Clone through the component, the host answering credentials from the store file.
-	let engine = engine()?;
+	let (engine, component) = shared();
 	let mut store_handle =
-		store_with_credentials(&engine, Box::new(StoreFileCredentials::new(&store)));
-	let repo = instantiate(&engine, &mut store_handle, build_component()).await?;
+		store_with_credentials(engine, Box::new(StoreFileCredentials::new(&store)));
+	let repo = instantiate_component(engine, &mut store_handle, component).await?;
 	let git_desc = grant_dir(&mut store_handle, &git)?;
 	let work_desc = grant_dir(&mut store_handle, &work)?;
 	repo
