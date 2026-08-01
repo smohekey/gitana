@@ -111,8 +111,23 @@ fn prune_refuses_while_an_operation_is_in_progress() {
 	write_add_commit(w, &work, "f.txt", "theirs", "theirs");
 	git_id(w, &["checkout", "main"]);
 
-	// A conflicting merge leaves MERGE_HEAD in place.
-	assert!(!git_ok(w, &["merge", "other"]), "merge should conflict");
+	// A conflicting merge leaves MERGE_HEAD in place. The identity flags matter: git refuses to *start*
+	// a merge with no committer identity (a bare runner has none), erroring out before it can conflict —
+	// so pass one, or MERGE_HEAD is never written and there is no in-progress state for prune to refuse.
+	assert!(
+		!git_ok(
+			w,
+			&[
+				"-c",
+				"user.name=T",
+				"-c",
+				"user.email=t@e",
+				"merge",
+				"other"
+			]
+		),
+		"merge should conflict"
+	);
 
 	std::fs::write(work.join("dangling"), "unique dangling 99\n").unwrap();
 	let dangling = git(w, &["hash-object", "-w", "dangling"]).trim().to_owned();
