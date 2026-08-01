@@ -70,19 +70,37 @@ pub fn formats() -> Vec<(&'static str, HashKind)> {
 	out
 }
 
-/// `git init --object-format=<fmt>` an ordinary repo at `work` with a committer identity set.
+/// `git init --object-format=<fmt>` an ordinary repo at `work` with a committer identity set. `-b
+/// main` pins the initial branch so tests do not depend on the ambient `init.defaultBranch` (which
+/// differs by platform — `master` on stock git, `main` on some vendored builds).
 pub fn init_repo(work: &Path, fmt: &str) {
 	let w = work.to_str().unwrap();
-	git(&["init", &format!("--object-format={fmt}"), "-q", w]);
+	git(&[
+		"init",
+		"-b",
+		"main",
+		&format!("--object-format={fmt}"),
+		"-q",
+		w,
+	]);
 	git(&["-C", w, "config", "user.name", "T"]);
 	git(&["-C", w, "config", "user.email", "t@e"]);
 	git(&["-C", w, "config", "commit.gpgsign", "false"]);
 }
 
-/// `git init --bare --object-format=<fmt>` a bare repo at `git_dir`.
+/// `git init --bare --object-format=<fmt>` a bare repo at `git_dir` (initial branch pinned to `main`;
+/// see [`init_repo`]).
 pub fn init_bare(git_dir: &Path, fmt: &str) {
 	let g = git_dir.to_str().unwrap();
-	git(&["init", "--bare", &format!("--object-format={fmt}"), "-q", g]);
+	git(&[
+		"init",
+		"--bare",
+		"-b",
+		"main",
+		&format!("--object-format={fmt}"),
+		"-q",
+		g,
+	]);
 	git(&["-C", g, "config", "user.name", "T"]);
 	git(&["-C", g, "config", "user.email", "t@e"]);
 	git(&["-C", g, "config", "commit.gpgsign", "false"]);

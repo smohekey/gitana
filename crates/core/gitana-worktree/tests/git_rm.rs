@@ -380,7 +380,19 @@ async fn rm_negative_only_no_candidate_is_pathspec_match() {
 	let work = unique_tmp("rm-negonly-nomatch");
 	let w = work.to_str().unwrap();
 	git(&["init", "--object-format=sha256", "-q", w]);
-	git(&["-C", w, "commit", "-q", "--allow-empty", "-m", "empty"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"--allow-empty",
+		"-m",
+		"empty",
+	]);
 
 	let result = make_repo(&work)
 		.rm(&[":!nope"], "", false, false, true, false)

@@ -189,7 +189,19 @@ async fn restore_negative_only_empty_repo_errors() {
 	let work = unique_tmp("restore-negonly-empty");
 	let w = work.to_str().unwrap();
 	git(&["init", "--object-format=sha256", "-q", w]);
-	git(&["-C", w, "commit", "-q", "--allow-empty", "-m", "empty"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"--allow-empty",
+		"-m",
+		"empty",
+	]);
 
 	let result = make_repo(&work)
 		.restore(None, true, false, &[":!nope"], "")

@@ -41,6 +41,8 @@ fn check_linked_worktree(object_format: &str) {
 		&[
 			"init",
 			"-q",
+			"-b",
+			"main",
 			&format!("--object-format={object_format}"),
 			".",
 		],
@@ -108,7 +110,10 @@ fn switch_refuses_a_branch_checked_out_in_another_worktree() {
 	let wt_s = wt.to_str().unwrap();
 
 	std::fs::create_dir_all(&main).unwrap();
-	git(main_s, &["init", "-q", "--object-format=sha256", "."]);
+	git(
+		main_s,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
 	git(main_s, &["config", "user.name", "T"]);
 	git(main_s, &["config", "user.email", "t@e"]);
 	std::fs::write(main.join("f.txt"), "base\n").unwrap();
@@ -202,7 +207,10 @@ fn rebase_state_is_isolated_per_worktree() {
 
 	// `main` and `feature` diverge on f.txt (so a rebase conflicts); `feature` lives in a linked wt.
 	std::fs::create_dir_all(&main).unwrap();
-	git(main_s, &["init", "-q", "--object-format=sha256", "."]);
+	git(
+		main_s,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
 	git(main_s, &["config", "user.name", "T"]);
 	git(main_s, &["config", "user.email", "t@e"]);
 	std::fs::write(main.join("f.txt"), "base\n").unwrap();
