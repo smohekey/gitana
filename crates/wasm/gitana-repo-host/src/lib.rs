@@ -358,6 +358,12 @@ impl gitana::repo::ssh_transport::HostSshSession for State {
 }
 
 /// Instantiate the component at `component_path` against the p2 WASI linker.
+///
+/// Convenience over [`instantiate_component`] for the one-shot case: it compiles the component with
+/// [`Component::from_file`] and instantiates it. Compilation is expensive (Cranelift, seconds for this
+/// component) and unavoidable here — a caller that instantiates the *same* component repeatedly (a test
+/// harness, or a host serving many repositories) should compile it once and reuse it via
+/// [`instantiate_component`].
 pub async fn instantiate(
 	engine: &Engine,
 	store: &mut Store<State>,
@@ -365,6 +371,20 @@ pub async fn instantiate(
 ) -> Result<Repo> {
 	let component = Component::from_file(engine, component_path)
 		.with_context(|| format!("loading component {}", component_path.display()))?;
+	instantiate_component(engine, store, &component).await
+}
+
+/// Instantiate an already-compiled `component` against the p2 WASI linker, wiring the host side of the
+/// `credentials` and `ssh-transport` imports. `component` must have been compiled by `engine`.
+///
+/// Split out from [`instantiate`] so the expensive [`Component::from_file`] compile can be paid once and
+/// the resulting [`Component`] reused across many instantiations (each cheap — a fresh [`Store`] per
+/// instantiation is all that a new session needs).
+pub async fn instantiate_component(
+	engine: &Engine,
+	store: &mut Store<State>,
+	component: &Component,
+) -> Result<Repo> {
 	let mut linker = Linker::new(engine);
 	wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 	wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
@@ -377,7 +397,7 @@ pub async fn instantiate(
 	gitana::repo::ssh_transport::add_to_linker::<_, HasSelf<_>>(&mut linker, |state: &mut State| {
 		state
 	})?;
-	Ok(Repo::instantiate_async(store, &component, &linker).await?)
+	Ok(Repo::instantiate_async(store, component, &linker).await?)
 }
 
 /// Mint a `wasi:filesystem` directory descriptor for `host_path` and push it into the

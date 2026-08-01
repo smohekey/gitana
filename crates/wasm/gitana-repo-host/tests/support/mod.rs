@@ -14,12 +14,12 @@ use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, Tag, encode_tag};
 use gitana_object_store::ObjectStore;
 use gitana_repo_host::exports::gitana::repo::porcelain::{HashKind, RepoError};
 use gitana_repo_host::{
-	HostCredentialProvider, HostSshProvider, Repo, State, engine, grant_dir, instantiate, store,
-	store_with_credentials, store_with_ssh,
+	HostCredentialProvider, HostSshProvider, Repo, State, engine, grant_dir, instantiate_component,
+	store, store_with_credentials, store_with_ssh,
 };
 use gitana_repository::{FileMode, ReflogIntent, Repository, TreeBuildEntry};
-use wasmtime::Store;
-use wasmtime::component::ResourceAny;
+use wasmtime::component::{Component, ResourceAny};
+use wasmtime::{Engine, Store};
 
 pub const AUTHOR: &str = "A U Thor <author@example.com> 1719900000 +0000";
 
@@ -65,6 +65,24 @@ pub fn build_component() -> &'static Path {
 			.unwrap_or_else(|| workspace.join("target"));
 		target.join("wasm32-wasip2/debug/gitana_repo_component.wasm")
 	})
+}
+
+/// A shared engine and the guest component compiled against it, built once per test process.
+///
+/// `Component::from_file` Cranelift-compiles the component (seconds); every `Session` used to pay that
+/// on each open. Compiling once here and reusing the `Component` across sessions makes each open cheap
+/// (a fresh `Store` + instantiation, ~1ms) — the component and engine are immutable and safe to share
+/// across the parallel test threads. Every session in a process must instantiate against *this* engine,
+/// since a component can only run in the engine that compiled it.
+pub fn shared() -> (&'static Engine, &'static Component) {
+	static SHARED: OnceLock<(Engine, Component)> = OnceLock::new();
+	let (engine, component) = SHARED.get_or_init(|| {
+		let engine = engine().expect("build wasmtime engine");
+		let component =
+			Component::from_file(&engine, build_component()).expect("compile guest component");
+		(engine, component)
+	});
+	(engine, component)
 }
 
 /// Open the fixture directory as a native gitana repository (the tests' oracle view).
@@ -239,9 +257,9 @@ impl Session {
 	/// Instantiate the guest (no preopens), grant `git_dir` as a descriptor, and
 	/// open the repository through it.
 	pub async fn open(git_dir: &Path) -> Result<Self> {
-		let engine = engine()?;
-		let mut store = store(&engine);
-		let repo = instantiate(&engine, &mut store, build_component()).await?;
+		let (engine, component) = shared();
+		let mut store = store(engine);
+		let repo = instantiate_component(engine, &mut store, component).await?;
 		let dir = grant_dir(&mut store, git_dir)?;
 		let handle = repo
 			.gitana_repo_porcelain()
@@ -263,9 +281,9 @@ impl Session {
 		git_dir: &Path,
 		credentials: Box<dyn HostCredentialProvider>,
 	) -> Result<Self> {
-		let engine = engine()?;
-		let mut store = store_with_credentials(&engine, credentials);
-		let repo = instantiate(&engine, &mut store, build_component()).await?;
+		let (engine, component) = shared();
+		let mut store = store_with_credentials(engine, credentials);
+		let repo = instantiate_component(engine, &mut store, component).await?;
 		let dir = grant_dir(&mut store, git_dir)?;
 		let handle = repo
 			.gitana_repo_porcelain()
@@ -283,9 +301,9 @@ impl Session {
 	/// Like [`Session::open`], but granting `ssh` as the host source answering the guest's
 	/// `ssh-transport` import — so a fetch/push against an SSH remote spawns via the provider.
 	pub async fn open_with_ssh(git_dir: &Path, ssh: Box<dyn HostSshProvider>) -> Result<Self> {
-		let engine = engine()?;
-		let mut store = store_with_ssh(&engine, ssh);
-		let repo = instantiate(&engine, &mut store, build_component()).await?;
+		let (engine, component) = shared();
+		let mut store = store_with_ssh(engine, ssh);
+		let repo = instantiate_component(engine, &mut store, component).await?;
 		let dir = grant_dir(&mut store, git_dir)?;
 		let handle = repo
 			.gitana_repo_porcelain()
@@ -304,9 +322,9 @@ impl Session {
 	/// `work_dir` as descriptors, and open a repository with its working tree that
 	/// routes across the three (`git_dir == common_dir` for an ordinary repository).
 	pub async fn open_worktree(git_dir: &Path, common_dir: &Path, work_dir: &Path) -> Result<Self> {
-		let engine = engine()?;
-		let mut store = store(&engine);
-		let repo = instantiate(&engine, &mut store, build_component()).await?;
+		let (engine, component) = shared();
+		let mut store = store(engine);
+		let repo = instantiate_component(engine, &mut store, component).await?;
 		let git = grant_dir(&mut store, git_dir)?;
 		let common = grant_dir(&mut store, common_dir)?;
 		let work = grant_dir(&mut store, work_dir)?;
@@ -326,9 +344,9 @@ impl Session {
 	/// Like [`Session::open`], but through the guest's `init` export; the guest's
 	/// typed error is preserved for tests asserting init failures.
 	pub async fn try_init(git_dir: &Path, kind: HashKind) -> Result<Result<Self, RepoError>> {
-		let engine = engine()?;
-		let mut store = store(&engine);
-		let repo = instantiate(&engine, &mut store, build_component()).await?;
+		let (engine, component) = shared();
+		let mut store = store(engine);
+		let repo = instantiate_component(engine, &mut store, component).await?;
 		let dir = grant_dir(&mut store, git_dir)?;
 		let opened = repo
 			.gitana_repo_porcelain()

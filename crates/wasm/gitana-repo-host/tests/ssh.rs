@@ -22,10 +22,11 @@ use anyhow::{Result, anyhow};
 use gitana_object::{HashAlgorithm, Sha1, Sha256};
 use gitana_repo_host::exports::gitana::repo::porcelain::PushOutcome;
 use gitana_repo_host::{
-	HostSshProvider, StoreFileCredentials, engine, grant_dir, instantiate, store_with, store_with_ssh,
+	HostSshProvider, StoreFileCredentials, grant_dir, instantiate_component, store_with,
+	store_with_ssh,
 };
 
-use self::support::{Session, build_component, native_repo};
+use self::support::{Session, native_repo, shared};
 
 // --- the fake ssh provider ----------------------------------------------------------------------
 
@@ -145,9 +146,9 @@ async fn clone_over_ssh<H: HashAlgorithm>() -> Result<()> {
 	std::fs::create_dir_all(&git_dir)?;
 
 	// `clone` is a static func consuming the two granted descriptors; the host answers ssh-transport.
-	let engine = engine()?;
-	let mut store = store_with_ssh(&engine, Box::new(FakeSsh));
-	let repo = instantiate(&engine, &mut store, build_component()).await?;
+	let (engine, component) = shared();
+	let mut store = store_with_ssh(engine, Box::new(FakeSsh));
+	let repo = instantiate_component(engine, &mut store, component).await?;
 	let git_desc = grant_dir(&mut store, &git_dir)?;
 	let work_desc = grant_dir(&mut store, &work)?;
 	repo
@@ -453,13 +454,13 @@ async fn both_capabilities_can_be_granted_together() {
 	let cred_store = cli.join("creds");
 	std::fs::write(&cred_store, "").unwrap();
 
-	let engine = engine().unwrap();
+	let (engine, component) = shared();
 	let mut store = store_with(
-		&engine,
+		engine,
 		Some(Box::new(StoreFileCredentials::new(&cred_store))),
 		Some(Box::new(FakeSsh)),
 	);
-	let repo = instantiate(&engine, &mut store, build_component())
+	let repo = instantiate_component(engine, &mut store, component)
 		.await
 		.unwrap();
 	let dir = grant_dir(&mut store, &client_git).unwrap();
