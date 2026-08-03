@@ -5,6 +5,7 @@ use gitana_file_store_local::{Meta, WorkDirFs};
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::Repository;
 
+use crate::excludes::StandardExcludes;
 use crate::fsmeta::{effective_mode, join_rel, mode_of, push_gitignore, stat_of};
 use crate::ignore::{self, DirIgnore};
 use crate::sparse::{SparseCheckout, SparseReapply, SparseSet};
@@ -572,8 +573,38 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		pathspecs: &[&str],
 		prefix: &str,
 		force: bool,
+		excludes_file: Option<&str>,
 	) -> Result<(), WorktreeError> {
 		let mut index = self.load_index().await?;
+		// `add` with no pathspec at all is git's "Nothing specified, nothing added" no-op: it reads no
+		// exclude files (so a directory `.git/info/exclude` is not fatal here) but *does* validate
+		// `core.ignoreCase` (probed vs git 2.55). Callers reaching this crate directly — the wasm
+		// component, MCP, other API users — can pass an empty list even though the `gta` CLI requires
+		// paths, so handle it before loading any exclude file.
+		if pathspecs.is_empty() {
+			crate::excludes::ignore_case(self).await?;
+			return self.save_index(&index).await;
+		}
+		// git's standard excludes for the ignored-path decisions below: the `core.ignoreCase` fold flag
+		// plus the whole-tree exclude levels (`core.excludesFile`, `.git/info/exclude`) beneath
+		// per-directory `.gitignore`. Seeds every ignore stack so `add` prunes (and advises about) the same
+		// files git does; previously only `.gitignore` was consulted, case-sensitively.
+		//
+		// `add -f` stages ignored paths regardless, and git does not read the exclude files on that path
+		// (a directory `.git/info/exclude` is fatal for a plain `add` but not for `add -f`, probed vs git
+		// 2.55) — it still validates `core.ignoreCase`, so resolve the fold flag alone and leave the base
+		// empty (the forced walk consults no ignore stack anyway).
+		let StandardExcludes {
+			fold,
+			base: excludes,
+		} = if force {
+			StandardExcludes {
+				fold: crate::excludes::ignore_case(self).await?,
+				base: Vec::new(),
+			}
+		} else {
+			crate::excludes::standard_excludes(self, excludes_file).await?
+		};
 		// The active sparse matcher: `add` never stages a path outside it (git refuses an out-of-cone path,
 		// advising `--sparse`), whether or not the path already has a skip-worktree entry.
 		let sparse = self.sparse_checkout().await?;
@@ -597,17 +628,14 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		let ignored = if force {
 			Vec::new()
 		} else {
-			self.collect_ignored_advisory(&set, &index)?
+			self.collect_ignored_advisory(&set, &index, &excludes, fold)?
 		};
-		let mut ignore_stack: Vec<DirIgnore> = Vec::new();
+		let mut ignore_stack: Vec<DirIgnore> = excludes.clone();
 		if set.is_positive_empty() {
-			// No pathspec at all is a no-op (git's "Nothing specified, nothing added"); a set of *only*
-			// negatives stages the whole tree minus them, like `add .` with the exclusions applied.
-			if pathspecs.is_empty() {
-				return self.save_index(&index).await;
-			}
+			// A set of *only* negatives (the empty-pathspec case having already returned above) stages the
+			// whole tree minus them, like `add .` with the exclusions applied.
 			let mut files = Vec::new();
-			walk_files(self.work(), "", &mut ignore_stack, &mut files, force)?;
+			walk_files(self.work(), "", &mut ignore_stack, &mut files, force, fold)?;
 			let walked: std::collections::HashSet<String> = files.iter().cloned().collect();
 			for file in &files {
 				if !set.is_excluded(file) {
@@ -664,6 +692,8 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 						&initial_tracked_all,
 						&mut sparse_omitted,
 						force,
+						&excludes,
+						fold,
 					)
 					.await?;
 				continue;
@@ -673,7 +703,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			// The empty spec (`.` at the work-tree root) always names the root directory to walk.
 			if rel.is_empty() {
 				let mut files = Vec::new();
-				walk_files(self.work(), "", &mut ignore_stack, &mut files, force)?;
+				walk_files(self.work(), "", &mut ignore_stack, &mut files, force, fold)?;
 				let walked: std::collections::HashSet<String> = files.iter().cloned().collect();
 				for file in &files {
 					if !set.is_excluded(file) {
@@ -692,15 +722,15 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					let mut files = Vec::new();
 					// Seed the ignore stack with the ancestor `.gitignore`s (root down to `rel`'s parent)
 					// so a rule above the named directory still applies to its walk.
-					let mut stack = crate::checkout::ignore_prefix(self.work(), &rel)?;
+					let mut stack = crate::checkout::ignore_prefix(self.work(), &rel, &excludes)?;
 					// Don't stage *untracked* files from an explicitly-named ignored directory (or one under an
 					// ignored ancestor): git refuses them, staging only the tracked modifications beneath it
 					// (handled by `stage_tracked_outside_walk` below). `force` stages the untracked content too.
 					// The advisory itself is recorded by the up-front `collect_ignored_advisory` pass; here we
 					// only decide whether to walk. Probed vs git 2.50.1: `add ignored` on an ignored `ignored/`
 					// stages a modified tracked child but not an untracked sibling, and exits non-zero.
-					if force || self.ignored_report_path(&rel, &stack)?.is_none() {
-						walk_files(self.work(), &rel, &mut stack, &mut files, force)?;
+					if force || self.ignored_report_path(&rel, &stack, fold)?.is_none() {
+						walk_files(self.work(), &rel, &mut stack, &mut files, force, fold)?;
 					}
 					files.retain(|file| !set.is_excluded(file));
 					// An explicitly-named directory whose matches are ALL out-of-cone is one git reports (the
@@ -751,8 +781,8 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					let tracked =
 						index.entry(&rel).is_some() || index.unmerged_paths().any(|path| path == rel);
 					if !force && !tracked {
-						let stack = crate::checkout::ignore_prefix(self.work(), &rel)?;
-						if self.ignored_report_path(&rel, &stack)?.is_some() {
+						let stack = crate::checkout::ignore_prefix(self.work(), &rel, &excludes)?;
+						if self.ignored_report_path(&rel, &stack, fold)?.is_some() {
 							// A `:(glob)` pathspec (glob magic, even without metacharacters) that resolves only to
 							// an untracked ignored file is git's "did not match" (exit 128), NOT the ignored advisory
 							// a plain literal gets — the glob matched no addable path (probed vs git 2.50.1:
@@ -853,6 +883,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		&self,
 		target: &str,
 		stack: &[DirIgnore],
+		fold: bool,
 	) -> Result<Option<(String, bool)>, WorktreeError> {
 		let mut idx = 0;
 		while let Some(next) = target[idx..].find('/') {
@@ -861,14 +892,14 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			// ignored regular file that a pathspec descends through (`.gitignore` = `file`, `add x :!file/sub`
 			// → reports `file`). A dir-only rule (`file/`) then correctly won't match the regular file.
 			if let Some(meta) = self.work().lstat(ancestor)?
-				&& ignore::is_ignored(ancestor, meta.kind.is_dir(), stack)
+				&& ignore::is_ignored_fold(ancestor, meta.kind.is_dir(), stack, fold)
 			{
 				return Ok(Some((ancestor.to_owned(), false)));
 			}
 			idx += next + 1;
 		}
 		match self.work().lstat(target)? {
-			Some(meta) if ignore::is_ignored(target, meta.kind.is_dir(), stack) => {
+			Some(meta) if ignore::is_ignored_fold(target, meta.kind.is_dir(), stack, fold) => {
 				Ok(Some((target.to_owned(), true)))
 			}
 			_ => Ok(None),
@@ -947,6 +978,8 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		&self,
 		set: &crate::pathspec::PathspecSet,
 		index: &Index<H>,
+		excludes: &[DirIgnore],
+		fold: bool,
 	) -> Result<Vec<String>, WorktreeError> {
 		let mut ignored = Vec::new();
 		for pathspec in set.all() {
@@ -977,8 +1010,8 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			if probe.is_empty() {
 				continue;
 			}
-			let stack = crate::checkout::ignore_prefix(self.work(), probe)?;
-			if let Some((report, is_leaf)) = self.ignored_report_path(probe, &stack)? {
+			let stack = crate::checkout::ignore_prefix(self.work(), probe, excludes)?;
+			if let Some((report, is_leaf)) = self.ignored_report_path(probe, &stack, fold)? {
 				// A leaf ignore-match on an already-tracked path does not advise — git stages it (ignore never
 				// applies to a tracked path, and there is no ignored ancestor directory to report).
 				let tracked =
@@ -1016,24 +1049,26 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		initial_tracked: &std::collections::HashSet<String>,
 		omitted: &mut Vec<String>,
 		force: bool,
+		excludes: &[DirIgnore],
+		fold: bool,
 	) -> Result<(), WorktreeError> {
 		let base = pathspec.base_dir();
 		let mut files = Vec::new();
-		let mut stack = crate::checkout::ignore_prefix(self.work(), base)?;
+		let mut stack = crate::checkout::ignore_prefix(self.work(), base, excludes)?;
 		// Don't walk into an explicitly-named ignored base (`add 'ign/*'` with `.gitignore` containing
 		// `ign/`): git stages no *untracked* file from it, so a glob whose only fresh candidates are ignored
 		// is git's "did not match" unless a tracked entry also matched. `force` walks it (staging the ignored
 		// content); a broad glob (empty base) is never a refused ignored base. The ignored-path advisory for
 		// the base is recorded by the caller's `collect_ignored_advisory` pass. Probed vs git 2.50.1.
 		let base_ignored =
-			!base.is_empty() && !force && self.ignored_report_path(base, &stack)?.is_some();
+			!base.is_empty() && !force && self.ignored_report_path(base, &stack, fold)?.is_some();
 		// Walk only when the base directory exists and is not a refused ignored base — a glob under a missing
 		// directory matches no present file, though it may still match a tracked deletion below. The seeded
 		// `stack` carries the ancestor `.gitignore`s (root down to `base`'s parent) into the walk.
 		if !base_ignored
 			&& (base.is_empty() || matches!(self.work().lstat(base)?, Some(meta) if meta.kind.is_dir()))
 		{
-			walk_files(self.work(), base, &mut stack, &mut files, force)?;
+			walk_files(self.work(), base, &mut stack, &mut files, force, fold)?;
 		}
 		let mut matched = false;
 		let mut staged: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1303,9 +1338,12 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	}
 
 	/// Compute the three-way status: HEAD tree vs index (staged) and index vs
-	/// working tree (unstaged), plus untracked files.
-	pub async fn status(&self) -> Result<Status, WorktreeError> {
-		crate::status::compute(self).await
+	/// working tree (unstaged), plus untracked files. `excludes_file` is the content of git's global
+	/// excludes file (`core.excludesFile`), which the caller resolves because it lives outside the
+	/// worktree; `None` when there is none. `core.ignoreCase` and `.git/info/exclude` are read
+	/// internally (see [`crate::excludes`]).
+	pub async fn status(&self, excludes_file: Option<&str>) -> Result<Status, WorktreeError> {
+		crate::status::compute(self, excludes_file).await
 	}
 
 	/// git `ls-files`: list index and/or working-tree paths selected by `opts` and filtered by
@@ -1362,9 +1400,17 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	}
 
 	/// Materialise `tree` into the working directory and index. Without `force`,
-	/// refuses to overwrite uncommitted local changes. Does not move `HEAD`.
-	pub async fn checkout(&self, tree: ObjectId<H>, force: bool) -> Result<(), WorktreeError> {
-		crate::checkout::run(self, tree, force).await
+	/// refuses to overwrite uncommitted local changes. Does not move `HEAD`. `excludes_file` is the
+	/// content of git's global excludes file (`core.excludesFile`); the overwrite guard treats a file
+	/// ignored by it (or by `.git/info/exclude`, or a `core.ignoreCase` case-variant) as expendable.
+	/// `None` when there is none (internal callers, wasm).
+	pub async fn checkout(
+		&self,
+		tree: ObjectId<H>,
+		force: bool,
+		excludes_file: Option<&str>,
+	) -> Result<(), WorktreeError> {
+		crate::checkout::run(self, tree, force, excludes_file).await
 	}
 
 	/// Apply only the `from_tree` → `to_tree` diff (git's `read-tree -m -u` two-way merge, for a
@@ -1559,6 +1605,7 @@ fn walk_files<W: WorkDirFs>(
 	stack: &mut Vec<DirIgnore>,
 	out: &mut Vec<String>,
 	force: bool,
+	fold: bool,
 ) -> Result<(), WorktreeError> {
 	let pushed = push_gitignore(work, dir_rel, stack)?;
 	for entry in work.read_dir(dir_rel)? {
@@ -1567,11 +1614,11 @@ fn walk_files<W: WorkDirFs>(
 		}
 		let rel = join_rel(dir_rel, &entry.name);
 		let is_dir = entry.kind.is_dir();
-		if !force && ignore::is_ignored(&rel, is_dir, stack) {
+		if !force && ignore::is_ignored_fold(&rel, is_dir, stack, fold) {
 			continue;
 		}
 		if is_dir {
-			walk_files(work, &rel, stack, out, force)?;
+			walk_files(work, &rel, stack, out, force, fold)?;
 		} else {
 			out.push(rel);
 		}

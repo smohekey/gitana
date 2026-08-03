@@ -350,7 +350,7 @@ mod native {
 					|| repo.cherry_pick_head().await?.is_some()
 					|| repo.revert_head().await?.is_some();
 				let status = WorkTree::new(repo, work, git_dir.to_path_buf())
-					.status()
+					.status(None)
 					.await?;
 				(status, has_stash, operation_in_progress)
 			}
@@ -362,7 +362,7 @@ mod native {
 					|| repo.cherry_pick_head().await?.is_some()
 					|| repo.revert_head().await?.is_some();
 				let status = WorkTree::new(repo, work, git_dir.to_path_buf())
-					.status()
+					.status(None)
 					.await?;
 				(status, has_stash, operation_in_progress)
 			}
@@ -393,13 +393,13 @@ mod native {
 			HashKind::Sha1 => {
 				let repo = Repository::<_, Sha1>::new(ObjectStore::new(store));
 				WorkTree::new(repo, work, git_dir.to_path_buf())
-					.status()
+					.status(None)
 					.await?
 			}
 			HashKind::Sha256 => {
 				let repo = Repository::<_, Sha256>::new(ObjectStore::new(store));
 				WorkTree::new(repo, work, git_dir.to_path_buf())
-					.status()
+					.status(None)
 					.await?
 			}
 		};

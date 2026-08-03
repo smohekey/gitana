@@ -74,6 +74,180 @@ fn rm_cached_on_unmerged_path_shows_both_lines() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+#[test]
+fn honors_ignorecase_info_exclude_and_excludes_file() {
+	// End-to-end: `gta status` must consult git's three standard exclude sources for untracked
+	// detection — a case-folded `.gitignore` (`core.ignoreCase`), `.git/info/exclude`, and the global
+	// `core.excludesFile` — exactly as `git status` does. Previously it read only `.gitignore`,
+	// case-sensitively, so it over-reported untracked files here.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-status-excludes");
+	let w = work.to_str().unwrap();
+	write(&work, "a.txt", "a\n");
+	commit_all(w, "base");
+
+	// (1) core.ignoreCase: an UPPER-case `.gitignore` rule folds onto a lower-case file.
+	write(&work, ".gitignore", "*.LOG\n");
+	git(w, &["config", "core.ignoreCase", "true"]);
+	write(&work, "debug.log", "log\n");
+	// (2) `.git/info/exclude`.
+	std::fs::write(work.join(".git/info/exclude"), b"*.tmp\n").unwrap();
+	write(&work, "scratch.tmp", "t\n");
+	// (3) `core.excludesFile`, kept inside `.git` so neither scan lists the excludes file itself.
+	let excludes = work.join(".git/custom_excludes");
+	std::fs::write(&excludes, b"*.bak\n").unwrap();
+	git(
+		w,
+		&["config", "core.excludesFile", excludes.to_str().unwrap()],
+	);
+	write(&work, "old.bak", "b\n");
+	// A plainly untracked file none of the sources cover.
+	write(&work, "keep.txt", "k\n");
+
+	let theirs = git(w, &["status", "--porcelain"]);
+	assert!(
+		!theirs.contains("debug.log")
+			&& !theirs.contains("scratch.tmp")
+			&& !theirs.contains("old.bak")
+			&& theirs.contains("keep.txt"),
+		"sanity: git omits the three excluded files and lists keep.txt: {theirs}"
+	);
+	assert_eq!(
+		gta(w, &["status"], b""),
+		theirs,
+		"gta status must honour ignoreCase + info/exclude + excludesFile like git"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn honors_worktree_config_ignorecase_override() {
+	// End-to-end (native effective-config path): `gta status` must honour a per-worktree `core.ignoreCase`
+	// override in `config.worktree` (with `extensions.worktreeConfig`), exactly as `git status` does —
+	// the override beats the common value (probed vs git 2.55).
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-status-wtcfg-ic");
+	let w = work.to_str().unwrap();
+	write(&work, ".gitignore", "*.LOG\n");
+	write(&work, "a.txt", "a\n");
+	commit_all(w, "base");
+	git(w, &["config", "extensions.worktreeConfig", "true"]);
+	git(w, &["config", "core.ignoreCase", "true"]); // common: fold
+	git(w, &["config", "--worktree", "core.ignoreCase", "false"]); // override: no fold
+	write(&work, "debug.log", "log\n");
+
+	let theirs = git(w, &["status", "--porcelain"]);
+	assert!(
+		theirs.contains("debug.log"),
+		"sanity: git honours the false override (debug.log untracked): {theirs}"
+	);
+	assert_eq!(
+		gta(w, &["status"], b""),
+		theirs,
+		"gta status must honour the per-worktree core.ignoreCase override like git"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn rejects_valueless_excludes_file() {
+	// A valueless `core.excludesFile` (`[core]\n\texcludesFile`) is fatal to git ("missing value"); gta
+	// must reject it too — on `status`, and on `add -f`, which skips reading the excludes file but still
+	// validates the setting (probed vs git 2.55).
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-valueless-excludes");
+	let w = work.to_str().unwrap();
+	write(&work, "a.txt", "a\n");
+	commit_all(w, "base");
+	let cfg = work.join(".git/config");
+	let content = format!(
+		"{}[core]\n\texcludesFile\n",
+		std::fs::read_to_string(&cfg).unwrap()
+	);
+	std::fs::write(&cfg, content).unwrap();
+	write(&work, "u.txt", "u\n");
+
+	// Sanity: git aborts on the valueless setting.
+	assert!(
+		!Command::new("git")
+			.args(["-C", w, "status", "--porcelain"])
+			.status()
+			.expect("run git")
+			.success(),
+		"sanity: git rejects a valueless core.excludesFile"
+	);
+	for args in [vec!["status"], vec!["add", "-f", "u.txt"]] {
+		let out = assert_cmd::Command::cargo_bin("gta")
+			.unwrap()
+			.args(["-C", w])
+			.args(&args)
+			.output()
+			.expect("run gta");
+		assert!(
+			!out.status.success(),
+			"gta {args:?} must reject a valueless core.excludesFile"
+		);
+	}
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn honors_bare_tilde_excludes_file_with_empty_home() {
+	// `core.excludesFile=~` under an EMPTY `HOME`: git treats the bare-tilde expansion as no excludes file and
+	// continues (probed vs git 2.55: exit 0, the untracked file is listed), rather than resolving `~` to the
+	// worktree root and aborting on a directory. `gta status` must match — the shared excludes resolver may
+	// not fail in sanitized/container environments where `HOME=`.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-status-baretilde");
+	let w = work.to_str().unwrap();
+	write(&work, "a.txt", "a\n");
+	commit_all(w, "base");
+	git(w, &["config", "core.excludesFile", "~"]);
+	write(&work, "u.txt", "u\n");
+
+	let theirs = Command::new("git")
+		.args(["-C", w, "status", "--porcelain"])
+		.env("HOME", "")
+		.output()
+		.expect("run git");
+	assert!(
+		theirs.status.success(),
+		"sanity: git tolerates a bare `~` excludesFile with empty HOME"
+	);
+	let theirs = String::from_utf8(theirs.stdout).unwrap();
+	assert!(
+		theirs.contains("u.txt"),
+		"sanity: git lists the untracked file: {theirs}"
+	);
+
+	let ours = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", w, "status"])
+		.env("HOME", "")
+		.output()
+		.expect("run gta");
+	assert!(
+		ours.status.success(),
+		"gta status must tolerate a bare `~` excludesFile with empty HOME like git: {}",
+		String::from_utf8_lossy(&ours.stderr)
+	);
+	assert_eq!(String::from_utf8(ours.stdout).unwrap(), theirs);
+	std::fs::remove_dir_all(&work).ok();
+}
+
 fn init(tag: &str) -> PathBuf {
 	let work = unique_tmp(tag);
 	let w = work.to_str().unwrap();

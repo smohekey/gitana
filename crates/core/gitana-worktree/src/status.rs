@@ -8,6 +8,7 @@ use gitana_file_store::{FileStore, FileStoreError};
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind};
 
+use crate::excludes::StandardExcludes;
 use crate::fsmeta::{blob_of, effective_mode, join_rel, push_gitignore};
 use crate::ignore::{self, DirIgnore};
 use crate::worktree::stat_matches;
@@ -58,6 +59,7 @@ impl Status {
 
 pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
+	excludes_file: Option<&str>,
 ) -> Result<Status, WorktreeError> {
 	// `core.fileMode` (git's `trust_executable_bit`): when `false`, an executable-bit-only difference between
 	// the working tree and the index is *not* a modification. Resolved with git's worktree precedence — a
@@ -83,15 +85,31 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		})
 		.collect();
 
-	// A conflicted path is tracked (it has a working-tree file), so exclude it from untracked.
+	// git's standard excludes for untracked detection: the `core.ignoreCase` fold flag plus the
+	// whole-tree exclude levels (`core.excludesFile`, `.git/info/exclude`) that sit below per-directory
+	// `.gitignore`. Seeding these makes `status` agree with `ls-files -o` and stock git, where it
+	// previously read only `.gitignore` and matched case-sensitively.
+	let StandardExcludes { fold, base } =
+		crate::excludes::standard_excludes(wt, excludes_file).await?;
+	// A conflicted path is tracked (it has a working-tree file), so exclude it from untracked. Under
+	// `core.ignoreCase` git matches a working-tree entry to a tracked index path case-folded (a disk
+	// `FOO` counts as the tracked `foo`), so fold the membership keys the same way the lookups below do.
 	let tracked: HashSet<String> = index_map
 		.keys()
 		.cloned()
 		.chain(unmerged.keys().cloned())
+		.map(|path| fold_key(&path, fold))
 		.collect();
 	let mut untracked = Vec::new();
-	let mut ignore_stack: Vec<DirIgnore> = Vec::new();
-	collect_untracked(wt.work(), "", &tracked, &mut ignore_stack, &mut untracked)?;
+	let mut ignore_stack: Vec<DirIgnore> = base;
+	collect_untracked(
+		wt.work(),
+		"",
+		&tracked,
+		&mut ignore_stack,
+		&mut untracked,
+		fold,
+	)?;
 
 	let mut merged: BTreeMap<String, StatusEntry> = BTreeMap::new();
 
@@ -336,7 +354,7 @@ pub(crate) async fn worktree_file_mode<F: FileStore, W: WorkDirFs, H: HashAlgori
 /// Whether a config carries an `include` or `includeIf` directive. gitana does not process these, so any
 /// config value they might override cannot be trusted for a safety decision. A directive is detected even when
 /// *valueless* (`get_all_raw` keeps a bare `include.path`, which `get_all` drops) — git errors on that too.
-fn config_has_includes(config: &gitana_config::GitConfig) -> bool {
+pub(crate) fn config_has_includes(config: &gitana_config::GitConfig) -> bool {
 	!config.get_all_raw("include", None, "path").is_empty()
 		|| !config.subsections("includeIf").is_empty()
 }
@@ -397,6 +415,7 @@ fn collect_untracked<W: WorkDirFs>(
 	tracked: &HashSet<String>,
 	stack: &mut Vec<DirIgnore>,
 	out: &mut Vec<String>,
+	fold: bool,
 ) -> Result<(), WorktreeError> {
 	let pushed = push_gitignore(work, dir_rel, stack)?;
 
@@ -407,17 +426,23 @@ fn collect_untracked<W: WorkDirFs>(
 		let rel = join_rel(dir_rel, &entry.name);
 		// The entry's kind is an `lstat` (a symlinked directory is a symlink, not a directory).
 		let is_dir = entry.kind.is_dir();
-		if ignore::is_ignored(&rel, is_dir, stack) {
+		if ignore::is_ignored_fold(&rel, is_dir, stack, fold) {
 			continue;
 		}
+		// Membership is checked case-folded under `core.ignoreCase` (the `tracked` keys are already
+		// folded); the emitted path is always the real on-disk spelling.
 		if is_dir {
 			let prefix = format!("{rel}/");
-			if tracked.iter().any(|path| path.starts_with(&prefix)) {
-				collect_untracked(work, &rel, tracked, stack, out)?;
-			} else {
-				out.push(prefix); // fully-untracked directory → "dir/"
+			let prefix_key = fold_key(&prefix, fold);
+			if tracked.iter().any(|path| path.starts_with(&prefix_key)) {
+				collect_untracked(work, &rel, tracked, stack, out, fold)?;
+			} else if dir_has_unignored(work, &rel, stack, fold)? {
+				// A fully-untracked directory collapses to a single `dir/` — but only when it holds some
+				// non-ignored content. git omits a directory whose entire content is ignored (by any
+				// standard exclude source), so descend to check before collapsing.
+				out.push(prefix);
 			}
-		} else if !tracked.contains(&rel) {
+		} else if !tracked.contains(&fold_key(&rel, fold)) {
 			out.push(rel);
 		}
 	}
@@ -426,6 +451,74 @@ fn collect_untracked<W: WorkDirFs>(
 		stack.pop();
 	}
 	Ok(())
+}
+
+/// Whether the untracked directory `dir_rel` holds at least one non-ignored entry (recursively). git
+/// collapses an untracked directory to `dir/` only when it has some non-ignored content; one whose
+/// entire content is ignored (by any standard exclude source) is omitted from status. `stack` is the
+/// ignore stack down to `dir_rel`'s parent; this pushes `dir_rel`'s own `.gitignore` while descending.
+fn dir_has_unignored<W: WorkDirFs>(
+	work: &W,
+	dir_rel: &str,
+	stack: &mut Vec<DirIgnore>,
+	fold: bool,
+) -> Result<bool, WorktreeError> {
+	// An untracked embedded git repository is reportable regardless of its content — git lists the single
+	// `?? dir/` and never descends (probed vs git 2.55). Omitting it would let a default `worktree remove`
+	// recursively delete the nested repo. Recognise a valid `.git` *directory* repo, and conservatively any
+	// `.git` *file* (a gitfile — a linked worktree or submodule): over-reporting a bogus gitfile is the
+	// safe direction (it refuses removal, never deletes).
+	if crate::ls_files::is_embedded_repo(work, dir_rel)
+		|| matches!(
+			work.lstat(&format!("{dir_rel}/.git")),
+			Ok(Some(meta)) if !meta.kind.is_dir()
+		) {
+		return Ok(true);
+	}
+	// An unreadable directory is warned-and-omitted by git (not fatal, exit 0), so treat it as having no
+	// reportable content rather than aborting the whole status. Read the entries before pushing this
+	// directory's `.gitignore` so a permission error here never propagates.
+	let Ok(entries) = work.read_dir(dir_rel) else {
+		return Ok(false);
+	};
+	// An unusable per-directory `.gitignore` (a directory at that path, or permission-denied) contributes
+	// no rules and must not abort status — git tolerates it and reports the parent as `?? dir/`.
+	let pushed = push_gitignore(work, dir_rel, stack).unwrap_or(false);
+	let mut found = false;
+	for entry in entries {
+		if entry.name == ".git" {
+			continue;
+		}
+		let rel = join_rel(dir_rel, &entry.name);
+		let is_dir = entry.kind.is_dir();
+		if ignore::is_ignored_fold(&rel, is_dir, stack, fold) {
+			continue;
+		}
+		if is_dir {
+			if dir_has_unignored(work, &rel, stack, fold)? {
+				found = true;
+				break;
+			}
+		} else {
+			found = true;
+			break;
+		}
+	}
+	if pushed {
+		stack.pop();
+	}
+	Ok(found)
+}
+
+/// The membership key for `path` under `core.ignoreCase`: ASCII-lower-cased when `fold`, else `path`
+/// unchanged. Used to make tracked-vs-untracked detection case-insensitive without altering the path
+/// git reports.
+fn fold_key(path: &str, fold: bool) -> String {
+	if fold {
+		path.to_ascii_lowercase()
+	} else {
+		path.to_owned()
+	}
 }
 
 pub(crate) fn worktree_change<W: WorkDirFs, H: HashAlgorithm>(

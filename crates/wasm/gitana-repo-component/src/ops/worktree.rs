@@ -19,7 +19,9 @@ use super::{HostIdentity, repo_error, worktree_error};
 type Tree<H> = WorkTree<WorktreeFileStore, DescriptorWorkDir, H>;
 
 pub(crate) async fn status<H: HashAlgorithm>(wt: &Tree<H>) -> Result<WitWorktreeStatus, RepoError> {
-	let status = wt.status().await.map_err(worktree_error)?;
+	// The component has no global excludes file (no `$HOME`/XDG in the sandbox), so pass `None`;
+	// `core.ignoreCase` and `.git/info/exclude` are still honoured, read internally from the repo.
+	let status = wt.status(None).await.map_err(worktree_error)?;
 	Ok(WitWorktreeStatus {
 		changed: status
 			.changed
@@ -41,7 +43,10 @@ pub(crate) async fn add<H: HashAlgorithm>(
 	force: bool,
 ) -> Result<(), RepoError> {
 	let specs: Vec<&str> = pathspecs.iter().map(String::as_str).collect();
-	wt.add(&specs, prefix, force).await.map_err(worktree_error)
+	// No global excludes file in the sandbox; `core.ignoreCase` and `.git/info/exclude` are read internally.
+	wt.add(&specs, prefix, force, None)
+		.await
+		.map_err(worktree_error)
 }
 
 pub(crate) async fn checkout<H: HashAlgorithm>(
@@ -52,7 +57,7 @@ pub(crate) async fn checkout<H: HashAlgorithm>(
 	// Resolve the spec (commit/tag/tree) and peel it to the tree checkout materialises.
 	let id = wt.rev_parse(tree_ish).await.map_err(worktree_error)?;
 	let tree = wt.repository().peel_to_tree(id).await.map_err(repo_error)?;
-	wt.checkout(tree, force).await.map_err(worktree_error)
+	wt.checkout(tree, force, None).await.map_err(worktree_error)
 }
 
 pub(crate) async fn commit<H: HashAlgorithm>(

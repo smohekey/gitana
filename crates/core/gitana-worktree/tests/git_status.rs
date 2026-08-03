@@ -54,7 +54,7 @@ async fn status_matches_git() {
 	)));
 	let ours = sorted(
 		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-			.status()
+			.status(None)
 			.await
 			.unwrap()
 			.porcelain_v1(),
@@ -107,7 +107,7 @@ async fn status_with_gitignore_matches_git() {
 	)));
 	let ours = sorted(
 		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-			.status()
+			.status(None)
 			.await
 			.unwrap()
 			.porcelain_v1(),
@@ -153,7 +153,7 @@ async fn status_honors_core_filemode() {
 		)));
 		sorted(
 			&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-				.status()
+				.status(None)
 				.await
 				.unwrap()
 				.porcelain_v1(),
@@ -235,7 +235,7 @@ async fn status_filemode_worktree_override_numeric_is_true() {
 		)));
 		sorted(
 			&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-				.status()
+				.status(None)
 				.await
 				.unwrap()
 				.porcelain_v1(),
@@ -311,7 +311,7 @@ async fn status_fails_closed_on_filemode_include() {
 	)));
 	let ours = sorted(
 		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-			.status()
+			.status(None)
 			.await
 			.unwrap()
 			.porcelain_v1(),
@@ -370,7 +370,7 @@ async fn status_fails_closed_on_worktree_config_include() {
 	)));
 	let ours = sorted(
 		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-			.status()
+			.status(None)
 			.await
 			.unwrap()
 			.porcelain_v1(),
@@ -425,7 +425,7 @@ async fn status_fails_closed_on_malformed_worktree_config() {
 	)));
 	let ours = sorted(
 		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-			.status()
+			.status(None)
 			.await
 			.unwrap()
 			.porcelain_v1(),
@@ -477,7 +477,7 @@ async fn status_ignores_skip_worktree_entries() {
 	)));
 	let ours = sorted(
 		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-			.status()
+			.status(None)
 			.await
 			.unwrap()
 			.porcelain_v1(),
@@ -485,6 +485,650 @@ async fn status_ignores_skip_worktree_entries() {
 	assert!(
 		ours.is_empty(),
 		"skip-worktree entry must not read as deleted, got {ours:?}"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn status_folds_ignorecase_for_gitignore() {
+	// git consults `core.ignoreCase` when matching `.gitignore` for untracked detection. A rule in UPPER
+	// case only matches a lower-case file when folded, so the file's untracked-ness flips with the flag —
+	// and gitana's `status` must track git in both directions (previously it matched case-sensitively).
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("status-ignorecase");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join(".gitignore"), b"*.LOG\n").unwrap();
+	std::fs::write(work.join("a.txt"), b"a\n").unwrap();
+	git(&["-C", w, "add", "a.txt", ".gitignore"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"init",
+	]);
+	std::fs::write(work.join("debug.log"), b"log\n").unwrap();
+
+	let status = || async {
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			open_dir(&git_dir),
+		)));
+		sorted(
+			&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+				.status(None)
+				.await
+				.unwrap()
+				.porcelain_v1(),
+		)
+	};
+
+	// ignoreCase=true: `*.LOG` folds onto `debug.log` → git omits it as ignored; so must we.
+	git(&["-C", w, "config", "core.ignoreCase", "true"]);
+	assert!(
+		!git(&["-C", w, "status", "--porcelain=v1"]).contains("debug.log"),
+		"sanity: git folds `*.LOG` onto debug.log and ignores it"
+	);
+	assert_eq!(
+		status().await,
+		sorted(&git(&["-C", w, "status", "--porcelain=v1"])),
+		"ignoreCase=true: debug.log must be folded-ignored, matching git"
+	);
+
+	// ignoreCase=false: `*.LOG` does not match `debug.log` → git lists it untracked; so must we.
+	git(&["-C", w, "config", "core.ignoreCase", "false"]);
+	assert!(
+		git(&["-C", w, "status", "--porcelain=v1"]).contains("debug.log"),
+		"sanity: case-sensitive, debug.log is untracked"
+	);
+	assert_eq!(
+		status().await,
+		sorted(&git(&["-C", w, "status", "--porcelain=v1"])),
+		"ignoreCase=false: debug.log must read untracked, matching git"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn status_folds_ignorecase_tracked_membership() {
+	// Under `core.ignoreCase`, git matches a working-tree entry to a tracked index path case-folded: a
+	// disk `foo.txt` counts as the tracked `Foo.txt` (not untracked). The differential compare drives git
+	// and gitana over the same working tree, so it holds whatever the filesystem's own case behaviour.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("status-ignorecase-tracked");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("Foo.txt"), b"x\n").unwrap();
+	git(&["-C", w, "add", "Foo.txt"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"init",
+	]);
+	// Re-create the file under a different case; the index still holds `Foo.txt`.
+	std::fs::remove_file(work.join("Foo.txt")).unwrap();
+	std::fs::write(work.join("foo.txt"), b"x\n").unwrap();
+
+	let status = || async {
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			open_dir(&git_dir),
+		)));
+		sorted(
+			&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+				.status(None)
+				.await
+				.unwrap()
+				.porcelain_v1(),
+		)
+	};
+
+	for value in ["true", "false"] {
+		git(&["-C", w, "config", "core.ignoreCase", value]);
+		assert_eq!(
+			status().await,
+			sorted(&git(&["-C", w, "status", "--porcelain=v1"])),
+			"ignoreCase={value}: tracked-membership folding must match git"
+		);
+	}
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn status_honors_info_exclude() {
+	// git consults `.git/info/exclude` for untracked detection everywhere; gitana's `status` reads it
+	// internally over the `.git` store (no caller help), so `status(None)` must still honour it.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("status-info-exclude");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"a\n").unwrap();
+	git(&["-C", w, "add", "a.txt"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"init",
+	]);
+	std::fs::write(git_dir.join("info").join("exclude"), b"*.tmp\n").unwrap();
+	std::fs::write(work.join("scratch.tmp"), b"t\n").unwrap();
+	std::fs::write(work.join("keep.txt"), b"k\n").unwrap();
+
+	let theirs = sorted(&git(&["-C", w, "status", "--porcelain=v1"]));
+	assert!(
+		!theirs.iter().any(|l| l.contains("scratch.tmp"))
+			&& theirs.iter().any(|l| l.contains("keep.txt")),
+		"sanity: git honours .git/info/exclude (scratch.tmp omitted, keep.txt untracked): {theirs:?}"
+	);
+
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
+	let ours = sorted(
+		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+			.status(None)
+			.await
+			.unwrap()
+			.porcelain_v1(),
+	);
+	assert_eq!(
+		ours, theirs,
+		"status must honour .git/info/exclude, matching git"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn status_seeds_excludes_file() {
+	// The global `core.excludesFile` lives outside the worktree, so the caller resolves its content and
+	// passes it in. Given that content, `status` must seed it as the lowest-priority exclude level and
+	// match git (which reads the file itself). The excludes file is kept inside `.git` so neither scan
+	// lists it as untracked.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("status-excludes-file");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"a\n").unwrap();
+	git(&["-C", w, "add", "a.txt"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"init",
+	]);
+	let excludes = git_dir.join("custom-excludes");
+	std::fs::write(&excludes, b"*.bak\n").unwrap();
+	git(&[
+		"-C",
+		w,
+		"config",
+		"core.excludesFile",
+		excludes.to_str().unwrap(),
+	]);
+	std::fs::write(work.join("old.bak"), b"b\n").unwrap();
+	std::fs::write(work.join("keep.txt"), b"k\n").unwrap();
+
+	let theirs = sorted(&git(&["-C", w, "status", "--porcelain=v1"]));
+	assert!(
+		!theirs.iter().any(|l| l.contains("old.bak")) && theirs.iter().any(|l| l.contains("keep.txt")),
+		"sanity: git honours core.excludesFile (old.bak omitted, keep.txt untracked): {theirs:?}"
+	);
+
+	let content = std::fs::read_to_string(&excludes).unwrap();
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
+	let ours = sorted(
+		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+			.status(Some(&content))
+			.await
+			.unwrap()
+			.porcelain_v1(),
+	);
+	assert_eq!(
+		ours, theirs,
+		"status must seed the resolved excludesFile content, matching git"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn status_honors_worktree_config_ignorecase_override() {
+	// git honours a per-worktree `core.ignoreCase` override in `config.worktree` (with
+	// `extensions.worktreeConfig`) for untracked detection (probed vs git 2.55). status must read that
+	// override, not just the common value — reading the wrong one could fold-hide an untracked file from a
+	// `worktree remove` safety check and delete it.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("status-wtcfg-ignorecase");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join(".gitignore"), b"*.LOG\n").unwrap();
+	std::fs::write(work.join("a.txt"), b"a\n").unwrap();
+	git(&["-C", w, "add", "."]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"init",
+	]);
+	git(&["-C", w, "config", "extensions.worktreeConfig", "true"]);
+	git(&["-C", w, "config", "core.ignoreCase", "true"]); // common: fold
+	git(&["-C", w, "config", "--worktree", "core.ignoreCase", "false"]); // override: no fold
+	std::fs::write(work.join("debug.log"), b"log\n").unwrap();
+
+	// git honours the override (false): `debug.log` is NOT folded onto `*.LOG`, so it reads untracked.
+	let theirs = sorted(&git(&["-C", w, "status", "--porcelain=v1"]));
+	assert!(
+		theirs.iter().any(|l| l.contains("debug.log")),
+		"sanity: git honours the false worktree override (debug.log untracked): {theirs:?}"
+	);
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
+	let ours = sorted(
+		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+			.status(None)
+			.await
+			.unwrap()
+			.porcelain_v1(),
+	);
+	assert_eq!(
+		ours, theirs,
+		"status must honour the per-worktree core.ignoreCase override, matching git"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn status_omits_untracked_dir_with_only_ignored_content() {
+	// git omits an untracked directory whose *entire* content is ignored (here by `.git/info/exclude`),
+	// but collapses one with any non-ignored content to `dir/`. gta must match — not blindly collapse an
+	// all-ignored directory to `?? d/` (probed vs git 2.55).
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("status-ignored-dir");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"a\n").unwrap();
+	git(&["-C", w, "add", "a.txt"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"init",
+	]);
+	std::fs::write(git_dir.join("info").join("exclude"), b"*.log\n").unwrap();
+	// `d/` holds only ignored content → omitted; `e/` has a non-ignored file → collapsed to `e/`.
+	std::fs::create_dir_all(work.join("d")).unwrap();
+	std::fs::write(work.join("d/only.log"), b"x\n").unwrap();
+	std::fs::create_dir_all(work.join("e")).unwrap();
+	std::fs::write(work.join("e/keep.txt"), b"y\n").unwrap();
+
+	let theirs = sorted(&git(&["-C", w, "status", "--porcelain=v1"]));
+	assert!(
+		!theirs.iter().any(|l| l.contains("d/")) && theirs.iter().any(|l| l.contains("e/")),
+		"sanity: git omits the all-ignored d/ and shows e/: {theirs:?}"
+	);
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
+	let ours = sorted(
+		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+			.status(None)
+			.await
+			.unwrap()
+			.porcelain_v1(),
+	);
+	assert_eq!(
+		ours, theirs,
+		"an all-ignored untracked directory must be omitted, matching git"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn status_bare_ignorecase_fails_closed_on_includes() {
+	// A bare `WorkTree` (no frontend-merged config — the linked-worktree removal-safety path) does not
+	// process `[include]`, so a direct `core.ignoreCase=true` cannot be trusted when an include could
+	// override it. It must fail closed to `false` (do not fold) rather than fold-hide an untracked file.
+	// Here the include resolves `core.ignoreCase` to `false`, so git does not fold `debug.log` onto
+	// `*.LOG` and shows it; the fail-closed path reaches the same answer, where blindly trusting the direct
+	// `true` would wrongly hide it.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("status-ic-include");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join(".gitignore"), b"*.LOG\n").unwrap();
+	std::fs::write(work.join("a.txt"), b"a\n").unwrap();
+	git(&["-C", w, "add", "."]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"init",
+	]);
+	// Local `core.ignoreCase=true`, but an include overrides it to false.
+	git(&["-C", w, "config", "core.ignoreCase", "true"]);
+	std::fs::write(git_dir.join("extra.cfg"), "[core]\n\tignoreCase = false\n").unwrap();
+	std::fs::write(
+		git_dir.join("config"),
+		format!(
+			"{}[include]\n\tpath = extra.cfg\n",
+			std::fs::read_to_string(git_dir.join("config")).unwrap()
+		),
+	)
+	.unwrap();
+	std::fs::write(work.join("debug.log"), b"log\n").unwrap();
+
+	// git resolves the include → ignoreCase false → debug.log not folded, shown untracked.
+	let theirs = sorted(&git(&["-C", w, "status", "--porcelain=v1"]));
+	assert!(
+		theirs.iter().any(|l| l.contains("debug.log")),
+		"sanity: git's include resolves ignoreCase to false (debug.log shown): {theirs:?}"
+	);
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
+	let ours = sorted(
+		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+			.status(None)
+			.await
+			.unwrap()
+			.porcelain_v1(),
+	);
+	assert!(
+		ours.iter().any(|l| l.contains("debug.log")),
+		"an include present → fail closed to no-fold → debug.log shown, got {ours:?}"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn status_shows_embedded_repo_with_only_ignored_content() {
+	// A valid untracked embedded git repository must show `?? sub/` even when its own content is entirely
+	// ignored by the outer repo — git lists it opaquely and never descends (probed vs git 2.55). Omitting
+	// it would let a default `worktree remove` recursively delete the nested repo.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("status-embedded-repo");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join(".gitignore"), b"*.log\n").unwrap();
+	std::fs::write(work.join("a.txt"), b"a\n").unwrap();
+	git(&["-C", w, "add", "."]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"init",
+	]);
+	// A real embedded repo whose only extra content is ignored.
+	std::fs::create_dir_all(work.join("sub")).unwrap();
+	git(&["-C", work.join("sub").to_str().unwrap(), "init", "-q"]);
+	std::fs::write(work.join("sub/only.log"), b"x\n").unwrap();
+
+	let theirs = sorted(&git(&["-C", w, "status", "--porcelain=v1"]));
+	assert!(
+		theirs.iter().any(|l| l.contains("sub/")),
+		"sanity: git shows the embedded repo as ?? sub/: {theirs:?}"
+	);
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
+	let ours = sorted(
+		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+			.status(None)
+			.await
+			.unwrap()
+			.porcelain_v1(),
+	);
+	assert_eq!(
+		ours, theirs,
+		"a valid embedded repo with only-ignored content must still be shown, matching git"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn status_handles_unreadable_untracked_dir_nonfatally() {
+	// An unreadable untracked directory must not make status fatal: git warns and completes (exit 0),
+	// omitting it from the porcelain (probed vs git 2.55). The differential compare is robust to whether
+	// the test runs as root (where the dir stays readable).
+	use std::os::unix::fs::PermissionsExt;
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("status-unreadable-dir");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"a\n").unwrap();
+	git(&["-C", w, "add", "a.txt"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"init",
+	]);
+	std::fs::create_dir_all(work.join("noread")).unwrap();
+	std::fs::write(work.join("noread/f"), b"x\n").unwrap();
+	std::fs::write(work.join("keep.txt"), b"k\n").unwrap();
+	std::fs::set_permissions(work.join("noread"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+	let theirs = sorted(&git(&["-C", w, "status", "--porcelain=v1"]));
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
+	// Must return Ok (not a fatal PermissionDenied), matching git's exit 0.
+	let ours = sorted(
+		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+			.status(None)
+			.await
+			.expect("status must not fail on an unreadable untracked directory")
+			.porcelain_v1(),
+	);
+	// Restore permissions before comparing/cleanup so the temp dir can be removed.
+	std::fs::set_permissions(work.join("noread"), std::fs::Permissions::from_mode(0o755)).unwrap();
+	assert_eq!(
+		ours, theirs,
+		"status must handle the unreadable directory like git (omit it, non-fatal)"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn status_shows_gitfile_backed_embedded_repo() {
+	// A gitfile-backed embedded repo — `sub/.git` is a *file* pointing to a separate gitdir (a linked
+	// worktree / submodule) — whose visible content is entirely ignored must still show `?? sub/` (probed
+	// vs git 2.55). Omitting it would let a default `worktree remove` delete the nested repo.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("status-gitfile-repo");
+	let gitdir_ext = unique_tmp("status-gitfile-ext"); // the embedded repo's gitdir, OUTSIDE the worktree
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join(".gitignore"), b"*.log\n").unwrap();
+	std::fs::write(work.join("a.txt"), b"a\n").unwrap();
+	git(&["-C", w, "add", "."]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"init",
+	]);
+	git(&[
+		"init",
+		"--separate-git-dir",
+		gitdir_ext.to_str().unwrap(),
+		"-q",
+		work.join("sub").to_str().unwrap(),
+	]);
+	std::fs::write(work.join("sub/only.log"), b"x\n").unwrap();
+
+	let theirs = sorted(&git(&["-C", w, "status", "--porcelain=v1"]));
+	assert!(
+		theirs.iter().any(|l| l.contains("sub/")),
+		"sanity: git shows the gitfile-backed embedded repo as ?? sub/: {theirs:?}"
+	);
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
+	let ours = sorted(
+		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+			.status(None)
+			.await
+			.unwrap()
+			.porcelain_v1(),
+	);
+	assert_eq!(
+		ours, theirs,
+		"a gitfile-backed embedded repo with only-ignored content must still be shown, matching git"
+	);
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&gitdir_ext).ok();
+}
+
+#[tokio::test]
+async fn status_tolerates_gitignore_directory_in_untracked_dir() {
+	// A `.gitignore` that is a *directory* inside an otherwise-untracked directory must not abort status:
+	// git treats it as contributing no rules and reports the parent `?? dir/` (probed vs git 2.55).
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("status-gitignore-dir");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"a\n").unwrap();
+	git(&["-C", w, "add", "a.txt"]);
+	git(&[
+		"-C",
+		w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"commit",
+		"-q",
+		"-m",
+		"init",
+	]);
+	std::fs::create_dir_all(work.join("d2/.gitignore")).unwrap(); // `.gitignore` is a directory
+	std::fs::write(work.join("d2/keep.txt"), b"y\n").unwrap();
+
+	let theirs = sorted(&git(&["-C", w, "status", "--porcelain=v1"]));
+	assert!(
+		theirs.iter().any(|l| l.contains("d2/")),
+		"sanity: git tolerates the .gitignore directory and shows ?? d2/: {theirs:?}"
+	);
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
+	let ours = sorted(
+		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+			.status(None)
+			.await
+			.expect("status must not abort on a .gitignore directory")
+			.porcelain_v1(),
+	);
+	assert_eq!(
+		ours, theirs,
+		"an unusable .gitignore must contribute no rules, not abort status, matching git"
 	);
 	std::fs::remove_dir_all(&work).ok();
 }

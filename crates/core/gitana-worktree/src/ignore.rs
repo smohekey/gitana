@@ -10,6 +10,7 @@
 //! them into the `stack` as lower-priority [`DirIgnore`] levels — see `ls_files`.
 
 /// One ignore pattern.
+#[derive(Clone)]
 struct Pattern {
 	negated: bool,
 	dir_only: bool,
@@ -18,7 +19,9 @@ struct Pattern {
 }
 
 /// The patterns from one directory's `.gitignore`, tagged with that directory's
-/// path relative to the working-tree root (`""` for the root).
+/// path relative to the working-tree root (`""` for the root). `Clone` so a caller can seed a fresh
+/// per-directory stack with the shared whole-tree base levels (see [`crate::excludes`]).
+#[derive(Clone)]
 pub(crate) struct DirIgnore {
 	dir: String,
 	patterns: Vec<Pattern>,
@@ -84,9 +87,10 @@ fn trim_trailing_spaces(line: &str) -> &str {
 	&line[..end]
 }
 
-/// Whether `path` (relative to root) is ignored by the accumulated ignore files in
-/// `stack` (root first). Last matching pattern wins; a negated match re-includes. Case-sensitive;
-/// see [`is_ignored_fold`] for `core.ignoreCase`.
+/// The case-sensitive form of [`is_ignored_fold`] (`fold = false`) — a readable shim for the unit
+/// tests. Production callers pass the resolved `core.ignoreCase` flag through `is_ignored_fold`
+/// directly (see [`crate::excludes`]).
+#[cfg(test)]
 pub(crate) fn is_ignored(path: &str, is_dir: bool, stack: &[DirIgnore]) -> bool {
 	is_ignored_fold(path, is_dir, stack, false)
 }

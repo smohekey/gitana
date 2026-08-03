@@ -185,7 +185,7 @@ pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 		signer,
 	)
 	.await?;
-	wt.checkout(merged_tree, false).await?;
+	wt.checkout(merged_tree, false, None).await?;
 	repository
 		.reset_head(
 			merge_commit,

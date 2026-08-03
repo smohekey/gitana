@@ -7,6 +7,7 @@ pub mod commands;
 mod credential;
 mod dispatch;
 mod error;
+mod excludes;
 mod git_config;
 mod http_headers;
 mod identity;

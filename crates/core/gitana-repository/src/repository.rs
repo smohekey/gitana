@@ -52,6 +52,14 @@ where
 		self.effective = Some(config);
 	}
 
+	/// Whether the frontend has installed a merged effective config (vs. [`Repository::effective_config`]
+	/// falling back to the raw-local `.git/config`). A caller that must honour a layer the raw-local view
+	/// omits — the per-worktree `config.worktree` override, or global/system settings — uses this to
+	/// decide whether the merged view is authoritative or it must resolve that layer itself.
+	pub fn has_effective_config(&self) -> bool {
+		self.effective.is_some()
+	}
+
 	/// The ref store (HEAD, branches, tags), lent the effective config so reflog-policy reads
 	/// (`core.logallrefupdates`) honour git's merged precedence when the frontend has installed it.
 	pub fn refs(&self) -> RefStore<'_, F, H> {
