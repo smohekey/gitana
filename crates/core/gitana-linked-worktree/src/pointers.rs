@@ -403,10 +403,10 @@ fn probe_case_fold(dir: &Path) -> Option<bool> {
 /// object-format detection already enforces upstream, so this only guards the boolean itself.
 pub(crate) fn is_bare(common_dir: &Path) -> Result<bool, LinkedWorktreeError> {
 	let config_path = common_dir.join("config");
-	let Ok(text) = std::fs::read_to_string(&config_path) else {
+	let Ok(bytes) = std::fs::read(&config_path) else {
 		return Ok(false);
 	};
-	let Ok(config) = gitana_config::GitConfig::parse(&text) else {
+	let Ok(config) = gitana_config::GitConfigBytes::parse(&bytes) else {
 		return Ok(false);
 	};
 	match config.get_bool("core", None, "bare") {
@@ -438,10 +438,10 @@ pub(crate) fn ignorecase(effective: Option<&gitana_config::GitConfig>, common_di
 	if let Some(config) = effective {
 		return matches!(config.get_bool("core", None, "ignorecase"), Ok(Some(true)));
 	}
-	let Ok(text) = std::fs::read_to_string(common_dir.join("config")) else {
+	let Ok(bytes) = std::fs::read(common_dir.join("config")) else {
 		return false;
 	};
-	let Ok(config) = gitana_config::GitConfig::parse(&text) else {
+	let Ok(config) = gitana_config::GitConfigBytes::parse(&bytes) else {
 		return false;
 	};
 	matches!(config.get_bool("core", None, "ignorecase"), Ok(Some(true)))

@@ -1,4 +1,4 @@
-use gitana_config::GitConfig;
+use gitana_config::{GitConfig, GitConfigBytes};
 use gitana_file_store::{FileStore, FileStoreError};
 use gitana_object::HashAlgorithm;
 
@@ -79,9 +79,8 @@ impl Config {
 		config.render()
 	}
 
-	/// Read and validate the repository config from `store` (the git directory's file
-	/// store). A missing or non-UTF-8 `config` is reported as
-	/// [`RepositoryError::UnsupportedFormat`], like any other unusable format.
+	/// Read and validate the repository config from `store` (the git directory's file store).
+	/// Unrelated non-UTF-8 values do not affect the ASCII repository-format keys.
 	pub async fn read(store: &impl FileStore) -> Result<Self, RepositoryError> {
 		let bytes = match store.read_path("config").await {
 			Ok(bytes) => bytes,
@@ -92,29 +91,34 @@ impl Config {
 			}
 			Err(other) => return Err(other.into()),
 		};
-		let text = std::str::from_utf8(&bytes)
-			.map_err(|_| RepositoryError::UnsupportedFormat("config is not UTF-8".to_owned()))?;
-		Self::parse(text)
+		Self::parse_bytes(&bytes)
 	}
 
 	/// Parse a git config and validate the repository is a supported format (`sha1` or
 	/// `sha256`), with a `repositoryformatversion` consistent with that format.
 	pub fn parse(text: &str) -> Result<Self, RepositoryError> {
-		let config = GitConfig::parse(text)
+		Self::parse_bytes(text.as_bytes())
+	}
+
+	/// Parse arbitrary git-config bytes and validate the supported repository format.
+	pub fn parse_bytes(bytes: &[u8]) -> Result<Self, RepositoryError> {
+		let config = GitConfigBytes::parse(bytes)
 			.map_err(|error| RepositoryError::UnsupportedFormat(error.to_string()))?;
 
 		// git treats an absent `extensions.objectformat` as sha1.
 		let object_format = config
-			.get_string("extensions", None, "objectformat")
-			.unwrap_or("sha1")
-			.to_owned();
+			.get_raw("extensions", None, "objectformat")
+			.flatten()
+			.unwrap_or_else(|| b"sha1".to_vec());
+		let object_format = std::str::from_utf8(&object_format)
+			.map_err(|_| RepositoryError::UnsupportedFormat("objectformat is not UTF-8".to_owned()))?;
 
 		let version = config
 			.get_int("core", None, "repositoryformatversion")
 			.map_err(|error| RepositoryError::UnsupportedFormat(error.to_string()))?
 			.unwrap_or(0);
 
-		let version_ok = match object_format.as_str() {
+		let version_ok = match object_format {
 			// git records sha256 only at version 1 (where extensions are read).
 			"sha256" => version == 1,
 			// sha1 is the classic version-0 layout, but git also accepts a version-1 repo with an
@@ -134,7 +138,7 @@ impl Config {
 
 		Ok(Config {
 			repository_format_version: version as u32,
-			object_format,
+			object_format: object_format.to_owned(),
 		})
 	}
 }
