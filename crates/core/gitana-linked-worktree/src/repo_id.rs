@@ -152,10 +152,49 @@ mod native {
 		Ok(CapWorkDir::from_dir(dir))
 	}
 
-	/// Reject a repository whose common `config` declares a **format gitana cannot safely mutate** — git's
-	/// own `check_repository_format` refuses to operate on such a repo, so a destructive op must fail closed
-	/// the same way (requirements 257-258). Reproduces git's format grammar exactly (each rule verified
-	/// against stock `git worktree move`), reading only the config (no object store):
+	/// Require the files-layout anchors git uses to recognize the shared repository directory.
+	///
+	/// Metadata follows symlinks, matching git's acceptance of legacy symbolic `HEAD` files and
+	/// symlinked repository directories. Missing, unreadable, or wrong-kind entries fail closed at the
+	/// exact path instead of letting higher-level readers mistake an arbitrary directory for a repository.
+	pub(crate) fn validate_repository_structure(common: &Path) -> Result<(), LinkedWorktreeError> {
+		require_repository_entry(&common.join("HEAD"), "a file", std::fs::Metadata::is_file)?;
+		require_repository_entry(
+			&common.join("objects"),
+			"a directory",
+			std::fs::Metadata::is_dir,
+		)?;
+		require_repository_entry(
+			&common.join("refs"),
+			"a directory",
+			std::fs::Metadata::is_dir,
+		)
+	}
+
+	fn require_repository_entry(
+		path: &Path,
+		expected: &'static str,
+		matches: fn(&std::fs::Metadata) -> bool,
+	) -> Result<(), LinkedWorktreeError> {
+		let metadata = std::fs::metadata(path)
+			.map_err(|error| LinkedWorktreeError::io("inspecting repository structure", path, error))?;
+		if !matches(&metadata) {
+			return Err(LinkedWorktreeError::io(
+				"validating repository structure",
+				path,
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					format!("expected {expected}"),
+				),
+			));
+		}
+		Ok(())
+	}
+
+	/// Reject a repository whose common `config` declares a **format gitana cannot safely read or mutate** —
+	/// git's own `check_repository_format` refuses to operate on such a repo, so every structural reader or
+	/// writer must fail closed the same way (requirements 257-258). Reproduces git's format grammar exactly
+	/// (each rule verified against stock `git worktree move`), reading only the config (no object store):
 	///
 	/// - **`core.repositoryformatversion`** — validated at *every* occurrence (git parses it eagerly and
 	///   aborts on any malformed value, even one a later valid value shadows, and even at version 0); then the
@@ -184,8 +223,8 @@ mod native {
 	/// `refstorage` — reftable changes the **ref backend**, which gitana's structural HEAD/ref reads assume is
 	/// the files format; that is precisely a format gitana does not fully understand, so it fails closed.
 	///
-	/// A missing/unparseable config is left to `detect_kind`'s `UnsupportedObjectFormat`. Shared by the
-	/// destructive entry points (`remove`, `relocate`).
+	/// A missing/unparseable config is left to `detect_kind`'s `UnsupportedObjectFormat`. Shared by
+	/// enumeration and the destructive entry points (`remove`, `relocate`).
 	pub(crate) fn reject_unsupported_repository_format(
 		common: &Path,
 	) -> Result<(), LinkedWorktreeError> {
@@ -271,4 +310,5 @@ mod native {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use native::{
 	detect_kind, open_store_raw, open_work_dir, reject_unsupported_repository_format,
+	validate_repository_structure,
 };
