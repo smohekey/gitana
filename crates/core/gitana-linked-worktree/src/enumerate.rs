@@ -65,7 +65,10 @@ mod native {
 		RefSource, SYMREF_MAXDEPTH, admin_checkout_missing, canonical, ignorecase, is_bare,
 		linked_admin_dirs, main_worktree_path, resolve_ref_terminal, worktree_path_of,
 	};
-	use crate::repo_id::{detect_kind, open_store_raw};
+	use crate::repo_id::{
+		detect_kind, open_store_raw, reject_unsupported_repository_format,
+		validate_repository_structure,
+	};
 	use crate::{LinkedWorktreeError, WorktreeContext};
 
 	/// Enumerate the worktrees of the repository `cx` names.
@@ -74,6 +77,8 @@ mod native {
 	/// when injected, else the repository-local config alone.
 	pub async fn enumerate(cx: &WorktreeContext) -> Result<WorktreeListing, LinkedWorktreeError> {
 		let common = cx.repo().common_dir();
+		reject_unsupported_repository_format(common)?;
+		validate_repository_structure(common)?;
 		// The initial store only detects the object format (shared state) — anchor it on the stable
 		// `common_dir`, not the identity's `git_dir` (which, discovered inside a linked worktree, names that
 		// checkout's admin and fails to open once the checkout is pruned). Each worktree's HEAD is then

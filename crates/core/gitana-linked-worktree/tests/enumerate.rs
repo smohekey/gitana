@@ -9,6 +9,124 @@ use gitana_linked_worktree::{
 };
 
 #[tokio::test]
+async fn enumeration_requires_git_repository_structure() {
+	for entry in ["HEAD", "objects", "refs"] {
+		let base = unique_tmp(&format!("enum-missing-{entry}"));
+		let work = base.join("repo");
+		init_repo(&work, "sha1");
+		let missing = canonical(&work.join(".git")).join(entry);
+		if missing.is_dir() {
+			std::fs::remove_dir_all(&missing).unwrap();
+		} else {
+			std::fs::remove_file(&missing).unwrap();
+		}
+
+		assert!(
+			!git_ok(&["-C", work.to_str().unwrap(), "status", "--porcelain"]),
+			"git must reject a repository without {entry}"
+		);
+		let repository = RepositoryId::discover(&work).await.unwrap();
+		let error = enumerate(&WorktreeContext::new(repository))
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(
+				&error,
+				LinkedWorktreeError::Io {
+					path,
+					..
+				} if path == &missing
+			),
+			"missing {entry}: got {error:?}"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn enumeration_matches_git_on_unsupported_repository_formats() {
+	let refused: &[(&str, &str)] = &[
+		(
+			"unknown-flat",
+			"[extensions]\n\tobjectFormat = sha1\n\tfrobnicate = true",
+		),
+		("unknown-subsection", "[extensions \"foo\"]\n\tbar = true"),
+		(
+			"bad-bool-worktreeconfig",
+			"[extensions]\n\tworktreeConfig = notabool",
+		),
+		(
+			"bad-bool-preciousobjects",
+			"[extensions]\n\tpreciousObjects = notabool",
+		),
+		("valueless-partialclone", "[extensions]\n\tpartialClone"),
+		("valueless-objectformat", "[extensions]\n\tobjectFormat"),
+		("bad-objectformat", "[extensions]\n\tobjectFormat = bogus"),
+		(
+			"shadowed-bad-objectformat",
+			"[extensions]\n\tobjectFormat = bogus\n\tobjectFormat = sha1",
+		),
+		("version-too-new", "[core]\n\trepositoryformatversion = 2"),
+		(
+			"shadowed-bad-version",
+			"[core]\n\trepositoryformatversion = notanint",
+		),
+	];
+	for (tag, fragment) in refused {
+		let base = unique_tmp(&format!("enum-format-{tag}"));
+		let work = base.join("repo");
+		init_repo(&work, "sha1");
+		let config_path = work.join(".git/config");
+		let config = std::fs::read_to_string(&config_path)
+			.unwrap()
+			.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+		std::fs::write(&config_path, format!("{config}\n{fragment}\n")).unwrap();
+
+		assert!(
+			!git_ok(&[
+				"-C",
+				work.to_str().unwrap(),
+				"worktree",
+				"list",
+				"--porcelain"
+			]),
+			"git must reject {tag}"
+		);
+		let error = enumerate(&ctx_at(&work)).await.unwrap_err();
+		assert!(
+			matches!(error, LinkedWorktreeError::UnsupportedObjectFormat(_)),
+			"{tag}: got {error:?}"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn version_zero_ignores_unknown_repository_extensions() {
+	let base = unique_tmp("enum-version-zero-extension");
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	let config_path = work.join(".git/config");
+	let mut config = std::fs::read_to_string(&config_path).unwrap();
+	config.push_str("\n[extensions]\n\tfrobnicate = true\n");
+	std::fs::write(config_path, config).unwrap();
+
+	assert!(git_ok(&[
+		"-C",
+		work.to_str().unwrap(),
+		"worktree",
+		"list",
+		"--porcelain"
+	]));
+	let listing = enumerate(&ctx_at(&work)).await.unwrap();
+	assert!(matches!(
+		listing.entries[0].role,
+		WorktreeRole::Primary { bare: false }
+	));
+	let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
 async fn non_utf8_local_config_values_do_not_block_enumeration() {
 	for (fmt, _kind) in formats() {
 		let base = unique_tmp(&format!("enum-non-utf8-config-{fmt}"));
