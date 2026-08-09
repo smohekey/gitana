@@ -5,8 +5,39 @@ mod common;
 
 use common::*;
 use gitana_linked_worktree::{
-	HeadKind, LockState, RepositoryId, WorktreeContext, WorktreeRole, enumerate,
+	HeadKind, LinkedWorktreeError, LockState, RepositoryId, WorktreeContext, WorktreeRole, enumerate,
 };
+
+#[tokio::test]
+async fn non_utf8_local_config_values_do_not_block_enumeration() {
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("enum-non-utf8-config-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let config_path = work.join(".git/config");
+		let mut config = std::fs::read(&config_path).unwrap();
+		config.extend_from_slice(b"\n[remote \"binary\"]\n\turl = \xff\n");
+		std::fs::write(&config_path, config).unwrap();
+
+		let listing = enumerate(&ctx_at(&work)).await.unwrap();
+		assert!(matches!(
+			listing.entries[0].role,
+			WorktreeRole::Primary { bare: false }
+		));
+		assert_eq!(listing.entries[0].head, Some(HeadKind::Symbolic));
+		assert!(listing.entries[0].object.is_some());
+
+		let mut config = std::fs::read(&config_path).unwrap();
+		config.extend_from_slice(b"[core]\n\tbare = invalid\n");
+		std::fs::write(&config_path, config).unwrap();
+		assert!(matches!(
+			enumerate(&ctx_at(&work)).await,
+			Err(LinkedWorktreeError::InvalidCoreBare(_))
+		));
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
 
 /// The listing sort honours `core.ignorecase` from the **injected** config, overriding the
 /// repository-local value; a local-only context (the embedding default) reads `<common>/config` alone.

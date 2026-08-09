@@ -202,10 +202,10 @@ mod native {
 		// git requires a value for each of these (a valueless occurrence is an error).
 		const VALUE_REQUIRED: &[&str] = &["partialclone", "objectformat"];
 
-		let Ok(text) = std::fs::read_to_string(common.join("config")) else {
+		let Ok(bytes) = std::fs::read(common.join("config")) else {
 			return Ok(());
 		};
-		let Ok(config) = gitana_config::GitConfig::parse(&text) else {
+		let Ok(config) = gitana_config::GitConfigBytes::parse(&bytes) else {
 			return Ok(());
 		};
 		let bad = LinkedWorktreeError::UnsupportedObjectFormat;
@@ -226,11 +226,14 @@ mod native {
 
 		// Reject an unknown extension name (the whole dotted remainder).
 		for (key, _) in config.entries() {
-			if let Some(name) = key.strip_prefix("extensions.")
-				&& !KNOWN.contains(&name.to_ascii_lowercase().as_str())
+			if let Some(name) = key.strip_prefix(b"extensions.")
+				&& !KNOWN
+					.iter()
+					.any(|known| name.eq_ignore_ascii_case(known.as_bytes()))
 			{
 				return Err(bad(format!(
-					"unknown repository extension: extensions.{name}"
+					"unknown repository extension: extensions.{}",
+					String::from_utf8_lossy(name)
 				)));
 			}
 		}
@@ -252,11 +255,12 @@ mod native {
 		}
 		for raw in config.get_all_raw("extensions", None, "objectformat") {
 			if let Some(value) = raw
-				&& value != "sha1"
-				&& value != "sha256"
+				&& value.as_slice() != b"sha1"
+				&& value.as_slice() != b"sha256"
 			{
 				return Err(bad(format!(
-					"invalid value for extensions.objectformat: {value}"
+					"invalid value for extensions.objectformat: {}",
+					String::from_utf8_lossy(&value)
 				)));
 			}
 		}

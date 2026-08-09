@@ -32,9 +32,13 @@ mod tests {
 	use crate::{Config, RepositoryError};
 
 	async fn store_with_config(text: &str) -> MemoryFileStore {
+		store_with_bytes(text.as_bytes()).await
+	}
+
+	async fn store_with_bytes(bytes: &[u8]) -> MemoryFileStore {
 		let store = MemoryFileStore::new();
 		store
-			.write_path_if_absent("config", text.as_bytes())
+			.write_path_if_absent("config", bytes)
 			.await
 			.expect("write config");
 		store
@@ -59,6 +63,15 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn unrelated_non_utf8_values_do_not_hide_the_repository_format() {
+		let store = store_with_bytes(
+			b"[core]\n\trepositoryformatversion = 0\n[remote \"binary\"]\n\turl = \xff\n",
+		)
+		.await;
+		assert_eq!(detect_hash_kind(&store).await.unwrap(), HashKind::Sha1);
+	}
+
+	#[tokio::test]
 	async fn missing_config_is_unsupported() {
 		let store = MemoryFileStore::new();
 		assert!(matches!(
@@ -69,8 +82,10 @@ mod tests {
 
 	#[tokio::test]
 	async fn unknown_format_is_unsupported() {
-		let text = "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha999\n";
-		let store = store_with_config(text).await;
+		let store = store_with_bytes(
+			b"[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha999\n[remote \"binary\"]\n\turl = \xff\n",
+		)
+		.await;
 		assert!(matches!(
 			detect_hash_kind(&store).await,
 			Err(RepositoryError::UnsupportedFormat(_))
