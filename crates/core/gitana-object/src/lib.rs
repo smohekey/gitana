@@ -35,6 +35,7 @@ pub use bitmap::{
 };
 pub use commit::{
 	Commit, commit_signature_and_payload, commit_signed_payload, encode_commit, parse_commit,
+	validate_commit_structure,
 };
 pub use delta::apply_delta;
 pub use enumerate::{enumerate_objects, referenced_ids};
@@ -103,6 +104,12 @@ pub enum ObjectError {
 	/// A tree's entries were not in git's canonical directory-aware order.
 	#[error("tree entries are not canonically sorted")]
 	TreeNotSorted,
+	/// A commit's required headers were missing, duplicated, malformed, or out of order.
+	#[error("invalid commit structure")]
+	InvalidCommitStructure,
+	/// A commit's author or committer identity was not valid git identity syntax.
+	#[error("invalid commit identity")]
+	InvalidCommitIdentity,
 	/// A packfile's structure was invalid (bad signature, header, or trailer).
 	#[error("malformed packfile")]
 	MalformedPack,

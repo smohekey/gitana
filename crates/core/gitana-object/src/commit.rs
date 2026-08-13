@@ -1,5 +1,5 @@
 use crate::text::{as_str, split_message};
-use crate::{HashAlgorithm, ObjectError, ObjectId};
+use crate::{HashAlgorithm, ObjectError, ObjectId, Signature};
 
 /// A parsed commit object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +68,109 @@ pub fn parse_commit<H: HashAlgorithm>(payload: &[u8]) -> Result<Commit<H>, Objec
 		extra_headers,
 		message: message.to_owned(),
 	})
+}
+
+/// Validate the raw structural encoding of a git commit.
+///
+/// Valid commits contain one leading `tree` header, zero or more contiguous
+/// `parent` headers, exactly one `author`, and exactly one `committer`, in that
+/// order. Remaining headers must have valid names and continuation lines, and
+/// the hash algorithm's signature header may occur at most once. Author and
+/// committer values must be canonical git identity lines with non-negative
+/// timestamps.
+///
+/// This validation is intentionally byte-oriented and does not require the
+/// commit message or extra-header values to be UTF-8.
+pub fn validate_commit_structure<H: HashAlgorithm>(payload: &[u8]) -> Result<(), ObjectError> {
+	let separator = payload
+		.windows(2)
+		.position(|bytes| bytes == b"\n\n")
+		.ok_or(ObjectError::InvalidCommitStructure)?;
+	let header = &payload[..separator];
+	if header.is_empty() || header.contains(&0) {
+		return Err(ObjectError::InvalidCommitStructure);
+	}
+
+	let mut lines = header.split(|byte| *byte == b'\n').peekable();
+	validate_object_id_header::<H>(
+		lines.next().ok_or(ObjectError::InvalidCommitStructure)?,
+		b"tree ",
+	)?;
+	while lines
+		.peek()
+		.is_some_and(|line| line.starts_with(b"parent "))
+	{
+		validate_object_id_header::<H>(lines.next().expect("peeked parent header"), b"parent ")?;
+	}
+	validate_identity_header(
+		lines.next().ok_or(ObjectError::InvalidCommitStructure)?,
+		b"author ",
+	)?;
+	validate_identity_header(
+		lines.next().ok_or(ObjectError::InvalidCommitStructure)?,
+		b"committer ",
+	)?;
+
+	let signature_name = H::GPGSIG_HEADER.as_bytes();
+	let mut signature_seen = false;
+	let mut continuation_allowed = false;
+	for line in lines {
+		if line.starts_with(b" ") {
+			if !continuation_allowed {
+				return Err(ObjectError::InvalidCommitStructure);
+			}
+			continue;
+		}
+		let space = line
+			.iter()
+			.position(|byte| *byte == b' ')
+			.ok_or(ObjectError::InvalidCommitStructure)?;
+		let name = &line[..space];
+		if name.is_empty()
+			|| !name
+				.iter()
+				.all(|byte| byte.is_ascii_graphic() && *byte != b' ')
+			|| matches!(name, b"tree" | b"parent" | b"author" | b"committer")
+		{
+			return Err(ObjectError::InvalidCommitStructure);
+		}
+		if name == signature_name {
+			if signature_seen {
+				return Err(ObjectError::InvalidCommitStructure);
+			}
+			signature_seen = true;
+		}
+		continuation_allowed = true;
+	}
+	Ok(())
+}
+
+fn validate_object_id_header<H: HashAlgorithm>(
+	line: &[u8],
+	prefix: &[u8],
+) -> Result<(), ObjectError> {
+	let value = line
+		.strip_prefix(prefix)
+		.ok_or(ObjectError::InvalidCommitStructure)?;
+	let value = as_str(value).map_err(|_| ObjectError::InvalidCommitStructure)?;
+	ObjectId::<H>::from_hex(value).map_err(|_| ObjectError::InvalidCommitStructure)?;
+	Ok(())
+}
+
+fn validate_identity_header(line: &[u8], prefix: &[u8]) -> Result<(), ObjectError> {
+	let value = line
+		.strip_prefix(prefix)
+		.ok_or(ObjectError::InvalidCommitStructure)?;
+	let value = as_str(value).map_err(|_| ObjectError::InvalidCommitIdentity)?;
+	let identity = Signature::parse(value).map_err(|_| ObjectError::InvalidCommitIdentity)?;
+	if identity.name.is_empty()
+		|| identity.email.is_empty()
+		|| identity.seconds < 0
+		|| identity.to_string() != value
+	{
+		return Err(ObjectError::InvalidCommitIdentity);
+	}
+	Ok(())
 }
 
 /// Unfold a multi-line header value: `first` (the bytes after `name `) plus each following
@@ -202,6 +305,59 @@ mod tests {
 		assert_eq!(commit.parents, vec![p1, p2]);
 		assert_eq!(commit.author, "A <a@x> 1 +0000");
 		assert_eq!(commit.message, "merge\n");
+	}
+
+	#[test]
+	fn validates_raw_commit_structure() {
+		let tree = ObjectId::<Sha256>::compute(ObjectKind::Tree, b"t");
+		let parent = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"p");
+		let payload = format!(
+			"tree {tree}\nparent {parent}\n\
+			 author A <a@x> 1 +0000\ncommitter C <c@x> 2 -0000\n\
+			 encoding UTF-8\ncustom first\n continuation\n\nmessage\n",
+		);
+		validate_commit_structure::<Sha256>(payload.as_bytes()).expect("valid commit structure");
+	}
+
+	#[test]
+	fn rejects_duplicate_or_misordered_core_headers() {
+		let tree = ObjectId::<Sha256>::compute(ObjectKind::Tree, b"t");
+		for payload in [
+			format!(
+				"tree {tree}\ntree {tree}\nauthor A <a@x> 1 +0000\n\
+				 committer C <c@x> 2 +0000\n\nmessage\n"
+			),
+			format!(
+				"tree {tree}\nauthor A <a@x> 1 +0000\nauthor B <b@x> 1 +0000\n\
+				 committer C <c@x> 2 +0000\n\nmessage\n"
+			),
+			format!(
+				"tree {tree}\nencoding UTF-8\nauthor A <a@x> 1 +0000\n\
+				 committer C <c@x> 2 +0000\n\nmessage\n"
+			),
+		] {
+			assert!(matches!(
+				validate_commit_structure::<Sha256>(payload.as_bytes()),
+				Err(ObjectError::InvalidCommitStructure)
+			));
+		}
+	}
+
+	#[test]
+	fn rejects_invalid_commit_identities() {
+		let tree = ObjectId::<Sha256>::compute(ObjectKind::Tree, b"t");
+		for author in [
+			"A <a@x> -1 +0000",
+			"A <a@x> 01 +0000",
+			"A <a@x> 1 +0000 trailing",
+			" <a@x> 1 +0000",
+		] {
+			let payload = format!("tree {tree}\nauthor {author}\ncommitter C <c@x> 2 +0000\n\nmessage\n");
+			assert!(matches!(
+				validate_commit_structure::<Sha256>(payload.as_bytes()),
+				Err(ObjectError::InvalidCommitIdentity)
+			));
+		}
 	}
 
 	#[test]
