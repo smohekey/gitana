@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use gitana_file_store_local::{CapWorkDir, LocalFileStore};
-use gitana_object::{ObjectId, Sha256};
+use gitana_object::{ObjectId, ObjectKind, Sha256};
 use gitana_object_store::ObjectStore;
-use gitana_repository::{FileMode, Repository, TreeBuildEntry};
+use gitana_repository::Repository;
 use gitana_worktree::{WorkTree, WorktreeError};
 
 fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
@@ -77,13 +77,12 @@ async fn reset_index_rejects_unsafe_tree_path() {
 
 	// A crafted tree whose flattened entry escapes the work tree must not enter the index.
 	let blob = wt.repository().write_blob(b"PWN\n").await.unwrap();
+	let mut payload = b"100644 ../escape.txt\0".to_vec();
+	payload.extend_from_slice(blob.as_bytes());
 	let hostile = wt
 		.repository()
-		.write_tree(&[TreeBuildEntry {
-			path: "../escape.txt".to_owned(),
-			mode: FileMode::Regular,
-			id: blob,
-		}])
+		.objects()
+		.write_object(ObjectKind::Tree, &payload)
 		.await
 		.unwrap();
 

@@ -11,6 +11,9 @@ pub enum RepositoryError {
 	/// HEAD or a ref file could not be parsed, or a revision spec is malformed.
 	#[error("invalid ref content: {0}")]
 	InvalidRef(String),
+	/// A requested tree contains an invalid path, mode, or path conflict.
+	#[error("invalid tree: {0}")]
+	InvalidTree(String),
 	/// A (well-formed) revision spec did not resolve to any object.
 	#[error("unknown revision: {0}")]
 	UnknownRevision(String),

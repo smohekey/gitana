@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use gitana_file_store_local::{CapWorkDir, LocalFileStore};
-use gitana_object::{ObjectId, Sha256};
+use gitana_object::{ObjectId, ObjectKind, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 use gitana_worktree::{IndexEntry, Stat, WorkTree, WorktreeError};
@@ -625,13 +625,14 @@ async fn staged_restore_rejects_unsafe_tree_path() {
 	// so this must still be refused.
 	let (escape_spec, escape_outside) = escape_path(&work);
 	let blob = wt.repository().write_blob(b"PWN\n").await.unwrap();
+	let mut payload = b"100644 ".to_vec();
+	payload.extend_from_slice(escape_spec.as_bytes());
+	payload.push(0);
+	payload.extend_from_slice(blob.as_bytes());
 	let hostile = wt
 		.repository()
-		.write_tree(&[TreeBuildEntry {
-			path: escape_spec,
-			mode: FileMode::Regular,
-			id: blob,
-		}])
+		.objects()
+		.write_object(ObjectKind::Tree, &payload)
 		.await
 		.unwrap();
 

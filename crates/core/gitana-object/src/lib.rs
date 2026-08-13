@@ -62,7 +62,7 @@ pub use sha1::Sha1;
 pub use sha256::Sha256;
 pub use signature::{Signature, TzOffset};
 pub use tag::{Tag, encode_tag, parse_tag, tag_signature_and_payload, tag_signed_payload};
-pub use tree::{TreeEntry, encode_tree, parse_tree};
+pub use tree::{TreeEntry, encode_tree, parse_tree, validate_tree_structure};
 
 /// Errors from decoding or parsing git objects.
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +88,21 @@ pub enum ObjectError {
 	/// characters, or raw id bytes were not the algorithm's raw width.
 	#[error("invalid object id")]
 	InvalidObjectId,
+	/// A tree entry used an empty, reserved, or slash-containing name.
+	#[error("invalid tree entry name")]
+	InvalidTreeName,
+	/// A tree entry used a mode outside git's canonical tree modes.
+	#[error("invalid tree entry mode")]
+	InvalidTreeMode,
+	/// A tree entry referenced the all-zero object id.
+	#[error("tree entry references the null object id")]
+	NullTreeEntry,
+	/// A tree contained the same raw entry name more than once.
+	#[error("duplicate tree entry")]
+	DuplicateTreeEntry,
+	/// A tree's entries were not in git's canonical directory-aware order.
+	#[error("tree entries are not canonically sorted")]
+	TreeNotSorted,
 	/// A packfile's structure was invalid (bad signature, header, or trailer).
 	#[error("malformed packfile")]
 	MalformedPack,
