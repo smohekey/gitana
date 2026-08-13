@@ -1,5 +1,9 @@
+use std::collections::BTreeSet;
+
 use crate::text::as_str;
 use crate::{HashAlgorithm, ObjectError, ObjectId};
+
+const STANDARD_MODES: [&[u8]; 5] = [b"100644", b"100755", b"120000", b"40000", b"160000"];
 
 /// One entry in a tree object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +49,65 @@ pub fn parse_tree<H: HashAlgorithm>(payload: &[u8]) -> Result<Vec<TreeEntry<H>>,
 	}
 
 	Ok(entries)
+}
+
+/// Validate a raw tree payload without requiring entry names to be UTF-8.
+///
+/// Valid trees use canonical modes and git's directory-aware byte ordering.
+/// Entry names must be non-empty single path components other than `.` or `..`,
+/// names cannot be repeated, and referenced object ids cannot be all zeroes.
+pub fn validate_tree_structure<H: HashAlgorithm>(payload: &[u8]) -> Result<(), ObjectError> {
+	let mut names = BTreeSet::new();
+	let mut previous_key: Option<Vec<u8>> = None;
+	let mut rest = payload;
+
+	while !rest.is_empty() {
+		let space = rest
+			.iter()
+			.position(|&byte| byte == b' ')
+			.ok_or(ObjectError::MalformedHeader)?;
+		let mode = &rest[..space];
+		if !STANDARD_MODES.contains(&mode) {
+			return Err(ObjectError::InvalidTreeMode);
+		}
+		rest = &rest[space + 1..];
+
+		let nul = rest
+			.iter()
+			.position(|&byte| byte == 0)
+			.ok_or(ObjectError::MalformedHeader)?;
+		let name = &rest[..nul];
+		if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+			return Err(ObjectError::InvalidTreeName);
+		}
+		if !names.insert(name.to_vec()) {
+			return Err(ObjectError::DuplicateTreeEntry);
+		}
+		rest = &rest[nul + 1..];
+
+		if rest.len() < H::RAW_LEN {
+			return Err(ObjectError::MalformedHeader);
+		}
+		let raw_id = &rest[..H::RAW_LEN];
+		if raw_id.iter().all(|byte| *byte == 0) {
+			return Err(ObjectError::NullTreeEntry);
+		}
+		rest = &rest[H::RAW_LEN..];
+
+		let mut key = name.to_vec();
+		if mode == b"40000" {
+			key.push(b'/');
+		}
+		if previous_key
+			.as_ref()
+			.is_some_and(|previous| previous >= &key)
+		{
+			return Err(ObjectError::TreeNotSorted);
+		}
+		previous_key = Some(key);
+	}
+
+	Ok(())
 }
 
 /// Encode tree `entries` to the canonical git tree payload.
@@ -171,5 +234,76 @@ mod tests {
 		// Sorted: "dir" (as "dir/") sorts after "file.txt"? No — 'd' < 'f', so dir first.
 		assert_eq!(reparsed[0].name, "dir");
 		assert_eq!(reparsed[1].name, "file.txt");
+	}
+
+	#[test]
+	fn validates_non_utf8_names_as_raw_bytes() {
+		let blob = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"x");
+		let mut payload = b"100644 before\0".to_vec();
+		payload.extend_from_slice(blob.as_bytes());
+		payload.extend_from_slice(b"100644 \xffafter\0");
+		payload.extend_from_slice(blob.as_bytes());
+
+		validate_tree_structure::<Sha256>(&payload).expect("valid raw tree");
+		assert!(parse_tree::<Sha256>(&payload).is_err());
+	}
+
+	#[test]
+	fn rejects_invalid_tree_names() {
+		for name in [b"".as_slice(), b".", b"..", b"a/b"] {
+			let payload = raw_entry::<Sha256>(b"100644", name, &[1; 32]);
+			assert!(matches!(
+				validate_tree_structure::<Sha256>(&payload),
+				Err(ObjectError::InvalidTreeName)
+			));
+		}
+	}
+
+	#[test]
+	fn rejects_non_canonical_tree_modes_and_null_ids() {
+		let invalid_mode = raw_entry::<Sha1>(b"040000", b"dir", &[1; 20]);
+		assert!(matches!(
+			validate_tree_structure::<Sha1>(&invalid_mode),
+			Err(ObjectError::InvalidTreeMode)
+		));
+
+		let null_id = raw_entry::<Sha1>(b"100644", b"file", &[0; 20]);
+		assert!(matches!(
+			validate_tree_structure::<Sha1>(&null_id),
+			Err(ObjectError::NullTreeEntry)
+		));
+	}
+
+	#[test]
+	fn rejects_duplicate_tree_names() {
+		let mut payload = raw_entry::<Sha256>(b"100644", b"same", &[1; 32]);
+		payload.extend_from_slice(&raw_entry::<Sha256>(b"100755", b"same", &[2; 32]));
+
+		assert!(matches!(
+			validate_tree_structure::<Sha256>(&payload),
+			Err(ObjectError::DuplicateTreeEntry)
+		));
+	}
+
+	#[test]
+	fn rejects_non_canonical_directory_aware_order() {
+		let mut payload = raw_entry::<Sha256>(b"40000", b"foo", &[1; 32]);
+		payload.extend_from_slice(&raw_entry::<Sha256>(b"100644", b"foo.bar", &[2; 32]));
+
+		assert!(matches!(
+			validate_tree_structure::<Sha256>(&payload),
+			Err(ObjectError::TreeNotSorted)
+		));
+	}
+
+	fn raw_entry<H: HashAlgorithm>(mode: &[u8], name: &[u8], id: &[u8]) -> Vec<u8> {
+		assert_eq!(id.len(), H::RAW_LEN);
+		let mut payload = Vec::new();
+		payload.extend_from_slice(mode);
+		payload.push(b' ');
+		payload.extend_from_slice(name);
+		payload.push(0);
+		payload.extend_from_slice(id);
+		payload
 	}
 }

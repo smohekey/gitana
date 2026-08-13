@@ -10,7 +10,9 @@ use gitana_file_store_local::LocalFileStore;
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_object::{ObjectId, ObjectKind, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
-use gitana_repository::{FileMode, HeadState, ReflogIntent, Repository, TreeBuildEntry};
+use gitana_repository::{
+	FileMode, HeadState, ReflogIntent, Repository, TreeBuildEntry, compute_tree_id,
+};
 
 fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
 	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
@@ -242,21 +244,21 @@ async fn engine_commit_is_read_by_git() {
 	repo.init().await.unwrap();
 
 	let blob = repo.write_blob(b"hello\n").await.unwrap();
-	let tree = repo
-		.write_tree(&[
-			TreeBuildEntry {
-				path: "greeting.txt".to_owned(),
-				mode: FileMode::Regular,
-				id: blob,
-			},
-			TreeBuildEntry {
-				path: "src/lib.rs".to_owned(),
-				mode: FileMode::Regular,
-				id: blob,
-			},
-		])
-		.await
-		.unwrap();
+	let entries = [
+		TreeBuildEntry {
+			path: "greeting.txt".to_owned(),
+			mode: FileMode::Regular,
+			id: blob,
+		},
+		TreeBuildEntry {
+			path: "src/lib.rs".to_owned(),
+			mode: FileMode::Regular,
+			id: blob,
+		},
+	];
+	let computed_tree = compute_tree_id(&entries).unwrap();
+	let tree = repo.write_tree(&entries).await.unwrap();
+	assert_eq!(computed_tree, tree);
 	let author = "A U Thor <author@example.com> 1700000000 +0000";
 	let committer = "C O Mitter <committer@example.com> 1700000000 +0000";
 	let commit = repo

@@ -34,5 +34,5 @@ pub use self::{
 	ref_op::RefOp,
 	refs::{RefStore, ReflogIntent},
 	repository::Repository,
-	tree::TreeBuildEntry,
+	tree::{TreeBuildEntry, compute_tree_id},
 };
