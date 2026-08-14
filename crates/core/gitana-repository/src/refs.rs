@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use gitana_file_store::{FileStore, FileStoreError, WriteOutcome};
+use gitana_file_store::{FileStore, FileStoreError, PathLock};
 use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::{HeadState, RefOp, RepositoryError};
@@ -92,6 +92,74 @@ pub struct RefStore<'a, F, H> {
 	_hash: PhantomData<H>,
 }
 
+struct HeldRefLocks {
+	names: Vec<String>,
+	locks: Vec<PathLock>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct OwnedRefOp<H: HashAlgorithm> {
+	name: String,
+	expected: Option<ObjectId<H>>,
+	new: Option<ObjectId<H>>,
+	reflog: OwnedReflogIntent,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum OwnedReflogIntent {
+	Log { committer: String, message: String },
+	Skip,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl OwnedReflogIntent {
+	fn borrow(&self) -> ReflogIntent<'_> {
+		match self {
+			Self::Log { committer, message } => ReflogIntent::Log { committer, message },
+			Self::Skip => ReflogIntent::Skip,
+		}
+	}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<ReflogIntent<'_>> for OwnedReflogIntent {
+	fn from(reflog: ReflogIntent<'_>) -> Self {
+		match reflog {
+			ReflogIntent::Log { committer, message } => Self::Log {
+				committer: committer.to_owned(),
+				message: message.to_owned(),
+			},
+			ReflogIntent::Skip => Self::Skip,
+		}
+	}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn own_ref_ops<H: HashAlgorithm>(ops: &[RefOp<'_, H>]) -> Vec<OwnedRefOp<H>> {
+	ops
+		.iter()
+		.map(|op| OwnedRefOp {
+			name: op.name.clone(),
+			expected: op.expected,
+			new: op.new,
+			reflog: OwnedReflogIntent::from(op.reflog),
+		})
+		.collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn borrow_ref_ops<H: HashAlgorithm>(ops: &[OwnedRefOp<H>]) -> Vec<RefOp<'_, H>> {
+	ops
+		.iter()
+		.map(|op| RefOp {
+			name: op.name.clone(),
+			expected: op.expected,
+			new: op.new,
+			reflog: op.reflog.borrow(),
+		})
+		.collect()
+}
+
 impl<'a, F, H> RefStore<'a, F, H>
 where
 	F: FileStore,
@@ -107,7 +175,8 @@ where
 	}
 
 	/// Lend the store the effective (merged) config for its reflog-policy read. Called by
-	/// [`Repository::refs`]; a `None` leaves the store on the raw-local `config` fallback.
+	/// [`Repository::refs`](crate::Repository::refs); a `None` leaves the store on the raw-local
+	/// `config` fallback.
 	pub fn with_effective_config(mut self, effective: Option<&'a gitana_config::GitConfig>) -> Self {
 		self.effective = effective;
 		self
@@ -344,7 +413,37 @@ where
 	/// or a lost CAS race leaves the ref untouched — the atomicity a raw ref move lacked.
 	/// [`update_ref`](Self::update_ref) and [`delete_ref`](Self::delete_ref) are one-op wrappers; a
 	/// caller wanting all-or-nothing across several refs (a `--atomic` push) passes them together.
+	///
+	/// On native targets, the complete transaction runs in an owned task. Dropping the calling future
+	/// only stops waiting for its result: lock acquisition, validation, publication, lock release, and
+	/// directory pruning continue to completion. Wasm file-store operations execute synchronously when
+	/// polled, so the transaction runs inline there without requiring a Tokio runtime.
 	pub async fn transact(&self, ops: &[RefOp<'_, H>]) -> Result<(), (String, RepositoryError)> {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let files = self.files.shared_handle();
+			let effective = self.effective.cloned();
+			let ops = own_ref_ops(ops);
+			match tokio::spawn(async move {
+				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+				let ops = borrow_ref_ops(&ops);
+				store.transact_inline(&ops).await
+			})
+			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err((
+					String::new(),
+					RepositoryError::RetainedTask(error.to_string()),
+				)),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		self.transact_inline(ops).await
+	}
+
+	async fn transact_inline(&self, ops: &[RefOp<'_, H>]) -> Result<(), (String, RepositoryError)> {
 		let anon = |error| (String::new(), error);
 		let policy = self.reflog_policy().await.map_err(anon)?;
 		// The branch HEAD points at (read once, before locking): an op on it cascades into `logs/HEAD`,
@@ -362,14 +461,19 @@ where
 		let acquired = self.lock_all(&lock_names).await?;
 
 		// Confirm the cascade under the acquired locks (catching a `HEAD` retarget in the
-		// pre-lock→lock window), then validate and commit — releasing every lock on any path.
-		let outcome = match self.confirm_cascades(ops, cascades).await {
-			Ok(cascades) => self.transact_locked(ops, &cascades, policy).await,
-			Err(error) => Err(error),
-		};
+		// pre-lock→lock window), validate, then commit. On native this entire sequence lives in the
+		// retained worker, so the path-lock guards cannot be dropped while a backend write continues.
+		let outcome = async {
+			let cascades = self.confirm_cascades(ops, cascades).await?;
+			let olds = self.validate_locked(ops, &cascades, policy).await?;
+			self.commit_validated(ops, &olds, &cascades, policy).await
+		}
+		.await;
 
-		for name in &acquired {
-			self.unlock_ref(name).await;
+		let HeldRefLocks { names, locks } = acquired;
+		drop(locks);
+		for name in &names {
+			self.prune_empty_dirs(name).await;
 		}
 		outcome
 	}
@@ -402,14 +506,13 @@ where
 		)
 	}
 
-	/// Validate every op, then commit every op — assuming the full lock set is held. Split out so
-	/// [`transact`](Self::transact) releases the locks on every return path.
-	async fn transact_locked(
+	/// Validate every op while the full lock set is held, returning each observed old value.
+	async fn validate_locked(
 		&self,
 		ops: &[RefOp<'_, H>],
 		cascades: &[bool],
 		policy: ReflogPolicy,
-	) -> Result<(), (String, RepositoryError)> {
+	) -> Result<Vec<Option<ObjectId<H>>>, (String, RepositoryError)> {
 		// Validate all preconditions before mutating anything — so the common rejections (a stale
 		// `expected`, deleting a missing ref) apply nothing, even in a multi-op transaction.
 		let mut olds = Vec::with_capacity(ops.len());
@@ -493,9 +596,20 @@ where
 			olds.push(current);
 		}
 
-		// Commit each op. Validation preflighted every directory/file conflict, so a commit can now
-		// fail only on catastrophic I/O — nothing else moves a ref and then reports failure.
-		for ((op, &old), &cascade) in ops.iter().zip(&olds).zip(cascades) {
+		Ok(olds)
+	}
+
+	/// Commit prevalidated ops while both the ref locks and any caller guard remain held.
+	async fn commit_validated(
+		&self,
+		ops: &[RefOp<'_, H>],
+		olds: &[Option<ObjectId<H>>],
+		cascades: &[bool],
+		policy: ReflogPolicy,
+	) -> Result<(), (String, RepositoryError)> {
+		// Validation preflighted every directory/file conflict, so a commit can now fail only on
+		// catastrophic I/O — nothing else moves a ref and then reports failure.
+		for ((op, &old), &cascade) in ops.iter().zip(olds).zip(cascades) {
 			self
 				.commit_op(op, old, cascade, policy)
 				.await
@@ -580,31 +694,41 @@ where
 	/// Acquire every `<name>.lock` in `names`, sorted and deduped so concurrent transactions take
 	/// shared locks in the same order (deadlock-free). On the first contended lock, releases those
 	/// already taken and reports it.
-	async fn lock_all(&self, names: &[String]) -> Result<Vec<String>, (String, RepositoryError)> {
+	async fn lock_all(&self, names: &[String]) -> Result<HeldRefLocks, (String, RepositoryError)> {
 		let mut sorted: Vec<String> = names.to_vec();
 		sorted.sort();
 		sorted.dedup();
-		let mut acquired: Vec<String> = Vec::with_capacity(sorted.len());
+		let mut acquired = HeldRefLocks {
+			names: Vec::with_capacity(sorted.len()),
+			locks: Vec::with_capacity(sorted.len()),
+		};
 		for name in sorted {
-			if let Err(error) = self.lock_ref(&name).await {
-				for held in &acquired {
-					self.unlock_ref(held).await;
+			let lock = match self.lock_ref(&name).await {
+				Ok(lock) => lock,
+				Err(error) => {
+					let HeldRefLocks { mut names, locks } = acquired;
+					drop(locks);
+					names.push(name.clone());
+					for acquired_name in &names {
+						self.prune_empty_dirs(acquired_name).await;
+					}
+					return Err((name, error));
 				}
-				return Err((name, error));
-			}
-			acquired.push(name);
+			};
+			acquired.names.push(name);
+			acquired.locks.push(lock);
 		}
 		Ok(acquired)
 	}
 
 	/// Take `<name>.lock` (git's ref lock), retrying briefly on contention before giving up with
 	/// [`RepositoryError::RefLocked`].
-	async fn lock_ref(&self, name: &str) -> Result<(), RepositoryError> {
+	async fn lock_ref(&self, name: &str) -> Result<PathLock, RepositoryError> {
 		let path = format!("{name}.lock");
 		for attempt in 0..LOCK_ATTEMPTS {
-			match self.files.write_path_if_absent(&path, &[]).await? {
-				WriteOutcome::Written => return Ok(()),
-				WriteOutcome::AlreadyExists => {
+			match self.files.try_lock_path(&path).await? {
+				Some(lock) => return Ok(lock),
+				None => {
 					if attempt + 1 < LOCK_ATTEMPTS {
 						lock_backoff().await;
 					}
@@ -614,20 +738,6 @@ where
 		Err(RepositoryError::RefLocked {
 			name: name.to_owned(),
 		})
-	}
-
-	/// Release `<name>.lock`, using the lock-free unlink so it never contends for the very lock it is
-	/// removing, then prune any now-empty parent directories.
-	async fn unlock_ref(&self, name: &str) {
-		let _ = self
-			.files
-			.delete_path_unlocked(&format!("{name}.lock"))
-			.await;
-		// Acquiring `<name>.lock` may have created `<name>`'s parent directories (e.g. `refs/heads/foo/`
-		// for `refs/heads/foo/bar.lock`); an aborted transaction, or a delete that emptied the tree,
-		// leaves them behind. Git prunes such empty ref directories so a stale `refs/heads/foo/` cannot
-		// masquerade as a directory/file conflict blocking a later `refs/heads/foo`.
-		self.prune_empty_dirs(name).await;
 	}
 
 	/// Best-effort removal of `path`'s now-empty ancestor directories, from the innermost up, stopping
@@ -912,11 +1022,42 @@ where
 		target: &str,
 		reflog: ReflogIntent<'_>,
 	) -> Result<(), RepositoryError> {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let files = self.files.shared_handle();
+			let effective = self.effective.cloned();
+			let name = name.to_owned();
+			let target = target.to_owned();
+			let reflog = OwnedReflogIntent::from(reflog);
+			match tokio::spawn(async move {
+				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+				store
+					.set_symbolic_inline(&name, &target, reflog.borrow())
+					.await
+			})
+			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		self.set_symbolic_inline(name, target, reflog).await
+	}
+
+	async fn set_symbolic_inline(
+		&self,
+		name: &str,
+		target: &str,
+		reflog: ReflogIntent<'_>,
+	) -> Result<(), RepositoryError> {
 		// Hold `<name>.lock` across the reflog write and the retarget — like a ref transaction, so a
 		// reflog failure leaves the symbolic ref unchanged and no concurrent writer interleaves.
-		self.lock_ref(name).await?;
+		let lock = self.lock_ref(name).await?;
 		let result = self.set_symbolic_locked(name, target, reflog).await;
-		self.unlock_ref(name).await;
+		drop(lock);
+		self.prune_empty_dirs(name).await;
 		result
 	}
 
@@ -1202,9 +1343,17 @@ fn parse_oid<H: HashAlgorithm>(name: &str, bytes: &[u8]) -> Result<ObjectId<H>, 
 
 #[cfg(test)]
 mod tests {
+	#[cfg(not(target_arch = "wasm32"))]
+	use std::future::Future;
+	#[cfg(not(target_arch = "wasm32"))]
+	use std::task::{Context, Poll, Waker};
+
 	use gitana_file_store::{FileStore, FileStoreError};
 	use gitana_file_store_memory::MemoryFileStore;
 	use gitana_object::{ObjectId, ObjectKind, Sha256};
+
+	#[cfg(not(target_arch = "wasm32"))]
+	use crate::GatedFileStore;
 
 	use super::{RefStore, ReflogIntent};
 
@@ -1700,6 +1849,109 @@ mod tests {
 		);
 	}
 
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn cancelled_multi_ref_publication_retains_locks_and_completes() {
+		let files = GatedFileStore::new();
+		let store: RefStore<'_, GatedFileStore, Sha256> = RefStore::new(&files);
+		let first = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"first");
+		let second = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"second");
+		let successor = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"successor");
+		let ops = [
+			crate::RefOp {
+				name: "refs/heads/a".to_owned(),
+				expected: None,
+				new: Some(first),
+				reflog: ReflogIntent::Skip,
+			},
+			crate::RefOp {
+				name: "refs/heads/b".to_owned(),
+				expected: None,
+				new: Some(second),
+				reflog: ReflogIntent::Skip,
+			},
+		];
+		let mut transaction = Box::pin(store.transact(&ops));
+		let mut context = Context::from_waker(Waker::noop());
+		assert!(matches!(
+			transaction.as_mut().poll(&mut context),
+			Poll::Pending
+		));
+		files.wait_until_blocked().await;
+		assert!(
+			files.exists("refs/heads/a.lock").await.unwrap()
+				&& files.exists("refs/heads/b.lock").await.unwrap(),
+			"the worker reached publication with every ref lock held",
+		);
+
+		drop(transaction);
+		assert!(
+			files.exists("refs/heads/a.lock").await.unwrap(),
+			"dropping the waiter must not release the worker's ref lock",
+		);
+
+		let mut racing =
+			Box::pin(store.update_ref("refs/heads/a", successor, None, ReflogIntent::Skip));
+		assert!(matches!(racing.as_mut().poll(&mut context), Poll::Pending));
+		for _ in 0..10 {
+			tokio::task::yield_now().await;
+		}
+		assert_eq!(store.resolve("refs/heads/a").await.unwrap(), None);
+		assert!(files.exists("refs/heads/a.lock").await.unwrap());
+
+		files.release();
+		let error = racing
+			.await
+			.expect_err("the successor must observe the retained transaction's create");
+		assert!(matches!(error, crate::RepositoryError::RefMoved { .. }));
+		assert_eq!(store.resolve("refs/heads/a").await.unwrap(), Some(first));
+		assert_eq!(store.resolve("refs/heads/b").await.unwrap(), Some(second));
+		assert!(!files.exists("refs/heads/a.lock").await.unwrap());
+		assert!(!files.exists("refs/heads/b.lock").await.unwrap());
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn cancelled_symbolic_publication_retains_its_lock() {
+		let files = GatedFileStore::new();
+		let store: RefStore<'_, GatedFileStore, Sha256> = RefStore::new(&files);
+		let one = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"one");
+		let two = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"two");
+		files
+			.write_path_if_absent("refs/heads/one", format!("{one}\n").as_bytes())
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent("refs/heads/two", format!("{two}\n").as_bytes())
+			.await
+			.unwrap();
+
+		let mut first = Box::pin(store.set_symbolic("HEAD", "refs/heads/one", ReflogIntent::Skip));
+		let mut context = Context::from_waker(Waker::noop());
+		assert!(matches!(first.as_mut().poll(&mut context), Poll::Pending));
+		files.wait_until_blocked().await;
+		drop(first);
+		assert!(files.exists("HEAD.lock").await.unwrap());
+
+		let mut second = Box::pin(store.set_symbolic("HEAD", "refs/heads/two", ReflogIntent::Skip));
+		assert!(matches!(second.as_mut().poll(&mut context), Poll::Pending));
+		for _ in 0..10 {
+			tokio::task::yield_now().await;
+		}
+		assert!(files.exists("HEAD.lock").await.unwrap());
+		assert!(!files.exists("HEAD").await.unwrap());
+
+		files.release();
+		second
+			.await
+			.expect("successor retargets after the retained worker");
+		assert_eq!(
+			files.read_path("HEAD").await.unwrap(),
+			b"ref: refs/heads/two\n"
+		);
+		assert!(!files.exists("HEAD.lock").await.unwrap());
+	}
+
 	/// A multi-op transaction where one op's reflog path has a directory/file conflict rejects the
 	/// whole batch in validation — no ref is moved and no reflog is written. Uses `LocalFileStore`, the
 	/// only backend with real directory/file semantics.
@@ -1907,6 +2159,57 @@ mod tests {
 			.await
 			.expect("create refs/heads/foo after the aborted nested lock");
 		assert_eq!(store.resolve("refs/heads/foo").await.unwrap(), Some(a));
+
+		let _ = std::fs::remove_dir_all(&tmp);
+	}
+
+	/// Failure while acquiring a later lock releases and prunes directories created for earlier
+	/// nested locks, rather than leaving the parent spelling permanently blocked.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn partial_lock_acquisition_prunes_nested_directories() {
+		use gitana_file_store_local::LocalFileStore;
+
+		let tmp = std::env::temp_dir().join(format!("gitana-partial-lockprune-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(&tmp).unwrap();
+		let files = LocalFileStore::from_dir(
+			cap_std::fs::Dir::open_ambient_dir(&tmp, cap_std::ambient_authority()).unwrap(),
+		);
+		let store: RefStore<'_, LocalFileStore, Sha256> = RefStore::new(&files);
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+		let blocked = files
+			.try_lock_path("refs/heads/z.lock")
+			.await
+			.unwrap()
+			.expect("reserve the later lock");
+		let ops = [
+			crate::RefOp {
+				name: "refs/heads/a/nested".to_owned(),
+				expected: None,
+				new: Some(tip),
+				reflog: ReflogIntent::Skip,
+			},
+			crate::RefOp {
+				name: "refs/heads/z".to_owned(),
+				expected: None,
+				new: Some(tip),
+				reflog: ReflogIntent::Skip,
+			},
+		];
+		let (name, error) = store
+			.transact(&ops)
+			.await
+			.expect_err("the later lock is contended");
+		assert_eq!(name, "refs/heads/z");
+		assert!(matches!(error, crate::RepositoryError::RefLocked { .. }));
+		drop(blocked);
+
+		store
+			.update_ref("refs/heads/a", tip, None, ReflogIntent::Skip)
+			.await
+			.expect("the earlier nested lock directory was pruned");
+		assert_eq!(store.resolve("refs/heads/a").await.unwrap(), Some(tip));
 
 		let _ = std::fs::remove_dir_all(&tmp);
 	}

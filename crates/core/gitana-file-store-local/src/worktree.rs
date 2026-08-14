@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
 use cap_std::fs::Dir;
-use gitana_file_store::{ByteReader, DeleteOutcome, FileStore, Result, Version, WriteOutcome};
+use gitana_file_store::{
+	ByteReader, DeleteOutcome, FileStore, PathLock, Result, Version, WriteOutcome,
+};
 
 use crate::LocalFileStore;
 
@@ -154,6 +156,15 @@ fn is_pseudoref(path: &str) -> bool {
 }
 
 impl FileStore for WorktreeFileStore {
+	type Shared = Self;
+
+	fn shared_handle(&self) -> Self::Shared {
+		Self {
+			common: Arc::clone(&self.common),
+			worktree: Arc::clone(&self.worktree),
+		}
+	}
+
 	fn read_path(&self, path: &str) -> impl Future<Output = Result<Vec<u8>>> {
 		self.store(path).read_path(path)
 	}
@@ -168,6 +179,10 @@ impl FileStore for WorktreeFileStore {
 		bytes: &[u8],
 	) -> impl Future<Output = Result<WriteOutcome>> {
 		self.store(path).write_path_if_absent(path, bytes)
+	}
+
+	fn try_lock_path(&self, path: &str) -> impl Future<Output = Result<Option<PathLock>>> {
+		self.store(path).try_lock_path(path)
 	}
 
 	fn write_path_cas(

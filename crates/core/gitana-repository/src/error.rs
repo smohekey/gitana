@@ -32,6 +32,9 @@ pub enum RepositoryError {
 		/// The ref whose lock was contended.
 		name: String,
 	},
+	/// An owned repository mutation task could not be joined.
+	#[error("retained repository task failed: {0}")]
+	RetainedTask(String),
 	/// A referenced object does not exist (the hex id is recorded for diagnostics).
 	#[error("missing object {0}")]
 	MissingObject(String),

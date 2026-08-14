@@ -5,15 +5,109 @@
 
 use gitana_file_store::{DeleteOutcome, FileStore, FileStoreError, WriteOutcome};
 
-/// Run the full [`GitFileStore`] contract against `store`. Panics on any violation.
+/// Run the full [`FileStore`] contract against `store`. Panics on any violation.
 pub async fn check_file_store<S: FileStore>(store: &S) {
 	check_immutable_writes(store).await;
+	check_shared_handle(store).await;
+	check_path_locks(store).await;
 	check_cas_writes(store).await;
 	check_deletes(store).await;
 	check_unlocked_deletes(store).await;
 	check_is_dir(store).await;
 	check_listing(store).await;
 	check_streaming(store).await;
+}
+
+async fn check_shared_handle(store: &impl FileStore) {
+	let shared = store.shared_handle();
+	let state = "refs/heads/shared-handle-state";
+	assert_eq!(
+		shared
+			.write_path_if_absent(state, b"one")
+			.await
+			.expect("write through shared handle"),
+		WriteOutcome::Written,
+	);
+	assert_eq!(
+		store
+			.read_path(state)
+			.await
+			.expect("read through original handle"),
+		b"one",
+		"a shared handle must alias the original backend",
+	);
+	let (_, version) = store
+		.read_path_versioned(state)
+		.await
+		.expect("read shared version through original handle");
+	shared
+		.write_path_cas(state, b"two", Some(&version))
+		.await
+		.expect("CAS through shared handle");
+	assert_eq!(
+		store
+			.read_path(state)
+			.await
+			.expect("read shared CAS result"),
+		b"two",
+		"shared handles must observe one version sequence",
+	);
+
+	let path = "refs/heads/shared-handle.lock";
+	let held = store
+		.try_lock_path(path)
+		.await
+		.expect("lock through original handle")
+		.expect("an absent path must be lockable");
+	assert!(
+		shared
+			.try_lock_path(path)
+			.await
+			.expect("lock through shared handle")
+			.is_none(),
+		"a shared handle must observe the original handle's lock",
+	);
+	drop(held);
+	let reacquired = shared
+		.try_lock_path(path)
+		.await
+		.expect("lock through shared handle after release");
+	assert!(
+		reacquired.is_some(),
+		"a shared handle must observe release through the original handle",
+	);
+	drop(reacquired);
+}
+
+async fn check_path_locks(store: &impl FileStore) {
+	let path = "refs/heads/path-lock.lock";
+	let held = store
+		.try_lock_path(path)
+		.await
+		.expect("first lock attempt")
+		.expect("an absent path must be lockable");
+	assert!(store.exists(path).await.expect("held lock exists"));
+	assert!(
+		store
+			.try_lock_path(path)
+			.await
+			.expect("contended lock attempt")
+			.is_none(),
+		"an existing lock path must report contention",
+	);
+	drop(held);
+	assert!(
+		!store.exists(path).await.expect("dropped lock is absent"),
+		"dropping a path lock must release it synchronously",
+	);
+	assert!(
+		store
+			.try_lock_path(path)
+			.await
+			.expect("lock after release")
+			.is_some(),
+		"a released path must be lockable again",
+	);
 }
 
 async fn check_streaming(store: &impl FileStore) {
