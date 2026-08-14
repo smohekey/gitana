@@ -117,7 +117,7 @@ pub async fn revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 		signer,
 	)
 	.await?;
-	wt.checkout(merge.tree, false).await?;
+	wt.checkout(merge.tree, false, None).await?;
 	repository
 		.record_commit(&branch, Some(head), new_commit, &committer, &message)
 		.await?;

@@ -25,6 +25,7 @@ pub async fn run(
 	dispatch::on_worktree(
 		cwd,
 		Reset {
+			cwd: cwd.to_owned(),
 			soft,
 			mixed,
 			hard,
@@ -36,6 +37,7 @@ pub async fn run(
 }
 
 struct Reset {
+	cwd: std::path::PathBuf,
 	soft: bool,
 	mixed: bool,
 	hard: bool,
@@ -84,9 +86,16 @@ impl WorkTreeCommand for Reset {
 		// Materialise the index/working tree before moving the branch, so a failure (e.g. an unsafe
 		// tree path) leaves `HEAD` where it was — the same order `switch` checks out before moving.
 		if self.hard {
-			// Reset the index and the working tree to the commit, discarding local changes.
+			// Reset the index and the working tree to the commit, discarding local changes. The forced
+			// checkout skips the overwrite guard, but git still validates `core.excludesFile` (a directory
+			// is fatal) even under force, so resolve and pass it.
 			let tree = repo.commit_tree(commit).await?;
-			worktree.checkout(tree, true).await?;
+			let config = repo.effective_config().await?;
+			let excludes_file =
+				crate::excludes::resolve_excludes_file(&config, &self.cwd, &prefix).await?;
+			worktree
+				.checkout(tree, true, excludes_file.as_deref())
+				.await?;
 		} else if !self.soft {
 			// `--mixed` (the default): reset the index only.
 			let tree = repo.commit_tree(commit).await?;

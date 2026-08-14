@@ -62,7 +62,7 @@ pub async fn rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	};
 	// git requires a clean work tree to rebase: no staged or unstaged tracked changes (untracked files
 	// are allowed, unless the checkout to the base would overwrite one — caught below).
-	if !wt.status().await?.changed.is_empty() {
+	if !wt.status(None).await?.changed.is_empty() {
 		bail!("cannot rebase: you have uncommitted changes; commit or stash them before rebasing");
 	}
 
@@ -199,7 +199,7 @@ pub async fn abort_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		.reset_head(state.orig_head, &committer, "rebase: aborting")
 		.await?;
 	let orig_tree = repository.commit_tree(state.orig_head).await?;
-	wt.checkout(orig_tree, true).await?;
+	wt.checkout(orig_tree, true, None).await?;
 	repository.clear_rebase().await?;
 	Ok(())
 }
@@ -269,7 +269,7 @@ async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 			});
 		}
 
-		wt.checkout(merge.tree, false).await?;
+		wt.checkout(merge.tree, false, None).await?;
 		let committer = identity.committer().await?;
 		let message = conflict::ensure_trailing_newline(commit.message.clone());
 		signing::commit_on_head(
@@ -300,7 +300,7 @@ async fn move_branch_to<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 ) -> Result<()> {
 	let repository = wt.repository();
 	let tree = repository.commit_tree(target).await?;
-	wt.checkout(tree, false).await?;
+	wt.checkout(tree, false, None).await?;
 	repository.reset_head(target, committer, reflog).await?;
 	Ok(())
 }

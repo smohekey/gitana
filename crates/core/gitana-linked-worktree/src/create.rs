@@ -516,7 +516,7 @@ mod native {
 		let worktree = WorkTree::new(new_repo, work, admin.clone());
 		match tree {
 			Some(tree) => worktree
-				.checkout(tree, false)
+				.checkout(tree, false, None)
 				.await
 				.map_err(LinkedWorktreeError::Worktree)?,
 			// Orphan: no tree to lay down, but git still writes a zero-entry index immediately.

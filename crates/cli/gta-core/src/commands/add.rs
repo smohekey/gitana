@@ -11,10 +11,19 @@ use crate::error::AddAdvisory;
 /// Stage the given pathspecs (files, directories, or `.`), interpreted relative to `cwd`. `force`
 /// (git's `-f`/`--force`) stages explicitly-named ignored paths that would otherwise be refused.
 pub async fn run(cwd: &Path, pathspecs: &[String], force: bool) -> Result<()> {
-	dispatch::on_worktree(cwd, Add { pathspecs, force }).await
+	dispatch::on_worktree(
+		cwd,
+		Add {
+			cwd: cwd.to_owned(),
+			pathspecs,
+			force,
+		},
+	)
+	.await
 }
 
 struct Add<'a> {
+	cwd: std::path::PathBuf,
 	pathspecs: &'a [String],
 	force: bool,
 }
@@ -38,7 +47,20 @@ impl WorkTreeCommand for Add<'_> {
 		let show_ignored_hints = config
 			.get_bool("advice", None, "addIgnoredFile")?
 			.unwrap_or(true);
-		match worktree.add(&specs, &prefix, self.force).await {
+		// git's global excludes file (`core.excludesFile`) content, resolved here as it lives outside the
+		// worktree. `-f` stages ignored paths regardless, so skip the *read* then — matching git, which does
+		// not consult the excludes file when forcing — but still validate the setting: git aborts `add -f`
+		// on a valueless `core.excludesFile` before staging (probed vs git 2.55).
+		let excludes_file = if self.force {
+			crate::excludes::validate_excludes_file_setting(&config)?;
+			None
+		} else {
+			crate::excludes::resolve_excludes_file(&config, &self.cwd, &prefix).await?
+		};
+		match worktree
+			.add(&specs, &prefix, self.force, excludes_file.as_deref())
+			.await
+		{
 			Ok(()) => Ok(()),
 			// git stages everything it can, then exits non-zero rendering the sparse block (for out-of-cone
 			// pathspecs) and/or the ignored block (for ignored pathspecs). The staged work is already saved.

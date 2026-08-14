@@ -670,7 +670,7 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	}
 	if let Some(commit) = head {
 		let tree = worktree.repository().commit_tree(commit).await?;
-		worktree.checkout(tree, true).await?;
+		worktree.checkout(tree, true, None).await?;
 	}
 	Ok(())
 }

@@ -211,7 +211,7 @@ pub(crate) mod test_support {
 		identity: &TestIdentity,
 	) -> ObjectId<Sha256> {
 		std::fs::write(dir.join(path), content).unwrap();
-		wt.add(&[path], "", false).await.unwrap();
+		wt.add(&[path], "", false, None).await.unwrap();
 		crate::commit(wt, &format!("add {path}"), identity)
 			.await
 			.unwrap()

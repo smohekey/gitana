@@ -21,6 +21,7 @@ pub async fn run(
 	dispatch::on_worktree(
 		cwd,
 		Switch {
+			cwd: cwd.to_owned(),
 			name,
 			create,
 			start,
@@ -31,6 +32,7 @@ pub async fn run(
 }
 
 struct Switch<'a> {
+	cwd: std::path::PathBuf,
 	name: &'a str,
 	create: bool,
 	start: Option<String>,
@@ -41,7 +43,7 @@ impl WorkTreeCommand for Switch<'_> {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		_prefix: String,
+		prefix: String,
 	) -> Result<()> {
 		let repo = worktree.repository();
 		let branch = format!("refs/heads/{}", self.name);
@@ -49,33 +51,21 @@ impl WorkTreeCommand for Switch<'_> {
 		// Describe what HEAD points at now, before it moves — the `from` half of the checkout reflog.
 		let from = head_description(repo).await?;
 
-		if self.create {
+		// Resolve the commit to check out. The branch-already-exists check stays here, before any tree
+		// work, as git does it; the branch itself is created only *after* a successful checkout (below), so a
+		// failed checkout leaves no ref behind — no rollback needed.
+		let target = if self.create {
 			if repo.refs().resolve(&branch).await?.is_some() {
 				bail!("a branch named '{}' already exists", self.name);
 			}
-			let target = repo
-				.rev_parse(self.start.as_deref().unwrap_or("HEAD"))
-				.await?;
-			// git records the start point as named, defaulting to the literal `HEAD` for `switch -c`
-			// (unlike `branch`, which defaults to the current branch's name).
-			let created_from = self.start.as_deref().unwrap_or("HEAD");
-			let message = format!("branch: Created from {created_from}");
 			repo
-				.refs()
-				.update_ref(
-					&branch,
-					target,
-					None,
-					ReflogIntent::Log {
-						committer: &committer,
-						message: &message,
-					},
-				)
-				.await?;
-		}
-
-		let Some(commit) = repo.refs().resolve(&branch).await? else {
-			bail!("invalid reference: {}", self.name);
+				.rev_parse(self.start.as_deref().unwrap_or("HEAD"))
+				.await?
+		} else {
+			match repo.refs().resolve(&branch).await? {
+				Some(commit) => commit,
+				None => bail!("invalid reference: {}", self.name),
+			}
 		};
 
 		// A branch's ref is shared across a repository's worktrees, so git forbids checking the same
@@ -91,11 +81,44 @@ impl WorkTreeCommand for Switch<'_> {
 			);
 		}
 
-		let tree = repo.commit_tree(commit).await?;
-		worktree.checkout(tree, self.force).await?;
-		let message = format!("checkout: moving from {from} to {}", self.name);
+		let tree = repo.commit_tree(target).await?;
+		// git's global excludes file (`core.excludesFile`) content. Resolved for every switch — git
+		// validates it (a directory is fatal) even under `--force`, which skips the overwrite *protection*,
+		// not config validation.
+		let config = repo.effective_config().await?;
+		let excludes_file = crate::excludes::resolve_excludes_file(&config, &self.cwd, &prefix).await?;
+
+		// Check out the working tree BEFORE publishing the branch — git's order (probed vs git 2.55: a
+		// `switch -c` whose branch ref cannot be locked still updates the working tree, then fails to create
+		// the branch and leaves HEAD unmoved). Creating the branch only after a successful checkout keeps
+		// `switch -c` failure-atomic with no leftover ref AND needs no rollback: an earlier reserve-then-
+		// rollback design could race a concurrent worktree adopting the just-created branch and delete it out
+		// from under that worktree's HEAD (a dangling HEAD). A failed checkout now simply creates nothing.
 		worktree
-			.repository()
+			.checkout(tree, self.force, excludes_file.as_deref())
+			.await?;
+		if self.create {
+			// git records the start point as named, defaulting to the literal `HEAD` for `switch -c`
+			// (unlike `branch`, which defaults to the current branch's name). `update_ref` with `expected:
+			// None` also re-asserts the branch's absence, so a name created concurrently since the early
+			// existence check above fails here rather than being overwritten.
+			let created_from = self.start.as_deref().unwrap_or("HEAD");
+			let message = format!("branch: Created from {created_from}");
+			repo
+				.refs()
+				.update_ref(
+					&branch,
+					target,
+					None,
+					ReflogIntent::Log {
+						committer: &committer,
+						message: &message,
+					},
+				)
+				.await?;
+		}
+		let message = format!("checkout: moving from {from} to {}", self.name);
+		repo
 			.refs()
 			.set_head_symbolic(
 				&branch,

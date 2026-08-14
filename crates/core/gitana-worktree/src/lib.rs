@@ -9,6 +9,7 @@ mod checkout;
 mod diff;
 mod entry;
 mod error;
+mod excludes;
 mod fsmeta;
 mod ignore;
 mod index;

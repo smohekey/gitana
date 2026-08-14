@@ -58,7 +58,7 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 		);
 	}
 
-	wt.checkout(merged_tree, false).await?;
+	wt.checkout(merged_tree, false, None).await?;
 	// A conflict on an out-of-cone path would have been sparse-omitted by the checkout above, leaving the
 	// `UU` marker file unwritten and the conflict unresolvable. Conflicts are incompatible with
 	// skip-worktree, so vivify every conflicted path's merged (marker) content regardless of the sparse
@@ -117,7 +117,7 @@ pub async fn restore_to_head<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		bail!("HEAD is unborn");
 	};
 	let head_tree = repository.commit_tree(head).await?;
-	wt.checkout(head_tree, true).await?;
+	wt.checkout(head_tree, true, None).await?;
 	Ok(())
 }
 

@@ -121,7 +121,7 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			if let Some(text) = excludes_file {
 				stack.push(ignore::parse(text, ""));
 			}
-			if let Some(text) = read_info_exclude(wt).await? {
+			if let Some(text) = crate::excludes::read_info_exclude(wt).await? {
 				stack.push(ignore::parse(&text, ""));
 			}
 		}
@@ -255,25 +255,6 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	})
 }
 
-/// The content of `.git/info/exclude`, or `None` when absent/unreadable. It lives in the git (common)
-/// dir, so it is read through the repository's file store rather than the working-tree capability.
-/// git's classification: absent or permission-denied is non-fatal (no patterns), but a *directory* at
-/// that path is fatal — so check the type first (a directory read can return empty bytes on some
-/// platforms, which would otherwise slip through as "no patterns").
-async fn read_info_exclude<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
-	wt: &WorkTree<F, W, H>,
-) -> Result<Option<String>, WorktreeError> {
-	let store = wt.repository().objects().file_store();
-	if store.is_dir("info/exclude").await.unwrap_or(false) {
-		return Err(WorktreeError::ExcludeFile(".git/info/exclude".to_owned()));
-	}
-	match store.read_path("info/exclude").await {
-		Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
-		// Absent, or unreadable (permission-denied) — git warns and continues with no patterns.
-		Err(_) => Ok(None),
-	}
-}
-
 /// Render one output entry: the `path` relativised and quoted per `opts`, prefixed with
 /// `<mode> <sha> <stage>\t` when `opts.stage` and an index `entry` is supplied (others are always
 /// plain, so they pass `None`).
@@ -387,7 +368,7 @@ fn collect_others<W: WorkDirFs>(
 /// a directory opaquely under `-o`. An empty or malformed `.git`, or a `.git` gitfile (whose target
 /// may lie outside the worktree capability), is not recognised here — git validates the marker, so an
 /// unrecognised one is descended into like any ordinary directory.
-fn is_embedded_repo<W: WorkDirFs>(work: &W, dir: &str) -> bool {
+pub(crate) fn is_embedded_repo<W: WorkDirFs>(work: &W, dir: &str) -> bool {
 	let git = format!("{dir}/.git");
 	// `.git` must be a directory; any `lstat` failure (e.g. an unreadable directory) leaves it
 	// unrecognised — descended into, where an unreadable directory is then skipped by [`collect_others`].

@@ -148,6 +148,59 @@ fn commit(dir: &str, msg: &str) {
 	);
 }
 
+#[test]
+fn switch_c_that_fails_checkout_creates_no_branch() {
+	// A `switch -c <name> <start>` whose checkout aborts (an in-the-way untracked file) must not leave
+	// the new branch behind — git validates and updates the working tree before publishing the branch
+	// (probed vs git 2.55: `switch -c <name> <other>` that fails creates nothing).
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-switch-orphan");
+	let w = work.to_str().unwrap();
+	gta(w, &["init"], b"");
+	std::fs::write(work.join("blocker"), b"A\n").unwrap();
+	git(w, &["add", "."]);
+	commit(w, "with-blocker");
+	let with_blocker = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+	git(w, &["rm", "-q", "blocker"]);
+	commit(w, "no-blocker");
+	// An untracked `blocker` in the way of the start-point's tracked `blocker`.
+	std::fs::write(work.join("blocker"), b"LOCAL\n").unwrap();
+
+	let out = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", w, "switch", "-c", "newbr", &with_blocker])
+		.output()
+		.expect("run gta");
+	assert!(
+		!out.status.success(),
+		"switch -c over an in-the-way untracked file must fail"
+	);
+	assert!(
+		git(w, &["branch", "--list", "newbr"]).trim().is_empty(),
+		"a failed switch -c must not create the branch"
+	);
+	assert_eq!(
+		std::fs::read(work.join("blocker")).unwrap(),
+		b"LOCAL\n",
+		"the untracked file is untouched"
+	);
+	// Oracle: git refuses too and creates no branch.
+	let gout = Command::new("git")
+		.args(["-C", w, "switch", "-c", "gitnewbr", &with_blocker])
+		.output()
+		.expect("run git");
+	assert!(!gout.status.success(), "sanity: git also refuses");
+	assert!(
+		git(w, &["branch", "--list", "gitnewbr"]).trim().is_empty(),
+		"sanity: git creates no branch either"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 fn gta(dir: &str, args: &[&str], stdin: &[u8]) -> String {
 	let out = assert_cmd::Command::cargo_bin("gta")
 		.unwrap()
