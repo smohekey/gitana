@@ -397,6 +397,44 @@ impl FileStore for LocalFileStore {
 		})
 		.await
 	}
+
+	fn remove_lock_file_sync(&self, path: &str) {
+		// Synchronous best-effort unlink through the same backend primitive `LockFileGuard::drop` uses.
+		// Takes no in-process `lock_for` (a `Drop` cannot `await` the async mutex, and this is a
+		// best-effort release), and validates the path lexically as the async methods do. An absent
+		// lock — the caller already released it on its normal path — unlinks to a harmless ignored error.
+		if let Ok(path) = self.resolve(path) {
+			let _ = self.backend.remove_file(path);
+		}
+	}
+
+	async fn replace_and_release_lock(
+		&self,
+		path: &str,
+		bytes: &[u8],
+		lock_path: &str,
+	) -> Result<()> {
+		let path = self.resolve(path)?.to_owned();
+		let lock_path = self.resolve(lock_path)?.to_owned();
+		let bytes = bytes.to_vec();
+
+		// Deliberately NO in-process `lock_for` await: the caller holds `lock_path` (e.g. `index.lock`)
+		// as the sole-writer exclusion, so in-process serialisation is redundant here — and, crucially,
+		// omitting it means there is no `.await` before the blocking closure is queued. A `spawn_blocking`
+		// closure, once queued, runs to completion even if this future is dropped, so the caller can disarm
+		// its lock guard immediately before calling this: cancellation can only land on the `.await` below,
+		// by which point the write-and-unlink is already committed to run as one unit.
+		let fs = Arc::clone(&self.backend);
+		let counter = Arc::clone(&self.temp_counter);
+		blocking(move || {
+			let result = write_atomic(&*fs, &counter, &path, &bytes);
+			// Release the lock whether or not the write succeeded — a failed commit must not strand the
+			// lock — but only after the write has landed (or definitively failed), never before.
+			let _ = fs.remove_file(&lock_path);
+			result
+		})
+		.await
+	}
 }
 
 /// Run a synchronous filesystem operation without blocking the async runtime.

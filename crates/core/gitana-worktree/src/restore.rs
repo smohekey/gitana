@@ -129,6 +129,17 @@ where
 	// into the index (staged restore never reaches `write_worktree_file`'s check) or used to
 	// delete a file outside the work tree. Failing here also leaves nothing half-applied: the
 	// working tree is untouched and the index is only saved on success.
+	// Preflight every source blob a worktree restore will materialise BEFORE marking or writing
+	// anything, so a missing/corrupt blob aborts with an untouched tree and a cleanly released
+	// lock rather than after a partial restore (`write_worktree_file` reads the blob itself, so a
+	// missing blob on the first path would otherwise fail AFTER its mark and strand `index.lock`).
+	if worktree {
+		for &path in &selected {
+			if let Some((_, _, oid)) = source_entries.iter().find(|(p, _, _)| p == path) {
+				wt.repository().read_blob(*oid).await?;
+			}
+		}
+	}
 	for &path in &selected {
 		validate_path(path)?;
 	}
@@ -138,6 +149,10 @@ where
 	// released (not orphaned) and the index is left unwritten.
 	let lock = wt.lock_index().await?;
 	let result: Result<(), WorktreeError> = async {
+		// A worktree restore writes/removes files; each such mutation marks `lock` right before it
+		// (below), so a cancellation once the tree is half-applied fails closed. Marking per-write, not
+		// up front, lets a failure BEFORE any mutation (a missing source blob, an unreadable index)
+		// still release the lock cleanly; a staged-only restore never marks at all.
 		for &path in &selected {
 			match source_entries.iter().find(|(p, _, _)| p == path) {
 				// Present in the source: write the chosen targets from it.
@@ -154,6 +169,7 @@ where
 						index.remove_type_conflicts(path);
 					}
 					if worktree {
+						lock.mark_mutation_started();
 						write_worktree_file(wt, path, mode, *oid).await?;
 					}
 					if staged {
@@ -182,6 +198,7 @@ where
 				// Absent from the source but tracked: remove it from the chosen targets.
 				None => {
 					if worktree {
+						lock.mark_mutation_started();
 						remove_worktree_path(wt, path)?;
 					}
 					if staged {

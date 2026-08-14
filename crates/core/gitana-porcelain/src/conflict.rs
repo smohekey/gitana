@@ -32,6 +32,15 @@ pub async fn operation_in_progress<F: FileStore, H: HashAlgorithm>(
 	if repository.rebase_in_progress().await? {
 		return Ok(Some("rebase"));
 	}
+	// A rebase started by *stock git* keeps its state under `rebase-merge/` (interactive/merge backend) or
+	// `rebase-apply/` (am backend), not gitana's flat `REBASE_*` files — and once its conflicts are staged
+	// the index has no unmerged entries, so neither `rebase_in_progress` nor an unmerged-index check would
+	// notice it. git refuses to move HEAD while such a rebase is live (probed vs git 2.55: "cannot switch
+	// branch while rebasing"), so detect both layout directories directly.
+	let store = repository.objects().file_store();
+	if store.is_dir("rebase-merge").await? || store.is_dir("rebase-apply").await? {
+		return Ok(Some("rebase"));
+	}
 	Ok(None)
 }
 

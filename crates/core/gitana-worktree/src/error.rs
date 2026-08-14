@@ -25,6 +25,10 @@ pub enum WorktreeError {
 	/// A checkout would overwrite uncommitted local changes (without `--force`).
 	#[error("checkout would overwrite local changes to {0}")]
 	Conflict(String),
+	/// A two-tree merge (`switch`) was attempted while the index has unresolved conflict stages; git
+	/// refuses to move `HEAD` and leave the unmerged state attached to another branch.
+	#[error("you need to resolve your current index first")]
+	Unmerged,
 	/// A checkout would overwrite or remove an untracked working-tree file (without `--force`).
 	#[error("untracked working tree file would be overwritten by checkout: {0}")]
 	UntrackedOverwrite(String),
