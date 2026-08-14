@@ -8,6 +8,7 @@ use gitana_repository::Repository;
 use crate::excludes::StandardExcludes;
 use crate::fsmeta::{effective_mode, join_rel, mode_of, push_gitignore, stat_of};
 use crate::ignore::{self, DirIgnore};
+use crate::index_lock::IndexLock;
 use crate::sparse::{SparseCheckout, SparseReapply, SparseSet};
 use crate::{Index, IndexEntry, Status, WorktreeError};
 
@@ -23,12 +24,6 @@ pub struct WorkTree<F, W, H: HashAlgorithm> {
 	work: W,
 	git_dir: PathBuf,
 }
-
-/// Proof that the index lock (`index.lock`) is held: minted only by [`WorkTree::lock_index`] and
-/// consumed by [`WorkTree::commit_index`] / [`WorkTree::release_index_lock`], so the index cannot be
-/// written without first taking the lock. Dropping it without releasing leaves the lock in place (a
-/// stale `index.lock`), exactly as dropping the open lock file did before.
-pub(crate) struct IndexLock(());
 
 impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// Build a working tree over `repo`, with the working directory served by the capability `work`
@@ -108,6 +103,16 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// linked worktree's store routes them to its own git directory.
 	fn files(&self) -> &F {
 		self.repo.objects().file_store()
+	}
+
+	/// Whether the `.git/index` file exists. A *missing* index (distinct from a present-but-empty one, both
+	/// of which [`Self::load_index`] returns as an empty index) has no staged state to preserve, so a
+	/// two-tree-merge checkout falls back to a full authoritative checkout that rebuilds from the target.
+	pub(crate) async fn index_exists(&self) -> Result<bool, WorktreeError> {
+		// Ask the store whether the file exists rather than reading (and discarding) the whole index —
+		// `merge_apply` re-reads it via `load_index` immediately after, so a full read here would double
+		// the index I/O and allocation on every non-force switch.
+		Ok(self.files().exists("index").await?)
 	}
 
 	/// Read and parse the index (`index`), or an empty index if it does not exist.
@@ -241,7 +246,9 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		};
 		let file_mode = crate::status::worktree_file_mode(self).await;
 		let lock = self.lock_index().await?;
-		match self.apply_sparse(&matcher, file_mode).await {
+		// `apply_sparse` marks `lock` itself, at its first working-tree write (after the fallible index load) —
+		// so a failure while loading/inspecting the index still releases the lock cleanly.
+		match self.apply_sparse(&matcher, file_mode, &lock).await {
 			Ok((index, outcome)) => {
 				self.commit_index(lock, &index).await?;
 				Ok(outcome)
@@ -259,7 +266,12 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		&self,
 		matcher: &SparseCheckout,
 		file_mode: bool,
+		lock: &IndexLock<'_, F>,
 	) -> Result<(Index<H>, SparseReapply), WorktreeError> {
+		// Marks `lock` as mutating right before the FIRST working-tree write below — after `load_index` and
+		// each entry's fallible content hash, so a pre-mutation failure (a malformed index, an unreadable
+		// file) still releases the lock cleanly rather than stranding it. Index-only bit flips don't count:
+		// they are never written until the caller commits, so they leave no half-applied tree.
 		let mut index = self.load_index().await?;
 		let mut left_dirty = Vec::new();
 		let mut not_updated = Vec::new();
@@ -288,6 +300,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 							} else {
 								let mode = format!("{:o}", entry.mode);
 								let (path, oid) = (entry.path.clone(), entry.oid);
+								lock.mark_mutation_started();
 								crate::checkout::write_worktree_file(self, &path, &mode, oid).await?;
 							}
 						}
@@ -309,6 +322,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					crate::status::WorktreeContent::Absent => entry.skip_worktree = true,
 					// Present but reconstructable: remove the clean file and omit it.
 					crate::status::WorktreeContent::Reconstructable => {
+						lock.mark_mutation_started();
 						crate::checkout::remove_worktree_path(self, &entry.path)?;
 						entry.skip_worktree = true;
 					}
@@ -336,15 +350,20 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		let file_mode = crate::status::worktree_file_mode(self).await;
 		let lock = self.lock_index().await?;
 		let result: Result<(Index<H>, SparseReapply), WorktreeError> = async {
+			// Enabling the config and writing the pattern file are the first PERSISTENT changes, so mark before
+			// them (not just before the worktree reconciliation): a cancellation that has already written
+			// `config.worktree` / `info/sparse-checkout` must not release `index.lock` and let a successor act
+			// on a half-enabled sparse state. Fail closed from here.
+			lock.mark_mutation_started();
 			self.write_sparse_enabled(true, set.is_cone()).await?;
 			self
 				.files()
 				.write_path_replace("info/sparse-checkout", set.render().as_bytes())
 				.await?;
 			// Apply under the held lock. The set was just enabled, so the matcher is present; a defensive
-			// `None` (e.g. an empty file) is a no-op.
+			// `None` (e.g. an empty file) is a no-op. `apply_sparse` marks again at its first worktree write.
 			match self.sparse_checkout().await? {
-				Some(matcher) => self.apply_sparse(&matcher, file_mode).await,
+				Some(matcher) => self.apply_sparse(&matcher, file_mode, &lock).await,
 				None => Ok((self.load_index().await?, SparseReapply::default())),
 			}
 		}
@@ -405,7 +424,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	pub async fn disable_sparse(&self) -> Result<SparseReapply, WorktreeError> {
 		let file_mode = crate::status::worktree_file_mode(self).await;
 		let lock = self.lock_index().await?;
-		let outcome = match self.materialise_all_sparse(file_mode).await {
+		let outcome = match self.materialise_all_sparse(file_mode, &lock).await {
 			Ok((index, outcome)) => {
 				self.commit_index(lock, &index).await?;
 				outcome
@@ -427,7 +446,10 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	async fn materialise_all_sparse(
 		&self,
 		file_mode: bool,
+		lock: &IndexLock<'_, F>,
 	) -> Result<(Index<H>, SparseReapply), WorktreeError> {
+		// Marks `lock` right before the FIRST working-tree write below — after the fallible index load and
+		// per-entry content hash — so a pre-mutation failure releases the lock cleanly.
 		let mut index = self.load_index().await?;
 		let mut not_updated = Vec::new();
 		for entry in index.entries.iter_mut() {
@@ -441,6 +463,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					} else {
 						let mode = format!("{:o}", entry.mode);
 						let (path, oid) = (entry.path.clone(), entry.oid);
+						lock.mark_mutation_started();
 						crate::checkout::write_worktree_file(self, &path, &mode, oid).await?;
 					}
 				}
@@ -499,39 +522,54 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// [`Self::commit_index`] to write the index and release, or [`Self::release_index_lock`] to
 	/// release without writing. Taking the lock up front lets a destructive operation fail before it
 	/// mutates the working tree, rather than after.
-	pub(crate) async fn lock_index(&self) -> Result<IndexLock, WorktreeError> {
+	pub(crate) async fn lock_index(&self) -> Result<IndexLock<'_, F>, WorktreeError> {
 		match self.files().write_path_if_absent("index.lock", &[]).await? {
-			WriteOutcome::Written => Ok(IndexLock(())),
+			WriteOutcome::Written => Ok(IndexLock::new(self.files())),
 			WriteOutcome::AlreadyExists => Err(WorktreeError::IndexLocked),
 		}
 	}
 
-	/// Write `index` while holding `lock`, then release the lock. The index is replaced atomically
-	/// (`write_path_replace` writes to a temporary and renames), so a reader never sees a torn
-	/// index. `write_path_replace` deliberately takes no lock file of its own — the git-level
-	/// `index.lock` we already hold is the exclusion — so it does not contend for that same name the
-	/// way a compare-and-set write would. The lock is released even if the write fails, so a failure
-	/// does not strand `index.lock`.
+	/// Write `index` while holding `lock`, then release the lock — atomically. The index is replaced by
+	/// a write-to-temp-then-rename (a reader never sees a torn index) and `index.lock` is removed in the
+	/// *same* blocking step, which runs to completion even if this future is cancelled. That atomicity is
+	/// what makes the commit cancellation-safe: a cancelled commit can neither strand `index.lock` nor
+	/// release it before the write lands — releasing early would let another writer take the lock and race
+	/// the still-completing (uncancellable) write, losing an update. The lock is removed even if the write
+	/// fails, so a failure does not strand it.
 	pub(crate) async fn commit_index(
 		&self,
-		lock: IndexLock,
+		mut lock: IndexLock<'_, F>,
 		index: &Index<H>,
 	) -> Result<(), WorktreeError> {
-		let outcome = self
+		// Disarm the `Drop` backstop and hand the lock's release to `replace_and_release_lock`. Everything
+		// from here to that call's blocking hand-off is synchronous (no `.await`), and the store performs no
+		// `.await` before committing the write-and-unlink to run, so cancellation cannot slip in after
+		// disarming but before the atomic step is guaranteed — closing the window a separate write-then-delete
+		// would leave open (the write outlives cancellation on the blocking pool, but the delete would not).
+		lock.disarm();
+		self
 			.files()
-			.write_path_replace("index", &index.write_v4())
-			.await;
-		self.release_index_lock(lock).await;
-		Ok(outcome?)
+			.replace_and_release_lock("index", &index.write_v4(), "index.lock")
+			.await?;
+		Ok(())
 	}
 
 	/// Release a held index lock (from [`Self::lock_index`]) without writing, removing `index.lock`.
 	/// Use when an operation fails after locking but before [`Self::commit_index`], so it does not
 	/// leave a stale lock behind.
-	pub(crate) async fn release_index_lock(&self, _lock: IndexLock) {
-		// `IndexLock` is a zero-sized capability token (no `Drop`); consuming it by value is what enforces
-		// "hold the lock to release it". The on-disk lock is removed by deleting `index.lock`.
-		let _ = self.files().delete_path("index.lock", None).await;
+	pub(crate) async fn release_index_lock(&self, mut lock: IndexLock<'_, F>) {
+		// Remove the on-disk lock with a single SYNCHRONOUS unlink (the primitive the guard's `Drop` uses),
+		// then disarm — but ONLY if the working tree is still untouched. An operation that failed AFTER it
+		// began mutating leaves a half-applied tree, so its lock must stay (fail-closed), exactly as the `Drop`
+		// backstop keeps it; only a failure before any worktree write releases cleanly. Deliberately NOT the
+		// async `delete_path`: its `spawn_blocking` unlink can outlive a cancellation of this future and,
+		// because it unlinks unconditionally (`expected: None`), later remove a *successor's* freshly-taken
+		// `index.lock` — breaking mutual exclusion and risking a lost index update. A synchronous unlink
+		// completes in one uncancellable step while we still hold the lock, so no successor can interleave.
+		if !lock.mutation_started() {
+			self.files().remove_lock_file_sync("index.lock");
+		}
+		lock.disarm();
 	}
 
 	/// Stage `pathspecs`, interpreted relative to `prefix` (a `/`-joined work-tree-relative
@@ -1410,7 +1448,31 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		force: bool,
 		excludes_file: Option<&str>,
 	) -> Result<(), WorktreeError> {
-		crate::checkout::run(self, tree, force, excludes_file).await
+		let mode = if force {
+			crate::CheckoutMode::Reset
+		} else {
+			crate::CheckoutMode::Overlay
+		};
+		crate::checkout::run(self, tree, mode, excludes_file).await
+	}
+
+	/// Two-tree merge checkout (git's `read-tree -m -u`) from `head` to `target`: apply only the
+	/// `head`→`target` diff, preserving non-conflicting local (staged or unstaged) changes and refusing
+	/// conflicting ones — so staged work git would carry across a branch switch is not discarded. Backs
+	/// `switch`. `head` is the tree the index currently matches (the branch being left).
+	pub async fn checkout_merge(
+		&self,
+		head: ObjectId<H>,
+		target: ObjectId<H>,
+		excludes_file: Option<&str>,
+	) -> Result<(), WorktreeError> {
+		crate::checkout::run(
+			self,
+			target,
+			crate::CheckoutMode::Merge { head },
+			excludes_file,
+		)
+		.await
 	}
 
 	/// Apply only the `from_tree` → `to_tree` diff (git's `read-tree -m -u` two-way merge, for a
@@ -1627,4 +1689,105 @@ fn walk_files<W: WorkDirFs>(
 		stack.pop();
 	}
 	Ok(())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+	use std::sync::atomic::{AtomicU32, Ordering};
+
+	use cap_std::ambient_authority;
+	use cap_std::fs::Dir;
+	use gitana_file_store_local::{CapWorkDir, LocalFileStore};
+	use gitana_object::Sha256;
+	use gitana_object_store::ObjectStore;
+	use gitana_repository::Repository;
+
+	use super::*;
+
+	fn scratch(tag: &str) -> std::path::PathBuf {
+		static SEQ: AtomicU32 = AtomicU32::new(0);
+		let root = std::env::temp_dir().join(format!(
+			"gitana-{tag}-{}-{}",
+			std::process::id(),
+			SEQ.fetch_add(1, Ordering::Relaxed)
+		));
+		std::fs::create_dir_all(root.join(".git")).unwrap();
+		root
+	}
+
+	fn worktree(root: &std::path::Path) -> WorkTree<LocalFileStore, CapWorkDir, Sha256> {
+		let git_dir = root.join(".git");
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap(),
+		)));
+		WorkTree::new(
+			repo,
+			CapWorkDir::from_dir(Dir::open_ambient_dir(root, ambient_authority()).unwrap()),
+			git_dir,
+		)
+	}
+
+	/// Dropping a held `IndexLock` **before any worktree mutation** — a future cancelled between
+	/// [`WorkTree::lock_index`] and the first write — must remove `index.lock` (the working tree still
+	/// matches the index, so nothing is half-applied), so a later index write is not wedged by a stranded
+	/// lock. Enforced at the guard, covering every operation that takes the lock.
+	#[tokio::test]
+	async fn dropping_a_held_index_lock_before_mutation_releases_it() {
+		let root = scratch("lockdrop");
+		let git_dir = root.join(".git");
+		let wt = worktree(&root);
+
+		{
+			let _lock = wt.lock_index().await.unwrap();
+			assert!(
+				git_dir.join("index.lock").exists(),
+				"the lock file is taken"
+			);
+			// `_lock` leaves scope here WITHOUT `commit_index`/`release_index_lock` — the cancellation path.
+		}
+		assert!(
+			!git_dir.join("index.lock").exists(),
+			"dropping the guard before mutation must remove index.lock, not strand it"
+		);
+
+		// It was truly released, not merely orphaned: the lock can be taken again.
+		let lock = wt.lock_index().await.unwrap();
+		wt.release_index_lock(lock).await;
+		assert!(!git_dir.join("index.lock").exists());
+
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	/// Once an operation has begun mutating the working tree, a cancellation (dropped guard) or an
+	/// error release must **fail closed** — leave `index.lock` in place — so no later command proceeds
+	/// against a half-applied working tree (the tree no longer matches the index). This is the
+	/// `mark_mutation_started` half of the invariant in `docs/conventions.md`.
+	#[tokio::test]
+	async fn a_mid_mutation_drop_or_release_keeps_the_lock() {
+		let root = scratch("lockstrand");
+		let git_dir = root.join(".git");
+		let wt = worktree(&root);
+
+		// Cancellation after mutation began: the guard drops without commit/release, but the lock stays.
+		{
+			let lock = wt.lock_index().await.unwrap();
+			lock.mark_mutation_started();
+		}
+		assert!(
+			git_dir.join("index.lock").exists(),
+			"a cancellation after mutation began must leave index.lock (fail-closed)"
+		);
+		std::fs::remove_file(git_dir.join("index.lock")).unwrap();
+
+		// Error release after mutation began also keeps the lock (fail-closed), not removes it.
+		let lock = wt.lock_index().await.unwrap();
+		lock.mark_mutation_started();
+		wt.release_index_lock(lock).await;
+		assert!(
+			git_dir.join("index.lock").exists(),
+			"release after mutation began must leave index.lock (fail-closed)"
+		);
+
+		std::fs::remove_dir_all(&root).ok();
+	}
 }

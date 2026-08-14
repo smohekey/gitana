@@ -6,6 +6,7 @@
 //! This phase is the index codec.
 
 mod checkout;
+mod checkout_mode;
 mod diff;
 mod entry;
 mod error;
@@ -13,6 +14,7 @@ mod excludes;
 mod fsmeta;
 mod ignore;
 mod index;
+mod index_lock;
 mod ls_files;
 mod ls_files_options;
 mod mv;
@@ -24,6 +26,7 @@ mod sparse;
 mod status;
 mod worktree;
 
+pub(crate) use checkout_mode::CheckoutMode;
 pub use diff::{FileDiff, trees as diff_trees};
 pub use entry::{IndexEntry, Stat};
 pub use error::WorktreeError;

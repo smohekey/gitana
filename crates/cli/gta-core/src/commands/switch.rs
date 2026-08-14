@@ -94,9 +94,42 @@ impl WorkTreeCommand for Switch<'_> {
 		// `switch -c` failure-atomic with no leftover ref AND needs no rollback: an earlier reserve-then-
 		// rollback design could race a concurrent worktree adopting the just-created branch and delete it out
 		// from under that worktree's HEAD (a dangling HEAD). A failed checkout now simply creates nothing.
-		worktree
-			.checkout(tree, self.force, excludes_file.as_deref())
-			.await?;
+		// A non-force switch is git's two-tree merge (`read-tree -m -u`) from the current HEAD's tree to the
+		// target: it carries local staged/unstaged work across the switch, refusing only real conflicts —
+		// rather than treating the target as authoritative and silently dropping staged changes. `--force`
+		// keeps the authoritative reset, and does NOT resolve the current HEAD's tree — a `switch --force`
+		// must be able to recover even when the *current* branch's tip is missing/corrupt.
+		// git refuses to move HEAD while a merge/cherry-pick/revert/rebase is unconcluded, so the operation
+		// state is not left attached to another branch (a later `commit` could finish it on the wrong one).
+		// A resolved-but-not-committed merge (`MERGE_HEAD` present, no conflict stages) still counts, which
+		// the two-tree merge's unmerged-index check alone would miss. This runs even under `--force`: git
+		// refuses `switch -f`/`checkout -f` too while merging/rebasing (probed vs git 2.55: "cannot switch
+		// branch while merging/rebasing") — force overrides working-tree overwrite protection, not the
+		// operation-state guard.
+		if let Some(op) = gitana_porcelain::conflict::operation_in_progress(repo).await? {
+			// The hint names `gta {op} --abort`, but the operation may have been started by stock git (a
+			// `rebase-merge/` / `rebase-apply/` rebase), whose state gta's own `--abort` does not read — so
+			// point at the tool that started it too, rather than promising a command that would report "no
+			// {op} in progress".
+			bail!(
+				"cannot switch branch while {op} is in progress\nconclude or abort it first (\"gta {op} --abort\", or the tool that started it)"
+			);
+		}
+		if self.force {
+			worktree
+				.checkout(tree, true, excludes_file.as_deref())
+				.await?;
+		} else {
+			// The tree the index currently matches: the current HEAD's tree, or the empty tree for an unborn
+			// HEAD — so staged work created on an orphan branch is still carried across (git does).
+			let head_tree = match repo.refs().resolve_head().await? {
+				Some(commit) => repo.commit_tree(commit).await?,
+				None => repo.write_tree(&[]).await?,
+			};
+			worktree
+				.checkout_merge(head_tree, tree, excludes_file.as_deref())
+				.await?;
+		}
 		if self.create {
 			// git records the start point as named, defaulting to the literal `HEAD` for `switch -c`
 			// (unlike `branch`, which defaults to the current branch's name). `update_ref` with `expected:

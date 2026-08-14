@@ -123,6 +123,14 @@ fn is_per_worktree(path: &str) -> bool {
 		// `info/exclude`, which stays shared in the common dir.
 		|| path == "info/sparse-checkout"
 		|| path.starts_with("REBASE_")
+		// Stock git keeps an in-progress rebase's state per-worktree under `rebase-merge/` (interactive/merge
+		// backend) or `rebase-apply/` (am backend) — like gitana's flat `REBASE_*` files, they must route to
+		// the worktree's own git dir, so a guard checking for a live rebase (or a rebase reading its state)
+		// inspects `.git/worktrees/<name>/`, not the shared common dir.
+		|| path == "rebase-merge"
+		|| path.starts_with("rebase-merge/")
+		|| path == "rebase-apply"
+		|| path.starts_with("rebase-apply/")
 		|| path.starts_with("refs/worktree/")
 		|| path.starts_with("refs/bisect/")
 		|| path.starts_with("refs/rewritten/")
@@ -229,6 +237,23 @@ impl FileStore for WorktreeFileStore {
 		self
 			.store(path)
 			.write_path_stream_if_absent(path, reader, max_len)
+	}
+
+	fn remove_lock_file_sync(&self, path: &str) {
+		self.store(path).remove_lock_file_sync(path)
+	}
+
+	fn replace_and_release_lock(
+		&self,
+		path: &str,
+		bytes: &[u8],
+		lock_path: &str,
+	) -> impl Future<Output = Result<()>> {
+		// `path` and `lock_path` are a value and its lock (`index` / `index.lock`), which classify to the
+		// same per-worktree store; route by the value path and let that store resolve both against its root.
+		self
+			.store(path)
+			.replace_and_release_lock(path, bytes, lock_path)
 	}
 }
 

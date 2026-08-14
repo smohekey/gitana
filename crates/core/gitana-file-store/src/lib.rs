@@ -170,4 +170,47 @@ pub trait FileStore: Send + Sync {
 		reader: ByteReader,
 		max_len: u64,
 	) -> impl Future<Output = Result<WriteOutcome>> + Send;
+
+	/// Best-effort **synchronous** removal of the lock file at `path`, for RAII guards whose `Drop`
+	/// must release a lock when a future is cancelled (a `Drop` cannot `await`).
+	///
+	/// Errors are ignored: a process killed mid-operation orphans the lock (manual removal required),
+	/// exactly as git's `index.lock` / ref locks do — and a caller that reaches its normal async
+	/// release path removes the lock there instead, making this a no-op. This is deliberately narrow:
+	/// only for the store's own internal lock files (`index.lock`, `<path>.lock`), not a general
+	/// delete. Every backend is synchronous underneath (the async surface is a `blocking` wrapper), so
+	/// exposing a synchronous removal costs nothing.
+	///
+	/// **Deliberate exception to the "never block the runtime" rule** (`docs/conventions.md:73-74`): this
+	/// runs the unlink inline on the async task rather than offloading it. It is confined to two *cold*
+	/// paths — a `Drop` releasing a lock on cancellation (which cannot `await`, so cannot offload) and an
+	/// operation's error-recovery release — never the hot commit path (that offloads via
+	/// [`Self::replace_and_release_lock`]). It is a single fast metadata syscall, and it is what keeps the
+	/// release cancellation-safe: an offloaded `spawn_blocking` unlink could outlive cancellation and, being
+	/// unconditional, later remove a *successor's* freshly-taken lock. Offloading it safely would require
+	/// nonce-tagging every lock and a CAS-delete — cost on the hot lock-acquisition path to purify these
+	/// cold ones — a trade judged not worth it (the existing `LockFileGuard::drop` releases its lock the
+	/// same synchronous way).
+	fn remove_lock_file_sync(&self, path: &str);
+
+	/// Atomically replace the value at `path` with `bytes`, then remove the lock file at `lock_path`,
+	/// as a single step that **runs to completion even if the calling future is cancelled**.
+	///
+	/// This is the cancellation-safe *commit* of a lock-then-replace protocol (the working tree's
+	/// `index` + `index.lock`): the caller holds `lock_path` as its exclusion, so — like
+	/// [`Self::write_path_replace`] — no version check and no internal `<path>.lock` is taken. The write
+	/// and the lock removal happen in one non-cancellable unit so a cancelled commit can neither strand
+	/// `lock_path` nor release it *before* the write lands (which would let another writer acquire the
+	/// lock and race the still-completing write — a lost update). The lock is removed whether or not the
+	/// write succeeds (matching the old "release even if the write fails" behaviour); the write's result
+	/// is returned. `path` and `lock_path` must belong to the same store (they do for `index` /
+	/// `index.lock`, both per-worktree). Implementations MUST perform no `.await` between being polled
+	/// and committing the atomic step to run, so the caller can disarm its `Drop` guard immediately
+	/// before calling this without opening a cancellation window.
+	fn replace_and_release_lock(
+		&self,
+		path: &str,
+		bytes: &[u8],
+		lock_path: &str,
+	) -> impl Future<Output = Result<()>> + Send;
 }

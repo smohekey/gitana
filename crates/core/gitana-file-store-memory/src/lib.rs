@@ -208,4 +208,26 @@ impl FileStore for MemoryFileStore {
 		}
 		self.write_path_if_absent(path, &buf).await
 	}
+
+	fn remove_lock_file_sync(&self, path: &str) {
+		// Synchronous unconditional removal — the map write lock is already sync, so a `Drop`-time
+		// release needs no async path. Absent key → nothing to do.
+		let mut files = self.files.write().expect("file store lock poisoned");
+		files.remove(&path.to_owned());
+	}
+
+	async fn replace_and_release_lock(
+		&self,
+		path: &str,
+		bytes: &[u8],
+		lock_path: &str,
+	) -> Result<()> {
+		// One write-lock critical section makes the replace and the lock removal atomic and infallible;
+		// there is no blocking task to outlive cancellation, so nothing here can be interrupted mid-way.
+		let version = self.mint_version();
+		let mut files = self.files.write().expect("file store lock poisoned");
+		files.insert(path.to_owned(), (bytes.to_vec(), version));
+		files.remove(&lock_path.to_owned());
+		Ok(())
+	}
 }
