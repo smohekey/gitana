@@ -657,12 +657,15 @@ impl Backend for CapBackend {
 
 		#[cfg(not(windows))]
 		{
-			let directory = if path.is_empty() {
-				self.dir.try_clone()?
-			} else {
-				self.dir.open_dir(path)?
-			};
-			directory.into_std_file().sync_all()
+			// On Linux, cap-std directory capabilities may use `O_PATH`; cloning one and
+			// calling `fsync` on it fails with `EBADF`. Reopen the directory through the
+			// capability with read access to obtain a sync-capable descriptor.
+			let mut options = OpenOptions::new();
+			options.read(true);
+			self
+				.dir
+				.open_with(if path.is_empty() { "." } else { path }, &options)?
+				.sync_all()
 		}
 	}
 }
