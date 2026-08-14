@@ -62,8 +62,65 @@ where
 			stage: 0,
 			assume_valid,
 			skip_worktree,
+			intent_to_add: false,
 			path,
 		});
 	}
 	wt.save_index(&index).await
+}
+
+/// Rebuild the index from `tree` **only if `.git/index` is missing**, atomically under the index lock.
+///
+/// A porcelain operation whose model assumes `index == HEAD` (a merge fast-forward) uses this to repair a
+/// deleted/corrupt index before delegating to the two-tree merge. The existence check and the rebuild share
+/// one `index.lock` window, so a concurrent `add` cannot recreate-and-stage the index between them and then
+/// have its staged work discarded: if the index already exists (created by us on a prior call, or by a
+/// racing writer), this is a no-op that preserves it; only a genuinely absent index is rebuilt. Entries get
+/// a default stat and derive `skip_worktree` from the active sparse matcher, as [`run`] does for new paths.
+pub(crate) async fn ensure_from_tree_if_missing<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	tree: ObjectId<H>,
+) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	let lock = wt.lock_index().await?;
+	// Under the lock: a present index (ours from a prior call, or a racing writer's) must be left untouched.
+	if wt.index_exists().await? {
+		wt.release_index_lock(lock).await;
+		return Ok(());
+	}
+	let entries = wt.repository().read_tree(tree).await?;
+	for (path, _, _) in &entries {
+		validate_path(path)?;
+	}
+	let sparse = wt.sparse_checkout().await?;
+	let mut index = Index::new();
+	for (path, mode, oid) in entries {
+		// Prove the blob exists before recording an OID the merge will trust for `is_clean` — and thus treat
+		// the matching working-tree file as disposable. A missing/corrupt blob on a rebuilt-from-HEAD index
+		// would otherwise let the fast-forward delete the sole copy of a HEAD-tracked file it means to remove;
+		// abort instead, as the retired path refused a missing-index state. (A gitlink is a submodule commit,
+		// not a blob here.)
+		if mode != "160000" {
+			wt.repository().read_blob(oid).await?;
+		}
+		let skip_worktree = sparse
+			.as_ref()
+			.is_some_and(|matcher| !matcher.includes(&path));
+		index.upsert(IndexEntry {
+			stat: Stat::default(),
+			mode: u32::from_str_radix(&mode, 8).unwrap_or(0o100644),
+			oid,
+			stage: 0,
+			assume_valid: false,
+			skip_worktree,
+			intent_to_add: false,
+			path,
+		});
+	}
+	// No working-tree mutation occurred, so the lock commits (writes the index + releases) cleanly.
+	wt.commit_index(lock, &index).await
 }

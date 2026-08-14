@@ -36,6 +36,151 @@ fn fast_forward() {
 }
 
 #[test]
+fn fast_forward_rebuilds_a_missing_index_from_head() {
+	// A fast-forward assumes the index reflects HEAD. If `.git/index` is missing (deleted/corrupt), the
+	// two-tree merge must NOT fall back to the authoritative overlay and advance HEAD while leaving a
+	// to-be-removed tracked file untracked — it rebuilds the index from HEAD first and runs the normal diff,
+	// so a fast-forward that deletes a path removes it. (Gitana deliberately proceeds here; stock git, whose
+	// lazy rebuild treats the work-tree files as untracked, instead refuses — a documented divergence with no
+	// data loss.)
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-merge-ff-missing-index");
+	let w = work.to_str().unwrap();
+	let main = head_branch(w);
+
+	write(&work, "gone.txt", "x\n");
+	write(&work, "keep.txt", "k\n");
+	commit_all(w, "base");
+	git(w, &["checkout", "-q", "-b", "feature"]);
+	git(w, &["rm", "-q", "gone.txt"]);
+	let feature = commit_all(w, "drop gone");
+	git(w, &["checkout", "-q", &main]);
+
+	std::fs::remove_file(work.join(".git/index")).unwrap(); // the anomalous state
+
+	gta(w, &["merge", "feature"], b"");
+	assert_eq!(
+		gta(w, &["rev-parse", "HEAD"], b"").trim(),
+		feature,
+		"the fast-forward advances HEAD"
+	);
+	assert!(
+		!work.join("gone.txt").exists(),
+		"the fast-forward removes the deleted path rather than orphaning it"
+	);
+	assert!(work.join("keep.txt").exists());
+	assert!(
+		gta(w, &["status"], b"").is_empty(),
+		"clean after the rebuilt fast-forward"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn fast_forward_missing_index_aborts_on_a_corrupt_blob() {
+	// Rebuilding a missing index from HEAD must validate the blobs it records: if a HEAD-tracked path's blob
+	// is missing from the ODB while its working file survives (the sole copy), the fast-forward must abort
+	// rather than treat the file as clean-by-hash and delete it while advancing HEAD.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-merge-ff-corrupt-blob");
+	let w = work.to_str().unwrap();
+	let main = head_branch(w);
+
+	write(&work, "gone.txt", "x\n");
+	write(&work, "keep.txt", "k\n");
+	let base = commit_all(w, "base");
+	let gone_blob = git(w, &["rev-parse", "HEAD:gone.txt"]).trim().to_owned();
+	git(w, &["checkout", "-q", "-b", "feature"]);
+	git(w, &["rm", "-q", "gone.txt"]);
+	commit_all(w, "drop gone");
+	git(w, &["checkout", "-q", &main]);
+
+	std::fs::remove_file(work.join(".git/index")).unwrap(); // missing index
+	// Corrupt the ODB: remove gone.txt's blob. Its working file is now the sole copy.
+	std::fs::remove_file(
+		work
+			.join(".git/objects")
+			.join(&gone_blob[..2])
+			.join(&gone_blob[2..]),
+	)
+	.unwrap();
+
+	let ok = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", w, "merge", "feature"])
+		.output()
+		.expect("run gta merge")
+		.status
+		.success();
+	assert!(
+		!ok,
+		"a fast-forward that would delete a sole copy with a missing blob must abort"
+	);
+	assert_eq!(
+		std::fs::read(work.join("gone.txt")).unwrap(),
+		b"x\n",
+		"the sole surviving copy must not be deleted"
+	);
+	assert_eq!(
+		gta(w, &["rev-parse", "HEAD"], b"").trim(),
+		base,
+		"HEAD must not advance when the fast-forward aborts"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn unborn_fast_forward_validates_out_of_cone_target_blobs() {
+	// An unborn fast-forward now builds an empty from-index and runs through the two-tree merge, which
+	// validates every target blob — including sparse-excluded ones. A missing out-of-cone blob must abort
+	// rather than advance HEAD to an unmaterialisable commit (the old overlay fallback skipped that check).
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-merge-unborn-oob");
+	let w = work.to_str().unwrap();
+	git(w, &["config", "extensions.worktreeConfig", "true"]);
+	git(w, &["config", "--worktree", "core.sparseCheckout", "true"]);
+	git(
+		w,
+		&["config", "--worktree", "core.sparseCheckoutCone", "true"],
+	);
+	std::fs::write(work.join(".git/info/sparse-checkout"), "/*\n!/*/\n").unwrap();
+	git(w, &["checkout", "-q", "-b", "other"]);
+	write(&work, "keep", "k\n");
+	std::fs::create_dir(work.join("x")).unwrap();
+	std::fs::write(work.join("x/c"), b"C\n").unwrap();
+	git(w, &["add", "keep"]);
+	git(w, &["add", "--sparse", "x/c"]);
+	commit_all(w, "seed");
+	let xc = git(w, &["rev-parse", "other:x/c"]).trim().to_owned();
+	git(w, &["symbolic-ref", "HEAD", "refs/heads/main"]); // unborn main
+	std::fs::remove_file(work.join(".git/index")).unwrap(); // missing index
+	std::fs::remove_file(work.join(".git/objects").join(&xc[..2]).join(&xc[2..])).unwrap(); // corrupt oob blob
+
+	gta_fail(w, &["merge", "other"]);
+	let head = Command::new("git")
+		.args(["-C", w, "rev-parse", "--verify", "--quiet", "HEAD"])
+		.output()
+		.expect("run git rev-parse");
+	assert!(
+		!head.status.success(),
+		"HEAD must stay unborn — the merge must not advance to a commit with a missing blob"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
 fn clean_true_merge_has_two_parents_and_gits_tree() {
 	if !git_supports_sha256() {
 		return;

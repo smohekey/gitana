@@ -415,8 +415,8 @@ async fn checkout_refuses_to_delete_untracked_ancestor_file() {
 }
 
 #[tokio::test]
-async fn twoway_merge_applies_file_to_dir_type_change() {
-	// A fast-forward that turns a tracked file `thing` into a directory `thing/child` must remove the old
+async fn checkout_merge_applies_file_to_dir_type_change() {
+	// A two-tree merge that turns a tracked file `thing` into a directory `thing/child` must remove the old
 	// file before writing the child — a write-first order leaves the working tree half-changed and then
 	// fails to remove the now-directory. The whole diff applies (nothing would be overwritten).
 	if !git_supports_sha256() {
@@ -450,17 +450,13 @@ async fn twoway_merge_applies_file_to_dir_type_change() {
 	)
 	.await
 	.unwrap();
-	let overwrite = wt
-		.twoway_merge(
-			ObjectId::<Sha256>::from_hex(&from_tree).unwrap(),
-			ObjectId::<Sha256>::from_hex(&to_tree).unwrap(),
-		)
-		.await
-		.unwrap();
-	assert!(
-		overwrite.is_empty(),
-		"a file→directory type-change fast-forward must apply: {overwrite:?}"
-	);
+	wt.checkout_merge(
+		ObjectId::<Sha256>::from_hex(&from_tree).unwrap(),
+		ObjectId::<Sha256>::from_hex(&to_tree).unwrap(),
+		None,
+	)
+	.await
+	.expect("a file→directory type-change two-tree merge must apply");
 	assert_eq!(
 		std::fs::read(work.join("thing/child")).unwrap(),
 		b"CHILD\n",
@@ -475,8 +471,8 @@ async fn twoway_merge_applies_file_to_dir_type_change() {
 }
 
 #[tokio::test]
-async fn twoway_merge_applies_case_rename() {
-	// A fast-forward that renames `Foo`→`foo` (case only) under `core.ignoreCase` must APPLY, not refuse:
+async fn checkout_merge_applies_case_rename() {
+	// A two-tree merge that renames `Foo`→`foo` (case only) under `core.ignoreCase` must APPLY, not refuse:
 	// git's index is case-insensitive, so the to-side `foo` is the same tracked path, not an untracked
 	// obstruction. Result: the merge applies (nothing would be overwritten) and the index is the to-side
 	// case (probed vs git 2.55).
@@ -503,7 +499,7 @@ async fn twoway_merge_applies_case_rename() {
 		.to_owned();
 
 	let wt = make_repo(&work);
-	// Put the working state at `from` (Foo), then two-way-merge from→to (the case-rename fast-forward).
+	// Put the working state at `from` (Foo), then two-tree-merge from→to (the case-rename fast-forward).
 	wt.checkout(
 		ObjectId::<Sha256>::from_hex(&from_tree).unwrap(),
 		true,
@@ -511,17 +507,13 @@ async fn twoway_merge_applies_case_rename() {
 	)
 	.await
 	.unwrap();
-	let overwrite = wt
-		.twoway_merge(
-			ObjectId::<Sha256>::from_hex(&from_tree).unwrap(),
-			ObjectId::<Sha256>::from_hex(&to_tree).unwrap(),
-		)
-		.await
-		.unwrap();
-	assert!(
-		overwrite.is_empty(),
-		"a clean case-rename fast-forward must apply, not refuse: {overwrite:?}"
-	);
+	wt.checkout_merge(
+		ObjectId::<Sha256>::from_hex(&from_tree).unwrap(),
+		ObjectId::<Sha256>::from_hex(&to_tree).unwrap(),
+		None,
+	)
+	.await
+	.expect("a clean case-rename two-tree merge must apply, not refuse");
 	assert_eq!(
 		git(&["-C", w, "ls-files"]).trim(),
 		"foo",
@@ -538,9 +530,9 @@ async fn twoway_merge_applies_case_rename() {
 }
 
 #[tokio::test]
-async fn twoway_merge_case_colliding_removal_refuses_deterministically() {
-	// The fast-forward analogue of `checkout_case_colliding_removal_refuses_deterministically`: a colliding
-	// staged index (`Foo`=AAA, `foo`=BBB) fast-forwarded to a to-tree that drops the whole fold-key must
+async fn checkout_merge_case_colliding_removal_refuses_deterministically() {
+	// The two-tree-merge analogue of `checkout_case_colliding_removal_refuses_deterministically`: a colliding
+	// staged index (`Foo`=AAA, `foo`=BBB) merged to a to-tree that drops the whole fold-key must
 	// refuse when the single shared working file is dirty relative to a colliding entry — not silently remove
 	// it. A prior version tested cleanliness against an arbitrarily-kept folded entry, so the merge could pass
 	// and delete the file depending on `HashMap` ordering; this pins a deterministic refuse across repeats.
@@ -596,16 +588,16 @@ async fn twoway_merge_case_colliding_removal_refuses_deterministically() {
 
 	let wt = make_repo(&work);
 	for attempt in 0..8 {
-		let overwrite = wt
-			.twoway_merge(
+		let result = wt
+			.checkout_merge(
 				ObjectId::<Sha256>::from_hex(&from_tree).unwrap(),
 				ObjectId::<Sha256>::from_hex(&to_tree).unwrap(),
+				None,
 			)
-			.await
-			.unwrap();
+			.await;
 		assert!(
-			!overwrite.is_empty(),
-			"attempt {attempt}: a colliding fast-forward removal dirty vs a colliding entry must refuse"
+			result.is_err(),
+			"attempt {attempt}: a colliding merge removal dirty vs a colliding entry must refuse"
 		);
 		let content = std::fs::read(work.join("Foo"))
 			.or_else(|_| std::fs::read(work.join("foo")))
@@ -666,8 +658,8 @@ async fn checkout_preserves_staged_case_rename() {
 }
 
 #[tokio::test]
-async fn twoway_merge_refuses_staged_recase_on_modify() {
-	// A fast-forward that MODIFIES `Foo` while the index holds a staged `Foo`->`foo` rename must refuse: the
+async fn checkout_merge_refuses_staged_recase_on_modify() {
+	// A two-tree merge that MODIFIES `Foo` while the index holds a staged `Foo`->`foo` rename must refuse: the
 	// incoming write would overwrite the staged rename (probed vs git 2.55: "local changes to Foo would be
 	// overwritten by merge", aborts). The fold fallback must not mask the staged recase as clean.
 	if !git_supports_sha256() {
@@ -699,16 +691,16 @@ async fn twoway_merge_refuses_staged_recase_on_modify() {
 	git(&["-C", w, "mv", "Foo", "foo"]);
 
 	let wt = make_repo(&work);
-	let overwrite = wt
-		.twoway_merge(
+	let result = wt
+		.checkout_merge(
 			ObjectId::<Sha256>::from_hex(&from_tree).unwrap(),
 			ObjectId::<Sha256>::from_hex(&to_tree).unwrap(),
+			None,
 		)
-		.await
-		.unwrap();
+		.await;
 	assert!(
-		!overwrite.is_empty(),
-		"a fast-forward modifying a staged-renamed file must refuse, as git does"
+		result.is_err(),
+		"a two-tree merge modifying a staged-renamed file must refuse, as git does"
 	);
 	assert_eq!(
 		git(&["-C", w, "ls-files"]).trim(),
@@ -719,8 +711,8 @@ async fn twoway_merge_refuses_staged_recase_on_modify() {
 }
 
 #[tokio::test]
-async fn twoway_merge_preserves_staged_recase_on_delete() {
-	// A fast-forward that DELETES `Foo` while the index holds a staged `Foo`->`foo` rename must proceed and
+async fn checkout_merge_preserves_staged_recase_on_delete() {
+	// A two-tree merge that DELETES `Foo` while the index holds a staged `Foo`->`foo` rename must proceed and
 	// keep the staged `foo` (probed vs git 2.55: the delete fast-forwards, `foo` survives). gta must not
 	// remove the shared inode when applying the delete.
 	if !git_supports_sha256() {
@@ -751,17 +743,13 @@ async fn twoway_merge_preserves_staged_recase_on_delete() {
 	git(&["-C", w, "mv", "Foo", "foo"]);
 
 	let wt = make_repo(&work);
-	let overwrite = wt
-		.twoway_merge(
-			ObjectId::<Sha256>::from_hex(&from_tree).unwrap(),
-			ObjectId::<Sha256>::from_hex(&to_tree).unwrap(),
-		)
-		.await
-		.unwrap();
-	assert!(
-		overwrite.is_empty(),
-		"a fast-forward deleting a staged-renamed file must proceed, as git does: {overwrite:?}"
-	);
+	wt.checkout_merge(
+		ObjectId::<Sha256>::from_hex(&from_tree).unwrap(),
+		ObjectId::<Sha256>::from_hex(&to_tree).unwrap(),
+		None,
+	)
+	.await
+	.expect("a two-tree merge deleting a staged-renamed file must proceed, as git does");
 	let entries = git(&["-C", w, "ls-files"]);
 	assert!(
 		entries.contains("foo") && entries.contains("keep") && !entries.contains("Foo"),
@@ -1683,6 +1671,7 @@ async fn checkout_refuses_a_traversal_index_entry() {
 		stage: 0,
 		assume_valid: false,
 		skip_worktree: false,
+		intent_to_add: false,
 		path: "../victim-checkout-traversal".to_owned(),
 	});
 	wt.save_index(&index).await.unwrap();
@@ -1825,6 +1814,7 @@ async fn checkout_refuses_removal_through_a_symlinked_ancestor() {
 		stage: 0,
 		assume_valid: false,
 		skip_worktree: false,
+		intent_to_add: false,
 		path: "link/victim".to_owned(),
 	});
 	wt.save_index(&index).await.unwrap();

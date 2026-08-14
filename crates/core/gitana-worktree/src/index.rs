@@ -207,6 +207,7 @@ impl<H: HashAlgorithm> Index<H> {
 					stage,
 					assume_valid: false,
 					skip_worktree: false,
+					intent_to_add: false,
 					path: path.to_owned(),
 				});
 			}
@@ -355,6 +356,7 @@ impl<H: HashAlgorithm> Index<H> {
 			let assume_valid = flags & 0x8000 != 0;
 			let stage = ((flags >> 12) & 0x3) as u8;
 			let mut skip_worktree = false;
+			let mut intent_to_add = false;
 			if flags & 0x4000 != 0 {
 				if version < 3 {
 					return Err(WorktreeError::Malformed("extended flag in v2".to_owned()));
@@ -362,6 +364,7 @@ impl<H: HashAlgorithm> Index<H> {
 				// Extended flags (v3+): bit 0x4000 = skip-worktree (sparse), 0x2000 = intent-to-add.
 				let extended = read_u16(bytes, &mut cursor)?;
 				skip_worktree = extended & 0x4000 != 0;
+				intent_to_add = extended & 0x2000 != 0;
 			}
 
 			let path_bytes = if version == 4 {
@@ -393,6 +396,7 @@ impl<H: HashAlgorithm> Index<H> {
 				stage,
 				assume_valid,
 				skip_worktree,
+				intent_to_add,
 				path,
 			});
 		}
@@ -454,14 +458,18 @@ impl<H: HashAlgorithm> Index<H> {
 			if entry.assume_valid {
 				flags |= 0x8000;
 			}
-			// A skip-worktree entry needs the extended-flag bit set and a following extended-flags word, so the
-			// sparse marker round-trips (git would otherwise re-check the omitted path against the working tree).
-			if entry.skip_worktree {
+			// A skip-worktree or intent-to-add entry needs the extended-flag bit set and a following extended-
+			// flags word, so those markers round-trip (git would otherwise re-check the omitted path against the
+			// working tree, or lose the `add -N` placeholder).
+			if entry.skip_worktree || entry.intent_to_add {
 				flags |= 0x4000;
 			}
 			out.extend_from_slice(&flags.to_be_bytes());
-			if entry.skip_worktree {
-				out.extend_from_slice(&0x4000u16.to_be_bytes()); // extended flags: skip-worktree
+			if entry.skip_worktree || entry.intent_to_add {
+				// Extended flags: 0x4000 = skip-worktree, 0x2000 = intent-to-add.
+				let extended = if entry.skip_worktree { 0x4000u16 } else { 0 }
+					| if entry.intent_to_add { 0x2000u16 } else { 0 };
+				out.extend_from_slice(&extended.to_be_bytes());
 			}
 
 			let path = entry.path.as_bytes();
@@ -571,6 +579,7 @@ mod tests {
 			stage: 0,
 			assume_valid: false,
 			skip_worktree: false,
+			intent_to_add: false,
 			path: path.to_owned(),
 		}
 	}

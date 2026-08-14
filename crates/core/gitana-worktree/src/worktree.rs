@@ -1475,18 +1475,6 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		.await
 	}
 
-	/// Apply only the `from_tree` → `to_tree` diff (git's `read-tree -m -u` two-way merge, for a
-	/// fast-forward): touch just the changed paths, leaving unrelated staged or dirty entries alone.
-	/// Returns the changed paths whose local state would be overwritten (empty = applied; nothing is
-	/// applied when non-empty). Does not move `HEAD`.
-	pub async fn twoway_merge(
-		&self,
-		from_tree: ObjectId<H>,
-		to_tree: ObjectId<H>,
-	) -> Result<Vec<String>, WorktreeError> {
-		crate::checkout::twoway_merge(self, from_tree, to_tree).await
-	}
-
 	/// Restore `pathspecs` from `source` (a tree; `None` = the current index) into the chosen
 	/// targets — the working tree (`worktree`) and/or the index (`staged`) — discarding any
 	/// uncommitted changes to those paths. A selected path absent from the source but currently
@@ -1511,6 +1499,17 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// of `git reset --mixed`). The working tree is left untouched, and `HEAD` is not moved.
 	pub async fn reset_index(&self, tree: ObjectId<H>) -> Result<(), WorktreeError> {
 		crate::reset::run(self, tree).await
+	}
+
+	/// Rebuild the index from `tree` **only if `.git/index` is missing**, atomically under the index lock —
+	/// so a concurrent index writer cannot have its staged work discarded by the rebuild. A merge
+	/// fast-forward, whose model assumes `index == HEAD`, uses this to repair a deleted/corrupt index before
+	/// delegating to the two-tree merge, instead of taking that merge's rebuild-from-*target* fallback.
+	pub async fn ensure_index_from_tree_if_missing(
+		&self,
+		tree: ObjectId<H>,
+	) -> Result<(), WorktreeError> {
+		crate::reset::ensure_from_tree_if_missing(self, tree).await
 	}
 
 	/// Reset the index entries matched by `pathspecs` to their state in `tree` (the index half of
@@ -1580,6 +1579,7 @@ fn entry<H: HashAlgorithm>(path: &str, mode: u32, oid: ObjectId<H>, meta: &Meta)
 		stage: 0,
 		assume_valid: false,
 		skip_worktree: false,
+		intent_to_add: false,
 		path: path.to_owned(),
 	}
 }

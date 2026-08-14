@@ -67,7 +67,11 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 		);
 	}
 
-	wt.checkout(merged_tree, false, None).await?;
+	// Two-tree merge from HEAD's tree (`ours_tree`) to the merged result (conflict markers included): the
+	// index equals HEAD here (each caller guarantees a clean index before recording conflict stages below),
+	// so this lays down the merged/marker content while preserving unrelated local work, sharing `switch`'s
+	// lock-safe, D/F- and sparse-correct engine.
+	wt.checkout_merge(ours_tree, merged_tree, None).await?;
 	// A conflict on an out-of-cone path would have been sparse-omitted by the checkout above, leaving the
 	// `UU` marker file unwritten and the conflict unresolvable. Conflicts are incompatible with
 	// skip-worktree, so vivify every conflicted path's merged (marker) content regardless of the sparse

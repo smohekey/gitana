@@ -642,6 +642,7 @@ mod tests {
 			stage: 0,
 			assume_valid: false,
 			skip_worktree: false,
+			intent_to_add: false,
 			path: "a.txt".to_owned(),
 		};
 
@@ -711,6 +712,7 @@ mod tests {
 			stage: 0,
 			assume_valid: false,
 			skip_worktree: false,
+			intent_to_add: false,
 			path: "a.txt".to_owned(),
 		};
 		let mut index = Index::new();

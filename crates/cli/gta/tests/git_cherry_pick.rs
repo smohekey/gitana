@@ -50,6 +50,88 @@ fn clean_pick_preserves_author_and_matches_git() {
 }
 
 #[test]
+fn cherry_pick_carries_unstaged_work_like_git() {
+	// The pick's working-tree update is now git's two-tree merge from HEAD to the picked result (shared with
+	// `switch`), so an *unstaged* edit to a file the pick does NOT touch survives, while an unstaged edit to a
+	// file the pick DOES touch is refused rather than clobbered — exactly as git. Differential: build
+	// identical gta/git repos, pick, and assert the exit and the resulting working tree match either way.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	// (tag, file the picked commit writes, file left with an unstaged edit).
+	for (tag, feature_file, dirty_file) in [
+		("unrelated-file-survives", "c.txt", "base.txt"),
+		("touched-file-refused", "base.txt", "base.txt"),
+	] {
+		let build = |runner: &str| -> (PathBuf, String) {
+			let work = init(&format!("gta-cp-carry-{tag}-{runner}"));
+			let w = work.to_str().unwrap();
+			let main = head_branch(w);
+			write(&work, "base.txt", "base\n");
+			commit_all(w, "base");
+			git(w, &["checkout", "-q", "-b", "feature"]);
+			write(&work, feature_file, "feature\n");
+			let feature = commit_all(w, "F");
+			git(w, &["checkout", "-q", &main]);
+			write(&work, "m.txt", "m\n");
+			commit_all(w, "M");
+			write(&work, dirty_file, "DIRTY\n"); // an unstaged edit present at pick time
+			(work, feature)
+		};
+		let (gta_work, gta_feature) = build("gta");
+		let (git_work, git_feature) = build("git");
+
+		let gta_ok = assert_cmd::Command::cargo_bin("gta")
+			.unwrap()
+			.args([
+				"-C",
+				gta_work.to_str().unwrap(),
+				"cherry-pick",
+				&gta_feature,
+			])
+			.output()
+			.expect("run gta cherry-pick")
+			.status
+			.success();
+		let git_ok = Command::new("git")
+			.args([
+				"-C",
+				git_work.to_str().unwrap(),
+				"cherry-pick",
+				&git_feature,
+			])
+			.output()
+			.expect("run git cherry-pick")
+			.status
+			.success();
+		assert_eq!(gta_ok, git_ok, "{tag}: cherry-pick exit parity");
+
+		// Working-tree parity: the tracked files and porcelain status must match git's, whichever way it went.
+		let observe = |work: &Path| -> String {
+			let w = work.to_str().unwrap();
+			let read = |name: &str| {
+				std::fs::read_to_string(work.join(name)).unwrap_or_else(|_| "<absent>".to_owned())
+			};
+			format!(
+				"base.txt={:?} c.txt={:?} m.txt={:?}\nstatus:\n{}",
+				read("base.txt"),
+				read("c.txt"),
+				read("m.txt"),
+				git(w, &["status", "--porcelain"]),
+			)
+		};
+		assert_eq!(
+			observe(&gta_work),
+			observe(&git_work),
+			"{tag}: working-tree + status parity"
+		);
+		std::fs::remove_dir_all(&gta_work).ok();
+		std::fs::remove_dir_all(&git_work).ok();
+	}
+}
+
+#[test]
 fn conflicting_pick_materialises_state() {
 	if !git_supports_sha256() {
 		return;

@@ -700,6 +700,7 @@ async fn restore_rejects_unsafe_index_path() {
 		stage: 0,
 		assume_valid: false,
 		skip_worktree: false,
+		intent_to_add: false,
 		path: escape_spec,
 	});
 	wt.save_index(&index).await.unwrap();

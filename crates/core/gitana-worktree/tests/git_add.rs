@@ -419,6 +419,7 @@ async fn add_negative_only_resolves_deleted_unmerged_path() {
 			stage,
 			assume_valid: false,
 			skip_worktree: false,
+			intent_to_add: false,
 			path: "conflict".to_owned(),
 		});
 	}
@@ -477,6 +478,7 @@ async fn add_literal_resolves_deleted_unmerged_path() {
 			stage,
 			assume_valid: false,
 			skip_worktree: false,
+			intent_to_add: false,
 			path: "conflict".to_owned(),
 		});
 	}

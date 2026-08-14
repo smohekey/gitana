@@ -118,7 +118,11 @@ pub async fn cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer
 		signer,
 	)
 	.await?;
-	wt.checkout(merge.tree, false, None).await?;
+	// A two-tree merge from HEAD's tree to the picked result: the index still equals HEAD here (guarded
+	// above), so this lays down the pick while preserving unrelated local work and refusing a real
+	// conflict — sharing `switch`'s lock-safe, D/F- and sparse-correct engine rather than the authoritative
+	// overlay.
+	wt.checkout_merge(head_tree, merge.tree, None).await?;
 	repository
 		.record_commit(&branch, Some(head), new_commit, &committer, &message)
 		.await?;

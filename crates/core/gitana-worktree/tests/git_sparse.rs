@@ -291,19 +291,22 @@ async fn fast_forward_refuses_a_dirty_recreated_excluded_file() {
 	std::fs::create_dir_all(work.join("x")).unwrap();
 	std::fs::write(work.join("x/h"), b"LOCAL\n").unwrap();
 
-	let refused = make_repo(&work)
-		.twoway_merge(
+	let result = make_repo(&work)
+		.checkout_merge(
 			ObjectId::<Sha256>::from_hex(&base).unwrap(),
 			ObjectId::<Sha256>::from_hex(&other).unwrap(),
+			None,
 		)
-		.await
-		.unwrap();
-	assert_eq!(refused, vec!["x/h".to_owned()], "FF must be refused");
+		.await;
+	assert!(
+		matches!(&result, Err(WorktreeError::Conflict(p)) if p == "x/h"),
+		"FF must be refused at x/h: {result:?}"
+	);
 	assert_eq!(std::fs::read(work.join("x/h")).unwrap(), b"LOCAL\n");
 }
 
 /// A fast-forward must still refuse when it would discard *divergent staged content* at an excluded
-/// path — even though that path is never materialised, `twoway_merge` rewrites its index entry, so
+/// path — even though that path is never materialised, the two-tree merge rewrites its index entry, so
 /// applying the update would silently drop the staged blob. git refuses the checkout here (probed and
 /// oracled vs stock git 2.50.1); gitana must too, leaving the index untouched.
 #[tokio::test]
@@ -324,14 +327,17 @@ async fn fast_forward_refuses_divergent_staged_content_at_excluded_path() {
 	assert_eq!(git(&["-C", w, "cat-file", "blob", ":x/h"]), "xh-staged\n");
 
 	// gitana refuses: the changed path is reported and nothing is applied.
-	let refused = make_repo(&work)
-		.twoway_merge(
+	let result = make_repo(&work)
+		.checkout_merge(
 			ObjectId::<Sha256>::from_hex(&base).unwrap(),
 			ObjectId::<Sha256>::from_hex(&other).unwrap(),
+			None,
 		)
-		.await
-		.unwrap();
-	assert_eq!(refused, vec!["x/h".to_owned()], "FF must be refused");
+		.await;
+	assert!(
+		matches!(&result, Err(WorktreeError::Conflict(p)) if p == "x/h"),
+		"FF must be refused at x/h: {result:?}"
+	);
 	assert_eq!(
 		git(&["-C", w, "cat-file", "blob", ":x/h"]),
 		"xh-staged\n",
@@ -348,6 +354,989 @@ async fn fast_forward_refuses_divergent_staged_content_at_excluded_path() {
 		String::from_utf8_lossy(&out.stderr).contains("would be overwritten"),
 		"git refuses to preserve the staged content"
 	);
+}
+
+/// An out-of-cone gitlink (submodule, mode 160000) is recorded index-only and never blob-validated, so a
+/// two-tree merge that adds one succeeds without the submodule's commit being present. An IN-cone gitlink
+/// cannot be materialised, so the merge must refuse it BEFORE any mutation — leaving no stranded
+/// `index.lock` (the blob validation runs in the pre-mutation preflight, not mid-apply).
+#[tokio::test]
+async fn checkout_merge_handles_gitlinks_without_stranding_the_lock() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("gitlink-lock");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("root.txt"), b"r\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+	let base_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	// A commit id to use as the gitlink target — it exists in the ODB (so `read_blob` reports "is not a
+	// blob" rather than a lookup miss), standing in for a submodule commit.
+	let commit_oid = git(&["-C", w, "rev-parse", "HEAD"]).trim().to_owned();
+
+	// --- Out-of-cone gitlink: adding `x/sub` while `x/` is excluded must succeed, index-only. ---
+	git(&["-C", w, "config", "extensions.worktreeConfig", "true"]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckout",
+		"true",
+	]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckoutCone",
+		"true",
+	]);
+	std::fs::write(work.join(".git/info/sparse-checkout"), "/*\n!/*/\n").unwrap();
+	git(&[
+		"-C",
+		w,
+		"update-index",
+		"--add",
+		"--cacheinfo",
+		&format!("160000,{commit_oid},x/sub"),
+	]);
+	let oob_tree = git(&["-C", w, "write-tree"]).trim().to_owned();
+	git(&["-C", w, "read-tree", &base_tree]); // index back to base (no gitlink staged)
+	make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&oob_tree).unwrap(),
+			None,
+		)
+		.await
+		.expect("an out-of-cone gitlink is recorded index-only, without its commit present");
+	assert_eq!(
+		status_of(&git(&["-C", w, "ls-files", "-t"]), "x/sub"),
+		'S',
+		"the excluded gitlink is recorded skip-worktree"
+	);
+	assert!(
+		!work.join("x/sub").exists(),
+		"no submodule file is materialised"
+	);
+
+	// --- In-cone gitlink: adding `sub` in the cone must refuse, pre-mutation, leaving no stranded lock. ---
+	git(&["-C", w, "read-tree", &base_tree]);
+	git(&[
+		"-C",
+		w,
+		"update-index",
+		"--add",
+		"--cacheinfo",
+		&format!("160000,{commit_oid},sub"),
+	]);
+	let incone_tree = git(&["-C", w, "write-tree"]).trim().to_owned();
+	git(&["-C", w, "read-tree", &base_tree]);
+	let result = make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&incone_tree).unwrap(),
+			None,
+		)
+		.await;
+	assert!(
+		result.is_err(),
+		"an in-cone gitlink cannot be materialised and must refuse: {result:?}"
+	);
+	assert!(
+		!work.join(".git/index.lock").exists(),
+		"the pre-mutation refusal must release the index lock, not strand it"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// The post-write sparse reconciliation hashes carried out-of-cone files; that fallible read is done in the
+/// PRE-mutation preflight, so an unreadable out-of-cone file aborts the merge cleanly — no writes land, no
+/// stranded `index.lock` — rather than failing mid-apply after the in-cone writes have already changed the
+/// tree.
+#[tokio::test]
+async fn checkout_merge_aborts_cleanly_on_an_unreadable_out_of_cone_file() {
+	use std::os::unix::fs::PermissionsExt;
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("sparse-unreadable-oob");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("keep"), b"k\n").unwrap();
+	std::fs::create_dir(work.join("x")).unwrap();
+	std::fs::write(work.join("x/h"), b"xh\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+	let base_branch = git(&["-C", w, "branch", "--show-current"])
+		.trim()
+		.to_owned();
+	let base_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	// The target changes the in-cone `keep` — a write that would land before the reconciliation.
+	git(&["-C", w, "checkout", "-q", "-b", "other"]);
+	std::fs::write(work.join("keep"), b"k2\n").unwrap();
+	git(&["-C", w, "add", "keep"]);
+	commit(w, "mod keep");
+	let other_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", &base_branch]);
+	// Exclude `x/` but do NOT reapply — `x/h` stays present on disk (bit clear), so the switch reconciles it.
+	git(&["-C", w, "config", "extensions.worktreeConfig", "true"]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckout",
+		"true",
+	]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckoutCone",
+		"true",
+	]);
+	std::fs::write(work.join(".git/info/sparse-checkout"), "/*\n!/*/\n").unwrap();
+	std::fs::set_permissions(work.join("x/h"), std::fs::Permissions::from_mode(0o000)).unwrap();
+	if std::fs::read(work.join("x/h")).is_ok() {
+		// Running as root: mode 000 does not block the read, so the scenario cannot be exercised.
+		std::fs::set_permissions(work.join("x/h"), std::fs::Permissions::from_mode(0o644)).unwrap();
+		eprintln!("skipping: file readable despite mode 000 (root?)");
+		std::fs::remove_dir_all(&work).ok();
+		return;
+	}
+
+	let result = make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&other_tree).unwrap(),
+			None,
+		)
+		.await;
+	std::fs::set_permissions(work.join("x/h"), std::fs::Permissions::from_mode(0o644)).unwrap();
+	assert!(
+		result.is_err(),
+		"an unreadable out-of-cone entry must abort the merge: {result:?}"
+	);
+	assert!(
+		!work.join(".git/index.lock").exists(),
+		"the pre-mutation abort must release the index lock, not strand it"
+	);
+	assert_eq!(
+		std::fs::read(work.join("keep")).unwrap(),
+		b"k\n",
+		"the abort must precede any write — the in-cone change must not have landed"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// Replacing an out-of-cone tracked file with a gitlink removes the working file (index-only, no blob for the
+/// gitlink). If the OUTGOING blob is missing while that file is its sole surviving copy, the merge must
+/// validate it and abort rather than delete it and record the gitlink.
+#[tokio::test]
+async fn checkout_merge_validates_outgoing_blob_before_an_excluded_gitlink_replacement() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("oob-blob-to-gitlink");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("keep"), b"k\n").unwrap();
+	std::fs::create_dir(work.join("x")).unwrap();
+	std::fs::write(work.join("x/p"), b"P\n").unwrap(); // will become out-of-cone
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+	let base_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	let outgoing_blob = git(&["-C", w, "rev-parse", ":x/p"]).trim().to_owned();
+	let commit_oid = git(&["-C", w, "rev-parse", "HEAD"]).trim().to_owned();
+	// A target tree that turns `x/p` from a blob into a gitlink.
+	git(&["-C", w, "rm", "--cached", "-q", "x/p"]);
+	git(&[
+		"-C",
+		w,
+		"update-index",
+		"--add",
+		"--cacheinfo",
+		&format!("160000,{commit_oid},x/p"),
+	]);
+	let gitlink_tree = git(&["-C", w, "write-tree"]).trim().to_owned();
+	git(&["-C", w, "read-tree", &base_tree]); // index back to base
+
+	// Exclude `x/` (do not reapply — `x/p` stays present on disk), then corrupt its OUTGOING blob.
+	git(&["-C", w, "config", "extensions.worktreeConfig", "true"]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckout",
+		"true",
+	]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckoutCone",
+		"true",
+	]);
+	std::fs::write(work.join(".git/info/sparse-checkout"), "/*\n!/*/\n").unwrap();
+	std::fs::remove_file(
+		work
+			.join(".git/objects")
+			.join(&outgoing_blob[..2])
+			.join(&outgoing_blob[2..]),
+	)
+	.unwrap();
+
+	let result = make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&gitlink_tree).unwrap(),
+			None,
+		)
+		.await;
+	assert!(
+		result.is_err(),
+		"an excluded blob→gitlink replacement with a missing outgoing blob must abort: {result:?}"
+	);
+	assert_eq!(
+		std::fs::read(work.join("x/p")).unwrap(),
+		b"P\n",
+		"the sole surviving copy of the outgoing file must not be deleted"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// A staged edit to an OUT-OF-CONE child (`git add --sparse x/c`) that a fast-forward would drop when it
+/// replaces the parent subtree `x/` with a file `x` must be refused — git will not silently discard that
+/// out-of-cone staged content (unlike an in-cone D/F child, which it does drop).
+#[tokio::test]
+async fn checkout_merge_refuses_dropping_an_out_of_cone_staged_df_child() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("sparse-df-child");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("keep"), b"k\n").unwrap();
+	std::fs::create_dir(work.join("x")).unwrap();
+	std::fs::write(work.join("x/c"), b"c\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+	let base_branch = git(&["-C", w, "branch", "--show-current"])
+		.trim()
+		.to_owned();
+	let base_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	// The target replaces the `x/` subtree with a top-level file `x`.
+	git(&["-C", w, "checkout", "-q", "-b", "other"]);
+	git(&["-C", w, "rm", "-q", "-r", "x"]);
+	std::fs::write(work.join("x"), b"X\n").unwrap();
+	git(&["-C", w, "add", "x"]);
+	commit(w, "x-file");
+	let other_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", &base_branch]);
+	// Exclude `x/` and reapply (x/c omitted), then stage an out-of-cone edit to x/c.
+	git(&["-C", w, "config", "extensions.worktreeConfig", "true"]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckout",
+		"true",
+	]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckoutCone",
+		"true",
+	]);
+	std::fs::write(work.join(".git/info/sparse-checkout"), "/*\n!/*/\n").unwrap();
+	make_repo(&work).reapply_sparse().await.unwrap();
+	std::fs::create_dir_all(work.join("x")).unwrap();
+	std::fs::write(work.join("x/c"), b"EDIT\n").unwrap();
+	git(&["-C", w, "add", "--sparse", "x/c"]);
+
+	let result = make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&other_tree).unwrap(),
+			None,
+		)
+		.await;
+	assert!(
+		result.is_err(),
+		"dropping an out-of-cone staged D/F child must refuse: {result:?}"
+	);
+	assert_eq!(
+		std::fs::read(work.join("x/c")).unwrap(),
+		b"EDIT\n",
+		"the out-of-cone staged edit must survive the refused merge"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// A sparse fast-forward that changes an unrelated in-cone path must not delete an out-of-cone intent-to-add
+/// placeholder (`git add -N --sparse x/p`): its empty file hashes to the empty blob, but git treats
+/// intent-to-add as not-up-to-date, so the reconciliation must leave the file present and skip-worktree clear.
+#[tokio::test]
+async fn sparse_fast_forward_preserves_an_intent_to_add_placeholder() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("sparse-ita-reconcile");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("keep"), b"k\n").unwrap();
+	std::fs::create_dir(work.join("x")).unwrap();
+	std::fs::write(work.join("x/h"), b"xh\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+	let base_branch = git(&["-C", w, "branch", "--show-current"])
+		.trim()
+		.to_owned();
+	let base_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", "-b", "other"]);
+	std::fs::write(work.join("keep"), b"k2\n").unwrap();
+	git(&["-C", w, "add", "keep"]);
+	commit(w, "mod keep");
+	let other_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", &base_branch]);
+	git(&["-C", w, "config", "extensions.worktreeConfig", "true"]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckout",
+		"true",
+	]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckoutCone",
+		"true",
+	]);
+	std::fs::write(work.join(".git/info/sparse-checkout"), "/*\n!/*/\n").unwrap();
+	make_repo(&work).reapply_sparse().await.unwrap();
+	// Intent-to-add an out-of-cone empty placeholder.
+	std::fs::create_dir_all(work.join("x")).unwrap();
+	std::fs::write(work.join("x/p"), b"").unwrap();
+	git(&["-C", w, "add", "-N", "--sparse", "x/p"]);
+
+	make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&other_tree).unwrap(),
+			None,
+		)
+		.await
+		.expect("the fast-forward changes only the in-cone `keep`");
+	assert!(
+		work.join("x/p").exists(),
+		"the intent-to-add placeholder file must be preserved, not removed"
+	);
+	assert_eq!(
+		status_of(&git(&["-C", w, "ls-files", "-t"]), "x/p"),
+		'H',
+		"its skip-worktree bit must stay clear (still an intended addition)"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// A fast-forward that removes a tracked file deletes its clean-by-hash working copy; if that blob is missing
+/// from the ODB (the working file its sole copy), the merge must validate it and abort.
+#[tokio::test]
+async fn checkout_merge_validates_a_removed_files_blob() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("removal-blob");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("gone"), b"g\n").unwrap();
+	std::fs::write(work.join("keep"), b"k\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+	let base_branch = git(&["-C", w, "branch", "--show-current"])
+		.trim()
+		.to_owned();
+	let base_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	let gone_blob = git(&["-C", w, "rev-parse", ":gone"]).trim().to_owned();
+	git(&["-C", w, "checkout", "-q", "-b", "other"]);
+	git(&["-C", w, "rm", "-q", "gone"]);
+	commit(w, "drop gone");
+	let other_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", &base_branch]);
+	std::fs::remove_file(
+		work
+			.join(".git/objects")
+			.join(&gone_blob[..2])
+			.join(&gone_blob[2..]),
+	)
+	.unwrap();
+
+	let result = make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&other_tree).unwrap(),
+			None,
+		)
+		.await;
+	assert!(
+		result.is_err(),
+		"removing a clean file whose blob is missing must abort: {result:?}"
+	);
+	assert_eq!(
+		std::fs::read(work.join("gone")).unwrap(),
+		b"g\n",
+		"the sole surviving copy must not be deleted"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// A SATISFIED changed path (staged already equals the target) is not written, but the merge still advances
+/// HEAD to it — so if its target blob is missing, the merge must abort rather than move HEAD to content that
+/// is absent from the object database.
+#[tokio::test]
+async fn checkout_merge_validates_a_satisfied_target_blob() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("satisfied-blob");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a"), b"a\n").unwrap();
+	git(&["-C", w, "add", "a"]);
+	commit(w, "base");
+	let base_branch = git(&["-C", w, "branch", "--show-current"])
+		.trim()
+		.to_owned();
+	let base_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", "-b", "other"]);
+	std::fs::write(work.join("a"), b"a2\n").unwrap();
+	git(&["-C", w, "add", "a"]);
+	commit(w, "mod a");
+	let other_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	let a2_blob = git(&["-C", w, "rev-parse", ":a"]).trim().to_owned();
+	git(&["-C", w, "checkout", "-q", &base_branch]);
+	// Stage `a` at exactly the target content — a SATISFIED path (staged == target) — then corrupt that blob.
+	std::fs::write(work.join("a"), b"a2\n").unwrap();
+	git(&["-C", w, "add", "a"]);
+	std::fs::remove_file(
+		work
+			.join(".git/objects")
+			.join(&a2_blob[..2])
+			.join(&a2_blob[2..]),
+	)
+	.unwrap();
+
+	let result = make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&other_tree).unwrap(),
+			None,
+		)
+		.await;
+	assert!(
+		result.is_err(),
+		"a satisfied path with a missing target blob must abort, not advance HEAD: {result:?}"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// An OUT-OF-CONE staged-only addition (`git add --sparse x/c`) that a fast-forward would D/F-collide with
+/// (target adds file `x`) is PRESERVED, not dropped: git keeps out-of-cone staged content and skips the
+/// colliding file, leaving `x/c` staged skip-worktree (probed vs git 2.55 — byte-identical `ls-files`/status).
+#[tokio::test]
+async fn checkout_merge_preserves_an_out_of_cone_staged_addition_in_a_df_collision() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("sparse-staged-add-df");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("keep"), b"k\n").unwrap();
+	git(&["-C", w, "add", "keep"]);
+	commit(w, "base");
+	let base_branch = git(&["-C", w, "branch", "--show-current"])
+		.trim()
+		.to_owned();
+	let base_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	// The target adds a top-level file `x` that D/F-collides with the staged out-of-cone `x/c`.
+	git(&["-C", w, "checkout", "-q", "-b", "other"]);
+	std::fs::write(work.join("x"), b"X\n").unwrap();
+	git(&["-C", w, "add", "x"]);
+	commit(w, "x-file");
+	let other_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", &base_branch]);
+	// Exclude subdirs, then stage an out-of-cone `x/c` addition.
+	git(&["-C", w, "config", "extensions.worktreeConfig", "true"]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckout",
+		"true",
+	]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckoutCone",
+		"true",
+	]);
+	std::fs::write(work.join(".git/info/sparse-checkout"), "/*\n!/*/\n").unwrap();
+	std::fs::create_dir(work.join("x")).unwrap();
+	std::fs::write(work.join("x/c"), b"C\n").unwrap();
+	git(&["-C", w, "add", "--sparse", "x/c"]);
+
+	make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&other_tree).unwrap(),
+			None,
+		)
+		.await
+		.expect("the merge preserves the out-of-cone staged addition and skips the colliding file");
+	assert_eq!(
+		git(&["-C", w, "cat-file", "blob", ":x/c"]),
+		"C\n",
+		"the out-of-cone staged addition must be preserved"
+	);
+	assert_eq!(
+		status_of(&git(&["-C", w, "ls-files", "-t"]), "x/c"),
+		'S',
+		"the preserved staged addition is skip-worktree"
+	);
+	assert!(
+		git(&["-C", w, "ls-files"]).lines().all(|l| l != "x"),
+		"the colliding file `x` must be skipped (D/F with the preserved staged x/c)"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// An ABSENT out-of-cone intent-to-add placeholder (`git add -N --sparse x/p; rm x/p`) is reconciled like any
+/// excluded entry on an unrelated fast-forward: git sets skip-worktree (retaining the intent flag) rather than
+/// leaving the bit clear, so status stays clean instead of showing a spurious ` D x/p`.
+#[tokio::test]
+async fn sparse_fast_forward_reconciles_an_absent_intent_to_add_placeholder() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("sparse-ita-absent");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("keep"), b"k\n").unwrap();
+	std::fs::write(work.join("xh"), b"x\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+	let base_branch = git(&["-C", w, "branch", "--show-current"])
+		.trim()
+		.to_owned();
+	let base_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", "-b", "other"]);
+	std::fs::write(work.join("keep"), b"k2\n").unwrap();
+	git(&["-C", w, "add", "keep"]);
+	commit(w, "mod keep");
+	let other_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", &base_branch]);
+	git(&["-C", w, "config", "extensions.worktreeConfig", "true"]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckout",
+		"true",
+	]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckoutCone",
+		"true",
+	]);
+	std::fs::write(work.join(".git/info/sparse-checkout"), "/*\n!/*/\n").unwrap();
+	std::fs::create_dir(work.join("x")).unwrap();
+	std::fs::write(work.join("x/p"), b"").unwrap();
+	git(&["-C", w, "add", "-N", "--sparse", "x/p"]);
+	std::fs::remove_file(work.join("x/p")).unwrap(); // absent placeholder
+
+	make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&other_tree).unwrap(),
+			None,
+		)
+		.await
+		.expect("the fast-forward changes only the in-cone `keep`");
+	assert_eq!(
+		status_of(&git(&["-C", w, "ls-files", "-t"]), "x/p"),
+		'S',
+		"an absent out-of-cone placeholder is reconciled to skip-worktree"
+	);
+	assert!(
+		!git(&["-C", w, "status", "--porcelain"]).contains("x/p"),
+		"no spurious pending change for the omitted placeholder"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// When a fast-forward preserves an out-of-cone staged `x/c` (D/F), the colliding target file `x` is not
+/// written — but HEAD still advances to it, so its blob must be validated. A missing one must abort.
+#[tokio::test]
+async fn checkout_merge_validates_a_df_write_suppressed_by_preservation() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("sparse-df-skipped-write");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("keep"), b"k\n").unwrap();
+	git(&["-C", w, "add", "keep"]);
+	commit(w, "base");
+	let base_branch = git(&["-C", w, "branch", "--show-current"])
+		.trim()
+		.to_owned();
+	let base_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", "-b", "other"]);
+	std::fs::write(work.join("x"), b"X\n").unwrap();
+	git(&["-C", w, "add", "x"]);
+	commit(w, "x-file");
+	let other_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	let x_blob = git(&["-C", w, "rev-parse", "other:x"]).trim().to_owned();
+	git(&["-C", w, "checkout", "-q", &base_branch]);
+	git(&["-C", w, "config", "extensions.worktreeConfig", "true"]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckout",
+		"true",
+	]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckoutCone",
+		"true",
+	]);
+	std::fs::write(work.join(".git/info/sparse-checkout"), "/*\n!/*/\n").unwrap();
+	std::fs::create_dir(work.join("x")).unwrap();
+	std::fs::write(work.join("x/c"), b"C\n").unwrap();
+	git(&["-C", w, "add", "--sparse", "x/c"]);
+	// Corrupt the SUPPRESSED write's blob.
+	std::fs::remove_file(
+		work
+			.join(".git/objects")
+			.join(&x_blob[..2])
+			.join(&x_blob[2..]),
+	)
+	.unwrap();
+
+	let result = make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&other_tree).unwrap(),
+			None,
+		)
+		.await;
+	assert!(
+		result.is_err(),
+		"a suppressed D/F write with a missing blob must abort, not advance HEAD: {result:?}"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// A present intent-to-add placeholder that reappears after being reconciled skip-worktree (while absent)
+/// must have its skip-worktree bit CLEARED on the next switch — git never leaves a present intended addition
+/// omitted. (Regression guard for the reconcile of a present intent-to-add with a stale skip bit.)
+#[tokio::test]
+async fn sparse_reconcile_clears_skip_worktree_when_intent_to_add_reappears() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("sparse-ita-reappear");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("keep"), b"k\n").unwrap();
+	std::fs::write(work.join("xh"), b"x\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+	let base_branch = git(&["-C", w, "branch", "--show-current"])
+		.trim()
+		.to_owned();
+	let base_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", "-b", "other"]);
+	std::fs::write(work.join("keep"), b"k2\n").unwrap();
+	git(&["-C", w, "add", "keep"]);
+	commit(w, "mod keep");
+	let other_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", &base_branch]);
+	git(&["-C", w, "config", "extensions.worktreeConfig", "true"]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckout",
+		"true",
+	]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckoutCone",
+		"true",
+	]);
+	std::fs::write(work.join(".git/info/sparse-checkout"), "/*\n!/*/\n").unwrap();
+	std::fs::create_dir(work.join("x")).unwrap();
+	std::fs::write(work.join("x/p"), b"").unwrap();
+	git(&["-C", w, "add", "-N", "--sparse", "x/p"]);
+	std::fs::remove_file(work.join("x/p")).unwrap(); // absent
+
+	// First merge: absent placeholder is reconciled to skip-worktree.
+	make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&other_tree).unwrap(),
+			None,
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		status_of(&git(&["-C", w, "ls-files", "-t"]), "x/p"),
+		'S',
+		"absent placeholder → skip-worktree"
+	);
+	// The file reappears; a switch back must clear the skip-worktree bit.
+	std::fs::create_dir_all(work.join("x")).unwrap();
+	std::fs::write(work.join("x/p"), b"").unwrap();
+	make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&other_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			None,
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		status_of(&git(&["-C", w, "ls-files", "-t"]), "x/p"),
+		'H',
+		"a reappeared present placeholder must have skip-worktree cleared"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// A D/F-collision removal (a staged `p/c` discarded because the target adds file `p`) deletes the staged
+/// entry's clean-by-hash working file. Its staged blob must be validated first: if the blob is missing while
+/// the working copy is the sole surviving copy, the merge must abort rather than delete it and succeed.
+#[tokio::test]
+async fn checkout_merge_validates_discarded_df_blob_before_removing_it() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("df-removal-blob");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a"), b"a\n").unwrap();
+	git(&["-C", w, "add", "a"]);
+	commit(w, "base");
+	let base_branch = git(&["-C", w, "branch", "--show-current"])
+		.trim()
+		.to_owned();
+	let base_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	// A target that adds file `p` (D/F-colliding with the staged `p/c` below).
+	git(&["-C", w, "checkout", "-q", "-b", "other"]);
+	std::fs::write(work.join("p"), b"P\n").unwrap();
+	git(&["-C", w, "add", "p"]);
+	commit(w, "add-p-file");
+	let other_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", &base_branch]);
+	// Stage `p/c` (a staged-only addition), then delete its blob from the ODB — the working file is now the
+	// sole copy of that content.
+	std::fs::create_dir(work.join("p")).unwrap();
+	std::fs::write(work.join("p/c"), b"C\n").unwrap();
+	git(&["-C", w, "add", "p/c"]);
+	let pc_blob = git(&["-C", w, "rev-parse", ":p/c"]).trim().to_owned();
+	std::fs::remove_file(
+		work
+			.join(".git/objects")
+			.join(&pc_blob[..2])
+			.join(&pc_blob[2..]),
+	)
+	.unwrap();
+
+	let result = make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&other_tree).unwrap(),
+			None,
+		)
+		.await;
+	assert!(
+		result.is_err(),
+		"discarding a staged D/F path whose blob is missing must abort, not delete the sole copy: {result:?}"
+	);
+	assert_eq!(
+		std::fs::read(work.join("p/c")).unwrap(),
+		b"C\n",
+		"the staged working file (sole copy) must survive the aborted merge"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// A two-tree merge that moves an in-cone file to an *out-of-cone* path must validate the (excluded)
+/// target blob before removing the in-cone source — otherwise a missing/corrupt out-of-cone blob would
+/// let the merge remove the source, record a skip-worktree entry pointing at nothing, and silently
+/// succeed, destroying the moved content when it had no other copy. gitana has no partial clone, so a
+/// missing out-of-cone blob is corruption; the merge must abort with the source untouched.
+#[tokio::test]
+async fn merge_validates_out_of_cone_target_blob_before_removing_source() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("sparse-oob-blob");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("root.txt"), b"r\n").unwrap();
+	std::fs::write(work.join("mover.txt"), b"M\n").unwrap(); // in-cone; the source that must survive
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+	let base_branch = git(&["-C", w, "branch", "--show-current"])
+		.trim()
+		.to_owned();
+	let from_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+
+	// The to-branch moves `mover.txt` into the (soon-excluded) `x/` subtree with different content.
+	git(&["-C", w, "checkout", "-q", "-b", "other"]);
+	git(&["-C", w, "rm", "-q", "mover.txt"]);
+	std::fs::create_dir_all(work.join("x")).unwrap();
+	std::fs::write(work.join("x/mover.txt"), b"MOVED\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "other");
+	let to_tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	let moved_blob = git(&["-C", w, "rev-parse", "HEAD:x/mover.txt"])
+		.trim()
+		.to_owned();
+	git(&["-C", w, "checkout", "-q", &base_branch]);
+
+	// Exclude every subdir (`x/` becomes out-of-cone), leaving top-level files in-cone.
+	git(&["-C", w, "config", "extensions.worktreeConfig", "true"]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckout",
+		"true",
+	]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckoutCone",
+		"true",
+	]);
+	std::fs::write(work.join(".git/info/sparse-checkout"), "/*\n!/*/\n").unwrap();
+	make_repo(&work).reapply_sparse().await.unwrap();
+
+	// Corrupt the ODB: remove the out-of-cone target blob (loose object).
+	let obj = work
+		.join(".git/objects")
+		.join(&moved_blob[..2])
+		.join(&moved_blob[2..]);
+	assert!(obj.exists(), "the moved blob should be a loose object");
+	std::fs::remove_file(&obj).unwrap();
+
+	// The merge must ABORT (missing blob), not remove the source and succeed.
+	let result = make_repo(&work)
+		.checkout_merge(
+			ObjectId::<Sha256>::from_hex(&from_tree).unwrap(),
+			ObjectId::<Sha256>::from_hex(&to_tree).unwrap(),
+			None,
+		)
+		.await;
+	assert!(
+		result.is_err(),
+		"a merge with a missing out-of-cone target blob must abort: {result:?}"
+	);
+	assert_eq!(
+		std::fs::read(work.join("mover.txt")).unwrap(),
+		b"M\n",
+		"the in-cone source must survive the aborted merge"
+	);
+	assert_eq!(
+		git(&["-C", w, "ls-files"]).trim(),
+		"mover.txt\nroot.txt",
+		"the index must be untouched by the aborted merge"
+	);
+	std::fs::remove_dir_all(&work).ok();
 }
 
 /// A checkout that introduces *new* paths under active sparse-checkout recomputes each from the
