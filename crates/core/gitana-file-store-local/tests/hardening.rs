@@ -25,6 +25,29 @@ fn open_store(dir: &std::path::Path) -> LocalFileStore {
 }
 
 #[tokio::test]
+async fn durability_barrier_flushes_state_from_before_store_open() {
+	let dir = temp_dir("reopened-durability");
+	std::fs::create_dir_all(dir.join("objects/aa")).unwrap();
+	std::fs::create_dir_all(dir.join("refs/heads")).unwrap();
+	std::fs::write(dir.join("objects/aa/object"), b"object").unwrap();
+	std::fs::write(dir.join("refs/heads/main"), b"commit\n").unwrap();
+
+	let store = open_store(&dir);
+	store.durability_barrier().await.unwrap();
+
+	assert_eq!(
+		store.read_path("objects/aa/object").await.unwrap(),
+		b"object"
+	);
+	assert_eq!(
+		store.read_path("refs/heads/main").await.unwrap(),
+		b"commit\n"
+	);
+
+	let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn rejects_path_traversal() {
 	let dir = temp_dir("traversal");
 	let store = open_store(&dir);
