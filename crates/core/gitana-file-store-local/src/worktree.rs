@@ -154,6 +154,14 @@ fn is_pseudoref(path: &str) -> bool {
 }
 
 impl FileStore for WorktreeFileStore {
+	async fn durability_barrier(&self) -> Result<()> {
+		self.common.durability_barrier().await?;
+		if !Arc::ptr_eq(&self.common, &self.worktree) {
+			self.worktree.durability_barrier().await?;
+		}
+		Ok(())
+	}
+
 	fn read_path(&self, path: &str) -> impl Future<Output = Result<Vec<u8>>> {
 		self.store(path).read_path(path)
 	}
@@ -345,6 +353,7 @@ mod tests {
 			.write_path_if_absent("refs/heads/main", b"oid\n")
 			.await
 			.unwrap();
+		store.durability_barrier().await.unwrap();
 
 		assert_eq!(
 			LocalFileStore::from_dir(open_dir(&worktree))

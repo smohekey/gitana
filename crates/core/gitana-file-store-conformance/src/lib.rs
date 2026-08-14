@@ -14,6 +14,10 @@ pub async fn check_file_store<S: FileStore>(store: &S) {
 	check_is_dir(store).await;
 	check_listing(store).await;
 	check_streaming(store).await;
+	store
+		.durability_barrier()
+		.await
+		.expect("durability barrier");
 }
 
 async fn check_streaming(store: &impl FileStore) {

@@ -168,6 +168,11 @@ impl LocalFileStore {
 }
 
 impl FileStore for LocalFileStore {
+	async fn durability_barrier(&self) -> Result<()> {
+		let fs = Arc::clone(&self.backend);
+		blocking(move || sync_repository(&*fs)).await
+	}
+
 	async fn read_path(&self, path: &str) -> Result<Vec<u8>> {
 		let path = self.resolve(path)?.to_owned();
 		let fs = Arc::clone(&self.backend);
@@ -483,6 +488,12 @@ trait Backend: Send + Sync + 'static {
 	fn size(&self, path: &str) -> std::io::Result<u64>;
 	/// Raw entry names directly under `dir_rel` (`""` = root); empty if the dir is absent.
 	fn list_names(&self, dir_rel: &str) -> std::io::Result<Vec<String>>;
+	/// Classify `path` without following a final symbolic link.
+	fn kind(&self, path: &str) -> std::io::Result<FileKind>;
+	/// Flush one regular file's data and metadata to stable storage.
+	fn sync_file(&self, path: &str) -> std::io::Result<()>;
+	/// Flush one directory's namespace metadata to stable storage (`""` is the store root).
+	fn sync_dir(&self, path: &str) -> std::io::Result<()>;
 }
 
 /// Native backend: every operation goes through a [`cap_std::fs::Dir`] capability.
@@ -573,12 +584,98 @@ impl Backend for CapBackend {
 		}
 		Ok(names)
 	}
+
+	fn kind(&self, path: &str) -> std::io::Result<FileKind> {
+		let file_type = self.dir.symlink_metadata(path)?.file_type();
+		Ok(if file_type.is_file() {
+			FileKind::File
+		} else if file_type.is_dir() {
+			FileKind::Dir
+		} else if file_type.is_symlink() {
+			FileKind::Symlink
+		} else {
+			FileKind::Other
+		})
+	}
+
+	fn sync_file(&self, path: &str) -> std::io::Result<()> {
+		let mut options = OpenOptions::new();
+		options.read(true);
+		#[cfg(windows)]
+		options.write(true);
+		self.dir.open_with(path, &options)?.sync_all()
+	}
+
+	fn sync_dir(&self, path: &str) -> std::io::Result<()> {
+		#[cfg(windows)]
+		{
+			use cap_std::fs::OpenOptionsExt;
+			use windows_sys::Win32::Storage::FileSystem::{
+				FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+			};
+
+			let mut options = OpenOptions::new();
+			options
+				.read(true)
+				.write(true)
+				.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+			return self
+				.dir
+				.open_with(if path.is_empty() { "." } else { path }, &options)?
+				.sync_all();
+		}
+
+		#[cfg(not(windows))]
+		{
+			// On Linux, cap-std directory capabilities may use `O_PATH`; cloning one and
+			// calling `fsync` on it fails with `EBADF`. Reopen the directory through the
+			// capability with read access to obtain a sync-capable descriptor.
+			let mut options = OpenOptions::new();
+			options.read(true);
+			self
+				.dir
+				.open_with(if path.is_empty() { "." } else { path }, &options)?
+				.sync_all()
+		}
+	}
 }
 
 /// The parent of a git-relative path (everything before the last `/`), or `None` when
 /// the path is a direct child of the store root.
 fn parent_of(path: &str) -> Option<&str> {
 	path.rfind('/').map(|i| &path[..i])
+}
+
+/// Flush every regular value, then every directory from the leaves back to the store root.
+///
+/// Walking the current tree rather than retaining process-local dirty paths makes the same barrier
+/// usable after a restart: a caller can validate state left by an interrupted publication, flush
+/// whatever survived, and only then acknowledge it as durable. Symbolic links and special entries
+/// have no owned file contents to flush; synchronizing their parent directory persists their
+/// namespace entry without following them.
+fn sync_repository(fs: &dyn Backend) -> Result<()> {
+	let mut directories = vec![String::new()];
+	let mut index = 0;
+	while index < directories.len() {
+		let directory = directories[index].clone();
+		index += 1;
+		for name in fs.list_names(&directory).map_err(backend_err)? {
+			let path = if directory.is_empty() {
+				name
+			} else {
+				format!("{directory}/{name}")
+			};
+			match fs.kind(&path).map_err(backend_err)? {
+				FileKind::File => fs.sync_file(&path).map_err(backend_err)?,
+				FileKind::Dir => directories.push(path),
+				FileKind::Symlink | FileKind::Other => {}
+			}
+		}
+	}
+	for directory in directories.into_iter().rev() {
+		fs.sync_dir(&directory).map_err(backend_err)?;
+	}
+	Ok(())
 }
 
 fn write_if_absent(fs: &dyn Backend, path: &str, bytes: &[u8]) -> Result<WriteOutcome> {

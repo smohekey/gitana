@@ -57,6 +57,7 @@ wasip2 = "1.0.4"
 wasmtime = "46"
 wasmtime-wasi = "46"
 wasmtime-wasi-http = "46"
+windows-sys = "0.61.2"
 wit-bindgen = "0.58"
 
 [workspace.lints.rust]

@@ -64,6 +64,16 @@ pub enum DeleteOutcome {
 ///
 /// Paths are git-relative (`HEAD`, `refs/heads/main`, `objects/aa/bb...`).
 pub trait FileStore: Send + Sync {
+	/// Make every successful mutation completed before this call durable according to the
+	/// backend's persistence guarantees.
+	///
+	/// Atomic writes keep readers from observing partial values, but do not by themselves promise
+	/// that file contents, renames, or directory entries survive a power loss. A caller invokes this
+	/// barrier once its logical write batch is complete and must not mutate the store concurrently.
+	/// Returning success means the batch may be reported as durably committed. Backends without a
+	/// persistence boundary, such as an in-memory store, implement this as a no-op.
+	fn durability_barrier(&self) -> impl Future<Output = Result<()>> + Send;
+
 	/// Read the bytes stored at `path` within `repo`.
 	fn read_path(&self, path: &str) -> impl Future<Output = Result<Vec<u8>>> + Send;
 
