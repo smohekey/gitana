@@ -28,8 +28,8 @@ impl Write for DescriptorWriter {
 
 	fn flush(&mut self) -> std::io::Result<()> {
 		// WASI 0.2 `descriptor.write` is unbuffered on the guest side; there is nothing
-		// to flush. (Durability via `sync-data` is a separate concern the other
-		// backends do not provide either.)
+		// to flush. The caller-controlled file-store durability barrier invokes
+		// `descriptor.sync-data` after the logical write batch is complete.
 		Ok(())
 	}
 }

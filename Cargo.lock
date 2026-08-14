@@ -1676,6 +1676,7 @@ dependencies = [
  "sha2",
  "tokio",
  "wasip2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

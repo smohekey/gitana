@@ -36,6 +36,12 @@ impl MemoryFileStore {
 }
 
 impl FileStore for MemoryFileStore {
+	async fn durability_barrier(&self) -> Result<()> {
+		// Mutations are complete as soon as the in-memory map lock is released; there is no
+		// persistence layer for a caller-controlled barrier to flush.
+		Ok(())
+	}
+
 	async fn read_path(&self, path: &str) -> Result<Vec<u8>> {
 		self
 			.files
