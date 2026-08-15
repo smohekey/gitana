@@ -135,7 +135,11 @@ where
 	// missing blob on the first path would otherwise fail AFTER its mark and strand `index.lock`).
 	if worktree {
 		for &path in &selected {
-			if let Some((_, _, oid)) = source_entries.iter().find(|(p, _, _)| p == path) {
+			// A gitlink names a submodule COMMIT, not a blob — skip the blob preflight (as `checkout` does);
+			// `write_worktree_file` creates the empty mount directory without reading an object.
+			if let Some((_, mode, oid)) = source_entries.iter().find(|(p, _, _)| p == path)
+				&& mode != "160000"
+			{
 				wt.repository().read_blob(*oid).await?;
 			}
 		}

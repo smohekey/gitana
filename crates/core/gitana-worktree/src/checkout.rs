@@ -1384,7 +1384,19 @@ where
 	if has_symlinked_ancestor(wt.work(), path) {
 		return Ok(());
 	}
-	let _ = wt.work().remove_file(path);
+	// A tracked path is normally a file/symlink; unlink it. A tracked path that is a DIRECTORY is a
+	// submodule (gitlink) mount — rmdir it only when EMPTY (git removes an empty mount but leaves a
+	// populated submodule in place; `remove_dir` fails on a non-empty directory, ignored here), never
+	// recursively deleting content. Without this, a gitlink mount reconciled out by sparse-checkout would
+	// linger on disk while the index records it skip-worktree.
+	match wt.work().lstat(path)? {
+		Some(meta) if meta.kind.is_dir() => {
+			let _ = wt.work().remove_dir(path);
+		}
+		_ => {
+			let _ = wt.work().remove_file(path);
+		}
+	}
 	remove_empty_parents(wt.work(), path);
 	Ok(())
 }
@@ -1479,6 +1491,13 @@ where
 	W: WorkDirFs,
 	H: HashAlgorithm,
 {
+	// A submodule (gitlink) mount is opaque to checkout cleanliness — git never inspects a submodule's
+	// own working tree — so a CURRENT gitlink is never an overwrite conflict here (a removal or pointer
+	// change proceeds; the apply phase rmdir's only an empty mount, leaving a populated one). This mirrors
+	// `merge_apply`'s `is_gitlink` exemption, for the non-merge (Overlay/WIT `checkout`) path.
+	if matches!(current, Some((mode, _)) if mode == "160000") {
+		return Ok(());
+	}
 	// Absent, or unreachable because a file occupies an ancestor directory (`ENOTDIR`): either way
 	// there is nothing at `path` to overwrite.
 	let Some(meta) = wt.work().lstat(path)? else {

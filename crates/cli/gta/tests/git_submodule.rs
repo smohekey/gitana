@@ -666,6 +666,53 @@ fn worktree_remove_tolerates_an_empty_gitlink_mount() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// `gta restore <gitlink>` must recreate the empty mount directory the way git does, without reading
+/// a blob — the gitlink names a submodule commit, not an object in this repository.
+#[test]
+fn restore_recreates_a_gitlink_mount_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-sub-restore");
+	let w = work.to_str().unwrap();
+	git(
+		w,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	git(w, &["config", "user.name", "T"]);
+	git(w, &["config", "user.email", "t@e"]);
+	std::fs::write(format!("{w}/root"), b"r\n").unwrap();
+	git(w, &["add", "root"]);
+	commit(w, "base");
+	let c = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+	git(
+		w,
+		&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("160000,{c},sub"),
+		],
+	);
+	commit(w, "add gitlink");
+
+	// The mount is absent in the working tree (cacheinfo staged the gitlink without creating it).
+	assert!(!std::path::Path::new(&format!("{w}/sub")).exists());
+	// `restore` must not fail on the blob preflight; it creates the empty mount.
+	gta(w, &["restore", "sub"], b"");
+	assert!(
+		std::path::Path::new(&format!("{w}/sub")).is_dir(),
+		"restore recreates the empty gitlink mount"
+	);
+	assert_eq!(
+		sorted(&gta(w, &["status"], b"")),
+		sorted(&git(w, &["status", "--porcelain"])),
+		"status is clean after restoring the gitlink, matching git"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
 /// The added/removed lines of two diffs, sorted, for order-independent comparison.
 fn sorted(text: &str) -> Vec<String> {
 	let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
