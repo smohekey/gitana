@@ -9,7 +9,8 @@ use std::os::unix::fs::symlink;
 use common::*;
 use gitana_linked_worktree::{
 	BranchName, CheckoutTarget, CreateError, CreateRequest, Registration, RemovePolicy,
-	RemoveRequest, RepositoryId, WorktreeClassification, WorktreeObjectId, create, remove,
+	RemoveRequest, RepositoryId, WorktreeClassification, WorktreeObjectId, create,
+	durability_barrier_created, recover_prepared_create, remove,
 };
 
 fn req(work: &std::path::Path, dest: &std::path::Path, target: CheckoutTarget) -> CreateRequest {
@@ -502,6 +503,92 @@ async fn existing_branch_completes_an_interrupted_attempt() {
 		assert_eq!(git(&["-C", wts, "rev-parse", "HEAD"]).trim(), head);
 		let reflog_after = std::fs::read_to_string(work.join(".git/logs/refs/heads/feature")).ok();
 		assert_eq!(reflog_before, reflog_after, "{fmt}: branch not re-created");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn prepared_recovery_recreates_an_exact_nonempty_checkout_missing_partial() {
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-recover-owned-partial-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+		create(&req(&work, &wt, new_branch("feature", start.clone())), None)
+			.await
+			.unwrap();
+
+		// Reproduce the exact commit order's interruption: admin, index, and checkout exist, but the final
+		// checkout `.git` marker never became visible.
+		std::fs::remove_file(wt.join(".git")).unwrap();
+		assert!(wt.join("a.txt").is_file(), "{fmt}: partial is non-empty");
+		let recovery = req(&work, &wt, existing_branch("feature", Some(start.clone())));
+
+		let ordinary = create(&recovery, None).await.unwrap_err();
+		assert!(
+			matches!(
+				ordinary,
+				CreateError::Refused(WorktreeClassification::DestinationConflict { .. })
+			),
+			"{fmt}: ordinary create must still preserve unknown non-empty partials, got {ordinary:?}"
+		);
+
+		let inspection = recover_prepared_create(&recovery, None).await.unwrap();
+		assert!(matches!(
+			inspection.registration,
+			Registration::Present { .. }
+		));
+		assert_eq!(
+			git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
+			head
+		);
+		assert!(git(&["-C", wt.to_str().unwrap(), "status", "--porcelain"]).is_empty());
+		durability_barrier_created(&recovery).await.unwrap();
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
+async fn prepared_recovery_preserves_a_partial_when_the_baseline_does_not_match() {
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-recover-mismatch-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let first = commit_file(&work, "a.txt", "1\n", "first");
+		let wt = base.join("wt");
+		let start = WorktreeObjectId::parse(kind, &first).unwrap();
+		create(&req(&work, &wt, new_branch("feature", start)), None)
+			.await
+			.unwrap();
+		std::fs::remove_file(wt.join(".git")).unwrap();
+		let second = commit_file(&work, "b.txt", "2\n", "second");
+		let wrong = WorktreeObjectId::parse(kind, &second).unwrap();
+
+		let error = recover_prepared_create(
+			&req(&work, &wt, existing_branch("feature", Some(wrong))),
+			None,
+		)
+		.await
+		.unwrap_err();
+		assert!(
+			matches!(error, CreateError::Refused(_)),
+			"{fmt}: mismatched recovery must fail closed, got {error:?}"
+		);
+		assert!(
+			wt.join("a.txt").is_file(),
+			"{fmt}: checkout content preserved"
+		);
+		assert!(
+			work
+				.join(".git/worktrees")
+				.read_dir()
+				.unwrap()
+				.next()
+				.is_some(),
+			"{fmt}: registration preserved"
+		);
 		let _ = std::fs::remove_dir_all(&base);
 	}
 }

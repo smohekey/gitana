@@ -54,8 +54,8 @@ jobs:
       - run: git --version
       - run: cargo test --workspace
 
-  windows-file-store:
-    name: file-store durability (windows)
+  windows-storage-durability:
+    name: storage durability (windows)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +63,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Runtime coverage matters here: a cross-target check cannot establish whether Windows can
       # flush the writable directory handles used by the durability barrier.
-      - run: cargo test -p gitana-file-store-local
+      - run: cargo test -p gitana-file-store-local -p gitana-linked-worktree --lib
 
   msrv:
     name: msrv (1.96.0)

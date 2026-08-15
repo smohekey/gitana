@@ -10,7 +10,7 @@ use gitana_object::{
 	Commit, EwahBitmap, ObjectId, ObjectKind, PackedObject, Sha256, TreeEntry, decode_midx_bitmap,
 	decode_multi_pack_index, encode_commit, encode_midx_bitmap, encode_pack, encode_tree,
 };
-use gitana_object_store::ObjectStore;
+use gitana_object_store::{ObjectBacking, ObjectStore};
 
 /// A small object graph with two delta-friendly blobs, a tree, and a commit — enough that the
 /// encoded pack carries both full and delta entries at several offsets.
@@ -73,6 +73,43 @@ async fn reads_every_object_in_a_stored_pack() {
 }
 
 #[tokio::test]
+async fn reports_the_verified_loose_or_pack_pair_backing_an_object() {
+	let objects = sample_graph();
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	store
+		.write_pack(encode_pack(&objects))
+		.await
+		.expect("write pack");
+	let (_, _, packed) = store
+		.read_object_with_backing(&objects[0].id)
+		.await
+		.expect("read packed provenance");
+	let ObjectBacking::Packed { pack, index } = packed else {
+		panic!("packed object must report its pack pair");
+	};
+	assert!(pack.ends_with(".pack"));
+	let index = index.expect("written pack has an index sidecar");
+	assert!(index.ends_with(".idx"));
+	assert!(store.file_store().exists(&pack).await.unwrap());
+	assert!(store.file_store().exists(&index).await.unwrap());
+
+	let loose_id = store
+		.write_object(ObjectKind::Blob, b"loose")
+		.await
+		.expect("write loose object");
+	let (_, _, loose) = store
+		.read_object_with_backing(&loose_id)
+		.await
+		.expect("read loose provenance");
+	assert_eq!(
+		loose,
+		ObjectBacking::Loose {
+			path: gitana_object::loose_object_path(&loose_id),
+		}
+	);
+}
+
+#[tokio::test]
 async fn write_pack_writes_an_idx_sidecar() {
 	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
 	store
@@ -129,6 +166,15 @@ async fn reads_when_the_idx_sidecar_is_missing() {
 		assert_eq!(kind, object.kind);
 		assert_eq!(data, object.data);
 	}
+	let (_, _, backing) = store
+		.read_object_with_backing(&objects[0].id)
+		.await
+		.expect("read provenance without sidecar");
+	let ObjectBacking::Packed { pack, index } = backing else {
+		panic!("object remains pack-backed");
+	};
+	assert!(index.is_none(), "a missing sidecar is not durable backing");
+	assert_eq!(ObjectBacking::Packed { pack, index }.files().count(), 1);
 }
 
 #[tokio::test]

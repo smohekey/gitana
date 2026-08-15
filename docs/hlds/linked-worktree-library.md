@@ -253,6 +253,17 @@ effect and (b) every partial state being classifiable by `inspect`/`classify`. S
 so this is realized in the create/remove slices; full registration-level CAS + native-`OsStr` polish
 is the final hardening slice.
 
+Durable consumers add an explicit completion boundary rather than treating atomic visibility as
+power-loss durability. `durability_barrier_created` validates the exact completed request, flushes the
+checkout and admin trees, then their checkout-parent and `worktrees` namespaces, and revalidates the
+same inspection. `durability_barrier_removed` similarly requires checkout and registration absence and
+flushes both deletion namespaces. The branch/object half stays at the repository layer:
+`Repository::durability_barrier_ref` flushes the actual ref plus newly reachable loose objects or
+pack files (and their index sidecars when present) beyond caller-supplied durable frontiers, while
+`Repository::durability_barrier_ref_absent` persists ref deletion. This keeps the hot path targeted;
+recursive file-store tree barriers remain an explicit recovery tool, not an every-commit full-repository
+scan.
+
 ## Slice plan
 
 1. **Read-only inspection + enumeration + types + classification** (this HLD's slice 1) — pure reads,
@@ -588,7 +599,8 @@ pointer-publication hardening:
 
 **Resolved in slice 3 (was deferred from slice 2):**
 
-- **Recoverable mid-checkout state — resolved at the classification level; file-cleanup is empty-only.**
+- **Recoverable mid-checkout state — empty-only by default; exact durable intents can recover their own
+  non-empty partial.**
   ✅ (slice 3). git writes the checkout `.git` gitfile **first** (probed), so a mid-checkout failure leaves a
   *registered, dirty* worktree that `git worktree remove --force` recovers. gitana writes the gitfile **last**,
   so an interrupted-*before*-checkout create is cleanly `PartialRegistered`. Slice 3 makes an **absent-or-empty**
@@ -600,8 +612,13 @@ pointer-publication hardening:
   create's own rather than a reused path or a git-created prunable; a status-based "clean" check is also
   insufficient (a coincidental clone at the same commit, or ignored content, passes it). So a non-empty
   checkout-missing partial is **refused and preserved** (a `DestinationConflict`), matching git's own
-  `worktree remove`. An interrupted-*mid*-checkout that left files therefore still needs the caller (or a
-  future force path) to clear them before retry — the narrow, mostly-deferred (submodule-gitlink) tail below.
+  `worktree remove`. That remains the ordinary `create`/`remove` contract. A caller that first durably
+  recorded the exact materialization intent may instead call `recover_prepared_create` with an existing
+  branch and an exact expected baseline. That narrow entry point revalidates the repository, destination,
+  sole physical admin, missing final `.git` marker, admin `HEAD`, shared branch, and baseline under the
+  registration lock; only that complete match authorizes deleting the intent-owned partial and recreating
+  it. Any mismatch falls back to the ordinary fail-closed refusal, so a registration alone still never
+  grants authority over a reused directory.
 
 **Still deferred:**
 

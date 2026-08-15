@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
-use gitana_file_store::{FileStore, FileStoreError};
+use gitana_file_store::{DurabilityTarget, FileStore, FileStoreError};
 use gitana_file_store_local::LocalFileStore;
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -33,7 +33,10 @@ async fn durability_barrier_flushes_state_from_before_store_open() {
 	std::fs::write(dir.join("refs/heads/main"), b"commit\n").unwrap();
 
 	let store = open_store(&dir);
-	store.durability_barrier().await.unwrap();
+	store
+		.durability_barrier(&[DurabilityTarget::tree("")])
+		.await
+		.unwrap();
 
 	assert_eq!(
 		store.read_path("objects/aa/object").await.unwrap(),

@@ -19,6 +19,7 @@
 mod native {
 	use std::path::Path;
 
+	use crate::admin_cleanup::{deregister_admin, path_absent};
 	use crate::facts::{HeadKind, LockState};
 	use crate::head::{read_lock_reason, structural_head_branch};
 	use crate::inspect::{
@@ -513,65 +514,6 @@ mod native {
 				Err(RemoveError::Incomplete(Box::new(post)))
 			}
 		}
-	}
-
-	/// Atomically de-register `admin`: `rename` it to a sibling *outside* `<common>/worktrees/`, then delete the
-	/// moved directory best-effort. Returns `Ok` once the registration is gone — either the rename landed (any
-	/// undeletable remnant is then harmless cruft under the common dir, not a worktree entry) **or** the admin
-	/// was already absent (a concurrent remover/prune finished it). `Err` only when the rename fails with the
-	/// admin still in place, leaving the registration recognisable for a retry.
-	fn deregister_admin(admin: &Path) -> std::io::Result<()> {
-		use std::sync::atomic::{AtomicU64, Ordering};
-		static SEQ: AtomicU64 = AtomicU64::new(0);
-		// `admin` is `<common>/worktrees/<name>`; move it to a **fixed-length** sibling under the common dir
-		// (writable, same filesystem → `rename` is atomic) but *not* under `worktrees/`. The name is bounded
-		// (`pid`+`seq`, not the admin's own name) so a near-`NAME_MAX` admin name cannot make the trash name
-		// exceed the component limit and fail with `ENAMETOOLONG`.
-		let worktrees = admin.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
-		let common = worktrees.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
-		// `SEQ` makes names unique within this process, but across processes the `pid` can be **reused** after a
-		// prior removal crashed leaving a non-empty `.gitana-removing.<pid>.<seq>` remnant — a fresh process
-		// restarts `SEQ` at 0 and would target that exact existing dir. `rename` onto a non-empty dir fails
-		// (`ENOTEMPTY`), and since the checkout is already deleted by now that would strand the registration as a
-		// false `Incomplete`. So advance to the next sequence whenever the chosen trash name already exists,
-		// bounded by a (astronomically generous) retry cap.
-		const MAX_TRIES: u32 = 4096;
-		for _ in 0..MAX_TRIES {
-			let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-			let trash = common.join(format!(".gitana-removing.{}.{}", std::process::id(), seq));
-			// Skip a name that already exists — **before** attempting the rename. POSIX `rename` *replaces* an
-			// empty directory at the target, so renaming onto a pre-existing empty `.gitana-removing.*` (a crashed
-			// prior run after PID reuse, or an unrelated entry) would clobber it and then delete the replacement.
-			// A raced-in target between this check and the rename is caught by the error arm below. (No-replace
-			// `renameat2`/`renamex_np` would be atomic, but require `unsafe` libc, which the workspace forbids.)
-			if std::fs::symlink_metadata(&trash).is_ok() {
-				continue;
-			}
-			match std::fs::rename(admin, &trash) {
-				Ok(()) => {
-					let _ = std::fs::remove_dir_all(&trash); // best-effort; a remnant is harmless non-entry cruft
-					return Ok(());
-				}
-				// The **admin** (rename source) is already gone — a concurrent remover/prune de-registered it; the
-				// worktree is removed regardless.
-				Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-				// The chosen trash **name** was created between the check above and the rename — try the next
-				// sequence rather than fail (or clobber) with the checkout gone.
-				Err(_) if std::fs::symlink_metadata(&trash).is_ok() => continue,
-				Err(e) => return Err(e),
-			}
-		}
-		Err(std::io::Error::new(
-			std::io::ErrorKind::AlreadyExists,
-			"deregister_admin: exhausted trash-name sequences",
-		))
-	}
-
-	/// Whether `path` is *confirmed* absent — a `NotFound` stat (no symlink followed). Any other stat failure
-	/// (e.g. a permission error on a parent) is treated as **not** confirmed-absent, so removal reports
-	/// `Incomplete` rather than a false success.
-	fn path_absent(path: &Path) -> bool {
-		matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 	}
 
 	/// The repository's `common` dir if it lies *inside* `destination` (equal to it, or a descendant) — the

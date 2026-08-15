@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use gitana_file_store::{
-	ByteReader, DeleteOutcome, FileStore, FileStoreError, PathLock, Result, Version, WriteOutcome,
+	ByteReader, DeleteOutcome, DurabilityTarget, FileStore, FileStoreError, PathLock, Result,
+	Version, WriteOutcome,
 };
 use tokio::io::AsyncReadExt;
 
@@ -46,7 +47,7 @@ impl FileStore for MemoryFileStore {
 		}
 	}
 
-	async fn durability_barrier(&self) -> Result<()> {
+	async fn durability_barrier(&self, _targets: &[DurabilityTarget]) -> Result<()> {
 		// Mutations are complete as soon as the in-memory map lock is released; there is no
 		// persistence layer for a caller-controlled barrier to flush.
 		Ok(())

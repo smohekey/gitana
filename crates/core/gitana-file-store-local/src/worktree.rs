@@ -5,7 +5,7 @@ use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use cap_std::fs::Dir;
 use gitana_file_store::{
-	ByteReader, DeleteOutcome, FileStore, PathLock, Result, Version, WriteOutcome,
+	ByteReader, DeleteOutcome, DurabilityTarget, FileStore, PathLock, Result, Version, WriteOutcome,
 };
 
 use crate::LocalFileStore;
@@ -165,10 +165,28 @@ impl FileStore for WorktreeFileStore {
 		}
 	}
 
-	async fn durability_barrier(&self) -> Result<()> {
-		self.common.durability_barrier().await?;
-		if !Arc::ptr_eq(&self.common, &self.worktree) {
-			self.worktree.durability_barrier().await?;
+	async fn durability_barrier(&self, targets: &[DurabilityTarget]) -> Result<()> {
+		if Arc::ptr_eq(&self.common, &self.worktree) {
+			return self.common.durability_barrier(targets).await;
+		}
+
+		let mut common = Vec::new();
+		let mut worktree = Vec::new();
+		for target in targets {
+			if target.path().is_empty() {
+				common.push(target.clone());
+				worktree.push(target.clone());
+			} else if is_per_worktree(target.path()) {
+				worktree.push(target.clone());
+			} else {
+				common.push(target.clone());
+			}
+		}
+		if !common.is_empty() {
+			self.common.durability_barrier(&common).await?;
+		}
+		if !worktree.is_empty() {
+			self.worktree.durability_barrier(&worktree).await?;
 		}
 		Ok(())
 	}
@@ -368,7 +386,10 @@ mod tests {
 			.write_path_if_absent("refs/heads/main", b"oid\n")
 			.await
 			.unwrap();
-		store.durability_barrier().await.unwrap();
+		store
+			.durability_barrier(&[DurabilityTarget::tree("")])
+			.await
+			.unwrap();
 
 		assert_eq!(
 			LocalFileStore::from_dir(open_dir(&worktree))

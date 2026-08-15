@@ -33,6 +33,13 @@ cap-std.workspace = true
 # runtime transitively via the file store's own `spawn_blocking`.
 tokio = { workspace = true, features = ["rt"] }
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+winx.workspace = true
+
 [dev-dependencies]
 # The injected-config tests build a `GitConfig` to hand to `WorktreeContext::with_effective_config`. An
 # integration test is its own crate, so it names the type directly rather than through the library's deps.
