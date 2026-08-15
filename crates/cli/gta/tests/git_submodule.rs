@@ -211,6 +211,88 @@ fn diff_reports_submodule_pointer_change_like_git() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// Checking out a commit that records a gitlink must materialize it the way git does: create an
+/// EMPTY mount directory and record `160000 <commit> 0  sub` in the index, without cloning the
+/// submodule (`submodule update` would populate it). Mirrors a clone left without `submodule
+/// update` — the gitlink is staged via `cacheinfo`, so there is no `.git/modules` state.
+#[test]
+fn checkout_materializes_gitlink_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	// Superproject with a `feat` branch that records a gitlink but no populated submodule; leave the
+	// working tree on `main` (no `sub`), so switching back onto `feat` is the materialization under test.
+	let setup = |w: &str| -> String {
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		git(w, &["config", "user.name", "T"]);
+		git(w, &["config", "user.email", "t@e"]);
+		std::fs::write(format!("{w}/root"), b"r\n").unwrap();
+		git(w, &["add", "root"]);
+		commit(w, "base");
+		let c = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+		git(w, &["switch", "-q", "-c", "feat"]);
+		git(
+			w,
+			&[
+				"update-index",
+				"--add",
+				"--cacheinfo",
+				&format!("160000,{c},sub"),
+			],
+		);
+		commit(w, "addsub");
+		git(w, &["switch", "-q", "main"]);
+		c
+	};
+	let a = unique_tmp("gta-sub-co-gta");
+	let b = unique_tmp("gta-sub-co-git");
+	let (wa, wb) = (a.to_str().unwrap(), b.to_str().unwrap());
+	let ca = setup(wa);
+	setup(wb);
+
+	// Switch back onto `feat`: gta in one repo, git in the other.
+	gta(wa, &["switch", "feat"], b"");
+	git(wb, &["switch", "-q", "feat"]);
+
+	// An empty mount directory (no clone).
+	assert!(
+		a.join("sub").is_dir(),
+		"gta must create the submodule mount directory"
+	);
+	assert!(
+		std::fs::read_dir(a.join("sub")).unwrap().next().is_none(),
+		"gta must not populate (clone) the submodule"
+	);
+	// The recorded gitlink, byte-identical to git's.
+	assert_eq!(
+		git(wa, &["ls-files", "-s", "sub"]).trim(),
+		format!("160000 {ca} 0\tsub"),
+		"gta must record the gitlink in the index"
+	);
+	assert_eq!(
+		git(wa, &["ls-files", "-s", "sub"]),
+		git(wb, &["ls-files", "-s", "sub"]),
+		"gta's recorded gitlink must match git's"
+	);
+	// A clean status afterward, matching git.
+	assert_eq!(
+		git(wa, &["status", "--porcelain"]),
+		git(wb, &["status", "--porcelain"]),
+		"status after materializing the gitlink must match git"
+	);
+	assert!(
+		git(wa, &["status", "--porcelain"]).trim().is_empty(),
+		"clean after checkout, like git"
+	);
+
+	std::fs::remove_dir_all(&a).ok();
+	std::fs::remove_dir_all(&b).ok();
+}
+
 /// The semantic content of a unified diff: every added/removed line (sign + text), sorted,
 /// ignoring file/hunk headers. Compares gta's diff to git's without depending on git's exact byte
 /// framing (notably git's `index <old>..<new>` line, which gta does not emit).

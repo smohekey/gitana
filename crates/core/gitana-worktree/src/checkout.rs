@@ -391,6 +391,11 @@ where
 			if excluded {
 				continue;
 			}
+			// A gitlink names a submodule commit, not a blob — nothing to validate here; `write_entry`
+			// creates an empty mount directory rather than reading a blob.
+			if mode == "160000" {
+				continue;
+			}
 			wt.repository().read_blob(*oid).await?;
 		}
 		// A case-colliding staged entry (`foo` beside a retained `Foo`, a *distinct* blob from a
@@ -965,21 +970,14 @@ where
 			let (mode, oid) = to
 				.get(path)
 				.expect("a write path is present in the to-tree");
-			// A gitlink (submodule, mode 160000) names a COMMIT, not a blob in this object database. When it
-			// is OUT-OF-CONE it records an index entry only (`write_entry`'s excluded path reads no blob and
-			// materialises nothing), so skip the blob validation that would spuriously fail. An IN-CONE
-			// gitlink cannot be materialised — `write_entry` would `read_blob` and fail — so leave its
-			// validation HERE, before any mutation, rather than let it fail mid-apply and strand `index.lock`.
-			// (This is the pre-existing "in-cone submodule checkout is unsupported" behaviour, kept safe.)
-			let excluded = match sparse.as_ref() {
-				Some(matcher) => !matcher.includes(path),
-				None => index.entry(path).is_some_and(|entry| entry.skip_worktree),
-			};
-			if mode == "160000" && excluded {
-				// The target is an index-only gitlink (a submodule commit, no blob). But when it REPLACES a
-				// present non-gitlink at an out-of-cone path, `write_entry` removes that working file trusting it
-				// is reconstructable from its current blob — so that OUTGOING blob must exist, else the file is
-				// the sole surviving copy and the index-only replacement loses it. Validate it before the skip.
+			// A gitlink (submodule, mode 160000) names a COMMIT, not a blob in this object database — never
+			// `read_blob` it. Whether OUT-OF-CONE (recorded index-only, materialising nothing) or IN-CONE
+			// (recorded plus an empty mount directory, with no clone — `submodule update` would populate it),
+			// the incoming side needs no blob. But when it REPLACES a present non-gitlink file — which
+			// `write_entry`/`write_worktree_file` removes trusting it is reconstructable from its current blob
+			// — that OUTGOING blob must exist, else the file is the sole surviving copy and the replacement
+			// loses it. Validate it before any mutation.
+			if mode == "160000" {
 				if let Some((from_mode, from_oid)) = staged.get(path)
 					&& from_mode != "160000"
 				{
@@ -1314,6 +1312,23 @@ where
 {
 	validate_path(path)?;
 	ensure_parents(wt.work(), path)?;
+
+	if mode == "160000" {
+		// A submodule (gitlink) names a commit, not a blob: git records the gitlink and creates an
+		// empty mount directory, without cloning (`submodule update` would populate it). Never wipe an
+		// already-checked-out submodule working tree — leave an existing directory in place; replace
+		// only a plain file or symlink occupying the mount point.
+		match wt.work().lstat(path)? {
+			Some(meta) if meta.kind.is_dir() => {}
+			Some(_) => {
+				wt.work().remove_file(path)?;
+				wt.work().create_dir(path)?;
+			}
+			None => wt.work().create_dir(path)?,
+		}
+		return Ok(());
+	}
+
 	let content = wt.repository().read_blob(oid).await?;
 
 	if mode == "120000" {
