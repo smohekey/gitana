@@ -358,8 +358,9 @@ async fn fast_forward_refuses_divergent_staged_content_at_excluded_path() {
 
 /// An out-of-cone gitlink (submodule, mode 160000) is recorded index-only and never blob-validated, so a
 /// two-tree merge that adds one succeeds without the submodule's commit being present. An IN-cone gitlink
-/// cannot be materialised, so the merge must refuse it BEFORE any mutation — leaving no stranded
-/// `index.lock` (the blob validation runs in the pre-mutation preflight, not mid-apply).
+/// materialises as an EMPTY mount directory — git records the gitlink without cloning — with its index
+/// entry written and the `index.lock` released. The incoming gitlink names a commit, not a blob, so it is
+/// skipped by the pre-mutation blob validation, neither failing mid-apply nor stranding the lock.
 #[tokio::test]
 async fn checkout_merge_handles_gitlinks_without_stranding_the_lock() {
 	if !git_supports_sha256() {
@@ -425,7 +426,8 @@ async fn checkout_merge_handles_gitlinks_without_stranding_the_lock() {
 		"no submodule file is materialised"
 	);
 
-	// --- In-cone gitlink: adding `sub` in the cone must refuse, pre-mutation, leaving no stranded lock. ---
+	// --- In-cone gitlink: adding `sub` in the cone materialises an empty mount directory, records the
+	// gitlink, and releases the lock — no clone, no stranded lock. ---
 	git(&["-C", w, "read-tree", &base_tree]);
 	git(&[
 		"-C",
@@ -437,20 +439,30 @@ async fn checkout_merge_handles_gitlinks_without_stranding_the_lock() {
 	]);
 	let incone_tree = git(&["-C", w, "write-tree"]).trim().to_owned();
 	git(&["-C", w, "read-tree", &base_tree]);
-	let result = make_repo(&work)
+	make_repo(&work)
 		.checkout_merge(
 			ObjectId::<Sha256>::from_hex(&base_tree).unwrap(),
 			ObjectId::<Sha256>::from_hex(&incone_tree).unwrap(),
 			None,
 		)
-		.await;
+		.await
+		.expect("an in-cone gitlink materialises as an empty mount directory");
+	assert_eq!(
+		status_of(&git(&["-C", w, "ls-files", "-t"]), "sub"),
+		'H',
+		"the in-cone gitlink is recorded as a normal (cached) entry"
+	);
 	assert!(
-		result.is_err(),
-		"an in-cone gitlink cannot be materialised and must refuse: {result:?}"
+		work.join("sub").is_dir()
+			&& std::fs::read_dir(work.join("sub"))
+				.unwrap()
+				.next()
+				.is_none(),
+		"an empty mount directory is created, not a clone"
 	);
 	assert!(
 		!work.join(".git/index.lock").exists(),
-		"the pre-mutation refusal must release the index lock, not strand it"
+		"the completed checkout must release the index lock, not strand it"
 	);
 	std::fs::remove_dir_all(&work).ok();
 }
