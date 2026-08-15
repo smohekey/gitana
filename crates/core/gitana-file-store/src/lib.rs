@@ -1,3 +1,7 @@
+mod path_lock;
+
+pub use path_lock::PathLock;
+
 use tokio::io::AsyncRead;
 
 /// An owned, type-erased async byte reader (a streaming read, or a write source).
@@ -64,6 +68,16 @@ pub enum DeleteOutcome {
 ///
 /// Paths are git-relative (`HEAD`, `refs/heads/main`, `objects/aa/bb...`).
 pub trait FileStore: Send + Sync {
+	/// The concrete owned handle returned by [`Self::shared_handle`].
+	type Shared: FileStore + 'static;
+
+	/// Create an owned handle to the same storage and coordination state.
+	///
+	/// The returned handle must alias this store's backend, version source, and in-process locks; it
+	/// must not open an independent view of the same paths. Repository operations use this handle to
+	/// move a mutation into an owned task that can run through caller cancellation.
+	fn shared_handle(&self) -> Self::Shared;
+
 	/// Read the bytes stored at `path` within `repo`.
 	fn read_path(&self, path: &str) -> impl Future<Output = Result<Vec<u8>>> + Send;
 
@@ -79,6 +93,13 @@ pub trait FileStore: Send + Sync {
 		path: &str,
 		bytes: &[u8],
 	) -> impl Future<Output = Result<WriteOutcome>> + Send;
+
+	/// Try once to create `path` exclusively and return an owned guard that removes it on drop.
+	///
+	/// Unlike [`Self::write_path_if_absent`], ownership of a successful creation is explicit and
+	/// cancellation-safe: dropping the returned [`PathLock`] synchronously removes the path. `Ok(None)`
+	/// means another process or task already owns the path. Callers implement any retry policy.
+	fn try_lock_path(&self, path: &str) -> impl Future<Output = Result<Option<PathLock>>> + Send;
 
 	/// Conditionally write `bytes` at `path`, returning the new [`Version`].
 	///

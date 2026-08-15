@@ -1,21 +1,22 @@
 //! In-memory [`FileStore`] backend for tests and local CI.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use gitana_file_store::{
-	ByteReader, DeleteOutcome, FileStore, FileStoreError, Result, Version, WriteOutcome,
+	ByteReader, DeleteOutcome, FileStore, FileStoreError, PathLock, Result, Version, WriteOutcome,
 };
 use tokio::io::AsyncReadExt;
 
 type Key = String;
+type Files = Arc<RwLock<HashMap<Key, (Vec<u8>, Version)>>>;
 
 /// A `FileStore` that keeps every value in process memory.
 #[derive(Default)]
 pub struct MemoryFileStore {
-	files: RwLock<HashMap<Key, (Vec<u8>, Version)>>,
-	next_version: AtomicU64,
+	files: Files,
+	next_version: Arc<AtomicU64>,
 }
 
 impl MemoryFileStore {
@@ -36,6 +37,15 @@ impl MemoryFileStore {
 }
 
 impl FileStore for MemoryFileStore {
+	type Shared = Self;
+
+	fn shared_handle(&self) -> Self::Shared {
+		Self {
+			files: Arc::clone(&self.files),
+			next_version: Arc::clone(&self.next_version),
+		}
+	}
+
 	async fn read_path(&self, path: &str) -> Result<Vec<u8>> {
 		self
 			.files
@@ -66,6 +76,25 @@ impl FileStore for MemoryFileStore {
 				Ok(WriteOutcome::Written)
 			}
 		}
+	}
+
+	async fn try_lock_path(&self, path: &str) -> Result<Option<PathLock>> {
+		let version = self.mint_version();
+		let key = path.to_owned();
+		let mut files = self.files.write().expect("file store lock poisoned");
+		if files.contains_key(&key) {
+			return Ok(None);
+		}
+		files.insert(key.clone(), (Vec::new(), version));
+		drop(files);
+
+		let files = Arc::clone(&self.files);
+		Ok(Some(PathLock::new(move || {
+			files
+				.write()
+				.expect("file store lock poisoned")
+				.remove(&key);
+		})))
 	}
 
 	async fn write_path_cas(

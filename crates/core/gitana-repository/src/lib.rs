@@ -10,6 +10,8 @@
 mod config;
 mod detect;
 mod error;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod gated_file_store;
 mod head;
 mod merge;
 mod merge_base;
@@ -36,3 +38,6 @@ pub use self::{
 	repository::Repository,
 	tree::{TreeBuildEntry, compute_tree_id},
 };
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) use self::gated_file_store::GatedFileStore;

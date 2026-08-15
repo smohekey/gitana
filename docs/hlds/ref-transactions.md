@@ -210,6 +210,19 @@ Deltas from the design above and from `codex` review, recorded here rather than 
   per-worktree file, interoperably with git.
 - **`RefLocked`** is the new `RepositoryError` variant when a `<ref>.lock` stays contended past the
   retries.
+- **Native ref mutations are retained through cancellation.** `RefStore::transact` and
+  `set_symbolic` first copy their borrowed inputs and clone an aliasing `FileStore::shared_handle`,
+  then run lock acquisition, validation, publication, release, and directory pruning in an owned
+  Tokio task. Dropping the caller's future stops waiting but does not drop `PathLock` while an
+  offloaded filesystem write is still running. Every store handle aliases the same backend,
+  temporary-name counter, versions, and in-process locks. Wasm keeps the operation inline because
+  its descriptor-backed file-store calls complete synchronously when polled and the component does
+  not provide a Tokio runtime.
+- **Ref locks are owned RAII paths.** `FileStore::try_lock_path` returns `PathLock`; dropping the
+  complete lock set releases every lock synchronously. If acquiring a later lock fails, the
+  transaction explicitly drops the locks already acquired and prunes directories created for both
+  those names and the failed attempt before returning. This prevents an aborted nested lock such as
+  `refs/heads/foo/bar.lock` from leaving an empty `refs/heads/foo/` that blocks the parent ref.
 
 ## Implementation notes (as built, Phase 3)
 

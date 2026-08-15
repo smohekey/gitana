@@ -30,7 +30,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gitana_file_store::{
-	ByteReader, DeleteOutcome, FileStore, FileStoreError, Result, Version, WriteOutcome, split_prefix,
+	ByteReader, DeleteOutcome, FileStore, FileStoreError, PathLock, Result, Version, WriteOutcome,
+	split_prefix,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
@@ -101,7 +102,7 @@ pub struct LocalFileStore {
 	backend: Arc<dyn Backend>,
 	temp_counter: Arc<AtomicU64>,
 	#[cfg(not(target_arch = "wasm32"))]
-	locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+	locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl LocalFileStore {
@@ -126,7 +127,7 @@ impl LocalFileStore {
 			backend,
 			temp_counter: Arc::new(AtomicU64::new(temp_seed())),
 			#[cfg(not(target_arch = "wasm32"))]
-			locks: Mutex::new(HashMap::new()),
+			locks: Arc::new(Mutex::new(HashMap::new())),
 		}
 	}
 
@@ -168,6 +169,17 @@ impl LocalFileStore {
 }
 
 impl FileStore for LocalFileStore {
+	type Shared = Self;
+
+	fn shared_handle(&self) -> Self::Shared {
+		Self {
+			backend: Arc::clone(&self.backend),
+			temp_counter: Arc::clone(&self.temp_counter),
+			#[cfg(not(target_arch = "wasm32"))]
+			locks: Arc::clone(&self.locks),
+		}
+	}
+
 	async fn read_path(&self, path: &str) -> Result<Vec<u8>> {
 		let path = self.resolve(path)?.to_owned();
 		let fs = Arc::clone(&self.backend);
@@ -185,6 +197,24 @@ impl FileStore for LocalFileStore {
 		let bytes = bytes.to_vec();
 		let fs = Arc::clone(&self.backend);
 		blocking(move || write_if_absent(&*fs, &path, &bytes)).await
+	}
+
+	async fn try_lock_path(&self, path: &str) -> Result<Option<PathLock>> {
+		let path = self.resolve(path)?.to_owned();
+		let fs = Arc::clone(&self.backend);
+		blocking(move || {
+			if let Some(parent) = parent_of(&path) {
+				fs.create_dir_all(parent).map_err(backend_err)?;
+			}
+			let Some(file) = fs.create_new(&path).map_err(backend_err)? else {
+				return Ok(None);
+			};
+			drop(file);
+			Ok(Some(PathLock::new(move || {
+				let _ = fs.remove_file(&path);
+			})))
+		})
+		.await
 	}
 
 	async fn write_path_cas(
