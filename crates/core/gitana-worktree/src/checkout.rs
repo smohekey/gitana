@@ -794,13 +794,13 @@ where
 		let from_here = from.get(path).or_else(|| from_fold.get(&key).copied());
 		let to_here = to.get(path);
 		// git treats a submodule mount as opaque — it never inspects a gitlink's own working tree for
-		// checkout cleanliness. A gitlink transition (a removal, or a pointer change where either the current
-		// index entry or the target is a gitlink) therefore skips the worktree-cleanliness refusals below: the
-		// apply phase records the index change and removes an EMPTY mount directory, leaving a populated
-		// submodule in place (git warns "unable to rmdir" but never refuses). Keys on the index/tree modes,
-		// not the on-disk kind, so it holds whether or not the submodule is actually checked out.
-		let is_gitlink = current.is_some_and(|(mode, _)| mode == "160000")
-			|| to_here.is_some_and(|(mode, _)| mode == "160000");
+		// checkout cleanliness. When the CURRENT tracked entry is a gitlink (a removal, or a pointer change),
+		// skip the worktree-cleanliness refusals below: the apply phase records the index change and removes
+		// an EMPTY mount directory, leaving a populated submodule in place (git warns "unable to rmdir" but
+		// never refuses). This keys on the CURRENT side only — an INCOMING gitlink that replaces an ordinary
+		// file or an untracked path is NOT exempt: that content is git's to protect, and git refuses to
+		// overwrite a dirty/untracked file even to place a submodule (probed vs git 2.55).
+		let is_gitlink = current.is_some_and(|(mode, _)| mode == "160000");
 		// A new addition the sparse patterns exclude is added skip-worktree, not materialised, so an
 		// in-the-way untracked file is left alone and no cleanliness applies. It must be a genuine ADDITION —
 		// absent from HEAD (`from`) — not a path HEAD tracks whose index entry was staged-deleted: that is a

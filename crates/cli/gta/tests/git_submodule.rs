@@ -497,6 +497,132 @@ fn conflicted_gitlink_status_matches_git() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// Switching to a branch where an ordinary file becomes a gitlink must respect the working tree like
+/// git: a CLEAN file is replaced by the empty mount directory, but a DIRTY file blocks the switch — the
+/// incoming gitlink is not exempt from cleanliness the way an outgoing/current gitlink is.
+#[test]
+fn switch_to_a_gitlink_over_a_file_matches_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let setup = |w: &str| {
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		git(w, &["config", "user.name", "T"]);
+		git(w, &["config", "user.email", "t@e"]);
+		std::fs::write(format!("{w}/root"), b"r\n").unwrap();
+		git(w, &["add", "root"]);
+		commit(w, "base");
+		let c = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+		git(w, &["switch", "-q", "-c", "B"]);
+		git(
+			w,
+			&[
+				"update-index",
+				"--add",
+				"--cacheinfo",
+				&format!("160000,{c},sub"),
+			],
+		);
+		commit(w, "B");
+		git(w, &["switch", "-q", "main"]);
+		git(w, &["switch", "-q", "-c", "A"]);
+		std::fs::write(format!("{w}/sub"), b"file\n").unwrap();
+		git(w, &["add", "sub"]);
+		commit(w, "A");
+	};
+
+	// Clean file → gitlink: the switch succeeds and `sub` becomes the mount directory.
+	let clean = unique_tmp("gta-sub-file2link-clean");
+	let wc = clean.to_str().unwrap();
+	setup(wc);
+	gta(wc, &["switch", "B"], b"");
+	assert!(
+		clean.join("sub").is_dir(),
+		"a clean file must be replaced by the gitlink mount, like git"
+	);
+	std::fs::remove_dir_all(&clean).ok();
+
+	// Dirty file → gitlink: both gta and git refuse, leaving the file untouched.
+	let dirty = unique_tmp("gta-sub-file2link-dirty");
+	let wd = dirty.to_str().unwrap();
+	setup(wd);
+	std::fs::write(format!("{wd}/sub"), b"file\nDIRTY\n").unwrap();
+	let gta_out = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", wd, "switch", "B"])
+		.output()
+		.expect("run gta");
+	assert!(
+		!gta_out.status.success(),
+		"gta must refuse to overwrite the dirty file with a gitlink, like git"
+	);
+	let git_out = Command::new("git")
+		.args(["-C", wd, "switch", "B"])
+		.output()
+		.expect("run git");
+	assert!(
+		!git_out.status.success(),
+		"git refuses the same dirty file→gitlink switch"
+	);
+	assert!(
+		dirty.join("sub").is_file(),
+		"the dirty file must be left in place after the refusal"
+	);
+	std::fs::remove_dir_all(&dirty).ok();
+}
+
+/// A linked worktree holding only the empty mount directory a gitlink checkout produces is clean, so
+/// `gta worktree remove` must remove it WITHOUT `--force` — the empty mount is reconstructable, not a
+/// divergence. (Before, the removal-safety classifier could not hash the mount directory and treated it
+/// as diverged, refusing the removal.)
+#[test]
+fn worktree_remove_tolerates_an_empty_gitlink_mount() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-sub-wt");
+	let w = work.to_str().unwrap();
+	let main = format!("{w}/main");
+	std::fs::create_dir_all(&main).unwrap();
+	git(
+		&main,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	std::fs::write(format!("{main}/root"), b"r\n").unwrap();
+	git(&main, &["add", "root"]);
+	commit(&main, "base");
+	let c = git(&main, &["rev-parse", "HEAD"]).trim().to_owned();
+	git(
+		&main,
+		&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("160000,{c},sub"),
+		],
+	);
+	commit(&main, "add gitlink");
+
+	// A linked worktree materializes the empty gitlink mount.
+	gta(&main, &["worktree", "add", "../wt2", "-b", "feat"], b"");
+	assert!(
+		std::path::Path::new(&format!("{w}/wt2/sub")).is_dir(),
+		"the gitlink mount is materialized in the linked worktree"
+	);
+	// The `gta` helper asserts success, so a refusal (which needs `--force`) fails the test.
+	gta(&main, &["worktree", "remove", "../wt2"], b"");
+	assert!(
+		!std::path::Path::new(&format!("{w}/wt2")).exists(),
+		"a clean linked worktree with an empty gitlink mount is removed, like git"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
 /// The added/removed lines of two diffs, sorted, for order-independent comparison.
 fn sorted(text: &str) -> Vec<String> {
 	let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();

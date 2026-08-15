@@ -225,10 +225,28 @@ pub(crate) async fn write_tree<H: HashAlgorithm>(
 			WitFileMode::Symlink => FileMode::Symlink,
 			WitFileMode::Gitlink => FileMode::Gitlink,
 		};
-		// A gitlink's id names a COMMIT in the submodule's own repository — it need not be present
-		// here (that is the point of a submodule), so it is recorded without validation. Every other
-		// mode names a blob; a dangling or non-blob id would produce a tree git tooling cannot consume.
-		if mode != FileMode::Gitlink {
+		if mode == FileMode::Gitlink {
+			// A gitlink's id names a COMMIT in the submodule's own repository. It need not be present here
+			// (that is the point of a submodule), so a MISSING id is allowed. But if the object IS present
+			// locally it must be a commit: git rejects a `160000` entry naming a blob/tree/tag ("object … is a
+			// blob but specified type was (commit)"), and the object type participates in the hash, so the id
+			// cannot simultaneously be a commit.
+			match repo.objects().read_object(&id).await {
+				Ok((ObjectKind::Commit, _)) => {}
+				Ok((kind, _)) => {
+					return Err(RepoError::Invalid(format!(
+						"tree entry {}: {} is a {}, not a commit",
+						entry.path,
+						entry.id,
+						kind.as_str()
+					)));
+				}
+				Err(ObjectStoreError::NotFound) => {}
+				Err(error) => return Err(repo_error(RepositoryError::ObjectStore(error))),
+			}
+		} else {
+			// Every other mode names a blob; a dangling or non-blob id would produce a tree git tooling
+			// cannot consume.
 			let (kind, _) = match repo.objects().read_object(&id).await {
 				Ok(object) => object,
 				Err(ObjectStoreError::NotFound) => {

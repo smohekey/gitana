@@ -547,5 +547,27 @@ async fn write_tree_records_a_gitlink() -> Result<()> {
 		"a null-oid gitlink must be rejected: {rejected:?}"
 	);
 
+	// A gitlink whose id names a present NON-commit (a blob) is rejected — git rejects a `160000` entry
+	// pointing at a blob/tree/tag. (A missing id stays valid: it is an external submodule commit.)
+	let blob = porcelain
+		.call_write_blob(&mut *store, handle, b"not a commit\n")
+		.await?
+		.map_err(|error| anyhow!("write-blob: {error:?}"))?;
+	let non_commit = porcelain
+		.call_write_tree(
+			&mut *store,
+			handle,
+			&[TreeBuildEntry {
+				path: "sub".to_owned(),
+				mode: FileMode::Gitlink,
+				id: blob,
+			}],
+		)
+		.await?;
+	assert!(
+		matches!(non_commit, Err(RepoError::Invalid(_))),
+		"a gitlink pointing at a present blob must be rejected: {non_commit:?}"
+	);
+
 	Ok(())
 }

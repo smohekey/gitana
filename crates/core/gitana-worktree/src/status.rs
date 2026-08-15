@@ -248,6 +248,19 @@ pub(crate) async fn worktree_content_state<F: FileStore, W: WorkDirFs, H: HashAl
 	let Some(meta) = wt.work().lstat(&entry.path)? else {
 		return Ok(WorktreeContent::Absent);
 	};
+	// A submodule (gitlink) mount is not a blob and cannot be hashed. An EMPTY mount directory is
+	// reconstructable — a checkout recreates it without cloning — so it is safe to remove; a POPULATED
+	// submodule working tree, or a file/symlink that replaced the mount, is a divergence to preserve (git
+	// leaves such content in place). Without this a linked worktree holding the empty mount a gitlink
+	// checkout produces would be classed diverged, so `worktree remove` would refuse it without `--force`.
+	if entry.mode == 0o160000 {
+		let reconstructable = meta.kind.is_dir() && wt.work().read_dir(&entry.path)?.is_empty();
+		return Ok(if reconstructable {
+			WorktreeContent::Reconstructable
+		} else {
+			WorktreeContent::Diverged
+		});
+	}
 	// Deliberately *no* `stat_matches` shortcut: hash the working file and compare oid + mode directly.
 	let diverged = match blob_of::<W, H>(wt.work(), &entry.path, &meta)? {
 		Some((oid, _))
