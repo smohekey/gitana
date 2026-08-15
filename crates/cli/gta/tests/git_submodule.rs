@@ -785,6 +785,64 @@ fn switch_refuses_to_clobber_an_untracked_ancestor_of_a_gitlink() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// `restore` turning a tracked subtree `sub/file` into a gitlink `sub` must stage the change but LEAVE
+/// the working `sub/file` — git treats the submodule mount as opaque and never recurses into it to
+/// delete descendants (deleting them would be data loss). Status must match git afterward.
+#[test]
+fn restore_to_a_gitlink_preserves_descendants_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-sub-restore-subtree");
+	let w = work.to_str().unwrap();
+	git(
+		w,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	git(w, &["config", "user.name", "T"]);
+	git(w, &["config", "user.email", "t@e"]);
+	std::fs::write(format!("{w}/root"), b"r\n").unwrap();
+	git(w, &["add", "root"]);
+	commit(w, "base");
+	let c = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+	// Branch B records a gitlink at `sub`.
+	git(w, &["switch", "-q", "-c", "B"]);
+	git(
+		w,
+		&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("160000,{c},sub"),
+		],
+	);
+	commit(w, "B");
+	// main has `sub/` as a real subtree.
+	git(w, &["switch", "-q", "main"]);
+	std::fs::create_dir_all(format!("{w}/sub")).unwrap();
+	std::fs::write(format!("{w}/sub/file"), b"content\n").unwrap();
+	git(w, &["add", "sub/file"]);
+	commit(w, "mainsub");
+
+	gta(
+		w,
+		&["restore", "--source=B", "--staged", "--worktree", "sub"],
+		b"",
+	);
+	assert_eq!(
+		std::fs::read(format!("{w}/sub/file")).ok(),
+		Some(b"content\n".to_vec()),
+		"the working sub/file must be preserved (the mount is opaque), like git"
+	);
+	assert_eq!(
+		sorted(&gta(w, &["status"], b"")),
+		sorted(&git(w, &["status", "--porcelain"])),
+		"status after restoring the subtree→gitlink must match git"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
 /// The added/removed lines of two diffs, sorted, for order-independent comparison.
 fn sorted(text: &str) -> Vec<String> {
 	let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();

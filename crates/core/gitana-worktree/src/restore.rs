@@ -202,7 +202,14 @@ where
 				}
 				// Absent from the source but tracked: remove it from the chosen targets.
 				None => {
-					if worktree {
+					// A path BENEATH an incoming gitlink is inside the submodule mount, which git treats as
+					// opaque: restoring the subtree-to-gitlink change stages the descendant's removal but LEAVES
+					// the working file (git never recurses into the submodule to delete it). Removing it here
+					// would be data loss AND would prune the just-materialised mount. Update only the index.
+					let under_incoming_gitlink = source_entries
+						.iter()
+						.any(|(sp, sm, _)| sm == "160000" && path.starts_with(&format!("{sp}/")));
+					if worktree && !under_incoming_gitlink {
 						lock.mark_mutation_started();
 						remove_worktree_path(wt, path)?;
 					}
