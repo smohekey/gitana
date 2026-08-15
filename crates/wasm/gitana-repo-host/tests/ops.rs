@@ -528,5 +528,24 @@ async fn write_tree_records_a_gitlink() -> Result<()> {
 		assert_eq!(entries[0].id, id, "pointing at the submodule commit");
 	}
 
+	// The null (all-zero) sentinel is NOT a valid submodule commit — it must be rejected, not stored
+	// (both `validate_tree_structure` and `git fsck --strict` reject a null tree entry).
+	let null_id = "0".repeat(fixture.m.len());
+	let rejected = porcelain
+		.call_write_tree(
+			&mut *store,
+			handle,
+			&[TreeBuildEntry {
+				path: "sub".to_owned(),
+				mode: FileMode::Gitlink,
+				id: null_id,
+			}],
+		)
+		.await?;
+	assert!(
+		matches!(rejected, Err(RepoError::Invalid(_))),
+		"a null-oid gitlink must be rejected: {rejected:?}"
+	);
+
 	Ok(())
 }

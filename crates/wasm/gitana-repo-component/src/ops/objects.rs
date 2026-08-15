@@ -210,6 +210,15 @@ pub(crate) async fn write_tree<H: HashAlgorithm>(
 	for entry in entries {
 		let id = ObjectId::from_hex(&entry.id)
 			.map_err(|_| RepoError::Invalid(format!("not a full object id: {}", entry.id)))?;
+		// A null (all-zero) id is never a valid tree entry — `validate_tree_structure` and `git fsck`
+		// both reject it. Catch it here, since the gitlink path below skips the object lookup (a real
+		// submodule commit is non-null and need not be present, but the null sentinel still isn't).
+		if id.as_bytes().iter().all(|&byte| byte == 0) {
+			return Err(RepoError::Invalid(format!(
+				"tree entry {}: the null object id is not a valid entry",
+				entry.path
+			)));
+		}
 		let mode = match entry.mode {
 			WitFileMode::Regular => FileMode::Regular,
 			WitFileMode::Executable => FileMode::Executable,

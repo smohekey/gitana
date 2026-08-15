@@ -322,9 +322,13 @@ fn git_allow(dir: &str, args: &[&str]) -> String {
 }
 
 fn commit(dir: &str, msg: &str) {
-	git(
-		dir,
-		&[
+	// Pin author AND committer dates, not just identity: `commit_preserves_a_gitlink_entry_like_git`
+	// compares gitlink commit ids built in two independent repos, so their base commits must be
+	// byte-identical — a wall-clock date would make them diverge across a second boundary and flake.
+	let out = Command::new("git")
+		.args([
+			"-C",
+			dir,
 			"-c",
 			"user.name=T",
 			"-c",
@@ -333,7 +337,15 @@ fn commit(dir: &str, msg: &str) {
 			"-q",
 			"-m",
 			msg,
-		],
+		])
+		.env("GIT_AUTHOR_DATE", "1700000000 +0000")
+		.env("GIT_COMMITTER_DATE", "1700000000 +0000")
+		.output()
+		.expect("run git commit");
+	assert!(
+		out.status.success(),
+		"git commit failed: {}",
+		String::from_utf8_lossy(&out.stderr)
 	);
 }
 fn gta(dir: &str, args: &[&str], stdin: &[u8]) -> String {
