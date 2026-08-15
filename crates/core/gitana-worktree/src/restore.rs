@@ -191,6 +191,7 @@ where
 							stage: 0,
 							assume_valid,
 							skip_worktree,
+							intent_to_add: false,
 							path: path.to_owned(),
 						});
 					}

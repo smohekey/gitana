@@ -445,179 +445,6 @@ where
 	}
 }
 
-/// Apply only the `from_tree` → `to_tree` diff to the work tree and index — git's `read-tree -m -u`
-/// two-way merge, used for a fast-forward. Paths unchanged between the two trees (including unrelated
-/// staged or dirty entries) are left untouched. A *changed* path that is not clean — its stage-0
-/// index entry differs from `from` (a staged change), its work-tree file differs from the index (a
-/// local edit), or an untracked file sits where `to` adds one — would be overwritten; all such paths
-/// are returned (sorted) and **nothing** is applied. An empty result means the diff was applied.
-pub(crate) async fn twoway_merge<F, W, H>(
-	wt: &WorkTree<F, W, H>,
-	from_tree: ObjectId<H>,
-	to_tree: ObjectId<H>,
-) -> Result<Vec<String>, WorktreeError>
-where
-	F: FileStore,
-	W: WorkDirFs,
-	H: HashAlgorithm,
-{
-	let from = tree_map(wt.repository().read_tree(from_tree).await?);
-	let to = tree_map(wt.repository().read_tree(to_tree).await?);
-
-	// The only paths this update touches: those that differ between the two trees.
-	let mut changed: Vec<&str> = from
-		.keys()
-		.chain(to.keys())
-		.map(String::as_str)
-		.collect::<HashSet<_>>()
-		.into_iter()
-		.filter(|path| from.get(*path) != to.get(*path))
-		.collect();
-	changed.sort_unstable();
-
-	let sparse = wt.sparse_checkout().await?;
-	let mut index = wt.load_index().await?;
-	let staged: HashMap<String, (String, ObjectId<H>)> = index
-		.entries
-		.iter()
-		.filter(|e| e.stage == 0)
-		.map(|e| (e.path.clone(), (format!("{:o}", e.mode), e.oid)))
-		.collect();
-
-	// Refuse any changed path whose local state (index or work tree) would be overwritten. The work-tree
-	// cleanliness check is skipped only for a *new* excluded addition (present in `to`, not a current
-	// index entry): it is not materialised and there is no tracked content to protect, so an in-the-way
-	// untracked file is left alone. An excluded path that IS a current index entry keeps the check —
-	// git refuses the fast-forward when its present working-tree file is locally modified, since
-	// re-omitting the path would discard that edit (probed vs git 2.50.1). The staged check always
-	// applies — `write_entry` rewrites the index entry, and git refuses when it would discard divergent
-	// staged content — and an excluded path being DELETED (absent from `to`) keeps both checks too.
-	// Standard excludes for the untracked-in-the-way test. This fast-forward path is only ever driven by
-	// an internal `merge`, which supplies no global excludes file, so resolve with `None` — `core.ignoreCase`
-	// and `.git/info/exclude` are still honoured (read internally).
-	let fold = crate::excludes::ignore_case(wt).await?;
-	let base = crate::excludes::load_base(wt, None).await?;
-	// Under `core.ignoreCase`, git's index is case-insensitive, so `from`/`to`/`staged` are compared by
-	// fold-key: a `Foo`→`foo` case-rename is one path, not an add+delete. Without this the to-side spelling
-	// looks like an untracked obstruction and a fast-forward git completes is wrongly refused.
-	let from_fold: HashMap<String, &(String, ObjectId<H>)> =
-		from.iter().map(|(k, v)| (fold_key(k, fold), v)).collect();
-	let staged_fold: HashMap<String, &(String, ObjectId<H>)> =
-		staged.iter().map(|(k, v)| (fold_key(k, fold), v)).collect();
-	let from_paths: HashSet<&str> = from.keys().map(String::as_str).collect();
-	let to_fold: HashSet<String> = to.keys().map(|p| fold_key(p, fold)).collect();
-	// Fold-keys the index carries under a spelling `from` (HEAD) does not — a LOCALLY STAGED case-rename
-	// (`Foo`->`foo`). git refuses a fast-forward that still writes such a fold-key (it would overwrite the
-	// staged rename) but allows one that only deletes it (probed vs git 2.55: modifying the renamed file
-	// aborts, deleting it fast-forwards, preserving the staged spelling). Used below to refuse the former and
-	// to keep the staged file on the latter.
-	let staged_recase_folds: HashSet<String> = if fold {
-		staged
-			.keys()
-			.filter(|s| !from_paths.contains(s.as_str()))
-			.map(|s| fold_key(s, fold))
-			.filter(|k| from_fold.contains_key(k))
-			.collect()
-	} else {
-		HashSet::new()
-	};
-	let mut would_overwrite = Vec::new();
-	for &path in &changed {
-		let key = fold_key(path, fold);
-		// Prefer this path's EXACT staged/from entry, falling back to the folded lookup only when there is
-		// no exact entry — a genuine `Foo`->`foo` case-rename, whose to-side spelling `foo` is not itself
-		// staged. A case-colliding index (`Foo`+`foo`, different blobs) is then checked against each entry's
-		// OWN blob, refusing when the shared working file is dirty relative to *any* (as git does), rather
-		// than against an arbitrarily-kept colliding survivor, which made the verdict nondeterministic.
-		// A staged case-rename conflicts with any incoming change that still writes its fold-key: refuse (git
-		// aborts). A delete of the fold-key does not conflict and falls through to be applied below.
-		if staged_recase_folds.contains(&key) && to_fold.contains(&key) {
-			would_overwrite.push(path.to_owned());
-			continue;
-		}
-		let current = staged.get(path).or_else(|| staged_fold.get(&key).copied());
-		let from_here = from.get(path).or_else(|| from_fold.get(&key).copied());
-		let untracked_addition = to.contains_key(path)
-			&& !staged_fold.contains_key(&key)
-			&& sparse
-				.as_ref()
-				.is_some_and(|matcher| !matcher.includes(path));
-		if from_here != current || (!untracked_addition && !is_clean(wt, path, current, &base, fold)?) {
-			would_overwrite.push(path.to_owned());
-		}
-	}
-	if !would_overwrite.is_empty() {
-		return Ok(would_overwrite);
-	}
-
-	// Apply the diff, removing before writing. A case-rename (`Foo`→`foo`) must re-case the working-tree
-	// entry, not just the index: on a case-insensitive filesystem the to-side write reaches the same inode
-	// through the new spelling without changing the directory entry's case (probed vs git 2.55, which
-	// renames it), so the stale-cased file must go before the write recreates it. Removing *all* obsolete
-	// paths first (not just case-renames) also keeps a type change atomic — a `thing` file that becomes a
-	// `thing/child` directory must lose the file before the child is written, which a sorted single pass
-	// does not guarantee. The preflight above already refused a dirty rename. Everything else (unrelated
-	// staged/dirty entries) is left as-is.
-	// Fold-keys the to-tree keeps under an exact spelling that is also staged (a retained path whose working
-	// file stays): a different-cased staged entry folding to the same key must not have its working file
-	// removed — on a case-insensitive filesystem it is the same file as the retained entry. This arises only
-	// from a case-colliding index (`Foo` and `foo` both staged) the to-tree resolves to one spelling. As in
-	// `run` above, this is a deliberate safe divergence: git would delete the file when it is clean vs the
-	// dropped entry (orphaning the retained one); we always preserve both the file and the colliding index
-	// entry, discarding neither the shared file nor staged content git keeps.
-	let retained_folds: HashSet<String> = staged
-		.keys()
-		.filter(|path| to.contains_key(path.as_str()))
-		.map(|path| fold_key(path, fold))
-		.collect();
-	let mut collision = Vec::new();
-	let mut removals = Vec::new();
-	let mut writes = Vec::new();
-	for &path in &changed {
-		if to.contains_key(path) {
-			writes.push(path);
-		} else if retained_folds.contains(&fold_key(path, fold)) {
-			collision.push(path);
-		} else if staged_recase_folds.contains(&fold_key(path, fold)) {
-			// A to-side delete of a locally staged case-rename: the staged entry (a different spelling) owns the
-			// shared inode, so keep the file — removing `Foo` would delete the staged `foo`. git preserves it.
-			collision.push(path);
-		} else {
-			// A to-side deletion — a true removal or the stale side of a case-rename: remove the file.
-			removals.push(path);
-		}
-	}
-	// Validate every pending write's blob BEFORE removing anything. This phase removes before it writes
-	// (case-renames and type changes require it), so a missing or unreadable target blob would otherwise
-	// leave an already-removed source file gone after the merge errors — losing a case-rename's sole copy,
-	// or leaving a true removal applied while the merge did not. Preloading aborts cleanly with the working
-	// tree untouched, as git validates the target objects before mutating.
-	for &path in &writes {
-		let (_, oid) = to
-			.get(path)
-			.expect("a write path is present in the to-tree");
-		wt.repository().read_blob(*oid).await?;
-	}
-	// A case-colliding entry (`foo` beside a retained `Foo`) is left ENTIRELY untouched — file and index —
-	// as in `run` above: git preserves such a staged entry across a retaining fast-forward, so dropping its
-	// index entry would silently discard content git keeps. It stays classified as `collision` only to keep
-	// it out of `removals`, whose loop would delete the shared working file.
-	let _keep_collision_untouched = &collision;
-	for &path in &removals {
-		remove_worktree_file(wt, path)?;
-		index.remove(path);
-	}
-	for &path in &writes {
-		// A fast-forward is non-destructive, so an out-of-cone path with an in-the-way file is preserved.
-		let (mode, oid) = to
-			.get(path)
-			.expect("a write path is present in the to-tree");
-		write_entry(wt, path, mode, *oid, &mut index, sparse.as_ref(), false).await?;
-	}
-	wt.save_index(&index).await?;
-	Ok(Vec::new())
-}
-
 /// git's two-tree merge (`read-tree -m -u`) from `head` to `target`: touch only the paths that differ
 /// between the two trees, applying the change where the local (staged/working) state is clean or already
 /// equals the target, and refusing where it conflicts — so a path the switch does not touch keeps whatever
@@ -677,6 +504,17 @@ where
 		.iter()
 		.filter(|e| e.stage == 0)
 		.map(|e| (e.path.clone(), (format!("{:o}", e.mode), e.oid)))
+		.collect();
+	// Intent-to-add placeholders (`git add -N`): git refuses a checkout/merge that would DROP one, even to
+	// resolve a directory/file collision — its empty blob is not disposable staged content (probed vs git
+	// 2.55: `add -N p/c` + target file `p` aborts on both `switch` and a fast-forward). An overwrite of one is
+	// already caught by the generic staged-conflict check (the empty blob diverges from HEAD and the target),
+	// but a D/F drop bypasses that, so it is refused explicitly below.
+	let intent_to_add: HashSet<String> = index
+		.entries
+		.iter()
+		.filter(|e| e.stage == 0 && e.intent_to_add)
+		.map(|e| e.path.clone())
 		.collect();
 	let fold = crate::excludes::ignore_case(wt).await?;
 	// Keyed by fold-key so the D/F untracked-overwrite checks recognise a case-variant tracked file: with
@@ -804,7 +642,14 @@ where
 			Some(c) => wt.work().lstat(c)?.is_some(), // slot present → target wins; absent → preserve
 			None => true,                             // parent_of_write → always discarded
 		};
-		if discard {
+		// ...but an OUT-OF-CONE (sparse-excluded) staged CHILD of an incoming write/removal is preserved rather
+		// than discarded: git keeps out-of-cone staged content nested under a D/F collision instead of dropping
+		// it for the incoming write (probed vs git 2.55: `git add --sparse x/c` + target file `x` leaves `x/c`
+		// staged and skips the file). This is only the child case — an excluded staged PARENT of an incoming
+		// write (`x` staged, target adds `x/c`) is still dropped, git installing the subtree over it (probed).
+		let excluded =
+			collider.is_some() && sparse.as_ref().is_some_and(|matcher| !matcher.includes(sp));
+		if discard && !excluded {
 			df_removals.push(sp);
 		} else {
 			df_preserved.insert(sp);
@@ -974,11 +819,31 @@ where
 			&& from_fold.contains_key(&key)
 			&& !staged_fold.contains_key(&key)
 			&& to_here.is_some();
+		// A staged MODIFICATION of a HEAD-tracked file the target's D/F resolution would drop is refused when
+		// dropping it loses that staged content (probed vs git 2.55, both `switch` and a fast-forward). Two
+		// shapes qualify:
+		//   * the file's OWN slot is turned into a directory (`write_ancestor_dirs`): `p` → `p/c` directly
+		//     clobbers the staged file `p`;
+		//   * an OUT-OF-CONE (sparse-excluded) child swept away when its parent subtree becomes a file
+		//     (`x/c` staged out-of-cone via `add --sparse`, target replaces `x/` with file `x`).
+		// The IN-CONE inverse — an in-cone staged child under a subtree the target replaces with a file — git
+		// DOES drop (the `df_replaced` "target wins" path), as it does a staged addition or deletion.
+		let staged_mod_of_tracked = from_here.is_some()
+			&& current.is_some()
+			&& from_here != current
+			&& (write_ancestor_dirs.contains(path)
+				|| sparse
+					.as_ref()
+					.is_some_and(|matcher| !matcher.includes(path)));
 		if !untracked_addition {
 			// Conflict when the index diverges from HEAD *and* is not already the target — a staged change the
-			// switch would overwrite. (Not for a path an incoming D/F write replaces, nor a staged deletion the
-			// target's recase re-provides.)
-			if !df_replaced && !staged_deletion_recased && from_here != current && current != to_here {
+			// switch would overwrite. (Not for a path an incoming D/F write replaces — unless that path carries a
+			// staged modification git refuses to drop — nor a staged deletion the target's recase re-provides.)
+			if (!df_replaced || staged_mod_of_tracked)
+				&& !staged_deletion_recased
+				&& from_here != current
+				&& current != to_here
+			{
 				return Err(WorktreeError::Conflict(path.to_owned()));
 			}
 			// Working-tree cleanliness, dir-aware. A path the switch MATERIALISES whose slot is a *directory*
@@ -1017,6 +882,13 @@ where
 	// DIRECTORY occupying the slot is the incoming subtree's territory (the staged file is being replaced by
 	// a subtree, its untracked siblings preserved), not a dirty copy of the staged file — so it does not block.
 	for &sp in &df_removals {
+		// A PRESENT intent-to-add placeholder must not be dropped for the incoming subtree — git refuses
+		// regardless of whether its (empty-blob) working file happens to match, so the `is_clean` check below is
+		// not enough. But an ABSENT placeholder (`git add -N x; rm x`) git DROPS during D/F resolution, so it
+		// must not be refused (probed vs git 2.55: switching to a target with `x/c` succeeds).
+		if intent_to_add.contains(sp) && wt.work().lstat(sp)?.is_some() {
+			return Err(WorktreeError::Conflict(sp.to_owned()));
+		}
 		if matches!(wt.work().lstat(sp)?, Some(m) if m.kind.is_dir()) {
 			continue;
 		}
@@ -1046,6 +918,7 @@ where
 		let mut collision = Vec::new();
 		let mut removals = Vec::new();
 		let mut writes = Vec::new();
+		let mut skipped_writes = Vec::new();
 		for &path in &changed {
 			// A satisfied path (index already equals the target) is left exactly as it is — index and working
 			// file, including any unstaged divergence — so it is neither written nor removed.
@@ -1059,6 +932,9 @@ where
 				// preserved staged entry. O(path depth): `path` collides iff it is an ancestor dir of a
 				// preserved path, or nested under one.
 				if df_preserved_ancestor_dirs.contains(path) || ancestor_in(path, &df_preserved).is_some() {
+					// Not written, but HEAD still advances to the target — so its blob must exist (else the merge
+					// publishes a commit referencing a missing object). Validate it below with the writes.
+					skipped_writes.push(path);
 					continue;
 				}
 				writes.push(path);
@@ -1068,24 +944,140 @@ where
 				removals.push(path);
 			}
 		}
-		for path in removals.iter().chain(&writes) {
+		// Validate every path the apply phase will touch BEFORE it mutates — writes, plain removals, AND the
+		// D/F-collision removals. `df_removals` in particular must be here: a crafted stage-0 path (`p/.git/x`
+		// D/F-colliding with an incoming file `p`) is rejected by `remove_worktree_path`'s own guard mid-apply,
+		// and by then a sibling removal may have run — a partial tree with a stranded `index.lock`. Rejecting it
+		// up front keeps the working tree untouched.
+		for path in removals.iter().chain(&writes).chain(&df_removals) {
 			validate_path(path)?;
 		}
 		// Validate every pending write's blob BEFORE removing anything, so a missing/corrupt blob aborts with
 		// the working tree untouched rather than after a case-rename source has been removed. A sparse-excluded
-		// write records only its skip-worktree index entry — it materialises no file, so (like the authoritative
-		// checkout) an unavailable out-of-cone blob does not block the switch.
+		// write materialises no file, but its blob is validated here too: a two-tree merge that moves an
+		// in-cone file to an out-of-cone path would otherwise remove the source and record a skip-worktree entry
+		// pointing at a missing blob, silently succeeding and — when the moved content had no other copy —
+		// losing it. gitana has no partial clone, so a missing out-of-cone blob is corruption, not the
+		// legitimate absence a partial checkout would tolerate; validate it and abort, as the (retired)
+		// fast-forward path did. The cost is reading the changed out-of-cone blobs on such a switch, accepted
+		// for the data-safety guarantee.
 		for &path in &writes {
-			if sparse
-				.as_ref()
-				.is_some_and(|matcher| !matcher.includes(path))
-			{
-				continue;
-			}
-			let (_, oid) = to
+			let (mode, oid) = to
 				.get(path)
 				.expect("a write path is present in the to-tree");
+			// A gitlink (submodule, mode 160000) names a COMMIT, not a blob in this object database. When it
+			// is OUT-OF-CONE it records an index entry only (`write_entry`'s excluded path reads no blob and
+			// materialises nothing), so skip the blob validation that would spuriously fail. An IN-CONE
+			// gitlink cannot be materialised — `write_entry` would `read_blob` and fail — so leave its
+			// validation HERE, before any mutation, rather than let it fail mid-apply and strand `index.lock`.
+			// (This is the pre-existing "in-cone submodule checkout is unsupported" behaviour, kept safe.)
+			let excluded = match sparse.as_ref() {
+				Some(matcher) => !matcher.includes(path),
+				None => index.entry(path).is_some_and(|entry| entry.skip_worktree),
+			};
+			if mode == "160000" && excluded {
+				// The target is an index-only gitlink (a submodule commit, no blob). But when it REPLACES a
+				// present non-gitlink at an out-of-cone path, `write_entry` removes that working file trusting it
+				// is reconstructable from its current blob — so that OUTGOING blob must exist, else the file is
+				// the sole surviving copy and the index-only replacement loses it. Validate it before the skip.
+				if let Some((from_mode, from_oid)) = staged.get(path)
+					&& from_mode != "160000"
+				{
+					wt.repository().read_blob(*from_oid).await?;
+				}
+				continue;
+			}
 			wt.repository().read_blob(*oid).await?;
+		}
+		// A D/F-collision removal drops a staged entry and deletes its (clean-by-hash) working file, so its
+		// staged blob must exist before we destroy that file: if the blob is missing/corrupt while the working
+		// copy still hashes to its OID, the file is the sole copy and removing it loses the content. Validate
+		// each here, pre-mutation, aborting as the retired two-tree path did for this D/F state. (A staged
+		// gitlink has no blob to validate.)
+		for &path in &df_removals {
+			if let Some((mode, oid)) = staged.get(path)
+				&& mode != "160000"
+			{
+				wt.repository().read_blob(*oid).await?;
+			}
+		}
+		// Validate the blob of every SATISFIED changed path (staged already equals the target, so it is not
+		// written) and every plain REMOVAL's outgoing blob before advancing HEAD: a missing/corrupt blob would
+		// otherwise let the merge succeed with HEAD pointing at content absent from the object database (the
+		// retired two-tree path validated the satisfied blob, as a write), or delete the sole surviving copy of
+		// a removed clean-by-hash file. gitlinks name a submodule commit, not a blob, so skip them.
+		for &path in &satisfied {
+			if let Some((mode, oid)) = to.get(path)
+				&& mode != "160000"
+			{
+				wt.repository().read_blob(*oid).await?;
+			}
+		}
+		for &path in &removals {
+			if let Some((mode, oid)) = staged.get(path)
+				&& mode != "160000"
+			{
+				wt.repository().read_blob(*oid).await?;
+			}
+		}
+		// A D/F write suppressed by a preserved staged path is not materialised, but HEAD still advances to the
+		// target — so its blob must exist too, or the merge publishes a commit referencing a missing object.
+		for &path in &skipped_writes {
+			if let Some((mode, oid)) = to.get(path)
+				&& mode != "160000"
+			{
+				wt.repository().read_blob(*oid).await?;
+			}
+		}
+		// Classify the sparse reconciliation of CARRIED unchanged out-of-cone entries BEFORE mutating. That
+		// classification HASHES each excluded file, which can fail (an unreadable file, mode 000); running it
+		// after `mark_mutation_started` — once the writes have landed — would leave a half-applied working tree
+		// with a stranded `index.lock`. These entries are untouched by the writes/removals below (excluded by
+		// the matcher, not among the handled writes/collisions, and not being removed), so their on-disk state,
+		// and thus this classification, is identical now and after the apply. Applied (index bit + file removal)
+		// after the mutations below.
+		let sparse_reconcile: Vec<(String, crate::status::WorktreeContent)> =
+			if let Some(matcher) = sparse.as_ref() {
+				let handled: HashSet<&str> = writes.iter().chain(&collision).copied().collect();
+				let gone: HashSet<&str> = removals.iter().chain(&df_removals).copied().collect();
+				let file_mode = crate::status::worktree_file_mode(wt).await;
+				let mut out = Vec::new();
+				for entry in &index.entries {
+					if entry.stage != 0
+						|| handled.contains(entry.path.as_str())
+						|| gone.contains(entry.path.as_str())
+						|| matcher.includes(&entry.path)
+					{
+						continue;
+					}
+					// An intent-to-add placeholder is never "up to date" (git). A PRESENT one keeps its file and its
+					// skip-worktree bit CLEAR — force `Diverged` so a previously-set bit (e.g. reconciled while
+					// absent, then recreated) is cleared, rather than removing the empty-blob-matching file as
+					// `worktree_content_state` would call it reconstructable. An ABSENT one is reconciled like any
+					// excluded entry: git sets skip-worktree (retaining the intent flag), so its normal `Absent`
+					// classification sets the bit and avoids a spurious ` D` in status (probed vs git 2.55).
+					if entry.intent_to_add {
+						let state = if wt.work().lstat(&entry.path)?.is_some() {
+							crate::status::WorktreeContent::Diverged
+						} else {
+							crate::status::WorktreeContent::Absent
+						};
+						out.push((entry.path.clone(), state));
+						continue;
+					}
+					let state = crate::status::worktree_content_state(wt, entry, file_mode).await?;
+					out.push((entry.path.clone(), state));
+				}
+				out
+			} else {
+				Vec::new()
+			};
+		// A reconstructable reconcile entry is removed by `remove_worktree_path` in the apply phase, which
+		// validates its path — but that runs after `mark_mutation_started`, so a crafted unsafe carried path
+		// (`bad/.git/x`) would abort mid-apply and strand `index.lock` with a sibling write already landed.
+		// Validate every reconcile path here, pre-mutation, to keep the half-apply invariant (conventions.md).
+		for (path, _) in &sparse_reconcile {
+			validate_path(path)?;
 		}
 		let _keep_collision_untouched = &collision;
 		// The working tree is about to change: a cancellation from here must NOT release
@@ -1114,38 +1106,28 @@ where
 		// `changed` and never written/removed above. git applies the sparse patterns to the whole switched
 		// index: a path staged out-of-cone (`git add --sparse`, which materialises it and clears skip-worktree)
 		// is re-omitted on the switch — its clean working file removed and the skip-worktree bit re-set, the
-		// staged blob preserved. Only entries the matcher EXCLUDES whose bit is currently CLEAR need this (the
-		// anomalous `--sparse`-added state); everything else already matches the patterns. `changed` paths are
-		// skipped — `write_entry` above already set their bit, and the untracked-preserve case there must stand.
-		if let Some(matcher) = sparse.as_ref() {
-			// Apply the sparse patterns to the whole switched index, exactly as `apply_sparse` (git applies
-			// sparsity to the switch result). Exclude only the paths the apply loop already reconciled:
-			// `write_entry` set each write's skip-worktree bit (and may deliberately PRESERVE an untracked-prior
-			// excluded addition, which must stand), and the case-collision paths are left untouched on purpose.
-			// Every other excluded entry is reconciled regardless of its current bit — carried unchanged paths,
-			// *satisfied* changed paths (`git add --sparse` of a path the target also holds), AND a file
-			// recreated at an already-omitted path — so this `lstat`s each excluded entry per switch, the cost
-			// of matching git's per-switch reconciliation.
-			let handled: HashSet<&str> = writes.iter().chain(&collision).copied().collect();
-			let file_mode = crate::status::worktree_file_mode(wt).await;
+		// staged blob preserved. The classification (`sparse_reconcile`) was computed in the pre-mutation
+		// preflight above (its file hashing must not fail mid-apply); here we only apply it. Dirty → keep the
+		// file and CLEAR the bit (git's "left despite sparse patterns", now an ordinary modification); absent →
+		// omit (set the bit); clean → remove the reconstructable file and omit it.
+		for (path, state) in &sparse_reconcile {
+			if matches!(state, crate::status::WorktreeContent::Reconstructable) {
+				remove_worktree_path(wt, path)?;
+			}
+		}
+		if !sparse_reconcile.is_empty() {
+			let bits: HashMap<&str, bool> = sparse_reconcile
+				.iter()
+				.map(|(path, state)| {
+					(
+						path.as_str(),
+						!matches!(state, crate::status::WorktreeContent::Diverged),
+					)
+				})
+				.collect();
 			for entry in index.entries.iter_mut() {
-				if entry.stage != 0
-					|| handled.contains(entry.path.as_str())
-					|| matcher.includes(&entry.path)
-				{
-					continue;
-				}
-				// Excluded: reconcile the on-disk file regardless of the current bit (a file recreated at an
-				// omitted path must not stay hidden). Dirty → keep it and CLEAR the bit (git's "left despite
-				// sparse patterns", now an ordinary modification); absent → omit (set the bit); clean → remove
-				// the reconstructable file and omit it.
-				match crate::status::worktree_content_state(wt, entry, file_mode).await? {
-					crate::status::WorktreeContent::Diverged => entry.skip_worktree = false,
-					crate::status::WorktreeContent::Absent => entry.skip_worktree = true,
-					crate::status::WorktreeContent::Reconstructable => {
-						remove_worktree_path(wt, &entry.path)?;
-						entry.skip_worktree = true;
-					}
+				if let Some(&bit) = bits.get(entry.path.as_str()) {
+					entry.skip_worktree = bit;
 				}
 			}
 		}
@@ -1202,7 +1184,7 @@ fn tree_map<H: HashAlgorithm>(
 /// Whether `path` is clean enough to overwrite: a tracked path's work-tree file matches the index
 /// (`current`), an added path has no untracked file in the way (unless `.gitignore`d), and an absent
 /// file is always fine. The index-vs-`HEAD` (staged) check is the caller's. Mirrors
-/// [`ensure_no_overwrite`] but as a boolean for the two-way merge's batch check.
+/// [`ensure_no_overwrite`] but as a boolean for the two-tree merge's batch check.
 fn is_clean<F, W, H>(
 	wt: &WorkTree<F, W, H>,
 	path: &str,
@@ -1266,7 +1248,7 @@ where
 		//   PRESERVED on a non-force checkout — untracked data is never destroyed to satisfy the patterns —
 		//   leaving the bit CLEAR and the file reported modified;
 		// - a present file at a PRIOR tracked entry is reconstructable here (the cleanliness preflight in
-		//   `run`/`twoway_merge` already refused a dirty one), so a non-force checkout REMOVES it and omits
+		//   `run`/`merge_apply` already refused a dirty one), so a non-force checkout REMOVES it and omits
 		//   the path, exactly as git re-omits a clean recreated file rather than leaving a spurious change;
 		// - a FORCE checkout (`reset --hard`, a merge/rebase/cherry-pick/revert `--abort`, or `checkout -f`)
 		//   REMOVES any present file and omits the path, as git's `-f` discards in-the-way content.
@@ -1289,6 +1271,8 @@ where
 			stage: 0,
 			assume_valid,
 			skip_worktree: !preserve,
+			// A materialised entry is really present now, never an `add -N` placeholder.
+			intent_to_add: false,
 			path: path.to_owned(),
 		});
 		return Ok(());
@@ -1308,6 +1292,7 @@ where
 		stage: 0,
 		assume_valid,
 		skip_worktree: false,
+		intent_to_add: false,
 		path: path.to_owned(),
 	});
 	Ok(())
@@ -1375,7 +1360,7 @@ where
 /// Like [`remove_worktree_path`], but reports a removal failure. An already-absent file is fine;
 /// any other error (e.g. the path is now occupied by a directory) is returned so the caller can
 /// refuse rather than silently leave the file in place. Validates `path` first (same escape guard
-/// as [`remove_worktree_path`]), for the tree paths the two-way merge removes.
+/// as [`remove_worktree_path`]), for the tree paths the two-tree merge removes.
 pub(crate) fn remove_worktree_file<F, W, H>(
 	wt: &WorkTree<F, W, H>,
 	path: &str,

@@ -245,6 +245,14 @@ fn switch_two_way_merges_staged_changes_like_git() {
 			std::fs::write(format!("{w}/foo"), b"S\n").unwrap();
 			git(w, &["add", "foo"]);
 		}),
+		// A staged edit to `foo` whose slot the target turns into a directory (`foo/child`): git refuses to
+		// drop the staged change to grow the subtree ("local changes to foo would be overwritten"). The D/F
+		// "target wins" path must not silently discard it.
+		("staged-mod: target replaces foo with foo/child", |w| {
+			other_foo_to_subtree(w);
+			std::fs::write(format!("{w}/foo"), b"S\n").unwrap();
+			git(w, &["add", "foo"]);
+		}),
 		("staged-del: target keeps foo", |w| {
 			other_same(w);
 			git(w, &["rm", "-q", "foo"]);
@@ -307,6 +315,145 @@ fn switch_two_way_merges_staged_changes_like_git() {
 		std::fs::remove_dir_all(&a).ok();
 		std::fs::remove_dir_all(&b).ok();
 	}
+}
+
+#[test]
+fn switch_refuses_intent_to_add_over_df_collision_like_git() {
+	// `git add -N p/c` records an intent-to-add placeholder (an empty blob). If the target adds file `p`
+	// (D/F-colliding), git refuses to DROP the placeholder for the incoming subtree slot — even with an EMPTY
+	// working file that matches the empty blob, where a cleanliness check alone would let it through. gta must
+	// refuse too (it honours the intent-to-add flag, not just content cleanliness).
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let build = |tag: &str| -> PathBuf {
+		let work = unique_tmp(&format!("gta-switch-ita-{tag}"));
+		let w = work.to_str().unwrap();
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		std::fs::write(work.join("keep"), b"k\n").unwrap();
+		git(w, &["add", "keep"]);
+		commit(w, "base");
+		git(w, &["switch", "-q", "-c", "other"]);
+		std::fs::write(work.join("p"), b"P\n").unwrap();
+		git(w, &["add", "p"]);
+		commit(w, "addp");
+		git(w, &["switch", "-q", "main"]);
+		std::fs::create_dir(work.join("p")).unwrap();
+		std::fs::write(work.join("p/c"), b"").unwrap(); // empty — matches the intent-to-add empty blob
+		git(w, &["add", "-N", "p/c"]);
+		work
+	};
+	let a = build("gta");
+	let b = build("git");
+	assert_eq!(
+		switch_try_gta_to(a.to_str().unwrap(), "other"),
+		switch_try_git_to(b.to_str().unwrap(), "other"),
+		"switch exit parity (both must refuse to drop the intent-to-add placeholder)"
+	);
+	assert_eq!(snapshot(&a), snapshot(&b), "index+worktree parity");
+	std::fs::remove_dir_all(&a).ok();
+	std::fs::remove_dir_all(&b).ok();
+}
+
+#[test]
+fn switch_drops_absent_intent_to_add_over_df_like_git() {
+	// An ABSENT intent-to-add placeholder (`git add -N x; rm x`) is DROPPED, not refused, when the target adds
+	// a subtree at its slot — git allows the switch (unlike a PRESENT placeholder, which it refuses). gta must
+	// match, so the intent-to-add refusal is gated on the placeholder file still being present.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let build = |tag: &str| -> PathBuf {
+		let work = unique_tmp(&format!("gta-switch-ita-absent-{tag}"));
+		let w = work.to_str().unwrap();
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		std::fs::write(work.join("keep"), b"k\n").unwrap();
+		git(w, &["add", "keep"]);
+		commit(w, "base");
+		git(w, &["switch", "-q", "-c", "other"]);
+		std::fs::create_dir(work.join("x")).unwrap();
+		std::fs::write(work.join("x/c"), b"c\n").unwrap();
+		git(w, &["add", "x/c"]);
+		commit(w, "xsub");
+		git(w, &["switch", "-q", "main"]);
+		std::fs::write(work.join("x"), b"X\n").unwrap();
+		git(w, &["add", "-N", "x"]);
+		std::fs::remove_file(work.join("x")).unwrap(); // absent placeholder
+		work
+	};
+	let a = build("gta");
+	let b = build("git");
+	assert_eq!(
+		switch_try_gta_to(a.to_str().unwrap(), "other"),
+		switch_try_git_to(b.to_str().unwrap(), "other"),
+		"exit parity (an absent intent-to-add placeholder must not block the switch)"
+	);
+	assert_eq!(
+		git(a.to_str().unwrap(), &["ls-files", "-s"]),
+		git(b.to_str().unwrap(), &["ls-files", "-s"]),
+		"index parity"
+	);
+	std::fs::remove_dir_all(&a).ok();
+	std::fs::remove_dir_all(&b).ok();
+}
+
+#[test]
+fn switch_carries_case_variant_intent_to_add_like_git() {
+	// The fold counterpart of the exact-case refusal above: under `core.ignoreCase`, a target file `P` that
+	// only *fold*-collides with the intent-to-add `p/c` placeholder's parent dir `p` is NOT refused — git
+	// allows the switch and drops the placeholder cleanly (status ` D p/c`, a valid tree). gta must match, and
+	// must NOT over-refuse this (an earlier attempt did). Needs a case-insensitive fs for the fold to bite.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	if !case_insensitive_fs() {
+		eprintln!("skipping: case-sensitive filesystem (the P/p fold does not collide)");
+		return;
+	}
+	let build = |tag: &str| -> PathBuf {
+		let work = unique_tmp(&format!("gta-switch-ita-fold-{tag}"));
+		let w = work.to_str().unwrap();
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		git(w, &["config", "core.ignoreCase", "true"]);
+		std::fs::write(work.join("keep"), b"k\n").unwrap();
+		git(w, &["add", "keep"]);
+		commit(w, "base");
+		git(w, &["switch", "-q", "-c", "other"]);
+		std::fs::write(work.join("P"), b"P\n").unwrap();
+		git(w, &["add", "P"]);
+		commit(w, "addP");
+		git(w, &["switch", "-q", "main"]);
+		std::fs::create_dir(work.join("p")).unwrap();
+		std::fs::write(work.join("p/c"), b"").unwrap();
+		git(w, &["add", "-N", "p/c"]);
+		work
+	};
+	let a = build("gta");
+	let b = build("git");
+	assert_eq!(
+		switch_try_gta_to(a.to_str().unwrap(), "other"),
+		switch_try_git_to(b.to_str().unwrap(), "other"),
+		"switch exit parity (a fold-only intent-to-add collision must not be refused)"
+	);
+	assert_eq!(
+		git(a.to_str().unwrap(), &["ls-files", "-s"]),
+		git(b.to_str().unwrap(), &["ls-files", "-s"]),
+		"index parity"
+	);
+	std::fs::remove_dir_all(&a).ok();
+	std::fs::remove_dir_all(&b).ok();
 }
 
 #[test]
@@ -2077,6 +2224,15 @@ fn other_mod(w: &str) {
 fn other_del(w: &str) {
 	git(w, &["switch", "-q", "-c", "other"]);
 	git(w, &["rm", "-q", "foo"]);
+	commit(w, "t");
+	git(w, &["switch", "-q", "main"]);
+}
+fn other_foo_to_subtree(w: &str) {
+	git(w, &["switch", "-q", "-c", "other"]);
+	git(w, &["rm", "-q", "foo"]);
+	std::fs::create_dir(format!("{w}/foo")).unwrap();
+	std::fs::write(format!("{w}/foo/child"), b"c\n").unwrap();
+	git(w, &["add", "foo/child"]);
 	commit(w, "t");
 	git(w, &["switch", "-q", "main"]);
 }

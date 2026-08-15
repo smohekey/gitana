@@ -91,13 +91,16 @@ pub async fn rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	}
 
 	let committer = identity.committer_or_default().await?;
+	// The tree the index currently matches — HEAD's, since the work tree is clean (checked above) — is the
+	// from-tree for `move_branch_to`'s two-tree merge to the base.
+	let orig_tree = repository.commit_tree(head_tip).await?;
 
 	// Nothing to replay: the branch is already on (or behind) the base — a fast-forward or no-op.
 	if todo.is_empty() {
 		if onto == head_tip {
 			return Ok(RebaseOutcome::UpToDate { branch: head_name });
 		}
-		move_branch_to(wt, onto, &committer, "rebase: fast-forward").await?;
+		move_branch_to(wt, orig_tree, onto, &committer, "rebase: fast-forward").await?;
 		return Ok(RebaseOutcome::FastForwarded {
 			branch: head_name,
 			onto,
@@ -116,6 +119,7 @@ pub async fn rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	// state just written so a failed start does not leave a phantom rebase in progress, as git does.
 	if let Err(error) = move_branch_to(
 		wt,
+		orig_tree,
 		onto,
 		&committer,
 		&format!("rebase: checkout {}", short(onto)),
@@ -269,7 +273,9 @@ async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 			});
 		}
 
-		wt.checkout(merge.tree, false, None).await?;
+		// Two-tree merge from the current tip's tree to the replayed result: the loop keeps the index equal
+		// to that tip, so this shares `switch`'s lock-safe, D/F- and sparse-correct engine.
+		wt.checkout_merge(head_tree, merge.tree, None).await?;
 		let committer = identity.committer().await?;
 		let message = conflict::ensure_trailing_newline(commit.message.clone());
 		signing::commit_on_head(
@@ -291,16 +297,20 @@ async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	})
 }
 
-/// Move the current branch to `target` and update the work tree to match.
+/// Move the current branch to `target` and update the work tree to match. `from_tree` is the tree the
+/// index currently matches (HEAD's), so the update is git's two-tree merge from there to the base — an
+/// authoritative match on the clean work tree rebase requires, while keeping `switch`'s untracked-in-the-
+/// way refusal and D/F engine (the reason a failed base checkout still rolls the rebase state back).
 async fn move_branch_to<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
+	from_tree: ObjectId<H>,
 	target: ObjectId<H>,
 	committer: &str,
 	reflog: &str,
 ) -> Result<()> {
 	let repository = wt.repository();
 	let tree = repository.commit_tree(target).await?;
-	wt.checkout(tree, false, None).await?;
+	wt.checkout_merge(from_tree, tree, None).await?;
 	repository.reset_head(target, committer, reflog).await?;
 	Ok(())
 }

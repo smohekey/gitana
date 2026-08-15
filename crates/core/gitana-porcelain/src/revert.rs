@@ -117,7 +117,9 @@ pub async fn revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 		signer,
 	)
 	.await?;
-	wt.checkout(merge.tree, false, None).await?;
+	// Two-tree merge from HEAD's tree to the revert result: the index equals HEAD here (guarded above), so
+	// this preserves unrelated local work and refuses a real conflict, sharing `switch`'s engine.
+	wt.checkout_merge(head_tree, merge.tree, None).await?;
 	repository
 		.record_commit(&branch, Some(head), new_commit, &committer, &message)
 		.await?;

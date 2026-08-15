@@ -8,7 +8,7 @@ use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::{HeadState, Repository};
-use gitana_worktree::WorkTree;
+use gitana_worktree::{WorkTree, WorktreeError};
 
 use crate::conflict;
 use crate::{Identity, Signer, signing};
@@ -85,15 +85,29 @@ pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 
 	// Fast-forward (always for an unborn branch — there is no commit to be a merge parent).
 	if can_fast_forward && (!no_ff || head_tip.is_none()) {
-		// Apply only the HEAD→theirs diff (git's two-way merge), so unrelated staged or dirty files
-		// survive; a local change to a path the fast-forward updates is refused, not clobbered.
+		// Apply only the HEAD→theirs diff (git's two-tree merge), so unrelated staged or dirty files
+		// survive; a local change to a path the fast-forward updates is refused, not clobbered. This is the
+		// same lock-safe, D/F- and sparse-correct engine as `switch` — it aborts on the FIRST conflicting
+		// path (git names one), rather than the pre-scanned full list the retired `twoway_merge` returned.
 		let from_tree = match head_tip {
 			Some(head) => repository.commit_tree(head).await?,
 			None => repository.write_tree(&[]).await?,
 		};
-		let overwrite = wt.twoway_merge(from_tree, theirs_tree).await?;
-		if !overwrite.is_empty() {
-			bail!("{}", would_overwrite_message(&overwrite));
+		// The two-tree merge assumes the index reflects the `from_tree`. If `.git/index` is missing,
+		// `checkout_merge` would instead fall back to the authoritative overlay: on a born branch that could
+		// advance HEAD while leaving a to-be-removed tracked file untracked (git and the retired `twoway_merge`
+		// refuse this), and on an unborn branch the overlay skips validating sparse-excluded target blobs, so a
+		// missing out-of-cone blob would still publish an unmaterialisable commit. Build the from-index first —
+		// HEAD's tree on a born branch, the empty tree when unborn — so the fast-forward always runs through
+		// `merge_apply` (which validates every target blob). The rebuild is atomic under the index lock (a
+		// no-op if the index exists), so it cannot discard a concurrent writer's staged work.
+		wt.ensure_index_from_tree_if_missing(from_tree).await?;
+		match wt.checkout_merge(from_tree, theirs_tree, None).await {
+			Ok(()) => {}
+			Err(WorktreeError::Conflict(path)) | Err(WorktreeError::UntrackedOverwrite(path)) => {
+				bail!("{}", would_overwrite_message(&[path]));
+			}
+			Err(error) => return Err(error.into()),
 		}
 		let committer = identity.committer_or_default().await?;
 		repository
@@ -185,7 +199,10 @@ pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 		signer,
 	)
 	.await?;
-	wt.checkout(merged_tree, false, None).await?;
+	// Two-tree merge from HEAD's tree to the merged result: the index equals HEAD here (guarded above), so
+	// this lays down the merge while preserving unrelated local work and refusing a real conflict, sharing
+	// `switch`'s lock-safe, D/F- and sparse-correct engine.
+	wt.checkout_merge(head_tree, merged_tree, None).await?;
 	repository
 		.reset_head(
 			merge_commit,

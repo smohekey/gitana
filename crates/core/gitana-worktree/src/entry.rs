@@ -36,6 +36,10 @@ pub struct IndexEntry<H: HashAlgorithm> {
 	/// The skip-worktree flag (sparse checkout): git ignores the working tree for this path — an absent file
 	/// is not a deletion and a present one is not compared.
 	pub skip_worktree: bool,
+	/// The intent-to-add flag (`git add -N`): a placeholder for a path the user means to add but has not
+	/// staged content for yet (an empty blob). git refuses to overwrite or drop it in a checkout/merge, so it
+	/// must round-trip through the index and be honoured by the two-tree merge.
+	pub intent_to_add: bool,
 	/// The repository-relative path (forward slashes).
 	pub path: String,
 }

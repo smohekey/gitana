@@ -197,6 +197,7 @@ pub(crate) mod test_support {
 			stage: 0,
 			assume_valid: false,
 			skip_worktree: false,
+			intent_to_add: false,
 			path: path.to_owned(),
 		});
 	}
