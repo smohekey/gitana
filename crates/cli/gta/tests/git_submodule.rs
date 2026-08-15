@@ -80,6 +80,81 @@ fn commit_preserves_a_gitlink_entry_like_git() {
 	std::fs::remove_dir_all(&b).ok();
 }
 
+/// `status` must treat a real submodule the way git does: a clean one is clean (never a false ` M` nor
+/// listed `?? sub/`), and one whose checked-out `HEAD` differs from the recorded commit is ` M sub`.
+#[test]
+fn status_reports_submodule_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-sub-status");
+	let w = work.to_str().unwrap();
+	let src = format!("{w}/src");
+	let sup = format!("{w}/super");
+	std::fs::create_dir_all(&src).unwrap();
+	std::fs::create_dir_all(&sup).unwrap();
+	// A submodule source with two commits.
+	git(
+		&src,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	std::fs::write(format!("{src}/f"), b"s1\n").unwrap();
+	git(&src, &["add", "f"]);
+	commit(&src, "s1");
+	std::fs::write(format!("{src}/f"), b"s2\n").unwrap();
+	git(&src, &["add", "f"]);
+	commit(&src, "s2");
+	// A superproject embedding it.
+	git(
+		&sup,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	std::fs::write(format!("{sup}/root"), b"r\n").unwrap();
+	git(&sup, &["add", "root"]);
+	commit(&sup, "base");
+	git_allow(&sup, &["submodule", "add", "../src", "sub"]);
+	commit(&sup, "add submodule");
+
+	let norm = |s: String| {
+		let mut v: Vec<String> = s.lines().map(str::to_owned).collect();
+		v.sort();
+		v.join("\n")
+	};
+	// Clean submodule: both empty.
+	assert_eq!(
+		norm(gta(&sup, &["status"], b"")),
+		norm(git(&sup, &["status", "--porcelain"])),
+		"clean submodule status must match git (no false ` M`/`?? sub/`)"
+	);
+	// Move the submodule's HEAD off the recorded commit → both report ` M sub`.
+	git_allow(&format!("{sup}/sub"), &["checkout", "-q", "HEAD~1"]);
+	assert_eq!(
+		norm(gta(&sup, &["status"], b"")),
+		norm(git(&sup, &["status", "--porcelain"])),
+		"a moved-HEAD submodule must be ` M sub`, matching git"
+	);
+	assert!(
+		gta(&sup, &["status"], b"").contains("M sub"),
+		"the moved submodule must be reported modified"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// `git` with `protocol.file.allow=always` (modern git blocks `file://` submodule transport by default).
+fn git_allow(dir: &str, args: &[&str]) -> String {
+	let mut full = vec!["-C", dir, "-c", "protocol.file.allow=always"];
+	full.extend_from_slice(args);
+	let out = Command::new("git").args(&full).output().expect("run git");
+	assert!(
+		out.status.success(),
+		"git {args:?} failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	String::from_utf8(out.stdout).expect("git stdout utf8")
+}
+
 fn commit(dir: &str, msg: &str) {
 	git(
 		dir,

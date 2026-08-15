@@ -11,6 +11,7 @@ use gitana_object::{HashAlgorithm, ObjectId, ObjectKind};
 use crate::excludes::StandardExcludes;
 use crate::fsmeta::{blob_of, effective_mode, join_rel, push_gitignore};
 use crate::ignore::{self, DirIgnore};
+use crate::submodule_head_oid;
 use crate::worktree::stat_matches;
 use crate::{Conflict, IndexEntry, WorkTree, WorktreeError};
 
@@ -100,12 +101,20 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		.chain(unmerged.keys().cloned())
 		.map(|path| fold_key(&path, fold))
 		.collect();
+	// Tracked submodule (gitlink) paths, folded — a gitlink's on-disk directory is git's to track, never
+	// listed untracked (unlike a tracked file replaced by an untracked directory).
+	let gitlinks: HashSet<String> = index_map
+		.iter()
+		.filter(|(_, (mode, _))| mode == "160000")
+		.map(|(path, _)| fold_key(path, fold))
+		.collect();
 	let mut untracked = Vec::new();
 	let mut ignore_stack: Vec<DirIgnore> = base;
 	collect_untracked(
 		wt.work(),
 		"",
 		&tracked,
+		&gitlinks,
 		&mut ignore_stack,
 		&mut untracked,
 		fold,
@@ -139,7 +148,17 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		if entry.skip_worktree && wt.work().lstat(&entry.path)?.is_none() {
 			continue;
 		}
-		let code = worktree_change(wt.work(), entry, &entry.path, file_mode)?;
+		let code = if entry.mode == 0o160000 {
+			// A submodule (gitlink) is modified iff its checked-out `HEAD` differs from the recorded commit;
+			// git ignores the submodule's own dirty working content by default. An unresolvable submodule
+			// (an unhandled `.git` layout) is treated as unchanged rather than a false `M` (as `ls-files -m`).
+			match submodule_head_oid(wt, &entry.path).await {
+				Some(head) if head != entry.oid => 'M',
+				_ => ' ',
+			}
+		} else {
+			worktree_change(wt.work(), entry, &entry.path, file_mode)?
+		};
 		if code != ' ' {
 			at(&mut merged, &entry.path).worktree = code;
 		}
@@ -413,6 +432,7 @@ fn collect_untracked<W: WorkDirFs>(
 	work: &W,
 	dir_rel: &str,
 	tracked: &HashSet<String>,
+	gitlinks: &HashSet<String>,
 	stack: &mut Vec<DirIgnore>,
 	out: &mut Vec<String>,
 	fold: bool,
@@ -429,13 +449,20 @@ fn collect_untracked<W: WorkDirFs>(
 		if ignore::is_ignored_fold(&rel, is_dir, stack, fold) {
 			continue;
 		}
+		// A directory that is itself a tracked SUBMODULE (a gitlink) is git's to track — never listed
+		// untracked, and not descended into (its contents belong to the submodule). Its status is the
+		// tracked Y-column comparison above. (A tracked *file* replaced by a directory is NOT a gitlink and
+		// falls through to the normal untracked handling.)
+		if is_dir && gitlinks.contains(&fold_key(&rel, fold)) {
+			continue;
+		}
 		// Membership is checked case-folded under `core.ignoreCase` (the `tracked` keys are already
 		// folded); the emitted path is always the real on-disk spelling.
 		if is_dir {
 			let prefix = format!("{rel}/");
 			let prefix_key = fold_key(&prefix, fold);
 			if tracked.iter().any(|path| path.starts_with(&prefix_key)) {
-				collect_untracked(work, &rel, tracked, stack, out, fold)?;
+				collect_untracked(work, &rel, tracked, gitlinks, stack, out, fold)?;
 			} else if dir_has_unignored(work, &rel, stack, fold)? {
 				// A fully-untracked directory collapses to a single `dir/` — but only when it holds some
 				// non-ignored content. git omits a directory whose entire content is ignored (by any

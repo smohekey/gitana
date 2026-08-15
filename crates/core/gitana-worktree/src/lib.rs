@@ -24,6 +24,7 @@ mod restore;
 mod rm;
 mod sparse;
 mod status;
+mod submodule;
 mod worktree;
 
 pub(crate) use checkout_mode::CheckoutMode;
@@ -37,4 +38,5 @@ pub use rm::RmOutcome;
 pub(crate) use sparse::SparseCheckout;
 pub use sparse::{SparseReapply, SparseSet};
 pub use status::{Status, StatusEntry};
+pub(crate) use submodule::submodule_head_oid;
 pub use worktree::WorkTree;
