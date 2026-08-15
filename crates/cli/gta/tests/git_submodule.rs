@@ -713,6 +713,78 @@ fn restore_recreates_a_gitlink_mount_like_git() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// A nested gitlink `a/sub` whose parent slot `a` the user replaced with an untracked file: changing the
+/// gitlink's pointer must REFUSE (like git), never unlink `a` to build the mount's parent. The gitlink's
+/// own mount is opaque to cleanliness, but ancestor content is still protected — losing `a` is data loss.
+#[test]
+fn switch_refuses_to_clobber_an_untracked_ancestor_of_a_gitlink() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-sub-ancestor");
+	let w = work.to_str().unwrap();
+	git(
+		w,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	git(w, &["config", "user.name", "T"]);
+	git(w, &["config", "user.email", "t@e"]);
+	std::fs::write(format!("{w}/root"), b"r\n").unwrap();
+	git(w, &["add", "root"]);
+	commit(w, "base");
+	let c1 = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+	std::fs::write(format!("{w}/root"), b"r2\n").unwrap();
+	git(w, &["add", "root"]);
+	commit(w, "base2");
+	let c2 = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+	// Branches A and B record the nested gitlink `a/sub` at different commits (a pointer change).
+	git(w, &["switch", "-q", "-c", "A"]);
+	git(
+		w,
+		&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("160000,{c1},a/sub"),
+		],
+	);
+	commit(w, "A");
+	git(w, &["switch", "-q", "main"]);
+	git(w, &["switch", "-q", "-c", "B"]);
+	git(
+		w,
+		&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("160000,{c2},a/sub"),
+		],
+	);
+	commit(w, "B");
+	// Land on A (materializing the mount), then replace the parent `a/` with an untracked file `a`.
+	gta(w, &["switch", "A"], b"");
+	std::fs::remove_dir_all(format!("{w}/a")).ok();
+	std::fs::write(format!("{w}/a"), b"UNTRACKED\n").unwrap();
+
+	// The pointer-change switch must refuse (assert_cmd directly — the `gta` helper asserts success).
+	let out = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", w, "switch", "B"])
+		.output()
+		.expect("run gta");
+	assert!(
+		!out.status.success(),
+		"gta must refuse to clobber the untracked ancestor file, like git"
+	);
+	assert_eq!(
+		std::fs::read(format!("{w}/a")).ok(),
+		Some(b"UNTRACKED\n".to_vec()),
+		"the untracked ancestor file must be preserved"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
 /// The added/removed lines of two diffs, sorted, for order-independent comparison.
 fn sorted(text: &str) -> Vec<String> {
 	let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();

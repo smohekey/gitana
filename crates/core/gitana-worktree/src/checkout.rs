@@ -391,9 +391,18 @@ where
 			if excluded {
 				continue;
 			}
-			// A gitlink names a submodule commit, not a blob — nothing to validate here; `write_entry`
-			// creates an empty mount directory rather than reading a blob.
+			// A gitlink names a submodule commit, not a blob — nothing INCOMING to validate; `write_entry`
+			// creates an empty mount directory rather than reading a blob. But when a non-force checkout
+			// replaces a present non-gitlink file with the mount, `write_worktree_file` unlinks that file
+			// trusting it is reconstructable from its current blob — so that OUTGOING blob must exist, else
+			// the file is the sole surviving copy and installing the mount loses it (as `merge_apply` guards).
 			if mode == "160000" {
+				if !force
+					&& let Some((cur_mode, cur_oid)) = current.get(path)
+					&& cur_mode != "160000"
+				{
+					wt.repository().read_blob(*cur_oid).await?;
+				}
 				continue;
 			}
 			wt.repository().read_blob(*oid).await?;
@@ -409,7 +418,7 @@ where
 		// tree would be left half-applied), so fail closed instead.
 		lock.mark_mutation_started();
 		for path in &renamed_away {
-			remove_worktree_path(wt, path)?;
+			remove_current_path(wt, path, current.get(path))?;
 			index.remove(path);
 		}
 
@@ -435,7 +444,7 @@ where
 		// directory→symlink switch the stale child under the old directory is already gone), so the
 		// removal never escapes the work tree.
 		for path in &stray {
-			remove_worktree_path(wt, path)?;
+			remove_current_path(wt, path, current.get(path))?;
 			index.remove(path);
 		}
 		Ok(())
@@ -886,12 +895,16 @@ where
 				} else if !is_clean(wt, path, owner, &base, fold)? {
 					return Err(WorktreeError::Conflict(path.to_owned()));
 				}
-				// A path the switch materialises must not sit under an untracked file (a file→directory change).
-				if to.contains_key(path)
-					&& let Some(untracked) = untracked_file_ancestor(wt.work(), path, &tracked, &base, fold)?
-				{
-					return Err(WorktreeError::UntrackedOverwrite(untracked));
-				}
+			}
+			// A path the switch materialises must not sit under an untracked file (a file→directory change).
+			// This ancestor guard applies to GITLINKS too: only the mount's OWN cleanliness is opaque to git;
+			// it still refuses to clobber an untracked file to build a submodule's parent directory (probed vs
+			// git 2.55 — losing that file would be data loss, which `ensure_parents` would otherwise cause by
+			// unlinking it to create the mount).
+			if to.contains_key(path)
+				&& let Some(untracked) = untracked_file_ancestor(wt.work(), path, &tracked, &base, fold)?
+			{
+				return Err(WorktreeError::UntrackedOverwrite(untracked));
 			}
 		}
 	}
@@ -1399,6 +1412,28 @@ where
 	}
 	remove_empty_parents(wt.work(), path);
 	Ok(())
+}
+
+/// Remove `path` during a non-merge (`run`) checkout, honoring gitlink semantics. A CURRENT gitlink
+/// (mode 160000) uses the rmdir-only [`remove_gitlink_mount`] — an empty mount is removed, but a
+/// populated submodule OR a file/symlink the user placed at the slot is LEFT, as git only attempts
+/// `rmdir` for a removed submodule and never unlinks that content. Anything else is an ordinary
+/// file/symlink removal via [`remove_worktree_path`].
+fn remove_current_path<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	path: &str,
+	current: Option<&(String, ObjectId<H>)>,
+) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	if current.is_some_and(|(mode, _)| mode == "160000") {
+		remove_gitlink_mount(wt, path)
+	} else {
+		remove_worktree_path(wt, path)
+	}
 }
 
 /// Like [`remove_worktree_path`], but reports a removal failure. An already-absent file is fine;
