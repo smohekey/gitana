@@ -1,4 +1,4 @@
-package gitana:repo@0.12.0;
+package gitana:repo@0.13.0;
 
 /// HTTP credential resolution, granted by the host.
 ///
@@ -205,11 +205,14 @@ interface porcelain {
 	}
 
 	/// A tree-entry mode accepted by `write-tree`. Directories are implied by
-	/// entry paths and cannot be written directly; gitlinks are read-only today.
+	/// entry paths and cannot be written directly. A `gitlink` (submodule, mode
+	/// `160000`) names a commit that need not be present in this repository, so
+	/// its id is recorded without object validation.
 	enum file-mode {
 		regular,
 		executable,
 		symlink,
+		gitlink,
 	}
 
 	/// An input entry for `write-tree`.

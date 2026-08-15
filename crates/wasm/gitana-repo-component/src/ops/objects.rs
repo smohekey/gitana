@@ -210,31 +210,35 @@ pub(crate) async fn write_tree<H: HashAlgorithm>(
 	for entry in entries {
 		let id = ObjectId::from_hex(&entry.id)
 			.map_err(|_| RepoError::Invalid(format!("not a full object id: {}", entry.id)))?;
-		// Every write-tree mode names a blob; a dangling or non-blob id would
-		// produce a tree git tooling cannot consume.
-		let (kind, _) = match repo.objects().read_object(&id).await {
-			Ok(object) => object,
-			Err(ObjectStoreError::NotFound) => {
-				return Err(RepoError::Invalid(format!(
-					"tree entry {}: no such object {}",
-					entry.path, entry.id
-				)));
-			}
-			Err(error) => return Err(repo_error(RepositoryError::ObjectStore(error))),
-		};
-		if kind != ObjectKind::Blob {
-			return Err(RepoError::Invalid(format!(
-				"tree entry {}: {} is a {}, not a blob",
-				entry.path,
-				entry.id,
-				kind.as_str()
-			)));
-		}
 		let mode = match entry.mode {
 			WitFileMode::Regular => FileMode::Regular,
 			WitFileMode::Executable => FileMode::Executable,
 			WitFileMode::Symlink => FileMode::Symlink,
+			WitFileMode::Gitlink => FileMode::Gitlink,
 		};
+		// A gitlink's id names a COMMIT in the submodule's own repository — it need not be present
+		// here (that is the point of a submodule), so it is recorded without validation. Every other
+		// mode names a blob; a dangling or non-blob id would produce a tree git tooling cannot consume.
+		if mode != FileMode::Gitlink {
+			let (kind, _) = match repo.objects().read_object(&id).await {
+				Ok(object) => object,
+				Err(ObjectStoreError::NotFound) => {
+					return Err(RepoError::Invalid(format!(
+						"tree entry {}: no such object {}",
+						entry.path, entry.id
+					)));
+				}
+				Err(error) => return Err(repo_error(RepositoryError::ObjectStore(error))),
+			};
+			if kind != ObjectKind::Blob {
+				return Err(RepoError::Invalid(format!(
+					"tree entry {}: {} is a {}, not a blob",
+					entry.path,
+					entry.id,
+					kind.as_str()
+				)));
+			}
+		}
 		converted.push(TreeBuildEntry {
 			path: entry.path,
 			mode,
