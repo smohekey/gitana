@@ -1430,18 +1430,12 @@ where
 	if has_symlinked_ancestor(wt.work(), path) {
 		return Ok(());
 	}
-	match wt.work().lstat(path)? {
-		// Remove only an EMPTY mount directory; a populated submodule working tree is git's to keep.
-		Some(meta) if meta.kind.is_dir() => {
-			let _ = wt.work().remove_dir(path);
-		}
-		// A file/symlink now occupies the mount — remove it as any in-the-way file.
-		Some(_) => match wt.work().remove_file(path) {
-			Ok(()) => {}
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-			Err(error) => return Err(error.into()),
-		},
-		None => {}
+	// git only attempts `rmdir` on a removed submodule mount: an EMPTY directory is removed, and any
+	// other occupant is LEFT in place (git warns "unable to rmdir" and continues) — a populated submodule
+	// working tree, OR a file/symlink the user put at the slot. Never unlink that content: deleting a
+	// file the user placed where the gitlink was is data loss git does not do (probed vs git 2.55).
+	if matches!(wt.work().lstat(path)?, Some(meta) if meta.kind.is_dir()) {
+		let _ = wt.work().remove_dir(path);
 	}
 	remove_empty_parents(wt.work(), path);
 	Ok(())

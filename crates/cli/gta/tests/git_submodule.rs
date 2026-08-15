@@ -497,6 +497,49 @@ fn conflicted_gitlink_status_matches_git() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// Removing a gitlink whose mount the user replaced with a plain file must LEAVE that file, like git
+/// (which only `rmdir`s the mount — "unable to rmdir: Not a directory" — and continues). Deleting the
+/// user's file would be data loss git never does.
+#[test]
+fn switch_away_preserves_a_file_at_the_gitlink_slot() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-sub-slotfile");
+	let w = work.to_str().unwrap();
+	git(
+		w,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	git(w, &["config", "user.name", "T"]);
+	git(w, &["config", "user.email", "t@e"]);
+	std::fs::write(format!("{w}/root"), b"r\n").unwrap();
+	git(w, &["add", "root"]);
+	commit(w, "base");
+	let c = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+	git(w, &["branch", "nosub"]);
+	git(
+		w,
+		&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("160000,{c},sub"),
+		],
+	);
+	commit(w, "add gitlink");
+	// The user drops a plain file where the mount would be, then switches to the branch without the gitlink.
+	std::fs::write(format!("{w}/sub"), b"USERDATA\n").unwrap();
+	gta(w, &["switch", "nosub"], b"");
+	assert_eq!(
+		std::fs::read(format!("{w}/sub")).ok(),
+		Some(b"USERDATA\n".to_vec()),
+		"the user's file at the removed gitlink slot must be left untouched, like git"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
 /// Switching to a branch where an ordinary file becomes a gitlink must respect the working tree like
 /// git: a CLEAN file is replaced by the empty mount directory, but a DIRTY file blocks the switch — the
 /// incoming gitlink is not exempt from cleanliness the way an outgoing/current gitlink is.
