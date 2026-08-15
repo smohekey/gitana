@@ -107,6 +107,7 @@ fn file_mode(mode: u32) -> FileMode {
 	match mode {
 		0o100755 => FileMode::Executable,
 		0o120000 => FileMode::Symlink,
+		0o160000 => FileMode::Gitlink,
 		_ => FileMode::Regular,
 	}
 }

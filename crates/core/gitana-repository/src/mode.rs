@@ -9,6 +9,9 @@ pub enum FileMode {
 	Symlink,
 	/// Subdirectory / tree (`40000`).
 	Directory,
+	/// Submodule gitlink (`160000`): the entry's object id is a *commit* in the submodule's own
+	/// repository, not a blob in this one. git records it without cloning the submodule.
+	Gitlink,
 }
 
 impl FileMode {
@@ -19,6 +22,7 @@ impl FileMode {
 			FileMode::Executable => "100755",
 			FileMode::Symlink => "120000",
 			FileMode::Directory => "40000",
+			FileMode::Gitlink => "160000",
 		}
 	}
 }
