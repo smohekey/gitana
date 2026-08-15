@@ -142,6 +142,90 @@ fn status_reports_submodule_like_git() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// A submodule pointer change must diff like git: git renders a gitlink as a synthetic
+/// `Subproject commit <old>` → `<new>` line, across `diff` (index vs the submodule's checked-out
+/// `HEAD`), `diff --cached` (HEAD tree vs index), and `show` (tree vs tree). The submodule working
+/// tree is kept clean so git emits no `-dirty` suffix — gitana compares only the recorded commit to
+/// the checked-out `HEAD`, matching `status`, which likewise ignores submodule content-dirtiness.
+#[test]
+fn diff_reports_submodule_pointer_change_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-sub-diff");
+	let w = work.to_str().unwrap();
+	let src = format!("{w}/src");
+	let sup = format!("{w}/super");
+	std::fs::create_dir_all(&src).unwrap();
+	std::fs::create_dir_all(&sup).unwrap();
+	// A submodule source with two commits.
+	git(
+		&src,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	std::fs::write(format!("{src}/f"), b"s1\n").unwrap();
+	git(&src, &["add", "f"]);
+	commit(&src, "s1");
+	std::fs::write(format!("{src}/f"), b"s2\n").unwrap();
+	git(&src, &["add", "f"]);
+	commit(&src, "s2");
+	// A superproject embedding it at s2.
+	git(
+		&sup,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	std::fs::write(format!("{sup}/root"), b"r\n").unwrap();
+	git(&sup, &["add", "root"]);
+	commit(&sup, "base");
+	git_allow(&sup, &["submodule", "add", "../src", "sub"]);
+	commit(&sup, "add submodule");
+
+	// Move the submodule's checked-out HEAD back to s1 with a clean working tree.
+	let subdir = format!("{sup}/sub");
+	git_allow(&subdir, &["checkout", "-q", "HEAD~1"]);
+
+	// Unstaged: index (s2) vs the submodule's HEAD (s1).
+	assert_eq!(
+		diff_payload(&gta(&sup, &["diff"], b"")),
+		diff_payload(&git(&sup, &["diff"])),
+		"unstaged submodule pointer diff must match git"
+	);
+
+	// Staged: HEAD tree (s2) vs index (s1).
+	git(&sup, &["add", "sub"]);
+	assert_eq!(
+		diff_payload(&gta(&sup, &["diff", "--cached"], b"")),
+		diff_payload(&git(&sup, &["diff", "--cached"])),
+		"staged submodule pointer diff must match git"
+	);
+
+	// Tree vs tree: commit the pointer change and show it.
+	commit(&sup, "move submodule");
+	assert_eq!(
+		diff_payload(&gta(&sup, &["show", "HEAD"], b"")),
+		diff_payload(&git(&sup, &["show", "HEAD"])),
+		"committed submodule pointer diff (show) must match git"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// The semantic content of a unified diff: every added/removed line (sign + text), sorted,
+/// ignoring file/hunk headers. Compares gta's diff to git's without depending on git's exact byte
+/// framing (notably git's `index <old>..<new>` line, which gta does not emit).
+fn diff_payload(text: &str) -> Vec<String> {
+	let mut out: Vec<String> = text
+		.lines()
+		.filter(|l| {
+			(l.starts_with('+') || l.starts_with('-')) && !l.starts_with("+++") && !l.starts_with("---")
+		})
+		.map(str::to_owned)
+		.collect();
+	out.sort();
+	out
+}
+
 /// `git` with `protocol.file.allow=always` (modern git blocks `file://` submodule transport by default).
 fn git_allow(dir: &str, args: &[&str]) -> String {
 	let mut full = vec!["-C", dir, "-c", "protocol.file.allow=always"];
