@@ -293,6 +293,217 @@ fn checkout_materializes_gitlink_like_git() {
 	std::fs::remove_dir_all(&b).ok();
 }
 
+/// A submodule mount that is deleted (` D sub`) or replaced by a file (` T sub`) must be reported by
+/// `status` and `diff` like git — not hidden as clean. (git splits the type-change diff into a gitlink
+/// deletion plus a file addition; gta renders one block, but the added/removed lines are identical, so
+/// the `diff_payload` comparison holds.)
+#[test]
+fn status_and_diff_report_a_removed_or_retyped_gitlink_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let build = |tag: &str| -> (PathBuf, String) {
+		let work = unique_tmp(tag);
+		let w = work.to_str().unwrap();
+		let src = format!("{w}/src");
+		let sup = format!("{w}/super");
+		std::fs::create_dir_all(&src).unwrap();
+		std::fs::create_dir_all(&sup).unwrap();
+		git(
+			&src,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		std::fs::write(format!("{src}/f"), b"s1\n").unwrap();
+		git(&src, &["add", "f"]);
+		commit(&src, "s1");
+		git(
+			&sup,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		std::fs::write(format!("{sup}/root"), b"r\n").unwrap();
+		git(&sup, &["add", "root"]);
+		commit(&sup, "base");
+		git_allow(&sup, &["submodule", "add", "../src", "sub"]);
+		commit(&sup, "add submodule");
+		(work, sup)
+	};
+
+	// Deleted mount → ` D sub`.
+	let (work_a, sup_a) = build("gta-sub-del");
+	std::fs::remove_dir_all(format!("{sup_a}/sub")).unwrap();
+	assert_eq!(
+		sorted(&gta(&sup_a, &["status"], b"")),
+		sorted(&git(&sup_a, &["status", "--porcelain"])),
+		"a deleted gitlink must be ` D sub`, matching git"
+	);
+	assert_eq!(
+		diff_payload(&gta(&sup_a, &["diff"], b"")),
+		diff_payload(&git(&sup_a, &["diff"])),
+		"a deleted gitlink must diff as a deletion, matching git"
+	);
+	std::fs::remove_dir_all(&work_a).ok();
+
+	// Mount replaced by a file → ` T sub` (type change).
+	let (work_b, sup_b) = build("gta-sub-retype");
+	std::fs::remove_dir_all(format!("{sup_b}/sub")).unwrap();
+	std::fs::write(format!("{sup_b}/sub"), b"x\n").unwrap();
+	assert_eq!(
+		sorted(&gta(&sup_b, &["status"], b"")),
+		sorted(&git(&sup_b, &["status", "--porcelain"])),
+		"a gitlink replaced by a file must be ` T sub`, matching git"
+	);
+	assert_eq!(
+		diff_payload(&gta(&sup_b, &["diff"], b"")),
+		diff_payload(&git(&sup_b, &["diff"])),
+		"a retyped gitlink's diff lines must match git"
+	);
+	std::fs::remove_dir_all(&work_b).ok();
+}
+
+/// Switching to a branch that does not record the gitlink must succeed the way git does — never
+/// `checkout would overwrite local changes to sub` — and leave a populated submodule working tree in
+/// place, with status identical to git's afterward.
+#[test]
+fn switch_away_from_a_gitlink_matches_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let build = |tag: &str| -> (PathBuf, String) {
+		let work = unique_tmp(tag);
+		let w = work.to_str().unwrap();
+		let src = format!("{w}/src");
+		let sup = format!("{w}/super");
+		std::fs::create_dir_all(&src).unwrap();
+		std::fs::create_dir_all(&sup).unwrap();
+		git(
+			&src,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		std::fs::write(format!("{src}/f"), b"s1\n").unwrap();
+		git(&src, &["add", "f"]);
+		commit(&src, "s1");
+		git(
+			&sup,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		std::fs::write(format!("{sup}/root"), b"r\n").unwrap();
+		git(&sup, &["add", "root"]);
+		commit(&sup, "base");
+		git(&sup, &["branch", "nosub"]);
+		git_allow(&sup, &["submodule", "add", "../src", "sub"]);
+		commit(&sup, "add submodule");
+		(work, sup)
+	};
+	let (work_a, sup_a) = build("gta-sub-swaway-gta");
+	let (work_b, sup_b) = build("gta-sub-swaway-git");
+
+	// gta must not refuse (the `gta` helper asserts success); git switches too.
+	gta(&sup_a, &["switch", "nosub"], b"");
+	git(&sup_b, &["switch", "-q", "nosub"]);
+
+	assert!(
+		std::path::Path::new(&format!("{sup_a}/sub/f")).exists(),
+		"gta must leave the populated submodule working tree in place"
+	);
+	assert_eq!(
+		sorted(&git(&sup_a, &["status", "--porcelain"])),
+		sorted(&git(&sup_b, &["status", "--porcelain"])),
+		"status after switching away from the gitlink must match git"
+	);
+	std::fs::remove_dir_all(&work_a).ok();
+	std::fs::remove_dir_all(&work_b).ok();
+}
+
+/// A conflicted (unmerged) submodule must report only `UU sub`, never also `?? sub/`: the mount stays
+/// excluded from untracked even though the gitlink has no stage-0 index entry during the conflict.
+#[test]
+fn conflicted_gitlink_status_matches_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-sub-conflict");
+	let w = work.to_str().unwrap();
+	let src = format!("{w}/src");
+	let sup = format!("{w}/super");
+	std::fs::create_dir_all(&src).unwrap();
+	std::fs::create_dir_all(&sup).unwrap();
+	git(
+		&src,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	for (body, msg) in [("s1\n", "s1"), ("s2\n", "s2"), ("s3\n", "s3")] {
+		std::fs::write(format!("{src}/f"), body).unwrap();
+		git(&src, &["add", "f"]);
+		commit(&src, msg);
+	}
+	// Two commits that both differ from src's HEAD (the commit `submodule add` records for the base),
+	// so each branch's `cacheinfo` update is a real change git will commit — and they differ from each
+	// other, so merging conflicts the gitlink.
+	let c1 = git(&src, &["rev-parse", "HEAD~2"]).trim().to_owned();
+	let c2 = git(&src, &["rev-parse", "HEAD~1"]).trim().to_owned();
+	git(
+		&sup,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	std::fs::write(format!("{sup}/root"), b"r\n").unwrap();
+	git(&sup, &["add", "root"]);
+	commit(&sup, "base");
+	git_allow(&sup, &["submodule", "add", "../src", "sub"]);
+	commit(&sup, "add submodule");
+	// Two branches recording different submodule commits, merged to conflict the gitlink.
+	git(&sup, &["switch", "-q", "-c", "b2"]);
+	git(
+		&sup,
+		&["update-index", "--cacheinfo", &format!("160000,{c1},sub")],
+	);
+	commit(&sup, "b2");
+	git(&sup, &["switch", "-q", "main"]);
+	git(&sup, &["switch", "-q", "-c", "b3"]);
+	git(
+		&sup,
+		&["update-index", "--cacheinfo", &format!("160000,{c2},sub")],
+	);
+	commit(&sup, "b3");
+	// The merge conflicts (exit 1) — run it directly rather than through the success-asserting helper.
+	let _ = Command::new("git")
+		.args([
+			"-C",
+			&sup,
+			"-c",
+			"protocol.file.allow=always",
+			"merge",
+			"b2",
+		])
+		.output()
+		.expect("run git merge");
+
+	let gta_status = gta(&sup, &["status"], b"");
+	assert_eq!(
+		sorted(&gta_status),
+		sorted(&git(&sup, &["status", "--porcelain"])),
+		"a conflicted gitlink must match git (UU sub, no ?? sub/)"
+	);
+	assert!(
+		gta_status.contains("UU sub"),
+		"must report the unmerged gitlink"
+	);
+	assert!(
+		!gta_status.contains("?? sub"),
+		"must not list the mount as untracked"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// The added/removed lines of two diffs, sorted, for order-independent comparison.
+fn sorted(text: &str) -> Vec<String> {
+	let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+	lines.sort();
+	lines
+}
+
 /// The semantic content of a unified diff: every added/removed line (sign + text), sorted,
 /// ignoring file/hunk headers. Compares gta's diff to git's without depending on git's exact byte
 /// framing (notably git's `index <old>..<new>` line, which gta does not emit).

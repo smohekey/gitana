@@ -793,6 +793,14 @@ where
 		let owner = staged.get(path).or_else(|| staged_fold.get(&key).copied());
 		let from_here = from.get(path).or_else(|| from_fold.get(&key).copied());
 		let to_here = to.get(path);
+		// git treats a submodule mount as opaque — it never inspects a gitlink's own working tree for
+		// checkout cleanliness. A gitlink transition (a removal, or a pointer change where either the current
+		// index entry or the target is a gitlink) therefore skips the worktree-cleanliness refusals below: the
+		// apply phase records the index change and removes an EMPTY mount directory, leaving a populated
+		// submodule in place (git warns "unable to rmdir" but never refuses). Keys on the index/tree modes,
+		// not the on-disk kind, so it holds whether or not the submodule is actually checked out.
+		let is_gitlink = current.is_some_and(|(mode, _)| mode == "160000")
+			|| to_here.is_some_and(|(mode, _)| mode == "160000");
 		// A new addition the sparse patterns exclude is added skip-worktree, not materialised, so an
 		// in-the-way untracked file is left alone and no cleanliness applies. It must be a genuine ADDITION —
 		// absent from HEAD (`from`) — not a path HEAD tracks whose index entry was staged-deleted: that is a
@@ -855,30 +863,35 @@ where
 			// is a directory→file/symlink change: refuse only if the directory holds untracked, non-ignored
 			// content (a clean tracked subtree is git's to replace) — `is_clean` would reject any directory
 			// outright. Every other slot (a same-slot file, or absent) takes the standard cleanliness check.
-			if to.contains_key(path) && matches!(wt.work().lstat(path)?, Some(meta) if meta.kind.is_dir())
-			{
-				// But when `path` is itself TRACKED as a file (an index entry exists for it), a directory
-				// there is an unstaged file→directory replacement — the tracked file has an unstaged deletion,
-				// which git refuses (probed vs git 2.55). Refusing before the untracked-content scan matters:
-				// otherwise the write would recursively clear the directory and silently destroy files inside
-				// it, including IGNORED ones. Only a directory covering a tracked *subtree* (no entry for `path`
-				// itself) reaches the content scan and is git's to replace when clean.
-				if owner.is_some() {
+			// Gitlinks are exempt: git never inspects a submodule's working tree here (see `is_gitlink`).
+			if !is_gitlink {
+				if to.contains_key(path)
+					&& matches!(wt.work().lstat(path)?, Some(meta) if meta.kind.is_dir())
+				{
+					// But when `path` is itself TRACKED as a file (an index entry exists for it), a directory
+					// there is an unstaged file→directory replacement — the tracked file has an unstaged deletion,
+					// which git refuses (probed vs git 2.55). Refusing before the untracked-content scan matters:
+					// otherwise the write would recursively clear the directory and silently destroy files inside
+					// it, including IGNORED ones. Only a directory covering a tracked *subtree* (no entry for `path`
+					// itself) reaches the content scan and is git's to replace when clean.
+					if owner.is_some() {
+						return Err(WorktreeError::Conflict(path.to_owned()));
+					}
+					let mut stack = ignore_prefix(wt.work(), path, &base)?;
+					if let Some(untracked) =
+						first_untracked_under(wt.work(), path, &tracked, &mut stack, fold)?
+					{
+						return Err(WorktreeError::UntrackedOverwrite(untracked));
+					}
+				} else if !is_clean(wt, path, owner, &base, fold)? {
 					return Err(WorktreeError::Conflict(path.to_owned()));
 				}
-				let mut stack = ignore_prefix(wt.work(), path, &base)?;
-				if let Some(untracked) = first_untracked_under(wt.work(), path, &tracked, &mut stack, fold)?
+				// A path the switch materialises must not sit under an untracked file (a file→directory change).
+				if to.contains_key(path)
+					&& let Some(untracked) = untracked_file_ancestor(wt.work(), path, &tracked, &base, fold)?
 				{
 					return Err(WorktreeError::UntrackedOverwrite(untracked));
 				}
-			} else if !is_clean(wt, path, owner, &base, fold)? {
-				return Err(WorktreeError::Conflict(path.to_owned()));
-			}
-			// A path the switch materialises must not sit under an untracked file (a file→directory change).
-			if to.contains_key(path)
-				&& let Some(untracked) = untracked_file_ancestor(wt.work(), path, &tracked, &base, fold)?
-			{
-				return Err(WorktreeError::UntrackedOverwrite(untracked));
 			}
 		}
 	}
@@ -1082,7 +1095,11 @@ where
 		// `index.lock` (the tree would be left half-applied), so fail closed instead.
 		lock.mark_mutation_started();
 		for &path in &removals {
-			remove_worktree_file(wt, path)?;
+			if staged.get(path).is_some_and(|(mode, _)| mode == "160000") {
+				remove_gitlink_mount(wt, path)?;
+			} else {
+				remove_worktree_file(wt, path)?;
+			}
 			index.remove(path);
 		}
 		// Directory/file collision resolution (git's two-tree merge lets the incoming target win): drop the
@@ -1393,6 +1410,38 @@ where
 		Ok(()) => {}
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
 		Err(error) => return Err(error.into()),
+	}
+	remove_empty_parents(wt.work(), path);
+	Ok(())
+}
+
+/// Remove a submodule (gitlink) mount when its index entry goes away (a switch to a tree without the
+/// gitlink, or an `--abort`). git removes the gitlink and, if the mount directory is EMPTY, deletes it;
+/// a populated submodule working tree is LEFT in place (git only warns "unable to rmdir"). A mount the
+/// user replaced with a plain file/symlink is removed like any file. Never errors on a non-empty
+/// directory — unlike [`remove_worktree_file`], whose `remove_file` would fail on the mount directory.
+fn remove_gitlink_mount<F, W, H>(wt: &WorkTree<F, W, H>, path: &str) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	validate_path(path)?;
+	if has_symlinked_ancestor(wt.work(), path) {
+		return Ok(());
+	}
+	match wt.work().lstat(path)? {
+		// Remove only an EMPTY mount directory; a populated submodule working tree is git's to keep.
+		Some(meta) if meta.kind.is_dir() => {
+			let _ = wt.work().remove_dir(path);
+		}
+		// A file/symlink now occupies the mount — remove it as any in-the-way file.
+		Some(_) => match wt.work().remove_file(path) {
+			Ok(()) => {}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => return Err(error.into()),
+		},
+		None => {}
 	}
 	remove_empty_parents(wt.work(), path);
 	Ok(())

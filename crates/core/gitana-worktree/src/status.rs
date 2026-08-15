@@ -102,11 +102,14 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		.map(|path| fold_key(&path, fold))
 		.collect();
 	// Tracked submodule (gitlink) paths, folded — a gitlink's on-disk directory is git's to track, never
-	// listed untracked (unlike a tracked file replaced by an untracked directory).
-	let gitlinks: HashSet<String> = index_map
+	// listed untracked (unlike a tracked file replaced by an untracked directory). Built from ALL index
+	// entries, not just stage 0: an unmerged (conflicted) gitlink has only stage 1/2/3 entries, and its
+	// mount directory must still be excluded from untracked so status shows `UU sub`, never `?? sub/`.
+	let gitlinks: HashSet<String> = index
+		.entries
 		.iter()
-		.filter(|(_, (mode, _))| mode == "160000")
-		.map(|(path, _)| fold_key(path, fold))
+		.filter(|entry| entry.mode == 0o160000)
+		.map(|entry| fold_key(&entry.path, fold))
 		.collect();
 	let mut untracked = Vec::new();
 	let mut ignore_stack: Vec<DirIgnore> = base;
@@ -149,12 +152,18 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			continue;
 		}
 		let code = if entry.mode == 0o160000 {
-			// A submodule (gitlink) is modified iff its checked-out `HEAD` differs from the recorded commit;
-			// git ignores the submodule's own dirty working content by default. An unresolvable submodule
-			// (an unhandled `.git` layout) is treated as unchanged rather than a false `M` (as `ls-files -m`).
-			match submodule_head_oid(wt, &entry.path).await {
-				Some(head) if head != entry.oid => 'M',
-				_ => ' ',
+			// A submodule (gitlink) entry is compared by the path's kind first (probed vs git 2.55): an absent
+			// mount is ` D sub` (deleted), a mount replaced by a file/symlink is ` T sub` (type change), and a
+			// present directory is ` M` iff its checked-out `HEAD` differs from the recorded commit. git ignores
+			// the submodule's own dirty working content by default; an unresolvable submodule (an unhandled
+			// `.git` layout) under a real directory is treated as unchanged, never a false `M` (as `ls-files -m`).
+			match wt.work().lstat(&entry.path)? {
+				None => 'D',
+				Some(meta) if !meta.kind.is_dir() => 'T',
+				Some(_) => match submodule_head_oid(wt, &entry.path).await {
+					Some(head) if head != entry.oid => 'M',
+					_ => ' ',
+				},
 			}
 		} else {
 			worktree_change(wt.work(), entry, &entry.path, file_mode)?

@@ -48,17 +48,43 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	let mut out = Vec::new();
 	for entry in index.entries.iter().filter(|e| e.stage == 0) {
 		if entry.mode == GITLINK_MODE {
-			// A submodule's "working" side is the commit its own `HEAD` points at. Show a pointer
-			// change as `Subproject commit <recorded>` → `<head>`; an unresolvable submodule (not
-			// checked out) is treated as unchanged, as `status` does.
-			if let Some(head) = submodule_head_oid(wt, &entry.path).await
-				&& head != entry.oid
-			{
-				out.push(FileDiff {
-					path: entry.path.clone(),
-					old: Some((gitlink_content(&entry.oid), entry.mode)),
-					new: Some((gitlink_content(&head), entry.mode)),
-				});
+			// A submodule (gitlink) is diffed by the mount's kind (probed vs git 2.55):
+			// - absent → a deletion (`-Subproject commit <recorded>`), unless it is an omitted skip-worktree
+			//   entry (git ignores the working tree for it);
+			// - replaced by a file/symlink → a type change. git splits this into a gitlink deletion plus a file
+			//   addition; gta's one-`FileDiff`-per-path model renders it as a single mode+content block instead
+			//   (a documented divergence);
+			// - a present directory → a pointer change `<recorded>` → the submodule's checked-out `HEAD`
+			//   (unresolvable = unchanged, as `status`).
+			match wt.work().lstat(&entry.path)? {
+				None => {
+					if !entry.skip_worktree {
+						out.push(FileDiff {
+							path: entry.path.clone(),
+							old: Some((gitlink_content(&entry.oid), entry.mode)),
+							new: None,
+						});
+					}
+				}
+				Some(meta) if !meta.kind.is_dir() => {
+					let new = read_worktree(wt.work(), &entry.path, &meta)?;
+					out.push(FileDiff {
+						path: entry.path.clone(),
+						old: Some((gitlink_content(&entry.oid), entry.mode)),
+						new: Some((new, effective_mode(&meta, 0o100644))),
+					});
+				}
+				Some(_) => {
+					if let Some(head) = submodule_head_oid(wt, &entry.path).await
+						&& head != entry.oid
+					{
+						out.push(FileDiff {
+							path: entry.path.clone(),
+							old: Some((gitlink_content(&entry.oid), entry.mode)),
+							new: Some((gitlink_content(&head), entry.mode)),
+						});
+					}
+				}
 			}
 			continue;
 		}
