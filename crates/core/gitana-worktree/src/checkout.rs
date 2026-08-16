@@ -227,10 +227,17 @@ where
 			// switch). An incoming gitlink over an ordinary file or an arbitrary untracked dir stays protected.
 			// Fold-aware under `core.ignoreCase`: a populated gitlink `Sub` recased to target `sub` is the
 			// same slot, so match the CURRENT gitlink by fold-key (else the recase over-refuses on the mount).
+			// Require EVERY current owner of the fold-key to be a gitlink, not just one: with case-colliding
+			// stage-0 entries (`Sub` 160000 AND `sub` 100644) the incoming `sub` blob must still get the normal
+			// worktree-cleanliness checks below — a lone matching `Sub` gitlink must not exempt it and let a
+			// dirty working file be overwritten (probed reasoning; fail-safe toward running the checks).
 			let path_key = fold_key(path, fold);
-			let current_is_gitlink = current
+			let mut folded_owners = current
 				.iter()
-				.any(|(cp, (cm, _))| cm == "160000" && fold_key(cp, fold) == path_key)
+				.filter(|(cp, _)| fold_key(cp, fold) == path_key)
+				.peekable();
+			let current_is_gitlink = (folded_owners.peek().is_some()
+				&& folded_owners.all(|(_, (cm, _))| cm == "160000"))
 				|| (*mode == "160000" && is_submodule_checkout(wt.work(), path));
 			// The working-tree files whose cleanliness we must check before (re)writing this target path, each
 			// against the blob it is tracked under. Prefer the target's EXACT current entry; otherwise EVERY
@@ -865,12 +872,16 @@ where
 		// checkout cleanliness. Skip the worktree-cleanliness refusals below when the path is a submodule git
 		// treats as opaque: either the CURRENT tracked entry is a gitlink (a removal or pointer change — the
 		// apply records the index change and removes an EMPTY mount, leaving a populated one), OR the INCOMING
-		// entry is a gitlink AND an initialized submodule checkout is already on disk (git REUSES it, so a
-		// routine away-and-back switch does not choke on the retained `sub/…` files). An incoming gitlink over
-		// an ordinary file, or an arbitrary untracked directory with no `.git`, is NOT exempt — git refuses to
-		// overwrite that content even to place a submodule (probed vs git 2.55).
+		// entry is a gitlink over a slot with NO current tracked owner AND an initialized submodule checkout is
+		// already on disk (git REUSES it, so a routine away-and-back switch does not choke on the retained
+		// `sub/…` files). The no-current-owner guard matters: when the CURRENT tracked entry is a NON-gitlink
+		// blob the user has locally replaced with a directory, git REFUSES the switch ("local changes would be
+		// overwritten") rather than hiding that directory as submodule content (probed vs git 2.55). An incoming
+		// gitlink over an ordinary file, or an arbitrary untracked directory with no `.git`, is likewise not
+		// exempt.
 		let is_gitlink = current.is_some_and(|(mode, _)| mode == "160000")
-			|| (to_here.is_some_and(|(mode, _)| mode == "160000")
+			|| (current.is_none()
+				&& to_here.is_some_and(|(mode, _)| mode == "160000")
 				&& is_submodule_checkout(wt.work(), path));
 		// A new addition the sparse patterns exclude is added skip-worktree, not materialised, so an
 		// in-the-way untracked file is left alone and no cleanliness applies. It must be a genuine ADDITION —

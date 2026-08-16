@@ -697,6 +697,84 @@ fn switch_to_a_gitlink_over_a_file_matches_git() {
 	std::fs::remove_dir_all(&dirty).ok();
 }
 
+/// When a tracked NON-gitlink entry `sub` has been locally replaced by a directory and the target
+/// branch records `160000 sub`, git REFUSES the switch ("local changes would be overwritten") rather
+/// than reusing the directory as the submodule mount — the incoming-mount reuse exemption applies only
+/// to a slot with no current tracked owner (probed vs git 2.55). gta must refuse identically, so a
+/// switch-back cannot then recursively delete the hidden directory.
+#[test]
+fn switch_to_a_gitlink_over_a_replaced_blob_dir_refuses_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let setup = |w: &str| {
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		git(w, &["config", "user.name", "T"]);
+		git(w, &["config", "user.email", "t@e"]);
+		std::fs::write(format!("{w}/root"), b"r\n").unwrap();
+		git(w, &["add", "root"]);
+		commit(w, "base");
+		let c = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+		// Branch B: sub is a gitlink.
+		git(w, &["switch", "-q", "-c", "B"]);
+		git(
+			w,
+			&[
+				"update-index",
+				"--add",
+				"--cacheinfo",
+				&format!("160000,{c},sub"),
+			],
+		);
+		commit(w, "B");
+		git(w, &["switch", "-q", "main"]);
+		// Branch A: sub is an ordinary tracked FILE.
+		git(w, &["switch", "-q", "-c", "A"]);
+		std::fs::write(format!("{w}/sub"), b"file\n").unwrap();
+		git(w, &["add", "sub"]);
+		commit(w, "A");
+		// Locally replace the tracked file with a DIRECTORY holding content.
+		std::fs::remove_file(format!("{w}/sub")).unwrap();
+		std::fs::create_dir(format!("{w}/sub")).unwrap();
+		std::fs::write(format!("{w}/sub/keep.txt"), b"precious\n").unwrap();
+	};
+
+	let gdir = unique_tmp("gta-sub-blobdir2link-gta");
+	let ddir = unique_tmp("gta-sub-blobdir2link-git");
+	let (wg, wd) = (gdir.to_str().unwrap(), ddir.to_str().unwrap());
+	setup(wg);
+	setup(wd);
+
+	let gta_out = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", wg, "switch", "B"])
+		.output()
+		.expect("run gta");
+	let git_out = Command::new("git")
+		.args(["-C", wd, "switch", "B"])
+		.output()
+		.expect("run git");
+	assert!(
+		!git_out.status.success(),
+		"git refuses to hide a replaced-blob directory as a submodule mount"
+	);
+	assert!(
+		!gta_out.status.success(),
+		"gta must refuse the same switch, not reuse the directory as the mount"
+	);
+	assert_eq!(
+		std::fs::read(format!("{wg}/sub/keep.txt")).ok(),
+		Some(b"precious\n".to_vec()),
+		"the user's directory content must survive the refusal"
+	);
+	std::fs::remove_dir_all(&gdir).ok();
+	std::fs::remove_dir_all(&ddir).ok();
+}
+
 /// A linked worktree holding only the empty mount directory a gitlink checkout produces is clean, so
 /// `gta worktree remove` must remove it WITHOUT `--force` — the empty mount is reconstructable, not a
 /// divergence. (Before, the removal-safety classifier could not hash the mount directory and treated it
