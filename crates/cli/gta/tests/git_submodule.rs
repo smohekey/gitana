@@ -513,28 +513,14 @@ fn conflicted_gitlink_status_matches_git() {
 		&src,
 		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
 	);
-	// A base commit, then two DIVERGENT children (neither an ancestor of the other). This matters: with a
-	// LINEAR submodule history, a git that can reach the submodule resolves the superproject merge by
-	// fast-forwarding the pointer to the descendant — so it does NOT conflict (the merge is "already up to
-	// date" for that gitlink), which fails this test on some platforms/git versions. Divergent commits
-	// force the pointer conflict on every git.
-	std::fs::write(format!("{src}/f"), b"base\n").unwrap();
-	git(&src, &["add", "f"]);
-	commit(&src, "s0");
-	git(&src, &["switch", "-q", "-c", "a"]);
-	std::fs::write(format!("{src}/f"), b"a\n").unwrap();
-	git(&src, &["add", "f"]);
-	commit(&src, "sa");
-	let c1 = git(&src, &["rev-parse", "HEAD"]).trim().to_owned();
-	git(&src, &["switch", "-q", "main"]);
-	git(&src, &["switch", "-q", "-c", "b"]);
-	std::fs::write(format!("{src}/f"), b"b\n").unwrap();
-	git(&src, &["add", "f"]);
-	commit(&src, "sb");
-	let c2 = git(&src, &["rev-parse", "HEAD"]).trim().to_owned();
-	// Leave src on the base commit so `submodule add` records s0 — distinct from both c1 and c2, so the
-	// three-way pointer merge (base s0, ours sb, theirs sa) is a genuine divergent conflict.
-	git(&src, &["switch", "-q", "main"]);
+	// Three distinct submodule commits to serve as the base/ours/theirs of the conflict.
+	let mut sub_commits = Vec::new();
+	for (body, msg) in [("s1\n", "s1"), ("s2\n", "s2"), ("s3\n", "s3")] {
+		std::fs::write(format!("{src}/f"), body).unwrap();
+		git(&src, &["add", "f"]);
+		commit(&src, msg);
+		sub_commits.push(git(&src, &["rev-parse", "HEAD"]).trim().to_owned());
+	}
 	git(
 		&sup,
 		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
@@ -544,32 +530,26 @@ fn conflicted_gitlink_status_matches_git() {
 	commit(&sup, "base");
 	git_allow(&sup, &["submodule", "add", "../src", "sub"]);
 	commit(&sup, "add submodule");
-	// Two branches recording different submodule commits, merged to conflict the gitlink.
-	git(&sup, &["switch", "-q", "-c", "b2"]);
-	git(
-		&sup,
-		&["update-index", "--cacheinfo", &format!("160000,{c1},sub")],
+	// Build the conflicted (unmerged) gitlink index DIRECTLY — three 160000 stages — rather than via
+	// `git merge`, whose submodule-pointer resolution varies by git version/platform (a reachable
+	// submodule can fast-forward or decline a "non-trivial" merge differently, so the merge did not
+	// always leave a conflict). This is a deterministic `UU sub` on every git; the mount stays on disk
+	// from `submodule add`.
+	git(&sup, &["update-index", "--force-remove", "sub"]);
+	let info = format!(
+		"160000 {} 1\tsub\n160000 {} 2\tsub\n160000 {} 3\tsub\n",
+		sub_commits[0], sub_commits[1], sub_commits[2]
 	);
-	commit(&sup, "b2");
-	git(&sup, &["switch", "-q", "main"]);
-	git(&sup, &["switch", "-q", "-c", "b3"]);
-	git(
-		&sup,
-		&["update-index", "--cacheinfo", &format!("160000,{c2},sub")],
-	);
-	commit(&sup, "b3");
-	// The merge conflicts (exit 1) — run it directly rather than through the success-asserting helper.
-	let _ = Command::new("git")
-		.args([
-			"-C",
-			&sup,
-			"-c",
-			"protocol.file.allow=always",
-			"merge",
-			"b2",
-		])
-		.output()
-		.expect("run git merge");
+	let mut ch = Command::new("git")
+		.args(["-C", &sup, "update-index", "--index-info"])
+		.stdin(std::process::Stdio::piped())
+		.spawn()
+		.expect("update-index");
+	{
+		use std::io::Write;
+		ch.stdin.take().unwrap().write_all(info.as_bytes()).unwrap();
+	}
+	assert!(ch.wait().expect("wait").success());
 
 	let gta_status = gta(&sup, &["status"], b"");
 	assert_eq!(
