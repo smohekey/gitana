@@ -1829,6 +1829,63 @@ fn diff_rejects_a_symlink_at_a_gitlink_like_git() {
 	std::fs::remove_dir_all(&w).ok();
 }
 
+/// `gta diff` must abort like git when a tracked gitlink slot is occupied by a FIFO/socket/device — git
+/// cannot hash the node ("'sub': unsupported file type"), so it aborts rather than reporting a falsely
+/// clean type change.
+#[test]
+fn diff_rejects_a_special_node_at_a_gitlink_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let w = unique_tmp("gta-sub-fifodiff");
+	let ws = w.to_str().unwrap();
+	git(
+		ws,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	git(ws, &["config", "user.name", "T"]);
+	git(ws, &["config", "user.email", "t@e"]);
+	git(ws, &["commit", "-q", "--allow-empty", "-m", "base"]);
+	let c = git(ws, &["rev-parse", "HEAD"]).trim().to_owned();
+	git(
+		ws,
+		&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("160000,{c},sub"),
+		],
+	);
+	commit(ws, "addsub");
+	// Replace the mount with a FIFO (std has no FIFO API; `mkfifo` is a standard POSIX utility).
+	let mkfifo = Command::new("mkfifo")
+		.arg(format!("{ws}/sub"))
+		.status()
+		.expect("run mkfifo");
+	assert!(mkfifo.success(), "mkfifo failed");
+
+	let g = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", ws, "diff"])
+		.output()
+		.expect("run gta");
+	let gi = Command::new("git")
+		.args(["-C", ws, "diff"])
+		.output()
+		.expect("run git");
+	assert!(
+		!g.status.success() && !gi.status.success(),
+		"both git and gta must abort diff on a FIFO at a gitlink slot"
+	);
+	assert!(
+		String::from_utf8_lossy(&g.stderr).contains("unsupported file type"),
+		"gta must report git's unsupported-file-type error: {}",
+		String::from_utf8_lossy(&g.stderr)
+	);
+	std::fs::remove_dir_all(&w).ok();
+}
+
 /// The added/removed lines of two diffs, sorted, for order-independent comparison.
 fn sorted(text: &str) -> Vec<String> {
 	let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();

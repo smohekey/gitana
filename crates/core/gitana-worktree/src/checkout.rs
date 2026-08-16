@@ -231,21 +231,25 @@ where
 			// stage-0 entries (`Sub` 160000 AND `sub` 100644) the incoming `sub` blob must still get the normal
 			// worktree-cleanliness checks below — a lone matching `Sub` gitlink must not exempt it and let a
 			// dirty working file be overwritten (probed reasoning; fail-safe toward running the checks).
+			// Reuse the precomputed `current_fold_all` fold-key grouping (O(1) lookup) rather than rescanning
+			// all of `current` per target entry, which would be O(N²) on an unchanged checkout.
 			let path_key = fold_key(path, fold);
-			let folded_owners: Vec<_> = current
-				.iter()
-				.filter(|(cp, _)| fold_key(cp, fold) == path_key)
-				.collect();
+			let folded_owners = current_fold_all.get(&path_key);
+			let has_owner = folded_owners.is_some_and(|owners| !owners.is_empty());
 			// The INCOMING-mount exemption (target gitlink over an on-disk submodule checkout) must apply only
 			// when the slot has NO current tracked owner — mirroring `merge_apply`. When the current entry is a
 			// non-gitlink blob the user has locally replaced with a directory, git REFUSES the checkout ("local
 			// changes would be overwritten") rather than recording the gitlink over the user's files (which a
 			// later checkout back to a blob would then `remove_dir_all`, losing them; probed vs git 2.55).
-			let current_is_gitlink = (!folded_owners.is_empty()
-				&& folded_owners.iter().all(|(_, (cm, _))| cm == "160000"))
-				|| (folded_owners.is_empty()
-					&& *mode == "160000"
-					&& is_submodule_checkout(wt.work(), path));
+			// Require EVERY current owner of the fold-key to be a gitlink, not just one: with case-colliding
+			// stage-0 entries (`Sub` 160000 AND `sub` 100644) the incoming `sub` blob must still get the normal
+			// worktree-cleanliness checks below — a lone matching `Sub` gitlink must not exempt it.
+			let current_is_gitlink = (has_owner
+				&& folded_owners
+					.unwrap()
+					.iter()
+					.all(|(_, (cm, _))| cm == "160000"))
+				|| (!has_owner && *mode == "160000" && is_submodule_checkout(wt.work(), path));
 			// The working-tree files whose cleanliness we must check before (re)writing this target path, each
 			// against the blob it is tracked under. Prefer the target's EXACT current entry; otherwise EVERY
 			// case-colliding entry that folds to this key (`Foo` and `foo`), so the shared inode is verified
@@ -1084,6 +1088,12 @@ where
 			// — that OUTGOING blob must exist, else the file is the sole surviving copy and the replacement
 			// loses it. Validate it before any mutation.
 			if mode == "160000" {
+				// An all-zero gitlink OID is not a valid cache entry — git refuses to write the index and does
+				// not switch ("cache entry has null sha1"). Reject it before mutating anything; a non-null commit
+				// gitana lacks locally (an unfetched submodule) is still fine.
+				if oid.as_bytes().iter().all(|&byte| byte == 0) {
+					return Err(WorktreeError::NullGitlinkOid(path.to_owned()));
+				}
 				if let Some((from_mode, from_oid)) = staged.get(path)
 					&& from_mode != "160000"
 				{

@@ -674,18 +674,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		// submodule boundary purely from the index (the on-disk `.git` marker is irrelevant, probed vs git
 		// 2.55). Only a subtree conflict (tracked `sub/…` children) stays walkable — its dir is real subtree
 		// content `add` descends into.
-		let gitlinks: std::collections::HashSet<String> = index
-			.entries
-			.iter()
-			.filter(|entry| gitlink_mount(&index, &entry.path, fold))
-			.map(|entry| {
-				if fold {
-					entry.path.to_ascii_lowercase()
-				} else {
-					entry.path.clone()
-				}
-			})
-			.collect();
+		let gitlinks = opaque_gitlink_mounts(&index, fold);
 		// The active sparse matcher: `add` never stages a path outside it (git refuses an out-of-cone path,
 		// advising `--sparse`), whether or not the path already has a skip-worktree entry.
 		let sparse = self.sparse_checkout().await?;
@@ -1198,20 +1187,10 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		let base = pathspec.base_dir();
 		// Tracked submodule (gitlink) mounts: the walker prunes these directories (opaque to `add`),
 		// so it never descends into a submodule to stage its contents nor fails on an unreadable child.
-		// Folded under `core.ignoreCase`; index-based `gitlink_mount` (a gitlink stage with no tracked
-		// children) — a same-path blob-vs-gitlink conflict is still an opaque mount, as git treats it.
-		let gitlinks: std::collections::HashSet<String> = index
-			.entries
-			.iter()
-			.filter(|entry| gitlink_mount(index, &entry.path, fold))
-			.map(|entry| {
-				if fold {
-					entry.path.to_ascii_lowercase()
-				} else {
-					entry.path.clone()
-				}
-			})
-			.collect();
+		// Folded under `core.ignoreCase`; index-based (a gitlink stage with no tracked children) — a
+		// same-path blob-vs-gitlink conflict is still an opaque mount, as git treats it. Precomputed in one
+		// pass (per-entry `gitlink_mount` would be O(N²)).
+		let gitlinks = opaque_gitlink_mounts(index, fold);
 		let mut files = Vec::new();
 		let mut stack = crate::checkout::ignore_prefix(self.work(), base, excludes)?;
 		// Don't walk into an explicitly-named ignored base (`add 'ign/*'` with `.gitignore` containing
@@ -1874,6 +1853,40 @@ fn has_tracked_child<H: HashAlgorithm>(index: &Index<H>, path: &str, fold: bool)
 /// (a subtree-vs-gitlink conflict) turn it into a directory `add` descends into.
 fn gitlink_mount<H: HashAlgorithm>(index: &Index<H>, path: &str, fold: bool) -> bool {
 	has_gitlink_stage(index, path, fold) && !has_tracked_child(index, path, fold)
+}
+
+/// Every folded index key that is an opaque submodule mount for `add` (a gitlink stage with no tracked
+/// children), computed in ONE pass. The walker builds its prune set from this: calling the per-path
+/// `gitlink_mount` predicate (itself O(index)) once per entry would be O(N²) — regressing even a
+/// repository with no submodules — so gather the gitlink keys and subtract those with a tracked child.
+fn opaque_gitlink_mounts<H: HashAlgorithm>(
+	index: &Index<H>,
+	fold: bool,
+) -> std::collections::HashSet<String> {
+	let mut mounts: std::collections::HashSet<String> = index
+		.entries
+		.iter()
+		.filter(|entry| entry.mode == 0o160000)
+		.map(|entry| fold_case(&entry.path, fold))
+		.collect();
+	if mounts.is_empty() {
+		return mounts;
+	}
+	// Drop any gitlink key that has a tracked child (a subtree-vs-gitlink conflict, which `add` descends):
+	// walk each entry's ancestor keys and unmark a gitlink ancestor. O(total path components).
+	let mut with_child: std::collections::HashSet<String> = std::collections::HashSet::new();
+	for entry in &index.entries {
+		let key = fold_case(&entry.path, fold);
+		let mut rest = key.as_str();
+		while let Some((parent, _)) = rest.rsplit_once('/') {
+			if mounts.contains(parent) {
+				with_child.insert(parent.to_owned());
+			}
+			rest = parent;
+		}
+	}
+	mounts.retain(|key| !with_child.contains(key));
+	mounts
 }
 
 /// Case-fold `path` under `core.ignoreCase`, so an on-disk `sub` matches an indexed `Sub`.

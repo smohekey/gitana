@@ -50,6 +50,16 @@ pub enum WorktreeError {
 	/// treat the link as the submodule and aborts (probed vs git 2.55: `diff` → this exact message).
 	#[error("expected submodule path '{0}' not to be a symbolic link")]
 	SubmodulePathIsSymlink(String),
+	/// A tree records a gitlink (mode 160000) with an all-zero object id — not a valid cache entry. git
+	/// refuses to write the index and does not switch branches (probed vs git 2.55: "cache entry has null
+	/// sha1"). A non-null commit gitana does not have locally is fine (an unfetched submodule); only the
+	/// null id is rejected.
+	#[error("cache entry has null sha1: {0}")]
+	NullGitlinkOid(String),
+	/// A working-tree path is a FIFO, socket, or device — git cannot hash it, so `diff` aborts rather than
+	/// rendering a change (probed vs git 2.55: "'{0}': unsupported file type" / "cannot hash '{0}'").
+	#[error("'{0}': unsupported file type")]
+	UnsupportedFileType(String),
 	/// A standard excludes source (`.git/info/exclude`, or a configured/global excludes file) is a
 	/// directory or is otherwise unusable — git's fatal "cannot use … as an exclude file".
 	#[error("cannot use {0} as an exclude file")]

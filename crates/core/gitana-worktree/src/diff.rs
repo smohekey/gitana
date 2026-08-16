@@ -86,6 +86,12 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 						new: Some((new, effective_mode(&meta, 0o100644))),
 					});
 				}
+				// A FIFO/socket/device (`FileKind::Other`) at the slot is git's fatal — it cannot hash the node,
+				// so `diff` aborts ("'sub': unsupported file type") rather than reporting a (falsely clean) type
+				// change. Detected here as the only remaining non-directory kind (probed vs git 2.55).
+				Some(meta) if !meta.kind.is_dir() => {
+					return Err(WorktreeError::UnsupportedFileType(entry.path.clone()));
+				}
 				Some(_) => {
 					if let Some(head) = submodule_head_oid(wt, &entry.path).await
 						&& head != entry.oid
