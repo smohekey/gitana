@@ -70,10 +70,15 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 						new: None,
 					});
 				}
-				// A regular file or symlink replaced the mount — a type change; read its content. A FIFO/socket/
-				// device (`FileKind::Other`) is NOT read (reading a pipe blocks forever) — it falls to the arm
-				// below, which resolves nothing and emits no hunk (git exits "unsupported file type").
-				Some(meta) if meta.kind.is_file() || meta.kind.is_symlink() => {
+				// A SYMLINK at the mount is git's fatal — it refuses to treat the link as the submodule and
+				// aborts `diff` (probed vs git 2.55: "expected submodule path 'sub' not to be a symbolic link").
+				Some(meta) if meta.kind.is_symlink() => {
+					return Err(WorktreeError::SubmodulePathIsSymlink(entry.path.clone()));
+				}
+				// A regular file replaced the mount — a type change; read its content. A FIFO/socket/device
+				// (`FileKind::Other`) is NOT read (reading a pipe blocks forever) — it falls to the arm below,
+				// which resolves nothing and emits no hunk (git exits "unsupported file type").
+				Some(meta) if meta.kind.is_file() => {
 					let new = read_worktree(wt.work(), &entry.path, &meta)?;
 					out.push(FileDiff {
 						path: entry.path.clone(),

@@ -91,7 +91,22 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 	// `UU` marker file unwritten and the conflict unresolvable. Conflicts are incompatible with
 	// skip-worktree, so vivify every conflicted path's merged (marker) content regardless of the sparse
 	// patterns, as git does (an in-cone path was already written, so this is idempotent for it).
-	wt.materialise_paths(merged_tree, conflicts).await?;
+	// For a conflicted GITLINK, `materialise_paths` normally leaves the slot untouched, but a genuine
+	// INCOMING gitlink — one whose merged side differs from ours, e.g. a modify/delete where theirs keeps
+	// the gitlink — must still get an empty mount even when sparse-excluded (git: "Version theirs left in
+	// tree"). Compute that set from the merged tree so a divergent-pointer conflict that keeps ours (merged
+	// == ours) is NOT force-materialised, while a theirs-only/moved incoming gitlink is.
+	let merged = tree_entry_map(repository, merged_tree).await?;
+	let force_gitlink_mounts: std::collections::HashSet<String> = conflicts
+		.iter()
+		.filter(|path| {
+			merged.get(*path).is_some_and(|(mode, _)| *mode == 0o160000)
+				&& merged.get(*path) != ours.get(*path)
+		})
+		.cloned()
+		.collect();
+	wt.materialise_paths(merged_tree, conflicts, &force_gitlink_mounts)
+		.await?;
 
 	let mut index = wt.load_index().await?;
 	for path in conflicts {

@@ -46,6 +46,10 @@ pub enum WorktreeError {
 	/// fatal "'<path>' does not have a commit checked out": the conflict cannot be resolved.
 	#[error("'{0}' does not have a commit checked out")]
 	SubmoduleNoCommit(String),
+	/// git's fatal when a tracked submodule (gitlink) slot is occupied by a symbolic link — it refuses to
+	/// treat the link as the submodule and aborts (probed vs git 2.55: `diff` → this exact message).
+	#[error("expected submodule path '{0}' not to be a symbolic link")]
+	SubmodulePathIsSymlink(String),
 	/// A standard excludes source (`.git/info/exclude`, or a configured/global excludes file) is a
 	/// directory or is otherwise unusable — git's fatal "cannot use … as an exclude file".
 	#[error("cannot use {0} as an exclude file")]

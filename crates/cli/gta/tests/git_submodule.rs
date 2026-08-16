@@ -1669,15 +1669,162 @@ fn add_glob_into_a_submodule_errors_like_git() {
 			String::from_utf8_lossy(&g.stderr)
 		);
 	}
-	// A broad glob crossing the mount is NOT an error (silent opacity), matching git.
-	let broad = assert_cmd::Command::cargo_bin("gta")
+	// A pattern that merely NAMES or case-matches the mount ITSELF (not a path beneath it) must NOT error —
+	// git stages/matches the gitlink. And a broad glob crossing the mount keeps its silent opacity.
+	for spec in ["sub*", ":(icase)sub", "*"] {
+		let g = assert_cmd::Command::cargo_bin("gta")
+			.unwrap()
+			.args(["-C", ws, "add", spec])
+			.output()
+			.expect("run gta");
+		assert!(
+			g.status.success(),
+			"`add {spec}` names/crosses the mount but does not descend into it — must not error, like git: {}",
+			String::from_utf8_lossy(&g.stderr)
+		);
+	}
+	std::fs::remove_dir_all(&w).ok();
+}
+
+/// `gta rm` must treat a NON-directory occupant of a gitlink slot like git: a stage-0 gitlink replaced
+/// by a regular FILE is a local modification a non-force `rm` refuses; and a MIXED same-path conflict
+/// (blob + gitlink stages) whose worktree side is a file has that file unlinked by `rm`, resolving the
+/// conflict — never routed to the rmdir-only mount remover (which would strand the file untracked).
+#[test]
+fn rm_of_a_file_at_a_gitlink_slot_matches_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let commit_c = |w: &str| {
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		git(w, &["config", "user.name", "T"]);
+		git(w, &["config", "user.email", "t@e"]);
+		git(w, &["commit", "-q", "--allow-empty", "-m", "base"]);
+		git(w, &["rev-parse", "HEAD"]).trim().to_owned()
+	};
+
+	// (a) stage-0 gitlink replaced by a regular file → non-force rm refuses (local modification).
+	let a = unique_tmp("gta-sub-rmfile-a");
+	let wa = a.to_str().unwrap();
+	let c = commit_c(wa);
+	git(
+		wa,
+		&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("160000,{c},sub"),
+		],
+	);
+	commit(wa, "addsub");
+	std::fs::write(format!("{wa}/sub"), b"file\n").unwrap();
+	let ga = assert_cmd::Command::cargo_bin("gta")
 		.unwrap()
-		.args(["-C", ws, "add", "*"])
+		.args(["-C", wa, "rm", "sub"])
 		.output()
 		.expect("run gta");
 	assert!(
-		broad.status.success(),
-		"a broad glob must not error on the submodule boundary, like git"
+		!ga.status.success() && a.join("sub").is_file(),
+		"a non-force rm of a file at a gitlink slot must refuse and keep the file, like git"
+	);
+	std::fs::remove_dir_all(&a).ok();
+
+	// (b) mixed conflict (blob stage 2 + gitlink stage 3), worktree file → rm unlinks it, dropping stages.
+	let b = unique_tmp("gta-sub-rmfile-b");
+	let wb = b.to_str().unwrap();
+	commit_c(wb);
+	let blob = String::from_utf8(
+		Command::new("git")
+			.args(["-C", wb, "hash-object", "-w", "--stdin"])
+			.stdin(std::process::Stdio::piped())
+			.stdout(std::process::Stdio::piped())
+			.spawn()
+			.and_then(|mut ch| {
+				use std::io::Write;
+				ch.stdin.take().unwrap().write_all(b"x\n").unwrap();
+				ch.wait_with_output()
+			})
+			.expect("hash-object")
+			.stdout,
+	)
+	.unwrap()
+	.trim()
+	.to_owned();
+	let mut ch = Command::new("git")
+		.args(["-C", wb, "update-index", "--index-info"])
+		.stdin(std::process::Stdio::piped())
+		.spawn()
+		.expect("update-index");
+	{
+		use std::io::Write;
+		ch.stdin
+			.take()
+			.unwrap()
+			.write_all(format!("100644 {blob} 2\tsub\n160000 {blob} 3\tsub\n").as_bytes())
+			.unwrap();
+	}
+	assert!(ch.wait().expect("wait").success());
+	std::fs::write(format!("{wb}/sub"), b"x\n").unwrap();
+	gta(wb, &["rm", "sub"], b"");
+	assert!(
+		!b.join("sub").exists() && git(wb, &["ls-files", "-s", "sub"]).trim().is_empty(),
+		"rm of a mixed-conflict file at a gitlink slot must unlink it and drop the stages, like git"
+	);
+	std::fs::remove_dir_all(&b).ok();
+}
+
+/// `gta diff` must abort like git when a tracked gitlink slot is occupied by a SYMBOLIC LINK — git
+/// refuses to treat the link as the submodule ("expected submodule path 'sub' not to be a symbolic
+/// link"), rather than rendering a type-change diff of the link target.
+#[test]
+fn diff_rejects_a_symlink_at_a_gitlink_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let w = unique_tmp("gta-sub-symlinkdiff");
+	let ws = w.to_str().unwrap();
+	git(
+		ws,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	git(ws, &["config", "user.name", "T"]);
+	git(ws, &["config", "user.email", "t@e"]);
+	git(ws, &["commit", "-q", "--allow-empty", "-m", "base"]);
+	let c = git(ws, &["rev-parse", "HEAD"]).trim().to_owned();
+	git(
+		ws,
+		&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("160000,{c},sub"),
+		],
+	);
+	commit(ws, "addsub");
+	std::os::unix::fs::symlink("/tmp/whatever", format!("{ws}/sub")).unwrap();
+
+	let g = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", ws, "diff"])
+		.output()
+		.expect("run gta");
+	let gi = Command::new("git")
+		.args(["-C", ws, "diff"])
+		.output()
+		.expect("run git");
+	assert!(
+		!g.status.success() && !gi.status.success(),
+		"both git and gta must abort diff on a symlinked gitlink slot"
+	);
+	assert!(
+		String::from_utf8_lossy(&g.stderr).contains("not to be a symbolic link"),
+		"gta must report git's symlinked-submodule error: {}",
+		String::from_utf8_lossy(&g.stderr)
 	);
 	std::fs::remove_dir_all(&w).ok();
 }

@@ -395,19 +395,25 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		&self,
 		tree: ObjectId<H>,
 		paths: &[String],
+		force_gitlink_mounts: &std::collections::HashSet<String>,
 	) -> Result<(), WorktreeError> {
 		let entries = self.repository().read_tree(tree).await?;
 		for (path, mode, oid) in &entries {
 			if paths.iter().any(|p| p == path) {
-				// A gitlink conflict path: git records the base/ours/theirs stages but NEVER materialises the
-				// mount for a conflict — it leaves the slot exactly as it is. A present mount (populated or an
-				// empty mount directory) is preserved; a NON-DIRECTORY the user has there (file, symlink, FIFO,
-				// socket, device) is local data left in place; and an ABSENT mount stays ABSENT (probed vs git
-				// 2.55: a divergent-pointer conflict with no checkout leaves `sub` absent, so `add .` resolves
-				// it as `D sub` rather than erroring on a stray empty mount). So skip the mount write entirely
-				// here. (In a plain checkout `write_worktree_file` DOES create/replace the mount, which is
-				// correct there — this whole-slot preservation is specific to conflicts.)
+				// A gitlink conflict path: git records the base/ours/theirs stages but does not materialise the
+				// mount for a conflict where the merged side merely equals the current pointer — it leaves the
+				// slot exactly as it is. A present mount (populated or an empty mount directory) is preserved; a
+				// NON-DIRECTORY the user has there (file, symlink, FIFO, socket, device) is local data left in
+				// place; and an unchanged conflict's ABSENT mount stays ABSENT (probed vs git 2.55: a
+				// divergent-pointer conflict with no checkout leaves `sub` absent, so `add .` resolves it as
+				// `D sub`). The ONE exception is a genuine INCOMING gitlink (`force_gitlink_mounts`: the merged
+				// side differs from ours — e.g. a modify/delete where theirs keeps the gitlink) whose slot is
+				// ABSENT: git materialises it ("Version theirs of sub left in tree") even when sparse-excluded,
+				// so create the empty mount there.
 				if mode == "160000" {
+					if force_gitlink_mounts.contains(path) && self.work().lstat(path)?.is_none() {
+						crate::checkout::write_worktree_file(self, path, mode, *oid).await?;
+					}
 					continue;
 				}
 				crate::checkout::write_worktree_file(self, path, mode, *oid).await?;
@@ -765,15 +771,18 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			// explicitly-named directory it silently skips out-of-cone matches (like a broad `.` walk) and
 			// never triggers the out-of-cone-directory refusal — probed vs git 2.50.1.
 			if !pathspec.is_literal() || pathspec.is_icase() {
-				// A glob/`:(icase)` spec ROOTED inside a tracked submodule is git's fatal too (`add sub/*`,
-				// `:(icase)sub/new` → "Pathspec '…' is in submodule 'sub'"). Check the boundary BEFORE the glob
-				// walk — which would otherwise silently match nothing and report "did not match". The synthetic
-				// leaf makes `gitlink_ancestor` test the fixed prefix itself (so `sub/*`, whose prefix IS the
-				// mount, errors) as well as its ancestors. A broad glob (empty fixed prefix) keeps its silent
-				// opacity — probed vs git 2.55.
-				let rooted = pathspec.rooted_prefix().trim_end_matches('/');
+				// A glob/`:(icase)` spec that crosses a `/` boundary INTO a tracked submodule is git's fatal too
+				// (`add sub/*`, `:(icase)sub/new` → "Pathspec '…' is in submodule 'sub'"). Check the boundary
+				// BEFORE the glob walk — which would otherwise silently match nothing and report "did not match".
+				// Only a spec whose fixed prefix descends BENEATH the mount errors: `gitlink_ancestor` tests the
+				// STRICT ancestors of the fixed prefix, so `sub/*` (prefix `sub/`) and `:(icase)sub/new` (prefix
+				// `sub/new`) find the `sub` mount, while a prefix that merely NAMES or case-matches the mount
+				// itself — `sub`, `sub*`, `:(icase)sub` (prefix `sub`, no trailing boundary) — has no gitlink
+				// ancestor and stages/matches the gitlink as git does. A broad glob (empty prefix) keeps its
+				// silent opacity — probed vs git 2.55.
+				let rooted = pathspec.rooted_prefix();
 				if !rooted.is_empty()
-					&& let Some(submodule) = gitlink_ancestor(&index, &format!("{rooted}/*"), fold)
+					&& let Some(submodule) = gitlink_ancestor(&index, rooted, fold)
 				{
 					return Err(WorktreeError::PathspecInSubmodule {
 						path: spec.to_owned(),
@@ -1135,6 +1144,13 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				&glob_base
 			};
 			if probe.is_empty() {
+				continue;
+			}
+			// A path inside a tracked submodule mount is opaque — git never reads the submodule's own
+			// `.gitignore` for the superproject, and the spec is rejected as "is in submodule" anyway. Skip it
+			// here (index-only, before touching the mount) so probing the mount's contents cannot fail — e.g.
+			// an `EISDIR` if a directory named `.gitignore` sits inside it (probed vs git 2.55).
+			if gitlink_ancestor(index, probe, fold).is_some() {
 				continue;
 			}
 			let stack = crate::checkout::ignore_prefix(self.work(), probe, excludes)?;
