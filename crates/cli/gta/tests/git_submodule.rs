@@ -513,16 +513,28 @@ fn conflicted_gitlink_status_matches_git() {
 		&src,
 		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
 	);
-	for (body, msg) in [("s1\n", "s1"), ("s2\n", "s2"), ("s3\n", "s3")] {
-		std::fs::write(format!("{src}/f"), body).unwrap();
-		git(&src, &["add", "f"]);
-		commit(&src, msg);
-	}
-	// Two commits that both differ from src's HEAD (the commit `submodule add` records for the base),
-	// so each branch's `cacheinfo` update is a real change git will commit — and they differ from each
-	// other, so merging conflicts the gitlink.
-	let c1 = git(&src, &["rev-parse", "HEAD~2"]).trim().to_owned();
-	let c2 = git(&src, &["rev-parse", "HEAD~1"]).trim().to_owned();
+	// A base commit, then two DIVERGENT children (neither an ancestor of the other). This matters: with a
+	// LINEAR submodule history, a git that can reach the submodule resolves the superproject merge by
+	// fast-forwarding the pointer to the descendant — so it does NOT conflict (the merge is "already up to
+	// date" for that gitlink), which fails this test on some platforms/git versions. Divergent commits
+	// force the pointer conflict on every git.
+	std::fs::write(format!("{src}/f"), b"base\n").unwrap();
+	git(&src, &["add", "f"]);
+	commit(&src, "s0");
+	git(&src, &["switch", "-q", "-c", "a"]);
+	std::fs::write(format!("{src}/f"), b"a\n").unwrap();
+	git(&src, &["add", "f"]);
+	commit(&src, "sa");
+	let c1 = git(&src, &["rev-parse", "HEAD"]).trim().to_owned();
+	git(&src, &["switch", "-q", "main"]);
+	git(&src, &["switch", "-q", "-c", "b"]);
+	std::fs::write(format!("{src}/f"), b"b\n").unwrap();
+	git(&src, &["add", "f"]);
+	commit(&src, "sb");
+	let c2 = git(&src, &["rev-parse", "HEAD"]).trim().to_owned();
+	// Leave src on the base commit so `submodule add` records s0 — distinct from both c1 and c2, so the
+	// three-way pointer merge (base s0, ours sb, theirs sa) is a genuine divergent conflict.
+	git(&src, &["switch", "-q", "main"]);
 	git(
 		&sup,
 		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
