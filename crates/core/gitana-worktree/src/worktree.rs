@@ -1491,6 +1491,11 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				.filter(|path| admissible(path))
 				.map(str::to_owned),
 		);
+		// DEFERRED divergence: this reconciliation `lstat`s the EXACT index spelling. Under `core.ignoreCase`
+		// on a CASE-SENSITIVE filesystem, an indexed `Sub` whose on-disk mount is `sub` reports absent and the
+		// deletion arm drops it. This is gitana's general recased-entry handling (a recased tracked FILE drops
+		// the same way), not gitlink-specific; a fold-correct fix threads the folded on-disk spelling through
+		// `stage_file` too. Left as a documented deferral (unreproducible on a case-insensitive host).
 		for path in candidates {
 			match self.work().lstat(&path)? {
 				// Present as a file/symlink but unwalked — a tracked file the walk pruned as ignored. Restage
