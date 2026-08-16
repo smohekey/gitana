@@ -284,6 +284,19 @@ impl Pathspec {
 		}
 	}
 
+	/// The fixed leading path of the spec — everything before its first wildcard — INCLUDING any final
+	/// component (unlike [`base_dir`], which drops it) and regardless of `:(icase)` (the path structure is
+	/// still known even when the casing is not). `sub/*` → `sub/`, `:(icase)sub/new` → `sub/new`, `*` → ``.
+	/// Used to detect a spec rooted inside a tracked submodule (`add sub/*` is git's "is in submodule").
+	pub(crate) fn rooted_prefix(&self) -> &str {
+		let first_wild = self
+			.normalized
+			.bytes()
+			.position(|b| matches!(b, b'*' | b'?' | b'[' | b'\\'))
+			.unwrap_or(self.normalized.len());
+		&self.normalized[..first_wild]
+	}
+
 	/// Whether this pathspec matches the worktree-relative `path`. A glob uses git's default pathspec
 	/// wildmatch (`*`/`?`/`[]` cross `/`, `**` not special — probed against git 2.50.1); a literal spec
 	/// matches `path` exactly (unless it required a directory) or as a leading directory of `path`. A

@@ -1546,6 +1546,142 @@ fn switch_back_reuses_a_populated_submodule_like_git() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// `gta rm` on a submodule (gitlink) must match git: an EMPTY mount directory (the state a plain
+/// gitlink checkout leaves) is removed with its index entry WITHOUT --force, an ABSENT mount just drops
+/// the index entry, and a POPULATED submodule is refused by a non-force `rm` (git refuses too — via its
+/// .gitmodules name lookup, out of scope here). `rm` must never `remove_file` the mount directory.
+#[test]
+fn rm_removes_a_gitlink_mount_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let cacheinfo = |w: &str| {
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		git(w, &["config", "user.name", "T"]);
+		git(w, &["config", "user.email", "t@e"]);
+		git(w, &["commit", "-q", "--allow-empty", "-m", "base"]);
+		let c = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+		git(
+			w,
+			&[
+				"update-index",
+				"--add",
+				"--cacheinfo",
+				&format!("160000,{c},sub"),
+			],
+		);
+		commit(w, "addsub");
+	};
+
+	// Empty mount: `gta rm sub` removes the index entry and the directory, no --force needed.
+	let empty = unique_tmp("gta-sub-rm-empty");
+	let we = empty.to_str().unwrap();
+	cacheinfo(we);
+	std::fs::create_dir_all(format!("{we}/sub")).unwrap();
+	gta(we, &["rm", "sub"], b"");
+	assert!(
+		git(we, &["ls-files", "sub"]).trim().is_empty() && !empty.join("sub").exists(),
+		"rm of an empty gitlink mount must drop the index entry and the directory, like git"
+	);
+	std::fs::remove_dir_all(&empty).ok();
+
+	// Populated real submodule: a non-force `rm` must refuse and keep both the entry and the directory.
+	let pop = unique_tmp("gta-sub-rm-pop");
+	let wp = pop.to_str().unwrap();
+	cacheinfo(wp);
+	std::fs::create_dir_all(format!("{wp}/sub")).unwrap();
+	git(&format!("{wp}/sub"), &["init", "-q", "-b", "main", "."]);
+	git(&format!("{wp}/sub"), &["config", "user.name", "T"]);
+	git(&format!("{wp}/sub"), &["config", "user.email", "t@e"]);
+	git(
+		&format!("{wp}/sub"),
+		&["commit", "-q", "--allow-empty", "-m", "x"],
+	);
+	let out = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", wp, "rm", "sub"])
+		.output()
+		.expect("run gta");
+	assert!(
+		!out.status.success(),
+		"non-force rm of a populated submodule must refuse, like git"
+	);
+	assert!(
+		!git(wp, &["ls-files", "sub"]).trim().is_empty() && pop.join("sub").is_dir(),
+		"the refused populated submodule keeps its index entry and working tree"
+	);
+	std::fs::remove_dir_all(&pop).ok();
+}
+
+/// A GLOB or `:(icase)` pathspec rooted inside a tracked submodule must be git's fatal too — `gta add
+/// sub/*` / `:(icase)sub/new` → "Pathspec '…' is in submodule 'sub'" — not a silent "did not match".
+/// A broad glob that merely crosses the mount (`*` at the root) keeps its silent opacity, like git.
+#[test]
+fn add_glob_into_a_submodule_errors_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let w = unique_tmp("gta-sub-addglob");
+	let ws = w.to_str().unwrap();
+	git(
+		ws,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	git(ws, &["config", "user.name", "T"]);
+	git(ws, &["config", "user.email", "t@e"]);
+	git(ws, &["commit", "-q", "--allow-empty", "-m", "base"]);
+	let c = git(ws, &["rev-parse", "HEAD"]).trim().to_owned();
+	git(
+		ws,
+		&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("160000,{c},sub"),
+		],
+	);
+	commit(ws, "addsub");
+	std::fs::create_dir_all(format!("{ws}/sub")).unwrap();
+	std::fs::write(format!("{ws}/sub/new"), b"x\n").unwrap();
+
+	for spec in ["sub/*", ":(icase)sub/new"] {
+		let g = assert_cmd::Command::cargo_bin("gta")
+			.unwrap()
+			.args(["-C", ws, "add", spec])
+			.output()
+			.expect("run gta");
+		let gi = Command::new("git")
+			.args(["-C", ws, "add", spec])
+			.output()
+			.expect("run git");
+		assert!(
+			!g.status.success() && !gi.status.success(),
+			"both must reject `add {spec}` rooted in a submodule"
+		);
+		assert!(
+			String::from_utf8_lossy(&g.stderr).contains("is in submodule 'sub'"),
+			"gta must name the submodule for `add {spec}`: {}",
+			String::from_utf8_lossy(&g.stderr)
+		);
+	}
+	// A broad glob crossing the mount is NOT an error (silent opacity), matching git.
+	let broad = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", ws, "add", "*"])
+		.output()
+		.expect("run gta");
+	assert!(
+		broad.status.success(),
+		"a broad glob must not error on the submodule boundary, like git"
+	);
+	std::fs::remove_dir_all(&w).ok();
+}
+
 /// The added/removed lines of two diffs, sorted, for order-independent comparison.
 fn sorted(text: &str) -> Vec<String> {
 	let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();

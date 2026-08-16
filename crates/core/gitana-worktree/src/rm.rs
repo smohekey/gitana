@@ -163,8 +163,20 @@ where
 				continue;
 			};
 
-			// `local`: the working-tree file differs from the index entry.
-			let local = if stat_matches(entry, &meta) {
+			// `local`: the working-tree file differs from the index entry. A submodule (gitlink) mount is
+			// opaque — never hashed as a blob: an EMPTY (or absent, handled above) mount is reconstructable,
+			// so `rm sub` removes it and its index entry without --force (probed vs git 2.55); a POPULATED
+			// mount holds the submodule's own working tree, which a non-force `rm` must not discard, so it
+			// counts as a local modification that blocks the removal (git also refuses — via a .gitmodules
+			// name lookup, out of scope here). An unreadable mount is treated as populated (fail-safe).
+			let local = if entry.mode == 0o160000 {
+				meta.kind.is_dir()
+					&& wt
+						.work()
+						.read_dir(path)
+						.map(|entries| !entries.is_empty())
+						.unwrap_or(true)
+			} else if stat_matches(entry, &meta) {
 				false
 			} else {
 				match blob_of(wt.work(), path, &meta)? {
@@ -213,9 +225,24 @@ where
 	let mut removed = Vec::with_capacity(selected.len());
 	let mut failure: Option<WorktreeError> = None;
 	for path in &selected {
-		if !cached && let Err(error) = remove_worktree_file(wt, path) {
-			failure.get_or_insert(error);
-			continue;
+		// A submodule (gitlink) mount is removed by `rmdir` (an EMPTY mount goes; a populated one is left in
+		// place — non-force `rm` already refused it above), never by `remove_file`, which fails on a directory
+		// (probed vs git 2.55: `rm sub` removes the empty mount). Detect a gitlink at ANY stage so an unmerged
+		// conflict mount (no stage-0 entry) is handled too.
+		let is_gitlink = index
+			.entries
+			.iter()
+			.any(|entry| entry.path == *path && entry.mode == 0o160000);
+		if !cached {
+			let removal = if is_gitlink {
+				crate::checkout::remove_gitlink_mount(wt, path)
+			} else {
+				remove_worktree_file(wt, path)
+			};
+			if let Err(error) = removal {
+				failure.get_or_insert(error);
+				continue;
+			}
 		}
 		index.remove(path);
 		removed.push(path.clone());

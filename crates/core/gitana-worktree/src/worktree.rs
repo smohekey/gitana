@@ -765,6 +765,21 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			// explicitly-named directory it silently skips out-of-cone matches (like a broad `.` walk) and
 			// never triggers the out-of-cone-directory refusal — probed vs git 2.50.1.
 			if !pathspec.is_literal() || pathspec.is_icase() {
+				// A glob/`:(icase)` spec ROOTED inside a tracked submodule is git's fatal too (`add sub/*`,
+				// `:(icase)sub/new` → "Pathspec '…' is in submodule 'sub'"). Check the boundary BEFORE the glob
+				// walk — which would otherwise silently match nothing and report "did not match". The synthetic
+				// leaf makes `gitlink_ancestor` test the fixed prefix itself (so `sub/*`, whose prefix IS the
+				// mount, errors) as well as its ancestors. A broad glob (empty fixed prefix) keeps its silent
+				// opacity — probed vs git 2.55.
+				let rooted = pathspec.rooted_prefix().trim_end_matches('/');
+				if !rooted.is_empty()
+					&& let Some(submodule) = gitlink_ancestor(&index, &format!("{rooted}/*"), fold)
+				{
+					return Err(WorktreeError::PathspecInSubmodule {
+						path: spec.to_owned(),
+						submodule,
+					});
+				}
 				self
 					.add_glob(
 						&mut index,

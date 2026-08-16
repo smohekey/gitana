@@ -232,13 +232,20 @@ where
 			// worktree-cleanliness checks below — a lone matching `Sub` gitlink must not exempt it and let a
 			// dirty working file be overwritten (probed reasoning; fail-safe toward running the checks).
 			let path_key = fold_key(path, fold);
-			let mut folded_owners = current
+			let folded_owners: Vec<_> = current
 				.iter()
 				.filter(|(cp, _)| fold_key(cp, fold) == path_key)
-				.peekable();
-			let current_is_gitlink = (folded_owners.peek().is_some()
-				&& folded_owners.all(|(_, (cm, _))| cm == "160000"))
-				|| (*mode == "160000" && is_submodule_checkout(wt.work(), path));
+				.collect();
+			// The INCOMING-mount exemption (target gitlink over an on-disk submodule checkout) must apply only
+			// when the slot has NO current tracked owner — mirroring `merge_apply`. When the current entry is a
+			// non-gitlink blob the user has locally replaced with a directory, git REFUSES the checkout ("local
+			// changes would be overwritten") rather than recording the gitlink over the user's files (which a
+			// later checkout back to a blob would then `remove_dir_all`, losing them; probed vs git 2.55).
+			let current_is_gitlink = (!folded_owners.is_empty()
+				&& folded_owners.iter().all(|(_, (cm, _))| cm == "160000"))
+				|| (folded_owners.is_empty()
+					&& *mode == "160000"
+					&& is_submodule_checkout(wt.work(), path));
 			// The working-tree files whose cleanliness we must check before (re)writing this target path, each
 			// against the blob it is tracked under. Prefer the target's EXACT current entry; otherwise EVERY
 			// case-colliding entry that folds to this key (`Foo` and `foo`), so the shared inode is verified
