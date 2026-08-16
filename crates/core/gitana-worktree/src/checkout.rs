@@ -440,7 +440,13 @@ where
 		// tree would be left half-applied), so fail closed instead.
 		lock.mark_mutation_started();
 		for path in &renamed_away {
-			remove_current_path(wt, path, current.get(path))?;
+			// Detect a gitlink at ANY index stage (a modify/delete abort has only conflict stages, no
+			// stage-0 entry), so the empty mount materialised for the conflict is rmdir'd, not left behind.
+			let is_gitlink = index
+				.entries
+				.iter()
+				.any(|entry| entry.path == *path && entry.mode == 0o160000);
+			remove_current_path(wt, path, is_gitlink)?;
 			index.remove(path);
 		}
 
@@ -466,7 +472,13 @@ where
 		// directory→symlink switch the stale child under the old directory is already gone), so the
 		// removal never escapes the work tree.
 		for path in &stray {
-			remove_current_path(wt, path, current.get(path))?;
+			// Detect a gitlink at ANY index stage (a modify/delete abort has only conflict stages, no
+			// stage-0 entry), so the empty mount materialised for the conflict is rmdir'd, not left behind.
+			let is_gitlink = index
+				.entries
+				.iter()
+				.any(|entry| entry.path == *path && entry.mode == 0o160000);
+			remove_current_path(wt, path, is_gitlink)?;
 			index.remove(path);
 		}
 		// A subtree→gitlink transition removes the outgoing descendants (`sub/file` strays), and
@@ -1465,22 +1477,22 @@ where
 	Ok(())
 }
 
-/// Remove `path` during a non-merge (`run`) checkout, honoring gitlink semantics. A CURRENT gitlink
-/// (mode 160000) uses the rmdir-only [`remove_gitlink_mount`] — an empty mount is removed, but a
-/// populated submodule OR a file/symlink the user placed at the slot is LEFT, as git only attempts
-/// `rmdir` for a removed submodule and never unlinks that content. Anything else is an ordinary
-/// file/symlink removal via [`remove_worktree_path`].
+/// Remove `path` during a non-merge (`run`) checkout, honoring gitlink semantics. When `is_gitlink`
+/// (the removed entry is a submodule at ANY index stage — including the conflict stages of a
+/// modify/delete abort with no stage-0 entry) the rmdir-only [`remove_gitlink_mount`] removes an empty
+/// mount but LEAVES a populated submodule or a file/symlink at the slot, as git only attempts `rmdir`
+/// for a removed submodule. Anything else is an ordinary file/symlink removal via [`remove_worktree_path`].
 fn remove_current_path<F, W, H>(
 	wt: &WorkTree<F, W, H>,
 	path: &str,
-	current: Option<&(String, ObjectId<H>)>,
+	is_gitlink: bool,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
 	W: WorkDirFs,
 	H: HashAlgorithm,
 {
-	if current.is_some_and(|(mode, _)| mode == "160000") {
+	if is_gitlink {
 		remove_gitlink_mount(wt, path)
 	} else {
 		remove_worktree_path(wt, path)
@@ -1574,8 +1586,20 @@ fn has_symlinked_ancestor<W: WorkDirFs>(work: &W, path: &str) -> bool {
 /// exempting it from the untracked-content overwrite guard. An arbitrary untracked directory (no `.git`)
 /// is NOT a submodule checkout and stays protected.
 fn is_submodule_checkout<W: WorkDirFs>(work: &W, path: &str) -> bool {
-	matches!(work.lstat(path), Ok(Some(meta)) if meta.kind.is_dir())
-		&& matches!(work.lstat(&format!("{path}/.git")), Ok(Some(_)))
+	if !matches!(work.lstat(path), Ok(Some(meta)) if meta.kind.is_dir()) {
+		return false;
+	}
+	// Validate the `.git` marker, not merely its existence: an untracked directory with a malformed or
+	// empty `.git` is NOT a submodule checkout and must stay protected (git rejects it). A gitdir directory
+	// has a `HEAD`; a gitfile points at one (`gitdir: <path>`).
+	let dotgit = format!("{path}/.git");
+	match work.lstat(&dotgit) {
+		Ok(Some(meta)) if meta.kind.is_dir() => {
+			matches!(work.lstat(&format!("{dotgit}/HEAD")), Ok(Some(_)))
+		}
+		Ok(Some(_)) => matches!(work.read(&dotgit), Ok(bytes) if bytes.starts_with(b"gitdir:")),
+		_ => false,
+	}
 }
 
 fn ensure_no_overwrite<F, W, H>(
