@@ -408,6 +408,10 @@ where
 		// validates the target objects before mutating. A preserved, unchanged, or sparse-excluded path
 		// writes no file, so it needs no blob.
 		for (path, mode, oid) in &target {
+			// A null-OID gitlink target is never valid — reject it before any skip below (even `force`, and
+			// regardless of sparsity), matching git's "cache entry has null sha1" abort that leaves HEAD/index
+			// untouched. The `writes` loop's own skip for gitlinks would otherwise persist it.
+			reject_null_gitlink_oid(mode, oid, path)?;
 			if preserve_folds.contains(&fold_key(path, fold)) {
 				continue;
 			}
@@ -1087,13 +1091,8 @@ where
 			// `write_entry`/`write_worktree_file` removes trusting it is reconstructable from its current blob
 			// — that OUTGOING blob must exist, else the file is the sole surviving copy and the replacement
 			// loses it. Validate it before any mutation.
+			reject_null_gitlink_oid(mode, oid, path)?;
 			if mode == "160000" {
-				// An all-zero gitlink OID is not a valid cache entry — git refuses to write the index and does
-				// not switch ("cache entry has null sha1"). Reject it before mutating anything; a non-null commit
-				// gitana lacks locally (an unfetched submodule) is still fine.
-				if oid.as_bytes().iter().all(|&byte| byte == 0) {
-					return Err(WorktreeError::NullGitlinkOid(path.to_owned()));
-				}
 				if let Some((from_mode, from_oid)) = staged.get(path)
 					&& from_mode != "160000"
 				{
@@ -1594,13 +1593,29 @@ where
 	Ok(())
 }
 
+/// A gitlink (mode 160000) with an all-zero OID is not a valid cache entry — git refuses to write the
+/// index and does not switch ("cache entry has null sha1"). EVERY checkout/restore path that skips the
+/// object preflight for a gitlink must reject a null id first, or a crafted target tree would create the
+/// mount and persist `160000 000… path` in the index. A non-null commit gitana lacks locally (an
+/// unfetched submodule) is still fine — only the null id is rejected (probed vs git 2.55).
+pub(crate) fn reject_null_gitlink_oid<H: HashAlgorithm>(
+	mode: &str,
+	oid: &ObjectId<H>,
+	path: &str,
+) -> Result<(), WorktreeError> {
+	if mode == "160000" && oid.as_bytes().iter().all(|&byte| byte == 0) {
+		return Err(WorktreeError::NullGitlinkOid(path.to_owned()));
+	}
+	Ok(())
+}
+
 /// Whether any ancestor directory of `path` is a symlink. A removal must not follow such an ancestor
 /// out of the work tree (the checkout CVE class): the file it would reach is not a real tracked file
 /// within the tree — and after a directory→symlink switch the stale child under the old directory is
 /// already gone — so the removal is skipped. Lexical [`validate_path`] cannot catch this: `link/x`
 /// is lexically safe, yet `link` may point outside. A non-existent (or unstattable) ancestor is not
 /// a symlink.
-fn has_symlinked_ancestor<W: WorkDirFs>(work: &W, path: &str) -> bool {
+pub(crate) fn has_symlinked_ancestor<W: WorkDirFs>(work: &W, path: &str) -> bool {
 	let parts: Vec<&str> = path.split('/').collect();
 	let mut ancestor = String::new();
 	for part in &parts[..parts.len().saturating_sub(1)] {

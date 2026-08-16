@@ -241,7 +241,15 @@ where
 		if !cached {
 			let removal = match wt.work().lstat(path)? {
 				Some(meta) if is_gitlink && meta.kind.is_dir() => {
-					wt.work().remove_dir(path).map_err(WorktreeError::from)
+					// Never `rmdir` THROUGH a symlinked ancestor: for a nested gitlink `link/sub` where `link`
+					// is a symlink to another in-tree directory, `lstat` follows the link and a raw `remove_dir`
+					// would delete the real `actual/sub`. git aborts because `link` is symbolic, so refuse here
+					// too — keeping the index entry (probed vs git 2.55).
+					if crate::checkout::has_symlinked_ancestor(wt.work(), path) {
+						Err(WorktreeError::UnsafePath(path.to_owned()))
+					} else {
+						wt.work().remove_dir(path).map_err(WorktreeError::from)
+					}
 				}
 				_ => remove_worktree_file(wt, path),
 			};

@@ -1829,6 +1829,74 @@ fn diff_rejects_a_symlink_at_a_gitlink_like_git() {
 	std::fs::remove_dir_all(&w).ok();
 }
 
+/// `gta rm` of a nested gitlink whose ancestor is an on-disk SYMLINK must not follow the link out of the
+/// tree and delete the real target — git aborts because the ancestor is symbolic. A non-force `rm
+/// link/sub` (where `link` → `actual/`) must refuse and leave `actual/sub` untouched, matching git's
+/// refusal (the messages differ; the data-safety outcome must not).
+#[test]
+fn rm_refuses_a_gitlink_through_a_symlinked_ancestor_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let build = |w: &str| {
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		git(w, &["config", "user.name", "T"]);
+		git(w, &["config", "user.email", "t@e"]);
+		git(w, &["commit", "-q", "--allow-empty", "-m", "base"]);
+		let c = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+		git(
+			w,
+			&[
+				"update-index",
+				"--add",
+				"--cacheinfo",
+				&format!("160000,{c},link/sub"),
+			],
+		);
+		commit(w, "addlink");
+		// A real in-tree directory holding an empty `sub` mount, and `link` a symlink INTO it.
+		std::fs::create_dir_all(format!("{w}/actual/sub")).unwrap();
+		std::os::unix::fs::symlink("actual", format!("{w}/link")).unwrap();
+	};
+
+	for (tool, is_gta) in [("gta", true), ("git", false)] {
+		let dir = unique_tmp(&format!("gta-sub-rmsymlink-{tool}"));
+		let d = dir.to_str().unwrap();
+		build(d);
+		let status = if is_gta {
+			assert_cmd::Command::cargo_bin("gta")
+				.unwrap()
+				.args(["-C", d, "rm", "link/sub"])
+				.output()
+				.expect("run gta")
+				.status
+		} else {
+			Command::new("git")
+				.args(["-C", d, "rm", "link/sub"])
+				.output()
+				.expect("run git")
+				.status
+		};
+		assert!(
+			!status.success(),
+			"{tool} must refuse rm through a symlinked ancestor"
+		);
+		assert!(
+			dir.join("actual/sub").is_dir(),
+			"{tool}: the real target behind the symlink must survive"
+		);
+		assert!(
+			!git(d, &["ls-files", "link/sub"]).trim().is_empty(),
+			"{tool}: the index entry must be kept after the refusal"
+		);
+		std::fs::remove_dir_all(&dir).ok();
+	}
+}
+
 /// `gta diff` must abort like git when a tracked gitlink slot is occupied by a FIFO/socket/device — git
 /// cannot hash the node ("'sub': unsupported file type"), so it aborts rather than reporting a falsely
 /// clean type change.

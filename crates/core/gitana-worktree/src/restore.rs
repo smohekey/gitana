@@ -139,10 +139,13 @@ where
 		for &path in &selected {
 			// A gitlink names a submodule COMMIT, not a blob — skip the blob preflight (as `checkout` does);
 			// `write_worktree_file` creates the empty mount directory without reading an object.
-			if let Some((_, mode, oid)) = source_entries.iter().find(|(p, _, _)| p == path)
-				&& mode != "160000"
-			{
-				wt.repository().read_blob(*oid).await?;
+			if let Some((_, mode, oid)) = source_entries.iter().find(|(p, _, _)| p == path) {
+				// A null-OID gitlink is not a valid cache entry — reject it here too (git's "cache entry has
+				// null sha1"), not just in the merge/switch paths, rather than persisting it via the skip.
+				crate::checkout::reject_null_gitlink_oid(mode, oid, path)?;
+				if mode != "160000" {
+					wt.repository().read_blob(*oid).await?;
+				}
 			}
 		}
 	}
