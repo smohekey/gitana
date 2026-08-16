@@ -6,7 +6,7 @@ use gitana_file_store::{DeleteOutcome, DurabilityTarget, FileStore, FileStoreErr
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_commit, referenced_ids};
 use gitana_object_store::{ObjectBacking, ObjectStoreError};
 
-use crate::{RefStore, Repository, RepositoryError};
+use crate::{Config, HeadState, RefStore, Repository, RepositoryError};
 
 const STABILITY_ATTEMPTS: usize = 4;
 
@@ -29,10 +29,17 @@ where
 	pub async fn durability_barrier_initialized(&self) -> Result<(), RepositoryError> {
 		let files = self.objects().file_store();
 		for _ in 0..STABILITY_ATTEMPTS {
-			self.read_config().await?;
-			self.refs().read_head().await?;
 			let config = files.read_path("config").await?;
 			let head = files.read_path("HEAD").await?;
+			let parsed = Config::parse_bytes(&config)?;
+			if parsed.object_format != H::NAME {
+				return Err(RepositoryError::UnsupportedFormat(format!(
+					"objectformat = {} does not match repository algorithm {}",
+					parsed.object_format,
+					H::NAME
+				)));
+			}
+			HeadState::<H>::parse(&head)?;
 			let targets = [
 				DurabilityTarget::file("config"),
 				DurabilityTarget::file("HEAD"),
@@ -667,6 +674,26 @@ mod tests {
 				DurabilityTarget::file("HEAD")
 			]
 		);
+	}
+
+	#[tokio::test]
+	async fn initialization_barrier_rejects_a_mismatched_object_format() {
+		let (files, barriers) = RecordingFileStore::new();
+		let repo = Repository::<_, Sha256>::new(ObjectStore::new(files));
+		repo.init().await.unwrap();
+		repo
+			.objects()
+			.file_store()
+			.write_path_replace("config", Config::sha1().render().as_bytes())
+			.await
+			.unwrap();
+
+		assert!(matches!(
+			repo.durability_barrier_initialized().await,
+			Err(RepositoryError::UnsupportedFormat(reason))
+				if reason.contains("does not match repository algorithm sha256")
+		));
+		assert!(barriers.lock().unwrap().is_empty());
 	}
 
 	#[tokio::test]
