@@ -38,6 +38,10 @@ pub enum WorktreeError {
 	/// A pathspec matched no entries in the restore source.
 	#[error("pathspec did not match any file(s): {0}")]
 	PathspecMatch(String),
+	/// An explicitly-named pathspec points inside a tracked submodule (git's fatal, exit 128): the
+	/// superproject cannot add a submodule's own contents.
+	#[error("Pathspec '{path}' is in submodule '{submodule}'")]
+	PathspecInSubmodule { path: String, submodule: String },
 	/// A standard excludes source (`.git/info/exclude`, or a configured/global excludes file) is a
 	/// directory or is otherwise unusable — git's fatal "cannot use … as an exclude file".
 	#[error("cannot use {0} as an exclude file")]

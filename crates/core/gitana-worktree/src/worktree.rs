@@ -795,6 +795,16 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					.await?;
 				continue;
 			}
+			// An EXPLICITLY-named path inside a tracked submodule is git's fatal (exit 128): the superproject
+			// cannot stage a submodule's own contents. (A broad walk prunes the mount silently; only a literal
+			// path naming INTO it errors — probed vs git 2.55: `add sub/f` → "Pathspec 'sub/f' is in submodule
+			// 'sub'".)
+			if let Some(submodule) = gitlink_ancestor(&index, &rel) {
+				return Err(WorktreeError::PathspecInSubmodule {
+					path: rel,
+					submodule,
+				});
+			}
 			match self.work().lstat(&rel)? {
 				Some(meta) if meta.kind.is_dir() => {
 					let mut files = Vec::new();
@@ -1769,14 +1779,21 @@ fn is_gitlink_at<H: HashAlgorithm>(index: &Index<H>, path: &str) -> bool {
 /// (which would replace the `160000` gitlink with an ordinary subtree). Exact-path ancestry (git's
 /// index is keyed exactly); a case-variant mount is a rare edge left to the mount's own casing.
 fn ancestor_is_gitlink<H: HashAlgorithm>(index: &Index<H>, path: &str) -> bool {
+	gitlink_ancestor(index, path).is_some()
+}
+
+/// The nearest ancestor of `path` that is a tracked submodule (gitlink) at any stage, if any — the
+/// submodule that `path` lies inside. Used to name the submodule in the "is in submodule" error git
+/// raises for an explicitly-named `add` path beneath a mount.
+fn gitlink_ancestor<H: HashAlgorithm>(index: &Index<H>, path: &str) -> Option<String> {
 	let mut rest = path;
 	while let Some((parent, _)) = rest.rsplit_once('/') {
 		if is_gitlink_at(index, parent) {
-			return true;
+			return Some(parent.to_owned());
 		}
 		rest = parent;
 	}
-	false
+	None
 }
 
 fn walk_files<W: WorkDirFs>(

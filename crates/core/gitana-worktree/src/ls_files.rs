@@ -161,9 +161,16 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			}
 			if opts.modified || opts.deleted {
 				// git ignores the working tree for a skip-worktree (sparse) entry entirely: neither `-m` nor
-				// `-d` inspects its file, present or absent.
+				// `-d` inspects its file — EXCEPT a submodule (gitlink) whose mount is present on disk. git
+				// still examines a present sparse gitlink for `-m` and reports it when its checked-out `HEAD`
+				// differs from the recorded commit (probed vs git 2.55; matches `gta status`, which reports
+				// ` M sub`). A regular sparse file, or an absent gitlink mount, stays skipped.
 				if entry.skip_worktree {
-					continue;
+					let present_gitlink =
+						entry.mode == 0o160000 && wt.work().lstat(&entry.path).ok().flatten().is_some();
+					if !present_gitlink {
+						continue;
+					}
 				}
 				// Classify without over-reading: `-d` needs only an `lstat` (absence). Content is read only
 				// for a present, `-m`-selected, non-assume-valid entry — and a read failure is treated as a

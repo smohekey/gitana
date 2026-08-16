@@ -1088,6 +1088,54 @@ fn populated_submodule_conflict_and_resolution_like_git() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// An explicitly-named `gta add <path-inside-a-submodule>` must fail like git ("Pathspec '…' is in
+/// submodule '…'"), not silently succeed — the superproject cannot stage a submodule's own contents.
+#[test]
+fn add_inside_a_submodule_errors_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-sub-addinside");
+	let w = work.to_str().unwrap();
+	let src = format!("{w}/src");
+	let sup = format!("{w}/super");
+	std::fs::create_dir_all(&src).unwrap();
+	std::fs::create_dir_all(&sup).unwrap();
+	git(
+		&src,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	std::fs::write(format!("{src}/f"), b"s\n").unwrap();
+	git(&src, &["add", "f"]);
+	commit(&src, "s");
+	git(
+		&sup,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	std::fs::write(format!("{sup}/root"), b"r\n").unwrap();
+	git(&sup, &["add", "root"]);
+	commit(&sup, "base");
+	git_allow(&sup, &["submodule", "add", "../src", "sub"]);
+	commit(&sup, "add submodule");
+
+	let out = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", &sup, "add", "sub/f"])
+		.output()
+		.expect("run gta");
+	assert!(
+		!out.status.success(),
+		"add of a path inside a submodule must fail"
+	);
+	assert!(
+		String::from_utf8_lossy(&out.stderr).contains("Pathspec 'sub/f' is in submodule 'sub'"),
+		"error must name the submodule like git: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
 /// The added/removed lines of two diffs, sorted, for order-independent comparison.
 fn sorted(text: &str) -> Vec<String> {
 	let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
