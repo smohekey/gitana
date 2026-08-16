@@ -1017,13 +1017,26 @@ fn populated_submodule_conflict_and_resolution_like_git() {
 		&src,
 		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
 	);
+	// c[0] is the base; c[1] (ours) and c[2] (theirs) DIVERGE from it — neither is an ancestor of the
+	// other — so the pointer merge is a genuine conflict. (Deliberate: gitana records a conflict for any
+	// divergent submodule-pointer pair and does NOT fast-forward a linear one the way git does — that
+	// would require reading the submodule's own commit graph, part of the deferred submodule-operations
+	// work, like the `-dirty` submodule-content divergence.)
 	let mut c = Vec::new();
-	for (body, msg) in [("s1\n", "s1"), ("s2\n", "s2"), ("s3\n", "s3")] {
-		std::fs::write(format!("{src}/f"), body).unwrap();
-		git(&src, &["add", "f"]);
-		commit(&src, msg);
-		c.push(git(&src, &["rev-parse", "HEAD"]).trim().to_owned());
-	}
+	std::fs::write(format!("{src}/f"), b"s1\n").unwrap();
+	git(&src, &["add", "f"]);
+	commit(&src, "s1");
+	c.push(git(&src, &["rev-parse", "HEAD"]).trim().to_owned());
+	git(&src, &["switch", "-q", "-c", "ours-side"]);
+	std::fs::write(format!("{src}/f"), b"s2\n").unwrap();
+	git(&src, &["add", "f"]);
+	commit(&src, "s2");
+	c.push(git(&src, &["rev-parse", "HEAD"]).trim().to_owned());
+	git(&src, &["switch", "-q", "main"]);
+	std::fs::write(format!("{src}/g"), b"s3\n").unwrap();
+	git(&src, &["add", "g"]);
+	commit(&src, "s3");
+	c.push(git(&src, &["rev-parse", "HEAD"]).trim().to_owned());
 	git(
 		&sup,
 		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
@@ -1132,6 +1145,63 @@ fn add_inside_a_submodule_errors_like_git() {
 		String::from_utf8_lossy(&out.stderr).contains("Pathspec 'sub/f' is in submodule 'sub'"),
 		"error must name the submodule like git: {}",
 		String::from_utf8_lossy(&out.stderr)
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// Switching AWAY from a branch with an initialized submodule and back must reuse the retained
+/// submodule checkout like git — never abort on the populated `sub/…` files. (An arbitrary untracked
+/// directory with no `.git` at the slot is still protected; only a real submodule checkout is exempt.)
+#[test]
+fn switch_back_reuses_a_populated_submodule_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-sub-backreuse");
+	let w = work.to_str().unwrap();
+	let src = format!("{w}/src");
+	let sup = format!("{w}/super");
+	std::fs::create_dir_all(&src).unwrap();
+	std::fs::create_dir_all(&sup).unwrap();
+	git(
+		&src,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	std::fs::write(format!("{src}/f"), b"s\n").unwrap();
+	git(&src, &["add", "f"]);
+	commit(&src, "s");
+	git(
+		&sup,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	std::fs::write(format!("{sup}/root"), b"r\n").unwrap();
+	git(&sup, &["add", "root"]);
+	commit(&sup, "base");
+	git(&sup, &["branch", "nosub"]);
+	git_allow(&sup, &["submodule", "add", "../src", "sub"]);
+	commit(&sup, "add submodule");
+
+	// Away (leaves the populated mount) and back — must succeed and re-record the gitlink, clean.
+	gta(&sup, &["switch", "nosub"], b"");
+	assert!(
+		std::path::Path::new(&format!("{sup}/sub/f")).exists(),
+		"the populated submodule is retained on switch-away"
+	);
+	gta(&sup, &["switch", "main"], b""); // the `gta` helper asserts success — no abort
+	assert!(
+		std::path::Path::new(&format!("{sup}/sub/f")).exists(),
+		"switching back reuses the existing submodule checkout"
+	);
+	assert!(
+		git(&sup, &["ls-files", "-s", "sub"])
+			.trim()
+			.starts_with("160000 "),
+		"the gitlink is re-recorded on the way back"
+	);
+	assert!(
+		gta(&sup, &["status"], b"").trim().is_empty(),
+		"clean after the round-trip, like git"
 	);
 	std::fs::remove_dir_all(&work).ok();
 }

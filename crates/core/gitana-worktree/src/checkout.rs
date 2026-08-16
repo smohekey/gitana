@@ -222,9 +222,11 @@ where
 			// git treats a submodule mount as opaque — a CURRENT gitlink whose pointer is changing is never
 			// refused on its own working-tree contents (an initialized submodule's files are not "untracked"
 			// overwrites). Skip the mount-cleanliness scan below, mirroring `merge_apply`/`ensure_no_overwrite`;
-			// the ancestor guard still runs. Keys on the CURRENT side, so an incoming gitlink over an ordinary
-			// file/subtree is NOT exempt (that content is git's to protect).
-			let current_is_gitlink = current.get(*path).is_some_and(|(cm, _)| cm == "160000");
+			// the ancestor guard still runs. Also exempt an INCOMING gitlink when an initialized submodule
+			// checkout (a directory with `.git`) is already on disk — git reuses it (a routine away-and-back
+			// switch). An incoming gitlink over an ordinary file or an arbitrary untracked dir stays protected.
+			let current_is_gitlink = current.get(*path).is_some_and(|(cm, _)| cm == "160000")
+				|| (*mode == "160000" && is_submodule_checkout(wt.work(), path));
 			// The working-tree files whose cleanliness we must check before (re)writing this target path, each
 			// against the blob it is tracked under. Prefer the target's EXACT current entry; otherwise EVERY
 			// case-colliding entry that folds to this key (`Foo` and `foo`), so the shared inode is verified
@@ -840,13 +842,16 @@ where
 		let from_here = from.get(path).or_else(|| from_fold.get(&key).copied());
 		let to_here = to.get(path);
 		// git treats a submodule mount as opaque — it never inspects a gitlink's own working tree for
-		// checkout cleanliness. When the CURRENT tracked entry is a gitlink (a removal, or a pointer change),
-		// skip the worktree-cleanliness refusals below: the apply phase records the index change and removes
-		// an EMPTY mount directory, leaving a populated submodule in place (git warns "unable to rmdir" but
-		// never refuses). This keys on the CURRENT side only — an INCOMING gitlink that replaces an ordinary
-		// file or an untracked path is NOT exempt: that content is git's to protect, and git refuses to
-		// overwrite a dirty/untracked file even to place a submodule (probed vs git 2.55).
-		let is_gitlink = current.is_some_and(|(mode, _)| mode == "160000");
+		// checkout cleanliness. Skip the worktree-cleanliness refusals below when the path is a submodule git
+		// treats as opaque: either the CURRENT tracked entry is a gitlink (a removal or pointer change — the
+		// apply records the index change and removes an EMPTY mount, leaving a populated one), OR the INCOMING
+		// entry is a gitlink AND an initialized submodule checkout is already on disk (git REUSES it, so a
+		// routine away-and-back switch does not choke on the retained `sub/…` files). An incoming gitlink over
+		// an ordinary file, or an arbitrary untracked directory with no `.git`, is NOT exempt — git refuses to
+		// overwrite that content even to place a submodule (probed vs git 2.55).
+		let is_gitlink = current.is_some_and(|(mode, _)| mode == "160000")
+			|| (to_here.is_some_and(|(mode, _)| mode == "160000")
+				&& is_submodule_checkout(wt.work(), path));
 		// A new addition the sparse patterns exclude is added skip-worktree, not materialised, so an
 		// in-the-way untracked file is left alone and no cleanliness applies. It must be a genuine ADDITION —
 		// absent from HEAD (`from`) — not a path HEAD tracks whose index entry was staged-deleted: that is a
@@ -1561,6 +1566,16 @@ fn has_symlinked_ancestor<W: WorkDirFs>(work: &W, path: &str) -> bool {
 		}
 	}
 	false
+}
+
+/// Whether the working-tree `path` already holds an initialized submodule checkout — a directory
+/// containing a `.git` entry (git's own submodule marker). git REUSES such a checkout when it
+/// materialises a gitlink over it (so a routine away-and-back switch keeps the retained submodule),
+/// exempting it from the untracked-content overwrite guard. An arbitrary untracked directory (no `.git`)
+/// is NOT a submodule checkout and stays protected.
+fn is_submodule_checkout<W: WorkDirFs>(work: &W, path: &str) -> bool {
+	matches!(work.lstat(path), Ok(Some(meta)) if meta.kind.is_dir())
+		&& matches!(work.lstat(&format!("{path}/.git")), Ok(Some(_)))
 }
 
 fn ensure_no_overwrite<F, W, H>(

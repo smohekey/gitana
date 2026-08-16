@@ -1387,10 +1387,19 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			Some(meta) if meta.kind.is_dir() => {
 				// Any stage (including an unmerged submodule's 1/2/3): `upsert` collapses them to a stage-0
 				// gitlink at the submodule's current HEAD, resolving a submodule conflict the way `git add` does.
-				if is_gitlink_at(index, path)
-					&& let Some(head) = crate::submodule_head_oid(self, path).await
-				{
-					index.upsert(entry(path, 0o160000, head, &meta));
+				if is_gitlink_at(index, path) {
+					match crate::submodule_head_oid(self, path).await {
+						Some(head) => {
+							index.upsert(entry(path, 0o160000, head, &meta));
+						}
+						// An UNMERGED submodule with no checked-out HEAD cannot be resolved — git errors rather
+						// than leaving the conflict stages silently in place. A clean (stage-0) gitlink whose HEAD
+						// is merely unresolvable is left unchanged (as `ls-files -m` treats it), not an error.
+						None if index.unmerged_paths().any(|p| p == path) => {
+							return Err(WorktreeError::SubmoduleNoCommit(path.to_owned()));
+						}
+						None => {}
+					}
 				}
 			}
 			Some(_) => {}

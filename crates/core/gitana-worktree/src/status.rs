@@ -105,10 +105,17 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	// listed untracked (unlike a tracked file replaced by an untracked directory). Built from ALL index
 	// entries, not just stage 0: an unmerged (conflicted) gitlink has only stage 1/2/3 entries, and its
 	// mount directory must still be excluded from untracked so status shows `UU sub`, never `?? sub/`.
+	// EXCLUDE a gitlink path that ALSO has tracked CHILDREN (`sub/f`) — a mixed subtree-vs-gitlink conflict
+	// where the on-disk `sub/` holds tracked files, so it is a real directory to descend into (git reports
+	// `?? sub/new`), not an opaque submodule mount.
+	let has_tracked_child = |path: &str| {
+		let prefix = format!("{path}/");
+		index.entries.iter().any(|e| e.path.starts_with(&prefix))
+	};
 	let gitlinks: HashSet<String> = index
 		.entries
 		.iter()
-		.filter(|entry| entry.mode == 0o160000)
+		.filter(|entry| entry.mode == 0o160000 && !has_tracked_child(&entry.path))
 		.map(|entry| fold_key(&entry.path, fold))
 		.collect();
 	let mut untracked = Vec::new();

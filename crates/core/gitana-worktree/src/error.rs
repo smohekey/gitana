@@ -42,6 +42,10 @@ pub enum WorktreeError {
 	/// superproject cannot add a submodule's own contents.
 	#[error("Pathspec '{path}' is in submodule '{submodule}'")]
 	PathspecInSubmodule { path: String, submodule: String },
+	/// Staging an unmerged submodule (`add`) whose mount has no checked-out `HEAD` to record — git's
+	/// fatal "'<path>' does not have a commit checked out": the conflict cannot be resolved.
+	#[error("'{0}' does not have a commit checked out")]
+	SubmoduleNoCommit(String),
 	/// A standard excludes source (`.git/info/exclude`, or a configured/global excludes file) is a
 	/// directory or is otherwise unusable — git's fatal "cannot use … as an exclude file".
 	#[error("cannot use {0} as an exclude file")]
