@@ -56,15 +56,19 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			//   (a documented divergence);
 			// - a present directory → a pointer change `<recorded>` → the submodule's checked-out `HEAD`
 			//   (unresolvable = unchanged, as `status`).
+			// git honours the index trust bits for a gitlink exactly as for a blob: with skip-worktree or
+			// assume-valid set the working tree (and the submodule's HEAD) is not consulted, so a moved/absent/
+			// type-changed mount yields no unstaged diff (probed vs git 2.55; matches `ls-files -m` and status).
+			if entry.skip_worktree || entry.assume_valid {
+				continue;
+			}
 			match wt.work().lstat(&entry.path)? {
 				None => {
-					if !entry.skip_worktree {
-						out.push(FileDiff {
-							path: entry.path.clone(),
-							old: Some((gitlink_content(&entry.oid), entry.mode)),
-							new: None,
-						});
-					}
+					out.push(FileDiff {
+						path: entry.path.clone(),
+						old: Some((gitlink_content(&entry.oid), entry.mode)),
+						new: None,
+					});
 				}
 				// A regular file or symlink replaced the mount — a type change; read its content. A FIFO/socket/
 				// device (`FileKind::Other`) is NOT read (reading a pipe blocks forever) — it falls to the arm

@@ -168,13 +168,22 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			// present directory is ` M` iff its checked-out `HEAD` differs from the recorded commit. git ignores
 			// the submodule's own dirty working content by default; an unresolvable submodule (an unhandled
 			// `.git` layout) under a real directory is treated as unchanged, never a false `M` (as `ls-files -m`).
-			match wt.work().lstat(&entry.path)? {
-				None => 'D',
-				Some(meta) if !meta.kind.is_dir() => 'T',
-				Some(_) => match submodule_head_oid(wt, &entry.path).await {
-					Some(head) if head != entry.oid => 'M',
-					_ => ' ',
-				},
+			// git honours the index trust bits for a gitlink exactly as for a blob: with skip-worktree or
+			// assume-valid set the working tree and the submodule's HEAD are not consulted, so a moved/absent/
+			// type-changed mount is no worktree modification (probed vs git 2.55; matches `ls-files -m`).
+			// skip-worktree + absent already `continue`d above; this also covers skip-worktree + present and
+			// assume-valid.
+			if entry.skip_worktree || entry.assume_valid {
+				' '
+			} else {
+				match wt.work().lstat(&entry.path)? {
+					None => 'D',
+					Some(meta) if !meta.kind.is_dir() => 'T',
+					Some(_) => match submodule_head_oid(wt, &entry.path).await {
+						Some(head) if head != entry.oid => 'M',
+						_ => ' ',
+					},
+				}
 			}
 		} else {
 			worktree_change(wt.work(), entry, &entry.path, file_mode)?

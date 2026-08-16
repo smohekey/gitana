@@ -211,6 +211,85 @@ fn diff_reports_submodule_pointer_change_like_git() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// git honours the index trust bits for a gitlink exactly as for a blob: with `--skip-worktree` or
+/// `--assume-unchanged` set, a moved submodule HEAD produces NEITHER a ` M sub` status NOR an unstaged
+/// pointer diff (probed vs git 2.55; `ls-files -m` likewise stays silent). gta must suppress both too.
+#[test]
+fn trust_bits_suppress_a_moved_gitlink_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-sub-trust");
+	let w = work.to_str().unwrap();
+	let src = format!("{w}/src");
+	let sup = format!("{w}/super");
+	std::fs::create_dir_all(&src).unwrap();
+	std::fs::create_dir_all(&sup).unwrap();
+	// A submodule source with two commits.
+	git(
+		&src,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	std::fs::write(format!("{src}/f"), b"s1\n").unwrap();
+	git(&src, &["add", "f"]);
+	commit(&src, "s1");
+	std::fs::write(format!("{src}/f"), b"s2\n").unwrap();
+	git(&src, &["add", "f"]);
+	commit(&src, "s2");
+	// A superproject embedding it at s2, with the mount moved back to s1 (a pointer change).
+	git(
+		&sup,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	std::fs::write(format!("{sup}/root"), b"r\n").unwrap();
+	git(&sup, &["add", "root"]);
+	commit(&sup, "base");
+	git_allow(&sup, &["submodule", "add", "../src", "sub"]);
+	commit(&sup, "add submodule");
+	git_allow(&format!("{sup}/sub"), &["checkout", "-q", "HEAD~1"]);
+
+	let norm = |s: String| {
+		let mut v: Vec<String> = s.lines().map(str::to_owned).collect();
+		v.sort();
+		v.join("\n")
+	};
+	// Sanity: without a trust bit the moved pointer IS reported (so the suppression below is meaningful).
+	assert_eq!(
+		norm(gta(&sup, &["status"], b"")),
+		norm(git(&sup, &["status", "--porcelain"])),
+		"baseline: moved gitlink pointer must be reported by both"
+	);
+	assert!(
+		gta(&sup, &["status"], b"").contains("M sub"),
+		"baseline: the moved submodule must be reported modified"
+	);
+
+	// Each trust bit must silence both `status` and `diff` in gta exactly as in git.
+	for bit in ["--skip-worktree", "--assume-unchanged"] {
+		git(&sup, &["update-index", bit, "sub"]);
+		assert_eq!(
+			norm(gta(&sup, &["status"], b"")),
+			norm(git(&sup, &["status", "--porcelain"])),
+			"{bit}: status must match git (both suppressed)"
+		);
+		assert_eq!(
+			diff_payload(&gta(&sup, &["diff"], b"")),
+			diff_payload(&git(&sup, &["diff"])),
+			"{bit}: unstaged diff must match git (both suppressed)"
+		);
+		// Clear the bit again so the two bits are tested independently.
+		let clear = if bit == "--skip-worktree" {
+			"--no-skip-worktree"
+		} else {
+			"--no-assume-unchanged"
+		};
+		git(&sup, &["update-index", clear, "sub"]);
+	}
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 /// Checking out a commit that records a gitlink must materialize it the way git does: create an
 /// EMPTY mount directory and record `160000 <commit> 0  sub` in the index, without cloning the
 /// submodule (`submodule update` would populate it). Mirrors a clone left without `submodule

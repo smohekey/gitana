@@ -660,13 +660,15 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		};
 		// Tracked submodule (gitlink) mounts the walker prunes (opaque to `add`) — so it never descends into
 		// a submodule to stage its contents nor fails on an unreadable child. Folded under `core.ignoreCase`
-		// so a case-variant on-disk mount (indexed `Sub`, on disk `sub`) is still matched, and built from
-		// OPAQUE gitlinks only (excluding a gitlink that also has tracked children — a mixed subtree conflict
-		// `add` resolves to the subtree).
+		// so a case-variant on-disk mount (indexed `Sub`, on disk `sub`) is still matched. Uses the same
+		// `add_gitlink_dir` gate as the dir-arms below: an OPAQUE gitlink, OR a blob-vs-gitlink conflict whose
+		// on-disk slot is a REAL submodule mount (`sub/.git`) — the latter must be pruned too, else the walk
+		// descends the mount and stages its files as superproject blobs. (A gitlink alongside a same-path blob
+		// with NO real mount stays walkable — its dir is ordinary subtree content `add` resolves.)
 		let gitlinks: std::collections::HashSet<String> = index
 			.entries
 			.iter()
-			.filter(|entry| is_opaque_gitlink(&index, &entry.path, fold))
+			.filter(|entry| add_gitlink_dir(&index, self.work(), &entry.path, fold))
 			.map(|entry| {
 				if fold {
 					entry.path.to_ascii_lowercase()
