@@ -208,17 +208,16 @@ where
 			Err(FileStoreError::NotFound) => return Ok(None),
 			Err(other) => return Err(other.into()),
 		};
-		let text = std::str::from_utf8(&bytes)
-			.map_err(|_| RepositoryError::InvalidRef("packed-refs not UTF-8".to_owned()))?;
-		for line in text.lines() {
+		for line in bytes.split(|byte| *byte == b'\n') {
+			let line = line.strip_suffix(b"\r").unwrap_or(line);
 			// Skip the header and `^<peeled>` lines.
-			if line.starts_with('#') || line.starts_with('^') || line.is_empty() {
+			if line.starts_with(b"#") || line.starts_with(b"^") || line.is_empty() {
 				continue;
 			}
-			if let Some((oid, refname)) = line.split_once(' ')
-				&& refname == name
+			if let Some((oid, refname)) = split_packed_ref(line)
+				&& refname == name.as_bytes()
 			{
-				return Ok(Some(parse_oid(name, oid.as_bytes())?));
+				return Ok(Some(parse_oid(name, oid)?));
 			}
 		}
 		Ok(None)
@@ -234,16 +233,18 @@ where
 
 		// packed-refs first; loose files override.
 		if let Some(bytes) = self.read_opt("packed-refs").await? {
-			let text = std::str::from_utf8(&bytes)
-				.map_err(|_| RepositoryError::InvalidRef("packed-refs not UTF-8".to_owned()))?;
-			for line in text.lines() {
-				if line.starts_with('#') || line.starts_with('^') || line.is_empty() {
+			for line in bytes.split(|byte| *byte == b'\n') {
+				let line = line.strip_suffix(b"\r").unwrap_or(line);
+				if line.starts_with(b"#") || line.starts_with(b"^") || line.is_empty() {
 					continue;
 				}
-				if let Some((oid, name)) = line.split_once(' ')
-					&& name.starts_with(prefix)
+				if let Some((oid, name)) = split_packed_ref(line)
+					&& name.starts_with(prefix.as_bytes())
 				{
-					refs.insert(name.to_owned(), parse_oid(name, oid.as_bytes())?);
+					let name = std::str::from_utf8(name).map_err(|_| {
+						RepositoryError::InvalidRef(format!("packed ref under {prefix} is not UTF-8"))
+					})?;
+					refs.insert(name.to_owned(), parse_oid(name, oid)?);
 				}
 			}
 		}
@@ -1341,6 +1342,11 @@ fn parse_oid<H: HashAlgorithm>(name: &str, bytes: &[u8]) -> Result<ObjectId<H>, 
 	ObjectId::from_hex(text).map_err(|_| RepositoryError::InvalidRef(format!("{name}: {text}")))
 }
 
+fn split_packed_ref(line: &[u8]) -> Option<(&[u8], &[u8])> {
+	let separator = line.iter().position(|byte| *byte == b' ')?;
+	Some((&line[..separator], &line[separator + 1..]))
+}
+
 #[cfg(test)]
 mod tests {
 	#[cfg(not(target_arch = "wasm32"))]
@@ -1356,6 +1362,48 @@ mod tests {
 	use crate::GatedFileStore;
 
 	use super::{RefStore, ReflogIntent};
+
+	#[tokio::test]
+	async fn resolves_a_packed_ref_without_decoding_unrelated_names() {
+		let files = MemoryFileStore::new();
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"target");
+		let mut packed = format!("{} refs/heads/main\n", target.to_hex()).into_bytes();
+		packed.extend_from_slice(format!("{} refs/heads/", "f".repeat(64)).as_bytes());
+		packed.extend_from_slice(b"other-\xff\n");
+		files
+			.write_path_if_absent("packed-refs", &packed)
+			.await
+			.unwrap();
+
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		assert_eq!(
+			store.resolve("refs/heads/main").await.unwrap(),
+			Some(target)
+		);
+	}
+
+	#[tokio::test]
+	async fn packed_ref_listing_decodes_only_the_requested_namespace() {
+		let files = MemoryFileStore::new();
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"target");
+		let mut packed = format!("{} refs/heads/main\n", target.to_hex()).into_bytes();
+		packed.extend_from_slice(format!("{} refs/tags/", "f".repeat(64)).as_bytes());
+		packed.extend_from_slice(b"other-\xff\n");
+		files
+			.write_path_if_absent("packed-refs", &packed)
+			.await
+			.unwrap();
+
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		assert_eq!(
+			store.list("refs/heads/").await.unwrap(),
+			vec![("refs/heads/main".to_owned(), target)]
+		);
+		assert!(matches!(
+			store.list("refs/tags/").await,
+			Err(crate::RepositoryError::InvalidRef(_))
+		));
+	}
 
 	#[tokio::test]
 	async fn reflog_object_ids_collects_ids_despite_a_non_utf8_message() {

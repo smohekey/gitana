@@ -552,7 +552,8 @@ trait Backend: Send + Sync + 'static {
 	fn is_dir(&self, path: &str) -> std::io::Result<bool>;
 	/// The byte length of the value at `path`.
 	fn size(&self, path: &str) -> std::io::Result<u64>;
-	/// Raw entry names directly under `dir_rel` (`""` = root); empty if the dir is absent.
+	/// UTF-8 entry names directly under `dir_rel` (`""` = root); empty if the dir is absent.
+	/// Returns `InvalidData` rather than lossily aliasing a native name that is not representable.
 	fn list_names(&self, dir_rel: &str) -> std::io::Result<Vec<String>>;
 	/// Classify `path` without following a final symbolic link.
 	fn kind(&self, path: &str) -> std::io::Result<FileKind>;
@@ -646,7 +647,13 @@ impl Backend for CapBackend {
 		};
 		let mut names = Vec::new();
 		for entry in entries {
-			names.push(entry?.file_name().to_string_lossy().into_owned());
+			let name = entry?.file_name().into_string().map_err(|_| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					"directory entry name is not UTF-8",
+				)
+			})?;
+			names.push(name);
 		}
 		Ok(names)
 	}

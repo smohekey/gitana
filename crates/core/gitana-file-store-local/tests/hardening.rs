@@ -96,6 +96,30 @@ async fn rejects_symlink_escape() {
 	let _ = std::fs::remove_dir_all(&outside);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn listing_rejects_a_non_utf8_name_without_lossy_aliasing() {
+	use std::os::unix::ffi::OsStrExt;
+
+	let dir = temp_dir("non-utf8-listing");
+	let refs = dir.join("refs/forge/workspaces");
+	std::fs::create_dir_all(&refs).unwrap();
+	let invalid = refs.join(std::ffi::OsStr::from_bytes(b"workspace-\xff"));
+	if std::fs::write(&invalid, b"value").is_err() {
+		let _ = std::fs::remove_dir_all(&dir);
+		return;
+	}
+	let store = open_store(&dir);
+
+	assert!(matches!(
+		store.list_prefix("refs/forge/workspaces/").await,
+		Err(FileStoreError::Backend(_))
+	));
+	assert_eq!(std::fs::read(&invalid).unwrap(), b"value");
+
+	let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_cas_has_no_lost_updates() {
 	let dir = temp_dir("cas");
