@@ -399,6 +399,16 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		let entries = self.repository().read_tree(tree).await?;
 		for (path, mode, oid) in &entries {
 			if paths.iter().any(|p| p == path) {
+				// A gitlink conflict path: git records the stages but does NOT overwrite a FILE/symlink the
+				// user has at the slot with an empty mount directory — that would destroy local bytes. Only
+				// materialise the mount when the slot is a directory (the actual submodule) or absent; leave
+				// any other occupant in place. (In a plain checkout `write_worktree_file` does replace a clean
+				// file with the mount, which is correct there — this preservation is specific to conflicts.)
+				if mode == "160000"
+					&& matches!(self.work().lstat(path)?, Some(meta) if meta.kind.is_file() || meta.kind.is_symlink())
+				{
+					continue;
+				}
 				crate::checkout::write_worktree_file(self, path, mode, *oid).await?;
 			}
 		}
@@ -1230,6 +1240,11 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 						self.stage_file(index, &path, sparse).await?;
 					}
 				}
+				// A tracked gitlink present as its mount directory is not a deletion — restage via `stage_file`
+				// (updates the pointer to HEAD opaquely; resolves an unmerged gitlink to stage 0), never dropping it.
+				Some(meta) if meta.kind.is_dir() && is_gitlink_at(index, &path) => {
+					self.stage_file(index, &path, sparse).await?;
+				}
 				// Absent, or now a directory (a file->directory change): the tracked entry is a deletion.
 				_ => index.remove(&path),
 			}
@@ -1773,6 +1788,12 @@ fn walk_files<W: WorkDirFs>(
 	force: bool,
 	fold: bool,
 ) -> Result<(), WorktreeError> {
+	// A walk ROOT that is itself a tracked gitlink mount (`gta add sub`, or a glob rooted at the mount)
+	// is opaque — return before opening it, so a large submodule is not scanned and an unreadable child
+	// cannot fail the add (git succeeds). Children are pruned in the loop below.
+	if gitlinks.contains(dir_rel) {
+		return Ok(());
+	}
 	let pushed = push_gitignore(work, dir_rel, stack)?;
 	for entry in work.read_dir(dir_rel)? {
 		if entry.name == ".git" {

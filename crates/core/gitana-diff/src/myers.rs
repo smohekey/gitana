@@ -15,6 +15,11 @@ pub enum Edit {
 
 /// Compute the shortest edit script transforming `a` into `b`.
 pub fn diff<T: PartialEq>(a: &[T], b: &[T]) -> Vec<Edit> {
+	// Two empty sequences have no edits — and the Myers arrays below are sized `2*max+1`, which is 1
+	// when both are empty, so the `v[k+1+offset]` probe at `d = 0` would index out of bounds and panic.
+	if a.is_empty() && b.is_empty() {
+		return Vec::new();
+	}
 	let n = a.len() as isize;
 	let m = b.len() as isize;
 	let max = (n + m) as usize;
@@ -95,6 +100,13 @@ fn backtrack(trace: &[Vec<isize>], depth: usize, n: isize, m: isize, offset: isi
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn both_empty_yields_no_edits() {
+		// Two empty sequences must not panic (the Myers arrays are width 1 here) and have no edits.
+		let empty: [&str; 0] = [];
+		assert!(diff(&empty, &empty).is_empty());
+	}
 
 	#[test]
 	fn identical_is_all_equal() {

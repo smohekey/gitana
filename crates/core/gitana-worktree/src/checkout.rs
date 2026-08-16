@@ -1332,7 +1332,14 @@ where
 		let present = wt.work().lstat(path)?.is_some();
 		let preserve = present && !force && prior.is_none();
 		if present && !preserve {
-			remove_worktree_path(wt, path)?;
+			// An excluded PRIOR gitlink's mount is a directory: rmdir only its empty form via the mode-aware
+			// helper (git removes an excluded empty mount and keeps the entry omitted), leaving a populated
+			// submodule. `remove_worktree_path` never removes a directory, so the mount would otherwise linger.
+			if prior.is_some_and(|entry| entry.mode == 0o160000) {
+				remove_gitlink_mount(wt, path)?;
+			} else {
+				remove_worktree_path(wt, path)?;
+			}
 		}
 		let stat = if preserve {
 			crate::Stat::default()

@@ -65,7 +65,8 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 	// it before writing anything (an in-cone dirty conflict path is also refused by the checkout itself).
 	// A conflicted SUBMODULE (gitlink) is EXEMPT: git records its base/ours/theirs stages even with a
 	// populated mount present, never treating the submodule's own contents as local changes that block the
-	// merge (the mount is opaque). A file/symlink at the slot is not a gitlink here and still blocks.
+	// merge (the mount is opaque). `materialise_paths` below preserves any FILE/symlink the user placed at
+	// the slot (like git), so exempting a gitlink here cannot delete local data.
 	let is_gitlink = |path: &String| {
 		[base.get(path), ours.get(path), theirs.get(path)]
 			.into_iter()
