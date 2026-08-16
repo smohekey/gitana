@@ -1829,6 +1829,94 @@ fn diff_rejects_a_symlink_at_a_gitlink_like_git() {
 	std::fs::remove_dir_all(&w).ok();
 }
 
+/// An `:(icase)` restore that materialises an incoming gitlink `Sub` must PRESERVE a current descendant
+/// under the differently-cased `sub/…` — git treats the mount as opaque and never recurses in to delete
+/// it (probed vs git 2.55: uncommitted `sub/file` survives). The prefix test must fold, or the descendant
+/// (including uncommitted content) is deleted.
+#[test]
+fn icase_restore_preserves_a_recased_gitlink_descendant_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let build = |w: &str| -> String {
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		git(w, &["config", "user.name", "T"]);
+		git(w, &["config", "user.email", "t@e"]);
+		std::fs::write(format!("{w}/file0"), b"c\n").unwrap();
+		std::fs::create_dir_all(format!("{w}/sub")).unwrap();
+		std::fs::write(format!("{w}/sub/file"), b"x\n").unwrap();
+		git(w, &["add", "file0", "sub/file"]);
+		commit(w, "base");
+		let base = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+		// A commit where `Sub` (different case) is a gitlink and `sub/file` is gone.
+		git(w, &["rm", "-q", "-r", "sub"]);
+		git(
+			w,
+			&[
+				"update-index",
+				"--add",
+				"--cacheinfo",
+				&format!("160000,{base},Sub"),
+			],
+		);
+		commit(w, "gitlinkver");
+		let gl = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+		// Back to base (sub/file present), then leave uncommitted content in the descendant.
+		git(w, &["read-tree", "--reset", "-u", &base]);
+		std::fs::write(format!("{w}/sub/file"), b"UNCOMMITTED\n").unwrap();
+		gl
+	};
+
+	let g = unique_tmp("gta-sub-icaserestore-gta");
+	let h = unique_tmp("gta-sub-icaserestore-git");
+	let (wg, wh) = (g.to_str().unwrap(), h.to_str().unwrap());
+	let glg = build(wg);
+	let glh = build(wh);
+
+	assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args([
+			"-C",
+			wg,
+			"restore",
+			&format!("--source={glg}"),
+			"--staged",
+			"--worktree",
+			":(icase)Sub",
+		])
+		.output()
+		.expect("run gta");
+	Command::new("git")
+		.args([
+			"-C",
+			wh,
+			"restore",
+			&format!("--source={glh}"),
+			"--staged",
+			"--worktree",
+			":(icase)Sub",
+		])
+		.output()
+		.expect("run git");
+
+	assert_eq!(
+		std::fs::read(format!("{wg}/sub/file")).ok(),
+		Some(b"UNCOMMITTED\n".to_vec()),
+		"gta must preserve the recased descendant's uncommitted content, like git"
+	);
+	assert_eq!(
+		std::fs::read(format!("{wh}/sub/file")).ok(),
+		Some(b"UNCOMMITTED\n".to_vec()),
+		"sanity: git preserves it"
+	);
+	std::fs::remove_dir_all(&g).ok();
+	std::fs::remove_dir_all(&h).ok();
+}
+
 /// `gta rm` of a nested gitlink whose ancestor is an on-disk SYMLINK must not follow the link out of the
 /// tree and delete the real target — git aborts because the ancestor is symbolic. A non-force `rm
 /// link/sub` (where `link` → `actual/`) must refuse and leave `actual/sub` untouched, matching git's

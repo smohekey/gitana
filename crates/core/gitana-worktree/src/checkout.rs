@@ -523,7 +523,20 @@ where
 				Some(matcher) => !matcher.includes(path),
 				None => index.entry(path).is_some_and(|entry| entry.skip_worktree),
 			};
-			if !excluded && wt.work().lstat(path)?.is_none() {
+			if excluded {
+				// An out-of-cone gitlink materialises no mount; git records it as a clean SPARSE entry. A
+				// subtree→gitlink transition first records it with the bit CLEAR (the old `sub/` dir was present
+				// when the gitlink was written) and then prunes that dir with the outgoing descendants — leaving a
+				// non-sparse entry with no mount, a spurious ` D sub` in status. Repair the skip-worktree bit so
+				// the index matches git's sparse entry rather than a phantom deletion.
+				if let Some(entry) = index
+					.entries
+					.iter_mut()
+					.find(|e| e.path == *path && e.stage == 0)
+				{
+					entry.skip_worktree = true;
+				}
+			} else if wt.work().lstat(path)?.is_none() {
 				ensure_parents(wt.work(), path)?;
 				wt.work().create_dir(path)?;
 			}

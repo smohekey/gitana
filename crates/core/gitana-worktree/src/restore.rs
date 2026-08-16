@@ -90,6 +90,10 @@ where
 		}
 	}
 	let set = PathspecSet::parse(pathspecs, prefix)?;
+	// Whether path comparisons here fold case: `core.ignoreCase`, OR an `:(icase)` pathspec (which selects
+	// a differently-cased path). Used so a recased descendant under an incoming gitlink is still recognised
+	// as inside the mount and preserved, not deleted (git leaves it untouched — probed vs git 2.55).
+	let fold = crate::excludes::ignore_case(wt).await? || set.all().any(|spec| spec.is_icase());
 	// A *truly* empty pathspec list specifies nothing and is a no-op — distinct from an all-negative set,
 	// which git treats as an implicit repository-root `.` minus the exclusions. Without this guard a
 	// direct `restore(…, &[], …)` (or `reset_index_paths(…, &[], …)`) would select the whole universe.
@@ -139,18 +143,20 @@ where
 		for &path in &selected {
 			// A gitlink names a submodule COMMIT, not a blob — skip the blob preflight (as `checkout` does);
 			// `write_worktree_file` creates the empty mount directory without reading an object.
-			if let Some((_, mode, oid)) = source_entries.iter().find(|(p, _, _)| p == path) {
-				// A null-OID gitlink is not a valid cache entry — reject it here too (git's "cache entry has
-				// null sha1"), not just in the merge/switch paths, rather than persisting it via the skip.
-				crate::checkout::reject_null_gitlink_oid(mode, oid, path)?;
-				if mode != "160000" {
-					wt.repository().read_blob(*oid).await?;
-				}
+			if let Some((_, mode, oid)) = source_entries.iter().find(|(p, _, _)| p == path)
+				&& mode != "160000"
+			{
+				wt.repository().read_blob(*oid).await?;
 			}
 		}
 	}
 	for &path in &selected {
 		validate_path(path)?;
+		// A null-OID gitlink is not a valid cache entry — reject it (git's "cache entry has null sha1")
+		// for a STAGED restore too, not just the worktree preflight above, before the upsert persists it.
+		if let Some((_, mode, oid)) = source_entries.iter().find(|(p, _, _)| p == path) {
+			crate::checkout::reject_null_gitlink_oid(mode, oid, path)?;
+		}
 	}
 
 	// Take the index lock before mutating the working tree, so a held lock aborts before any change
@@ -213,7 +219,16 @@ where
 					// when the gitlink ancestor is itself selected (so the mount is materialised); if the pathspec
 					// picked just the descendant, git removes it normally, so we must too.
 					let under_incoming_gitlink = source_entries.iter().any(|(sp, sm, _)| {
-						sm == "160000" && path.starts_with(&format!("{sp}/")) && selected.contains(sp.as_str())
+						if sm != "160000" || !selected.contains(sp.as_str()) {
+							return false;
+						}
+						// Exact prefix, plus a fold-aware one under `core.ignoreCase` / an `:(icase)` pathspec so a
+						// recased descendant `sub/file` is recognised as inside a selected gitlink `Sub` and preserved.
+						path.starts_with(&format!("{sp}/"))
+							|| (fold
+								&& path
+									.to_ascii_lowercase()
+									.starts_with(&format!("{}/", sp.to_ascii_lowercase())))
 					});
 					// Removing a gitlink itself rmdir's only its EMPTY mount (git leaves a populated submodule, or
 					// a file the user put at the slot) via the mode-aware helper — `remove_worktree_path` never
