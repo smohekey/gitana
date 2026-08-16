@@ -1275,6 +1275,12 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		if index.is_sparse(path) || sparse.is_some_and(|matcher| !matcher.includes(path)) {
 			return Ok(());
 		}
+		// A path INSIDE a tracked submodule mount is the submodule's to manage, not the superproject's:
+		// `add` must never descend into a gitlink and stage its contents, which would replace the `160000`
+		// gitlink with a `100644` subtree and silently corrupt the submodule on the next commit.
+		if ancestor_is_gitlink(index, path) {
+			return Ok(());
+		}
 		match self.work().lstat(path)? {
 			Some(meta) if meta.kind.is_symlink() => {
 				let target = self.work().read_link(path)?;
@@ -1295,6 +1301,18 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					.unwrap_or(0o100644);
 				index.remove_type_conflicts(path);
 				index.upsert(entry(path, effective_mode(&meta, expected), oid, &meta));
+			}
+			// A tracked gitlink present as its mount directory: stage the submodule's current `HEAD`, so a
+			// moved submodule records its new pointer on `add` the way git does — leaving it unchanged if the
+			// submodule is not checked out / unresolvable. Any other directory at a slot is not staged.
+			Some(meta) if meta.kind.is_dir() => {
+				if index
+					.entry(path)
+					.is_some_and(|existing| existing.mode == 0o160000)
+					&& let Some(head) = crate::submodule_head_oid(self, path).await
+				{
+					index.upsert(entry(path, 0o160000, head, &meta));
+				}
 			}
 			Some(_) => {}
 			None => index.remove(path),
@@ -1365,6 +1383,17 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				// Present as a file/symlink but unwalked — a tracked file the walk pruned as ignored. Restage
 				// it (git stages modifications to tracked files regardless of ignore rules).
 				Some(meta) if meta.kind.is_file() || meta.kind.is_symlink() => {
+					self.stage_file(index, &path, sparse).await?
+				}
+				// A tracked gitlink present as its mount DIRECTORY is not a deletion (the submodule is there):
+				// restage via `stage_file`, which updates the pointer to the submodule HEAD opaquely. Without
+				// this the mount dir would hit the deletion arm below and drop the gitlink, corrupting the tree.
+				Some(meta)
+					if meta.kind.is_dir()
+						&& index
+							.entry(&path)
+							.is_some_and(|entry| entry.mode == 0o160000) =>
+				{
 					self.stage_file(index, &path, sparse).await?
 				}
 				// Gone from the working tree, or replaced by a directory (a tracked file `dir` now a `dir/`
@@ -1661,6 +1690,24 @@ fn glob_ignore_base(normalized: &str) -> String {
 /// directories are walked and staged too — `add -f .` / `add -f <dir>` / a forced glob stage the
 /// ignored content, matching git 2.50.1; without it, ignored entries are pruned. `.git` is never
 /// entered regardless.
+/// Whether any ancestor directory of `path` is a tracked submodule (gitlink) — i.e. `path` lies inside
+/// a submodule mount. `add` treats such a mount as opaque, never staging the submodule's own contents
+/// (which would replace the `160000` gitlink with an ordinary subtree). Exact-path ancestry (git's
+/// index is keyed exactly); a case-variant mount is a rare edge left to the mount's own casing.
+fn ancestor_is_gitlink<H: HashAlgorithm>(index: &Index<H>, path: &str) -> bool {
+	let mut rest = path;
+	while let Some((parent, _)) = rest.rsplit_once('/') {
+		if index
+			.entry(parent)
+			.is_some_and(|entry| entry.mode == 0o160000)
+		{
+			return true;
+		}
+		rest = parent;
+	}
+	false
+}
+
 fn walk_files<W: WorkDirFs>(
 	work: &W,
 	dir_rel: &str,

@@ -393,6 +393,27 @@ where
 			{
 				continue;
 			}
+			// A gitlink names a submodule commit, not a blob — nothing INCOMING to validate; `write_entry`
+			// creates an empty mount directory rather than reading a blob. But installing the mount REMOVES
+			// the outgoing content it supplants — an ordinary file at the exact slot, OR the descendants of a
+			// subtree the gitlink replaces (`sub/file` under a target gitlink `sub`). Both the in-cone stray
+			// removal AND `write_entry`'s excluded (out-of-cone) branch delete that content trusting it is
+			// reconstructable from its blob, so every such OUTGOING blob must exist, else the sole clean copy is
+			// lost — validate it BEFORE the sparse short-circuit below (mirrors `merge_apply`'s guard, which
+			// validates the outgoing blob whether the incoming gitlink is in-cone or excluded).
+			if mode == "160000" && !force {
+				if let Some((cur_mode, cur_oid)) = current.get(path)
+					&& cur_mode != "160000"
+				{
+					wt.repository().read_blob(*cur_oid).await?;
+				}
+				let prefix = format!("{path}/");
+				for (cur_path, (cur_mode, cur_oid)) in &current {
+					if cur_mode != "160000" && cur_path.starts_with(&prefix) {
+						wt.repository().read_blob(*cur_oid).await?;
+					}
+				}
+			}
 			let excluded = match sparse.as_ref() {
 				Some(matcher) => !matcher.includes(path),
 				None => index.entry(path).is_some_and(|entry| entry.skip_worktree),
@@ -400,26 +421,8 @@ where
 			if excluded {
 				continue;
 			}
-			// A gitlink names a submodule commit, not a blob — nothing INCOMING to validate; `write_entry`
-			// creates an empty mount directory rather than reading a blob. But installing the mount REMOVES
-			// the outgoing content it supplants — an ordinary file at the exact slot, OR the descendants of a
-			// subtree the gitlink replaces (`sub/file` under a target gitlink `sub`). The stray-removal loop
-			// deletes that content trusting it is reconstructable from its blob, so every such OUTGOING blob
-			// must exist, else the sole clean copy is lost (mirrors `merge_apply`'s outgoing-blob guard).
+			// The incoming gitlink has no blob to validate (handled above); an ordinary target's blob does.
 			if mode == "160000" {
-				if !force {
-					if let Some((cur_mode, cur_oid)) = current.get(path)
-						&& cur_mode != "160000"
-					{
-						wt.repository().read_blob(*cur_oid).await?;
-					}
-					let prefix = format!("{path}/");
-					for (cur_path, (cur_mode, cur_oid)) in &current {
-						if cur_mode != "160000" && cur_path.starts_with(&prefix) {
-							wt.repository().read_blob(*cur_oid).await?;
-						}
-					}
-				}
 				continue;
 			}
 			wt.repository().read_blob(*oid).await?;
@@ -1174,7 +1177,17 @@ where
 		// omit (set the bit); clean → remove the reconstructable file and omit it.
 		for (path, state) in &sparse_reconcile {
 			if matches!(state, crate::status::WorktreeContent::Reconstructable) {
-				remove_worktree_path(wt, path)?;
+				// A reconstructable gitlink mount (an empty submodule directory) is rmdir'd via the mode-aware
+				// helper; an ordinary reconstructable file is unlinked. `remove_worktree_path` leaves a directory
+				// in place, so a gitlink mount would otherwise linger while the index records it skip-worktree.
+				if index
+					.entry(path)
+					.is_some_and(|entry| entry.mode == 0o160000)
+				{
+					remove_gitlink_mount(wt, path)?;
+				} else {
+					remove_worktree_path(wt, path)?;
+				}
 			}
 		}
 		if !sparse_reconcile.is_empty() {
@@ -1431,19 +1444,11 @@ where
 	if has_symlinked_ancestor(wt.work(), path) {
 		return Ok(());
 	}
-	// A tracked path is normally a file/symlink; unlink it. A tracked path that is a DIRECTORY is a
-	// submodule (gitlink) mount — rmdir it only when EMPTY (git removes an empty mount but leaves a
-	// populated submodule in place; `remove_dir` fails on a non-empty directory, ignored here), never
-	// recursively deleting content. Without this, a gitlink mount reconciled out by sparse-checkout would
-	// linger on disk while the index records it skip-worktree.
-	match wt.work().lstat(path)? {
-		Some(meta) if meta.kind.is_dir() => {
-			let _ = wt.work().remove_dir(path);
-		}
-		_ => {
-			let _ = wt.work().remove_file(path);
-		}
-	}
+	// Unlink a file/symlink; a DIRECTORY at the slot is left in place (`remove_file` no-ops on it), the
+	// way git only attempts `rmdir` and warns for a non-directory. A gitlink mount (a tracked path that
+	// is a directory) is removed via the mode-aware [`remove_gitlink_mount`], NOT here — so an ordinary
+	// tracked file the user replaced with a directory is never silently rmdir'd.
+	let _ = wt.work().remove_file(path);
 	remove_empty_parents(wt.work(), path);
 	Ok(())
 }

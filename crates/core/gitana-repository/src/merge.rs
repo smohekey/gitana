@@ -51,12 +51,20 @@ enum Side<'a, H: HashAlgorithm> {
 	Absent,
 	Blob(&'a TreeEntry<H>),
 	Tree(&'a TreeEntry<H>),
+	/// A submodule (gitlink, mode 160000): the id is a commit in the submodule, not a blob here. The
+	/// entry itself is carried by `ours_entry`/`theirs_entry` at the conflict fallback, so no field.
+	Gitlink,
 }
 
 fn classify<H: HashAlgorithm>(entry: Option<&TreeEntry<H>>) -> Side<'_, H> {
 	match entry {
 		None => Side::Absent,
 		Some(entry) if entry.mode == FileMode::Directory.as_str() => Side::Tree(entry),
+		// A gitlink is NOT a blob — never feed its commit id to blob merging (`read_blob` would fail with
+		// "object not found", since a submodule's commit lives in the submodule). When both sides move the
+		// pointer differently it falls to the conflict fallback below, which flags the path so the caller
+		// records base/ours/theirs as `160000` conflict stages, exactly as git does.
+		Some(entry) if entry.mode == FileMode::Gitlink.as_str() => Side::Gitlink,
 		Some(entry) => Side::Blob(entry),
 	}
 }
