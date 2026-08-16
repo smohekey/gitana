@@ -111,9 +111,13 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		// Exclude a gitlink path that ALSO has tracked children (a mixed subtree-vs-gitlink conflict): the
 		// on-disk directory holds tracked files, so `-o` descends into it and reports `sub/new`, as status
 		// does — not an opaque submodule mount.
+		// Fold-aware (matches `fold_key`): a mixed `160000 Sub` + `sub/f` conflict compares by fold-key.
 		let has_tracked_child = |path: &str| {
-			let prefix = format!("{path}/");
-			index.entries.iter().any(|e| e.path.starts_with(&prefix))
+			let prefix = format!("{}/", fold_key(path));
+			index
+				.entries
+				.iter()
+				.any(|e| fold_key(&e.path).starts_with(&prefix))
 		};
 		let gitlinks: HashSet<String> = index
 			.entries
@@ -167,17 +171,12 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 				);
 			}
 			if opts.modified || opts.deleted {
-				// git ignores the working tree for a skip-worktree (sparse) entry entirely: neither `-m` nor
-				// `-d` inspects its file — EXCEPT a submodule (gitlink) whose mount is present on disk. git
-				// still examines a present sparse gitlink for `-m` and reports it when its checked-out `HEAD`
-				// differs from the recorded commit (probed vs git 2.55; matches `gta status`, which reports
-				// ` M sub`). A regular sparse file, or an absent gitlink mount, stays skipped.
+				// git ignores the working tree for a skip-worktree (sparse) entry ENTIRELY: neither `-m` nor `-d`
+				// inspects its file, present or absent — and this holds for a submodule (gitlink) too, even when
+				// its mount is present and its `HEAD` has moved (probed vs git 2.55: `ls-files -m sub` is empty
+				// after `update-index --skip-worktree sub`).
 				if entry.skip_worktree {
-					let present_gitlink =
-						entry.mode == 0o160000 && wt.work().lstat(&entry.path).ok().flatten().is_some();
-					if !present_gitlink {
-						continue;
-					}
+					continue;
 				}
 				// Classify without over-reading: `-d` needs only an `lstat` (absence). Content is read only
 				// for a present, `-m`-selected, non-assume-valid entry — and a read failure is treated as a

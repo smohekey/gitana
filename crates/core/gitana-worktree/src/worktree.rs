@@ -1272,7 +1272,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				}
 				// A tracked gitlink present as its mount directory is not a deletion — restage via `stage_file`
 				// (updates the pointer to HEAD opaquely; resolves an unmerged gitlink to stage 0), never dropping it.
-				Some(meta) if meta.kind.is_dir() && is_opaque_gitlink(index, &path, fold) => {
+				Some(meta) if meta.kind.is_dir() && add_gitlink_dir(index, self.work(), &path, fold) => {
 					self.stage_file(index, &path, sparse, fold).await?;
 				}
 				// Absent, or now a directory (a file->directory change): the tracked entry is a deletion.
@@ -1409,7 +1409,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			Some(meta) if meta.kind.is_dir() => {
 				// Any stage (including an unmerged submodule's 1/2/3): `upsert` collapses them to a stage-0
 				// gitlink at the submodule's current HEAD, resolving a submodule conflict the way `git add` does.
-				if is_opaque_gitlink(index, path, fold) {
+				if add_gitlink_dir(index, self.work(), path, fold) {
 					match crate::submodule_head_oid(self, path).await {
 						Some(head) => {
 							index.upsert(entry(path, 0o160000, head, &meta));
@@ -1499,7 +1499,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				// A tracked gitlink present as its mount DIRECTORY is not a deletion (the submodule is there):
 				// restage via `stage_file`, which updates the pointer to the submodule HEAD opaquely. Without
 				// this the mount dir would hit the deletion arm below and drop the gitlink, corrupting the tree.
-				Some(meta) if meta.kind.is_dir() && is_opaque_gitlink(index, &path, fold) => {
+				Some(meta) if meta.kind.is_dir() && add_gitlink_dir(index, self.work(), &path, fold) => {
 					self.stage_file(index, &path, sparse, fold).await?
 				}
 				// Gone from the working tree, or replaced by a directory (a tracked file `dir` now a `dir/`
@@ -1796,6 +1796,38 @@ fn glob_ignore_base(normalized: &str) -> String {
 /// directories are walked and staged too — `add -f .` / `add -f <dir>` / a forced glob stage the
 /// ignored content, matching git 2.50.1; without it, ignored entries are pruned. `.git` is never
 /// entered regardless.
+/// Whether `path` is a submodule (gitlink) at ANY index stage (fold-aware) — including the stage 1/2/3
+/// entries of an unmerged conflict. `add` must never descend into such a mount.
+fn has_gitlink_stage<H: HashAlgorithm>(index: &Index<H>, path: &str, fold: bool) -> bool {
+	let key = fold_case(path, fold);
+	index
+		.entries
+		.iter()
+		.any(|entry| fold_case(&entry.path, fold) == key && entry.mode == 0o160000)
+}
+
+/// Whether the working-tree `path` is an initialized submodule checkout — a directory with a `.git`
+/// entry. `add` resolves a gitlink conflict to the submodule's `HEAD` whenever a real checkout is present
+/// (even a mixed blob-vs-gitlink conflict), never corrupting it into a subtree; an empty/plain directory
+/// with no `.git` is left to the ordinary subtree/deletion resolution instead.
+fn on_disk_submodule<W: WorkDirFs>(work: &W, path: &str) -> bool {
+	matches!(work.lstat(&format!("{path}/.git")), Ok(Some(_)))
+}
+
+/// Whether `add` should treat the directory at `path` as a submodule mount to stage (via `HEAD`) rather
+/// than descend into: it has a gitlink index stage AND is either a PURE gitlink conflict (no same-path
+/// blob, no tracked children) or an initialized submodule on disk. A mixed blob/subtree conflict over a
+/// plain directory is NOT — `add` resolves that to the subtree/deletion.
+fn add_gitlink_dir<W: WorkDirFs, H: HashAlgorithm>(
+	index: &Index<H>,
+	work: &W,
+	path: &str,
+	fold: bool,
+) -> bool {
+	has_gitlink_stage(index, path, fold)
+		&& (is_opaque_gitlink(index, path, fold) || on_disk_submodule(work, path))
+}
+
 /// Case-fold `path` under `core.ignoreCase`, so an on-disk `sub` matches an indexed `Sub`.
 fn fold_case(path: &str, fold: bool) -> String {
 	if fold {

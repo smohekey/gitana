@@ -225,7 +225,12 @@ where
 			// the ancestor guard still runs. Also exempt an INCOMING gitlink when an initialized submodule
 			// checkout (a directory with `.git`) is already on disk — git reuses it (a routine away-and-back
 			// switch). An incoming gitlink over an ordinary file or an arbitrary untracked dir stays protected.
-			let current_is_gitlink = current.get(*path).is_some_and(|(cm, _)| cm == "160000")
+			// Fold-aware under `core.ignoreCase`: a populated gitlink `Sub` recased to target `sub` is the
+			// same slot, so match the CURRENT gitlink by fold-key (else the recase over-refuses on the mount).
+			let path_key = fold_key(path, fold);
+			let current_is_gitlink = current
+				.iter()
+				.any(|(cp, (cm, _))| cm == "160000" && fold_key(cp, fold) == path_key)
 				|| (*mode == "160000" && is_submodule_checkout(wt.work(), path));
 			// The working-tree files whose cleanliness we must check before (re)writing this target path, each
 			// against the blob it is tracked under. Prefer the target's EXACT current entry; otherwise EVERY
@@ -404,14 +409,17 @@ where
 			// lost — validate it BEFORE the sparse short-circuit below (mirrors `merge_apply`'s guard, which
 			// validates the outgoing blob whether the incoming gitlink is in-cone or excluded).
 			if mode == "160000" && !force {
-				if let Some((cur_mode, cur_oid)) = current.get(path)
-					&& cur_mode != "160000"
-				{
-					wt.repository().read_blob(*cur_oid).await?;
-				}
-				let prefix = format!("{path}/");
+				// Fold-aware under `core.ignoreCase`: a current blob `sub` recased to a target gitlink `Sub`
+				// (or its subtree children) is the same slot, so match the OUTGOING blob to validate by
+				// fold-key, not exact case — else the recase would skip the guard and delete the sole copy.
+				let key = fold_key(path, fold);
+				let child_prefix = format!("{key}/");
 				for (cur_path, (cur_mode, cur_oid)) in &current {
-					if cur_mode != "160000" && cur_path.starts_with(&prefix) {
+					if cur_mode == "160000" {
+						continue;
+					}
+					let cur_key = fold_key(cur_path, fold);
+					if cur_key == key || cur_key.starts_with(&child_prefix) {
 						wt.repository().read_blob(*cur_oid).await?;
 					}
 				}
