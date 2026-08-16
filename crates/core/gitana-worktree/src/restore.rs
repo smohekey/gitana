@@ -17,7 +17,9 @@ use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
 
-use crate::checkout::{remove_worktree_path, validate_path, write_worktree_file};
+use crate::checkout::{
+	remove_gitlink_mount, remove_worktree_path, validate_path, write_worktree_file,
+};
 use crate::fsmeta::stat_of;
 use crate::pathspec::PathspecSet;
 use crate::{IndexEntry, Stat, WorkTree, WorktreeError};
@@ -202,16 +204,25 @@ where
 				}
 				// Absent from the source but tracked: remove it from the chosen targets.
 				None => {
-					// A path BENEATH an incoming gitlink is inside the submodule mount, which git treats as
-					// opaque: restoring the subtree-to-gitlink change stages the descendant's removal but LEAVES
-					// the working file (git never recurses into the submodule to delete it). Removing it here
-					// would be data loss AND would prune the just-materialised mount. Update only the index.
-					let under_incoming_gitlink = source_entries
-						.iter()
-						.any(|(sp, sm, _)| sm == "160000" && path.starts_with(&format!("{sp}/")));
+					// A path BENEATH a SELECTED incoming gitlink is inside the submodule mount, which git treats
+					// as opaque: restoring the subtree→gitlink change stages the descendant's removal but LEAVES
+					// the working file (git never recurses into the submodule to delete it). This applies ONLY
+					// when the gitlink ancestor is itself selected (so the mount is materialised); if the pathspec
+					// picked just the descendant, git removes it normally, so we must too.
+					let under_incoming_gitlink = source_entries.iter().any(|(sp, sm, _)| {
+						sm == "160000" && path.starts_with(&format!("{sp}/")) && selected.contains(sp.as_str())
+					});
+					// Removing a gitlink itself rmdir's only its EMPTY mount (git leaves a populated submodule, or
+					// a file the user put at the slot) via the mode-aware helper — `remove_worktree_path` never
+					// removes a directory, so it would leave a stale empty mount behind.
+					let removed_is_gitlink = index.entry(path).is_some_and(|e| e.mode == 0o160000);
 					if worktree && !under_incoming_gitlink {
 						lock.mark_mutation_started();
-						remove_worktree_path(wt, path)?;
+						if removed_is_gitlink {
+							remove_gitlink_mount(wt, path)?;
+						} else {
+							remove_worktree_path(wt, path)?;
+						}
 					}
 					if staged {
 						index.remove(path);

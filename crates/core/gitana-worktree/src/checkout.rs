@@ -1506,7 +1506,10 @@ where
 /// a populated submodule working tree is LEFT in place (git only warns "unable to rmdir"). A mount the
 /// user replaced with a plain file/symlink is removed like any file. Never errors on a non-empty
 /// directory — unlike [`remove_worktree_file`], whose `remove_file` would fail on the mount directory.
-fn remove_gitlink_mount<F, W, H>(wt: &WorkTree<F, W, H>, path: &str) -> Result<(), WorktreeError>
+pub(crate) fn remove_gitlink_mount<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	path: &str,
+) -> Result<(), WorktreeError>
 where
 	F: FileStore,
 	W: WorkDirFs,

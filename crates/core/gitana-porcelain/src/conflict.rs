@@ -55,12 +55,28 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 	theirs_tree: ObjectId<H>,
 	conflicts: &[String],
 ) -> Result<()> {
+	let repository = wt.repository();
+	let base = tree_entry_map(repository, base_tree).await?;
+	let ours = tree_entry_map(repository, ours_tree).await?;
+	let theirs = tree_entry_map(repository, theirs_tree).await?;
 	// A conflicted path is materialised regardless of the sparse patterns (below), which would overwrite
 	// local bytes the user has at that path — so refuse first, as git aborts a merge that would clobber
 	// local changes. An out-of-cone conflict path recreated/edited on disk diverges from the index; catch
 	// it before writing anything (an in-cone dirty conflict path is also refused by the checkout itself).
+	// A conflicted SUBMODULE (gitlink) is EXEMPT: git records its base/ours/theirs stages even with a
+	// populated mount present, never treating the submodule's own contents as local changes that block the
+	// merge (the mount is opaque). A file/symlink at the slot is not a gitlink here and still blocks.
+	let is_gitlink = |path: &String| {
+		[base.get(path), ours.get(path), theirs.get(path)]
+			.into_iter()
+			.flatten()
+			.any(|(mode, _)| *mode == 0o160000)
+	};
 	let diverged = wt.diverged_tracked_content_paths().await?;
-	let clobbered: Vec<&String> = conflicts.iter().filter(|p| diverged.contains(p)).collect();
+	let clobbered: Vec<&String> = conflicts
+		.iter()
+		.filter(|p| diverged.contains(*p) && !is_gitlink(p))
+		.collect();
 	if !clobbered.is_empty() {
 		bail!(
 			"your local changes to {clobbered:?} would be overwritten by the merge; commit or stash them first"
@@ -78,10 +94,6 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 	// patterns, as git does (an in-cone path was already written, so this is idempotent for it).
 	wt.materialise_paths(merged_tree, conflicts).await?;
 
-	let repository = wt.repository();
-	let base = tree_entry_map(repository, base_tree).await?;
-	let ours = tree_entry_map(repository, ours_tree).await?;
-	let theirs = tree_entry_map(repository, theirs_tree).await?;
 	let mut index = wt.load_index().await?;
 	for path in conflicts {
 		index.record_conflict(

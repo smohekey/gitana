@@ -997,6 +997,97 @@ fn merge_conflicts_on_a_submodule_pointer_like_git() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// An INITIALIZED (populated) submodule whose pointer both branches move must conflict and resolve
+/// like git: `gta merge` records three `160000` stages even with the mount checked out (it must not
+/// abort on the submodule's contents), and `gta add sub` afterward collapses the unmerged stages to a
+/// stage-0 gitlink at the submodule's HEAD (never descending into the mount to stage `sub/f`).
+#[test]
+fn populated_submodule_conflict_and_resolution_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-sub-popmerge");
+	let w = work.to_str().unwrap();
+	let src = format!("{w}/src");
+	let sup = format!("{w}/super");
+	std::fs::create_dir_all(&src).unwrap();
+	std::fs::create_dir_all(&sup).unwrap();
+	git(
+		&src,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	let mut c = Vec::new();
+	for (body, msg) in [("s1\n", "s1"), ("s2\n", "s2"), ("s3\n", "s3")] {
+		std::fs::write(format!("{src}/f"), body).unwrap();
+		git(&src, &["add", "f"]);
+		commit(&src, msg);
+		c.push(git(&src, &["rev-parse", "HEAD"]).trim().to_owned());
+	}
+	git(
+		&sup,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	std::fs::write(format!("{sup}/root"), b"r\n").unwrap();
+	git(&sup, &["add", "root"]);
+	commit(&sup, "base");
+	git_allow(&sup, &["submodule", "add", "../src", "sub"]);
+	let subdir = format!("{sup}/sub");
+	git_allow(&subdir, &["checkout", "-q", &c[0]]);
+	git(&sup, &["add", "sub"]);
+	commit(&sup, "addsub");
+	// ours → s2, theirs → s3 (both differ from base s1 and each other).
+	git(&sup, &["switch", "-q", "-c", "ours"]);
+	git_allow(&subdir, &["checkout", "-q", &c[1]]);
+	git(&sup, &["add", "sub"]);
+	commit(&sup, "ours");
+	git(&sup, &["switch", "-q", "main"]);
+	git(&sup, &["switch", "-q", "-c", "theirs"]);
+	git_allow(&subdir, &["checkout", "-q", &c[2]]);
+	git(&sup, &["add", "sub"]);
+	commit(&sup, "theirs");
+	git(&sup, &["switch", "-q", "ours"]);
+	git_allow(&subdir, &["checkout", "-q", &c[1]]);
+
+	// Merge must conflict (not abort on the populated mount) and record three 160000 stages.
+	let out = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", &sup, "merge", "theirs"])
+		.output()
+		.expect("run gta merge");
+	assert!(!out.status.success(), "a submodule conflict exits non-zero");
+	let modes_stages: Vec<(String, String)> = git(&sup, &["ls-files", "-s", "-u", "sub"])
+		.lines()
+		.map(|l| {
+			let mut p = l.split_whitespace();
+			(p.next().unwrap().to_owned(), p.nth(1).unwrap().to_owned())
+		})
+		.collect();
+	assert_eq!(
+		modes_stages,
+		vec![
+			("160000".to_owned(), "1".to_owned()),
+			("160000".to_owned(), "2".to_owned()),
+			("160000".to_owned(), "3".to_owned()),
+		],
+		"populated submodule conflict must record three 160000 stages, like git"
+	);
+
+	// Resolve to ours' pointer and `gta add sub`: collapses to a stage-0 gitlink, no `sub/f` blob.
+	git_allow(&subdir, &["checkout", "-q", &c[1]]);
+	gta(&sup, &["add", "sub"], b"");
+	assert_eq!(
+		git(&sup, &["ls-files", "-s", "sub"]).trim(),
+		format!("160000 {} 0\tsub", c[1]),
+		"`gta add sub` must resolve the conflict to a stage-0 gitlink, like git"
+	);
+	assert!(
+		git(&sup, &["ls-files", "sub/f"]).trim().is_empty(),
+		"add must not stage the submodule's contents as superproject blobs"
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
 /// The added/removed lines of two diffs, sorted, for order-independent comparison.
 fn sorted(text: &str) -> Vec<String> {
 	let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
