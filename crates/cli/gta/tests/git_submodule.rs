@@ -1154,6 +1154,99 @@ fn merge_conflicts_on_a_submodule_pointer_like_git() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// A divergent gitlink-pointer conflict whose mount is ABSENT (an uninitialized submodule) must leave
+/// the slot absent like git — `gta merge` records the conflict stages but does NOT materialise a stray
+/// empty mount directory, so `gta add .` afterward resolves the absent path as a DELETION (`D sub`),
+/// exactly as git does, rather than erroring on an empty mount that "does not have a commit checked out".
+#[test]
+fn absent_gitlink_conflict_leaves_slot_absent_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	// Two branches move an uninitialized submodule pointer to different commits; the mount is never
+	// checked out. Build with cacheinfo (no real submodule), then merge — gta on one repo, git on another.
+	let build = |w: &str| {
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		git(w, &["config", "user.name", "T"]);
+		git(w, &["config", "user.email", "t@e"]);
+		git(w, &["commit", "-q", "--allow-empty", "-m", "base"]);
+		let c0 = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+		git(w, &["switch", "-q", "-c", "a"]);
+		git(
+			w,
+			&[
+				"update-index",
+				"--add",
+				"--cacheinfo",
+				&format!("160000,{c0},sub"),
+			],
+		);
+		commit(w, "a");
+		let c1 = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+		git(w, &["switch", "-q", "-c", "b", "main"]);
+		git(
+			w,
+			&[
+				"update-index",
+				"--add",
+				"--cacheinfo",
+				&format!("160000,{c1},sub"),
+			],
+		);
+		commit(w, "b");
+		git(w, &["switch", "-q", "a"]);
+		// Ensure the mount is genuinely absent.
+		std::fs::remove_dir_all(format!("{w}/sub")).ok();
+	};
+
+	let g = unique_tmp("gta-sub-absentconf-gta");
+	let h = unique_tmp("gta-sub-absentconf-git");
+	let (wg, wh) = (g.to_str().unwrap(), h.to_str().unwrap());
+	build(wg);
+	build(wh);
+
+	// Merge (both expected to conflict, exit non-zero).
+	assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", wg, "merge", "b"])
+		.output()
+		.expect("run gta merge");
+	Command::new("git")
+		.args(["-C", wh, "-c", "protocol.file.allow=always", "merge", "b"])
+		.output()
+		.expect("run git merge");
+
+	assert!(
+		!g.join("sub").exists(),
+		"gta must leave the absent conflicted mount absent, not create an empty directory"
+	);
+	assert!(
+		!h.join("sub").exists(),
+		"sanity: git also leaves the absent conflicted mount absent"
+	);
+	// Resolve with `add .`: both must record a staged deletion of the gitlink.
+	assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", wg, "add", "."])
+		.output()
+		.expect("run gta add");
+	Command::new("git")
+		.args(["-C", wh, "add", "."])
+		.output()
+		.expect("run git add");
+	assert_eq!(
+		git(wg, &["status", "--porcelain", "sub"]).trim(),
+		git(wh, &["status", "--porcelain", "sub"]).trim(),
+		"add . must resolve the absent conflicted gitlink identically to git (D sub)"
+	);
+	std::fs::remove_dir_all(&g).ok();
+	std::fs::remove_dir_all(&h).ok();
+}
+
 /// An INITIALIZED (populated) submodule whose pointer both branches move must conflict and resolve
 /// like git: `gta merge` records three `160000` stages even with the mount checked out (it must not
 /// abort on the submodule's contents), and `gta add sub` afterward collapses the unmerged stages to a
@@ -1304,6 +1397,96 @@ fn add_inside_a_submodule_errors_like_git() {
 		String::from_utf8_lossy(&out.stderr)
 	);
 	std::fs::remove_dir_all(&work).ok();
+}
+
+/// `add <path-inside>` must be rejected even for a MIXED same-path conflict — a `sub` slot carrying BOTH
+/// a blob stage AND a gitlink stage. git decides "is inside a submodule" purely from the index gitlink
+/// stage, independent of the same-path blob and of the on-disk `.git` marker (probed vs git 2.55), so an
+/// explicit `sub/new` is rejected whether the mount is a real checkout or a marker-free directory. gta
+/// must match, never descending to stage `sub/new` as a superproject blob.
+#[test]
+fn add_inside_a_mixed_gitlink_conflict_errors_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	// Build a same-path blob-vs-gitlink conflict directly in the index (git RELOCATES such a conflict on a
+	// real merge, so we construct the non-relocated stages the way gitana's own merge leaves them).
+	let build = |w: &str| {
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		git(w, &["config", "user.name", "T"]);
+		git(w, &["config", "user.email", "t@e"]);
+		std::fs::write(format!("{w}/root"), b"r\n").unwrap();
+		git(w, &["add", "root"]);
+		commit(w, "base");
+		let c = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+		let blob = String::from_utf8(
+			Command::new("git")
+				.args(["-C", w, "hash-object", "-w", "--stdin"])
+				.stdin(std::process::Stdio::piped())
+				.stdout(std::process::Stdio::piped())
+				.spawn()
+				.and_then(|mut ch| {
+					use std::io::Write;
+					ch.stdin.take().unwrap().write_all(b"iam a file\n").unwrap();
+					ch.wait_with_output()
+				})
+				.expect("hash-object")
+				.stdout,
+		)
+		.unwrap()
+		.trim()
+		.to_owned();
+		// stage 2 = blob, stage 3 = gitlink, both at `sub`.
+		let info = format!("100644 {blob} 2\tsub\n160000 {c} 3\tsub\n");
+		let mut ch = Command::new("git")
+			.args(["-C", w, "update-index", "--index-info"])
+			.stdin(std::process::Stdio::piped())
+			.spawn()
+			.expect("update-index");
+		{
+			use std::io::Write;
+			ch.stdin.take().unwrap().write_all(info.as_bytes()).unwrap();
+		}
+		assert!(ch.wait().expect("wait").success());
+		// A marker-free directory at the slot, holding an untracked file.
+		std::fs::create_dir(format!("{w}/sub")).unwrap();
+		std::fs::write(format!("{w}/sub/new"), b"x\n").unwrap();
+	};
+
+	let g = unique_tmp("gta-sub-mixedinside-gta");
+	let h = unique_tmp("gta-sub-mixedinside-git");
+	let (wg, wh) = (g.to_str().unwrap(), h.to_str().unwrap());
+	build(wg);
+	build(wh);
+
+	let gta_out = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", wg, "add", "sub/new"])
+		.output()
+		.expect("run gta");
+	let git_out = Command::new("git")
+		.args(["-C", wh, "add", "sub/new"])
+		.output()
+		.expect("run git");
+	assert!(
+		!git_out.status.success() && !gta_out.status.success(),
+		"both git and gta must reject add of a path inside a mixed gitlink conflict"
+	);
+	assert!(
+		String::from_utf8_lossy(&gta_out.stderr).contains("Pathspec 'sub/new' is in submodule 'sub'"),
+		"gta must name the submodule like git: {}",
+		String::from_utf8_lossy(&gta_out.stderr)
+	);
+	assert!(
+		git(wg, &["ls-files", "sub/new"]).trim().is_empty(),
+		"gta must not stage the submodule's contents as a superproject blob"
+	);
+	std::fs::remove_dir_all(&g).ok();
+	std::fs::remove_dir_all(&h).ok();
 }
 
 /// Switching AWAY from a branch with an initialized submodule and back must reuse the retained
