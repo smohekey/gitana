@@ -55,12 +55,27 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 	theirs_tree: ObjectId<H>,
 	conflicts: &[String],
 ) -> Result<()> {
+	let repository = wt.repository();
+	let base = tree_entry_map(repository, base_tree).await?;
+	let ours = tree_entry_map(repository, ours_tree).await?;
+	let theirs = tree_entry_map(repository, theirs_tree).await?;
 	// A conflicted path is materialised regardless of the sparse patterns (below), which would overwrite
 	// local bytes the user has at that path — so refuse first, as git aborts a merge that would clobber
 	// local changes. An out-of-cone conflict path recreated/edited on disk diverges from the index; catch
 	// it before writing anything (an in-cone dirty conflict path is also refused by the checkout itself).
+	// A conflicted SUBMODULE (gitlink) is EXEMPT: git records its base/ours/theirs stages even with a
+	// populated mount present, never treating the submodule's own contents as local changes that block the
+	// merge (the mount is opaque). Keyed on OURS only — the conflict fallback keeps ours, so the merged
+	// result at the path is ours' entry: if ours is an ordinary file (a file-vs-gitlink type conflict),
+	// `materialise_paths` rewrites it from ours' blob, so an unstaged edit to that file MUST still block the
+	// merge (a gitlink on theirs alone does not make the path opaque). A gitlink `ours` is opaque and its
+	// mount is preserved by `materialise_paths`, so exempting it cannot delete local data.
+	let is_gitlink = |path: &String| ours.get(path).is_some_and(|(mode, _)| *mode == 0o160000);
 	let diverged = wt.diverged_tracked_content_paths().await?;
-	let clobbered: Vec<&String> = conflicts.iter().filter(|p| diverged.contains(p)).collect();
+	let clobbered: Vec<&String> = conflicts
+		.iter()
+		.filter(|p| diverged.contains(*p) && !is_gitlink(p))
+		.collect();
 	if !clobbered.is_empty() {
 		bail!(
 			"your local changes to {clobbered:?} would be overwritten by the merge; commit or stash them first"
@@ -76,12 +91,23 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 	// `UU` marker file unwritten and the conflict unresolvable. Conflicts are incompatible with
 	// skip-worktree, so vivify every conflicted path's merged (marker) content regardless of the sparse
 	// patterns, as git does (an in-cone path was already written, so this is idempotent for it).
-	wt.materialise_paths(merged_tree, conflicts).await?;
+	// For a conflicted GITLINK, `materialise_paths` normally leaves the slot untouched, but a genuine
+	// INCOMING gitlink — one whose merged side differs from ours, e.g. a modify/delete where theirs keeps
+	// the gitlink — must still get an empty mount even when sparse-excluded (git: "Version theirs left in
+	// tree"). Compute that set from the merged tree so a divergent-pointer conflict that keeps ours (merged
+	// == ours) is NOT force-materialised, while a theirs-only/moved incoming gitlink is.
+	let merged = tree_entry_map(repository, merged_tree).await?;
+	let force_gitlink_mounts: std::collections::HashSet<String> = conflicts
+		.iter()
+		.filter(|path| {
+			merged.get(*path).is_some_and(|(mode, _)| *mode == 0o160000)
+				&& merged.get(*path) != ours.get(*path)
+		})
+		.cloned()
+		.collect();
+	wt.materialise_paths(merged_tree, conflicts, &force_gitlink_mounts)
+		.await?;
 
-	let repository = wt.repository();
-	let base = tree_entry_map(repository, base_tree).await?;
-	let ours = tree_entry_map(repository, ours_tree).await?;
-	let theirs = tree_entry_map(repository, theirs_tree).await?;
 	let mut index = wt.load_index().await?;
 	for path in conflicts {
 		index.record_conflict(

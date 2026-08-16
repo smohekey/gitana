@@ -488,3 +488,86 @@ async fn write_tree_rejects_malformed_entries() -> Result<()> {
 
 	Ok(())
 }
+
+/// A gitlink (submodule) entry names a commit that need not be present in this repository, so
+/// `write-tree` records it without object validation — the exact contrast to the `not_a_blob` case
+/// above, where the *same* commit id is rejected under `regular`. The recorded tree entry is a
+/// `160000` gitlink pointing at that id.
+#[tokio::test]
+async fn write_tree_records_a_gitlink() -> Result<()> {
+	use gitana_repo_host::exports::gitana::repo::porcelain::{FileMode, TreeBuildEntry};
+
+	let fixture = build_fixture::<Sha256>().await?;
+	let mut session = Session::open(fixture.dir.path()).await?;
+	let porcelain = session.repo.gitana_repo_porcelain().repository();
+	let store = &mut session.store;
+	let handle = session.handle;
+
+	// A present commit (`fixture.m`, rejected under `regular`) and a wholly absent id both record a
+	// gitlink: git points a submodule at a commit living in another repository.
+	for id in [fixture.m.clone(), "3".repeat(64)] {
+		let tree = porcelain
+			.call_write_tree(
+				&mut *store,
+				handle,
+				&[TreeBuildEntry {
+					path: "sub".to_owned(),
+					mode: FileMode::Gitlink,
+					id: id.clone(),
+				}],
+			)
+			.await?
+			.map_err(|error| anyhow!("write-tree gitlink: {error:?}"))?;
+		let entries = porcelain
+			.call_ls_tree(&mut *store, handle, &tree)
+			.await?
+			.map_err(|error| anyhow!("ls-tree: {error:?}"))?;
+		assert_eq!(entries.len(), 1, "one gitlink entry");
+		assert_eq!(entries[0].path, "sub");
+		assert_eq!(entries[0].mode, "160000", "recorded as a gitlink");
+		assert_eq!(entries[0].id, id, "pointing at the submodule commit");
+	}
+
+	// The null (all-zero) sentinel is NOT a valid submodule commit — it must be rejected, not stored
+	// (both `validate_tree_structure` and `git fsck --strict` reject a null tree entry).
+	let null_id = "0".repeat(fixture.m.len());
+	let rejected = porcelain
+		.call_write_tree(
+			&mut *store,
+			handle,
+			&[TreeBuildEntry {
+				path: "sub".to_owned(),
+				mode: FileMode::Gitlink,
+				id: null_id,
+			}],
+		)
+		.await?;
+	assert!(
+		matches!(rejected, Err(RepoError::Invalid(_))),
+		"a null-oid gitlink must be rejected: {rejected:?}"
+	);
+
+	// A gitlink whose id names a present NON-commit (a blob) is rejected — git rejects a `160000` entry
+	// pointing at a blob/tree/tag. (A missing id stays valid: it is an external submodule commit.)
+	let blob = porcelain
+		.call_write_blob(&mut *store, handle, b"not a commit\n")
+		.await?
+		.map_err(|error| anyhow!("write-blob: {error:?}"))?;
+	let non_commit = porcelain
+		.call_write_tree(
+			&mut *store,
+			handle,
+			&[TreeBuildEntry {
+				path: "sub".to_owned(),
+				mode: FileMode::Gitlink,
+				id: blob,
+			}],
+		)
+		.await?;
+	assert!(
+		matches!(non_commit, Err(RepoError::Invalid(_))),
+		"a gitlink pointing at a present blob must be rejected: {non_commit:?}"
+	);
+
+	Ok(())
+}

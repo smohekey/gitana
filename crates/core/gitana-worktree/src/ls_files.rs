@@ -15,6 +15,7 @@ use crate::fsmeta::{join_rel, push_gitignore};
 use crate::ignore::{self, DirIgnore};
 use crate::pathspec::PathspecSet;
 use crate::status::worktree_change;
+use crate::submodule_head_oid;
 use crate::{IndexEntry, LsFilesOptions, WorkTree, WorktreeError};
 
 /// The rendered output plus, when `--error-unmatch` is set, the first pathspec that matched nothing
@@ -107,10 +108,21 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		// Gitlink (submodule) paths — mode `160000`. git never lists a tracked gitlink directory under
 		// `-o`; an ordinary tracked file whose path is now a directory (a file→dir replacement) is *not* a
 		// gitlink, so it is still descended into.
+		// Exclude a gitlink path that ALSO has tracked children (a mixed subtree-vs-gitlink conflict): the
+		// on-disk directory holds tracked files, so `-o` descends into it and reports `sub/new`, as status
+		// does — not an opaque submodule mount.
+		// Fold-aware (matches `fold_key`): a mixed `160000 Sub` + `sub/f` conflict compares by fold-key.
+		let has_tracked_child = |path: &str| {
+			let prefix = format!("{}/", fold_key(path));
+			index
+				.entries
+				.iter()
+				.any(|e| fold_key(&e.path).starts_with(&prefix))
+		};
 		let gitlinks: HashSet<String> = index
 			.entries
 			.iter()
-			.filter(|e| e.mode == 0o160000)
+			.filter(|e| e.mode == 0o160000 && !has_tracked_child(&e.path))
 			.map(|e| fold_key(&e.path))
 			.collect();
 		let mut stack: Vec<DirIgnore> = Vec::new();
@@ -159,8 +171,10 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 				);
 			}
 			if opts.modified || opts.deleted {
-				// git ignores the working tree for a skip-worktree (sparse) entry entirely: neither `-m` nor
-				// `-d` inspects its file, present or absent.
+				// git ignores the working tree for a skip-worktree (sparse) entry ENTIRELY: neither `-m` nor `-d`
+				// inspects its file, present or absent — and this holds for a submodule (gitlink) too, even when
+				// its mount is present and its `HEAD` has moved (probed vs git 2.55: `ls-files -m sub` is empty
+				// after `update-index --skip-worktree sub`).
 				if entry.skip_worktree {
 					continue;
 				}
@@ -402,67 +416,6 @@ fn placeholder_matches<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 }
 
 /// The commit id a checked-out submodule at `path` currently points at (its `HEAD`), or `None` when it
-/// cannot be resolved. Handles the common modern layout — a `.git` *gitfile* whose `gitdir:` target
-/// lives directly under the superproject's `.git/modules/…` (readable through the repository file
-/// store) — with `HEAD` either detached (a bare id) or a symref resolved from a loose ref or
-/// `packed-refs`. An old-style in-worktree `.git` directory, or a target outside this git dir's
-/// `.git/` — notably a submodule of a *linked* worktree, stored under `.git/worktrees/<wt>/modules/…`
-/// — is left unresolved (a best-effort, deliberately documented limitation; see TODO.md). An
-/// unresolved submodule is treated as unchanged rather than a false `M`.
-async fn submodule_head_oid<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
-	wt: &WorkTree<F, W, H>,
-	path: &str,
-) -> Option<ObjectId<H>> {
-	let gitfile = wt.work().read(&format!("{path}/.git")).ok()?;
-	let target = std::str::from_utf8(&gitfile)
-		.ok()?
-		.strip_prefix("gitdir:")?
-		.trim();
-	let git_dir = resolve_module_gitdir(path, target)?;
-	let store = wt.repository().objects().file_store();
-
-	let head = store.read_path(&format!("{git_dir}/HEAD")).await.ok()?;
-	let head = std::str::from_utf8(&head).ok()?.trim();
-	let Some(refname) = head.strip_prefix("ref:").map(str::trim) else {
-		// A detached `HEAD` is a bare object id.
-		return ObjectId::from_hex(head).ok();
-	};
-	// A loose ref first, then `packed-refs`.
-	if let Ok(bytes) = store.read_path(&format!("{git_dir}/{refname}")).await
-		&& let Ok(text) = std::str::from_utf8(&bytes)
-		&& let Ok(oid) = ObjectId::from_hex(text.trim())
-	{
-		return Some(oid);
-	}
-	let packed = store
-		.read_path(&format!("{git_dir}/packed-refs"))
-		.await
-		.ok()?;
-	std::str::from_utf8(&packed).ok()?.lines().find_map(|line| {
-		let (oid, name) = line.split_once(' ')?;
-		(name == refname)
-			.then(|| ObjectId::from_hex(oid).ok())
-			.flatten()
-	})
-}
-
-/// Resolve a submodule gitfile's `gitdir:` `target` (relative to the submodule work-tree `path`) to a
-/// path *under* the superproject `.git/` — returning it relative to that git dir (`modules/<name>`).
-/// `None` for a target that escapes the work tree or does not live under `.git/` (an unhandled layout).
-fn resolve_module_gitdir(path: &str, target: &str) -> Option<String> {
-	let mut parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-	for component in target.split('/') {
-		match component {
-			"" | "." => {}
-			".." => {
-				parts.pop()?;
-			}
-			other => parts.push(other),
-		}
-	}
-	parts.join("/").strip_prefix(".git/").map(str::to_owned)
-}
-
 /// Whether `bytes` is a valid `HEAD`: a `ref:` symbolic ref pointing under `refs/`, or a bare object
 /// id (40 hex for SHA-1, 64 for SHA-256). Mirrors git's `validate_headref` closely enough to tell a
 /// real repository from a directory with a garbage `HEAD` — git rejects a symref target that is not a

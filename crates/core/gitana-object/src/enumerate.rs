@@ -84,8 +84,13 @@ pub fn referenced_ids<H: HashAlgorithm>(
 			ids.extend(commit.parents);
 			ids
 		}
+		// A gitlink (submodule, mode 160000) entry's id is a COMMIT in the submodule's own repository —
+		// it is not an object of THIS repository and is never packed or connectivity-checked here. Skip it,
+		// exactly as the bitmap builder does; enqueuing it would make pack generation / receive-pack read a
+		// missing object and fail on any tree that records a submodule.
 		ObjectKind::Tree => parse_tree::<H>(data)?
 			.into_iter()
+			.filter(|entry| entry.mode != "160000")
 			.map(|entry| entry.id)
 			.collect(),
 		ObjectKind::Tag => vec![parse_tag::<H>(data)?.object],
@@ -140,6 +145,53 @@ mod tests {
 			name: name.to_owned(),
 			id: blob,
 		}])
+	}
+
+	fn tree_with_gitlink(blob: ObjectId<Sha256>, submodule: ObjectId<Sha256>) -> Vec<u8> {
+		encode_tree(&[
+			TreeEntry {
+				mode: "100644".to_owned(),
+				name: "f".to_owned(),
+				id: blob,
+			},
+			TreeEntry {
+				mode: "160000".to_owned(),
+				name: "sub".to_owned(),
+				id: submodule,
+			},
+		])
+	}
+
+	/// A submodule (gitlink) entry names a commit that lives only in the submodule's own repository —
+	/// absent from the superproject. The reachability walk must skip it, not try to read the missing
+	/// commit and fail (as pack generation / receive-pack connectivity would).
+	#[test]
+	fn enumerate_skips_absent_gitlink_commits() {
+		let mut store = Store::default();
+		let blob = store.put(ObjectKind::Blob, b"hello".to_vec());
+		// A commit id deliberately NOT inserted — an external submodule commit.
+		let submodule = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"external submodule commit");
+		let tree = store.put(ObjectKind::Tree, tree_with_gitlink(blob, submodule));
+		let root = store.put(ObjectKind::Commit, commit(tree, vec![], "root"));
+
+		let objects = enumerate_objects(&[root], &[], store.reader())
+			.expect("enumerate must not try to read the absent gitlink commit");
+		let ids: HashSet<ObjectId<Sha256>> = objects.iter().map(|o| o.id).collect();
+		assert_eq!(
+			ids,
+			HashSet::from([blob, tree, root]),
+			"the external gitlink commit must not be enumerated"
+		);
+		assert!(!ids.contains(&submodule));
+
+		// `referenced_ids` itself drops the gitlink entry.
+		let refs = referenced_ids::<Sha256>(ObjectKind::Tree, &tree_with_gitlink(blob, submodule))
+			.expect("parse tree");
+		assert_eq!(
+			refs,
+			vec![blob],
+			"referenced_ids yields the blob but not the gitlink commit"
+		);
 	}
 
 	#[test]

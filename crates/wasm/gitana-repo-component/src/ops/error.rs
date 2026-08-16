@@ -68,6 +68,14 @@ pub(crate) fn worktree_error(error: WorktreeError) -> RepoError {
 		| WorktreeError::SparsePathExcluded(_)
 		| WorktreeError::PathspecAdvisory { .. }
 		| WorktreeError::InvalidPathspecMagic(_)
+		// Submodule (gitlink) rejections are caller/state errors, not backend failures: a pathspec naming
+		// into a submodule, an unresolvable/no-HEAD or null-OID gitlink, or a symlink/special node at a
+		// mount slot. `backend` is reserved for underlying file-store faults, so surface these as `invalid`.
+		| WorktreeError::PathspecInSubmodule { .. }
+		| WorktreeError::SubmoduleNoCommit(_)
+		| WorktreeError::SubmodulePathIsSymlink(_)
+		| WorktreeError::NullGitlinkOid(_)
+		| WorktreeError::UnsupportedFileType(_)
 		| WorktreeError::Config(_)) => RepoError::Invalid(invalid.to_string()),
 		other => RepoError::Backend(other.to_string()),
 	}

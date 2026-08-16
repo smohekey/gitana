@@ -11,6 +11,7 @@ use gitana_object::{HashAlgorithm, ObjectId, ObjectKind};
 use crate::excludes::StandardExcludes;
 use crate::fsmeta::{blob_of, effective_mode, join_rel, push_gitignore};
 use crate::ignore::{self, DirIgnore};
+use crate::submodule_head_oid;
 use crate::worktree::stat_matches;
 use crate::{Conflict, IndexEntry, WorkTree, WorktreeError};
 
@@ -100,12 +101,34 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		.chain(unmerged.keys().cloned())
 		.map(|path| fold_key(&path, fold))
 		.collect();
+	// Tracked submodule (gitlink) paths, folded — a gitlink's on-disk directory is git's to track, never
+	// listed untracked (unlike a tracked file replaced by an untracked directory). Built from ALL index
+	// entries, not just stage 0: an unmerged (conflicted) gitlink has only stage 1/2/3 entries, and its
+	// mount directory must still be excluded from untracked so status shows `UU sub`, never `?? sub/`.
+	// EXCLUDE a gitlink path that ALSO has tracked CHILDREN (`sub/f`) — a mixed subtree-vs-gitlink conflict
+	// where the on-disk `sub/` holds tracked files, so it is a real directory to descend into (git reports
+	// `?? sub/new`), not an opaque submodule mount.
+	// Fold-aware under `core.ignoreCase`: a mixed `160000 Sub` + `sub/f` conflict compares by fold-key.
+	let has_tracked_child = |path: &str| {
+		let prefix = format!("{}/", fold_key(path, fold));
+		index
+			.entries
+			.iter()
+			.any(|e| fold_key(&e.path, fold).starts_with(&prefix))
+	};
+	let gitlinks: HashSet<String> = index
+		.entries
+		.iter()
+		.filter(|entry| entry.mode == 0o160000 && !has_tracked_child(&entry.path))
+		.map(|entry| fold_key(&entry.path, fold))
+		.collect();
 	let mut untracked = Vec::new();
 	let mut ignore_stack: Vec<DirIgnore> = base;
 	collect_untracked(
 		wt.work(),
 		"",
 		&tracked,
+		&gitlinks,
 		&mut ignore_stack,
 		&mut untracked,
 		fold,
@@ -139,7 +162,32 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		if entry.skip_worktree && wt.work().lstat(&entry.path)?.is_none() {
 			continue;
 		}
-		let code = worktree_change(wt.work(), entry, &entry.path, file_mode)?;
+		let code = if entry.mode == 0o160000 {
+			// A submodule (gitlink) entry is compared by the path's kind first (probed vs git 2.55): an absent
+			// mount is ` D sub` (deleted), a mount replaced by a file/symlink is ` T sub` (type change), and a
+			// present directory is ` M` iff its checked-out `HEAD` differs from the recorded commit. git ignores
+			// the submodule's own dirty working content by default; an unresolvable submodule (an unhandled
+			// `.git` layout) under a real directory is treated as unchanged, never a false `M` (as `ls-files -m`).
+			// git honours the index trust bits for a gitlink exactly as for a blob: with skip-worktree or
+			// assume-valid set the working tree and the submodule's HEAD are not consulted, so a moved/absent/
+			// type-changed mount is no worktree modification (probed vs git 2.55; matches `ls-files -m`).
+			// skip-worktree + absent already `continue`d above; this also covers skip-worktree + present and
+			// assume-valid.
+			if entry.skip_worktree || entry.assume_valid {
+				' '
+			} else {
+				match wt.work().lstat(&entry.path)? {
+					None => 'D',
+					Some(meta) if !meta.kind.is_dir() => 'T',
+					Some(_) => match submodule_head_oid(wt, &entry.path).await {
+						Some(head) if head != entry.oid => 'M',
+						_ => ' ',
+					},
+				}
+			}
+		} else {
+			worktree_change(wt.work(), entry, &entry.path, file_mode)?
+		};
 		if code != ' ' {
 			at(&mut merged, &entry.path).worktree = code;
 		}
@@ -220,6 +268,27 @@ pub(crate) async fn worktree_content_state<F: FileStore, W: WorkDirFs, H: HashAl
 	let Some(meta) = wt.work().lstat(&entry.path)? else {
 		return Ok(WorktreeContent::Absent);
 	};
+	// A submodule (gitlink) mount is not a blob and cannot be hashed. An EMPTY mount directory is
+	// reconstructable — a checkout recreates it without cloning — so it is safe to remove; a POPULATED
+	// submodule working tree, or a file/symlink that replaced the mount, is a divergence to preserve (git
+	// leaves such content in place). Without this a linked worktree holding the empty mount a gitlink
+	// checkout produces would be classed diverged, so `worktree remove` would refuse it without `--force`.
+	if entry.mode == 0o160000 {
+		// An UNREADABLE mount (e.g. a mode-000 directory) must not abort the scan — git records a submodule
+		// conflict without reading the mount. Treat a mount we cannot list as non-empty (Diverged/preserved),
+		// never propagating the error.
+		let reconstructable = meta.kind.is_dir()
+			&& wt
+				.work()
+				.read_dir(&entry.path)
+				.map(|entries| entries.is_empty())
+				.unwrap_or(false);
+		return Ok(if reconstructable {
+			WorktreeContent::Reconstructable
+		} else {
+			WorktreeContent::Diverged
+		});
+	}
 	// Deliberately *no* `stat_matches` shortcut: hash the working file and compare oid + mode directly.
 	let diverged = match blob_of::<W, H>(wt.work(), &entry.path, &meta)? {
 		Some((oid, _))
@@ -413,6 +482,7 @@ fn collect_untracked<W: WorkDirFs>(
 	work: &W,
 	dir_rel: &str,
 	tracked: &HashSet<String>,
+	gitlinks: &HashSet<String>,
 	stack: &mut Vec<DirIgnore>,
 	out: &mut Vec<String>,
 	fold: bool,
@@ -429,13 +499,20 @@ fn collect_untracked<W: WorkDirFs>(
 		if ignore::is_ignored_fold(&rel, is_dir, stack, fold) {
 			continue;
 		}
+		// A directory that is itself a tracked SUBMODULE (a gitlink) is git's to track — never listed
+		// untracked, and not descended into (its contents belong to the submodule). Its status is the
+		// tracked Y-column comparison above. (A tracked *file* replaced by a directory is NOT a gitlink and
+		// falls through to the normal untracked handling.)
+		if is_dir && gitlinks.contains(&fold_key(&rel, fold)) {
+			continue;
+		}
 		// Membership is checked case-folded under `core.ignoreCase` (the `tracked` keys are already
 		// folded); the emitted path is always the real on-disk spelling.
 		if is_dir {
 			let prefix = format!("{rel}/");
 			let prefix_key = fold_key(&prefix, fold);
 			if tracked.iter().any(|path| path.starts_with(&prefix_key)) {
-				collect_untracked(work, &rel, tracked, stack, out, fold)?;
+				collect_untracked(work, &rel, tracked, gitlinks, stack, out, fold)?;
 			} else if dir_has_unignored(work, &rel, stack, fold)? {
 				// A fully-untracked directory collapses to a single `dir/` — but only when it holds some
 				// non-ignored content. git omits a directory whose entire content is ignored (by any

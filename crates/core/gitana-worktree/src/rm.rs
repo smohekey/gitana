@@ -163,8 +163,23 @@ where
 				continue;
 			};
 
-			// `local`: the working-tree file differs from the index entry.
-			let local = if stat_matches(entry, &meta) {
+			// `local`: the working-tree file differs from the index entry. A submodule (gitlink) mount is
+			// opaque — never hashed as a blob. Only an ABSENT (handled above) or EMPTY mount directory is
+			// reconstructable, so `rm sub` removes it and its index entry without --force (probed vs git 2.55).
+			// Anything else at the slot is a local modification a non-force `rm` must refuse: a POPULATED mount
+			// holds the submodule's own working tree (git refuses too — via a .gitmodules name lookup, out of
+			// scope here), and a regular FILE/symlink the user put where the gitlink was is local data git
+			// likewise reports modified. An unreadable mount is treated as populated (fail-safe).
+			let local = if entry.mode == 0o160000 {
+				if meta.kind.is_dir() {
+					wt.work()
+						.read_dir(path)
+						.map(|entries| !entries.is_empty())
+						.unwrap_or(true)
+				} else {
+					true
+				}
+			} else if stat_matches(entry, &meta) {
 				false
 			} else {
 				match blob_of(wt.work(), path, &meta)? {
@@ -213,9 +228,41 @@ where
 	let mut removed = Vec::with_capacity(selected.len());
 	let mut failure: Option<WorktreeError> = None;
 	for path in &selected {
-		if !cached && let Err(error) = remove_worktree_file(wt, path) {
-			failure.get_or_insert(error);
-			continue;
+		// Choose the removal by what actually occupies the slot (probed vs git 2.55), NOT by an index stage:
+		// a gitlink materialized as a mount DIRECTORY is removed by `rmdir` (an EMPTY mount goes; a non-empty
+		// one errors and keeps its index entry — never `remove_file`, which fails on a directory), while a
+		// regular FILE/symlink at the slot — e.g. a mixed blob-vs-gitlink conflict whose worktree side is a
+		// file — is unlinked like any other tracked path. A failure keeps the index entry so the index stays
+		// consistent with the working tree.
+		let is_gitlink = index
+			.entries
+			.iter()
+			.any(|entry| entry.path == *path && entry.mode == 0o160000);
+		if !cached {
+			let removal = match wt.work().lstat(path)? {
+				Some(meta) if is_gitlink && meta.kind.is_dir() => {
+					// Never `rmdir` THROUGH a symlinked ancestor: for a nested gitlink `link/sub` where `link`
+					// is a symlink to another in-tree directory, `lstat` follows the link and a raw `remove_dir`
+					// would delete the real `actual/sub`. git aborts because `link` is symbolic, so refuse here
+					// too — keeping the index entry (probed vs git 2.55).
+					if crate::checkout::has_symlinked_ancestor(wt.work(), path) {
+						Err(WorktreeError::UnsafePath(path.to_owned()))
+					} else {
+						// rmdir removes an EMPTY mount and errors on a populated one (kept, non-force already
+						// refused it above). DEFERRED divergence: `rm -f` of a POPULATED mount — git recursively
+						// removes a plain directory but ERRORS on a real submodule (`.git` present, needs a
+						// .gitmodules name lookup, out of scope); gta's rmdir keeps the entry either way. The
+						// plain-dir `-f` case is a minor capability gap; the real-submodule case is .gitmodules
+						// territory. Both are safe (no data deleted).
+						wt.work().remove_dir(path).map_err(WorktreeError::from)
+					}
+				}
+				_ => remove_worktree_file(wt, path),
+			};
+			if let Err(error) = removal {
+				failure.get_or_insert(error);
+				continue;
+			}
 		}
 		index.remove(path);
 		removed.push(path.clone());

@@ -38,6 +38,28 @@ pub enum WorktreeError {
 	/// A pathspec matched no entries in the restore source.
 	#[error("pathspec did not match any file(s): {0}")]
 	PathspecMatch(String),
+	/// An explicitly-named pathspec points inside a tracked submodule (git's fatal, exit 128): the
+	/// superproject cannot add a submodule's own contents.
+	#[error("Pathspec '{path}' is in submodule '{submodule}'")]
+	PathspecInSubmodule { path: String, submodule: String },
+	/// Staging an unmerged submodule (`add`) whose mount has no checked-out `HEAD` to record — git's
+	/// fatal "'<path>' does not have a commit checked out": the conflict cannot be resolved.
+	#[error("'{0}' does not have a commit checked out")]
+	SubmoduleNoCommit(String),
+	/// git's fatal when a tracked submodule (gitlink) slot is occupied by a symbolic link — it refuses to
+	/// treat the link as the submodule and aborts (probed vs git 2.55: `diff` → this exact message).
+	#[error("expected submodule path '{0}' not to be a symbolic link")]
+	SubmodulePathIsSymlink(String),
+	/// A tree records a gitlink (mode 160000) with an all-zero object id — not a valid cache entry. git
+	/// refuses to write the index and does not switch branches (probed vs git 2.55: "cache entry has null
+	/// sha1"). A non-null commit gitana does not have locally is fine (an unfetched submodule); only the
+	/// null id is rejected.
+	#[error("cache entry has null sha1: {0}")]
+	NullGitlinkOid(String),
+	/// A working-tree path is a FIFO, socket, or device — git cannot hash it, so `diff` aborts rather than
+	/// rendering a change (probed vs git 2.55: "'{0}': unsupported file type" / "cannot hash '{0}'").
+	#[error("'{0}': unsupported file type")]
+	UnsupportedFileType(String),
 	/// A standard excludes source (`.git/info/exclude`, or a configured/global excludes file) is a
 	/// directory or is otherwise unusable — git's fatal "cannot use … as an exclude file".
 	#[error("cannot use {0} as an exclude file")]

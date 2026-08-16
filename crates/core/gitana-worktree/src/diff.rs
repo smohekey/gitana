@@ -11,8 +11,21 @@ use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_repository::Repository;
 
 use crate::fsmeta::{blob_of, effective_mode};
+use crate::submodule_head_oid;
 use crate::worktree::stat_matches;
 use crate::{WorkTree, WorktreeError};
+
+/// git's mode bits for a submodule (gitlink) entry.
+const GITLINK_MODE: u32 = 0o160000;
+
+/// git renders a submodule (gitlink) as a one-line synthetic blob, so a pointer change shows as
+/// `Subproject commit <old>` → `<new>`. We compare the recorded commit to the submodule's
+/// checked-out `HEAD`; we do **not** inspect the submodule's own working-tree dirtiness (git's
+/// `-dirty` suffix), matching `status`, which likewise ignores dirty submodule content. Recording
+/// submodule dirtiness belongs to the separate submodule-operations initiative.
+fn gitlink_content<H: HashAlgorithm>(oid: &ObjectId<H>) -> Vec<u8> {
+	format!("Subproject commit {oid}\n").into_bytes()
+}
 
 /// One path's change between two sides. A `None` content/mode means the path is
 /// absent on that side (an addition or deletion).
@@ -34,6 +47,65 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	let index = wt.load_index().await?;
 	let mut out = Vec::new();
 	for entry in index.entries.iter().filter(|e| e.stage == 0) {
+		if entry.mode == GITLINK_MODE {
+			// A submodule (gitlink) is diffed by the mount's kind (probed vs git 2.55):
+			// - absent → a deletion (`-Subproject commit <recorded>`), unless it is an omitted skip-worktree
+			//   entry (git ignores the working tree for it);
+			// - replaced by a file/symlink → a type change. git splits this into a gitlink deletion plus a file
+			//   addition; gta's one-`FileDiff`-per-path model renders it as a single mode+content block instead
+			//   (a documented divergence);
+			// - a present directory → a pointer change `<recorded>` → the submodule's checked-out `HEAD`
+			//   (unresolvable = unchanged, as `status`).
+			// git honours the index trust bits for a gitlink exactly as for a blob: with skip-worktree or
+			// assume-valid set the working tree (and the submodule's HEAD) is not consulted, so a moved/absent/
+			// type-changed mount yields no unstaged diff (probed vs git 2.55; matches `ls-files -m` and status).
+			if entry.skip_worktree || entry.assume_valid {
+				continue;
+			}
+			match wt.work().lstat(&entry.path)? {
+				None => {
+					out.push(FileDiff {
+						path: entry.path.clone(),
+						old: Some((gitlink_content(&entry.oid), entry.mode)),
+						new: None,
+					});
+				}
+				// A SYMLINK at the mount is git's fatal — it refuses to treat the link as the submodule and
+				// aborts `diff` (probed vs git 2.55: "expected submodule path 'sub' not to be a symbolic link").
+				Some(meta) if meta.kind.is_symlink() => {
+					return Err(WorktreeError::SubmodulePathIsSymlink(entry.path.clone()));
+				}
+				// A regular file replaced the mount — a type change; read its content. A FIFO/socket/device
+				// (`FileKind::Other`) is NOT read (reading a pipe blocks forever) — it falls to the arm below,
+				// which resolves nothing and emits no hunk (git exits "unsupported file type").
+				Some(meta) if meta.kind.is_file() => {
+					let new = read_worktree(wt.work(), &entry.path, &meta)?;
+					out.push(FileDiff {
+						path: entry.path.clone(),
+						old: Some((gitlink_content(&entry.oid), entry.mode)),
+						new: Some((new, effective_mode(&meta, 0o100644))),
+					});
+				}
+				// A FIFO/socket/device (`FileKind::Other`) at the slot is git's fatal — it cannot hash the node,
+				// so `diff` aborts ("'sub': unsupported file type") rather than reporting a (falsely clean) type
+				// change. Detected here as the only remaining non-directory kind (probed vs git 2.55).
+				Some(meta) if !meta.kind.is_dir() => {
+					return Err(WorktreeError::UnsupportedFileType(entry.path.clone()));
+				}
+				Some(_) => {
+					if let Some(head) = submodule_head_oid(wt, &entry.path).await
+						&& head != entry.oid
+					{
+						out.push(FileDiff {
+							path: entry.path.clone(),
+							old: Some((gitlink_content(&entry.oid), entry.mode)),
+							new: Some((gitlink_content(&head), entry.mode)),
+						});
+					}
+				}
+			}
+			continue;
+		}
 		let Some(meta) = wt.work().lstat(&entry.path)? else {
 			// An omitted sparse path (skip-worktree) is absent by design — git ignores the working tree for
 			// it, so its absence is not an unstaged deletion. A skip-worktree path that *is* present falls
@@ -123,7 +195,8 @@ pub(crate) async fn staged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 /// tree-to-tree diff. `old` is `None` for an empty left side (a root commit has no parent) — an
 /// empty side is represented in memory, never materialised, so this stays read-only. Needs only the
 /// repository — no working tree — but produces the same [`FileDiff`]s as the index/working-tree
-/// diffs, so it lives alongside them. Submodule (gitlink) entries are skipped: no blob to diff.
+/// diffs, so it lives alongside them. A submodule (gitlink) pointer change shows as git's synthetic
+/// `Subproject commit <old>` → `<new>`.
 pub async fn trees<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	old: Option<ObjectId<H>>,
@@ -150,7 +223,8 @@ pub async fn trees<F: FileStore, H: HashAlgorithm>(
 	Ok(out)
 }
 
-/// A tree flattened to `path -> (mode, oid)`, dropping gitlinks (submodule entries).
+/// A tree flattened to `path -> (mode, oid)`. Gitlinks (submodule entries) are kept: their `oid`
+/// is a commit, rendered as `Subproject commit <oid>` by [`side`], not read as a blob.
 async fn tree_entries<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	tree: ObjectId<H>,
@@ -160,18 +234,19 @@ async fn tree_entries<F: FileStore, H: HashAlgorithm>(
 			.read_tree(tree)
 			.await?
 			.into_iter()
-			.filter(|(_, mode, _)| mode != "160000")
 			.map(|(path, mode, oid)| (path, (parse_mode(&mode), oid)))
 			.collect(),
 	)
 }
 
-/// Resolve a `(mode, oid)` reference to its blob content and mode, or `None`.
+/// Resolve a `(mode, oid)` reference to its content and mode, or `None`. A gitlink's `oid` is a
+/// commit, not a blob, so it renders as git's synthetic `Subproject commit <oid>` line.
 async fn side<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	what: Option<&(u32, ObjectId<H>)>,
 ) -> Result<Option<(Vec<u8>, u32)>, WorktreeError> {
 	match what {
+		Some((mode, oid)) if *mode == GITLINK_MODE => Ok(Some((gitlink_content(oid), *mode))),
 		Some((mode, oid)) => Ok(Some((repo.read_blob(*oid).await?, *mode))),
 		None => Ok(None),
 	}
