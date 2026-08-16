@@ -108,10 +108,17 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		// Gitlink (submodule) paths — mode `160000`. git never lists a tracked gitlink directory under
 		// `-o`; an ordinary tracked file whose path is now a directory (a file→dir replacement) is *not* a
 		// gitlink, so it is still descended into.
+		// Exclude a gitlink path that ALSO has tracked children (a mixed subtree-vs-gitlink conflict): the
+		// on-disk directory holds tracked files, so `-o` descends into it and reports `sub/new`, as status
+		// does — not an opaque submodule mount.
+		let has_tracked_child = |path: &str| {
+			let prefix = format!("{path}/");
+			index.entries.iter().any(|e| e.path.starts_with(&prefix))
+		};
 		let gitlinks: HashSet<String> = index
 			.entries
 			.iter()
-			.filter(|e| e.mode == 0o160000)
+			.filter(|e| e.mode == 0o160000 && !has_tracked_child(&e.path))
 			.map(|e| fold_key(&e.path))
 			.collect();
 		let mut stack: Vec<DirIgnore> = Vec::new();

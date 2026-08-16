@@ -66,7 +66,10 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 						});
 					}
 				}
-				Some(meta) if !meta.kind.is_dir() => {
+				// A regular file or symlink replaced the mount — a type change; read its content. A FIFO/socket/
+				// device (`FileKind::Other`) is NOT read (reading a pipe blocks forever) — it falls to the arm
+				// below, which resolves nothing and emits no hunk (git exits "unsupported file type").
+				Some(meta) if meta.kind.is_file() || meta.kind.is_symlink() => {
 					let new = read_worktree(wt.work(), &entry.path, &meta)?;
 					out.push(FileDiff {
 						path: entry.path.clone(),

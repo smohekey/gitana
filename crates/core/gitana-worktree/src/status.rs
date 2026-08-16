@@ -261,7 +261,15 @@ pub(crate) async fn worktree_content_state<F: FileStore, W: WorkDirFs, H: HashAl
 	// leaves such content in place). Without this a linked worktree holding the empty mount a gitlink
 	// checkout produces would be classed diverged, so `worktree remove` would refuse it without `--force`.
 	if entry.mode == 0o160000 {
-		let reconstructable = meta.kind.is_dir() && wt.work().read_dir(&entry.path)?.is_empty();
+		// An UNREADABLE mount (e.g. a mode-000 directory) must not abort the scan — git records a submodule
+		// conflict without reading the mount. Treat a mount we cannot list as non-empty (Diverged/preserved),
+		// never propagating the error.
+		let reconstructable = meta.kind.is_dir()
+			&& wt
+				.work()
+				.read_dir(&entry.path)
+				.map(|entries| entries.is_empty())
+				.unwrap_or(false);
 		return Ok(if reconstructable {
 			WorktreeContent::Reconstructable
 		} else {

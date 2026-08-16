@@ -1441,6 +1441,10 @@ where
 		match wt.work().lstat(path)? {
 			Some(meta) if meta.kind.is_dir() => wt.work().remove_dir_all(path)?,
 			Some(meta) if meta.kind.is_symlink() => wt.work().remove_file(path)?,
+			// A FIFO/socket/device (`FileKind::Other`) is not a plain file — writing over it would block or
+			// fail — so unlink it first (git does the same). A plain file, or an absent path, takes the
+			// in-place overwrite / create below.
+			Some(meta) if !meta.kind.is_file() => wt.work().remove_file(path)?,
 			_ => {}
 		}
 		wt.work().write(path, &content, mode == "100755")?;
@@ -1586,20 +1590,17 @@ fn has_symlinked_ancestor<W: WorkDirFs>(work: &W, path: &str) -> bool {
 /// exempting it from the untracked-content overwrite guard. An arbitrary untracked directory (no `.git`)
 /// is NOT a submodule checkout and stays protected.
 fn is_submodule_checkout<W: WorkDirFs>(work: &W, path: &str) -> bool {
-	if !matches!(work.lstat(path), Ok(Some(meta)) if meta.kind.is_dir()) {
-		return false;
-	}
-	// Validate the `.git` marker, not merely its existence: an untracked directory with a malformed or
-	// empty `.git` is NOT a submodule checkout and must stay protected (git rejects it). A gitdir directory
-	// has a `HEAD`; a gitfile points at one (`gitdir: <path>`).
-	let dotgit = format!("{path}/.git");
-	match work.lstat(&dotgit) {
-		Ok(Some(meta)) if meta.kind.is_dir() => {
-			matches!(work.lstat(&format!("{dotgit}/HEAD")), Ok(Some(_)))
-		}
-		Ok(Some(_)) => matches!(work.read(&dotgit), Ok(bytes) if bytes.starts_with(b"gitdir:")),
-		_ => false,
-	}
+	// git materialises an incoming gitlink by REUSING whatever DIRECTORY sits at the slot — a submodule
+	// checkout, an arbitrary untracked directory (marker-free), whatever — leaving its contents in place
+	// (probed vs git 2.55: a marker-free `sub/` with content is preserved and the gitlink recorded). Only a
+	// FILE/symlink/special node at the slot is protected, because git refuses to overwrite it. So the
+	// exemption is simply "the slot is a directory".
+	//
+	// Documented divergence: git FATALS on a directory whose `.git` gitfile is dangling ("gitdir: nowhere");
+	// gitana cannot detect that here — a valid submodule gitfile points into the git dir, OUTSIDE the
+	// working-tree sandbox this crate can see, so it cannot validate any gitfile target. A dangling-gitfile
+	// mount is therefore reused rather than rejected (an ultra-rare, hostile-ish state).
+	matches!(work.lstat(path), Ok(Some(meta)) if meta.kind.is_dir())
 }
 
 fn ensure_no_overwrite<F, W, H>(

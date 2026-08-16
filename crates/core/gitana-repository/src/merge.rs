@@ -142,7 +142,12 @@ fn merge_tree<'a, H: HashAlgorithm>(
 						entries.push(entry);
 						continue;
 					}
-					// Directory/file, modify/delete, etc.: keep a deterministic side, flag a conflict.
+					// Directory/file, modify/delete, gitlink-vs-anything, etc.: keep a deterministic side and
+					// flag a conflict. This is gitana's general D/F conflict simplification — it does NOT
+					// perform git's D/F RELOCATION (materialising the tree side while relocating the file/gitlink
+					// side to `name~<branch>`), so the non-kept side's changes are represented only by the
+					// conflict flag, not a second path. Applies to blob-vs-tree the same as gitlink-vs-tree; full
+					// D/F relocation is a separate general-merge concern, not submodule-specific.
 					_ => {
 						conflicts.push(name.to_owned());
 						ours_entry.or(theirs_entry)
