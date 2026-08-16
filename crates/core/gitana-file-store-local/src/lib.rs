@@ -23,6 +23,7 @@
 //! crate is *capability-pure*: it never mints ambient authority — callers hand it an
 //! open `Dir` (native) or a descriptor (wasm).
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::{Seek, SeekFrom};
@@ -30,8 +31,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gitana_file_store::{
-	ByteReader, DeleteOutcome, FileStore, FileStoreError, PathLock, Result, Version, WriteOutcome,
-	split_prefix,
+	ByteReader, DeleteOutcome, DurabilityTarget, FileStore, FileStoreError, PathLock, Result,
+	Version, WriteOutcome, split_prefix,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
@@ -141,6 +142,25 @@ impl LocalFileStore {
 		blocking(move || fs.create_dir_all(&path).map_err(backend_err)).await
 	}
 
+	/// Inspect one path without following its final component.
+	///
+	/// This stays crate-private: the split worktree router uses it to distinguish an absent logical
+	/// subtree (whose surviving parent namespace must be flushed) from a symlink or other collision
+	/// that a durability boundary must reject.
+	pub(crate) async fn kind_nofollow(&self, path: &str) -> Result<Option<FileKind>> {
+		if path.is_empty() {
+			return Ok(Some(FileKind::Dir));
+		}
+		let path = self.resolve(path)?.to_owned();
+		let fs = Arc::clone(&self.backend);
+		blocking(move || match fs.kind(&path) {
+			Ok(kind) => Ok(Some(kind)),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+			Err(error) => Err(backend_err(error)),
+		})
+		.await
+	}
+
 	/// Lexically validate a git-relative path, returning it unchanged. The backend
 	/// confines paths structurally; this is cheap defence-in-depth that also gives a
 	/// deterministic [`FileStoreError::Backend`] for traversal/empty components.
@@ -178,6 +198,27 @@ impl FileStore for LocalFileStore {
 			#[cfg(not(target_arch = "wasm32"))]
 			locks: Arc::clone(&self.locks),
 		}
+	}
+
+	async fn durability_barrier(&self, targets: &[DurabilityTarget]) -> Result<()> {
+		let targets = targets
+			.iter()
+			.map(|target| {
+				let path = target.path();
+				if path.is_empty() {
+					if matches!(target, DurabilityTarget::File(_)) {
+						return Err(FileStoreError::Backend(
+							"the store root is not a regular-file durability target".to_owned(),
+						));
+					}
+				} else {
+					self.resolve(path)?;
+				}
+				Ok(target.clone())
+			})
+			.collect::<Result<Vec<_>>>()?;
+		let fs = Arc::clone(&self.backend);
+		blocking(move || sync_targets(&*fs, &targets)).await
 	}
 
 	async fn read_path(&self, path: &str) -> Result<Vec<u8>> {
@@ -513,6 +554,12 @@ trait Backend: Send + Sync + 'static {
 	fn size(&self, path: &str) -> std::io::Result<u64>;
 	/// Raw entry names directly under `dir_rel` (`""` = root); empty if the dir is absent.
 	fn list_names(&self, dir_rel: &str) -> std::io::Result<Vec<String>>;
+	/// Classify `path` without following a final symbolic link.
+	fn kind(&self, path: &str) -> std::io::Result<FileKind>;
+	/// Flush one regular file's data and metadata to stable storage.
+	fn sync_file(&self, path: &str) -> std::io::Result<()>;
+	/// Flush one directory's namespace metadata to stable storage (`""` is the store root).
+	fn sync_dir(&self, path: &str) -> std::io::Result<()>;
 }
 
 /// Native backend: every operation goes through a [`cap_std::fs::Dir`] capability.
@@ -603,12 +650,165 @@ impl Backend for CapBackend {
 		}
 		Ok(names)
 	}
+
+	fn kind(&self, path: &str) -> std::io::Result<FileKind> {
+		let file_type = self.dir.symlink_metadata(path)?.file_type();
+		Ok(if file_type.is_file() {
+			FileKind::File
+		} else if file_type.is_dir() {
+			FileKind::Dir
+		} else if file_type.is_symlink() {
+			FileKind::Symlink
+		} else {
+			FileKind::Other
+		})
+	}
+
+	fn sync_file(&self, path: &str) -> std::io::Result<()> {
+		let mut options = OpenOptions::new();
+		options.read(true);
+		#[cfg(windows)]
+		options.write(true);
+		self.dir.open_with(path, &options)?.sync_all()
+	}
+
+	fn sync_dir(&self, path: &str) -> std::io::Result<()> {
+		#[cfg(windows)]
+		{
+			use cap_std::fs::OpenOptionsExt;
+			use windows_sys::Win32::Storage::FileSystem::{
+				FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+			};
+
+			let mut options = OpenOptions::new();
+			options
+				.read(true)
+				.write(true)
+				.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+			return self
+				.dir
+				.open_with(if path.is_empty() { "." } else { path }, &options)?
+				.sync_all();
+		}
+
+		#[cfg(not(windows))]
+		{
+			// On Linux, cap-std directory capabilities may use `O_PATH`; cloning one and
+			// calling `fsync` on it fails with `EBADF`. Reopen the directory through the
+			// capability with read access to obtain a sync-capable descriptor.
+			let mut options = OpenOptions::new();
+			options.read(true);
+			self
+				.dir
+				.open_with(if path.is_empty() { "." } else { path }, &options)?
+				.sync_all()
+		}
+	}
 }
 
 /// The parent of a git-relative path (everything before the last `/`), or `None` when
 /// the path is a direct child of the store root.
 fn parent_of(path: &str) -> Option<&str> {
 	path.rfind('/').map(|i| &path[..i])
+}
+
+/// Flush every targeted regular value, then every targeted directory from the leaves back to the
+/// store root.
+///
+/// Walking the current tree rather than retaining process-local dirty paths makes the same barrier
+/// usable after a restart: a caller can validate state left by an interrupted publication, flush
+/// whatever survived, and only then acknowledge it as durable. Symbolic links and special entries
+/// have no owned file contents to flush; synchronizing their parent directory persists their
+/// namespace entry without following them.
+fn sync_targets(fs: &dyn Backend, targets: &[DurabilityTarget]) -> Result<()> {
+	let mut files = BTreeSet::new();
+	let mut directories = BTreeSet::new();
+
+	for target in targets {
+		match target {
+			DurabilityTarget::File(path) => {
+				if fs.kind(path).map_err(backend_err)? != FileKind::File {
+					return Err(FileStoreError::Backend(format!(
+						"durability file target is not a regular file: {path:?}"
+					)));
+				}
+				files.insert(path.clone());
+				add_directory_chain(parent_of(path).unwrap_or(""), &mut directories);
+			}
+			DurabilityTarget::Directory(path) => {
+				if !path.is_empty() && fs.kind(path).map_err(backend_err)? != FileKind::Dir {
+					return Err(FileStoreError::Backend(format!(
+						"durability directory target is not a directory: {path:?}"
+					)));
+				}
+				add_directory_chain(path, &mut directories);
+			}
+			DurabilityTarget::Tree(root) => {
+				if !root.is_empty() && fs.kind(root).map_err(backend_err)? != FileKind::Dir {
+					return Err(FileStoreError::Backend(format!(
+						"durability tree target is not a directory: {root:?}"
+					)));
+				}
+				add_directory_chain(root, &mut directories);
+				let mut pending = vec![root.clone()];
+				while let Some(directory) = pending.pop() {
+					for name in fs.list_names(&directory).map_err(backend_err)? {
+						let path = if directory.is_empty() {
+							name
+						} else {
+							format!("{directory}/{name}")
+						};
+						match fs.kind(&path).map_err(backend_err)? {
+							FileKind::File => {
+								files.insert(path);
+							}
+							FileKind::Dir => {
+								directories.insert(path.clone());
+								pending.push(path);
+							}
+							FileKind::Symlink | FileKind::Other => {}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	for file in files {
+		fs.sync_file(&file).map_err(backend_err)?;
+	}
+	let mut directories: Vec<_> = directories.into_iter().collect();
+	directories.sort_by(|left, right| {
+		path_depth(right)
+			.cmp(&path_depth(left))
+			.then_with(|| left.cmp(right))
+	});
+	for directory in directories {
+		fs.sync_dir(&directory).map_err(backend_err)?;
+	}
+	Ok(())
+}
+
+fn add_directory_chain(path: &str, directories: &mut BTreeSet<String>) {
+	let mut current = path;
+	loop {
+		directories.insert(current.to_owned());
+		let Some(parent) = parent_of(current) else {
+			if !current.is_empty() {
+				directories.insert(String::new());
+			}
+			break;
+		};
+		current = parent;
+	}
+}
+
+fn path_depth(path: &str) -> usize {
+	if path.is_empty() {
+		0
+	} else {
+		path.bytes().filter(|byte| *byte == b'/').count() + 1
+	}
 }
 
 fn write_if_absent(fs: &dyn Backend, path: &str, bytes: &[u8]) -> Result<WriteOutcome> {
@@ -884,5 +1084,149 @@ fn read_err(error: std::io::Error) -> FileStoreError {
 		// packed-ref fallback resolve the child, diverging from git's unknown-revision result.
 		std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory => FileStoreError::NotFound,
 		_ => FileStoreError::Backend(error.to_string()),
+	}
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod durability_tests {
+	use std::collections::HashMap;
+	use std::io::{Error, ErrorKind};
+	use std::sync::Mutex;
+
+	use super::*;
+
+	#[derive(Debug, Clone, PartialEq, Eq)]
+	enum Sync {
+		File(String),
+		Directory(String),
+	}
+
+	struct TrackingBackend {
+		kinds: HashMap<String, FileKind>,
+		listings: HashMap<String, Vec<String>>,
+		syncs: Mutex<Vec<Sync>>,
+	}
+
+	impl TrackingBackend {
+		fn unsupported<T>() -> std::io::Result<T> {
+			Err(Error::new(ErrorKind::Unsupported, "unused test operation"))
+		}
+	}
+
+	impl Backend for TrackingBackend {
+		fn read(&self, _path: &str) -> std::io::Result<Vec<u8>> {
+			Self::unsupported()
+		}
+
+		fn read_range(&self, _path: &str, _offset: u64, _length: u64) -> std::io::Result<Vec<u8>> {
+			Self::unsupported()
+		}
+
+		fn create_dir_all(&self, _path: &str) -> std::io::Result<()> {
+			Self::unsupported()
+		}
+
+		fn create_new(&self, _path: &str) -> std::io::Result<Option<Box<dyn Write + Send>>> {
+			Self::unsupported()
+		}
+
+		fn open_read(&self, _path: &str) -> std::io::Result<Box<dyn Read + Send>> {
+			Self::unsupported()
+		}
+
+		fn rename(&self, _from: &str, _to: &str) -> std::io::Result<()> {
+			Self::unsupported()
+		}
+
+		fn remove_file(&self, _path: &str) -> std::io::Result<()> {
+			Self::unsupported()
+		}
+
+		fn remove_dir(&self, _path: &str) -> std::io::Result<()> {
+			Self::unsupported()
+		}
+
+		fn exists(&self, _path: &str) -> std::io::Result<bool> {
+			Self::unsupported()
+		}
+
+		fn is_dir(&self, _path: &str) -> std::io::Result<bool> {
+			Self::unsupported()
+		}
+
+		fn size(&self, _path: &str) -> std::io::Result<u64> {
+			Self::unsupported()
+		}
+
+		fn list_names(&self, path: &str) -> std::io::Result<Vec<String>> {
+			Ok(self.listings.get(path).cloned().unwrap_or_default())
+		}
+
+		fn kind(&self, path: &str) -> std::io::Result<FileKind> {
+			self
+				.kinds
+				.get(path)
+				.copied()
+				.ok_or_else(|| Error::new(ErrorKind::NotFound, path.to_owned()))
+		}
+
+		fn sync_file(&self, path: &str) -> std::io::Result<()> {
+			self.syncs.lock().unwrap().push(Sync::File(path.to_owned()));
+			Ok(())
+		}
+
+		fn sync_dir(&self, path: &str) -> std::io::Result<()> {
+			self
+				.syncs
+				.lock()
+				.unwrap()
+				.push(Sync::Directory(path.to_owned()));
+			Ok(())
+		}
+	}
+
+	#[test]
+	fn targeted_barrier_skips_unrelated_files_and_orders_namespaces_last() {
+		let backend = TrackingBackend {
+			kinds: HashMap::from([
+				("refs/heads/main".to_owned(), FileKind::File),
+				("admin".to_owned(), FileKind::Dir),
+				("admin/config".to_owned(), FileKind::File),
+				("admin/nested".to_owned(), FileKind::Dir),
+				("admin/nested/index".to_owned(), FileKind::File),
+				("objects/unrelated".to_owned(), FileKind::File),
+			]),
+			listings: HashMap::from([
+				(
+					"admin".to_owned(),
+					vec!["config".to_owned(), "nested".to_owned()],
+				),
+				("admin/nested".to_owned(), vec!["index".to_owned()]),
+			]),
+			syncs: Mutex::new(Vec::new()),
+		};
+
+		sync_targets(
+			&backend,
+			&[
+				DurabilityTarget::file("refs/heads/main"),
+				DurabilityTarget::tree("admin"),
+			],
+		)
+		.unwrap();
+
+		assert_eq!(
+			*backend.syncs.lock().unwrap(),
+			vec![
+				Sync::File("admin/config".to_owned()),
+				Sync::File("admin/nested/index".to_owned()),
+				Sync::File("refs/heads/main".to_owned()),
+				Sync::Directory("admin/nested".to_owned()),
+				Sync::Directory("refs/heads".to_owned()),
+				Sync::Directory("admin".to_owned()),
+				Sync::Directory("refs".to_owned()),
+				Sync::Directory(String::new()),
+			],
+		);
 	}
 }

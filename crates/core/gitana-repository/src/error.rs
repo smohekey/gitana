@@ -32,6 +32,12 @@ pub enum RepositoryError {
 		/// The ref whose lock was contended.
 		name: String,
 	},
+	/// A targeted durability boundary could not observe stable ref/object storage after bounded retries.
+	#[error("repository storage kept changing while making {name} durable")]
+	DurabilityUnstable {
+		/// The ref whose publication or deletion was being made durable.
+		name: String,
+	},
 	/// An owned repository mutation task could not be joined.
 	#[error("retained repository task failed: {0}")]
 	RetainedTask(String),

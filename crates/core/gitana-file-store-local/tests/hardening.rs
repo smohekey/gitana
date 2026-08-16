@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
-use gitana_file_store::{FileStore, FileStoreError};
+use gitana_file_store::{DurabilityTarget, FileStore, FileStoreError};
 use gitana_file_store_local::LocalFileStore;
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -22,6 +22,32 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 fn open_store(dir: &std::path::Path) -> LocalFileStore {
 	std::fs::create_dir_all(dir).unwrap();
 	LocalFileStore::from_dir(Dir::open_ambient_dir(dir, ambient_authority()).unwrap())
+}
+
+#[tokio::test]
+async fn durability_barrier_flushes_state_from_before_store_open() {
+	let dir = temp_dir("reopened-durability");
+	std::fs::create_dir_all(dir.join("objects/aa")).unwrap();
+	std::fs::create_dir_all(dir.join("refs/heads")).unwrap();
+	std::fs::write(dir.join("objects/aa/object"), b"object").unwrap();
+	std::fs::write(dir.join("refs/heads/main"), b"commit\n").unwrap();
+
+	let store = open_store(&dir);
+	store
+		.durability_barrier(&[DurabilityTarget::tree("")])
+		.await
+		.unwrap();
+
+	assert_eq!(
+		store.read_path("objects/aa/object").await.unwrap(),
+		b"object"
+	);
+	assert_eq!(
+		store.read_path("refs/heads/main").await.unwrap(),
+		b"commit\n"
+	);
+
+	let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

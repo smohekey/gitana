@@ -7,7 +7,8 @@ mod common;
 use common::*;
 use gitana_linked_worktree::{
 	BranchName, DestinationKind, IdentityConflict, ProtectionReason, RemoveError, RemoveOutcome,
-	RemovePolicy, RemoveRequest, WorktreeClassification, WorktreeQuery, classify, inspect, remove,
+	RemovePolicy, RemoveRequest, WorktreeClassification, WorktreeQuery, classify,
+	durability_barrier_removed, inspect, remove,
 };
 
 fn rreq(work: &std::path::Path, dest: &std::path::Path, branch: Option<&str>) -> RemoveRequest {
@@ -62,6 +63,27 @@ async fn classify_no_status(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn removed_worktree_barrier_flushes_namespaces_and_clears_an_empty_leftover() {
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-durable-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		let request = rreq(&work, &wt, Some("feature"));
+		remove(&request).await.unwrap();
+
+		// A safe, unrelated empty directory can appear after idempotent removal. The explicit durability
+		// boundary removes that otherwise-ambiguous namespace before flushing the deletion.
+		std::fs::create_dir(&wt).unwrap();
+		durability_barrier_removed(&request).await.unwrap();
+		assert!(!wt.exists(), "{fmt}: removed checkout remains absent");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
 async fn removes_a_worktree_addressed_by_a_dot_segment_alias() {
 	// A destination alias ending in dot-segments (`.../wt/sub/..`) identifies the checkout canonically to
 	// inspection, but the destructive primitives must act on the *real* path: `remove_dir_all(".../wt/sub/..")`
@@ -82,7 +104,8 @@ async fn removes_a_worktree_addressed_by_a_dot_segment_alias() {
 		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
 		let alias = wt.join("sub").join(".."); // .../wt/sub/.. — canonically .../wt
 
-		let out = remove(&rreq(&work, &alias, Some("feature"))).await.unwrap();
+		let request = rreq(&work, &alias, Some("feature"));
+		let out = remove(&request).await.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: expected Removed via a dot-segment alias, got {out:?}"
@@ -97,6 +120,10 @@ async fn removes_a_worktree_addressed_by_a_dot_segment_alias() {
 			"{fmt}: git should no longer list the worktree"
 		);
 		assert!(git(&["-C", w, "worktree", "prune", "-n"]).is_empty());
+		durability_barrier_removed(&request).await.unwrap();
+		durability_barrier_removed(&request)
+			.await
+			.expect("the dot-segment removal barrier is exactly retryable");
 		let _ = std::fs::remove_dir_all(&base);
 	}
 }

@@ -46,7 +46,11 @@ mod worktree_context;
 // The filesystem-reading helpers exist only to serve the native (cap-std) reading API, so they are
 // native-only — on wasm the crate exposes just the pure model + classification.
 #[cfg(not(target_arch = "wasm32"))]
+mod admin_cleanup;
+#[cfg(not(target_arch = "wasm32"))]
 mod create;
+#[cfg(not(target_arch = "wasm32"))]
+mod durability;
 #[cfg(not(target_arch = "wasm32"))]
 mod head;
 #[cfg(not(target_arch = "wasm32"))]
@@ -82,7 +86,9 @@ pub use status::{CheckoutSafety, UnpushedRef, WorktreeStatusReport};
 pub use worktree_context::WorktreeContext;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use create::create;
+pub use create::{create, recover_prepared_create};
+#[cfg(not(target_arch = "wasm32"))]
+pub use durability::{durability_barrier_created, durability_barrier_removed};
 #[cfg(not(target_arch = "wasm32"))]
 pub use enumerate::enumerate;
 #[cfg(not(target_arch = "wasm32"))]

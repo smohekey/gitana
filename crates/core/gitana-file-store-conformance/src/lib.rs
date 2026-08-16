@@ -3,7 +3,7 @@
 //! Each backend crate calls [`check_file_store`] from its own `tests/` so every
 //! backend is held to the same contract.
 
-use gitana_file_store::{DeleteOutcome, FileStore, FileStoreError, WriteOutcome};
+use gitana_file_store::{DeleteOutcome, DurabilityTarget, FileStore, FileStoreError, WriteOutcome};
 
 /// Run the full [`FileStore`] contract against `store`. Panics on any violation.
 pub async fn check_file_store<S: FileStore>(store: &S) {
@@ -16,6 +16,13 @@ pub async fn check_file_store<S: FileStore>(store: &S) {
 	check_is_dir(store).await;
 	check_listing(store).await;
 	check_streaming(store).await;
+	store
+		.durability_barrier(&[
+			DurabilityTarget::file("refs/heads/shared-handle-state"),
+			DurabilityTarget::directory("refs/heads"),
+		])
+		.await
+		.expect("durability barrier");
 }
 
 async fn check_shared_handle(store: &impl FileStore) {

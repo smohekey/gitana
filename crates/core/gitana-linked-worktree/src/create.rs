@@ -20,6 +20,7 @@ mod native {
 	use gitana_repository::{HeadState, RefOp, ReflogIntent, Repository};
 	use gitana_worktree::{Index, WorkTree};
 
+	use crate::admin_cleanup::{deregister_admin, path_absent, remove_directory_tree};
 	use crate::create_error::CreateError;
 	use crate::facts::{HeadKind, LockState};
 	use crate::inspect::{
@@ -51,6 +52,36 @@ mod native {
 		request: &CreateRequest,
 		effective: Option<&GitConfig>,
 	) -> Result<WorktreeInspection, CreateError> {
+		create_inner(request, effective, false).await
+	}
+
+	/// Establish a worktree while authorizing cleanup of the exact checkout-missing partial left by
+	/// this durable create intent.
+	///
+	/// Ordinary [`create`] deliberately refuses a non-empty `PresentCheckoutMissing` destination,
+	/// because a registration alone cannot prove who owns its current files. This recovery entry point
+	/// adds that missing authority: it accepts only an [`CheckoutTarget::ExistingBranch`] with an exact
+	/// `expected_start`, and discards the partial only when the retained admin `HEAD`, shared branch,
+	/// repository, destination, and baseline all match that request. The checkout must still lack its
+	/// final `.git` marker. Every mismatch follows ordinary fail-closed create behavior.
+	pub async fn recover_prepared_create(
+		request: &CreateRequest,
+		effective: Option<&GitConfig>,
+	) -> Result<WorktreeInspection, CreateError> {
+		let request = request.clone();
+		let effective = effective.cloned();
+		match tokio::spawn(async move { create_inner(&request, effective.as_ref(), true).await }).await
+		{
+			Ok(result) => result,
+			Err(error) => Err(LinkedWorktreeError::RetainedTask(error.to_string()).into()),
+		}
+	}
+
+	async fn create_inner(
+		request: &CreateRequest,
+		effective: Option<&GitConfig>,
+		recover_prepared: bool,
+	) -> Result<WorktreeInspection, CreateError> {
 		if !request.destination.is_absolute() {
 			return Err(LinkedWorktreeError::RelativePath(request.destination.clone()).into());
 		}
@@ -63,7 +94,11 @@ mod native {
 		let _lock = RegistrationLock::acquire(request.repo.common_dir()).await?;
 
 		let query = request_query(request);
-		let inspection = inspect(&query).await?;
+		let mut inspection = inspect(&query).await?;
+		if recover_prepared && let Some(admin) = prepared_partial_admin(request, &inspection) {
+			discard_prepared_partial(request, &inspection, &admin).await?;
+			inspection = inspect(&query).await?;
+		}
 
 		match decide(&inspection, &request.target)? {
 			Action::AlreadyThere => return Ok(inspection),
@@ -88,6 +123,117 @@ mod native {
 		match decide(&established, &request.target) {
 			Ok(Action::AlreadyThere) => Ok(established),
 			Ok(Action::Write { .. }) | Err(_) => Err(CreateError::NotEstablished(Box::new(established))),
+		}
+	}
+
+	/// The uniquely request-owned partial admin that recovery may discard.
+	fn prepared_partial_admin(
+		request: &CreateRequest,
+		inspection: &WorktreeInspection,
+	) -> Option<PathBuf> {
+		let CheckoutTarget::ExistingBranch {
+			name,
+			expected_start: Some(expected),
+		} = &request.target
+		else {
+			return None;
+		};
+		let Registration::PresentCheckoutMissing { admin_dir } = &inspection.registration else {
+			return None;
+		};
+		if inspection.destination != request.destination
+			|| !crate::pointers::canonical_eq(&inspection.common_dir, request.repo.common_dir())
+			|| inspection.identity_conflict.is_some()
+			|| inspection.cross_pointers != CrossPointerHealth::NotApplicable
+			|| !matches!(
+				inspection.destination_kind,
+				DestinationKind::Absent | DestinationKind::EmptyDir | DestinationKind::UnrelatedContent
+			) || !path_absent(&request.destination.join(".git"))
+		{
+			return None;
+		}
+		let expected_admin_parent = request.repo.common_dir().join("worktrees");
+		if !admin_dir
+			.parent()
+			.is_some_and(|parent| crate::pointers::canonical_eq(parent, &expected_admin_parent))
+		{
+			return None;
+		}
+		let expected_ref = name.refname();
+		let Some(head) = &inspection.head else {
+			return None;
+		};
+		if head.state != HeadKind::Symbolic
+			|| head.branch.as_deref() != Some(expected_ref.as_str())
+			|| head.object.as_ref() != Some(expected)
+			|| inspection.start.as_ref() != Some(expected)
+			|| inspection.start_relation != Some(crate::StartRelation::Equal)
+		{
+			return None;
+		}
+		match &inspection.requested_branch {
+			RequestedBranch::Exists {
+				object,
+				checked_out_elsewhere: None,
+			} if object == expected => Some(admin_dir.clone()),
+			_ => None,
+		}
+	}
+
+	async fn discard_prepared_partial(
+		request: &CreateRequest,
+		observed: &WorktreeInspection,
+		admin: &Path,
+	) -> Result<(), CreateError> {
+		let query = request_query(request);
+		let recheck = inspect(&query).await?;
+		if prepared_partial_admin(request, &recheck).as_deref() != Some(admin) || &recheck != observed {
+			return Err(CreateError::NotEstablished(Box::new(recheck)));
+		}
+
+		if recheck.destination_kind != DestinationKind::Absent {
+			offload_cleanup(
+				"discarding prepared checkout",
+				request.destination.clone(),
+				remove_directory_tree,
+			)
+			.await?;
+		}
+		if !path_absent(&request.destination) {
+			return Err(CreateError::NotEstablished(Box::new(
+				inspect(&query).await?,
+			)));
+		}
+
+		offload_cleanup(
+			"discarding prepared admin",
+			admin.to_path_buf(),
+			deregister_admin,
+		)
+		.await?;
+
+		let cleared = inspect(&query).await?;
+		if cleared.registration != Registration::None
+			|| cleared.destination_kind != DestinationKind::Absent
+		{
+			return Err(CreateError::NotEstablished(Box::new(cleared)));
+		}
+		Ok(())
+	}
+
+	async fn offload_cleanup<Op>(
+		context: &'static str,
+		path: PathBuf,
+		operation: Op,
+	) -> Result<(), CreateError>
+	where
+		Op: FnOnce(&Path) -> std::io::Result<()> + Send + 'static,
+	{
+		let error_path = path.clone();
+		match tokio::task::spawn_blocking(move || operation(&path)).await {
+			Ok(Ok(())) => Ok(()),
+			Ok(Err(error)) => Err(LinkedWorktreeError::io(context, error_path, error).into()),
+			Err(error) => Err(LinkedWorktreeError::RetainedTask(error.to_string()).into()),
 		}
 	}
 
@@ -231,7 +377,7 @@ mod native {
 	/// cases were already refused by [`decide`], so a symbolic head here is on the requested branch.) A
 	/// branch target additionally requires the branch to be at, or advanced past, the requested start
 	/// (never diverged); a detached target requires exactly the requested commit; an orphan an unborn HEAD.
-	fn matches_target(inspection: &WorktreeInspection, target: &CheckoutTarget) -> bool {
+	pub(crate) fn matches_target(inspection: &WorktreeInspection, target: &CheckoutTarget) -> bool {
 		let Some(head) = &inspection.head else {
 			return false;
 		};
@@ -253,7 +399,7 @@ mod native {
 	/// The read-only query that mirrors this create request's identity + intent, so inspection surfaces
 	/// exactly the state the create decides on. `ExistingBranch` carries no start (it checks out at the
 	/// branch tip), so no ancestry relation is requested for it.
-	fn request_query(request: &CreateRequest) -> WorktreeQuery {
+	pub(crate) fn request_query(request: &CreateRequest) -> WorktreeQuery {
 		let (expected_branch, start) = match &request.target {
 			CheckoutTarget::NewBranch { name, start, .. } => (Some(name.clone()), Some(start.clone())),
 			CheckoutTarget::ExistingBranch {
@@ -822,7 +968,47 @@ mod native {
 			assert_eq!(san(b"x.git"), "x.git"); // '.git' is fine
 		}
 	}
+
+	#[cfg(test)]
+	mod cleanup_tests {
+		use std::sync::Arc;
+		use std::sync::atomic::{AtomicBool, Ordering};
+
+		use super::offload_cleanup;
+
+		#[tokio::test]
+		async fn recursive_cleanup_does_not_block_the_runtime() {
+			let started = Arc::new(AtomicBool::new(false));
+			let released = Arc::new(AtomicBool::new(false));
+			let worker_started = Arc::clone(&started);
+			let worker_released = Arc::clone(&released);
+			let cleanup = tokio::spawn(offload_cleanup(
+				"testing cleanup offload",
+				std::env::temp_dir(),
+				move |_| {
+					worker_started.store(true, Ordering::Release);
+					while !worker_released.load(Ordering::Acquire) {
+						std::thread::yield_now();
+					}
+					Ok(())
+				},
+			));
+			while !started.load(Ordering::Acquire) {
+				tokio::task::yield_now().await;
+			}
+
+			let heartbeat = tokio::spawn(async {
+				tokio::task::yield_now().await;
+				true
+			});
+			assert!(heartbeat.await.unwrap());
+			released.store(true, Ordering::Release);
+			cleanup.await.unwrap().unwrap();
+		}
+	}
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::create;
+pub use native::{create, recover_prepared_create};
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use native::{matches_target, request_query};

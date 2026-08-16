@@ -9,6 +9,7 @@
 
 mod config;
 mod detect;
+mod durability;
 mod error;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod gated_file_store;

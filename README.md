@@ -23,7 +23,10 @@ What works today:
   config and negotiated with remotes over the wire.
 - Loose object encoding/decoding for blobs, trees, commits, and tags.
 - Packfile v2 decoding with OFS and REF deltas, plus packfile encoding.
-- Object storage over local and memory file stores.
+- Object storage over local and memory file stores. The storage contract exposes targeted durability
+  barriers for exact files, directory namespaces, or recovery trees: local callers flush only the
+  publication frontier before reporting durable success, while non-persistent backends treat it as a
+  no-op.
 - Refs, symbolic `HEAD`, packed-ref reads, ref CAS updates, and reflog writes
   for commits and resets.
 - Revision resolution for common forms such as `HEAD`, branch/tag names,

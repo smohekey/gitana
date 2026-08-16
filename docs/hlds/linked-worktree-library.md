@@ -253,6 +253,32 @@ effect and (b) every partial state being classifiable by `inspect`/`classify`. S
 so this is realized in the create/remove slices; full registration-level CAS + native-`OsStr` polish
 is the final hardening slice.
 
+Durable consumers add an explicit completion boundary rather than treating atomic visibility as
+power-loss durability. `durability_barrier_created` validates the exact completed request, flushes the
+checkout and admin trees, then their checkout-parent and `worktrees` namespaces, and revalidates the
+same inspection. `durability_barrier_removed` similarly requires checkout and registration absence and
+flushes both deletion namespaces. The branch/object half stays at the repository layer:
+`Repository::durability_barrier_initialized` persists the metadata written by `init`,
+`Repository::durability_barrier_object_graph` flushes an unpublished reachable graph,
+`Repository::durability_barrier_ref` flushes the actual ref plus newly reachable loose objects or pack
+files (and their index sidecars when present) beyond caller-supplied durable frontiers, and
+`Repository::durability_barrier_ref_absent` persists ref deletion. The separate object-graph and ref
+barriers let a durable caller enforce objects-before-ref publication without exposing storage layout.
+This keeps the hot path targeted; recursive file-store tree barriers remain an explicit recovery tool,
+not an every-commit full-repository scan.
+
+The barrier implementation keeps those boundaries narrow without weakening them. Packed-object
+provenance is observed through a fresh read session before and after each flush, so one pack index is
+validated once per snapshot rather than once per reachable object; ordinary object reads do not pay
+the provenance cost. Ref-absence cleanup holds the standard ref lock while confirming absence and
+removing a stale reflog, then releases the transient lock before synchronizing the namespace. The
+whole cleanup/barrier operation is retained through caller cancellation, preventing a racing creator's
+new reflog from being mistaken for stale state. `WorktreeFileStore` splits ambiguous root, `logs`,
+`info`, and `refs` directory/tree targets across common and per-worktree storage, while exact private
+roots stay per-worktree; an absent half is represented by its closest existing parent directory and a
+non-directory collision fails closed. On WASI, directory targets are opened with mutation authority
+and synchronized as directories rather than treated like file-data targets.
+
 ## Slice plan
 
 1. **Read-only inspection + enumeration + types + classification** (this HLD's slice 1) — pure reads,
@@ -588,7 +614,8 @@ pointer-publication hardening:
 
 **Resolved in slice 3 (was deferred from slice 2):**
 
-- **Recoverable mid-checkout state — resolved at the classification level; file-cleanup is empty-only.**
+- **Recoverable mid-checkout state — empty-only by default; exact durable intents can recover their own
+  non-empty partial.**
   ✅ (slice 3). git writes the checkout `.git` gitfile **first** (probed), so a mid-checkout failure leaves a
   *registered, dirty* worktree that `git worktree remove --force` recovers. gitana writes the gitfile **last**,
   so an interrupted-*before*-checkout create is cleanly `PartialRegistered`. Slice 3 makes an **absent-or-empty**
@@ -600,8 +627,18 @@ pointer-publication hardening:
   create's own rather than a reused path or a git-created prunable; a status-based "clean" check is also
   insufficient (a coincidental clone at the same commit, or ignored content, passes it). So a non-empty
   checkout-missing partial is **refused and preserved** (a `DestinationConflict`), matching git's own
-  `worktree remove`. An interrupted-*mid*-checkout that left files therefore still needs the caller (or a
-  future force path) to clear them before retry — the narrow, mostly-deferred (submodule-gitlink) tail below.
+  `worktree remove`. That remains the ordinary `create`/`remove` contract. A caller that first durably
+  recorded the exact materialization intent may instead call `recover_prepared_create` with an existing
+  branch and an exact expected baseline. That narrow entry point revalidates the repository, destination,
+  sole physical admin, missing final `.git` marker, admin `HEAD`, shared branch, and baseline under the
+  registration lock; only that complete match authorizes deleting the intent-owned partial and recreating
+  it. Any mismatch falls back to the ordinary fail-closed refusal, so a registration alone still never
+  grants authority over a reused directory. Recovery itself is retained to completion after caller
+  cancellation, and recursive checkout/admin cleanup is offloaded while the registration lock remains
+  held, so neither cancellation nor a large tree releases ownership ahead of the destructive work.
+  Removal durability resolves a destination component-by-component before cleanup; consequently a
+  post-removal retry using an alias such as `checkout/sub/..` continues to synchronize the checkout's
+  actual parent namespace instead of a newly dangling spelling.
 
 **Still deferred:**
 

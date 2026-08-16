@@ -27,6 +27,12 @@ use gitana_object::{
 };
 use tokio::sync::Mutex;
 
+mod object_backing;
+mod object_read_session;
+
+pub use object_backing::ObjectBacking;
+pub use object_read_session::ObjectReadSession;
+
 /// Re-exported so downstream layers name the parsed reachability bitmap through the store layer.
 pub use gitana_object::BitmapIndex as ReachabilityBitmap;
 /// Re-exported so downstream layers name object kinds through the store layer.
@@ -398,7 +404,8 @@ where
 		&self,
 		id: &ObjectId<H>,
 	) -> Result<(ObjectKind, Vec<u8>), ObjectStoreError> {
-		match self.files.read_path(&loose_object_path(id)).await {
+		let loose_path = loose_object_path(id);
+		match self.files.read_path(&loose_path).await {
 			Ok(bytes) => {
 				let (kind, payload) = decode_loose(&bytes)?;
 				let actual = ObjectId::<H>::compute(kind, &payload);
@@ -414,9 +421,6 @@ where
 				Some((pack_path, meta, offset)) => {
 					let bytes = self.pack_bytes(&pack_path).await?;
 					let object = decode_object_at::<H>(&bytes, &meta.index, offset)?;
-					// Content-address the result: a stale or corrupt `.idx` could point this id at
-					// the wrong offset, so the object we materialised must actually hash to `id`
-					// (the whole-pack decode this replaced was keyed by the recomputed id).
 					if &object.id != id {
 						return Err(ObjectStoreError::Corruption {
 							requested: id.to_hex(),
@@ -429,6 +433,28 @@ where
 			},
 			Err(other) => Err(other.into()),
 		}
+	}
+
+	/// Start a point-in-time physical-backing observation.
+	///
+	/// A session validates each pack index at most once and reuses that parsed view for the remaining
+	/// objects it reads. Durability callers create a fresh session for each pre/post-barrier snapshot,
+	/// so an index movement between snapshots remains visible without rereading an `O(n)` index for
+	/// every one of its `n` objects.
+	pub fn read_session(&self) -> ObjectReadSession<'_, F, H> {
+		ObjectReadSession::new(self)
+	}
+
+	/// Read and content-verify an object together with the physical files that supplied it.
+	///
+	/// The returned backing is a point-in-time observation. A caller using it as a durability
+	/// boundary must flush those files and re-read the object, because a concurrent repack can move
+	/// the same immutable object between loose and packed storage.
+	pub async fn read_object_with_backing(
+		&self,
+		id: &ObjectId<H>,
+	) -> Result<(ObjectKind, Vec<u8>, ObjectBacking), ObjectStoreError> {
+		self.read_session().read_object_with_backing(id).await
 	}
 
 	/// Read an object by id **without caching whole packs** — the loose file, or a packed object

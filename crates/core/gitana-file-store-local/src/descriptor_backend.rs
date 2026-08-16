@@ -12,7 +12,7 @@ use wasip2::filesystem::types::{
 	Descriptor, DescriptorFlags, DescriptorType, ErrorCode, OpenFlags, PathFlags,
 };
 
-use crate::{Backend, DescriptorReader, DescriptorWriter};
+use crate::{Backend, DescriptorReader, DescriptorWriter, FileKind};
 
 /// How many bytes to request per positional `descriptor.read` call.
 const READ_CHUNK: u64 = 64 * 1024;
@@ -150,6 +150,64 @@ impl Backend for DescriptorBackend {
 			names.push(entry.name);
 		}
 		Ok(names)
+	}
+
+	fn kind(&self, path: &str) -> std::io::Result<FileKind> {
+		let kind = self
+			.dir
+			.stat_at(PathFlags::empty(), path)
+			.map_err(io_error)?
+			.type_;
+		Ok(match kind {
+			DescriptorType::RegularFile => FileKind::File,
+			DescriptorType::Directory => FileKind::Dir,
+			DescriptorType::SymbolicLink => FileKind::Symlink,
+			_ => FileKind::Other,
+		})
+	}
+
+	fn sync_file(&self, path: &str) -> std::io::Result<()> {
+		self
+			.dir
+			.open_at(
+				PathFlags::empty(),
+				path,
+				OpenFlags::empty(),
+				DescriptorFlags::READ | DescriptorFlags::WRITE,
+			)
+			.map_err(io_error)?
+			.sync_data()
+			.map_err(io_error)
+	}
+
+	fn sync_dir(&self, path: &str) -> std::io::Result<()> {
+		let opened;
+		let directory = if path.is_empty() {
+			&self.dir
+		} else {
+			opened = self
+				.dir
+				.open_at(
+					PathFlags::empty(),
+					path,
+					OpenFlags::DIRECTORY,
+					DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
+				)
+				.map_err(io_error)?;
+			&opened
+		};
+
+		// `descriptor.sync` and `descriptor.sync-data` both succeed with no effect when the
+		// descriptor was not opened for mutation. Directory entries are metadata, so require the
+		// directory-write capability explicitly and use the full fsync-equivalent operation.
+		if !directory
+			.get_flags()
+			.map_err(io_error)?
+			.contains(DescriptorFlags::MUTATE_DIRECTORY)
+		{
+			return Err(io_error(ErrorCode::ReadOnly));
+		}
+		directory.sync().map_err(io_error)
 	}
 }
 

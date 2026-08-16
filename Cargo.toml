@@ -40,6 +40,7 @@ gitana-worktree = { version = "0.1.0", path = "crates/core/gitana-worktree" }
 gta-core = { version = "0.1.0", path = "crates/cli/gta-core" }
 gta-mcp = { version = "0.1.0", path = "crates/cli/gta-mcp" }
 hmac = "0.12"
+libc = "0.2"
 # Pure-Rust OpenPGP (rpgp). `default-features = false` drops the bzip2 C dependency; the verify path
 # needs no compression. Chosen over sequoia-openpgp for the wasm32-wasip2 build and clean-room story.
 pgp = { version = "0.20.0", default-features = false }
@@ -57,6 +58,8 @@ wasip2 = "1.0.4"
 wasmtime = "46"
 wasmtime-wasi = "46"
 wasmtime-wasi-http = "46"
+windows-sys = "0.61.2"
+winx = "0.36.4"
 wit-bindgen = "0.58"
 
 [workspace.lints.rust]

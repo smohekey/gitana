@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
 
 use gitana_file_store::{
-	ByteReader, DeleteOutcome, FileStore, PathLock, Result, Version, WriteOutcome,
+	ByteReader, DeleteOutcome, DurabilityTarget, FileStore, PathLock, Result, Version, WriteOutcome,
 };
 use gitana_file_store_memory::MemoryFileStore;
 
@@ -70,6 +70,13 @@ impl FileStore for GatedFileStore {
 			inner: Arc::clone(&self.inner),
 			gate: Arc::clone(&self.gate),
 		}
+	}
+
+	fn durability_barrier(
+		&self,
+		targets: &[DurabilityTarget],
+	) -> impl Future<Output = Result<()>> + Send {
+		self.inner.durability_barrier(targets)
 	}
 
 	fn read_path(&self, path: &str) -> impl Future<Output = Result<Vec<u8>>> {

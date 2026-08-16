@@ -114,6 +114,12 @@ pub enum LinkedWorktreeError {
 	/// cleared by removing the file. Carries the lock path.
 	#[error("worktree registration is locked by another operation: {}", .0.display())]
 	RegistrationLocked(PathBuf),
+
+	/// A retained native task failed before it could finish a cancellation-sensitive filesystem
+	/// operation. The task boundary keeps request cancellation from releasing repository ownership
+	/// while cleanup is still running; this variant preserves a join failure as an explicit error.
+	#[error("retained worktree task failed: {0}")]
+	RetainedTask(String),
 }
 
 impl LinkedWorktreeError {
