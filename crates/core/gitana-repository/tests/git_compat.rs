@@ -466,7 +466,13 @@ fn create_skeleton(git_dir: &Path) {
 }
 
 fn unique_tmp(tag: &str) -> PathBuf {
-	let dir = std::env::temp_dir().join(format!("gitana-{tag}-{}", std::process::id()));
+	// A per-call sequence number keeps every temp dir distinct even for a reused tag, so tests running
+	// in parallel threads never race on `remove_dir_all`/`create_dir_all` for the same path (which
+	// surfaced as a transient `File exists`). Matches the `git_status`/`git_diff`/`git_submodule` harnesses.
+	use std::sync::atomic::{AtomicU64, Ordering};
+	static SEQ: AtomicU64 = AtomicU64::new(0);
+	let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+	let dir = std::env::temp_dir().join(format!("gitana-{tag}-{}-{seq}", std::process::id()));
 	let _ = std::fs::remove_dir_all(&dir);
 	std::fs::create_dir_all(&dir).unwrap();
 	dir
