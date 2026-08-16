@@ -104,7 +104,8 @@ async fn removes_a_worktree_addressed_by_a_dot_segment_alias() {
 		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
 		let alias = wt.join("sub").join(".."); // .../wt/sub/.. — canonically .../wt
 
-		let out = remove(&rreq(&work, &alias, Some("feature"))).await.unwrap();
+		let request = rreq(&work, &alias, Some("feature"));
+		let out = remove(&request).await.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: expected Removed via a dot-segment alias, got {out:?}"
@@ -119,6 +120,10 @@ async fn removes_a_worktree_addressed_by_a_dot_segment_alias() {
 			"{fmt}: git should no longer list the worktree"
 		);
 		assert!(git(&["-C", w, "worktree", "prune", "-n"]).is_empty());
+		durability_barrier_removed(&request).await.unwrap();
+		durability_barrier_removed(&request)
+			.await
+			.expect("the dot-segment removal barrier is exactly retryable");
 		let _ = std::fs::remove_dir_all(&base);
 	}
 }

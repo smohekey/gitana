@@ -8,7 +8,7 @@ use gitana_file_store::{
 	ByteReader, DeleteOutcome, DurabilityTarget, FileStore, PathLock, Result, Version, WriteOutcome,
 };
 
-use crate::LocalFileStore;
+use crate::{FileKind, LocalFileStore};
 
 /// A `FileStore` for a working tree that may be *linked* (created by `git worktree add`).
 ///
@@ -133,8 +133,11 @@ fn is_per_worktree(path: &str) -> bool {
 		|| path.starts_with("rebase-merge/")
 		|| path == "rebase-apply"
 		|| path.starts_with("rebase-apply/")
+		|| path == "refs/worktree"
 		|| path.starts_with("refs/worktree/")
+		|| path == "refs/bisect"
 		|| path.starts_with("refs/bisect/")
+		|| path == "refs/rewritten"
 		|| path.starts_with("refs/rewritten/")
 		// `sharedindex.<oid>` — a split index's shared base — lives beside the per-worktree `index` in the
 		// worktree's own git dir, and `config.worktree` holds a linked worktree's `extensions.worktreeConfig`
@@ -173,9 +176,14 @@ impl FileStore for WorktreeFileStore {
 		let mut common = Vec::new();
 		let mut worktree = Vec::new();
 		for target in targets {
-			if target.path().is_empty() {
-				common.push(target.clone());
-				worktree.push(target.clone());
+			let split = matches!(
+				target,
+				DurabilityTarget::Directory(path) | DurabilityTarget::Tree(path)
+					if matches!(path.as_str(), "" | "logs" | "info" | "refs")
+			);
+			if split {
+				common.push(split_target(&self.common, target).await?);
+				worktree.push(split_target(&self.worktree, target).await?);
 			} else if is_per_worktree(target.path()) {
 				worktree.push(target.clone());
 			} else {
@@ -298,6 +306,37 @@ impl FileStore for WorktreeFileStore {
 	}
 }
 
+/// Map one half of a split logical tree onto a real namespace in that physical store.
+///
+/// A logical namespace such as `logs` may legitimately be absent from one side of a linked
+/// worktree. Flushing the closest existing parent proves that absence. A present non-directory is
+/// retained as the original target so the underlying barrier rejects the structural collision.
+async fn split_target(
+	store: &LocalFileStore,
+	target: &DurabilityTarget,
+) -> Result<DurabilityTarget> {
+	let path = target.path();
+	if path.is_empty() {
+		return Ok(target.clone());
+	}
+	if store.kind_nofollow(path).await?.is_some() {
+		return Ok(target.clone());
+	}
+
+	let mut current = parent_of(path).unwrap_or("");
+	loop {
+		match store.kind_nofollow(current).await? {
+			Some(FileKind::Dir) => return Ok(DurabilityTarget::directory(current)),
+			Some(_) => return Ok(DurabilityTarget::directory(current)),
+			None => current = parent_of(current).unwrap_or(""),
+		}
+	}
+}
+
+fn parent_of(path: &str) -> Option<&str> {
+	path.rfind('/').map(|index| &path[..index])
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use super::*;
@@ -326,9 +365,12 @@ mod tests {
 			"ORIG_HEAD.lock",
 			"index.lock",
 			"logs/HEAD",
+			"refs/worktree",
 			"refs/worktree/foo",
 			"refs/worktree/foo.lock",
+			"refs/bisect",
 			"refs/bisect/bad",
+			"refs/rewritten",
 			"refs/rewritten/onto",
 			// Any one-level *pseudoref* is per-worktree — git's `is_pseudoref_syntax`: uppercase letters, `_`, and
 			// `-` (NOT digits). Not just the well-known ones: `AUTO_MERGE` (a real git pseudoref we don't
@@ -410,5 +452,61 @@ mod tests {
 		assert!(store.exists("refs/heads/main").await.unwrap());
 
 		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[tokio::test]
+	async fn split_tree_flushes_an_absent_half_via_its_parent_namespace() {
+		let root = tempfile::tempdir().unwrap();
+		let common = root.path().join("common");
+		let worktree = root.path().join("wt");
+		std::fs::create_dir_all(common.join("logs")).unwrap();
+		let store = WorktreeFileStore::new(open_dir(&common), open_dir(&worktree));
+
+		store
+			.durability_barrier(&[DurabilityTarget::tree("logs")])
+			.await
+			.expect("an absent per-worktree logs tree is represented by its root namespace");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn split_tree_rejects_a_collision_in_the_worktree_half() {
+		use std::os::unix::fs::symlink;
+
+		let root = tempfile::tempdir().unwrap();
+		let common = root.path().join("common");
+		let worktree = root.path().join("wt");
+		let foreign = root.path().join("foreign");
+		std::fs::create_dir_all(common.join("logs")).unwrap();
+		std::fs::create_dir_all(&worktree).unwrap();
+		std::fs::create_dir_all(&foreign).unwrap();
+		symlink(&foreign, worktree.join("logs")).unwrap();
+		let store = WorktreeFileStore::new(open_dir(&common), open_dir(&worktree));
+
+		store
+			.durability_barrier(&[DurabilityTarget::tree("logs")])
+			.await
+			.expect_err("a split tree must inspect and reject the worktree-side symlink");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn exact_private_directory_routes_only_to_the_worktree_store() {
+		use std::os::unix::fs::symlink;
+
+		let root = tempfile::tempdir().unwrap();
+		let common = root.path().join("common");
+		let worktree = root.path().join("wt");
+		let foreign = root.path().join("foreign");
+		std::fs::create_dir_all(common.join("refs")).unwrap();
+		std::fs::create_dir_all(worktree.join("refs/worktree")).unwrap();
+		std::fs::create_dir_all(&foreign).unwrap();
+		symlink(&foreign, common.join("refs/worktree")).unwrap();
+		let store = WorktreeFileStore::new(open_dir(&common), open_dir(&worktree));
+
+		store
+			.durability_barrier(&[DurabilityTarget::directory("refs/worktree")])
+			.await
+			.expect("the exact private ref namespace must not inspect the common collision");
 	}
 }

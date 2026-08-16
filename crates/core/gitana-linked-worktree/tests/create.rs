@@ -551,6 +551,63 @@ async fn prepared_recovery_recreates_an_exact_nonempty_checkout_missing_partial(
 }
 
 #[tokio::test]
+async fn cancelling_prepared_recovery_does_not_abandon_the_owned_partial() {
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-recover-cancelled-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+		create(&req(&work, &wt, new_branch("feature", start.clone())), None)
+			.await
+			.unwrap();
+		std::fs::remove_file(wt.join(".git")).unwrap();
+
+		let lock = work.join(".git/worktrees.lock");
+		std::fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&lock)
+			.unwrap();
+		let recovery = req(&work, &wt, existing_branch("feature", Some(start)));
+		let retained_request = recovery.clone();
+		let caller =
+			tokio::spawn(async move { recover_prepared_create(&retained_request, None).await });
+		for _ in 0..8 {
+			tokio::task::yield_now().await;
+		}
+		assert!(
+			!caller.is_finished(),
+			"{fmt}: recovery is waiting on the lock"
+		);
+		caller.abort();
+		assert!(caller.await.unwrap_err().is_cancelled());
+		std::fs::remove_file(&lock).unwrap();
+
+		let mut recovered = false;
+		for _ in 0..100 {
+			if wt.join(".git").is_file() {
+				recovered = true;
+				break;
+			}
+			tokio::task::spawn_blocking(|| {
+				std::thread::sleep(std::time::Duration::from_millis(10));
+			})
+			.await
+			.unwrap();
+		}
+		assert!(recovered, "{fmt}: retained recovery did not finish");
+		assert_eq!(
+			git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
+			head
+		);
+		durability_barrier_created(&recovery).await.unwrap();
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
 async fn prepared_recovery_preserves_a_partial_when_the_baseline_does_not_match() {
 	for (fmt, kind) in formats() {
 		let base = unique_tmp(&format!("create-recover-mismatch-{fmt}"));

@@ -293,6 +293,35 @@ pub(crate) fn canonical(path: &Path) -> PathBuf {
 	}
 }
 
+/// Resolve every existing path prefix while normalizing lexical dot segments in an absent tail.
+///
+/// Unlike [`canonical`], this preserves a stable target after a path such as `checkout/sub/..` has
+/// been removed: the missing `sub` is appended and then popped, yielding `checkout` rather than a
+/// dangling spelling. Resolving each existing component also preserves filesystem semantics when a
+/// parent is a symlink or junction.
+pub(crate) fn resolved_path(path: &Path) -> PathBuf {
+	use std::path::Component;
+
+	let mut resolved = PathBuf::new();
+	for component in path.components() {
+		match component {
+			Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+			Component::RootDir => resolved.push(Component::RootDir.as_os_str()),
+			Component::CurDir => {}
+			Component::ParentDir => {
+				resolved.pop();
+			}
+			Component::Normal(name) => {
+				resolved.push(name);
+				if let Ok(canonical) = resolved.canonicalize() {
+					resolved = canonical;
+				}
+			}
+		}
+	}
+	resolved
+}
+
 /// Compare two paths for identity. On a **case-insensitive** filesystem (default macOS/Windows volumes)
 /// `canonicalize` preserves the caller's spelling, so `/repo/WorkTree` and `/repo/worktree` — the same
 /// directory git accepts interchangeably — canonicalize to *different* strings. So when both paths exist,
@@ -1007,7 +1036,7 @@ pub(crate) fn ensure_representable_path(path: &Path) -> Result<(), LinkedWorktre
 	// Check the **resolved** form the pointer files will actually record — a symlink/junction can resolve a
 	// UTF-8 lexical path to a non-representable one, which would then serialize lossily *after* the writes.
 	// Rejecting it here keeps the operation side-effect-free on failure.
-	if resolved_for_pointers(path).to_str().is_some() {
+	if resolved_path(path).to_str().is_some() {
 		Ok(())
 	} else {
 		Err(LinkedWorktreeError::io(
@@ -1016,33 +1045,6 @@ pub(crate) fn ensure_representable_path(path: &Path) -> Result<(), LinkedWorktre
 			std::io::Error::from(std::io::ErrorKind::InvalidInput),
 		))
 	}
-}
-
-/// The form of `path` the pointer files will actually record — its deepest existing ancestor canonicalized
-/// (so a symlinked parent is resolved to its real target, exactly as `create_dir_all` + `canonicalize`
-/// would), with the still-absent tail appended lexically. Used only by the non-Unix representability
-/// preflight; on Unix the pointers are byte-clean so no such check is needed.
-#[cfg(not(unix))]
-fn resolved_for_pointers(path: &Path) -> PathBuf {
-	use std::path::Component;
-	let mut resolved = PathBuf::new();
-	for component in path.components() {
-		match component {
-			Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
-			Component::RootDir => resolved.push(Component::RootDir.as_os_str()),
-			Component::CurDir => {}
-			Component::ParentDir => {
-				resolved.pop();
-			}
-			Component::Normal(name) => {
-				resolved.push(name);
-				if let Ok(canonical) = resolved.canonicalize() {
-					resolved = canonical;
-				}
-			}
-		}
-	}
-	resolved
 }
 
 /// A pointer path (already stripped of its line terminator) resolved against `base` when relative, else

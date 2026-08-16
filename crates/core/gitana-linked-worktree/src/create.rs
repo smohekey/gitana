@@ -68,7 +68,13 @@ mod native {
 		request: &CreateRequest,
 		effective: Option<&GitConfig>,
 	) -> Result<WorktreeInspection, CreateError> {
-		create_inner(request, effective, true).await
+		let request = request.clone();
+		let effective = effective.cloned();
+		match tokio::spawn(async move { create_inner(&request, effective.as_ref(), true).await }).await
+		{
+			Ok(result) => result,
+			Err(error) => Err(LinkedWorktreeError::RetainedTask(error.to_string()).into()),
+		}
 	}
 
 	async fn create_inner(
@@ -186,9 +192,12 @@ mod native {
 		}
 
 		if recheck.destination_kind != DestinationKind::Absent {
-			remove_directory_tree(&request.destination).map_err(|error| {
-				LinkedWorktreeError::io("discarding prepared checkout", &request.destination, error)
-			})?;
+			offload_cleanup(
+				"discarding prepared checkout",
+				request.destination.clone(),
+				remove_directory_tree,
+			)
+			.await?;
 		}
 		if !path_absent(&request.destination) {
 			return Err(CreateError::NotEstablished(Box::new(
@@ -196,8 +205,12 @@ mod native {
 			)));
 		}
 
-		deregister_admin(admin)
-			.map_err(|error| LinkedWorktreeError::io("discarding prepared admin", admin, error))?;
+		offload_cleanup(
+			"discarding prepared admin",
+			admin.to_path_buf(),
+			deregister_admin,
+		)
+		.await?;
 
 		let cleared = inspect(&query).await?;
 		if cleared.registration != Registration::None
@@ -206,6 +219,22 @@ mod native {
 			return Err(CreateError::NotEstablished(Box::new(cleared)));
 		}
 		Ok(())
+	}
+
+	async fn offload_cleanup<Op>(
+		context: &'static str,
+		path: PathBuf,
+		operation: Op,
+	) -> Result<(), CreateError>
+	where
+		Op: FnOnce(&Path) -> std::io::Result<()> + Send + 'static,
+	{
+		let error_path = path.clone();
+		match tokio::task::spawn_blocking(move || operation(&path)).await {
+			Ok(Ok(())) => Ok(()),
+			Ok(Err(error)) => Err(LinkedWorktreeError::io(context, error_path, error).into()),
+			Err(error) => Err(LinkedWorktreeError::RetainedTask(error.to_string()).into()),
+		}
 	}
 
 	/// Decide the create action from the inspection *against the requested target*, or refuse.
@@ -937,6 +966,44 @@ mod native {
 			assert_eq!(san(b"x.LOCK"), "x.LOCK"); // case-sensitive
 			assert_eq!(san(b"x.locked"), "x.locked"); // only a whole trailing '.lock'
 			assert_eq!(san(b"x.git"), "x.git"); // '.git' is fine
+		}
+	}
+
+	#[cfg(test)]
+	mod cleanup_tests {
+		use std::sync::Arc;
+		use std::sync::atomic::{AtomicBool, Ordering};
+
+		use super::offload_cleanup;
+
+		#[tokio::test]
+		async fn recursive_cleanup_does_not_block_the_runtime() {
+			let started = Arc::new(AtomicBool::new(false));
+			let released = Arc::new(AtomicBool::new(false));
+			let worker_started = Arc::clone(&started);
+			let worker_released = Arc::clone(&released);
+			let cleanup = tokio::spawn(offload_cleanup(
+				"testing cleanup offload",
+				std::env::temp_dir(),
+				move |_| {
+					worker_started.store(true, Ordering::Release);
+					while !worker_released.load(Ordering::Acquire) {
+						std::thread::yield_now();
+					}
+					Ok(())
+				},
+			));
+			while !started.load(Ordering::Acquire) {
+				tokio::task::yield_now().await;
+			}
+
+			let heartbeat = tokio::spawn(async {
+				tokio::task::yield_now().await;
+				true
+			});
+			assert!(heartbeat.await.unwrap());
+			released.store(true, Ordering::Release);
+			cleanup.await.unwrap().unwrap();
 		}
 	}
 }

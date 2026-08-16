@@ -63,6 +63,7 @@ pub async fn durability_barrier_created(
 /// An otherwise-idempotent empty destination is removed as part of this explicit cleanup boundary.
 /// Success requires both the registration and checkout to remain absent after the directory syncs.
 pub async fn durability_barrier_removed(request: &RemoveRequest) -> Result<(), RemoveError> {
+	let destination = crate::pointers::resolved_path(&request.destination);
 	let query = WorktreeQuery {
 		repo: request.repo.clone(),
 		destination: request.destination.clone(),
@@ -77,13 +78,12 @@ pub async fn durability_barrier_removed(request: &RemoveRequest) -> Result<(), R
 	match before.destination_kind {
 		DestinationKind::Absent => {}
 		DestinationKind::EmptyDir => {
-			remove_empty_directory(&request.destination).map_err(|error| {
-				LinkedWorktreeError::io("removing empty checkout", &request.destination, error)
-			})?;
+			remove_empty_directory(&destination)
+				.map_err(|error| LinkedWorktreeError::io("removing empty checkout", &destination, error))?;
 		}
 		_ => return Err(RemoveError::Incomplete(Box::new(before))),
 	}
-	if !path_absent(&request.destination) {
+	if !path_absent(&destination) {
 		return Err(RemoveError::Incomplete(Box::new(inspect(&query).await?)));
 	}
 
@@ -113,8 +113,7 @@ pub async fn durability_barrier_removed(request: &RemoveRequest) -> Result<(), R
 		}
 	}
 	sync_directory(
-		request
-			.destination
+		destination
 			.parent()
 			.ok_or_else(|| RemoveError::Incomplete(Box::new(before.clone())))?,
 		"syncing checkout parent namespace",

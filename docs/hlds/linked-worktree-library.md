@@ -258,11 +258,26 @@ power-loss durability. `durability_barrier_created` validates the exact complete
 checkout and admin trees, then their checkout-parent and `worktrees` namespaces, and revalidates the
 same inspection. `durability_barrier_removed` similarly requires checkout and registration absence and
 flushes both deletion namespaces. The branch/object half stays at the repository layer:
-`Repository::durability_barrier_ref` flushes the actual ref plus newly reachable loose objects or
-pack files (and their index sidecars when present) beyond caller-supplied durable frontiers, while
-`Repository::durability_barrier_ref_absent` persists ref deletion. This keeps the hot path targeted;
-recursive file-store tree barriers remain an explicit recovery tool, not an every-commit full-repository
-scan.
+`Repository::durability_barrier_initialized` persists the metadata written by `init`,
+`Repository::durability_barrier_object_graph` flushes an unpublished reachable graph,
+`Repository::durability_barrier_ref` flushes the actual ref plus newly reachable loose objects or pack
+files (and their index sidecars when present) beyond caller-supplied durable frontiers, and
+`Repository::durability_barrier_ref_absent` persists ref deletion. The separate object-graph and ref
+barriers let a durable caller enforce objects-before-ref publication without exposing storage layout.
+This keeps the hot path targeted; recursive file-store tree barriers remain an explicit recovery tool,
+not an every-commit full-repository scan.
+
+The barrier implementation keeps those boundaries narrow without weakening them. Packed-object
+provenance is observed through a fresh read session before and after each flush, so one pack index is
+validated once per snapshot rather than once per reachable object; ordinary object reads do not pay
+the provenance cost. Ref-absence cleanup holds the standard ref lock while confirming absence and
+removing a stale reflog, then releases the transient lock before synchronizing the namespace. The
+whole cleanup/barrier operation is retained through caller cancellation, preventing a racing creator's
+new reflog from being mistaken for stale state. `WorktreeFileStore` splits ambiguous root, `logs`,
+`info`, and `refs` directory/tree targets across common and per-worktree storage, while exact private
+roots stay per-worktree; an absent half is represented by its closest existing parent directory and a
+non-directory collision fails closed. On WASI, directory targets are opened with mutation authority
+and synchronized as directories rather than treated like file-data targets.
 
 ## Slice plan
 
@@ -618,7 +633,12 @@ pointer-publication hardening:
   sole physical admin, missing final `.git` marker, admin `HEAD`, shared branch, and baseline under the
   registration lock; only that complete match authorizes deleting the intent-owned partial and recreating
   it. Any mismatch falls back to the ordinary fail-closed refusal, so a registration alone still never
-  grants authority over a reused directory.
+  grants authority over a reused directory. Recovery itself is retained to completion after caller
+  cancellation, and recursive checkout/admin cleanup is offloaded while the registration lock remains
+  held, so neither cancellation nor a large tree releases ownership ahead of the destructive work.
+  Removal durability resolves a destination component-by-component before cleanup; consequently a
+  post-removal retry using an alias such as `checkout/sub/..` continues to synchronize the checkout's
+  actual parent namespace instead of a newly dangling spelling.
 
 **Still deferred:**
 

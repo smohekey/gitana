@@ -478,7 +478,7 @@ mod native {
 		// `canonical` resolves via the OS (following symlinks the real way, so a `..` pops the *resolved*
 		// location) and tolerates an already-absent leaf, so both the deletion and the post-check act on the
 		// actual target. Identity/enclosure/status were judged by inspection, which compares canonically already.
-		let destination = crate::pointers::canonical(&request.destination);
+		let destination = crate::pointers::resolved_path(&request.destination);
 		match action {
 			RemoveAction::RemoveFull { .. } => {
 				// A live, pristine checkout (only tracked files — verified before this) — remove all of it.

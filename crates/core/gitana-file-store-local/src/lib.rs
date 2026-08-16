@@ -142,6 +142,25 @@ impl LocalFileStore {
 		blocking(move || fs.create_dir_all(&path).map_err(backend_err)).await
 	}
 
+	/// Inspect one path without following its final component.
+	///
+	/// This stays crate-private: the split worktree router uses it to distinguish an absent logical
+	/// subtree (whose surviving parent namespace must be flushed) from a symlink or other collision
+	/// that a durability boundary must reject.
+	pub(crate) async fn kind_nofollow(&self, path: &str) -> Result<Option<FileKind>> {
+		if path.is_empty() {
+			return Ok(Some(FileKind::Dir));
+		}
+		let path = self.resolve(path)?.to_owned();
+		let fs = Arc::clone(&self.backend);
+		blocking(move || match fs.kind(&path) {
+			Ok(kind) => Ok(Some(kind)),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+			Err(error) => Err(backend_err(error)),
+		})
+		.await
+	}
+
 	/// Lexically validate a git-relative path, returning it unchanged. The backend
 	/// confines paths structurally; this is cheap defence-in-depth that also gives a
 	/// deterministic [`FileStoreError::Backend`] for traversal/empty components.

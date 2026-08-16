@@ -36,6 +36,7 @@ wasip2.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 cap-std.workspace = true
 gitana-file-store-conformance.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = [
 	"macros",
 	"rt",

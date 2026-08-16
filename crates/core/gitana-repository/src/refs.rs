@@ -723,7 +723,7 @@ where
 
 	/// Take `<name>.lock` (git's ref lock), retrying briefly on contention before giving up with
 	/// [`RepositoryError::RefLocked`].
-	async fn lock_ref(&self, name: &str) -> Result<PathLock, RepositoryError> {
+	pub(crate) async fn lock_ref(&self, name: &str) -> Result<PathLock, RepositoryError> {
 		let path = format!("{name}.lock");
 		for attempt in 0..LOCK_ATTEMPTS {
 			match self.files.try_lock_path(&path).await? {
@@ -742,7 +742,7 @@ where
 
 	/// Best-effort removal of `path`'s now-empty ancestor directories, from the innermost up, stopping
 	/// at the first that is not an empty directory (or on any error / a backend without directories).
-	async fn prune_empty_dirs(&self, path: &str) {
+	pub(crate) async fn prune_empty_dirs(&self, path: &str) {
 		let mut current = path;
 		while let Some(index) = current.rfind('/') {
 			let parent = &current[..index];

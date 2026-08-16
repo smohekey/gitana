@@ -181,20 +181,33 @@ impl Backend for DescriptorBackend {
 	}
 
 	fn sync_dir(&self, path: &str) -> std::io::Result<()> {
-		if path.is_empty() {
-			return self.dir.sync_data().map_err(io_error);
-		}
-		self
-			.dir
-			.open_at(
-				PathFlags::empty(),
-				path,
-				OpenFlags::DIRECTORY,
-				DescriptorFlags::READ,
-			)
+		let opened;
+		let directory = if path.is_empty() {
+			&self.dir
+		} else {
+			opened = self
+				.dir
+				.open_at(
+					PathFlags::empty(),
+					path,
+					OpenFlags::DIRECTORY,
+					DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
+				)
+				.map_err(io_error)?;
+			&opened
+		};
+
+		// `descriptor.sync` and `descriptor.sync-data` both succeed with no effect when the
+		// descriptor was not opened for mutation. Directory entries are metadata, so require the
+		// directory-write capability explicitly and use the full fsync-equivalent operation.
+		if !directory
+			.get_flags()
 			.map_err(io_error)?
-			.sync_data()
-			.map_err(io_error)
+			.contains(DescriptorFlags::MUTATE_DIRECTORY)
+		{
+			return Err(io_error(ErrorCode::ReadOnly));
+		}
+		directory.sync().map_err(io_error)
 	}
 }
 

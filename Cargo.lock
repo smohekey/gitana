@@ -1674,6 +1674,7 @@ dependencies = [
  "gitana-file-store",
  "gitana-file-store-conformance",
  "sha2",
+ "tempfile",
  "tokio",
  "wasip2",
  "windows-sys 0.61.2",
