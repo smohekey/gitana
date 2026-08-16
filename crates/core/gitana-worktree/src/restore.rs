@@ -93,6 +93,11 @@ where
 	// Whether path comparisons here fold case: `core.ignoreCase`, OR an `:(icase)` pathspec (which selects
 	// a differently-cased path). Used so a recased descendant under an incoming gitlink is still recognised
 	// as inside the mount and preserved, not deleted (git leaves it untouched — probed vs git 2.55).
+	// DEFERRED divergence (same case-sensitive-FS family as the recased-entry deferral): this fold flag is
+	// GLOBAL, so under `core.ignoreCase=false` an UNRELATED `:(icase)` spec in the set makes it protect a
+	// case-distinct `sub/file` under an incoming `Sub` that git would remove. Scoping the fold to the exact
+	// spec that matched the mount/descendant needs per-pathspec attribution; on a case-INSENSITIVE FS (the
+	// common case) `Sub`/`sub` are one slot so the preservation is correct regardless.
 	let fold = crate::excludes::ignore_case(wt).await? || set.all().any(|spec| spec.is_icase());
 	// A *truly* empty pathspec list specifies nothing and is a no-op — distinct from an all-negative set,
 	// which git treats as an implicit repository-root `.` minus the exclusions. Without this guard a

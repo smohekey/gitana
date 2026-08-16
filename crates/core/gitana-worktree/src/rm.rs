@@ -248,6 +248,12 @@ where
 					if crate::checkout::has_symlinked_ancestor(wt.work(), path) {
 						Err(WorktreeError::UnsafePath(path.to_owned()))
 					} else {
+						// rmdir removes an EMPTY mount and errors on a populated one (kept, non-force already
+						// refused it above). DEFERRED divergence: `rm -f` of a POPULATED mount — git recursively
+						// removes a plain directory but ERRORS on a real submodule (`.git` present, needs a
+						// .gitmodules name lookup, out of scope); gta's rmdir keeps the entry either way. The
+						// plain-dir `-f` case is a minor capability gap; the real-submodule case is .gitmodules
+						// territory. Both are safe (no data deleted).
 						wt.work().remove_dir(path).map_err(WorktreeError::from)
 					}
 				}

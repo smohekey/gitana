@@ -502,12 +502,18 @@ where
 		// directory→symlink switch the stale child under the old directory is already gone), so the
 		// removal never escapes the work tree.
 		for path in &stray {
-			// Detect a gitlink at ANY index stage (a modify/delete abort has only conflict stages, no
-			// stage-0 entry), so the empty mount materialised for the conflict is rmdir'd, not left behind.
-			let is_gitlink = index
+			// A gitlink at ANY index stage (a modify/delete abort has only conflict stages, no stage-0 entry)
+			// means the empty mount materialised for the conflict must be rmdir'd, not left behind. But choose
+			// by the MATERIALISED occupant, not just any stage: a mixed same-path conflict (stage-2 blob +
+			// stage-3 gitlink) whose worktree side is the stage-2 FILE must be UNLINKED (git does under
+			// `checkout -f`/`reset --hard`), not treated as a mount and rmdir'd — which would strand the file as
+			// `?? sub`. Only a directory (or absent) mount uses gitlink removal (probed vs git 2.55).
+			let has_gitlink_stage = index
 				.entries
 				.iter()
 				.any(|entry| entry.path == *path && entry.mode == 0o160000);
+			let is_gitlink = has_gitlink_stage
+				&& !matches!(wt.work().lstat(path)?, Some(meta) if meta.kind.is_file() || meta.kind.is_symlink());
 			remove_current_path(wt, path, is_gitlink)?;
 			index.remove(path);
 		}

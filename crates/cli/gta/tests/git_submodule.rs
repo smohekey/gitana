@@ -1917,6 +1917,79 @@ fn icase_restore_preserves_a_recased_gitlink_descendant_like_git() {
 	std::fs::remove_dir_all(&h).ok();
 }
 
+/// A force checkout away from a MIXED same-path conflict (stage-2 blob + stage-3 gitlink) whose worktree
+/// side is the materialized stage-2 FILE must UNLINK that file, like git — not treat the slot as a mount
+/// and `rmdir` it (which would leave the file as `?? sub`).
+#[test]
+fn force_checkout_off_a_mixed_conflict_unlinks_the_file_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let build = |w: &str| {
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		git(w, &["config", "user.name", "T"]);
+		git(w, &["config", "user.email", "t@e"]);
+		git(w, &["commit", "-q", "--allow-empty", "-m", "base"]);
+		// Any real commit id serves as the recorded submodule commit (must match the repo's hash width).
+		let c1 = git(w, &["rev-parse", "HEAD"]).trim().to_owned();
+		git(w, &["branch", "emptybr"]);
+		let blob = String::from_utf8(
+			Command::new("git")
+				.args(["-C", w, "hash-object", "-w", "--stdin"])
+				.stdin(std::process::Stdio::piped())
+				.stdout(std::process::Stdio::piped())
+				.spawn()
+				.and_then(|mut ch| {
+					use std::io::Write;
+					ch.stdin.take().unwrap().write_all(b"x\n").unwrap();
+					ch.wait_with_output()
+				})
+				.expect("hash-object")
+				.stdout,
+		)
+		.unwrap()
+		.trim()
+		.to_owned();
+		let mut ch = Command::new("git")
+			.args(["-C", w, "update-index", "--index-info"])
+			.stdin(std::process::Stdio::piped())
+			.spawn()
+			.expect("update-index");
+		{
+			use std::io::Write;
+			ch.stdin
+				.take()
+				.unwrap()
+				.write_all(format!("100644 {blob} 2\tsub\n160000 {c1} 3\tsub\n").as_bytes())
+				.unwrap();
+		}
+		assert!(ch.wait().expect("wait").success());
+		std::fs::write(format!("{w}/sub"), b"x\n").unwrap();
+	};
+
+	let g = unique_tmp("gta-sub-mixedforce-gta");
+	let h = unique_tmp("gta-sub-mixedforce-git");
+	let (wg, wh) = (g.to_str().unwrap(), h.to_str().unwrap());
+	build(wg);
+	build(wh);
+	gta(wg, &["checkout", "-f", "emptybr"], b"");
+	Command::new("git")
+		.args(["-C", wh, "checkout", "-f", "emptybr"])
+		.output()
+		.expect("run git");
+	assert!(
+		!g.join("sub").exists(),
+		"gta must unlink the materialized file on a force checkout, like git"
+	);
+	assert!(!h.join("sub").exists(), "sanity: git unlinks it too");
+	std::fs::remove_dir_all(&g).ok();
+	std::fs::remove_dir_all(&h).ok();
+}
+
 /// `gta rm` of a nested gitlink whose ancestor is an on-disk SYMLINK must not follow the link out of the
 /// tree and delete the real target — git aborts because the ancestor is symbolic. A non-force `rm
 /// link/sub` (where `link` → `actual/`) must refuse and leave `actual/sub` untouched, matching git's
