@@ -201,6 +201,87 @@ fn switch_c_that_fails_checkout_creates_no_branch() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// `switch -c X main` while `HEAD` already points at an *unborn* `refs/heads/X` must create `X`, stay on
+/// it, and record git's two `logs/HEAD` entries — the create cascade, then the checkout. Because `HEAD`
+/// is on `X`, the create cascades into `logs/HEAD`; the checkout holds `HEAD.lock` end-to-end, so the
+/// create must publish through that held lock rather than deadlock re-locking it. Cross-checked vs git 2.55.
+#[test]
+fn switch_c_creates_the_unborn_branch_head_is_on_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let build = |tag: &str| -> PathBuf {
+		let work = unique_tmp(&format!("gta-switch-c-unborn-{tag}"));
+		let w = work.to_str().unwrap();
+		git(
+			w,
+			&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+		);
+		std::fs::write(work.join("a.txt"), b"1\n").unwrap();
+		git(w, &["add", "."]);
+		commit(w, "one");
+		// Detach onto an unborn branch, so creating it cascades into `logs/HEAD`.
+		git(w, &["symbolic-ref", "HEAD", "refs/heads/orphan"]);
+		work
+	};
+	let a = build("gta");
+	let b = build("git");
+	gta(
+		a.to_str().unwrap(),
+		&["switch", "-c", "orphan", "main"],
+		b"",
+	);
+	let gout = Command::new("git")
+		.args(["-C", b.to_str().unwrap(), "switch", "-c", "orphan", "main"])
+		.output()
+		.expect("run git");
+	assert!(
+		gout.status.success(),
+		"sanity: git creates the unborn branch"
+	);
+
+	let head = |w: &str| git(w, &["symbolic-ref", "HEAD"]).trim().to_owned();
+	// orphan resolves to main's tip within each repo (the two repos have distinct commit ids).
+	let orphan_is_main = |w: &str| {
+		git(w, &["rev-parse", "refs/heads/orphan"]).trim()
+			== git(w, &["rev-parse", "refs/heads/main"]).trim()
+	};
+	let subjects = |w: &str| {
+		git(w, &["reflog", "--format=%gs", "HEAD"])
+			.lines()
+			.take(2)
+			.map(str::to_owned)
+			.collect::<Vec<_>>()
+	};
+
+	assert_eq!(head(a.to_str().unwrap()), "refs/heads/orphan");
+	assert_eq!(head(a.to_str().unwrap()), head(b.to_str().unwrap()));
+	assert!(
+		orphan_is_main(a.to_str().unwrap()),
+		"gta: orphan created at main's tip"
+	);
+	assert!(
+		orphan_is_main(b.to_str().unwrap()),
+		"git: orphan created at main's tip"
+	);
+	assert_eq!(
+		subjects(a.to_str().unwrap()),
+		subjects(b.to_str().unwrap()),
+		"logs/HEAD reflog subjects match git"
+	);
+	assert_eq!(
+		subjects(a.to_str().unwrap()),
+		[
+			"checkout: moving from orphan to orphan",
+			"branch: Created from main"
+		],
+	);
+
+	std::fs::remove_dir_all(&a).ok();
+	std::fs::remove_dir_all(&b).ok();
+}
+
 /// A non-force `switch` is git's two-tree merge (`read-tree -m -u`): local staged/unstaged work that does
 /// not conflict with the branch change is carried across the switch, and a real conflict is refused —
 /// rather than the target silently overwriting or dropping it. Each scenario builds an identical repo for

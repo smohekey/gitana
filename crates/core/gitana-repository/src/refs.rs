@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use gitana_file_store::{FileStore, FileStoreError, PathLock};
 use gitana_object::{HashAlgorithm, ObjectId};
 
-use crate::{HeadState, RefOp, RepositoryError};
+use crate::{HeadLock, HeadState, RefOp, RepositoryError};
 
 /// The maximum symbolic-ref chain depth to follow (git's limit), a guard against a cycle.
 const MAX_SYMREF_DEPTH: usize = 5;
@@ -743,11 +743,20 @@ where
 
 	/// Best-effort removal of `path`'s now-empty ancestor directories, from the innermost up, stopping
 	/// at the first that is not an empty directory (or on any error / a backend without directories).
+	///
+	/// **Namespace anchors are never removed:** a directory of two or fewer path components — `refs`,
+	/// `refs/heads`, `logs/refs`, … — is preserved, matching git, which skips the first two components
+	/// when pruning a ref's empty parents. `refs/` in particular must survive or the repository stops
+	/// being recognized (`is_git_dir` requires it). Deeper empties (e.g. `refs/heads/foo` left when
+	/// `refs/heads/foo/bar` is deleted) are pruned so the parent name is free to become a ref.
 	pub(crate) async fn prune_empty_dirs(&self, path: &str) {
 		let mut current = path;
 		while let Some(index) = current.rfind('/') {
 			let parent = &current[..index];
-			if parent.is_empty() || self.files.remove_dir(parent).await.is_err() {
+			if parent.matches('/').count() < 2 {
+				break;
+			}
+			if self.files.remove_dir(parent).await.is_err() {
 				break;
 			}
 			current = parent;
@@ -1000,6 +1009,127 @@ where
 			self.force_write("packed-refs", out.as_bytes()).await?;
 		}
 		Ok(())
+	}
+
+	/// Acquire this worktree's `HEAD.lock` as a typed checkout capability.
+	///
+	/// The returned [`HeadLock`] owns a handle to this exact store and can only be consumed by
+	/// publishing `HEAD`. Checkout code holds it from before it reads the merge base through the
+	/// working-tree mutation, so the branch cannot move under an in-flight checkout.
+	pub async fn lock_head(&self) -> Result<HeadLock<F::Shared, H>, RepositoryError> {
+		let files = self.files.shared_handle();
+		let effective = self.effective.cloned();
+		let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+		let lock = store.lock_ref("HEAD").await?;
+		Ok(HeadLock::new(files, effective, lock))
+	}
+
+	/// Publish a checkout while the caller's `head_lock` (this worktree's `HEAD.lock`) is held, consuming
+	/// it: optionally create `branch` at `create.0` (git's `switch -c`), then point `HEAD` at `branch`.
+	///
+	/// Backs [`HeadLock::finish_checkout`](crate::HeadLock::finish_checkout). On native the whole
+	/// publication runs in an owned task that OWNS `head_lock` (and, for the create, the branch's own
+	/// lock), so a cancelled checkout cannot release `HEAD.lock` between the create and the `HEAD` write.
+	pub(crate) async fn commit_checkout(
+		&self,
+		head_lock: PathLock,
+		branch: &str,
+		create: Option<(ObjectId<H>, ReflogIntent<'_>)>,
+		checkout_reflog: ReflogIntent<'_>,
+	) -> Result<(), RepositoryError> {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let files = self.files.shared_handle();
+			let effective = self.effective.cloned();
+			let branch = branch.to_owned();
+			let create = create.map(|(target, reflog)| (target, OwnedReflogIntent::from(reflog)));
+			let checkout_reflog = OwnedReflogIntent::from(checkout_reflog);
+			match tokio::spawn(async move {
+				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+				let create = create
+					.as_ref()
+					.map(|(target, reflog)| (*target, reflog.borrow()));
+				store
+					.commit_checkout_inline(head_lock, &branch, create, checkout_reflog.borrow())
+					.await
+			})
+			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		self
+			.commit_checkout_inline(head_lock, branch, create, checkout_reflog)
+			.await
+	}
+
+	/// The body of [`commit_checkout`](Self::commit_checkout), run holding `head_lock`.
+	async fn commit_checkout_inline(
+		&self,
+		head_lock: PathLock,
+		branch: &str,
+		create: Option<(ObjectId<H>, ReflogIntent<'_>)>,
+		checkout_reflog: ReflogIntent<'_>,
+	) -> Result<(), RepositoryError> {
+		// git's order: create the branch first, then point `HEAD` at it, so the (possibly just-created)
+		// branch resolves for `HEAD`'s reflog `old`/`new` (git writes `<tip> <tip> checkout: …`, not a
+		// zero old, and emits the entry rather than skipping an unresolved target).
+		if let Some((target, reflog)) = create {
+			self.create_under_head_lock(branch, target, reflog).await?;
+		}
+		let result = self
+			.set_symbolic_locked("HEAD", branch, checkout_reflog)
+			.await;
+		drop(head_lock);
+		self.prune_empty_dirs("HEAD").await;
+		result
+	}
+
+	/// Create `branch` at `target` while the checkout's `HEAD.lock` is held (not re-locked): a one-op
+	/// transaction that locks the branch, validates its absence, and commits. When `HEAD` points at
+	/// `branch` (an unborn branch being born) the create cascades into `logs/HEAD`; because the checkout
+	/// already holds `HEAD.lock`, that split-HEAD reflog is written under it rather than by re-acquiring
+	/// it — the deadlock a bare [`transact`](Self::transact) would hit.
+	async fn create_under_head_lock(
+		&self,
+		branch: &str,
+		target: ObjectId<H>,
+		reflog: ReflogIntent<'_>,
+	) -> Result<(), RepositoryError> {
+		let policy = self.reflog_policy().await?;
+		let op = RefOp {
+			name: branch.to_owned(),
+			expected: None,
+			new: Some(target),
+			reflog,
+		};
+		let ops = std::slice::from_ref(&op);
+		let lock = self.lock_ref(branch).await?;
+		// The cascade decision uses `HEAD` — stable, since the checkout holds `HEAD.lock`.
+		let head_target = self.read_symbolic("HEAD").await?;
+		let cascades =
+			vec![branch.starts_with("refs/heads/") && head_target.as_deref() == Some(branch)];
+		let result = async {
+			let cascades = self
+				.confirm_cascades(ops, cascades)
+				.await
+				.map_err(|(_, error)| error)?;
+			let olds = self
+				.validate_locked(ops, &cascades, policy)
+				.await
+				.map_err(|(_, error)| error)?;
+			self
+				.commit_validated(ops, &olds, &cascades, policy)
+				.await
+				.map_err(|(_, error)| error)
+		}
+		.await;
+		drop(lock);
+		self.prune_empty_dirs(branch).await;
+		result
 	}
 
 	/// Point `HEAD` at a ref name (`ref: <target>`), overwriting any current HEAD.
@@ -2258,6 +2388,184 @@ mod tests {
 			.await
 			.expect("the earlier nested lock directory was pruned");
 		assert_eq!(store.resolve("refs/heads/a").await.unwrap(), Some(tip));
+
+		let _ = std::fs::remove_dir_all(&tmp);
+	}
+
+	/// The `switch -c` self-cascade path: `finish_checkout` creates the branch its (unborn) `HEAD` points
+	/// at and publishes `HEAD` in one step. That create cascades into `logs/HEAD`, so a bare transaction
+	/// would re-lock the very `HEAD.lock` the checkout holds and deadlock; the checkout writes it under
+	/// the held lock instead, then publishes `HEAD` and releases.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn finish_checkout_creates_the_branch_head_is_on_without_relocking() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+		// HEAD on an unborn branch: creating it cascades into `logs/HEAD`, so it would join the lock set.
+		store
+			.set_symbolic("HEAD", "refs/heads/orphan", ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		let head_lock = store.lock_head().await.unwrap();
+		assert!(files.exists("HEAD.lock").await.unwrap());
+
+		head_lock
+			.finish_checkout(
+				"refs/heads/orphan",
+				Some((tip, ReflogIntent::Skip)),
+				ReflogIntent::Skip,
+			)
+			.await
+			.expect("create the branch HEAD is on and publish HEAD under the held lock, not deadlocking");
+		assert_eq!(store.resolve("refs/heads/orphan").await.unwrap(), Some(tip));
+		assert_eq!(
+			files.read_path("HEAD").await.unwrap(),
+			b"ref: refs/heads/orphan\n"
+		);
+		assert!(
+			!files.exists("HEAD.lock").await.unwrap(),
+			"publishing the checkout releases the HEAD.lock",
+		);
+	}
+
+	/// Cancellation invariant: `finish_checkout` moves the `HEAD.lock` into its owned worker, so dropping
+	/// the caller mid-publish must NOT release the lock — the worker runs to completion holding it, and
+	/// only then is the branch published and the lock freed.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn cancelled_finish_checkout_retains_head_lock_until_the_worker_completes() {
+		let files = GatedFileStore::new();
+		let store: RefStore<'_, GatedFileStore, Sha256> = RefStore::new(&files);
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+
+		let head_lock = store.lock_head().await.unwrap();
+		let mut publish = Box::pin(head_lock.finish_checkout(
+			"refs/heads/feature",
+			Some((tip, ReflogIntent::Skip)),
+			ReflogIntent::Skip,
+		));
+		let mut context = Context::from_waker(Waker::noop());
+		assert!(matches!(publish.as_mut().poll(&mut context), Poll::Pending));
+		files.wait_until_blocked().await;
+		assert!(files.exists("HEAD.lock").await.unwrap());
+
+		drop(publish);
+		for _ in 0..10 {
+			tokio::task::yield_now().await;
+		}
+		assert!(
+			files.exists("HEAD.lock").await.unwrap(),
+			"the retained worker must keep HEAD.lock across caller cancellation",
+		);
+		assert_eq!(store.resolve("refs/heads/feature").await.unwrap(), None);
+
+		files.release();
+		for _ in 0..50 {
+			tokio::task::yield_now().await;
+			if !files.exists("HEAD.lock").await.unwrap() {
+				break;
+			}
+		}
+		assert_eq!(
+			store.resolve("refs/heads/feature").await.unwrap(),
+			Some(tip)
+		);
+		assert_eq!(
+			files.read_path("HEAD").await.unwrap(),
+			b"ref: refs/heads/feature\n"
+		);
+		assert!(!files.exists("HEAD.lock").await.unwrap());
+	}
+
+	/// A held [`HeadLock`] (as `switch` keeps across a checkout) excludes a ref transaction that moves the
+	/// branch `HEAD` is on, because that move must lock `HEAD` for its reflog cascade. The branch cannot
+	/// move out from under the checkout while the lock is held.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn a_held_head_lock_excludes_a_cascading_branch_move() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+		let next = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"next");
+		store
+			.update_ref("refs/heads/main", tip, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		store
+			.set_symbolic("HEAD", "refs/heads/main", ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		let head_lock = store.lock_head().await.unwrap();
+		assert!(files.exists("HEAD.lock").await.unwrap());
+
+		let error = store
+			.update_ref("refs/heads/main", next, Some(tip), ReflogIntent::Skip)
+			.await
+			.expect_err("a cascading move must contend on the checkout's held HEAD.lock");
+		assert!(
+			matches!(&error, crate::RepositoryError::RefLocked { name } if name == "HEAD"),
+			"expected HEAD.lock contention, got {error:?}",
+		);
+		assert_eq!(store.resolve("refs/heads/main").await.unwrap(), Some(tip));
+
+		drop(head_lock);
+		store
+			.update_ref("refs/heads/main", next, Some(tip), ReflogIntent::Skip)
+			.await
+			.expect("releasing the checkout lock lets the move through");
+		assert_eq!(store.resolve("refs/heads/main").await.unwrap(), Some(next));
+	}
+
+	/// Deleting a nested ref frees its parent name while keeping the namespace anchors: after
+	/// `refs/heads/foo/bar` is deleted, the emptied `refs/heads/foo` is pruned but `refs/heads` and
+	/// `refs/` survive (the repository's `refs/` must remain for `is_git_dir`). Guards the anchor bound in
+	/// [`prune_empty_dirs`](super::RefStore::prune_empty_dirs).
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn deleting_a_nested_ref_frees_the_parent_name_but_keeps_anchors() {
+		use gitana_file_store_local::LocalFileStore;
+
+		let tmp =
+			std::env::temp_dir().join(format!("gitana-headlock-delnested-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(tmp.join("refs").join("heads")).unwrap();
+		let files = LocalFileStore::from_dir(
+			cap_std::fs::Dir::open_ambient_dir(&tmp, cap_std::ambient_authority()).unwrap(),
+		);
+		let store: RefStore<'_, LocalFileStore, Sha256> = RefStore::new(&files);
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+
+		store
+			.update_ref("refs/heads/foo/bar", tip, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		store
+			.delete_ref("refs/heads/foo/bar", Some(tip), ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		// Immediately after the delete: anchors intact, emptied parent pruned.
+		assert!(
+			tmp.join("refs").is_dir(),
+			"the refs/ anchor survives the delete"
+		);
+		assert!(
+			tmp.join("refs").join("heads").is_dir(),
+			"the refs/heads anchor survives the delete",
+		);
+		assert!(
+			!tmp.join("refs").join("heads").join("foo").exists(),
+			"the emptied refs/heads/foo is pruned so its name is free",
+		);
+
+		store
+			.update_ref("refs/heads/foo", tip, None, ReflogIntent::Skip)
+			.await
+			.expect("refs/heads/foo is free after the nested ref was deleted");
+		assert_eq!(store.resolve("refs/heads/foo").await.unwrap(), Some(tip));
 
 		let _ = std::fs::remove_dir_all(&tmp);
 	}

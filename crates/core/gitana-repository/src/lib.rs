@@ -14,6 +14,7 @@ mod error;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod gated_file_store;
 mod head;
+mod head_lock;
 mod merge;
 mod merge_base;
 mod merge_state;
@@ -31,6 +32,7 @@ pub use self::{
 	detect::detect_hash_kind,
 	error::RepositoryError,
 	head::HeadState,
+	head_lock::HeadLock,
 	merge::TreeMerge,
 	mode::FileMode,
 	rebase_state::RebaseState,

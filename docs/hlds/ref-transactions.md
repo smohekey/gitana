@@ -192,9 +192,13 @@ Deltas from the design above and from `codex` review, recorded here rather than 
 - **Empty ref directories are pruned (git parity), via a new `FileStore::remove_dir`.** Acquiring
   `<ref>.lock` `create_dir_all`s the ref's parents; an aborted transaction (or a delete that empties a
   subtree) would otherwise leave an empty `refs/heads/foo/` that the new `is_dir` preflight reads as a
-  permanent conflict. `unlock_ref` (and the delete path, for `logs/`) best-effort removes now-empty
-  parent directories from the innermost up, stopping at the first non-empty one — exactly as git prunes
-  empty ref dirs so a stale directory cannot block a later ref.
+  permanent conflict. After the transaction's locks release, `prune_empty_dirs` best-effort removes
+  now-empty parent directories from the innermost up, stopping at the first non-empty one — exactly as
+  git prunes empty ref dirs so a stale directory cannot block a later ref. **It never removes a
+  namespace anchor** — a directory of two or fewer path components (`refs`, `refs/heads`, `logs/refs`,
+  …), matching git, which skips the first two components; removing `refs/` would strip a directory
+  `is_git_dir` requires and make the repository unrecognizable, so deleting the last ref under
+  `refs/heads` prunes nothing above it.
 - **The HEAD cascade is gated on the prepared flag, *re-confirmed under the lock*.** `HEAD` is read
   once pre-lock to fix the lock set (locked iff some op cascades); `confirm_cascades` re-reads it under
   the acquired locks (catching a `set_symbolic` retarget in the pre-lock→lock window) and keeps the
@@ -223,6 +227,26 @@ Deltas from the design above and from `codex` review, recorded here rather than 
   transaction explicitly drops the locks already acquired and prunes directories created for both
   those names and the failed attempt before returning. This prevents an aborted nested lock such as
   `refs/heads/foo/bar.lock` from leaving an empty `refs/heads/foo/` that blocks the parent ref.
+- **Checkout holds `HEAD.lock` end to end (`HeadLock`).** `RefStore::lock_head` returns a `HeadLock`
+  (own file `head_lock.rs`) — an owned `HEAD.lock` paired with an aliasing store handle. `gta switch`
+  acquires it before it reads the two-tree merge base and holds it through the working-tree mutation,
+  then publishes by **consuming** it via `HeadLock::finish_checkout` — never a fresh
+  `set_head_symbolic`/`update_ref`, which would try to re-acquire the lock it holds. Because a ref
+  transaction moving the branch this worktree's `HEAD` is on must also lock `HEAD` for its reflog
+  cascade, the held lock excludes such a move for the checkout's duration — the checked-out branch
+  cannot shift under the in-flight checkout. (A cross-worktree move of a branch checked out here does
+  not cascade into this `HEAD`, so it is not excluded; that case is out of scope.)
+  - **Publish is one consuming, lock-owning operation.** `finish_checkout` optionally creates `branch`
+    (git's `switch -c`) and then points `HEAD` at it, both inside a single owned task that owns
+    `HEAD.lock` (backed by `RefStore::commit_checkout`). The retained worker owns every lock it relies
+    on, so dropping the caller mid-publish cannot release `HEAD.lock` early. The branch is created
+    first and `HEAD` retargeted **after**, matching git's create-then-set-HEAD order so the just-created
+    branch resolves for `HEAD`'s reflog `old`/`new`.
+  - **`switch -c X` when `HEAD` is on an (unborn) `X`.** The create cascades into `logs/HEAD`; because
+    the worker owns `HEAD.lock` it writes that split-HEAD reflog directly instead of re-locking `HEAD`
+    (which a bare `transact` would do, deadlocking on the held lock). Verified byte-for-byte against git
+    2.55 — all three `logs/HEAD` entries in order (`… commit (initial)`, `branch: Created from main`,
+    `<tip> <tip> checkout: moving from X to X`).
 
 ## Implementation notes (as built, Phase 3)
 

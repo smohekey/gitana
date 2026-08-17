@@ -48,7 +48,18 @@ impl WorkTreeCommand for Switch<'_> {
 		let repo = worktree.repository();
 		let branch = format!("refs/heads/{}", self.name);
 		let committer = signature_or_default(repo, "COMMITTER").await?;
-		// Describe what HEAD points at now, before it moves — the `from` half of the checkout reflog.
+
+		// Hold this worktree's `HEAD.lock` for the whole checkout — from before the merge base is read
+		// through publishing the new `HEAD`. This serializes the checkout against a concurrent `HEAD`
+		// retarget and against a ref transaction moving the branch this worktree currently has checked
+		// out (such a move locks `HEAD` for its reflog cascade), so the two-tree merge base, the working-
+		// tree mutation, and the final `HEAD` publish cannot interleave with them. The lock releases on
+		// drop if the checkout bails or is cancelled before that publish, leaving `HEAD` unmoved.
+		let head_lock = repo.refs().lock_head().await?;
+
+		// Describe what HEAD points at now, for the `from` half of the checkout reflog — read *after*
+		// acquiring the lock so overlapping switches serialize and each records its real starting HEAD,
+		// not one a concurrent switch has since moved.
 		let from = head_description(repo).await?;
 
 		// Resolve the commit to check out. The branch-already-exists check stays here, before any tree
@@ -130,34 +141,34 @@ impl WorkTreeCommand for Switch<'_> {
 				.checkout_merge(head_tree, tree, excludes_file.as_deref())
 				.await?;
 		}
-		if self.create {
-			// git records the start point as named, defaulting to the literal `HEAD` for `switch -c`
-			// (unlike `branch`, which defaults to the current branch's name). `update_ref` with `expected:
-			// None` also re-asserts the branch's absence, so a name created concurrently since the early
-			// existence check above fails here rather than being overwritten.
-			let created_from = self.start.as_deref().unwrap_or("HEAD");
-			let message = format!("branch: Created from {created_from}");
-			repo
-				.refs()
-				.update_ref(
-					&branch,
-					target,
-					None,
-					ReflogIntent::Log {
-						committer: &committer,
-						message: &message,
-					},
-				)
-				.await?;
-		}
-		let message = format!("checkout: moving from {from} to {}", self.name);
-		repo
-			.refs()
-			.set_head_symbolic(
-				&branch,
+		// git records the start point as named, defaulting to the literal `HEAD` for `switch -c` (unlike
+		// `branch`, which defaults to the current branch's name). The create asserts the branch's absence
+		// (`expected: None`), so a name created concurrently since the early existence check above fails
+		// here rather than being overwritten.
+		let created_from = self.start.as_deref().unwrap_or("HEAD");
+		let create_message = format!("branch: Created from {created_from}");
+		let create = self.create.then(|| {
+			(
+				target,
 				ReflogIntent::Log {
 					committer: &committer,
-					message: &message,
+					message: &create_message,
+				},
+			)
+		});
+		// Publish the checkout by consuming the `HEAD.lock` held across the whole checkout: create the
+		// branch (if `-c`) and set `HEAD` in one owned task that keeps the lock — never a fresh
+		// `set_head_symbolic`/`update_ref`, which would try to re-acquire the lock we already own. When
+		// `HEAD` is on the (unborn) branch being created, the create cascades into `logs/HEAD` and is
+		// written under the held lock.
+		let checkout_message = format!("checkout: moving from {from} to {}", self.name);
+		head_lock
+			.finish_checkout(
+				&branch,
+				create,
+				ReflogIntent::Log {
+					committer: &committer,
+					message: &checkout_message,
 				},
 			)
 			.await?;
