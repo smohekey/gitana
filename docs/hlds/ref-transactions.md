@@ -176,19 +176,31 @@ Deltas from the design above and from `codex` review, recorded here rather than 
   (`reflog_policy` / `should_log` / `log_ref_update` / `append_reflog` / `remove_from_packed`), so it
   lives on `RefStore` in `refs.rs` — co-locating it avoids widening seven helpers to `pub(crate)`.
   `RefOp` (the one caller-facing type) still gets its own file, `ref_op.rs`, per conventions.
-- **Directory/file preflight of both the ref path and the reflog path, via a new `FileStore::is_dir`
-  (git's prepare-phase ref-name availability check).** Validation checks `path_write_blocked` for a
-  move's ref path, (when logged) its reflog path, and (for a cascade) the mirrored `logs/HEAD` —
-  `is_dir(target)` catches the destination being a
-  directory (a leftover from a nested ref/reflog, *including empty dirs* a delete left behind, which
-  `read_path`/`list` miss), and `read_path(ancestor).is_ok()` catches a *file* ancestor (only a file
-  reads back `Ok`; a directory or absent path errors, kind varying by backend). `FileStore::exists`
-  couldn't do this — it's `metadata`-based and reads `true` for the normal `logs/refs/heads`
-  directory. Preflighting both paths for every op means a **validated commit cannot fail on a D/F
-  conflict**, so even a multi-op `--atomic` batch is all-or-nothing (the residual is catastrophic
-  mid-commit I/O only). A delete needs no preflight — it removes, and validation already proved the
-  ref resolves. With both paths validated, commit writes the **reflog before the ref** again (a
-  catastrophic `logs/` failure then leaves the ref unpublished — receive-pack's reject-without-moving).
+- **Directory/file preflight of both the ref path and the reflog path, via `FileStore::is_dir`
+  (git's prepare-phase ref-name availability check).** Validation checks the loose path for a move's
+  ref, (when logged) its reflog, and (for a cascade) the mirrored `logs/HEAD`. `is_dir(target)` catches
+  a physical directory (including an empty one left by a delete) or a logical directory implied by
+  descendant keys on a flat store; `read_path(ancestor).is_ok()` catches a loose file ancestor. Ref
+  paths additionally inspect `packed-refs` bytewise for strict ancestors and descendants, while an
+  exact packed name remains a valid update target. Every mutation under `refs/` holds
+  `packed-refs.lock` from before that snapshot through loose-ref publication; Gitana's packed-prefix
+  rewriters use the same lock, and stock Git's `pack-refs` protocol does too. A concurrent packer
+  therefore cannot move a conflicting loose name into the table between validation and commit.
+  Concrete ref locks are acquired in lexical order **before** `packed-refs.lock`, matching stock
+  Git's update-ref order and avoiding a cross-process lock inversion. Bulk prefix operations first
+  inventory and reserve every affected source and destination ref, then take `packed-refs.lock` and
+  repeat the inventory; if a newly visible ref needs another lock, they release and retry. Their
+  writes are lock-assuming, so they do not try to reacquire a ref lock while holding the packed lock.
+  Transaction errors attribute contention on this shared lock to the first affected operation name
+  (while the `RefLocked` diagnostic still identifies `packed-refs`), so atomic receive-pack can attach
+  the concrete failure to a requested command.
+  `FileStore::exists` could not replace these checks because it is metadata-based and reads `true`
+  for normal namespace directories. Preflighting both paths for every op means a **validated commit
+  cannot fail on a D/F conflict**, so even a multi-op `--atomic` batch is all-or-nothing (the residual
+  is catastrophic mid-commit I/O only). A delete needs no preflight — it removes, and validation
+  already proved the ref resolves. With both paths validated, commit writes the **reflog before the
+  ref** again (a catastrophic `logs/` failure then leaves the ref unpublished — receive-pack's
+  reject-without-moving).
 - **Empty ref directories are pruned (git parity), via a new `FileStore::remove_dir`.** Acquiring
   `<ref>.lock` `create_dir_all`s the ref's parents; an aborted transaction (or a delete that empties a
   subtree) would otherwise leave an empty `refs/heads/foo/` that the new `is_dir` preflight reads as a
@@ -214,14 +226,14 @@ Deltas from the design above and from `codex` review, recorded here rather than 
   per-worktree file, interoperably with git.
 - **`RefLocked`** is the new `RepositoryError` variant when a `<ref>.lock` stays contended past the
   retries.
-- **Native ref mutations are retained through cancellation.** `RefStore::transact` and
-  `set_symbolic` first copy their borrowed inputs and clone an aliasing `FileStore::shared_handle`,
-  then run lock acquisition, validation, publication, release, and directory pruning in an owned
-  Tokio task. Dropping the caller's future stops waiting but does not drop `PathLock` while an
-  offloaded filesystem write is still running. Every store handle aliases the same backend,
-  temporary-name counter, versions, and in-process locks. Wasm keeps the operation inline because
-  its descriptor-backed file-store calls complete synchronously when polled and the component does
-  not provide a Tokio runtime.
+- **Native ref mutations are retained through cancellation.** `RefStore::transact`,
+  `set_symbolic`, `remove_prefix`, and `rename_prefix` first copy their borrowed inputs and clone an
+  aliasing `FileStore::shared_handle`, then run lock acquisition, validation, publication, release,
+  and directory pruning in an owned Tokio task. Dropping the caller's future stops waiting but does
+  not drop `PathLock` while an offloaded filesystem write is still running. Every store handle
+  aliases the same backend, temporary-name counter, versions, and in-process locks. Wasm keeps the
+  operation inline because its descriptor-backed file-store calls complete synchronously when
+  polled and the component does not provide a Tokio runtime.
 - **Ref locks are owned RAII paths.** `FileStore::try_lock_path` returns `PathLock`; dropping the
   complete lock set releases every lock synchronously. If acquiring a later lock fails, the
   transaction explicitly drops the locks already acquired and prunes directories created for both

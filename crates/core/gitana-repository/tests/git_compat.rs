@@ -144,6 +144,73 @@ async fn rev_parse_treats_a_ref_directory_as_a_miss() {
 }
 
 #[tokio::test]
+async fn packed_ref_directory_file_conflicts_match_git() {
+	for (case, existing, requested) in [
+		("packed-child", "refs/tags/topic/child", "refs/tags/topic"),
+		("packed-parent", "refs/tags/topic", "refs/tags/topic/child"),
+	] {
+		let work = unique_tmp(case);
+		let bare = work.join("repo.git");
+		let payload = work.join("payload");
+		std::fs::write(&payload, b"ref namespace probe").unwrap();
+		git(&["init", "--bare", bare.to_str().unwrap()]);
+		let oid = git(&[
+			"--git-dir",
+			bare.to_str().unwrap(),
+			"hash-object",
+			"-w",
+			payload.to_str().unwrap(),
+		]);
+		let oid = oid.trim();
+		git(&[
+			"--git-dir",
+			bare.to_str().unwrap(),
+			"update-ref",
+			existing,
+			oid,
+		]);
+		git(&[
+			"--git-dir",
+			bare.to_str().unwrap(),
+			"pack-refs",
+			"--all",
+			"--prune",
+		]);
+		let output = Command::new("git")
+			.args([
+				"--git-dir",
+				bare.to_str().unwrap(),
+				"update-ref",
+				requested,
+				oid,
+			])
+			.output()
+			.expect("run git update-ref");
+		assert!(
+			!output.status.success(),
+			"git must reject {requested:?} against packed {existing:?}"
+		);
+
+		let files = MemoryFileStore::new();
+		files
+			.write_path_if_absent("packed-refs", format!("{oid} {existing}\n").as_bytes())
+			.await
+			.unwrap();
+		let refs = gitana_repository::RefStore::<_, Sha1>::new(&files);
+		let object = ObjectId::<Sha1>::from_hex(oid).unwrap();
+		assert!(
+			refs
+				.update_ref(requested, object, None, ReflogIntent::Skip)
+				.await
+				.is_err(),
+			"gitana must reject the same packed namespace conflict"
+		);
+
+		std::fs::remove_dir_all(work).ok();
+	}
+}
+
+#[tokio::test]
 async fn abbreviations_resolve_across_loose_and_packed_objects() {
 	let repo = mem_repo();
 	repo.init().await.unwrap();

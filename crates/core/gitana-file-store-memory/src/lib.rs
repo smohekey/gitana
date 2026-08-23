@@ -170,9 +170,22 @@ impl FileStore for MemoryFileStore {
 		)
 	}
 
-	async fn is_dir(&self, _path: &str) -> Result<bool> {
-		// The in-memory store is a flat key→value map with no directories.
-		Ok(false)
+	async fn is_dir(&self, path: &str) -> Result<bool> {
+		// The map has no physical directories, but descendant keys imply the same logical directory
+		// namespace as a filesystem-backed store. Report that shape so callers cannot create both a
+		// value and one of its ancestor/descendant paths.
+		Ok(
+			self
+				.files
+				.read()
+				.expect("file store lock poisoned")
+				.keys()
+				.any(|candidate| {
+					candidate
+						.strip_prefix(path)
+						.is_some_and(|suffix| suffix.starts_with('/'))
+				}),
+		)
 	}
 
 	async fn remove_dir(&self, _path: &str) -> Result<()> {

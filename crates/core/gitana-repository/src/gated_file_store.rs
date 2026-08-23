@@ -11,6 +11,7 @@ use gitana_file_store_memory::MemoryFileStore;
 struct WriteGate {
 	started: AtomicBool,
 	released: AtomicBool,
+	fail_packed_reads: AtomicBool,
 	waker: Mutex<Option<Waker>>,
 }
 
@@ -27,9 +28,14 @@ impl GatedFileStore {
 			gate: Arc::new(WriteGate {
 				started: AtomicBool::new(false),
 				released: AtomicBool::new(false),
+				fail_packed_reads: AtomicBool::new(false),
 				waker: Mutex::new(None),
 			}),
 		}
+	}
+
+	pub(crate) fn fail_packed_reads(&self) {
+		self.gate.fail_packed_reads.store(true, Ordering::Release);
 	}
 
 	pub(crate) async fn wait_until_blocked(&self) {
@@ -79,8 +85,13 @@ impl FileStore for GatedFileStore {
 		self.inner.durability_barrier(targets)
 	}
 
-	fn read_path(&self, path: &str) -> impl Future<Output = Result<Vec<u8>>> {
-		self.inner.read_path(path)
+	async fn read_path(&self, path: &str) -> Result<Vec<u8>> {
+		if path == "packed-refs" && self.gate.fail_packed_reads.load(Ordering::Acquire) {
+			return Err(gitana_file_store::FileStoreError::Backend(
+				"injected packed-refs read failure".to_owned(),
+			));
+		}
+		self.inner.read_path(path).await
 	}
 
 	fn read_path_versioned(&self, path: &str) -> impl Future<Output = Result<(Vec<u8>, Version)>> {

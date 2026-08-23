@@ -120,6 +120,35 @@ async fn listing_rejects_a_non_utf8_name_without_lossy_aliasing() {
 	let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn failed_atomic_replace_removes_its_temporary_file() {
+	let dir = temp_dir("failed-replace-cleanup");
+	let child = dir.join("refs/remotes/upstream/main/child");
+	std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+	std::fs::write(&child, b"existing").unwrap();
+	let store = open_store(&dir);
+
+	assert!(
+		store
+			.write_path_replace("refs/remotes/upstream/main", b"replacement")
+			.await
+			.is_err()
+	);
+	assert_eq!(std::fs::read(&child).unwrap(), b"existing");
+	assert!(
+		std::fs::read_dir(dir.join("refs/remotes/upstream"))
+			.unwrap()
+			.all(|entry| !entry
+				.unwrap()
+				.file_name()
+				.to_string_lossy()
+				.starts_with(".tmp.")),
+		"a failed replacement must not strand an invalid temporary ref"
+	);
+
+	let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_cas_has_no_lost_updates() {
 	let dir = temp_dir("cas");

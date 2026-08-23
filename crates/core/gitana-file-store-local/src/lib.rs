@@ -840,10 +840,17 @@ fn write_atomic(fs: &dyn Backend, counter: &AtomicU64, path: &str, bytes: &[u8])
 		fs.create_dir_all(parent).map_err(backend_err)?;
 	}
 	let (temp, mut writer) = create_temp(fs, counter, parent)?;
-	writer.write_all(bytes).map_err(backend_err)?;
-	writer.flush().map_err(backend_err)?;
+	let write_result = writer.write_all(bytes).and_then(|()| writer.flush());
 	drop(writer);
-	fs.rename(&temp, path).map_err(backend_err)
+	if let Err(error) = write_result {
+		let _ = fs.remove_file(&temp);
+		return Err(backend_err(error));
+	}
+	if let Err(error) = fs.rename(&temp, path) {
+		let _ = fs.remove_file(&temp);
+		return Err(backend_err(error));
+	}
+	Ok(())
 }
 
 /// Discard a partially-written temp file (best effort), off-reactor: drop the writer to
