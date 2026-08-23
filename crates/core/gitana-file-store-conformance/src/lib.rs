@@ -354,9 +354,8 @@ async fn check_deletes(store: &impl FileStore) {
 	);
 }
 
-/// [`FileStore::is_dir`] reports `false` for a regular value and for an absent path (both backends
-/// agree on these; a backend with real directories additionally reports `true` for one, covered by
-/// its own tests).
+/// [`FileStore::is_dir`] reports `false` for a regular value and for an absent path, and reports a
+/// directory implied by a stored descendant on both physical and flat backends.
 async fn check_is_dir(store: &impl FileStore) {
 	store
 		.write_path_replace("refs/heads/isdir", b"x")
@@ -372,6 +371,17 @@ async fn check_is_dir(store: &impl FileStore) {
 			.await
 			.expect("is_dir absent"),
 		"an absent path is not a directory",
+	);
+	store
+		.write_path_replace("refs/heads/nested/child", b"x")
+		.await
+		.expect("create nested value for is_dir test");
+	assert!(
+		store
+			.is_dir("refs/heads/nested")
+			.await
+			.expect("is_dir logical directory"),
+		"a stored descendant implies a directory namespace",
 	);
 	// Removing a non-existent directory errors (both backends agree; a best-effort pruner treats it
 	// as "stop"). Removing an actual empty directory is backend-specific and covered by those tests.

@@ -8,6 +8,9 @@ use crate::{HeadLock, HeadState, RefOp, RepositoryError};
 /// The maximum symbolic-ref chain depth to follow (git's limit), a guard against a cycle.
 const MAX_SYMREF_DEPTH: usize = 5;
 
+/// Git's shared lock for rewriting and taking a stable snapshot of the packed ref namespace.
+const PACKED_REFS: &str = "packed-refs";
+
 /// How many times to retry acquiring a contended `<ref>.lock`, and the wait between tries — mirrors
 /// the file store's own `LockFileGuard` (50 × 10 ms), so a ref transaction waits for stock git (or
 /// another gitana writer) to release the lock instead of failing instantly.
@@ -95,6 +98,12 @@ pub struct RefStore<'a, F, H> {
 struct HeldRefLocks {
 	names: Vec<String>,
 	locks: Vec<PathLock>,
+}
+
+struct PrefixSnapshot {
+	ref_files: Vec<(String, Vec<u8>)>,
+	reflog_files: Vec<(String, Vec<u8>)>,
+	packed_refs: Vec<String>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -405,7 +414,9 @@ where
 
 	/// Apply `ops` as one atomic ref transaction — git's ref-lock model.
 	///
-	/// Every op's ref (and `HEAD`, for a split-HEAD reflog cascade) is locked via `<ref>.lock`,
+	/// Every op's ref (and `HEAD`, for a split-HEAD reflog cascade) is locked via `<ref>.lock`.
+	/// Transactions touching `refs/` also hold `packed-refs.lock`, making the packed namespace used by
+	/// validation stable through publication and excluding concurrent packed-ref rewrites. Locks are
 	/// acquired in a fixed sorted order so concurrent transactions cannot deadlock; every precondition
 	/// is validated; then each op's reflog is written and its ref committed. Any failure applies
 	/// nothing and returns the offending ref name and error.
@@ -459,7 +470,21 @@ where
 		if cascades.iter().any(|&c| c) {
 			lock_names.push("HEAD".to_owned());
 		}
-		let acquired = self.lock_all(&lock_names).await?;
+		if ops.iter().any(|op| op.name.starts_with("refs/")) {
+			lock_names.push(PACKED_REFS.to_owned());
+		}
+		let packed_owner = ops
+			.iter()
+			.find(|op| op.name.starts_with("refs/"))
+			.map(|op| op.name.clone());
+		let acquired = self.lock_all(&lock_names).await.map_err(|(name, error)| {
+			let owner = if name == PACKED_REFS {
+				packed_owner.clone().unwrap_or(name)
+			} else {
+				name
+			};
+			(owner, error)
+		})?;
 
 		// Confirm the cascade under the acquired locks (catching a `HEAD` retarget in the
 		// pre-lock→lock window), validate, then commit. On native this entire sequence lives in the
@@ -516,6 +541,23 @@ where
 	) -> Result<Vec<Option<ObjectId<H>>>, (String, RepositoryError)> {
 		// Validate all preconditions before mutating anything — so the common rejections (a stale
 		// `expected`, deleting a missing ref) apply nothing, even in a multi-op transaction.
+		let packed_owner = ops.iter().find(|op| op.name.starts_with("refs/"));
+		let packed_refs = if ops
+			.iter()
+			.any(|op| op.new.is_some() && op.name.starts_with("refs/"))
+		{
+			self.read_opt("packed-refs").await.map_err(|error| {
+				(
+					packed_owner
+						.expect("a packed snapshot requires an operation under refs/")
+						.name
+						.clone(),
+					error,
+				)
+			})?
+		} else {
+			None
+		};
 		let mut olds = Vec::with_capacity(ops.len());
 		for (op, &cascade) in ops.iter().zip(cascades) {
 			let current = self
@@ -544,7 +586,7 @@ where
 			let mut logged: Vec<&str> = Vec::new();
 			if op.new.is_some() {
 				if self
-					.path_write_blocked(&op.name)
+					.ref_path_write_blocked(&op.name, packed_refs.as_deref())
 					.await
 					.map_err(|e| (op.name.clone(), e))?
 				{
@@ -658,7 +700,9 @@ where
 						.await?;
 				}
 				self.files.delete_path_unlocked(&op.name).await?;
-				self.remove_from_packed(&op.name).await?;
+				if op.name.starts_with("refs/") {
+					self.remove_from_packed_locked(&op.name).await?;
+				}
 				// Best-effort, like git: a stale reflog (e.g. a leftover `logs/<name>` directory) must
 				// not turn a completed deletion into a reported failure. Prune the reflog's now-empty
 				// parent dirs too (the ref's own are pruned when its lock is released), so a later ref
@@ -671,9 +715,24 @@ where
 		Ok(())
 	}
 
-	/// Whether writing a value at `target` would hit a directory/file conflict: `target` is itself a
+	/// Whether writing a ref at `target` would conflict with either the loose storage namespace or a
+	/// strict ancestor/descendant in `packed-refs`. An exact packed ref is allowed: the loose write
+	/// replaces it by shadowing its packed value, as Git does.
+	async fn ref_path_write_blocked(
+		&self,
+		target: &str,
+		packed_refs: Option<&[u8]>,
+	) -> Result<bool, RepositoryError> {
+		Ok(
+			self.path_write_blocked(target).await?
+				|| packed_refs.is_some_and(|packed| packed_ref_path_conflict(packed, target)),
+		)
+	}
+
+	/// Whether writing a value at `target` would hit a loose directory/file conflict: `target` is a
 	/// directory (a leftover from a nested ref/reflog, e.g. `refs/heads/foo` when `refs/heads/foo/bar`
-	/// exists, or an empty dir a delete left behind), or a strict ancestor is a *file* (blocking the
+	/// exists, an implied directory on a flat store, or an empty dir a delete left behind), or a strict
+	/// ancestor is a *file* (blocking the
 	/// intermediate directory, e.g. a stray `logs/refs/heads/foo` file under `logs/refs/heads/foo/bar`).
 	///
 	/// A transaction preflights this for a move's ref path and its reflog path, so a validated commit
@@ -693,11 +752,18 @@ where
 	}
 
 	/// Acquire every `<name>.lock` in `names`, sorted and deduped so concurrent transactions take
-	/// shared locks in the same order (deadlock-free). On the first contended lock, releases those
-	/// already taken and reports it.
+	/// shared locks in the same order (deadlock-free). Ordinary ref locks sort first and
+	/// `packed-refs.lock` sorts last, matching stock Git's update-ref protocol. On the first contended
+	/// lock, releases those already taken and reports it.
 	async fn lock_all(&self, names: &[String]) -> Result<HeldRefLocks, (String, RepositoryError)> {
 		let mut sorted: Vec<String> = names.to_vec();
-		sorted.sort();
+		sorted.sort_by(
+			|left, right| match (left == PACKED_REFS, right == PACKED_REFS) {
+				(false, true) => std::cmp::Ordering::Less,
+				(true, false) => std::cmp::Ordering::Greater,
+				_ => left.cmp(right),
+			},
+		);
 		sorted.dedup();
 		let mut acquired = HeldRefLocks {
 			names: Vec::with_capacity(sorted.len()),
@@ -720,6 +786,14 @@ where
 			acquired.locks.push(lock);
 		}
 		Ok(acquired)
+	}
+
+	async fn release_locks(&self, acquired: HeldRefLocks) {
+		let HeldRefLocks { names, locks } = acquired;
+		drop(locks);
+		for name in &names {
+			self.prune_empty_dirs(name).await;
+		}
 	}
 
 	/// Take `<name>.lock` (git's ref lock), retrying briefly on contention before giving up with
@@ -767,25 +841,132 @@ where
 	/// entry alike. Used to drop a remote's whole `refs/remotes/<name>/` tree, which
 	/// [`Self::delete_ref`] cannot: it resolves and value-checks a single, non-symbolic ref.
 	pub async fn remove_prefix(&self, prefix: &str) -> Result<(), RepositoryError> {
-		// Loose ref files (a symbolic `ref:` file has no oid, so `list` skips it — delete files
-		// directly, so `origin/HEAD` goes too), then their reflogs under `logs/`.
-		self.delete_files_under(prefix).await?;
-		self.delete_files_under(&format!("logs/{prefix}")).await?;
-		// Packed: drop every entry whose name is under the prefix.
-		self
-			.remove_packed_matching(|name| name.starts_with(prefix))
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let files = self.files.shared_handle();
+			let effective = self.effective.cloned();
+			let prefix = prefix.to_owned();
+			match tokio::spawn(async move {
+				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+				store.remove_prefix_inline(&prefix).await
+			})
 			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		self.remove_prefix_inline(prefix).await
+	}
+
+	async fn remove_prefix_inline(&self, prefix: &str) -> Result<(), RepositoryError> {
+		for _ in 0..LOCK_ATTEMPTS {
+			let snapshot = self.prefix_snapshot(prefix).await?;
+			let lock_names = remove_prefix_lock_names(&snapshot);
+			let acquired = self
+				.lock_all(&lock_names)
+				.await
+				.map_err(|(_, error)| error)?;
+			let snapshot = match self.prefix_snapshot(prefix).await {
+				Ok(snapshot) => snapshot,
+				Err(error) => {
+					self.release_locks(acquired).await;
+					return Err(error);
+				}
+			};
+			if !locks_cover(&acquired, &remove_prefix_lock_names(&snapshot)) {
+				self.release_locks(acquired).await;
+				continue;
+			}
+
+			// Delete lock-free while the corresponding ref locks and `packed-refs.lock` remain held. A
+			// symbolic loose ref has no oid, so it is intentionally removed as an ordinary file too.
+			let result = async {
+				for (path, _) in snapshot.ref_files.iter().chain(&snapshot.reflog_files) {
+					self.files.delete_path_unlocked(path).await?;
+				}
+				self
+					.remove_packed_matching_locked(|name| name.starts_with(prefix))
+					.await
+			}
+			.await;
+			self.release_locks(acquired).await;
+			return result;
+		}
+
+		Err(RepositoryError::RefMoved {
+			name: prefix.to_owned(),
+		})
 	}
 
 	/// Move every ref under `old` to `new` — loose (direct *or* symbolic, rewriting a symbolic target
 	/// that points back under `old`), its reflog, and any packed entry alike. Used to rename a
 	/// remote's whole `refs/remotes/<old>/` tree to `refs/remotes/<new>/`.
 	pub async fn rename_prefix(&self, old: &str, new: &str) -> Result<(), RepositoryError> {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let files = self.files.shared_handle();
+			let effective = self.effective.cloned();
+			let old = old.to_owned();
+			let new = new.to_owned();
+			match tokio::spawn(async move {
+				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+				store.rename_prefix_inline(&old, &new).await
+			})
+			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		self.rename_prefix_inline(old, new).await
+	}
+
+	async fn rename_prefix_inline(&self, old: &str, new: &str) -> Result<(), RepositoryError> {
+		for _ in 0..LOCK_ATTEMPTS {
+			let snapshot = self.prefix_snapshot(old).await?;
+			let lock_names = rename_prefix_lock_names(&snapshot, old, new);
+			let acquired = self
+				.lock_all(&lock_names)
+				.await
+				.map_err(|(_, error)| error)?;
+			let snapshot = match self.prefix_snapshot(old).await {
+				Ok(snapshot) => snapshot,
+				Err(error) => {
+					self.release_locks(acquired).await;
+					return Err(error);
+				}
+			};
+			if !locks_cover(&acquired, &rename_prefix_lock_names(&snapshot, old, new)) {
+				self.release_locks(acquired).await;
+				continue;
+			}
+
+			let result = self.rename_prefix_locked(old, new, &snapshot).await;
+			self.release_locks(acquired).await;
+			return result;
+		}
+
+		Err(RepositoryError::RefMoved {
+			name: old.to_owned(),
+		})
+	}
+
+	async fn rename_prefix_locked(
+		&self,
+		old: &str,
+		new: &str,
+		snapshot: &PrefixSnapshot,
+	) -> Result<(), RepositoryError> {
 		// Loose ref files, rewriting a symbolic `ref:` target that itself points under `old`. Keep the
 		// paths we write — they are the destination's *authoritative* loose refs, so the stale-shadow
 		// sweep below must not delete them.
 		let loose_targets = self
-			.move_files_under(old, new, |bytes| {
+			.move_locked_files(&snapshot.ref_files, old, new, |bytes| {
 				if let Ok(text) = std::str::from_utf8(bytes)
 					&& let Some(target) = text.trim().strip_prefix("ref:")
 					&& let Some(rest) = target.trim().strip_prefix(old)
@@ -797,14 +978,15 @@ where
 			.await?;
 		// Reflogs, moved verbatim (a message may carry non-UTF-8 bytes).
 		self
-			.move_files_under(
+			.move_locked_files(
+				&snapshot.reflog_files,
 				&format!("logs/{old}"),
 				&format!("logs/{new}"),
 				<[u8]>::to_vec,
 			)
 			.await?;
 		// Packed entries: rewrite each `<old>…` ref name to `<new>…`, returning the renamed destinations.
-		let renamed_dests = self.rename_packed_prefix(old, new).await?;
+		let renamed_dests = self.rename_packed_prefix_locked(old, new).await?;
 		// A stale *loose* ref already sitting at a renamed packed ref's destination would shadow it,
 		// leaving the tracking branch on the old commit. Git's rename overwrites the destination, so
 		// drop any such loose ref — except one we just wrote by moving the source remote's own refs.
@@ -812,10 +994,7 @@ where
 			if loose_targets.contains(dest) {
 				continue;
 			}
-			match self.files.delete_path(dest, None).await {
-				Ok(_) | Err(FileStoreError::NotFound) => {}
-				Err(other) => return Err(other.into()),
-			}
+			self.files.delete_path_unlocked(dest).await?;
 		}
 		Ok(())
 	}
@@ -830,40 +1009,37 @@ where
 	/// source ref whose destination it could not create. Skipping the delete of a source that is also
 	/// a target keeps an overlapping rename (`new` nested under `old`, e.g. `.../origin/` →
 	/// `.../origin/foo/`) from deleting a ref it just wrote.
-	async fn move_files_under(
+	async fn move_locked_files(
 		&self,
+		files: &[(String, Vec<u8>)],
 		old: &str,
 		new: &str,
 		rewrite: impl Fn(&[u8]) -> Vec<u8>,
 	) -> Result<Vec<String>, RepositoryError> {
-		let mut stack = vec![old.to_owned()];
-		let mut moves: Vec<(String, Vec<u8>)> = Vec::new();
-		let mut sources: Vec<String> = Vec::new();
-		while let Some(dir) = stack.pop() {
-			for path in self.files.list_prefix(&dir).await? {
-				match self.files.read_path(&path).await {
-					Ok(bytes) => {
-						let target = format!("{new}{}", &path[old.len()..]);
-						moves.push((target, rewrite(&bytes)));
-						sources.push(path);
-					}
-					Err(_) => stack.push(format!("{path}/")),
-				}
+		let moves: Vec<(String, Vec<u8>)> = files
+			.iter()
+			.map(|(path, bytes)| (format!("{new}{}", &path[old.len()..]), rewrite(bytes)))
+			.collect();
+		let targets: Vec<String> = moves.iter().map(|(target, _)| target.clone()).collect();
+		// Validate every destination before publishing any of them. In particular, a surviving child
+		// makes its parent a directory (`.../main/foo` blocks `.../main`); attempting the atomic replace
+		// in that state would otherwise create a temporary sibling before the final rename fails.
+		for target in &targets {
+			if self.path_write_blocked(target).await? {
+				return Err(RepositoryError::InvalidRef(format!(
+					"{target}: blocked by an existing directory or file"
+				)));
 			}
 		}
-		let targets: Vec<String> = moves.iter().map(|(target, _)| target.clone()).collect();
 		for (target, bytes) in &moves {
-			self.force_write(target, bytes).await?;
+			self.files.write_path_replace(target, bytes).await?;
 		}
 		let target_set: std::collections::HashSet<&str> = targets.iter().map(String::as_str).collect();
-		for path in &sources {
+		for (path, _) in files {
 			if target_set.contains(path.as_str()) {
 				continue;
 			}
-			match self.files.delete_path(path, None).await {
-				Ok(_) | Err(FileStoreError::NotFound) => {}
-				Err(other) => return Err(other.into()),
-			}
+			self.files.delete_path_unlocked(path).await?;
 		}
 		Ok(targets)
 	}
@@ -876,7 +1052,7 @@ where
 	/// A renamed entry landing on a name that already exists (a stale destination in `packed-refs`)
 	/// **overwrites** it, as git's rename does — so the rebuilt file never carries a duplicate name
 	/// (which `git fsck --strict` would also reject).
-	async fn rename_packed_prefix(
+	async fn rename_packed_prefix_locked(
 		&self,
 		old: &str,
 		new: &str,
@@ -943,38 +1119,83 @@ where
 		for (_, entry) in &chosen {
 			out.push_str(entry);
 		}
-		self.force_write("packed-refs", out.as_bytes()).await?;
+		self
+			.files
+			.write_path_replace(PACKED_REFS, out.as_bytes())
+			.await?;
 		Ok(renamed_dests)
 	}
 
-	/// Delete every file under `prefix`, descending into subdirectories the way [`Self::list`] walks:
-	/// a `read_path` that fails (a real subdirectory, or a synthetic directory entry a backend like
-	/// `MemoryFileStore` returns as `NotFound`) is treated as a subtree to descend into, not a file.
-	async fn delete_files_under(&self, prefix: &str) -> Result<(), RepositoryError> {
+	async fn prefix_snapshot(&self, prefix: &str) -> Result<PrefixSnapshot, RepositoryError> {
+		let ref_files = self.collect_files_under(prefix).await?;
+		let reflog_files = self.collect_files_under(&format!("logs/{prefix}")).await?;
+		let packed_refs = self
+			.read_packed_ref_names()
+			.await?
+			.into_iter()
+			.filter(|name| name.starts_with(prefix))
+			.collect();
+		Ok(PrefixSnapshot {
+			ref_files,
+			reflog_files,
+			packed_refs,
+		})
+	}
+
+	/// Buffer every ordinary file under `prefix`, descending through physical or flat-store logical
+	/// directories. Lock artifacts are protocol state, not refs or reflogs, and are never included.
+	async fn collect_files_under(
+		&self,
+		prefix: &str,
+	) -> Result<Vec<(String, Vec<u8>)>, RepositoryError> {
 		let mut stack = vec![prefix.to_owned()];
+		let mut files = Vec::new();
 		while let Some(dir) = stack.pop() {
 			for path in self.files.list_prefix(&dir).await? {
+				if path.ends_with(".lock") {
+					continue;
+				}
+				if self.files.is_dir(&path).await? {
+					stack.push(format!("{path}/"));
+					continue;
+				}
 				match self.files.read_path(&path).await {
-					Ok(_) => match self.files.delete_path(&path, None).await {
-						Ok(_) | Err(FileStoreError::NotFound) => {}
-						Err(other) => return Err(other.into()),
-					},
-					Err(_) => stack.push(format!("{path}/")),
+					Ok(bytes) => files.push((path, bytes)),
+					Err(FileStoreError::NotFound) => {}
+					Err(other) => return Err(other.into()),
 				}
 			}
 		}
-		Ok(())
+		Ok(files)
 	}
 
-	/// Rewrite `packed-refs` without `name` (and its `^<peeled>` continuation line).
-	/// A no-op if there is no packed-refs file or the ref is not packed.
-	async fn remove_from_packed(&self, name: &str) -> Result<(), RepositoryError> {
-		self.remove_packed_matching(|refname| refname == name).await
+	async fn read_packed_ref_names(&self) -> Result<Vec<String>, RepositoryError> {
+		let Some(bytes) = self.read_opt(PACKED_REFS).await? else {
+			return Ok(Vec::new());
+		};
+		let text = std::str::from_utf8(&bytes)
+			.map_err(|_| RepositoryError::InvalidRef("packed-refs not UTF-8".to_owned()))?;
+		Ok(
+			text
+				.lines()
+				.filter(|line| !line.starts_with('#') && !line.starts_with('^') && !line.is_empty())
+				.filter_map(|line| line.split_once(' ').map(|(_, name)| name.to_owned()))
+				.collect(),
+		)
 	}
 
-	/// Rewrite `packed-refs` without the entries `drop` selects (and their `^<peeled>` continuations).
-	/// A no-op if there is no packed-refs file or nothing matches.
-	async fn remove_packed_matching(
+	/// Rewrite `packed-refs` without `name` (and its `^<peeled>` continuation line) while the caller
+	/// holds `packed-refs.lock`. A no-op if there is no packed-refs file or the ref is not packed.
+	async fn remove_from_packed_locked(&self, name: &str) -> Result<(), RepositoryError> {
+		self
+			.remove_packed_matching_locked(|refname| refname == name)
+			.await
+	}
+
+	/// Rewrite `packed-refs` without the entries `drop` selects (and their `^<peeled>` continuations)
+	/// while the caller holds `packed-refs.lock`. A no-op if there is no packed-refs file or nothing
+	/// matches.
+	async fn remove_packed_matching_locked(
 		&self,
 		drop: impl Fn(&str) -> bool,
 	) -> Result<(), RepositoryError> {
@@ -1006,7 +1227,10 @@ where
 			out.push('\n');
 		}
 		if changed {
-			self.force_write("packed-refs", out.as_bytes()).await?;
+			self
+				.files
+				.write_path_replace(PACKED_REFS, out.as_bytes())
+				.await?;
 		}
 		Ok(())
 	}
@@ -1107,12 +1331,15 @@ where
 			reflog,
 		};
 		let ops = std::slice::from_ref(&op);
-		let lock = self.lock_ref(branch).await?;
-		// The cascade decision uses `HEAD` — stable, since the checkout holds `HEAD.lock`.
-		let head_target = self.read_symbolic("HEAD").await?;
-		let cascades =
-			vec![branch.starts_with("refs/heads/") && head_target.as_deref() == Some(branch)];
+		let acquired = self
+			.lock_all(&[PACKED_REFS.to_owned(), branch.to_owned()])
+			.await
+			.map_err(|(_, error)| error)?;
 		let result = async {
+			// The cascade decision uses `HEAD` — stable, since the checkout holds `HEAD.lock`.
+			let head_target = self.read_symbolic("HEAD").await?;
+			let cascades =
+				vec![branch.starts_with("refs/heads/") && head_target.as_deref() == Some(branch)];
 			let cascades = self
 				.confirm_cascades(ops, cascades)
 				.await
@@ -1127,8 +1354,11 @@ where
 				.map_err(|(_, error)| error)
 		}
 		.await;
-		drop(lock);
-		self.prune_empty_dirs(branch).await;
+		let HeldRefLocks { names, locks } = acquired;
+		drop(locks);
+		for name in &names {
+			self.prune_empty_dirs(name).await;
+		}
 		result
 	}
 
@@ -1184,15 +1414,28 @@ where
 		reflog: ReflogIntent<'_>,
 	) -> Result<(), RepositoryError> {
 		// Hold `<name>.lock` across the reflog write and the retarget — like a ref transaction, so a
-		// reflog failure leaves the symbolic ref unchanged and no concurrent writer interleaves.
-		let lock = self.lock_ref(name).await?;
+		// reflog failure leaves the symbolic ref unchanged and no concurrent writer interleaves. A
+		// symbolic ref under `refs/` also takes `packed-refs.lock`, keeping its namespace validation
+		// stable and excluding packed-ref rewrites until publication completes.
+		let mut lock_names = vec![name.to_owned()];
+		if name.starts_with("refs/") {
+			lock_names.push(PACKED_REFS.to_owned());
+		}
+		let acquired = self
+			.lock_all(&lock_names)
+			.await
+			.map_err(|(_, error)| error)?;
 		let result = self.set_symbolic_locked(name, target, reflog).await;
-		drop(lock);
-		self.prune_empty_dirs(name).await;
+		let HeldRefLocks { names, locks } = acquired;
+		drop(locks);
+		for name in &names {
+			self.prune_empty_dirs(name).await;
+		}
 		result
 	}
 
-	/// The body of [`set_symbolic`](Self::set_symbolic), run with `<name>.lock` held.
+	/// The body of [`set_symbolic`](Self::set_symbolic), run with `<name>.lock` and, for a name under
+	/// `refs/`, `packed-refs.lock` held.
 	async fn set_symbolic_locked(
 		&self,
 		name: &str,
@@ -1202,7 +1445,15 @@ where
 		// Preflight the destination's writability before appending any reflog (as `transact` does): a
 		// directory/file conflict at `name` (or, when logged, at `logs/<name>`) must reject the retarget
 		// rather than record a reflog for a move that then fails on the ref write.
-		if self.path_write_blocked(name).await? {
+		let packed_refs = if name.starts_with("refs/") {
+			self.read_opt("packed-refs").await?
+		} else {
+			None
+		};
+		if self
+			.ref_path_write_blocked(name, packed_refs.as_deref())
+			.await?
+		{
 			return Err(RepositoryError::InvalidRef(format!(
 				"{name}: blocked by an existing directory or file"
 			)));
@@ -1477,6 +1728,74 @@ fn split_packed_ref(line: &[u8]) -> Option<(&[u8], &[u8])> {
 	Some((&line[..separator], &line[separator + 1..]))
 }
 
+fn packed_ref_path_conflict(packed_refs: &[u8], target: &str) -> bool {
+	let target = target.as_bytes();
+	packed_refs.split(|byte| *byte == b'\n').any(|line| {
+		let line = line.strip_suffix(b"\r").unwrap_or(line);
+		if line.starts_with(b"#") || line.starts_with(b"^") || line.is_empty() {
+			return false;
+		}
+		let Some((_, name)) = split_packed_ref(line) else {
+			return false;
+		};
+		strict_ref_prefix(name, target) || strict_ref_prefix(target, name)
+	})
+}
+
+fn strict_ref_prefix(prefix: &[u8], value: &[u8]) -> bool {
+	value
+		.strip_prefix(prefix)
+		.is_some_and(|suffix| suffix.starts_with(b"/"))
+}
+
+fn remove_prefix_lock_names(snapshot: &PrefixSnapshot) -> Vec<String> {
+	let mut names: Vec<String> = snapshot
+		.ref_files
+		.iter()
+		.map(|(path, _)| path.clone())
+		.chain(
+			snapshot
+				.reflog_files
+				.iter()
+				.filter_map(|(path, _)| path.strip_prefix("logs/").map(str::to_owned)),
+		)
+		.chain(snapshot.packed_refs.iter().cloned())
+		.collect();
+	names.push(PACKED_REFS.to_owned());
+	names
+}
+
+fn rename_prefix_lock_names(snapshot: &PrefixSnapshot, old: &str, new: &str) -> Vec<String> {
+	let mut names = Vec::new();
+	for (source, _) in &snapshot.ref_files {
+		names.push(source.clone());
+		names.push(format!("{new}{}", &source[old.len()..]));
+	}
+	let old_logs = format!("logs/{old}");
+	let new_logs = format!("logs/{new}");
+	for (source, _) in &snapshot.reflog_files {
+		if let Some(source_ref) = source.strip_prefix("logs/") {
+			names.push(source_ref.to_owned());
+		}
+		let target = format!("{new_logs}{}", &source[old_logs.len()..]);
+		if let Some(target_ref) = target.strip_prefix("logs/") {
+			names.push(target_ref.to_owned());
+		}
+	}
+	for source in &snapshot.packed_refs {
+		names.push(source.clone());
+		names.push(format!("{new}{}", &source[old.len()..]));
+	}
+	names.push(PACKED_REFS.to_owned());
+	names
+}
+
+fn locks_cover(acquired: &HeldRefLocks, required: &[String]) -> bool {
+	let acquired: std::collections::HashSet<&str> =
+		acquired.names.iter().map(String::as_str).collect();
+	required.iter().all(|name| acquired.contains(name.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
 	#[cfg(not(target_arch = "wasm32"))]
@@ -1491,7 +1810,46 @@ mod tests {
 	#[cfg(not(target_arch = "wasm32"))]
 	use crate::GatedFileStore;
 
-	use super::{RefStore, ReflogIntent};
+	use super::{PACKED_REFS, RefStore, ReflogIntent};
+
+	#[cfg(not(target_arch = "wasm32"))]
+	async fn let_retained_mutation_reach_a_held_lock() {
+		tokio::task::spawn_blocking(|| {
+			std::thread::sleep(std::time::Duration::from_millis(50));
+		})
+		.await
+		.expect("wait task completes");
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn packed_snapshot_failures_are_attributed_to_a_requested_ref() {
+		let files = GatedFileStore::new();
+		files.fail_packed_reads();
+		let store: RefStore<'_, GatedFileStore, Sha256> = RefStore::new(&files);
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"target");
+		let ops = [
+			crate::RefOp {
+				name: "refs/heads/main".to_owned(),
+				expected: None,
+				new: Some(target),
+				reflog: ReflogIntent::Skip,
+			},
+			crate::RefOp {
+				name: "refs/heads/feature".to_owned(),
+				expected: None,
+				new: Some(target),
+				reflog: ReflogIntent::Skip,
+			},
+		];
+
+		let (name, error) = store
+			.transact(&ops)
+			.await
+			.expect_err("the packed snapshot read must fail");
+		assert_eq!(name, "refs/heads/main");
+		assert!(matches!(error, crate::RepositoryError::FileStore(_)));
+	}
 
 	#[tokio::test]
 	async fn resolves_a_packed_ref_without_decoding_unrelated_names() {
@@ -1533,6 +1891,268 @@ mod tests {
 			store.list("refs/tags/").await,
 			Err(crate::RepositoryError::InvalidRef(_))
 		));
+	}
+
+	#[tokio::test]
+	async fn flat_store_ref_transactions_reject_loose_descendant_conflicts_atomically() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let child = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"child");
+		let proposed = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"proposed");
+		store
+			.update_ref("refs/tags/topic/child", child, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		let ops = [
+			crate::RefOp {
+				name: "refs/tags/clean".to_owned(),
+				expected: None,
+				new: Some(proposed),
+				reflog: ReflogIntent::Skip,
+			},
+			crate::RefOp {
+				name: "refs/tags/topic".to_owned(),
+				expected: None,
+				new: Some(proposed),
+				reflog: ReflogIntent::Skip,
+			},
+		];
+		let (name, error) = store
+			.transact(&ops)
+			.await
+			.expect_err("a loose descendant must block its parent on a flat store");
+		assert_eq!(name, "refs/tags/topic");
+		assert!(matches!(error, crate::RepositoryError::InvalidRef(_)));
+		assert_eq!(store.resolve("refs/tags/clean").await.unwrap(), None);
+		assert_eq!(store.resolve("refs/tags/topic").await.unwrap(), None);
+		assert_eq!(
+			store.resolve("refs/tags/topic/child").await.unwrap(),
+			Some(child)
+		);
+	}
+
+	#[tokio::test]
+	async fn packed_ref_ancestors_and_descendants_block_loose_writes() {
+		let existing = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"existing");
+		let proposed = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"proposed");
+		let cases = [
+			(b"refs/tags/topic/child".as_slice(), "refs/tags/topic"),
+			(b"refs/tags/topic".as_slice(), "refs/tags/topic/child"),
+			(b"refs/tags/topic/\xff".as_slice(), "refs/tags/topic"),
+		];
+
+		for (packed_name, requested) in cases {
+			let files = MemoryFileStore::new();
+			let mut packed = format!("{} ", existing.to_hex()).into_bytes();
+			packed.extend_from_slice(packed_name);
+			packed.push(b'\n');
+			files
+				.write_path_if_absent("packed-refs", &packed)
+				.await
+				.unwrap();
+			let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+
+			let error = store
+				.update_ref(requested, proposed, None, ReflogIntent::Skip)
+				.await
+				.expect_err("a packed directory/file conflict must reject the write");
+			assert!(matches!(error, crate::RepositoryError::InvalidRef(_)));
+			assert!(matches!(
+				files.read_path(requested).await,
+				Err(FileStoreError::NotFound)
+			));
+		}
+	}
+
+	#[tokio::test]
+	async fn an_exact_packed_ref_can_still_be_shadowed_by_a_loose_update() {
+		let files = MemoryFileStore::new();
+		let old = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"old");
+		let new = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"new");
+		files
+			.write_path_if_absent(
+				"packed-refs",
+				format!("{} refs/tags/topic\n", old.to_hex()).as_bytes(),
+			)
+			.await
+			.unwrap();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+
+		store
+			.update_ref("refs/tags/topic", new, Some(old), ReflogIntent::Skip)
+			.await
+			.expect("an exact packed ref is a valid update target");
+		assert_eq!(store.resolve("refs/tags/topic").await.unwrap(), Some(new));
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn ref_transactions_validate_after_a_concurrent_packed_ref_rewrite() {
+		let files = MemoryFileStore::new();
+		let existing = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"existing");
+		let proposed = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"proposed");
+		let packed_lock = files
+			.try_lock_path("packed-refs.lock")
+			.await
+			.unwrap()
+			.expect("simulate pack-refs owning its lock");
+
+		let worker_files = files.shared_handle();
+		let update = tokio::spawn(async move {
+			let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&worker_files);
+			store
+				.update_ref("refs/tags/topic", proposed, None, ReflogIntent::Skip)
+				.await
+		});
+		let_retained_mutation_reach_a_held_lock().await;
+		assert!(
+			!update.is_finished(),
+			"the ref transaction must wait for packed-refs.lock"
+		);
+
+		// The packer publishes a child while it owns the lock. Once the transaction acquires the lock,
+		// it must read this new table and reject the now-conflicting parent rather than use a stale view.
+		files
+			.write_path_replace(
+				PACKED_REFS,
+				format!("{} refs/tags/topic/child\n", existing.to_hex()).as_bytes(),
+			)
+			.await
+			.unwrap();
+		drop(packed_lock);
+
+		let error = update
+			.await
+			.expect("update task completes")
+			.expect_err("the newly packed child blocks its parent");
+		assert!(matches!(error, crate::RepositoryError::InvalidRef(_)));
+		assert!(matches!(
+			files.read_path("refs/tags/topic").await,
+			Err(FileStoreError::NotFound)
+		));
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn symbolic_refs_validate_after_a_concurrent_packed_ref_rewrite() {
+		let files = MemoryFileStore::new();
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"target");
+		files
+			.write_path_if_absent("refs/heads/main", format!("{target}\n").as_bytes())
+			.await
+			.unwrap();
+		let packed_lock = files
+			.try_lock_path("packed-refs.lock")
+			.await
+			.unwrap()
+			.expect("simulate pack-refs owning its lock");
+
+		let worker_files = files.shared_handle();
+		let update = tokio::spawn(async move {
+			let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&worker_files);
+			store
+				.set_symbolic("refs/tags/topic", "refs/heads/main", ReflogIntent::Skip)
+				.await
+		});
+		let_retained_mutation_reach_a_held_lock().await;
+		assert!(
+			!update.is_finished(),
+			"the symbolic update must wait for packed-refs.lock"
+		);
+
+		files
+			.write_path_replace(
+				PACKED_REFS,
+				format!("{target} refs/tags/topic/child\n").as_bytes(),
+			)
+			.await
+			.unwrap();
+		drop(packed_lock);
+
+		let error = update
+			.await
+			.expect("symbolic update task completes")
+			.expect_err("the newly packed child blocks its parent");
+		assert!(matches!(error, crate::RepositoryError::InvalidRef(_)));
+		assert!(matches!(
+			files.read_path("refs/tags/topic").await,
+			Err(FileStoreError::NotFound)
+		));
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn packed_ref_prefix_rewriters_wait_for_the_shared_lock() {
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+
+		let remove_files = MemoryFileStore::new();
+		let remove_lock = remove_files
+			.try_lock_path("packed-refs.lock")
+			.await
+			.unwrap()
+			.expect("simulate a concurrent packed-ref writer");
+		let worker_files = remove_files.shared_handle();
+		let remove = tokio::spawn(async move {
+			let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&worker_files);
+			store.remove_prefix("refs/remotes/origin/").await
+		});
+		let_retained_mutation_reach_a_held_lock().await;
+		assert!(
+			!remove.is_finished(),
+			"prefix removal must wait for packed-refs.lock"
+		);
+		remove_files
+			.write_path_replace(
+				PACKED_REFS,
+				format!("{tip} refs/remotes/origin/main\n").as_bytes(),
+			)
+			.await
+			.unwrap();
+		drop(remove_lock);
+		remove
+			.await
+			.expect("remove task completes")
+			.expect("remove the newly packed source");
+		assert!(
+			!String::from_utf8(remove_files.read_path(PACKED_REFS).await.unwrap())
+				.unwrap()
+				.contains("refs/remotes/origin/main")
+		);
+
+		let rename_files = MemoryFileStore::new();
+		let rename_lock = rename_files
+			.try_lock_path("packed-refs.lock")
+			.await
+			.unwrap()
+			.expect("simulate a concurrent packed-ref writer");
+		let worker_files = rename_files.shared_handle();
+		let rename = tokio::spawn(async move {
+			let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&worker_files);
+			store
+				.rename_prefix("refs/remotes/origin/", "refs/remotes/upstream/")
+				.await
+		});
+		let_retained_mutation_reach_a_held_lock().await;
+		assert!(
+			!rename.is_finished(),
+			"prefix rename must wait for packed-refs.lock"
+		);
+		rename_files
+			.write_path_replace(
+				PACKED_REFS,
+				format!("{tip} refs/remotes/origin/main\n").as_bytes(),
+			)
+			.await
+			.unwrap();
+		drop(rename_lock);
+		rename
+			.await
+			.expect("rename task completes")
+			.expect("rename the newly packed source");
+		let packed = String::from_utf8(rename_files.read_path(PACKED_REFS).await.unwrap()).unwrap();
+		assert!(packed.contains("refs/remotes/upstream/main"));
+		assert!(!packed.contains("refs/remotes/origin/main"));
 	}
 
 	#[tokio::test]
@@ -2025,6 +2645,114 @@ mod tests {
 			!files.exists("refs/heads/x.lock").await.unwrap(),
 			"the transaction released its own lock"
 		);
+	}
+
+	#[tokio::test]
+	async fn packed_ref_lock_contention_is_attributed_to_an_operation() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let first = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"first");
+		let second = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"second");
+		let _packed_lock = files
+			.try_lock_path("packed-refs.lock")
+			.await
+			.unwrap()
+			.expect("hold the shared packed-ref lock");
+		let ops = [
+			crate::RefOp {
+				name: "refs/heads/one".to_owned(),
+				expected: None,
+				new: Some(first),
+				reflog: ReflogIntent::Skip,
+			},
+			crate::RefOp {
+				name: "refs/heads/two".to_owned(),
+				expected: None,
+				new: Some(second),
+				reflog: ReflogIntent::Skip,
+			},
+		];
+
+		let (name, error) = store
+			.transact(&ops)
+			.await
+			.expect_err("the shared lock remains contended");
+		assert_eq!(
+			name, "refs/heads/one",
+			"transaction callers receive an actual operation name"
+		);
+		assert!(
+			matches!(&error, crate::RepositoryError::RefLocked { name } if name == PACKED_REFS),
+			"the underlying diagnostic still identifies packed-refs.lock: {error:?}"
+		);
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn ref_transactions_acquire_ref_locks_before_packed_refs() {
+		let files = MemoryFileStore::new();
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+		let ref_lock = files
+			.try_lock_path("refs/tags/topic.lock")
+			.await
+			.unwrap()
+			.expect("simulate stock Git owning the ref lock");
+		let worker_files = files.shared_handle();
+		let update = tokio::spawn(async move {
+			let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&worker_files);
+			store
+				.update_ref("refs/tags/topic", tip, None, ReflogIntent::Skip)
+				.await
+		});
+		let_retained_mutation_reach_a_held_lock().await;
+		assert!(!update.is_finished());
+		assert!(
+			!files.exists("packed-refs.lock").await.unwrap(),
+			"a transaction waiting for a ref lock must not hold packed-refs.lock"
+		);
+
+		drop(ref_lock);
+		update
+			.await
+			.expect("update task completes")
+			.expect("update proceeds after the ref lock is released");
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn prefix_rewriters_acquire_ref_locks_before_packed_refs() {
+		let files = MemoryFileStore::new();
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+		files
+			.write_path_if_absent("refs/remotes/origin/main", format!("{tip}\n").as_bytes())
+			.await
+			.unwrap();
+		let ref_lock = files
+			.try_lock_path("refs/remotes/origin/main.lock")
+			.await
+			.unwrap()
+			.expect("simulate stock Git owning the ref lock");
+		let worker_files = files.shared_handle();
+		let remove = tokio::spawn(async move {
+			let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&worker_files);
+			store.remove_prefix("refs/remotes/origin/").await
+		});
+		let_retained_mutation_reach_a_held_lock().await;
+		assert!(!remove.is_finished());
+		assert!(
+			!files.exists("packed-refs.lock").await.unwrap(),
+			"a prefix rewrite waiting for a ref lock must not hold packed-refs.lock"
+		);
+
+		drop(ref_lock);
+		remove
+			.await
+			.expect("remove task completes")
+			.expect("remove proceeds after the ref lock is released");
+		assert!(matches!(
+			files.read_path("refs/remotes/origin/main").await,
+			Err(FileStoreError::NotFound)
+		));
 	}
 
 	#[cfg(not(target_arch = "wasm32"))]

@@ -170,8 +170,9 @@ pub trait FileStore: Send + Sync {
 	///
 	/// Lets a caller preflight a directory/file conflict before writing a value at `path` — e.g. a ref
 	/// transaction checking that `refs/heads/foo` (or its reflog `logs/refs/heads/foo`) is not a
-	/// directory left by a nested ref. A backend without a directory concept (an in-memory map) always
-	/// returns `false`.
+	/// directory left by a nested ref. A flat backend without physical directories reports a logical
+	/// directory when at least one stored value is a strict descendant of `path`; this preserves the
+	/// same directory/file namespace as a filesystem-backed store.
 	fn is_dir(&self, path: &str) -> impl Future<Output = Result<bool>> + Send;
 
 	/// The byte length of the value at `path`. [`FileStoreError::NotFound`] if it is absent.
