@@ -176,8 +176,10 @@ pub fn decode_ewah(bytes: &[u8]) -> Result<(EwahBitmap, usize), ObjectError> {
 		return Err(ObjectError::MalformedEwah);
 	}
 	let compressed: Vec<u64> = bytes[8..words_end]
-		.chunks_exact(8)
-		.map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+		.as_chunks::<8>()
+		.0
+		.iter()
+		.map(|word| u64::from_be_bytes(*word))
 		.collect();
 
 	// git records the logical bit count (highest set bit + 1); the uncompressed words must be
