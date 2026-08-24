@@ -1007,13 +1007,26 @@ fn list_prefix_in(
 ) -> Result<Vec<String>> {
 	let mut out = Vec::new();
 	for name in fs.list_names(dir_rel).map_err(backend_err)? {
-		// Skip the backend's own ref-lock and temp files.
-		if name.ends_with(".lock") || name.starts_with(".tmp.") {
+		if !name.starts_with(frag) {
 			continue;
 		}
-		if name.starts_with(frag) {
-			out.push(format!("{dir_part}{name}"));
+		// Skip only the backend's own regular ref-lock and temp files. A directory,
+		// symlink, or special entry with the same spelling is persistent namespace
+		// state that callers must be able to inspect and reject.
+		if name.ends_with(".lock") || name.starts_with(".tmp.") {
+			let path = if dir_rel.is_empty() {
+				name.clone()
+			} else {
+				format!("{dir_rel}/{name}")
+			};
+			match fs.kind(&path) {
+				Ok(FileKind::File) => continue,
+				Ok(_) => {}
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+				Err(error) => return Err(backend_err(error)),
+			}
 		}
+		out.push(format!("{dir_part}{name}"));
 	}
 	Ok(out)
 }
