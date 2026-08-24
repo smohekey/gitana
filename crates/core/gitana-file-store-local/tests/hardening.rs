@@ -149,6 +149,39 @@ async fn failed_atomic_replace_removes_its_temporary_file() {
 	let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn listing_hides_transient_files_but_exposes_transient_looking_directories() {
+	let dir = temp_dir("transient-looking-directories");
+	let refs = dir.join("refs/heads");
+	std::fs::create_dir_all(refs.join("feature.lock")).unwrap();
+	std::fs::create_dir_all(refs.join(".tmp.7")).unwrap();
+	std::fs::write(refs.join("feature.lock/child"), b"persistent").unwrap();
+	std::fs::write(refs.join(".tmp.7/child"), b"persistent").unwrap();
+	std::fs::write(refs.join("held.lock"), b"transient").unwrap();
+	std::fs::write(refs.join(".tmp.8"), b"transient").unwrap();
+	let store = open_store(&dir);
+
+	let mut entries = store.list_prefix("refs/heads/").await.unwrap();
+	entries.sort();
+	assert_eq!(
+		entries,
+		vec![
+			"refs/heads/.tmp.7".to_owned(),
+			"refs/heads/feature.lock".to_owned(),
+		]
+	);
+	assert_eq!(
+		store.list_prefix("refs/heads/feature.lock/").await.unwrap(),
+		vec!["refs/heads/feature.lock/child".to_owned()]
+	);
+	assert_eq!(
+		store.list_prefix("refs/heads/.tmp.7/").await.unwrap(),
+		vec!["refs/heads/.tmp.7/child".to_owned()]
+	);
+
+	let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_cas_has_no_lost_updates() {
 	let dir = temp_dir("cas");

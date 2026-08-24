@@ -183,6 +183,9 @@ pub trait FileStore: Send + Sync {
 	/// `prefix` is treated as a directory boundary at its last `/`: the directory
 	/// it names is listed and entries are filtered by the trailing name fragment.
 	/// Not recursive — sufficient for flat collections like `objects/pack/`.
+	/// A backend may omit its own regular lock and temporary files, but must not
+	/// hide directories or other unexpected entries solely because their names
+	/// resemble transient files.
 	fn list_prefix(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> + Send;
 
 	/// Read `length` bytes starting at `offset` within the value at `path`.
