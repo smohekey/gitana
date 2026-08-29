@@ -11,7 +11,7 @@ use crate::fsmeta::{effective_mode, join_rel, mode_of, push_gitignore, stat_of};
 use crate::ignore::{self, DirIgnore};
 use crate::index_lock::IndexLock;
 use crate::sparse::{SparseCheckout, SparseReapply, SparseSet};
-use crate::{Index, IndexEntry, Status, WorktreeError};
+use crate::{Index, IndexEntry, IndexTransaction, Status, WorktreeError};
 
 /// A working directory paired with its repository.
 ///
@@ -115,7 +115,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// The repository's file store — the capability the index (and `index.lock`) live under, the
 	/// same one the object database and refs use. `index`/`index.lock` are per-worktree paths, so a
 	/// linked worktree's store routes them to its own git directory.
-	fn files(&self) -> &F {
+	pub(crate) fn files(&self) -> &F {
 		self.repo.objects().file_store()
 	}
 
@@ -586,6 +586,16 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		self.commit_index(lock, index).await
 	}
 
+	/// Acquire `index.lock` before loading the index and retain it until the
+	/// returned transaction is finished or rolled back.
+	pub async fn begin_index_transaction(
+		&self,
+	) -> Result<IndexTransaction<'_, F, W, H>, WorktreeError> {
+		let lock = self.lock_index().await?;
+		let index = self.load_index().await?;
+		Ok(IndexTransaction::new(self, lock, index))
+	}
+
 	/// Acquire the index lock (`index.lock`), returning a guard proving it is held. Fails with
 	/// [`WorktreeError::IndexLocked`] if another writer already holds it. Pair with
 	/// [`Self::commit_index`] to write the index and release, or [`Self::release_index_lock`] to
@@ -703,7 +713,36 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		force: bool,
 		excludes_file: Option<&[u8]>,
 	) -> Result<(), WorktreeError> {
-		let mut index = self.load_index().await?;
+		let mut transaction = self.begin_index_transaction().await?;
+		let result = transaction
+			.stage_pathspecs(pathspecs, prefix, force, excludes_file)
+			.await;
+		match result {
+			Ok(()) => {
+				transaction.publish().await?;
+				transaction.finish();
+				Ok(())
+			}
+			Err(error @ WorktreeError::PathspecAdvisory { .. }) => {
+				transaction.publish().await?;
+				transaction.finish();
+				Err(error)
+			}
+			Err(error) => {
+				transaction.rollback().await?;
+				Err(error)
+			}
+		}
+	}
+
+	pub(crate) async fn stage_pathspecs_into(
+		&self,
+		index: &mut Index<H>,
+		pathspecs: &[GitPathspec],
+		prefix: &GitPath,
+		force: bool,
+		excludes_file: Option<&[u8]>,
+	) -> Result<(), WorktreeError> {
 		// `add` with no pathspec at all is git's "Nothing specified, nothing added" no-op: it reads no
 		// exclude files (so a directory `.git/info/exclude` is not fatal here) but *does* validate
 		// `core.ignoreCase` (probed vs git 2.55). Callers reaching this crate directly — the wasm
@@ -711,7 +750,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		// paths, so handle it before loading any exclude file.
 		if pathspecs.is_empty() {
 			crate::excludes::ignore_case(self).await?;
-			return self.save_index(&index).await;
+			return Ok(());
 		}
 		// git's standard excludes for the ignored-path decisions below: the `core.ignoreCase` fold flag
 		// plus the whole-tree exclude levels (`core.excludesFile`, `.git/info/exclude`) beneath
@@ -741,7 +780,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		// submodule boundary purely from the index (the on-disk `.git` marker is irrelevant, probed vs git
 		// 2.55). Only a subtree conflict (tracked `sub/…` children) stays walkable — its dir is real subtree
 		// content `add` descends into.
-		let gitlinks = opaque_gitlink_mounts(&index, fold);
+		let gitlinks = opaque_gitlink_mounts(index, fold);
 		// The active sparse matcher: `add` never stages a path outside it (git refuses an out-of-cone path,
 		// advising `--sparse`), whether or not the path already has a skip-worktree entry.
 		let sparse = self.sparse_checkout().await?;
@@ -765,7 +804,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		let ignored = if force {
 			Vec::new()
 		} else {
-			self.collect_ignored_advisory(&set, &index, &excludes, fold)?
+			self.collect_ignored_advisory(&set, index, &excludes, fold)?
 		};
 		let mut ignore_stack: Vec<DirIgnore> = excludes.clone();
 		if set.is_positive_empty() {
@@ -785,13 +824,13 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			for file in &files {
 				if !set.is_excluded(file) {
 					self
-						.stage_walked(&mut index, file, sparse.as_ref(), &mut sparse_omitted, fold)
+						.stage_walked(index, file, sparse.as_ref(), &mut sparse_omitted, fold)
 						.await?;
 				}
 			}
 			self
 				.stage_tracked_outside_walk(
-					&mut index,
+					index,
 					&GitPath::root(),
 					sparse.as_ref(),
 					&set,
@@ -799,7 +838,6 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					fold,
 				)
 				.await?;
-			self.save_index(&index).await?;
 			return finish_advisory(sparse_omitted, ignored);
 		}
 		// git decides whether each positive matched a tracked path against the index *as it was before any
@@ -853,7 +891,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				}
 				if !rooted.is_empty()
 					&& let Ok(rooted) = GitPath::from_bytes(probe)
-					&& let Some(submodule) = gitlink_ancestor(&index, &rooted, fold)
+					&& let Some(submodule) = gitlink_ancestor(index, &rooted, fold)
 				{
 					return Err(WorktreeError::PathspecInSubmodule {
 						path: spec.clone(),
@@ -862,7 +900,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				}
 				self
 					.add_glob(
-						&mut index,
+						index,
 						pathspec,
 						spec,
 						sparse.as_ref(),
@@ -895,13 +933,13 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				for file in &files {
 					if !set.is_excluded(file) {
 						self
-							.stage_walked(&mut index, file, sparse.as_ref(), &mut sparse_omitted, fold)
+							.stage_walked(index, file, sparse.as_ref(), &mut sparse_omitted, fold)
 							.await?;
 					}
 				}
 				self
 					.stage_tracked_outside_walk(
-						&mut index,
+						index,
 						&GitPath::root(),
 						sparse.as_ref(),
 						&set,
@@ -915,7 +953,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			// cannot stage a submodule's own contents. (A broad walk prunes the mount silently; only a literal
 			// path naming INTO it errors — probed vs git 2.55: `add sub/f` → "Pathspec 'sub/f' is in submodule
 			// 'sub'".)
-			if let Some(submodule) = gitlink_ancestor(&index, &rel, fold) {
+			if let Some(submodule) = gitlink_ancestor(index, &rel, fold) {
 				return Err(WorktreeError::PathspecInSubmodule {
 					path: spec.clone(),
 					submodule: submodule.clone(),
@@ -948,17 +986,17 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					// An explicitly-named directory whose matches are ALL out-of-cone is one git reports (the
 					// deferred sparse advice), unlike a broad `.` walk that silently skips such paths, or a
 					// directory with any in-cone content (which stages that and skips the out-of-cone siblings).
-					if self.only_out_of_cone_dir(&index, &rel, &files, sparse.as_ref()) {
+					if self.only_out_of_cone_dir(index, &rel, &files, sparse.as_ref()) {
 						sparse_omitted.push(pathspec_for_advisory(&rel));
 					}
 					let walked: std::collections::HashSet<GitPath> = files.iter().cloned().collect();
 					for file in &files {
 						self
-							.stage_walked(&mut index, file, sparse.as_ref(), &mut sparse_omitted, fold)
+							.stage_walked(index, file, sparse.as_ref(), &mut sparse_omitted, fold)
 							.await?;
 					}
 					self
-						.stage_tracked_outside_walk(&mut index, &rel, sparse.as_ref(), &set, &walked, fold)
+						.stage_tracked_outside_walk(index, &rel, sparse.as_ref(), &set, &walked, fold)
 						.await?;
 				}
 				// A trailing-slash spec required a directory but resolved to a file.
@@ -1005,9 +1043,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 							continue;
 						}
 					}
-					self
-						.stage_file(&mut index, &rel, sparse.as_ref(), fold)
-						.await?
+					self.stage_file(index, &rel, sparse.as_ref(), fold).await?
 				}
 				// Absent from the working tree: stage the deletion of whatever tracked entries the
 				// pathspec covers — the exact path (a removed file) and any children (a removed
@@ -1028,7 +1064,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					// A directory pathspec covering only out-of-cone (skip-worktree) tracked entries is
 					// reported the same way (`add b` when the whole `b/` subtree is excluded and absent) —
 					// git reports it rather than silently staging nothing.
-					if self.only_out_of_cone_dir(&index, &rel, &[], sparse.as_ref()) {
+					if self.only_out_of_cone_dir(index, &rel, &[], sparse.as_ref()) {
 						sparse_omitted.push(pathspec_for_advisory(&rel));
 						continue;
 					}
@@ -1060,7 +1096,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					// deletion candidate.
 					self
 						.stage_tracked_outside_walk(
-							&mut index,
+							index,
 							&rel,
 							sparse.as_ref(),
 							&set,
@@ -1071,7 +1107,6 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				}
 			}
 		}
-		self.save_index(&index).await?;
 		// git stages everything it can, saves, and only THEN exits non-zero with its advice — emitting the
 		// sparse block (for out-of-cone pathspecs) and/or the ignored block (for ignored pathspecs), both
 		// when both occurred. Surface the two lists together for the front-end to render.
@@ -2212,6 +2247,26 @@ mod tests {
 		)
 	}
 
+	async fn single_entry_index(
+		wt: &WorkTree<LocalFileStore, CapWorkDir, Sha256>,
+		path: &str,
+		content: &[u8],
+	) -> Index<Sha256> {
+		let oid = wt.repository().write_blob(content).await.unwrap();
+		let mut index = Index::new();
+		index.upsert(IndexEntry {
+			stat: crate::Stat::default(),
+			mode: 0o100644,
+			oid,
+			stage: 0,
+			assume_valid: false,
+			skip_worktree: false,
+			intent_to_add: false,
+			path: GitPath::from_utf8(path).unwrap(),
+		});
+		index
+	}
+
 	#[test]
 	fn ignored_advisory_sorts_and_deduplicates_before_rendering() {
 		let literal_collision = GitPath::from_utf8("\"raw-\\377\"").unwrap();
@@ -2319,6 +2374,81 @@ mod tests {
 			git_dir.join("index.lock").exists(),
 			"release after mutation began must leave index.lock (fail-closed)"
 		);
+
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[tokio::test]
+	async fn index_transaction_locks_before_reading_the_index() {
+		let root = scratch("transaction-order");
+		let git_dir = root.join(".git");
+		std::fs::write(git_dir.join("index"), b"not an index").unwrap();
+		std::fs::write(git_dir.join("index.lock"), b"").unwrap();
+		let wt = worktree(&root);
+
+		let error = match wt.begin_index_transaction().await {
+			Ok(_) => panic!("the existing index lock must be observed before parsing"),
+			Err(error) => error,
+		};
+		assert!(matches!(error, WorktreeError::IndexLocked));
+
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[tokio::test]
+	async fn index_transaction_blocks_writers_and_rolls_back_exactly() {
+		let root = scratch("transaction-rollback");
+		let git_dir = root.join(".git");
+		let wt = worktree(&root);
+		let original = single_entry_index(&wt, "original", b"old").await;
+		wt.save_index(&original).await.unwrap();
+
+		let mut transaction = wt.begin_index_transaction().await.unwrap();
+		let staged = single_entry_index(&wt, "staged", b"new").await;
+		*transaction.index_mut() = staged.clone();
+		assert!(matches!(
+			wt.save_index(&Index::new()).await,
+			Err(WorktreeError::IndexLocked)
+		));
+		transaction.publish().await.unwrap();
+		assert_eq!(wt.load_index().await.unwrap(), staged);
+		transaction.rollback().await.unwrap();
+
+		assert_eq!(wt.load_index().await.unwrap(), original);
+		assert!(!git_dir.join("index.lock").exists());
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[tokio::test]
+	async fn index_transaction_finish_keeps_publication_and_releases_lock() {
+		let root = scratch("transaction-finish");
+		let git_dir = root.join(".git");
+		let wt = worktree(&root);
+		let staged = single_entry_index(&wt, "staged", b"new").await;
+
+		let mut transaction = wt.begin_index_transaction().await.unwrap();
+		*transaction.index_mut() = staged.clone();
+		transaction.publish().await.unwrap();
+		transaction.finish();
+
+		assert_eq!(wt.load_index().await.unwrap(), staged);
+		assert!(!git_dir.join("index.lock").exists());
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[tokio::test]
+	async fn index_transaction_drop_releases_before_publish_and_fails_closed_after() {
+		let root = scratch("transaction-drop");
+		let git_dir = root.join(".git");
+		let wt = worktree(&root);
+
+		drop(wt.begin_index_transaction().await.unwrap());
+		assert!(!git_dir.join("index.lock").exists());
+
+		let mut transaction = wt.begin_index_transaction().await.unwrap();
+		transaction.publish().await.unwrap();
+		drop(transaction);
+		assert!(git_dir.join("index.lock").exists());
 
 		std::fs::remove_dir_all(&root).ok();
 	}
