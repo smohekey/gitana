@@ -15,8 +15,15 @@ workspace = true
 # `gitana-config` (pure, wasm-portable) leaves out, so it never builds for wasm.
 [dependencies]
 anyhow.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 gitana-config.workspace = true
+gitana-fs-native.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

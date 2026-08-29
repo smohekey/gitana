@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use crate::{ConfigError, GitConfigSource};
 
 /// A layered git configuration: an ordered stack of [`GitConfigSource`] files resolved with git's
@@ -17,6 +19,8 @@ pub struct GitConfig {
 	sources: Vec<GitConfigSource>,
 	/// Index into `sources` that writes and `render` target.
 	writable: usize,
+	/// Repository-owned sources within the stack (common local through worktree local).
+	repository_sources: Range<usize>,
 }
 
 impl Default for GitConfig {
@@ -41,6 +45,7 @@ impl GitConfig {
 		Self {
 			sources: vec![source],
 			writable: 0,
+			repository_sources: 0..1,
 		}
 	}
 
@@ -53,7 +58,12 @@ impl GitConfig {
 			"a GitConfig needs at least one source (the writable one)"
 		);
 		let writable = sources.len() - 1;
-		Self { sources, writable }
+		let repository_sources = 0..sources.len();
+		Self {
+			sources,
+			writable,
+			repository_sources,
+		}
 	}
 
 	/// Like [`from_sources`](Self::from_sources), but an empty stack yields an empty config (a single
@@ -76,6 +86,8 @@ impl GitConfig {
 		combined.append(&mut self.sources);
 		self.sources = combined;
 		self.writable += added;
+		self.repository_sources.start += added;
+		self.repository_sources.end += added;
 	}
 
 	/// Layer `higher` above the existing stack as higher-precedence sources (in read order — lowest of
@@ -84,6 +96,17 @@ impl GitConfig {
 	/// while writes still land in the local file below.
 	pub fn overlay(&mut self, higher: impl IntoIterator<Item = GitConfigSource>) {
 		self.sources.extend(higher);
+	}
+
+	/// Mark the range of sources owned by the repository itself. Native merged configs use this to
+	/// distinguish common/worktree-local values from system, global, and command-scope values.
+	///
+	/// Panics if the range is outside the current source stack.
+	pub fn with_repository_sources(mut self, repository_sources: Range<usize>) -> Self {
+		assert!(repository_sources.start <= repository_sources.end);
+		assert!(repository_sources.end <= self.sources.len());
+		self.repository_sources = repository_sources;
+		self
 	}
 
 	/// The single-valued lookup: the value from the highest-precedence source that sets the key
@@ -140,6 +163,39 @@ impl GitConfig {
 		name: &str,
 	) -> Result<Option<bool>, ConfigError> {
 		match self.winning_source(section, subsection, name) {
+			Some(source) => source.get_bool(section, subsection, name),
+			None => Ok(None),
+		}
+	}
+
+	/// Interpret a boolean from the designated writable source only, ignoring both lower-precedence
+	/// sources and command-scope overlays. Frontends use this when repository identity must come from
+	/// the local config even though the complete effective stack has already been assembled.
+	pub fn get_writable_bool(
+		&self,
+		section: &str,
+		subsection: Option<&str>,
+		name: &str,
+	) -> Result<Option<bool>, ConfigError> {
+		self.sources[self.writable].get_bool(section, subsection, name)
+	}
+
+	/// Interpret the highest-precedence repository-owned value as a git boolean, excluding system,
+	/// global, and command-scope sources. `None` means no repository-owned source sets the key.
+	pub fn get_repository_bool(
+		&self,
+		section: &str,
+		subsection: Option<&str>,
+		name: &str,
+	) -> Result<Option<bool>, ConfigError> {
+		match self
+			.sources
+			.get(self.repository_sources.clone())
+			.into_iter()
+			.flatten()
+			.rev()
+			.find(|source| source.contains(section, subsection, name))
+		{
 			Some(source) => source.get_bool(section, subsection, name),
 			None => Ok(None),
 		}
@@ -505,6 +561,61 @@ mod tests {
 		// Writes still land in the (still-writable) local source, not a lower layer.
 		config.set("user", None, "name", "Edited").unwrap();
 		assert_eq!(config.render(), "[user]\n\tname = Edited\n");
+	}
+
+	#[test]
+	fn repository_boolean_resolves_common_and_worktree_layers_only() {
+		let mut config = GitConfig::from_sources(vec![
+			source("[core]\n\tbare = false\n"),
+			source("[core]\n\tbare = false\n"),
+			source("[core]\n\tbare = true\n"),
+			source(""),
+		])
+		.with_repository_sources(2..4);
+		config.overlay([source("[core]\n\tbare = false\n")]);
+
+		assert_eq!(
+			config.get_repository_bool("core", None, "bare").unwrap(),
+			Some(true),
+			"a missing worktree value must retain the common-local value"
+		);
+
+		let mut overridden = GitConfig::from_sources(vec![
+			source("[core]\n\tbare = false\n"),
+			source("[core]\n\tbare = true\n"),
+			source("[core]\n\tbare = false\n"),
+		])
+		.with_repository_sources(1..3);
+		overridden.overlay([source("[core]\n\tbare = true\n")]);
+		assert_eq!(
+			overridden
+				.get_repository_bool("core", None, "bare")
+				.unwrap(),
+			Some(false),
+			"worktree local must override common local while command config remains excluded"
+		);
+	}
+
+	#[test]
+	fn repository_source_range_tracks_underlays_and_ignores_overlays() {
+		let mut config = GitConfig::parse("[core]\n\tbare = true\n").unwrap();
+		config.underlay([
+			source("[core]\n\tbare = false\n"),
+			source("[core]\n\tbare = false\n"),
+		]);
+		config.overlay([source("[core]\n\tbare = false\n")]);
+
+		assert_eq!(
+			config.get_repository_bool("core", None, "bare").unwrap(),
+			Some(true)
+		);
+
+		let ambient = GitConfig::from_sources(vec![source("[core]\n\tbare = true\n")])
+			.with_repository_sources(0..0);
+		assert_eq!(
+			ambient.get_repository_bool("core", None, "bare").unwrap(),
+			None
+		);
 	}
 
 	#[test]

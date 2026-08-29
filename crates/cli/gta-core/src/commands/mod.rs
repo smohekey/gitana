@@ -33,6 +33,7 @@ pub mod rm;
 pub mod show;
 pub mod sparse_checkout;
 pub mod status;
+pub mod submodule;
 pub mod switch;
 pub mod symbolic_ref;
 pub mod tag;

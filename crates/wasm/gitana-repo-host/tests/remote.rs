@@ -351,6 +351,17 @@ async fn clone_populates_checkout<H: HashAlgorithm>() -> Result<()> {
 
 	// The working tree was materialised and the origin persisted through the descriptor file store.
 	assert_eq!(std::fs::read(work.join("hello.txt"))?, b"world\n");
+	assert!(
+		std::fs::read_dir(&work)?.all(|entry| {
+			entry.is_ok_and(|entry| {
+				!entry
+					.file_name()
+					.to_string_lossy()
+					.starts_with(".gitana-populate.")
+			})
+		}),
+		"successful WASI population must not leave private source names"
+	);
 	let config = std::fs::read_to_string(git.join("config"))?;
 	assert!(
 		config.contains(&format!("url = {url}")),

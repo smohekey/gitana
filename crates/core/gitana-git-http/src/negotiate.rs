@@ -39,13 +39,14 @@ pub(crate) async fn ok_to_give_up<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	wants: &[ObjectId<H>],
 	commons: &[ObjectId<H>],
+	source_shallow: &HashSet<ObjectId<H>>,
 ) -> Result<bool, GitHttpError> {
 	if commons.is_empty() {
 		return Ok(false);
 	}
 	let common: HashSet<ObjectId<H>> = commons.iter().copied().collect();
 	for &want in wants {
-		if !want_reaches_common(repo, want, &common).await? {
+		if !want_reaches_common(repo, want, &common, source_shallow).await? {
 			return Ok(false);
 		}
 	}
@@ -58,6 +59,7 @@ async fn want_reaches_common<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	want: ObjectId<H>,
 	common: &HashSet<ObjectId<H>>,
+	source_shallow: &HashSet<ObjectId<H>>,
 ) -> Result<bool, GitHttpError> {
 	// A want the client already has (the ref did not move) is trivially satisfied.
 	if common.contains(&want) {
@@ -70,7 +72,7 @@ async fn want_reaches_common<H: HashAlgorithm>(
 	// A reachability bitmap answers this without a full walk: is any `common` among the commits
 	// reachable from the want? A common a step away short-circuits at once. (A shallow server has no
 	// bitmap, so it keeps the walk below.)
-	if repo.objects().has_reachability_bitmap().await? {
+	if source_shallow.is_empty() && repo.objects().has_reachability_bitmap().await? {
 		return Ok(repo.objects().commit_reaches_any(start, common).await?);
 	}
 	let mut stack = vec![start];
@@ -80,6 +82,9 @@ async fn want_reaches_common<H: HashAlgorithm>(
 			return Ok(true);
 		}
 		if !seen.insert(id) {
+			continue;
+		}
+		if source_shallow.contains(&id) {
 			continue;
 		}
 		if let Some(commit) = read_commit(repo, id).await? {
@@ -122,7 +127,11 @@ mod tests {
 		let stranger = ObjectId::<Sha256>::compute(gitana_object::ObjectKind::Commit, b"x");
 		let commons = common_haves(&repo, &[stranger]).await.unwrap();
 		assert!(commons.is_empty());
-		assert!(!ok_to_give_up(&repo, &[b], &commons).await.unwrap());
+		assert!(
+			!ok_to_give_up(&repo, &[b], &commons, &HashSet::new())
+				.await
+				.unwrap()
+		);
 	}
 
 	#[tokio::test]
@@ -133,7 +142,11 @@ mod tests {
 		// The client has `base` (a common ancestor of the want) → ready.
 		let commons = common_haves(&repo, &[base]).await.unwrap();
 		assert_eq!(commons, vec![base]);
-		assert!(ok_to_give_up(&repo, &[tip], &commons).await.unwrap());
+		assert!(
+			ok_to_give_up(&repo, &[tip], &commons, &HashSet::new())
+				.await
+				.unwrap()
+		);
 	}
 
 	#[tokio::test]
@@ -146,9 +159,13 @@ mod tests {
 		// The client has `base` (a common for the first want) but nothing under the disjoint want, so the
 		// server must keep negotiating: not every want is covered.
 		let commons = common_haves(&repo, &[base]).await.unwrap();
-		assert!(ok_to_give_up(&repo, &[tracked], &commons).await.unwrap());
 		assert!(
-			!ok_to_give_up(&repo, &[tracked, disjoint], &commons)
+			ok_to_give_up(&repo, &[tracked], &commons, &HashSet::new())
+				.await
+				.unwrap()
+		);
+		assert!(
+			!ok_to_give_up(&repo, &[tracked, disjoint], &commons, &HashSet::new())
 				.await
 				.unwrap()
 		);
@@ -165,8 +182,10 @@ mod tests {
 
 		let commons = common_haves(&repo, &[base]).await.unwrap();
 		assert!(!repo.objects().has_reachability_bitmap().await.unwrap());
-		let walk_tip = ok_to_give_up(&repo, &[tip], &commons).await.unwrap();
-		let walk_two = ok_to_give_up(&repo, &[tip, disjoint], &commons)
+		let walk_tip = ok_to_give_up(&repo, &[tip], &commons, &HashSet::new())
+			.await
+			.unwrap();
+		let walk_two = ok_to_give_up(&repo, &[tip, disjoint], &commons, &HashSet::new())
 			.await
 			.unwrap();
 		assert!(walk_tip);
@@ -181,11 +200,13 @@ mod tests {
 			.unwrap();
 		assert!(repo.objects().has_reachability_bitmap().await.unwrap());
 		assert_eq!(
-			ok_to_give_up(&repo, &[tip], &commons).await.unwrap(),
+			ok_to_give_up(&repo, &[tip], &commons, &HashSet::new())
+				.await
+				.unwrap(),
 			walk_tip
 		);
 		assert_eq!(
-			ok_to_give_up(&repo, &[tip, disjoint], &commons)
+			ok_to_give_up(&repo, &[tip, disjoint], &commons, &HashSet::new())
 				.await
 				.unwrap(),
 			walk_two,
@@ -198,6 +219,26 @@ mod tests {
 		let a = commit(&repo, &[], "a\n").await;
 		// The want is itself a have (the ref did not move on the server).
 		let commons = common_haves(&repo, &[a]).await.unwrap();
-		assert!(ok_to_give_up(&repo, &[a], &commons).await.unwrap());
+		assert!(
+			ok_to_give_up(&repo, &[a], &commons, &HashSet::new())
+				.await
+				.unwrap()
+		);
+	}
+
+	#[tokio::test]
+	async fn source_shallow_boundary_blocks_negotiation_ancestry() {
+		let repo = new_repo().await;
+		let hidden = commit(&repo, &[], "hidden\n").await;
+		let boundary = commit(&repo, &[hidden], "boundary\n").await;
+		let tip = commit(&repo, &[boundary], "tip\n").await;
+		let commons = common_haves(&repo, &[hidden]).await.unwrap();
+
+		assert!(
+			!ok_to_give_up(&repo, &[tip], &commons, &HashSet::from([boundary]))
+				.await
+				.unwrap(),
+			"an object retained below the source shallow boundary is not advertised history"
+		);
 	}
 }

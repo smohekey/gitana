@@ -31,5 +31,6 @@ tokio = { workspace = true, features = ["io-util", "process"], optional = true }
 
 [dev-dependencies]
 gitana-file-store-memory.workspace = true
+gitana-object-store.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

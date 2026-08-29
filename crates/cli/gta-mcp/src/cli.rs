@@ -4,60 +4,62 @@
 //! arguments here, since MCP tool calls can't order multiple positionals. All commands
 //! delegate to the shared `gta-core` implementations.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use clap_mcp::{ClapMcpToolError, IntoClapMcpToolError};
 use gta_core::commands;
 
-/// The clap-mcp output function (named by `#[clap_mcp_output_from]`): drive the parsed
-/// command to completion on a fresh current-thread runtime. Handlers print their output to
-/// stdout — which clap-mcp captures from the re-executed subprocess in MCP mode — so this
-/// returns no extra text on success and maps any error to an MCP tool error.
-pub(crate) fn execute(cli: Cli) -> std::result::Result<String, McpError> {
+/// Drive one parsed command to completion on a fresh current-thread runtime.
+pub(crate) fn execute(cli: Cli) -> Result<()> {
 	let runtime = tokio::runtime::Builder::new_current_thread()
 		.enable_all()
-		.build()
-		.map_err(|error| McpError(error.into()))?;
-	runtime.block_on(cli.dispatch()).map_err(McpError)?;
-	Ok(String::new())
+		.build()?;
+	runtime.block_on(cli.dispatch())
 }
 
-/// Wraps a gta error so clap-mcp can render it as an MCP tool error (`is_error: true`).
-pub(crate) struct McpError(pub(crate) anyhow::Error);
-
-impl IntoClapMcpToolError for McpError {
-	fn into_tool_error(self) -> ClapMcpToolError {
-		ClapMcpToolError::text(format!("{:#}", self.0))
-	}
-}
-
-/// The `gta-mcp` command line. Deriving `ClapMcp` exposes each subcommand as an MCP tool
-/// (`--mcp` over stdio, `--mcp-http` over HTTP); each tool call re-executes `gta-mcp` as a
-/// subprocess (`reinvocation_safe = false`). Operations touch a shared working tree, so
-/// tool calls are not parallel-safe.
-#[derive(Parser, clap_mcp::ClapMcp)]
+/// The `gta-mcp` one-shot command surface. The MCP bridge derives tool schemas and routes calls
+/// through subprocesses; operations are serialized because they may touch one shared worktree.
+#[derive(Parser)]
 #[command(
 	name = "gta-mcp",
 	version,
 	about = "MCP server for the gta toolchain",
 	long_about = "MCP server for the gta toolchain.\n\nRun `--mcp` to serve the gta \
-	              commands as MCP tools over stdio, or `--mcp-http <addr>` over HTTP. With \
+	              commands as MCP tools over stdio, or `--mcp-http <addr>` over loopback-only HTTP. With \
 	              no flag, runs a single command and exits, like `gta`."
 )]
-#[clap_mcp(reinvocation_safe = false, parallel_safe = false)]
-#[clap_mcp_output_from = "execute"]
 pub(crate) struct Cli {
+	/// Serve MCP over standard input/output.
+	#[arg(long)]
+	mcp: bool,
+	/// Serve MCP over streamable HTTP at the given loopback address.
+	#[arg(
+		id = "mcp-http",
+		long,
+		value_name = "addr",
+		num_args = 0..=1,
+		default_missing_value = ""
+	)]
+	mcp_http: Option<String>,
 	/// Run as if started in `<dir>`.
-	#[arg(short = 'C', value_name = "dir", global = true)]
+	#[arg(
+		short = 'C',
+		value_name = "dir",
+		global = true,
+		allow_hyphen_values = true
+	)]
 	directory: Option<PathBuf>,
+	/// Pass a command-scope configuration parameter. Must precede the subcommand.
+	#[arg(short = 'c', value_name = "key=value")]
+	config: Vec<String>,
 	#[command(subcommand)]
 	command: Command,
 }
 
-#[derive(Subcommand, clap_mcp::ClapMcp)]
-#[clap_mcp(schema_only)]
+#[derive(Subcommand)]
 enum Command {
 	/// Create an empty repository.
 	Init {
@@ -536,6 +538,11 @@ enum Command {
 		#[arg(long = "follow-tags", conflicts_with = "tags")]
 		follow_tags: bool,
 	},
+	/// Inspect, initialize, or update one level of tracked submodules.
+	Submodule {
+		#[command(subcommand)]
+		action: SubmoduleAction,
+	},
 	/// List, add, remove, or retarget the configured remotes.
 	Remote {
 		/// With no sub-command, also print each remote's fetch/push URL.
@@ -561,9 +568,29 @@ enum Command {
 	},
 }
 
+#[derive(Subcommand)]
+enum SubmoduleAction {
+	/// Show the recorded and checked-out state of tracked submodules.
+	Status {
+		#[arg(long = "path")]
+		paths: Vec<String>,
+	},
+	/// Register selected submodule URLs and activate them.
+	Init {
+		#[arg(long = "path")]
+		paths: Vec<String>,
+	},
+	/// Materialize and check out selected submodules at the recorded commits.
+	Update {
+		#[arg(long)]
+		init: bool,
+		#[arg(long = "path")]
+		paths: Vec<String>,
+	},
+}
+
 /// A `sparse-checkout` sub-command.
-#[derive(Subcommand, clap_mcp::ClapMcp)]
-#[clap_mcp(schema_only)]
+#[derive(Subcommand)]
 enum SparseCheckoutAction {
 	/// Enable sparse-checkout with the default set (cone: root files only).
 	Init {
@@ -595,8 +622,7 @@ enum SparseCheckoutAction {
 }
 
 /// A `worktree` sub-command.
-#[derive(Subcommand, clap_mcp::ClapMcp)]
-#[clap_mcp(schema_only)]
+#[derive(Subcommand)]
 enum WorktreeAction {
 	/// Create a worktree at <path> and check out <commit-ish> (default: a new branch named after the
 	/// path's basename, or HEAD when detached).
@@ -682,8 +708,7 @@ enum WorktreeAction {
 }
 
 /// A `trust` sub-command.
-#[derive(Subcommand, clap_mcp::ClapMcp)]
-#[clap_mcp(schema_only)]
+#[derive(Subcommand)]
 enum TrustAction {
 	/// Bootstrap the trust root: create a self-signed root enrolling the signing key.
 	Init {
@@ -749,8 +774,7 @@ enum TrustAction {
 }
 
 /// A `remote` sub-command. Absent means "list the remotes".
-#[derive(Subcommand, clap_mcp::ClapMcp)]
-#[clap_mcp(schema_only)]
+#[derive(Subcommand)]
 enum RemoteAction {
 	/// Add a remote named <name> for <url>.
 	Add {
@@ -782,7 +806,35 @@ enum RemoteAction {
 }
 
 impl Cli {
-	async fn dispatch(self) -> Result<()> {
+	fn dispatch(self) -> Pin<Box<dyn Future<Output = Result<()>>>> {
+		Box::pin(self.dispatch_inner())
+	}
+
+	async fn dispatch_inner(self) -> Result<()> {
+		let scoped_keyed_config_read = matches!(
+			&self.command,
+			Command::Config {
+				get_all: false,
+				add: false,
+				replace_all: false,
+				unset: false,
+				list: false,
+				global: true,
+				system: false,
+				value: None,
+				..
+			} | Command::Config {
+				get_all: false,
+				add: false,
+				replace_all: false,
+				unset: false,
+				list: false,
+				global: false,
+				system: true,
+				value: None,
+				..
+			}
+		);
 		let cwd = match self.directory {
 			Some(dir) => dir,
 			None => std::env::current_dir()?,
@@ -791,8 +843,13 @@ impl Cli {
 		// (GIT_CONFIG_GLOBAL/SYSTEM) resolve against it, as git does under `-C`. Terminal credential
 		// prompts are disabled for the whole MCP dispatch: there is no interactive user behind an MCP
 		// tool call, so a command must never block on `/dev/tty` (askpass helpers still apply).
+		let context = gta_core::CommandContext::from_env(cwd.clone(), self.config);
+		if !scoped_keyed_config_read {
+			context.preflight().await?;
+		}
+		let command_context = context.clone();
 		let command = self.command;
-		gta_core::with_terminal_prompts_disabled(gta_core::with_command_cwd(cwd.clone(), async move {
+		gta_core::with_terminal_prompts_disabled(context.scope(async move {
 			match command {
 				Command::Init {
 					path,
@@ -1045,6 +1102,9 @@ impl Cli {
 					)
 					.await
 				}
+				Command::Submodule { action } => {
+					commands::submodule::run(&cwd, &command_context, submodule_action(action)).await
+				}
 				Command::Remote { verbose, action } => {
 					commands::remote::run(&cwd, remote_action(verbose, action)).await
 				}
@@ -1058,6 +1118,15 @@ impl Cli {
 			}
 		}))
 		.await
+	}
+}
+
+fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
+	use commands::submodule::Action;
+	match action {
+		SubmoduleAction::Status { paths } => Action::Status { paths },
+		SubmoduleAction::Init { paths } => Action::Init { paths },
+		SubmoduleAction::Update { init, paths } => Action::Update { init, paths },
 	}
 }
 

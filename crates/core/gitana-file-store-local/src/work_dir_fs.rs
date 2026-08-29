@@ -13,6 +13,26 @@ pub struct DirEntry {
 	pub kind: FileKind,
 }
 
+/// One entry to add while populating an empty or partially populated work tree.
+///
+/// [`WorkDirFs::populate_new`] creates every missing parent through retained, no-follow directory
+/// capabilities and refuses to replace the final name. This is deliberately narrower than the
+/// normal checkout primitives: it is for recovery and initial attachment, where preserving any
+/// concurrently added content takes priority over making the target tree authoritative.
+pub enum PopulationEntry<'a> {
+	/// A directory, including the opaque directory that represents a gitlink.
+	Directory,
+	/// A regular file with its complete content and executable-bit intent.
+	Regular {
+		/// The file content.
+		bytes: &'a [u8],
+		/// Whether the executable bit should be set on platforms that represent it.
+		executable: bool,
+	},
+	/// A symbolic link with the target bytes stored in the tree.
+	Symlink(&'a [u8]),
+}
+
 /// A working-tree directory as a capability: all access is relative to a confined root (the work
 /// tree), with no ambient authority. The native implementation `CapWorkDir` wraps a
 /// `cap_std::fs::Dir`; the wasm implementation `DescriptorWorkDir` wraps a `wasi:filesystem`
@@ -28,6 +48,13 @@ pub struct DirEntry {
 /// (the working tree still applies its lexical `validate_path` guard against `..`/`.git`/traversal
 /// before calling in).
 pub trait WorkDirFs: Send + Sync + 'static {
+	/// Whether this backend represents tree symlinks as regular files containing the target bytes.
+	/// Population verification uses this to accept the platform fallback it just requested from
+	/// [`Self::populate_new`] without weakening normal checkout comparisons.
+	fn uses_symlink_placeholders(&self) -> bool {
+		false
+	}
+
 	/// `lstat` the entry at `path` (not following a final symlink). `Ok(None)` when nothing is there
 	/// — both "no such entry" and "a non-directory occupies an ancestor" (`ENOENT`/`ENOTDIR`) fold to
 	/// `None`, since either way `path` names nothing.
@@ -46,6 +73,15 @@ pub trait WorkDirFs: Send + Sync + 'static {
 	/// the executable bit iff `executable`. Parent directories must already exist. A capability that
 	/// cannot represent the executable bit (WASI) silently writes a non-executable file.
 	fn write(&self, path: &str, bytes: &[u8], executable: bool) -> io::Result<()>;
+
+	/// Add one population entry without following any parent symlink or replacing the final name.
+	/// Missing parents are created component-by-component. Returns `false` when the final name is
+	/// already occupied; structural parent conflicts are returned as I/O errors. A failed regular-file
+	/// write fails closed without removing a name that may have been replaced concurrently. Native
+	/// backends retire their private prepared leaf under an internal quarantine name; WASI creates the
+	/// final leaf exclusively and preserves a partial leaf when descriptor writes fail because the
+	/// platform has no identity-conditioned unlink.
+	fn populate_new(&self, path: &str, entry: PopulationEntry<'_>) -> io::Result<bool>;
 
 	/// Create a symlink at `path` pointing at `target` (raw bytes, as stored in the blob).
 	fn symlink(&self, target: &[u8], path: &str) -> io::Result<()>;

@@ -16,10 +16,67 @@ use gitana_repository::Repository;
 
 use crate::GitHttpError;
 use crate::deepen::Deepen;
+use crate::refs::collect_refs;
 
 /// git's `INFINITE_DEPTH` sentinel — the absolute `deepen` a client sends for `fetch --unshallow`
 /// (request all history). The server treats it as "drop every shallow boundary", not a literal depth.
 const INFINITE_DEPTH: u32 = 0x7fff_ffff;
+
+/// Reject exact object wants that name commits hidden below the source repository's own shallow
+/// boundary. A retained parent object is not part of a shallow repository's visible history merely
+/// because it still exists in the object store.
+///
+/// A non-shallow source keeps the existing exact-want behavior. For a shallow source, advertised
+/// objects and peeled tag targets are valid directly; other commit wants must be reachable from an
+/// advertised ref without traversing through a source-shallow commit's parents.
+pub(crate) async fn validate_source_wants<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	wants: &[ObjectId<H>],
+	source_shallow: &[ObjectId<H>],
+) -> Result<(), GitHttpError> {
+	if source_shallow.is_empty() {
+		return Ok(());
+	}
+
+	let source_boundary: HashSet<ObjectId<H>> = source_shallow.iter().copied().collect();
+	let mut advertised = HashSet::new();
+	let mut pending = Vec::new();
+	for reference in collect_refs(repo, true).await? {
+		advertised.insert(reference.oid);
+		if let Some(peeled) = reference.peeled {
+			advertised.insert(peeled);
+		}
+		if let Some(commit) = peel_to_commit(repo, reference.oid).await? {
+			pending.push(commit);
+		}
+	}
+
+	let mut visible_commits = HashSet::new();
+	while let Some(id) = pending.pop() {
+		if !visible_commits.insert(id) || source_boundary.contains(&id) {
+			continue;
+		}
+		if let Some(commit) = read_commit(repo, id).await? {
+			pending.extend(commit.parents);
+		}
+	}
+
+	for &want in wants {
+		if advertised.contains(&want) {
+			continue;
+		}
+		if let Some(commit) = peel_to_commit(repo, want).await?
+			&& visible_commits.contains(&commit)
+		{
+			continue;
+		}
+		return Err(GitHttpError::MalformedRequest(format!(
+			"want {want} is not reachable within the source repository's shallow boundary"
+		)));
+	}
+
+	Ok(())
+}
 
 /// The outcome of a shallow-boundary computation.
 pub(crate) struct ShallowPlan<H: HashAlgorithm> {
@@ -38,20 +95,26 @@ pub(crate) struct ShallowPlan<H: HashAlgorithm> {
 	pub send_roots: Vec<ObjectId<H>>,
 }
 
-/// Compute the shallow view for `wants` under `deepen`, given the client's current `client_shallow`
-/// boundary. Only commit `want`s drive the ancestry walk; a non-commit want (e.g. a tag) is left to the
-/// pack walk and never becomes a boundary. An unknown want is ignored here (the caller validates wants).
+/// Compute the shallow view for `wants` under `deepen`, given both the client's current boundary and
+/// the source repository's own shallow boundary. A source boundary is always a hard send-side cut:
+/// neither an unshallow request nor the presence of its parent objects may expose history past it.
+/// With no deepen request, the client's boundary is hard too so an ordinary fetch never deepens it.
+/// Only commit `want`s drive the ancestry walk; a non-commit want is left to the pack walk.
 pub(crate) async fn compute_shallow<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	wants: &[ObjectId<H>],
+	haves: &[ObjectId<H>],
 	deepen: &Deepen,
 	client_shallow: &[ObjectId<H>],
+	source_shallow: &[ObjectId<H>],
 ) -> Result<ShallowPlan<H>, GitHttpError> {
 	let excluded = deepen_not_closure(repo, &deepen.not).await?;
 	let client: HashSet<ObjectId<H>> = client_shallow.iter().copied().collect();
+	let source: HashSet<ObjectId<H>> = source_shallow.iter().copied().collect();
 
 	let mut included: HashSet<ObjectId<H>> = HashSet::new();
 	let mut boundary: HashSet<ObjectId<H>> = HashSet::new();
+	let mut source_only_boundary: HashSet<ObjectId<H>> = HashSet::new();
 	// Breadth-first over commit→parent edges. Each node carries a `budget`: the number of parent
 	// descents still allowed (`None` = unlimited, bounded only by since/deepen-not). A want is peeled to
 	// its commit first, so `--depth 1 <annotated-tag>` bounds the tag's commit, not its full ancestry.
@@ -95,6 +158,30 @@ pub(crate) async fn compute_shallow<H: HashAlgorithm>(
 		} else {
 			popped_budget
 		};
+		if source.contains(&id) {
+			// Remember whether this commit is a boundary solely because the source is shallow. A client
+			// that already owns the hidden history need not persist that send-side constraint, but an
+			// explicit depth/since/exclude boundary remains semantically significant even at the same OID.
+			let mut requested_boundary = false;
+			for &parent in &commit.parents {
+				if matches!(budget, Some(0))
+					|| !parent_within_since(repo, parent, deepen.since).await?
+					|| excluded.contains(&parent)
+				{
+					requested_boundary = true;
+					break;
+				}
+			}
+			if !requested_boundary {
+				source_only_boundary.insert(id);
+			}
+			boundary.insert(id);
+			continue;
+		}
+		if deepen.is_empty() && client.contains(&id) {
+			boundary.insert(id);
+			continue;
+		}
 		let mut withholds_a_parent = false;
 		for &parent in &commit.parents {
 			// A parent is followed only while the depth budget allows it, and it passes the since /
@@ -115,10 +202,16 @@ pub(crate) async fn compute_shallow<H: HashAlgorithm>(
 		}
 	}
 
+	// A source boundary still limits what this upload-pack may send, but it must not make an already
+	// complete client shallow. If the client's offered have closure reaches that boundary without
+	// crossing one of its own shallow commits, the client already owns the hidden ancestry.
+	let source_boundaries_in_haves =
+		source_boundaries_in_have_closure(repo, haves, &client, &source).await?;
 	let shallow = boundary
 		.iter()
 		.copied()
 		.filter(|oid| !client.contains(oid))
+		.filter(|oid| !(source_only_boundary.contains(oid) && source_boundaries_in_haves.contains(oid)))
 		.collect();
 	// A client-shallow commit becomes unshallow when it is in the view and no longer a boundary — i.e.
 	// its parents are now being sent.
@@ -147,6 +240,40 @@ pub(crate) async fn compute_shallow<H: HashAlgorithm>(
 		unshallow,
 		send_roots,
 	})
+}
+
+/// Source-imposed boundaries reached through commits the client says it already has. The walk stops
+/// at both peers' shallow frontiers: retained objects below either frontier do not prove that the
+/// client owns the hidden history.
+async fn source_boundaries_in_have_closure<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	haves: &[ObjectId<H>],
+	client_shallow: &HashSet<ObjectId<H>>,
+	source_shallow: &HashSet<ObjectId<H>>,
+) -> Result<HashSet<ObjectId<H>>, GitHttpError> {
+	let mut reached = HashSet::new();
+	let mut seen = HashSet::new();
+	let mut stack = Vec::new();
+	for &have in haves {
+		if let Some(commit) = peel_to_commit(repo, have).await? {
+			stack.push(commit);
+		}
+	}
+
+	while let Some(id) = stack.pop() {
+		if !seen.insert(id) || client_shallow.contains(&id) {
+			continue;
+		}
+		if source_shallow.contains(&id) {
+			reached.insert(id);
+			continue;
+		}
+		if let Some(commit) = read_commit(repo, id).await? {
+			stack.extend(commit.parents);
+		}
+	}
+
+	Ok(reached)
 }
 
 /// The tag objects to add to a shallow pack for `include-tag`: the id of each `refs/tags/*` whose
@@ -352,7 +479,7 @@ mod tests {
 		deepen: Deepen,
 		client_shallow: &[ObjectId<Sha256>],
 	) -> ShallowPlan<Sha256> {
-		compute_shallow(repo, wants, &deepen, client_shallow)
+		compute_shallow(repo, wants, &[], &deepen, client_shallow, &[])
 			.await
 			.unwrap()
 	}
@@ -524,7 +651,117 @@ mod tests {
 			not: vec!["refs/tags/does-not-exist".to_owned()],
 			..Default::default()
 		};
-		assert!(compute_shallow(&repo, &[c], &deepen, &[]).await.is_err());
+		assert!(
+			compute_shallow(&repo, &[c], &[], &deepen, &[], &[])
+				.await
+				.is_err()
+		);
+	}
+
+	#[tokio::test]
+	async fn source_boundary_is_hard_and_only_reachable_entries_are_advertised() {
+		let repo = new_repo().await;
+		let root = commit(&repo, &[], 1).await;
+		let boundary = commit(&repo, &[root], 2).await;
+		let tip = commit(&repo, &[boundary], 3).await;
+		let unrelated_root = commit(&repo, &[], 4).await;
+		let unrelated_boundary = commit(&repo, &[unrelated_root], 5).await;
+
+		let source = [boundary, unrelated_boundary];
+		let plan = compute_shallow(&repo, &[tip], &[], &Deepen::default(), &[], &source)
+			.await
+			.unwrap();
+		assert_eq!(plan.included, set(&[tip, boundary]));
+		assert_eq!(plan.boundary, set(&[boundary]));
+		assert_eq!(plan.shallow, vec![boundary]);
+		assert!(!plan.included.contains(&root));
+		assert!(!plan.boundary.contains(&unrelated_boundary));
+
+		let unshallow = compute_shallow(&repo, &[tip], &[], &unshallow(), &[tip], &source)
+			.await
+			.unwrap();
+		assert_eq!(unshallow.boundary, set(&[boundary]));
+		assert_eq!(unshallow.shallow, vec![boundary]);
+		assert_eq!(unshallow.unshallow, vec![tip]);
+		assert!(!unshallow.included.contains(&root));
+	}
+
+	#[tokio::test]
+	async fn plain_fetch_keeps_the_clients_shallower_boundary() {
+		let repo = new_repo().await;
+		let root = commit(&repo, &[], 1).await;
+		let source_boundary = commit(&repo, &[root], 2).await;
+		let client_boundary = commit(&repo, &[source_boundary], 3).await;
+		let tip = commit(&repo, &[client_boundary], 4).await;
+
+		let plan = compute_shallow(
+			&repo,
+			&[tip],
+			&[],
+			&Deepen::default(),
+			&[client_boundary],
+			&[source_boundary],
+		)
+		.await
+		.unwrap();
+		assert_eq!(plan.included, set(&[tip, client_boundary]));
+		assert_eq!(plan.boundary, set(&[client_boundary]));
+		assert!(plan.shallow.is_empty());
+		assert!(plan.unshallow.is_empty());
+	}
+
+	#[tokio::test]
+	async fn source_boundary_already_in_complete_have_closure_is_not_advertised() {
+		let repo = new_repo().await;
+		let root = commit(&repo, &[], 1).await;
+		let source_boundary = commit(&repo, &[root], 2).await;
+		let tip = commit(&repo, &[source_boundary], 3).await;
+
+		let plan = compute_shallow(
+			&repo,
+			&[tip],
+			&[source_boundary],
+			&Deepen::default(),
+			&[],
+			&[source_boundary],
+		)
+		.await
+		.unwrap();
+		assert_eq!(plan.boundary, set(&[source_boundary]));
+		assert!(
+			plan.shallow.is_empty(),
+			"a complete client must not acquire the source's shallow boundary"
+		);
+
+		let depth_limited = compute_shallow(
+			&repo,
+			&[tip],
+			&[source_boundary],
+			&depth(2),
+			&[],
+			&[source_boundary],
+		)
+		.await
+		.unwrap();
+		assert_eq!(
+			depth_limited.shallow,
+			vec![source_boundary],
+			"an explicit depth boundary remains significant at the same commit"
+		);
+
+		let client_boundary = tip;
+		let shallow_client = compute_shallow(
+			&repo,
+			&[tip],
+			&[tip],
+			&Deepen::default(),
+			&[client_boundary],
+			&[source_boundary],
+		)
+		.await
+		.unwrap();
+		assert!(shallow_client.shallow.is_empty());
+		assert!(shallow_client.unshallow.is_empty());
 	}
 
 	fn depth(n: u32) -> Deepen {

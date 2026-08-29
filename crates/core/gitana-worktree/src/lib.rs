@@ -34,6 +34,7 @@ pub use error::WorktreeError;
 pub use index::{Conflict, Index};
 pub use ls_files::{LsFilesConfig, LsFilesOutput};
 pub use ls_files_options::LsFilesOptions;
+pub use pathspec::PathspecSet;
 pub use rm::RmOutcome;
 pub(crate) use sparse::SparseCheckout;
 pub use sparse::{SparseReapply, SparseSet};

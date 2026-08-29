@@ -1290,6 +1290,91 @@ where
 			.await
 	}
 
+	/// Validate a detached `HEAD` update while the caller retains `HEAD.lock`. No repository state is
+	/// changed: the returned reflog image and target can be committed after the worktree checkout.
+	pub(crate) async fn prepare_detached_checkout(
+		&self,
+		target: ObjectId<H>,
+		reflog: ReflogIntent<'_>,
+	) -> Result<Option<Vec<u8>>, RepositoryError> {
+		if self.ref_path_write_blocked("HEAD", None).await? {
+			return Err(RepositoryError::InvalidRef(
+				"HEAD: blocked by an existing directory or file".to_owned(),
+			));
+		}
+		let old = self.follow_symref("HEAD").await?;
+		if let ReflogIntent::Log { committer, message } = reflog
+			&& self.should_log("HEAD", self.reflog_policy().await?).await?
+		{
+			if self.path_write_blocked("logs/HEAD").await? {
+				return Err(RepositoryError::InvalidRef(
+					"HEAD: reflog path blocked by an existing file or directory".to_owned(),
+				));
+			}
+			let mut content = match self.files.read_path("logs/HEAD").await {
+				Ok(bytes) => bytes,
+				Err(FileStoreError::NotFound) => Vec::new(),
+				Err(other) => return Err(other.into()),
+			};
+			content.extend_from_slice(&reflog_line(old, Some(target), committer, message));
+			return Ok(Some(content));
+		}
+		Ok(None)
+	}
+
+	/// Publish a prepared detached `HEAD` while consuming the already-held checkout lock.
+	pub(crate) async fn commit_prepared_detached_checkout(
+		&self,
+		head_lock: PathLock,
+		target: ObjectId<H>,
+		reflog_content: Option<Vec<u8>>,
+	) -> Result<(), RepositoryError> {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let files = self.files.shared_handle();
+			let effective = self.effective.cloned();
+			match tokio::spawn(async move {
+				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+				store
+					.commit_prepared_detached_checkout_inline(head_lock, target, reflog_content)
+					.await
+			})
+			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		self
+			.commit_prepared_detached_checkout_inline(head_lock, target, reflog_content)
+			.await
+	}
+
+	async fn commit_prepared_detached_checkout_inline(
+		&self,
+		head_lock: PathLock,
+		target: ObjectId<H>,
+		reflog_content: Option<Vec<u8>>,
+	) -> Result<(), RepositoryError> {
+		let result = async {
+			if let Some(content) = reflog_content {
+				self.files.write_path_replace("logs/HEAD", &content).await?;
+			}
+			let bytes = HeadState::<H>::Detached(target).render();
+			self
+				.files
+				.write_path_replace("HEAD", bytes.as_bytes())
+				.await?;
+			Ok(())
+		}
+		.await;
+		drop(head_lock);
+		self.prune_empty_dirs("HEAD").await;
+		result
+	}
+
 	/// The body of [`commit_checkout`](Self::commit_checkout), run holding `head_lock`.
 	async fn commit_checkout_inline(
 		&self,
@@ -1514,22 +1599,13 @@ where
 		committer: &str,
 		message: &str,
 	) -> Result<(), RepositoryError> {
-		let zero = || "0".repeat(H::RAW_LEN * 2);
-		let old = old.map_or_else(zero, |id| id.to_hex());
-		let new = new.map_or_else(zero, |id| id.to_hex());
-		let line = if message.is_empty() {
-			format!("{old} {new} {committer}\n")
-		} else {
-			format!("{old} {new} {committer}\t{message}\n")
-		};
-
 		let path = format!("logs/{refname}");
 		let mut content = match self.files.read_path(&path).await {
 			Ok(bytes) => bytes,
 			Err(FileStoreError::NotFound) => Vec::new(),
 			Err(other) => return Err(other.into()),
 		};
-		content.extend_from_slice(line.as_bytes());
+		content.extend_from_slice(&reflog_line(old, new, committer, message));
 		self.force_write(&path, &content).await
 	}
 
@@ -1603,20 +1679,26 @@ where
 	}
 
 	/// Resolve `core.logAllRefUpdates` from config: `always`, a git boolean, or — unset — git's
-	/// default (on for a non-bare repo, off for a bare one). A missing or unparseable config falls
-	/// back to the non-bare default, as an on-disk gitana repo is never bare-by-omission.
+	/// default (on for a non-bare repo, off for a bare one). A malformed explicit value is rejected;
+	/// only an absent value falls back to the repository-kind default.
 	///
 	/// `logallrefupdates` follows git's merged precedence when the frontend installed the effective
 	/// config (a global `true` enables reflogs); the `core.bare` fallback stays repo-local, matching
 	/// the rest of gitana — a *global* `core.bare` is a footgun, so it is not honoured.
 	async fn reflog_policy(&self) -> Result<ReflogPolicy, RepositoryError> {
-		// The repo-local config: the sole source for `core.bare`, and the `logallrefupdates` source
-		// when no effective (merged) config was installed (tests, the wasm sandbox).
+		// The raw common config is the fallback for `core.bare`, and the `logallrefupdates` source when
+		// no effective (merged) config was installed (tests, the wasm sandbox). A native effective
+		// config carries the complete common/worktree-local repository range even when the common file
+		// is a symlink outside this file-store capability.
 		let local = match self.files.read_path("config").await {
 			Ok(bytes) => std::str::from_utf8(&bytes)
 				.ok()
 				.and_then(|text| gitana_config::GitConfig::parse(text).ok()),
 			Err(FileStoreError::NotFound) => None,
+			// A native frontend may have followed a repository config symlink whose target is outside
+			// this file-store capability and installed the resulting effective stack. In that case the
+			// effective view is authoritative; do not turn a safe read boundary into a repository error.
+			Err(_) if self.effective.is_some() => None,
 			Err(other) => return Err(other.into()),
 		};
 		let Some(config) = self.effective.or(local.as_ref()) else {
@@ -1628,15 +1710,29 @@ where
 		{
 			return Ok(ReflogPolicy::Always);
 		}
-		match config.get_bool("core", None, "logallrefupdates") {
-			Ok(Some(true)) => Ok(ReflogPolicy::Enabled),
-			Ok(Some(false)) => Ok(ReflogPolicy::Disabled),
-			// Unset (or an unparseable value): git's default keys off whether the repo is bare. Read
-			// `core.bare` from the local config only — a global bare is deliberately not honoured.
-			_ => {
-				let bare = local
-					.as_ref()
-					.and_then(|c| c.get_bool("core", None, "bare").ok().flatten())
+		match config
+			.get_bool("core", None, "logallrefupdates")
+			.map_err(|error| {
+				RepositoryError::UnsupportedFormat(format!("core.logAllRefUpdates: {error}"))
+			})? {
+			Some(true) => Ok(ReflogPolicy::Enabled),
+			Some(false) => Ok(ReflogPolicy::Disabled),
+			// Unset: git's default keys off whether the repo is bare. Resolve the winner across the
+			// repository-owned common and worktree layers only; global and command values remain excluded.
+			None => {
+				let bare = self
+					.effective
+					.and_then(|config| {
+						config
+							.get_repository_bool("core", None, "bare")
+							.ok()
+							.flatten()
+					})
+					.or_else(|| {
+						local
+							.as_ref()
+							.and_then(|config| config.get_bool("core", None, "bare").ok().flatten())
+					})
 					.unwrap_or(false);
 				Ok(if bare {
 					ReflogPolicy::Disabled
@@ -1704,6 +1800,22 @@ where
 				Err(other) => return Err(other.into()),
 			}
 		}
+	}
+}
+
+fn reflog_line<H: HashAlgorithm>(
+	old: Option<ObjectId<H>>,
+	new: Option<ObjectId<H>>,
+	committer: &str,
+	message: &str,
+) -> Vec<u8> {
+	let zero = || "0".repeat(H::RAW_LEN * 2);
+	let old = old.map_or_else(zero, |id| id.to_hex());
+	let new = new.map_or_else(zero, |id| id.to_hex());
+	if message.is_empty() {
+		format!("{old} {new} {committer}\n").into_bytes()
+	} else {
+		format!("{old} {new} {committer}\t{message}\n").into_bytes()
 	}
 }
 
@@ -3156,6 +3268,207 @@ mod tests {
 			!files.exists("HEAD.lock").await.unwrap(),
 			"publishing the checkout releases the HEAD.lock",
 		);
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn finish_detached_publishes_the_target_and_releases_head_lock() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let old = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"old");
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"target");
+		store
+			.update_ref("refs/heads/main", old, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		store
+			.set_symbolic("HEAD", "refs/heads/main", ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		let head_lock = store.lock_head().await.unwrap();
+		assert!(files.exists("HEAD.lock").await.unwrap());
+
+		head_lock
+			.finish_detached(target, ReflogIntent::Skip)
+			.await
+			.expect("publish detached HEAD under the held lock");
+		assert_eq!(store.resolve_head().await.unwrap(), Some(target));
+		assert_eq!(
+			files.read_path("HEAD").await.unwrap(),
+			format!("{}\n", target.to_hex()).as_bytes()
+		);
+		assert!(!files.exists("HEAD.lock").await.unwrap());
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn prepared_detached_head_validates_before_publication_and_releases_on_drop() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let old = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"old");
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"target");
+		store
+			.update_ref("refs/heads/main", old, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		store
+			.set_symbolic("HEAD", "refs/heads/main", ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		let prepared = store
+			.lock_head()
+			.await
+			.unwrap()
+			.prepare_detached(target, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		assert!(files.exists("HEAD.lock").await.unwrap());
+		assert_eq!(store.resolve_head().await.unwrap(), Some(old));
+
+		drop(prepared);
+		assert!(!files.exists("HEAD.lock").await.unwrap());
+		assert_eq!(store.resolve_head().await.unwrap(), Some(old));
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn prepared_detached_head_rejects_reflog_conflicts_without_publishing() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let old = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"old");
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"target");
+		store
+			.update_ref("refs/heads/main", old, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		store
+			.set_symbolic("HEAD", "refs/heads/main", ReflogIntent::Skip)
+			.await
+			.unwrap();
+		files
+			.write_path_replace("logs/HEAD/blocked", b"conflict")
+			.await
+			.unwrap();
+
+		let error = store
+			.lock_head()
+			.await
+			.unwrap()
+			.prepare_detached(
+				target,
+				ReflogIntent::Log {
+					committer: "A U Thor <a@u> 0 +0000",
+					message: "checkout",
+				},
+			)
+			.await
+			.err()
+			.expect("the reflog directory conflict must fail during preparation");
+		assert!(matches!(error, crate::RepositoryError::InvalidRef(_)));
+		assert!(!files.exists("HEAD.lock").await.unwrap());
+		assert_eq!(store.resolve_head().await.unwrap(), Some(old));
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn prepared_detached_head_rejects_a_malformed_effective_reflog_policy() {
+		let files = MemoryFileStore::new();
+		let raw: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let old = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"old");
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"target");
+		raw
+			.update_ref("refs/heads/main", old, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		raw
+			.set_symbolic("HEAD", "refs/heads/main", ReflogIntent::Skip)
+			.await
+			.unwrap();
+		let config =
+			gitana_config::GitConfig::parse("[core]\n\tlogAllRefUpdates = definitely-not-a-boolean\n")
+				.unwrap();
+		let store: RefStore<'_, MemoryFileStore, Sha256> =
+			RefStore::new(&files).with_effective_config(Some(&config));
+
+		let error = store
+			.lock_head()
+			.await
+			.unwrap()
+			.prepare_detached(
+				target,
+				ReflogIntent::Log {
+					committer: "A U Thor <a@u> 0 +0000",
+					message: "checkout",
+				},
+			)
+			.await
+			.err()
+			.expect("a malformed effective policy must fail during preparation");
+		assert!(matches!(
+			error,
+			crate::RepositoryError::UnsupportedFormat(_)
+		));
+		assert!(!files.exists("HEAD.lock").await.unwrap());
+		assert_eq!(store.resolve_head().await.unwrap(), Some(old));
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn skipped_reflog_transaction_rejects_a_malformed_effective_policy_before_mutation() {
+		let files = MemoryFileStore::new();
+		let config =
+			gitana_config::GitConfig::parse("[core]\n\tlogAllRefUpdates = definitely-not-a-boolean\n")
+				.unwrap();
+		let store: RefStore<'_, MemoryFileStore, Sha256> =
+			RefStore::new(&files).with_effective_config(Some(&config));
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"target");
+
+		let error = store
+			.update_ref("refs/tags/v1", target, None, ReflogIntent::Skip)
+			.await
+			.expect_err("a malformed policy must be rejected even when the reflog is skipped");
+		assert!(matches!(
+			error,
+			crate::RepositoryError::UnsupportedFormat(_)
+		));
+		assert_eq!(store.resolve("refs/tags/v1").await.unwrap(), None);
+		assert!(!files.exists("refs/tags/v1.lock").await.unwrap());
+	}
+
+	/// Detached checkout publication has the same cancellation guarantee as branch checkout: the
+	/// owned worker retains `HEAD.lock` until the direct HEAD write completes.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn cancelled_finish_detached_retains_head_lock_until_publication_completes() {
+		let files = GatedFileStore::new();
+		let store: RefStore<'_, GatedFileStore, Sha256> = RefStore::new(&files);
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"detached target");
+
+		let head_lock = store.lock_head().await.unwrap();
+		let mut publish = Box::pin(head_lock.finish_detached(target, ReflogIntent::Skip));
+		let mut context = Context::from_waker(Waker::noop());
+		assert!(matches!(publish.as_mut().poll(&mut context), Poll::Pending));
+		files.wait_until_blocked().await;
+		assert!(files.exists("HEAD.lock").await.unwrap());
+
+		drop(publish);
+		for _ in 0..10 {
+			tokio::task::yield_now().await;
+		}
+		assert!(files.exists("HEAD.lock").await.unwrap());
+		assert!(!files.exists("HEAD").await.unwrap());
+
+		files.release();
+		for _ in 0..50 {
+			tokio::task::yield_now().await;
+			if !files.exists("HEAD.lock").await.unwrap() {
+				break;
+			}
+		}
+		assert_eq!(store.resolve_head().await.unwrap(), Some(target));
+		assert!(!files.exists("HEAD.lock").await.unwrap());
 	}
 
 	/// Cancellation invariant: `finish_checkout` moves the `HEAD.lock` into its owned worker, so dropping

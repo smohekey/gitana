@@ -20,7 +20,9 @@ tokio = { workspace = true, features = ["io-util"] }
 # backs the per-path CAS mutex. On wasm the backend is `std::fs` and the store runs the
 # sync calls directly (single-threaded), carrying no tokio runtime.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cap-fs-ext.workspace = true
 cap-std.workspace = true
+gitana-fs-native.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
 
 [target.'cfg(windows)'.dependencies]

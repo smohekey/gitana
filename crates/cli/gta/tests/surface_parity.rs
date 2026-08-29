@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// clap-mcp injects these top-level arguments on `gta-mcp` only (to select stdio/HTTP serving).
+/// The MCP bridge adds these top-level arguments on `gta-mcp` only (to select stdio/HTTP serving).
 /// They are not part of the shared command surface.
 const MCP_ONLY_ARG_IDS: &[&str] = &["mcp", "mcp-http"];
 
@@ -149,7 +149,11 @@ impl GroupSpec {
 		// `ArgGroup::is_multiple` takes `&mut self`, so probe it on a clone.
 		let mut multiple_probe = group.clone();
 		GroupSpec {
-			args: group.get_args().map(|id| id.as_str().to_owned()).collect(),
+			args: group
+				.get_args()
+				.filter(|id| !MCP_ONLY_ARG_IDS.contains(&id.as_str()))
+				.map(|id| id.as_str().to_owned())
+				.collect(),
 			required: group.is_required_set(),
 			multiple: multiple_probe.is_multiple(),
 		}

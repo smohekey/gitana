@@ -3,6 +3,8 @@
 //! for `gta`, named for `gta-mcp`) and call into the `commands` here, which drive the
 //! gitana engine and working tree in-process and print their results to stdout.
 
+mod clone_destination;
+mod command_context;
 pub mod commands;
 mod credential;
 mod dispatch;
@@ -16,11 +18,15 @@ mod repo;
 mod shallow;
 mod signer;
 mod ssh;
+mod submodule_configuration;
+mod submodule_transfer;
 mod url_rewrite;
 
+pub(crate) use clone_destination::CloneDestination;
+pub use command_context::CommandContext;
 pub use credential::{CliCredentialProvider, transport_for};
 pub use error::{AddAdvisory, MergeConflict, SilentExit};
-pub use git_config::with_command_cwd;
+pub use git_config::{validate_command_config, with_command_config, with_command_cwd};
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
 pub use gitana_worktree::LsFilesOptions;
 pub use prompt::with_terminal_prompts_disabled;

@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_porcelain::Identity;
 use gitana_remote::{
-	self as transport, Connection, HttpPackFetcher, PackFetcher, RemoteUrl, SshConnection,
-	SshPackFetcher,
+	self as transport, Connection, HttpPackFetcher, LocalConnection, LocalPackFetcher, PackFetcher,
+	RemoteUrl, SshConnection, SshPackFetcher,
 };
 use gitana_repository::HeadState;
 use gitana_worktree::WorkTree;
@@ -17,7 +17,7 @@ use crate::commands::merge;
 use crate::dispatch;
 use crate::identity::CliIdentity;
 use crate::signer;
-use crate::{git_config, repo, transport_for, url_rewrite};
+use crate::{CommandContext, git_config, repo, transport_for, url_rewrite};
 
 /// Pull `HEAD`'s branch from the origin.
 pub async fn run(cwd: &Path) -> Result<()> {
@@ -26,6 +26,13 @@ pub async fn run(cwd: &Path) -> Result<()> {
 	let config = git_config::from_repo(&found.git_dir, &found.common_dir).await?;
 	let url = url_rewrite::resolve_fetch_url(&config, "origin")?;
 	let remote = RemoteUrl::parse(&url)?;
+	if let Some(command) = CommandContext::current() {
+		command.authorize(
+			&config,
+			&remote,
+			gitana_remote::ProtocolContext::UserInitiated,
+		)?;
+	}
 	// A credential-free form for the "Fetched from" line and the merge commit message — *all* userinfo
 	// stripped (a token can occupy the username field), so no credential can reach a persisted commit.
 	// The raw `url` is only for the auth-bearing transport parse above.
@@ -50,6 +57,39 @@ pub async fn run(cwd: &Path) -> Result<()> {
 			let body = connection.advertisement().to_vec();
 			let mut fetcher = SshPackFetcher::new(connection);
 			pull_dispatch(&mut fetcher, &found, &body, &display, cwd).await
+		}
+		RemoteUrl::Local(path) => {
+			let source = {
+				let path = std::path::PathBuf::from(path);
+				if path.is_absolute() {
+					path
+				} else {
+					askpass_cwd.join(path)
+				}
+			};
+			let source_layout = repo::inspect_root(&source).await?;
+			match dispatch::detect_algorithm(&source_layout.common_dir)? {
+				HashKind::Sha1 => {
+					let source =
+						repo::open_generic::<Sha1>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let connection = LocalConnection::open(source).await?;
+					let body = connection.advertisement().to_vec();
+					let source =
+						repo::open_generic::<Sha1>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let mut fetcher = LocalPackFetcher::new(source);
+					pull_dispatch(&mut fetcher, &found, &body, &display, cwd).await
+				}
+				HashKind::Sha256 => {
+					let source =
+						repo::open_generic::<Sha256>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let connection = LocalConnection::open(source).await?;
+					let body = connection.advertisement().to_vec();
+					let source =
+						repo::open_generic::<Sha256>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let mut fetcher = LocalPackFetcher::new(source);
+					pull_dispatch(&mut fetcher, &found, &body, &display, cwd).await
+				}
+			}
 		}
 	}
 }
@@ -85,10 +125,11 @@ async fn pull_into<H: HashAlgorithm>(
 		.clone()
 		.context("cannot pull in a bare repository")?;
 	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir).await?;
-	let worktree = WorkTree::new(
+	let worktree = WorkTree::new_located(
 		repository,
 		repo::open_work_dir(&work)?,
 		found.git_dir.clone(),
+		work,
 	);
 
 	// Every branch checked out in a worktree. `update_head_ok` below exempts only *this* worktree's

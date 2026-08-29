@@ -2,7 +2,11 @@
 //! target exists so the clap command tree can be introspected by the `gta`/`gta-mcp` surface-parity
 //! test. It is not used by the binary itself.
 
+#[allow(dead_code)]
 mod cli;
+#[cfg(test)]
+#[allow(dead_code)]
+mod mcp_bridge;
 
 use clap::CommandFactory;
 

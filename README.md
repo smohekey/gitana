@@ -94,8 +94,10 @@ Major gaps:
 - `gta rebase <upstream> [--onto <newbase>]` replays the branch's commits onto a
   new base (linear histories only), with `--continue` / `--skip` / `--abort`.
   Non-interactive: no `-i`, autosquash, or `--rebase-merges`.
-- There is no interactive rebase, stash, blame, bisect, submodule, or hook
-  support.
+- `gta submodule status` / `init` / `update` implement one-level consumer operations. Nested
+  recursion, clone-time recursion, and the `merge`, `rebase`, or custom-command update strategies
+  are not yet supported.
+- There is no interactive rebase, stash, blame, bisect, or hook support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
 - Sparse-checkout (`gta sparse-checkout init/set/add/list/disable/reapply`, and `clone --sparse`),
@@ -121,7 +123,8 @@ Major gaps:
   and the port flag follows the variant (`GIT_SSH_VARIANT` / `ssh.variant` / basename:
   `-p` for OpenSSH, `-P` for the PuTTY family). `fetch`/`pull` run git's stateful
   `multi_ack_detailed` negotiation over the ssh stream; `push` (including `--signed`)
-  sends receive-pack over it. Other URL schemes (`git://`, `file://`) are unsupported.
+  sends receive-pack over it. Local paths and `file://` URLs are supported for clone, fetch, pull,
+  and submodule transfers; local push and the `git://` scheme are unsupported.
 - Object storage now uses pack `.idx` and a multi-pack-index for lookup. `gta repack`
   consolidates into size-bounded packs (honoring `pack.packSizeLimit`); `gta gc` prunes,
   repacks *incrementally* (git's geometric strategy — keeping the large packs, as does
@@ -183,6 +186,8 @@ Implemented command groups:
   or the main worktree. `move`/`remove` refuse a worktree holding an initialized submodule, and
   `worktree.useRelativePaths` pointers are preserved across a move/repair. The result is byte-for-byte
   git's layout, so stock git reads and operates in a gta-created worktree.
+- Submodules: `submodule status`, `submodule init`, and `submodule update [--init]` for one level of
+  tracked consumer modules.
 - Repository setup: `config`, scoped like git — `--local` (the repository `.git/config`, the default
   for writes), `--global` (`$GIT_CONFIG_GLOBAL`, else `~/.gitconfig` / the XDG file), and `--system`
   (`$GIT_CONFIG_SYSTEM`, else `/etc/gitconfig`). An unscoped read resolves across git's whole
@@ -207,7 +212,8 @@ Implemented command groups:
   the OpenSSH/PuTTY variant) to invoke `git-upload-pack` / `git-receive-pack` on the remote — a
   dash-leading host/path is refused (git's CVE-2017-1000117 guard). `fetch`/`pull` run git's stateful
   `multi_ack_detailed` negotiation over the ssh stream; `push` (and `push --signed`) sends receive-pack
-  over it.
+  over it. Clone, fetch, and pull also support local repository paths and `file://` URLs; pushing to a
+  local filesystem remote is not yet supported.
 - HTTP authentication, matching git's credential flow: a remote that answers `401 WWW-Authenticate:
   Basic` is retried once with an `Authorization: Basic` header. Credentials resolve in git's order —
   URL userinfo (`https://user:pass@host`, with the password kept out of the saved `remote.origin.url`),
@@ -262,6 +268,8 @@ Implemented command groups:
 - `crates/core/gitana-repository`: Repository semantics over objects and refs.
 - `crates/core/gitana-worktree`: Git index, worktree scanning, status, add,
   checkout, and diff support.
+- `crates/core/gitana-submodule`: One-level submodule declaration, status, initialization, update,
+  and crash-recovery state machines over injected configuration and transport capabilities.
 - `crates/core/gitana-config`: Git config parser.
 - `crates/core/gitana-diff`: Myers line diff and diff3 three-way line merge.
 - `crates/core/gitana-git-http`: Transport-agnostic Smart HTTP protocol helpers.

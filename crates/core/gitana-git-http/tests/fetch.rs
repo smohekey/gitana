@@ -165,6 +165,160 @@ async fn v0_upload_pack_returns_nak_then_pack() {
 	assert!(objects.iter().any(|o| o.id == commit));
 }
 
+#[tokio::test]
+async fn v0_and_v2_propagate_a_source_shallow_boundary_with_retained_parents() {
+	let (repo, hidden, boundary, _) = repo_with_two_big_commits().await;
+	let blob = repo.write_blob(b"tip\n").await.expect("tip blob");
+	let tree = repo
+		.write_tree(&[TreeBuildEntry {
+			path: "file.txt".to_owned(),
+			mode: FileMode::Regular,
+			id: blob,
+		}])
+		.await
+		.expect("tip tree");
+	let tip = repo
+		.commit_on_head(tree, "A <a@x> 3 +0000", "A <a@x> 3 +0000", "tip\n")
+		.await
+		.expect("tip commit");
+	// Keep the parent object present deliberately. The shallow file, not object absence, is the source
+	// of truth for what upload-pack may advertise and traverse.
+	repo
+		.write_shallow(&[boundary])
+		.await
+		.expect("mark source shallow");
+	assert!(repo.objects().exists_object(&hidden).await.unwrap());
+
+	let mut hidden_v2_request = pkt("command=fetch\n");
+	hidden_v2_request.extend_from_slice(b"0001");
+	hidden_v2_request.extend_from_slice(&pkt(&format!("want {hidden}\n")));
+	hidden_v2_request.extend_from_slice(&pkt("done\n"));
+	hidden_v2_request.extend_from_slice(b"0000");
+	let hidden_v2_error = fetch(&repo, &hidden_v2_request)
+		.await
+		.expect_err("v2 must reject a retained commit below the source boundary");
+	assert!(
+		hidden_v2_error
+			.to_string()
+			.contains("not reachable within the source repository's shallow boundary")
+	);
+
+	let mut hidden_v0_request = pkt(&format!("want {hidden} side-band-64k ofs-delta\n"));
+	hidden_v0_request.extend_from_slice(b"0000");
+	hidden_v0_request.extend_from_slice(&pkt("done\n"));
+	let hidden_v0_error = upload_pack_v0(&repo, &hidden_v0_request)
+		.await
+		.expect_err("v0 must reject a retained commit below the source boundary");
+	assert!(
+		hidden_v0_error
+			.to_string()
+			.contains("not reachable within the source repository's shallow boundary")
+	);
+
+	let mut v2_request = pkt("command=fetch\n");
+	v2_request.extend_from_slice(b"0001");
+	v2_request.extend_from_slice(&pkt(&format!("want {tip}\n")));
+	v2_request.extend_from_slice(&pkt("done\n"));
+	v2_request.extend_from_slice(b"0000");
+	let v2 = fetch(&repo, &v2_request)
+		.await
+		.expect("v2 shallow-source fetch");
+	let v2_lines = pkt_lines(&v2);
+	assert!(v2_lines.iter().any(|line| line == b"shallow-info\n"));
+	assert!(
+		v2_lines
+			.iter()
+			.any(|line| line == format!("shallow {boundary}\n").as_bytes())
+	);
+	let v2_objects = decode_pack::<Sha256>(&extract_pack(&v2)).expect("decode v2 pack");
+	assert!(v2_objects.iter().any(|object| object.id == tip));
+	assert!(v2_objects.iter().any(|object| object.id == boundary));
+	assert!(!v2_objects.iter().any(|object| object.id == hidden));
+
+	// A complete client that offers the source boundary already owns its hidden parent history. The
+	// boundary still caps this response's walk, but must not be persisted as new client shallowness.
+	let mut complete_v2_request = pkt("command=fetch\n");
+	complete_v2_request.extend_from_slice(b"0001");
+	complete_v2_request.extend_from_slice(&pkt(&format!("want {tip}\n")));
+	complete_v2_request.extend_from_slice(&pkt(&format!("have {boundary}\n")));
+	complete_v2_request.extend_from_slice(&pkt("done\n"));
+	complete_v2_request.extend_from_slice(b"0000");
+	let complete_v2 = fetch(&repo, &complete_v2_request)
+		.await
+		.expect("v2 fetch from a shallow source into a complete client");
+	assert!(
+		!pkt_lines(&complete_v2)
+			.iter()
+			.any(|line| line == format!("shallow {boundary}\n").as_bytes())
+	);
+
+	let phantom = ObjectId::<Sha256>::compute(gitana_object::ObjectKind::Commit, b"absent");
+	let mut v0_probe = pkt(&format!(
+		"want {tip} multi_ack_detailed side-band-64k ofs-delta\n"
+	));
+	v0_probe.extend_from_slice(b"0000");
+	v0_probe.extend_from_slice(&pkt(&format!("have {phantom}\n")));
+	v0_probe.extend_from_slice(b"0000");
+	let probe = upload_pack_v0(&repo, &v0_probe)
+		.await
+		.expect("v0 shallow-source negotiation probe");
+	let probe_lines = pkt_lines(&probe);
+	assert!(probe_lines.iter().any(|line| line == b"NAK\n"));
+	assert!(extract_pack_v0(&probe).is_empty());
+
+	let mut v0_ready = pkt(&format!(
+		"want {tip} multi_ack_detailed side-band-64k ofs-delta\n"
+	));
+	v0_ready.extend_from_slice(b"0000");
+	v0_ready.extend_from_slice(&pkt(&format!("have {boundary}\n")));
+	v0_ready.extend_from_slice(b"0000");
+	let ready = upload_pack_v0(&repo, &v0_ready)
+		.await
+		.expect("v0 shallow-source ready negotiation round");
+	let ready_lines = pkt_lines(&ready);
+	assert!(
+		ready_lines
+			.iter()
+			.any(|line| line == format!("ACK {boundary} common\n").as_bytes())
+	);
+	assert!(
+		ready_lines
+			.iter()
+			.any(|line| line == format!("ACK {boundary} ready\n").as_bytes())
+	);
+	assert!(extract_pack_v0(&ready).is_empty());
+
+	let mut v0_request = pkt(&format!("want {tip} side-band-64k ofs-delta\n"));
+	v0_request.extend_from_slice(b"0000");
+	v0_request.extend_from_slice(&pkt("done\n"));
+	let v0 = upload_pack_v0(&repo, &v0_request)
+		.await
+		.expect("v0 shallow-source fetch");
+	let v0_lines = pkt_lines(&v0);
+	assert!(
+		v0_lines
+			.iter()
+			.any(|line| line == format!("shallow {boundary}\n").as_bytes())
+	);
+	let v0_objects = decode_pack::<Sha256>(&extract_pack_v0(&v0)).expect("decode v0 pack");
+	assert!(v0_objects.iter().any(|object| object.id == tip));
+	assert!(v0_objects.iter().any(|object| object.id == boundary));
+	assert!(!v0_objects.iter().any(|object| object.id == hidden));
+
+	let mut complete_v0_request = pkt(&format!("want {tip} side-band-64k ofs-delta\n"));
+	complete_v0_request.extend_from_slice(b"0000");
+	complete_v0_request.extend_from_slice(&pkt(&format!("have {boundary}\n")));
+	complete_v0_request.extend_from_slice(&pkt("done\n"));
+	let complete_v0 = upload_pack_v0(&repo, &complete_v0_request)
+		.await
+		.expect("v0 fetch from a shallow source into a complete client");
+	assert!(
+		!pkt_lines(&complete_v0)
+			.iter()
+			.any(|line| line == format!("shallow {boundary}\n").as_bytes())
+	);
+}
+
 /// Reassemble the side-band pack from a v0 response (NAK then channel-1 lines).
 fn extract_pack_v0(body: &[u8]) -> Vec<u8> {
 	let mut pack = Vec::new();

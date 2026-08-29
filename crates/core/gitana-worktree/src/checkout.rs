@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use gitana_file_store::FileStore;
-use gitana_file_store_local::WorkDirFs;
+use gitana_file_store_local::{PopulationEntry, WorkDirFs};
 use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::CheckoutMode;
@@ -557,6 +557,223 @@ where
 			Err(error)
 		}
 	}
+}
+
+/// Authoritatively build an index and materialise `tree` by additions only. This is deliberately
+/// separate from Reset: a retained/recovery mount may need every target path restored even when its
+/// old index already matches, but content appearing concurrently must never be unlinked or truncated.
+pub(crate) async fn populate<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	tree: ObjectId<H>,
+) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	let target = wt.repository().read_tree(tree).await?;
+	let sparse = wt.sparse_checkout().await?;
+	let lock = wt.lock_index().await?;
+	let mut index = wt.load_index().await?;
+	let prior: HashMap<String, IndexEntry<H>> = index
+		.entries
+		.iter()
+		.filter(|entry| entry.stage == 0)
+		.map(|entry| (entry.path.clone(), entry.clone()))
+		.collect();
+	index.entries.clear();
+
+	let mut expected = HashMap::new();
+	let mut directories = HashSet::new();
+	let mut opaque = HashSet::new();
+	let result = async {
+		for (path, mode, oid) in &target {
+			validate_path(path)?;
+			let prior = prior.get(path);
+			let excluded = match sparse.as_ref() {
+				Some(matcher) => !matcher.includes(path),
+				None => prior.is_some_and(|entry| entry.skip_worktree),
+			};
+			let stat = if excluded {
+				crate::Stat::default()
+			} else {
+				populate_entry(wt, path, mode, *oid).await?;
+				let meta = wt.work().lstat(path)?.ok_or_else(|| {
+					std::io::Error::new(std::io::ErrorKind::NotFound, "populated entry is missing")
+				})?;
+				for parent in path_parents(path) {
+					directories.insert(parent);
+				}
+				if mode == "160000" {
+					directories.insert(path.clone());
+					opaque.insert(path.clone());
+				} else {
+					expected.insert(path.clone(), (mode.clone(), *oid));
+				}
+				stat_of(&meta)
+			};
+			index.upsert(IndexEntry {
+				stat,
+				mode: u32::from_str_radix(mode, 8).unwrap_or(0o100644),
+				oid: *oid,
+				stage: 0,
+				assume_valid: prior.is_some_and(|entry| entry.assume_valid),
+				skip_worktree: excluded,
+				intent_to_add: false,
+				path: path.clone(),
+			});
+		}
+
+		verify_population(wt, "", &expected, &directories, &opaque)?;
+		for (path, (mode, oid)) in &expected {
+			if !population_entry_matches(wt, path, mode, *oid)? {
+				return Err(WorktreeError::UntrackedOverwrite(path.clone()));
+			}
+		}
+		for path in &directories {
+			if !matches!(wt.work().lstat(path)?, Some(meta) if meta.kind.is_dir()) {
+				return Err(WorktreeError::UntrackedOverwrite(path.clone()));
+			}
+		}
+		Ok(())
+	}
+	.await;
+
+	match result {
+		Ok(()) => wt.commit_index(lock, &index).await,
+		Err(error) => {
+			// Population only adds reconstructable target content and never removes or replaces a path.
+			// A partial result is therefore safe to retry, and must not strand index.lock.
+			wt.release_index_lock(lock).await;
+			Err(error)
+		}
+	}
+}
+
+async fn populate_entry<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	path: &str,
+	mode: &str,
+	oid: ObjectId<H>,
+) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	if mode == "160000" {
+		match wt.work().lstat(path)? {
+			Some(meta) if meta.kind.is_dir() => return Ok(()),
+			Some(_) => return Err(WorktreeError::UntrackedOverwrite(path.to_owned())),
+			None => match wt.work().populate_new(path, PopulationEntry::Directory)? {
+				true => return Ok(()),
+				false => {
+					if matches!(wt.work().lstat(path)?, Some(meta) if meta.kind.is_dir()) {
+						return Ok(());
+					}
+					return Err(WorktreeError::UntrackedOverwrite(path.to_owned()));
+				}
+			},
+		}
+	}
+
+	if wt.work().lstat(path)?.is_some() {
+		return if population_entry_matches(wt, path, mode, oid)? {
+			Ok(())
+		} else {
+			Err(WorktreeError::UntrackedOverwrite(path.to_owned()))
+		};
+	}
+	let content = wt.repository().read_blob(oid).await?;
+	let entry = if mode == "120000" {
+		PopulationEntry::Symlink(&content)
+	} else {
+		PopulationEntry::Regular {
+			bytes: &content,
+			executable: mode == "100755",
+		}
+	};
+	match wt.work().populate_new(path, entry)? {
+		true => Ok(()),
+		false => Err(WorktreeError::UntrackedOverwrite(path.to_owned())),
+	}
+}
+
+fn population_entry_matches<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	path: &str,
+	mode: &str,
+	oid: ObjectId<H>,
+) -> Result<bool, WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	let Some(meta) = wt.work().lstat(path)? else {
+		return Ok(false);
+	};
+	let expected_mode = u32::from_str_radix(mode, 8).unwrap_or(0);
+	let mode_matches =
+		population_mode_matches(&meta, expected_mode, wt.work().uses_symlink_placeholders());
+	Ok(matches!(
+		blob_of(wt.work(), path, &meta)?,
+		Some((actual, _)) if actual == oid && mode_matches
+	))
+}
+
+fn population_mode_matches(
+	meta: &gitana_file_store_local::Meta,
+	expected_mode: u32,
+	uses_symlink_placeholders: bool,
+) -> bool {
+	effective_mode(meta, expected_mode) == expected_mode
+		|| (expected_mode == 0o120000 && uses_symlink_placeholders && meta.kind.is_file())
+}
+
+fn verify_population<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	directory: &str,
+	expected: &HashMap<String, (String, ObjectId<H>)>,
+	directories: &HashSet<String>,
+	opaque: &HashSet<String>,
+) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	for entry in wt.work().read_dir(directory)? {
+		let path = if directory.is_empty() {
+			entry.name
+		} else {
+			format!("{directory}/{}", entry.name)
+		};
+		if directory.is_empty() && path == ".git" {
+			continue;
+		}
+		if expected.contains_key(&path) {
+			continue;
+		}
+		if directories.contains(&path) && entry.kind.is_dir() {
+			if !opaque.contains(&path) {
+				verify_population(wt, &path, expected, directories, opaque)?;
+			}
+			continue;
+		}
+		return Err(WorktreeError::UntrackedOverwrite(path));
+	}
+	Ok(())
+}
+
+fn path_parents(path: &str) -> Vec<String> {
+	let mut parents = Vec::new();
+	let mut current = path;
+	while let Some((parent, _)) = current.rsplit_once('/') {
+		parents.push(parent.to_owned());
+		current = parent;
+	}
+	parents
 }
 
 /// git's two-tree merge (`read-tree -m -u`) from `head` to `target`: touch only the paths that differ
@@ -1959,5 +2176,34 @@ fn remove_empty_parents<W: WorkDirFs>(work: &W, path: &str) {
 		if work.remove_dir(&dir).is_err() {
 			break;
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use gitana_file_store_local::{FileKind, Meta};
+
+	use super::population_mode_matches;
+
+	fn meta(kind: FileKind) -> Meta {
+		Meta {
+			kind,
+			size: 0,
+			mtime: (0, 0),
+			ctime: (0, 0),
+			mode: 0,
+			dev: 0,
+			ino: 0,
+			uid: 0,
+			gid: 0,
+		}
+	}
+
+	#[test]
+	fn population_accepts_a_backend_symlink_placeholder_only_for_symlink_entries() {
+		let file = meta(FileKind::File);
+		assert!(population_mode_matches(&file, 0o120000, true));
+		assert!(!population_mode_matches(&file, 0o120000, false));
+		assert!(!population_mode_matches(&file, 0o040000, true));
 	}
 }

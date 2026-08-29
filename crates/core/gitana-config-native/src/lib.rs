@@ -19,11 +19,22 @@
 //! *scoped* single-file read (`--global`/`--system`/`--local`) does **not** expand includes, matching
 //! git.
 
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
+use std::io::{ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_std::{
+	ambient_authority,
+	fs::{Dir, OpenOptions},
+};
 use gitana_config::{ConfigError, GitConfig, GitConfigSource, IncludeContext, IncludeResolver};
+use gitana_fs_native::{
+	EntryIdentity, file_identity, remove_file_if_identity, rename_noreplace_if_identity,
+	replace_if_identities,
+};
 use tokio::io::AsyncWriteExt;
 
 tokio::task_local! {
@@ -32,6 +43,11 @@ tokio::task_local! {
 	/// resolves against it, matching git — which resolves such overrides against the directory it runs
 	/// in, not the process's launch directory.
 	static COMMAND_CWD: PathBuf;
+
+	/// Command-line `-c <key>=<value>` overrides in command-line order. These are installed at the
+	/// frontend boundary so every in-process operation, including a nested submodule transfer, sees
+	/// the same command-scope configuration.
+	static COMMAND_CONFIG: Vec<String>;
 }
 
 /// Run `future` with `cwd` established as the command's working directory (see [`COMMAND_CWD`]). The
@@ -47,6 +63,15 @@ pub async fn with_command_cwd<F: Future>(cwd: PathBuf, future: F) -> F::Output {
 /// since gitana records `-C` in this task-local rather than changing the process cwd.
 pub fn command_cwd() -> Option<PathBuf> {
 	COMMAND_CWD.try_with(|cwd| cwd.clone()).ok()
+}
+
+/// Run `future` with the command's `-c` overrides installed.
+pub async fn with_command_config<F: Future>(entries: Vec<String>, future: F) -> F::Output {
+	COMMAND_CONFIG.scope(entries, future).await
+}
+
+fn command_config() -> Vec<String> {
+	COMMAND_CONFIG.try_with(Clone::clone).unwrap_or_default()
 }
 
 /// Which git configuration file a scoped `config` operation targets.
@@ -78,9 +103,11 @@ pub async fn from_repo(git_dir: &Path, common: &Path) -> Result<GitConfig> {
 	let gitdir_absolute = logical_gitdir(&gitdir).await;
 	let branch = head_branch(git_dir).await;
 	let mut base = global_and_system_layers().await?;
+	let repository_start = base.len();
 	base.push(local_layer(common).await?);
 	assemble_merged(
 		base,
+		Some(repository_start),
 		Some(&gitdir),
 		gitdir_absolute.as_deref(),
 		branch.as_deref(),
@@ -114,6 +141,7 @@ pub async fn for_worktree(common: &Path, git_dir: &Path) -> Result<GitConfig> {
 		.get_bool_validated("extensions", None, "worktreeconfig")?
 		.unwrap_or(false);
 	let mut base = global_and_system_layers().await?;
+	let repository_start = base.len();
 	base.push(local);
 	if worktree_config
 		&& let Some(worktree_layer) = read_layer(&git_dir.join("config.worktree")).await?
@@ -123,6 +151,48 @@ pub async fn for_worktree(common: &Path, git_dir: &Path) -> Result<GitConfig> {
 	let gitdir_absolute = logical_gitdir(&gitdir).await;
 	assemble_merged(
 		base,
+		Some(repository_start),
+		Some(&gitdir),
+		gitdir_absolute.as_deref(),
+		branch.as_deref(),
+	)
+	.await
+}
+
+/// The effective configuration for an invoking worktree whose repository directories are already
+/// open. Repository-owned layers are read through those retained capabilities; the paths are used
+/// only for Git's include-condition and relative-include semantics and for diagnostics. System,
+/// global, command-scope, and explicitly included files remain native ambient configuration inputs.
+pub async fn for_worktree_at(
+	common: Dir,
+	git_dir: Dir,
+	common_path: &Path,
+	git_dir_path: &Path,
+) -> Result<GitConfig> {
+	let branch = head_branch_at(&git_dir);
+	let local = local_layer_at(common.try_clone()?, common_path, Path::new("config")).await?;
+	let worktree_config = local
+		.source
+		.get_bool_validated("extensions", None, "worktreeconfig")?
+		.unwrap_or(false);
+	let mut base = global_and_system_layers().await?;
+	let repository_start = base.len();
+	base.push(local);
+	if worktree_config
+		&& let Some(worktree_layer) = read_layer_at(
+			git_dir,
+			&git_dir_path.join("config.worktree"),
+			Path::new("config.worktree"),
+		)
+		.await?
+	{
+		base.push(worktree_layer);
+	}
+	let gitdir = git_dir_path.to_owned();
+	let gitdir_absolute = logical_gitdir(&gitdir).await;
+	assemble_merged(
+		base,
+		Some(repository_start),
 		Some(&gitdir),
 		gitdir_absolute.as_deref(),
 		branch.as_deref(),
@@ -154,6 +224,16 @@ pub fn ensure_count_valid() -> Result<()> {
 	env_config_source().map(|_| ())
 }
 
+/// Validate command-line `-c key[=value]` entries before dispatch. This keeps malformed input from
+/// reaching a mutating command before the effective configuration is first read.
+pub fn validate_command_config(entries: &[String]) -> Result<()> {
+	for entry in entries {
+		let key = entry.split_once('=').map_or(entry.as_str(), |(key, _)| key);
+		parse_env_key(key)?;
+	}
+	Ok(())
+}
+
 /// The ambient effective config — the global and system layers with no repository — for an unscoped
 /// read run outside a repository, and the config a `clone` resolves credentials from before a checkout
 /// exists. Stock `git config <key>` resolves from this stack when there is no repo; only an unscoped
@@ -161,7 +241,7 @@ pub fn ensure_count_valid() -> Result<()> {
 /// `gitdir:`/`onbranch:` conditions never match, but `hasconfig:remote.*.url:` can still match a
 /// global/system remote URL.
 pub async fn from_ambient() -> Result<GitConfig> {
-	assemble_merged(global_and_system_layers().await?, None, None, None).await
+	assemble_merged(global_and_system_layers().await?, None, None, None, None).await
 }
 
 /// The single file an explicit `config --global` / `--system` operation reads and writes (git scopes
@@ -233,6 +313,551 @@ pub async fn write_file(path: &Path, config: &GitConfig) -> Result<()> {
 	Ok(())
 }
 
+/// Atomically read-modify-write one config file while holding its Git-style lock. The symlink target
+/// is resolved before the lock is acquired, then the latest target contents are read under that lock
+/// so an independent writer cannot be lost. The blocking worker owns the lock transaction through
+/// rename; cancelling the awaiting future can neither strand the lock nor release it early.
+pub async fn edit_file<T, F>(path: &Path, edit: F) -> Result<T>
+where
+	T: Send + 'static,
+	F: FnOnce(&mut GitConfig) -> Result<T> + Send + 'static,
+{
+	let path = path.to_owned();
+	tokio::task::spawn_blocking(move || edit_file_sync(&path, edit))
+		.await
+		.map_err(|error| anyhow!("config edit worker failed: {error}"))?
+}
+
+/// Atomically edit a config file reached from an already-open directory capability.
+///
+/// The final target parent remains open through lock creation, reread, identity-conditioned
+/// publication, and directory sync.
+/// Replacing the ambient spelling of `directory` therefore cannot redirect the transaction. A
+/// symlinked config is resolved from the pinned directory and its target is edited without replacing
+/// the link, including relative targets that leave the original directory through `..`.
+pub async fn edit_file_at<T, F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	edit: F,
+) -> Result<T>
+where
+	T: Send + 'static,
+	F: FnOnce(&mut GitConfig) -> Result<T> + Send + 'static,
+{
+	let path = path.to_owned();
+	let display_path = display_path.to_owned();
+	tokio::task::spawn_blocking(move || edit_file_at_sync(directory, &path, &display_path, edit))
+		.await
+		.map_err(|error| anyhow!("config edit worker failed: {error}"))?
+}
+
+/// The exact config target and entry identity published by a tracked capability-relative edit.
+///
+/// The fields are deliberately private: callers can only consume the token through
+/// [`edit_file_at_if_current`], which reuses the retained target directory and symlink chain.
+pub struct ConfigPublication {
+	pinned: PinnedConfig,
+	identity: EntryIdentity,
+}
+
+/// Atomically edit a capability-relative config file and return a token for the exact publication.
+pub async fn edit_file_at_tracked<T, F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	edit: F,
+) -> Result<(T, ConfigPublication)>
+where
+	T: Send + 'static,
+	F: FnOnce(&mut GitConfig) -> Result<T> + Send + 'static,
+{
+	let path = path.to_owned();
+	let display_path = display_path.to_owned();
+	tokio::task::spawn_blocking(move || {
+		edit_file_at_tracked_sync(directory, &path, &display_path, edit)
+	})
+	.await
+	.map_err(|error| anyhow!("tracked config edit worker failed: {error}"))?
+}
+
+/// Edit the exact config target named by `publication`, refusing a replacement inode or symlink.
+pub async fn edit_file_at_if_current<T, F>(
+	publication: ConfigPublication,
+	display_path: &Path,
+	edit: F,
+) -> Result<T>
+where
+	T: Send + 'static,
+	F: FnOnce(&mut GitConfig) -> Result<T> + Send + 'static,
+{
+	let display_path = display_path.to_owned();
+	tokio::task::spawn_blocking(move || {
+		edit_file_at_if_current_sync(publication, &display_path, edit)
+	})
+	.await
+	.map_err(|error| anyhow!("conditional config edit worker failed: {error}"))?
+}
+
+/// Read one optional configuration file through an already-open directory capability. Supported
+/// config symlinks are followed explicitly, and every followed link plus the final entry is
+/// revalidated before the bytes are returned.
+pub async fn read_file_at(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+) -> Result<Option<Vec<u8>>> {
+	let path = path.to_owned();
+	let display_path = display_path.to_owned();
+	tokio::task::spawn_blocking(move || read_file_at_sync(directory, &path, &display_path))
+		.await
+		.map_err(|error| anyhow!("config read worker failed: {error}"))?
+}
+
+struct PinnedConfigTarget {
+	directory: Dir,
+	name: OsString,
+}
+
+struct PinnedConfig {
+	target: PinnedConfigTarget,
+	symlinks: Vec<PinnedConfigSymlink>,
+}
+
+struct PinnedConfigSymlink {
+	directory: Dir,
+	name: OsString,
+	identity: EntryIdentity,
+	target: PathBuf,
+}
+
+enum ConfigTargetState {
+	Missing,
+	File {
+		identity: EntryIdentity,
+		permissions: cap_std::fs::Permissions,
+	},
+}
+
+fn edit_file_at_sync<T, F>(directory: Dir, path: &Path, display_path: &Path, edit: F) -> Result<T>
+where
+	F: FnOnce(&mut GitConfig) -> Result<T>,
+{
+	Ok(edit_file_at_tracked_sync(directory, path, display_path, edit)?.0)
+}
+
+fn edit_file_at_tracked_sync<T, F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	edit: F,
+) -> Result<(T, ConfigPublication)>
+where
+	F: FnOnce(&mut GitConfig) -> Result<T>,
+{
+	let pinned = pin_config_target(directory, path)?;
+	edit_pinned_config(pinned, None, display_path, edit)
+}
+
+fn edit_file_at_if_current_sync<T, F>(
+	publication: ConfigPublication,
+	display_path: &Path,
+	edit: F,
+) -> Result<T>
+where
+	F: FnOnce(&mut GitConfig) -> Result<T>,
+{
+	let expected = publication.identity;
+	Ok(edit_pinned_config(publication.pinned, Some(expected), display_path, edit)?.0)
+}
+
+fn edit_pinned_config<T, F>(
+	pinned: PinnedConfig,
+	expected: Option<EntryIdentity>,
+	display_path: &Path,
+	edit: F,
+) -> Result<(T, ConfigPublication)>
+where
+	F: FnOnce(&mut GitConfig) -> Result<T>,
+{
+	struct LockCleanup {
+		directory: Dir,
+		name: OsString,
+		identity: EntryIdentity,
+		armed: bool,
+	}
+
+	impl Drop for LockCleanup {
+		fn drop(&mut self) {
+			if self.armed {
+				let _ = remove_file_if_identity(&self.directory, &self.name, self.identity);
+			}
+		}
+	}
+
+	let target = &pinned.target;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	let mut lock_name = target.name.clone();
+	lock_name.push(".lock");
+	let mut lock_options = OpenOptions::new();
+	lock_options.write(true).create_new(true);
+	#[cfg(windows)]
+	{
+		use cap_std::fs::OpenOptionsExt as _;
+		use windows_sys::Win32::Storage::FileSystem::{
+			FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+		};
+		lock_options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+	}
+	let mut lock_file = target
+		.directory
+		.open_with(&lock_name, &lock_options)
+		.map_err(|error| {
+			anyhow!(
+				"could not lock config file '{}': {error}",
+				display_path.display()
+			)
+		})?;
+	let lock_identity = file_identity(&lock_file)?;
+	let mut cleanup = LockCleanup {
+		directory: target.directory.try_clone()?,
+		name: lock_name.clone(),
+		identity: lock_identity,
+		armed: true,
+	};
+
+	let (mut config, state) = read_pinned_config_target(target, display_path)?;
+	if let Some(expected) = expected
+		&& !matches!(&state, ConfigTargetState::File { identity, .. } if *identity == expected)
+	{
+		return Err(anyhow!(
+			"config target changed after its tracked publication: {}",
+			display_path.display()
+		));
+	}
+	let result = edit(&mut config)?;
+	if let ConfigTargetState::File { permissions, .. } = &state {
+		let _ = target
+			.directory
+			.set_permissions(&lock_name, permissions.clone());
+	}
+	lock_file.write_all(config.render().as_bytes())?;
+	lock_file.sync_all()?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	ensure_config_target_unchanged(target, &state, display_path)?;
+	publish_config_target(target, &lock_name, lock_identity, &state, display_path)?;
+	drop(lock_file);
+	cleanup.armed = false;
+
+	#[cfg(not(windows))]
+	target.directory.try_clone()?.into_std_file().sync_all()?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	Ok((
+		result,
+		ConfigPublication {
+			pinned,
+			identity: lock_identity,
+		},
+	))
+}
+
+fn read_file_at_sync(directory: Dir, path: &Path, display_path: &Path) -> Result<Option<Vec<u8>>> {
+	let pinned = pin_config_target(directory, path)?;
+	let (bytes, state) = read_pinned_config_bytes(&pinned.target, display_path)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	ensure_config_target_unchanged(&pinned.target, &state, display_path)?;
+	Ok(bytes)
+}
+
+fn read_pinned_config_target(
+	target: &PinnedConfigTarget,
+	display_path: &Path,
+) -> Result<(GitConfig, ConfigTargetState)> {
+	let (bytes, state) = read_pinned_config_bytes(target, display_path)?;
+	let bytes = bytes.unwrap_or_default();
+	let text =
+		String::from_utf8(bytes).map_err(|_| anyhow!("{} is not UTF-8", display_path.display()))?;
+	Ok((GitConfig::parse(&text)?, state))
+}
+
+fn read_pinned_config_bytes(
+	target: &PinnedConfigTarget,
+	display_path: &Path,
+) -> Result<(Option<Vec<u8>>, ConfigTargetState)> {
+	let mut options = OpenOptions::new();
+	options.read(true).follow(FollowSymlinks::No);
+	let mut file = match target.directory.open_with(&target.name, &options) {
+		Ok(file) => file,
+		Err(error) if error.kind() == ErrorKind::NotFound => {
+			return Ok((None, ConfigTargetState::Missing));
+		}
+		Err(error) => return Err(anyhow!("reading {}: {error}", display_path.display())),
+	};
+	let metadata = file.metadata()?;
+	if !metadata.is_file() || metadata.file_type().is_symlink() {
+		return Err(anyhow!("{} is not a regular file", display_path.display()));
+	}
+	let state = ConfigTargetState::File {
+		identity: EntryIdentity::from_metadata(&metadata),
+		permissions: metadata.permissions(),
+	};
+	let mut bytes = Vec::new();
+	file.read_to_end(&mut bytes)?;
+	Ok((Some(bytes), state))
+}
+
+fn ensure_config_symlinks_unchanged(pinned: &PinnedConfig, display_path: &Path) -> Result<()> {
+	for link in &pinned.symlinks {
+		let metadata = link
+			.directory
+			.symlink_metadata(&link.name)
+			.map_err(|error| anyhow!("checking {}: {error}", display_path.display()))?;
+		let current = EntryIdentity::from_metadata(&metadata);
+		if !metadata.file_type().is_symlink()
+			|| current != link.identity
+			|| link.directory.read_link_contents(&link.name)? != link.target
+		{
+			return Err(anyhow!(
+				"config symlink changed while accessing {}",
+				display_path.display()
+			));
+		}
+	}
+	Ok(())
+}
+
+fn pin_config_target(directory: Dir, path: &Path) -> Result<PinnedConfig> {
+	let mut symlink_hops = 0;
+	let mut symlinks = Vec::new();
+	let target = resolve_config_target(directory, path, &mut symlink_hops, &mut symlinks)?;
+	Ok(PinnedConfig { target, symlinks })
+}
+
+fn ensure_config_target_unchanged(
+	target: &PinnedConfigTarget,
+	expected: &ConfigTargetState,
+	display_path: &Path,
+) -> Result<()> {
+	match expected {
+		ConfigTargetState::Missing => match target.directory.symlink_metadata(&target.name) {
+			Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+			Ok(_) => Err(anyhow!(
+				"config target changed while editing {}",
+				display_path.display()
+			)),
+			Err(error) => Err(anyhow!("checking {}: {error}", display_path.display())),
+		},
+		ConfigTargetState::File { identity, .. } => {
+			let mut options = OpenOptions::new();
+			options.read(true).follow(FollowSymlinks::No);
+			let file = target
+				.directory
+				.open_with(&target.name, &options)
+				.map_err(|error| anyhow!("checking {}: {error}", display_path.display()))?;
+			let metadata = file.metadata()?;
+			let current = EntryIdentity::from_metadata(&metadata);
+			if metadata.is_file() && !metadata.file_type().is_symlink() && current == *identity {
+				Ok(())
+			} else {
+				Err(anyhow!(
+					"config target changed while editing {}",
+					display_path.display()
+				))
+			}
+		}
+	}
+}
+
+fn publish_config_target(
+	target: &PinnedConfigTarget,
+	lock_name: &OsStr,
+	lock_identity: EntryIdentity,
+	state: &ConfigTargetState,
+	display_path: &Path,
+) -> Result<()> {
+	let publication = match state {
+		ConfigTargetState::Missing => rename_noreplace_if_identity(
+			&target.directory,
+			lock_name,
+			lock_identity,
+			&target.directory,
+			&target.name,
+		),
+		ConfigTargetState::File { identity, .. } => replace_if_identities(
+			&target.directory,
+			lock_name,
+			lock_identity,
+			&target.name,
+			*identity,
+		),
+	};
+	publication.map_err(|error| anyhow!("writing {}: {error}", display_path.display()))
+}
+
+fn resolve_config_target(
+	directory: Dir,
+	path: &Path,
+	symlink_hops: &mut usize,
+	symlinks: &mut Vec<PinnedConfigSymlink>,
+) -> Result<PinnedConfigTarget> {
+	let (mut directory, relative) = if path.is_absolute() {
+		let parent = path
+			.parent()
+			.ok_or_else(|| anyhow!("config path '{}' has no parent", path.display()))?;
+		(
+			Dir::open_ambient_dir(parent, ambient_authority())?,
+			Path::new(
+				path
+					.file_name()
+					.ok_or_else(|| anyhow!("config path '{}' has no file name", path.display()))?,
+			),
+		)
+	} else {
+		(directory, path)
+	};
+
+	if let Some(parent) = relative.parent() {
+		for component in parent.components() {
+			use std::path::Component;
+			match component {
+				Component::CurDir => {}
+				Component::ParentDir => {
+					directory = directory.open_parent_dir(ambient_authority())?;
+				}
+				Component::Normal(name) => {
+					let target = resolve_config_name(directory, name, symlink_hops, symlinks)?;
+					directory = open_resolved_config_directory(target)?;
+				}
+				Component::Prefix(_) | Component::RootDir => {
+					return Err(anyhow!(
+						"invalid relative config target '{}'",
+						path.display()
+					));
+				}
+			}
+		}
+	}
+	let name = relative
+		.file_name()
+		.ok_or_else(|| anyhow!("config path '{}' has no file name", path.display()))?;
+	resolve_config_name(directory, name, symlink_hops, symlinks)
+}
+
+/// Open a directory component only if the name still identifies the non-symlink entry resolved
+/// above. A legitimate config symlink is followed explicitly by [`resolve_config_name`]; following a
+/// replacement symlink here would let a concurrent namespace swap redirect the transaction.
+fn open_resolved_config_directory(target: PinnedConfigTarget) -> Result<Dir> {
+	Ok(target.directory.open_dir_nofollow(&target.name)?)
+}
+
+fn resolve_config_name(
+	directory: Dir,
+	name: &OsStr,
+	symlink_hops: &mut usize,
+	symlinks: &mut Vec<PinnedConfigSymlink>,
+) -> Result<PinnedConfigTarget> {
+	match directory.symlink_metadata(name) {
+		Ok(metadata) if metadata.file_type().is_symlink() => {
+			*symlink_hops += 1;
+			if *symlink_hops > 40 {
+				return Err(anyhow!("too many symbolic links while resolving config"));
+			}
+			let identity = EntryIdentity::from_metadata(&metadata);
+			let target = directory.read_link_contents(name)?;
+			let current = directory.symlink_metadata(name)?;
+			if !current.file_type().is_symlink() || EntryIdentity::from_metadata(&current) != identity {
+				return Err(anyhow!("config symlink changed while resolving"));
+			}
+			symlinks.push(PinnedConfigSymlink {
+				directory: directory.try_clone()?,
+				name: name.to_owned(),
+				identity,
+				target: target.clone(),
+			});
+			resolve_config_target(directory, &target, symlink_hops, symlinks)
+		}
+		Ok(_) => Ok(PinnedConfigTarget {
+			directory,
+			name: name.to_owned(),
+		}),
+		Err(error) if error.kind() == ErrorKind::NotFound => Ok(PinnedConfigTarget {
+			directory,
+			name: name.to_owned(),
+		}),
+		Err(error) => Err(error.into()),
+	}
+}
+
+fn edit_file_sync<T, F>(path: &Path, edit: F) -> Result<T>
+where
+	F: FnOnce(&mut GitConfig) -> Result<T>,
+{
+	use std::io::Write as _;
+
+	struct LockCleanup(Option<PathBuf>);
+	impl Drop for LockCleanup {
+		fn drop(&mut self) {
+			if let Some(path) = self.0.take() {
+				let _ = std::fs::remove_file(path);
+			}
+		}
+	}
+
+	let target = resolve_symlink_sync(path);
+	let mut lock = target.as_os_str().to_owned();
+	lock.push(".lock");
+	let lock = PathBuf::from(lock);
+	let mut file = std::fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(&lock)
+		.map_err(|error| anyhow!("could not lock config file '{}': {error}", target.display()))?;
+	let mut cleanup = LockCleanup(Some(lock.clone()));
+
+	let mut config = match std::fs::read(&target) {
+		Ok(bytes) => {
+			let text =
+				String::from_utf8(bytes).map_err(|_| anyhow!("{} is not UTF-8", target.display()))?;
+			GitConfig::parse(&text)?
+		}
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => GitConfig::new(),
+		Err(error) => return Err(anyhow!("reading {}: {error}", target.display())),
+	};
+	let result = edit(&mut config)?;
+	if let Ok(metadata) = std::fs::metadata(&target) {
+		let _ = std::fs::set_permissions(&lock, metadata.permissions());
+	}
+	file.write_all(config.render().as_bytes())?;
+	file.sync_all()?;
+	drop(file);
+	std::fs::rename(&lock, &target)
+		.map_err(|error| anyhow!("writing {}: {error}", target.display()))?;
+	cleanup.0 = None;
+
+	#[cfg(not(windows))]
+	if let Some(parent) = target.parent() {
+		std::fs::File::open(parent)?.sync_all()?;
+	}
+	Ok(result)
+}
+
+fn resolve_symlink_sync(path: &Path) -> PathBuf {
+	let mut current = path.to_owned();
+	for _ in 0..40 {
+		match std::fs::symlink_metadata(&current) {
+			Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::read_link(&current) {
+				Ok(target) if target.is_absolute() => current = target,
+				Ok(target) => {
+					current = current.parent().unwrap_or(Path::new("")).join(target);
+				}
+				Err(_) => return current,
+			},
+			_ => return current,
+		}
+	}
+	current
+}
+
 /// Resolve a symlinked config path to its real target so a write updates that target and preserves
 /// the link — as git does. The chain is followed by hand (not `canonicalize`, which requires the
 /// target to exist) so a link to a **not-yet-existing** target still resolves to that target: the
@@ -286,6 +911,7 @@ fn sources_of(layers: Vec<ConfigLayer>) -> Vec<GitConfigSource> {
 /// writable base. `gitdir`/`branch` drive `gitdir:`/`onbranch:` (`None` outside a repository).
 async fn assemble_merged(
 	mut base: Vec<ConfigLayer>,
+	repository_start: Option<usize>,
 	gitdir: Option<&Path>,
 	gitdir_absolute: Option<&Path>,
 	branch: Option<&str>,
@@ -307,7 +933,9 @@ async fn assemble_merged(
 	// Peel the command-scope source(s) back off the top so they overlay (highest precedence for reads)
 	// while `from_sources_or_empty` keeps the writable source on the base's last layer (the local file).
 	let env_sources = sources.split_off(base_len);
-	let mut config = GitConfig::from_sources_or_empty(sources);
+	let repository_sources = repository_start.map_or(0..0, |start| start..base_len);
+	let mut config =
+		GitConfig::from_sources_or_empty(sources).with_repository_sources(repository_sources);
 	config.overlay(env_sources);
 	Ok(config)
 }
@@ -345,6 +973,42 @@ async fn local_layer(common: &Path) -> Result<ConfigLayer> {
 				fileless: false,
 			}),
 	)
+}
+
+async fn local_layer_at(directory: Dir, common: &Path, path: &Path) -> Result<ConfigLayer> {
+	Ok(
+		read_layer_at(directory, &common.join(path), path)
+			.await?
+			.unwrap_or_else(|| ConfigLayer {
+				source: GitConfigSource::new(),
+				dir: common.to_path_buf(),
+				real_dir: common.to_path_buf(),
+				fileless: false,
+			}),
+	)
+}
+
+async fn read_layer_at(
+	directory: Dir,
+	display_path: &Path,
+	relative_path: &Path,
+) -> Result<Option<ConfigLayer>> {
+	let Some(bytes) = read_file_at(directory, relative_path, display_path).await? else {
+		return Ok(None);
+	};
+	let text =
+		std::str::from_utf8(&bytes).map_err(|_| anyhow!("{} is not UTF-8", display_path.display()))?;
+	let source = GitConfigSource::parse(text)
+		.map_err(|error| anyhow!("parsing {}: {error}", display_path.display()))?;
+	Ok(Some(ConfigLayer {
+		source,
+		dir: display_path
+			.parent()
+			.map(Path::to_path_buf)
+			.unwrap_or_default(),
+		real_dir: canonical_dir(display_path).await,
+		fileless: false,
+	}))
 }
 
 /// Parse one config file into a [`ConfigLayer`], or `None` if it is absent. A file that exists but
@@ -454,6 +1118,14 @@ async fn head_branch(git_dir: &Path) -> Option<String> {
 		.map(std::borrow::ToOwned::to_owned)
 }
 
+fn head_branch_at(git_dir: &Dir) -> Option<String> {
+	let head = String::from_utf8(git_dir.read("HEAD").ok()?).ok()?;
+	let target = head.strip_prefix("ref:")?.trim();
+	target
+		.strip_prefix("refs/heads/")
+		.map(std::borrow::ToOwned::to_owned)
+}
+
 /// A [`tokio::fs`]-backed [`IncludeResolver`], the native driver for git-config include expansion. An
 /// absent target reads as `None` (git silently skips it); a present-but-unreadable or non-UTF-8 target
 /// is an error, as git aborts on a bad included file.
@@ -554,39 +1226,41 @@ async fn expand_layers(
 	Ok(())
 }
 
-/// Config entries passed through the environment: `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>` /
-/// `GIT_CONFIG_VALUE_<n>` pairs — git's mechanism for propagating `-c key=value` options. They sit at
-/// the very top of the precedence stack (above the repository-local file) for a *merged* read only; an
-/// explicitly scoped `--global`/`--system`/`--local` lookup ignores them, as git does. `None` when
-/// `GIT_CONFIG_COUNT` is unset or zero; an error (as git aborts) on a malformed count or a missing
-/// key/value pair.
+/// The command-scope configuration: inherited `GIT_CONFIG_*` entries followed by this process's own
+/// `-c` entries. Both are above repository-local configuration; direct scoped reads ignore them.
 fn env_config_source() -> Result<Option<GitConfigSource>> {
-	let count = match std::env::var("GIT_CONFIG_COUNT") {
+	let mut source = GitConfigSource::new();
+	let mut any = false;
+	match std::env::var("GIT_CONFIG_COUNT") {
 		// Only the exact empty string is "unset"; any other value (including whitespace like `" 1 "` or
 		// `"   "`) is parsed strictly, so git's "bogus count" surfaces rather than being trimmed away.
-		Ok(value) if value.is_empty() => return Ok(None),
-		Ok(value) => value
-			.parse::<usize>()
-			.map_err(|_| anyhow!("bogus count in GIT_CONFIG_COUNT: {value}"))?,
-		Err(_) => return Ok(None),
-	};
-	if count == 0 {
-		return Ok(None);
+		Ok(value) if value.is_empty() => {}
+		Ok(value) => {
+			let count = value
+				.parse::<usize>()
+				.map_err(|_| anyhow!("bogus count in GIT_CONFIG_COUNT: {value}"))?;
+			for n in 0..count {
+				let key = std::env::var(format!("GIT_CONFIG_KEY_{n}"))
+					.map_err(|_| anyhow!("missing GIT_CONFIG_KEY_{n}"))?;
+				let value = std::env::var(format!("GIT_CONFIG_VALUE_{n}"))
+					.map_err(|_| anyhow!("missing GIT_CONFIG_VALUE_{n}"))?;
+				let (section, subsection, name) = parse_env_key(&key)?;
+				source.append(section, subsection, name, Some(&value));
+				any = true;
+			}
+		}
+		Err(_) => {}
 	}
-	let mut source = GitConfigSource::new();
-	for n in 0..count {
-		let key = std::env::var(format!("GIT_CONFIG_KEY_{n}"))
-			.map_err(|_| anyhow!("missing GIT_CONFIG_KEY_{n}"))?;
-		let value = std::env::var(format!("GIT_CONFIG_VALUE_{n}"))
-			.map_err(|_| anyhow!("missing GIT_CONFIG_VALUE_{n}"))?;
-		let (section, subsection, name) = parse_env_key(&key)?;
-		// `append` (not `add`) preserves strict command-line order: each entry becomes its own block, so
-		// an `include.path` interleaved with repeats of a key expands at its true position and git's
-		// last-entry-wins holds. `add` would group a repeat back into an earlier section, moving it past
-		// the include. Multi-valued accumulation and single-value last-wins are preserved either way.
-		source.append(section, subsection, name, Some(&value));
+	for entry in command_config() {
+		let (key, value) = match entry.split_once('=') {
+			Some((key, value)) => (key, Some(value)),
+			None => (entry.as_str(), None),
+		};
+		let (section, subsection, name) = parse_env_key(key)?;
+		source.append(section, subsection, name, value);
+		any = true;
 	}
-	Ok(Some(source))
+	Ok(any.then_some(source))
 }
 
 /// Split a dotted `GIT_CONFIG_KEY_<n>` into `(section, subsection, name)`: the first `.` ends the
@@ -595,6 +1269,9 @@ fn env_config_source() -> Result<Option<GitConfigSource>> {
 /// letter and is otherwise alphanumeric/`-`, and the subsection is freeform — since git rejects a
 /// malformed propagated `-c` key (e.g. `user.na_me`, `a.1`) before running.
 fn parse_env_key(key: &str) -> Result<(&str, Option<&str>, &str)> {
+	if key.contains('\n') {
+		return Err(anyhow!("invalid key (newline): {key}"));
+	}
 	let first = key
 		.find('.')
 		.ok_or_else(|| anyhow!("invalid config key '{key}' (no section)"))?;
@@ -729,5 +1406,460 @@ pub fn parse_git_bool(value: &str) -> Option<bool> {
 		"" | "false" | "no" | "off" => Some(false),
 		// git falls back to integer truthiness: any nonzero integer is true, zero is false.
 		other => other.parse::<i64>().ok().map(|n| n != 0),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	#[cfg(unix)]
+	use super::{
+		PinnedConfigTarget, edit_file_at, edit_file_at_if_current, edit_file_at_tracked,
+		ensure_config_target_unchanged, open_resolved_config_directory, publish_config_target,
+		read_pinned_config_bytes, resolve_config_name,
+	};
+	use super::{for_worktree, from_ambient, validate_command_config, with_command_config};
+	#[cfg(unix)]
+	use cap_std::{ambient_authority, fs::Dir};
+	#[cfg(unix)]
+	use gitana_fs_native::entry_identity;
+	#[cfg(unix)]
+	use std::{ffi::OsStr, path::Path};
+
+	#[test]
+	fn command_config_validation() {
+		validate_command_config(&[
+			"core.bare=true".to_owned(),
+			"submodule.name.url=x=y".to_owned(),
+			"user.name".to_owned(),
+		])
+		.expect("valid command configuration");
+		assert!(validate_command_config(&["a.b\nc.d=x".to_owned()]).is_err());
+		assert!(validate_command_config(&["invalid".to_owned()]).is_err());
+	}
+
+	#[tokio::test]
+	async fn command_config_is_the_last_effective_layer_in_argument_order() {
+		let config = with_command_config(
+			vec![
+				"gitana-test.command-scope=first".to_owned(),
+				"gitana-test.command-scope=last".to_owned(),
+			],
+			from_ambient(),
+		)
+		.await
+		.unwrap();
+		assert_eq!(
+			config.get_raw("gitana-test", None, "command-scope"),
+			Some(Some("last"))
+		);
+	}
+
+	#[tokio::test]
+	async fn worktree_config_marks_both_repository_owned_layers() {
+		let temporary = tempfile::tempdir().unwrap();
+		let common = temporary.path().join("common");
+		let git_dir = temporary.path().join("worktree");
+		std::fs::create_dir_all(&common).unwrap();
+		std::fs::create_dir_all(&git_dir).unwrap();
+		std::fs::write(
+			common.join("config"),
+			"[extensions]\n\tworktreeConfig = true\n[core]\n\tbare = true\n",
+		)
+		.unwrap();
+		std::fs::write(
+			git_dir.join("config.worktree"),
+			"[user]\n\tname = Worktree\n",
+		)
+		.unwrap();
+
+		let config = for_worktree(&common, &git_dir).await.unwrap();
+		assert_eq!(
+			config.get_repository_bool("core", None, "bare").unwrap(),
+			Some(true)
+		);
+
+		std::fs::write(git_dir.join("config.worktree"), "[core]\n\tbare = false\n").unwrap();
+		let config = for_worktree(&common, &git_dir).await.unwrap();
+		assert_eq!(
+			config.get_repository_bool("core", None, "bare").unwrap(),
+			Some(false)
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn pinned_edit_cannot_be_redirected_by_directory_replacement() {
+		use std::os::unix::fs::symlink;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let original = temporary.path().join("module");
+		let retained = temporary.path().join("retained");
+		let foreign = temporary.path().join("foreign");
+		std::fs::create_dir(&original).unwrap();
+		std::fs::create_dir(&foreign).unwrap();
+		std::fs::write(original.join("config"), "[core]\n\tbare = true\n").unwrap();
+		std::fs::write(foreign.join("config"), "[foreign]\n\tuntouched = true\n").unwrap();
+		let pinned = Dir::open_ambient_dir(&original, ambient_authority()).unwrap();
+		std::fs::rename(&original, &retained).unwrap();
+		symlink(&foreign, &original).unwrap();
+
+		edit_file_at(
+			pinned,
+			Path::new("config"),
+			&original.join("config"),
+			|config| {
+				config.set("core", None, "worktree", "../../work")?;
+				Ok(())
+			},
+		)
+		.await
+		.unwrap();
+
+		let retained_config = std::fs::read_to_string(retained.join("config")).unwrap();
+		assert!(retained_config.contains("worktree = ../../work"));
+		assert_eq!(
+			std::fs::read_to_string(foreign.join("config")).unwrap(),
+			"[foreign]\n\tuntouched = true\n"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn config_publication_preserves_a_same_content_replacement_after_validation() {
+		use std::ffi::OsString;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		directory
+			.write("config", b"[core]\n\tbare = true\n")
+			.unwrap();
+		let target = PinnedConfigTarget {
+			directory: directory.try_clone().unwrap(),
+			name: OsString::from("config"),
+		};
+		let (_, state) = read_pinned_config_bytes(&target, &temporary.path().join("config")).unwrap();
+		ensure_config_target_unchanged(&target, &state, &temporary.path().join("config")).unwrap();
+		directory
+			.write("config.lock", b"[core]\n\tbare = false\n")
+			.unwrap();
+		let lock_identity = entry_identity(&directory, OsStr::new("config.lock")).unwrap();
+		directory.rename("config", &directory, "displaced").unwrap();
+		directory
+			.write("config", b"[core]\n\tbare = true\n")
+			.unwrap();
+		let replacement = entry_identity(&directory, OsStr::new("config")).unwrap();
+
+		assert!(
+			publish_config_target(
+				&target,
+				OsStr::new("config.lock"),
+				lock_identity,
+				&state,
+				&temporary.path().join("config"),
+			)
+			.is_err()
+		);
+		assert_eq!(
+			entry_identity(&directory, OsStr::new("config")).unwrap(),
+			replacement
+		);
+		assert_eq!(
+			directory.read("config").unwrap(),
+			b"[core]\n\tbare = true\n"
+		);
+		assert_eq!(
+			directory.read("config.lock").unwrap(),
+			b"[core]\n\tbare = false\n"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn config_publication_rejects_a_replaced_lock_for_a_missing_target() {
+		use std::ffi::OsString;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let target = PinnedConfigTarget {
+			directory: directory.try_clone().unwrap(),
+			name: OsString::from("config"),
+		};
+		directory.write("config.lock", b"owned").unwrap();
+		let expected = entry_identity(&directory, OsStr::new("config.lock")).unwrap();
+		directory
+			.rename("config.lock", &directory, "owned.lock")
+			.unwrap();
+		directory.write("config.lock", b"foreign").unwrap();
+
+		assert!(
+			publish_config_target(
+				&target,
+				OsStr::new("config.lock"),
+				expected,
+				&super::ConfigTargetState::Missing,
+				&temporary.path().join("config"),
+			)
+			.is_err()
+		);
+		assert!(directory.symlink_metadata("config").is_err());
+		assert_eq!(directory.read("config.lock").unwrap(), b"foreign");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn config_publication_rejects_a_replaced_lock_for_an_existing_target() {
+		use std::ffi::OsString;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		directory.write("config", b"old").unwrap();
+		let target = PinnedConfigTarget {
+			directory: directory.try_clone().unwrap(),
+			name: OsString::from("config"),
+		};
+		let (_, state) = read_pinned_config_bytes(&target, &temporary.path().join("config")).unwrap();
+		directory.write("config.lock", b"owned-new").unwrap();
+		let expected = entry_identity(&directory, OsStr::new("config.lock")).unwrap();
+		directory
+			.rename("config.lock", &directory, "owned.lock")
+			.unwrap();
+		directory.write("config.lock", b"foreign").unwrap();
+
+		assert!(
+			publish_config_target(
+				&target,
+				OsStr::new("config.lock"),
+				expected,
+				&state,
+				&temporary.path().join("config"),
+			)
+			.is_err()
+		);
+		assert_eq!(directory.read("config").unwrap(), b"old");
+		assert_eq!(directory.read("config.lock").unwrap(), b"foreign");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn resolved_config_directory_cannot_be_replaced_by_a_symlink() {
+		use std::ffi::OsStr;
+		use std::os::unix::fs::symlink;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let original = temporary.path().join("module");
+		let retained = temporary.path().join("retained");
+		let foreign = temporary.path().join("foreign");
+		std::fs::create_dir(&original).unwrap();
+		std::fs::create_dir(&foreign).unwrap();
+		std::fs::write(foreign.join("config"), "[foreign]\n\tuntouched = true\n").unwrap();
+
+		let parent = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let resolved =
+			resolve_config_name(parent, OsStr::new("module"), &mut 0, &mut Vec::new()).unwrap();
+		std::fs::rename(&original, &retained).unwrap();
+		symlink(&foreign, &original).unwrap();
+
+		assert!(open_resolved_config_directory(resolved).is_err());
+		assert_eq!(
+			std::fs::read_to_string(foreign.join("config")).unwrap(),
+			"[foreign]\n\tuntouched = true\n"
+		);
+		assert!(!foreign.join("config.lock").exists());
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn pinned_edit_preserves_an_external_relative_config_symlink_and_mode() {
+		use std::os::unix::fs::{PermissionsExt, symlink};
+
+		let temporary = tempfile::tempdir().unwrap();
+		let module = temporary.path().join("module");
+		let target = temporary.path().join("module-config");
+		std::fs::create_dir(&module).unwrap();
+		std::fs::write(&target, "[core]\n\tbare = true\n").unwrap();
+		std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+		symlink("../module-config", module.join("config")).unwrap();
+		let pinned = Dir::open_ambient_dir(&module, ambient_authority()).unwrap();
+
+		edit_file_at(
+			pinned,
+			Path::new("config"),
+			&module.join("config"),
+			|config| {
+				config.set("core", None, "worktree", "../../work")?;
+				Ok(())
+			},
+		)
+		.await
+		.unwrap();
+
+		assert!(
+			std::fs::symlink_metadata(module.join("config"))
+				.unwrap()
+				.file_type()
+				.is_symlink()
+		);
+		assert!(
+			std::fs::read_to_string(&target)
+				.unwrap()
+				.contains("worktree = ../../work")
+		);
+		assert_eq!(
+			std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+			0o600
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn pinned_edit_refuses_a_retargeted_config_symlink() {
+		use std::os::unix::fs::symlink;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let module = temporary.path().join("module");
+		let original = temporary.path().join("original-config");
+		let replacement = temporary.path().join("replacement-config");
+		std::fs::create_dir(&module).unwrap();
+		std::fs::write(&original, "[core]\n\tbare = true\n").unwrap();
+		std::fs::write(&replacement, "[foreign]\n\tuntouched = true\n").unwrap();
+		symlink("../original-config", module.join("config")).unwrap();
+		let pinned = Dir::open_ambient_dir(&module, ambient_authority()).unwrap();
+		let module_for_edit = module.clone();
+
+		let result = edit_file_at(
+			pinned,
+			Path::new("config"),
+			&module.join("config"),
+			move |config| {
+				config.set("core", None, "worktree", "../../work")?;
+				std::fs::remove_file(module_for_edit.join("config"))?;
+				symlink("../replacement-config", module_for_edit.join("config"))?;
+				Ok(())
+			},
+		)
+		.await;
+
+		assert!(result.is_err());
+		assert_eq!(
+			std::fs::read_link(module.join("config")).unwrap(),
+			Path::new("../replacement-config")
+		);
+		assert_eq!(
+			std::fs::read_to_string(&original).unwrap(),
+			"[core]\n\tbare = true\n"
+		);
+		assert_eq!(
+			std::fs::read_to_string(&replacement).unwrap(),
+			"[foreign]\n\tuntouched = true\n"
+		);
+		assert!(!temporary.path().join("original-config.lock").exists());
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn pinned_edit_refuses_a_replaced_final_config_entry() {
+		use std::os::unix::fs::symlink;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let module = temporary.path().join("module");
+		let original = temporary.path().join("original-config");
+		let foreign = temporary.path().join("foreign-config");
+		std::fs::create_dir(&module).unwrap();
+		std::fs::write(module.join("config"), "[core]\n\tbare = true\n").unwrap();
+		std::fs::write(&foreign, "[foreign]\n\tuntouched = true\n").unwrap();
+		let pinned = Dir::open_ambient_dir(&module, ambient_authority()).unwrap();
+		let module_for_edit = module.clone();
+		let original_for_edit = original.clone();
+		let foreign_for_edit = foreign.clone();
+
+		let result = edit_file_at(
+			pinned,
+			Path::new("config"),
+			&module.join("config"),
+			move |config| {
+				config.set("core", None, "worktree", "../../work")?;
+				std::fs::rename(module_for_edit.join("config"), &original_for_edit)?;
+				symlink(&foreign_for_edit, module_for_edit.join("config"))?;
+				Ok(())
+			},
+		)
+		.await;
+
+		assert!(result.is_err());
+		assert_eq!(
+			std::fs::read_to_string(&foreign).unwrap(),
+			"[foreign]\n\tuntouched = true\n"
+		);
+		assert_eq!(
+			std::fs::read_to_string(&original).unwrap(),
+			"[core]\n\tbare = true\n"
+		);
+		assert!(
+			std::fs::symlink_metadata(module.join("config"))
+				.unwrap()
+				.file_type()
+				.is_symlink()
+		);
+		assert!(!module.join("config.lock").exists());
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn failed_edit_preserves_a_replacement_config_lock() {
+		let temporary = tempfile::tempdir().unwrap();
+		let config = temporary.path().join("config");
+		let lock = temporary.path().join("config.lock");
+		let displaced = temporary.path().join("owned.lock");
+		std::fs::write(&config, "[core]\n\tbare = true\n").unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let lock_for_edit = lock.clone();
+
+		let result = edit_file_at(directory, Path::new("config"), &config, move |_| {
+			std::fs::rename(&lock_for_edit, &displaced)?;
+			std::fs::write(&lock_for_edit, b"foreign lock")?;
+			Err::<(), _>(anyhow::anyhow!("injected edit failure"))
+		})
+		.await;
+
+		assert!(result.is_err());
+		assert_eq!(std::fs::read(&lock).unwrap(), b"foreign lock");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn conditional_edit_refuses_a_same_content_replacement() {
+		use std::os::unix::fs::MetadataExt as _;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let config = temporary.path().join("config");
+		std::fs::write(&config, "[core]\n\tbare = true\n").unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+
+		let ((before, after), publication) =
+			edit_file_at_tracked(directory, Path::new("config"), &config, |config| {
+				let before = config.render();
+				config.set("core", None, "worktree", "../work")?;
+				Ok((before, config.render()))
+			})
+			.await
+			.unwrap();
+		std::fs::rename(&config, temporary.path().join("published-config")).unwrap();
+		std::fs::write(&config, &after).unwrap();
+		let replacement = std::fs::metadata(&config).unwrap().ino();
+
+		let result = edit_file_at_if_current(publication, &config, move |config| {
+			assert_eq!(config.render(), after);
+			*config = gitana_config::GitConfig::parse(&before)?;
+			Ok(())
+		})
+		.await;
+
+		assert!(result.is_err());
+		assert_eq!(std::fs::metadata(&config).unwrap().ino(), replacement);
+		assert!(
+			std::fs::read_to_string(&config)
+				.unwrap()
+				.contains("worktree = ../work")
+		);
 	}
 }

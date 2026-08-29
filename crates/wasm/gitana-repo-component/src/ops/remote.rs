@@ -56,6 +56,9 @@ pub(crate) async fn fetch<H: HashAlgorithm>(
 	match parse_remote_url(url)? {
 		RemoteUrl::Http(origin) => fetch_http(repo, &origin).await,
 		RemoteUrl::Ssh(ssh) => fetch_ssh(repo, &ssh).await,
+		RemoteUrl::Local(_) => Err(RepoError::Invalid(
+			"local filesystem remotes are unsupported in the component".to_owned(),
+		)),
 	}
 }
 
@@ -168,6 +171,9 @@ pub(crate) async fn push<H: HashAlgorithm>(
 	match parse_remote_url(url)? {
 		RemoteUrl::Http(origin) => push_http(repo, &origin, force, delete).await,
 		RemoteUrl::Ssh(ssh) => push_ssh(repo, &ssh, force, delete).await,
+		RemoteUrl::Local(_) => Err(RepoError::Invalid(
+			"local filesystem remotes are unsupported in the component".to_owned(),
+		)),
 	}
 }
 

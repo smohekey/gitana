@@ -13,7 +13,9 @@ rust-version = "1.96.0"
 anyhow = "1.0.103"
 assert_cmd = "2.2.2"
 axum = "0.8"
+cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
+caseless = "0.2.2"
 clap = { version = "4.6.1", features = ["derive"] }
 clap-mcp = "0.0.5"
 flate2 = "1.1.9"
@@ -26,6 +28,7 @@ gitana-file-store = { version = "0.1.0", path = "crates/core/gitana-file-store" 
 gitana-file-store-conformance = { version = "0.1.0", path = "crates/core/gitana-file-store-conformance" }
 gitana-file-store-local = { version = "0.1.0", path = "crates/core/gitana-file-store-local" }
 gitana-file-store-memory = { version = "0.1.0", path = "crates/core/gitana-file-store-memory" }
+gitana-fs-native = { version = "0.1.0", path = "crates/core/gitana-fs-native" }
 gitana-git-http = { version = "0.1.0", path = "crates/core/gitana-git-http" }
 gitana-identity = { version = "0.1.0", path = "crates/core/gitana-identity" }
 gitana-linked-worktree = { version = "0.1.0", path = "crates/core/gitana-linked-worktree" }
@@ -35,6 +38,7 @@ gitana-porcelain = { version = "0.1.0", path = "crates/core/gitana-porcelain", d
 gitana-remote = { version = "0.1.0", path = "crates/core/gitana-remote", default-features = false }
 gitana-repository-layout = { version = "0.1.0", path = "crates/core/gitana-repository-layout" }
 gitana-repository = { version = "0.1.0", path = "crates/core/gitana-repository" }
+gitana-submodule = { version = "0.1.0", path = "crates/core/gitana-submodule" }
 gitana-trust = { version = "0.1.0", path = "crates/core/gitana-trust" }
 gitana-worktree = { version = "0.1.0", path = "crates/core/gitana-worktree" }
 gta-core = { version = "0.1.0", path = "crates/cli/gta-core" }
@@ -46,6 +50,8 @@ libc = "0.2"
 pgp = { version = "0.20.0", default-features = false }
 proptest = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rmcp = { version = "1.8.0", features = ["server", "transport-io", "transport-streamable-http-server"] }
+rustix = { version = "1.1.4", features = ["fs"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha1 = "0.10.6"
@@ -54,6 +60,7 @@ ssh-key = { version = "0.6", features = ["ed25519"] }
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = "1.52.3"
+unicode-normalization = "0.1.25"
 wasip2 = "1.0.4"
 wasmtime = "46"
 wasmtime-wasi = "46"

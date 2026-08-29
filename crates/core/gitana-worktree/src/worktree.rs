@@ -23,6 +23,7 @@ pub struct WorkTree<F, W, H: HashAlgorithm> {
 	repo: Repository<F, H>,
 	work: W,
 	git_dir: PathBuf,
+	worktree_root: Option<PathBuf>,
 }
 
 impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
@@ -33,6 +34,27 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			repo,
 			work,
 			git_dir: git_dir.into(),
+			worktree_root: None,
+		}
+	}
+
+	/// Build a working tree whose native worktree root is known.
+	///
+	/// The root is used for repository-layout-sensitive operations such as resolving a submodule's
+	/// `.git` marker. Descriptor-only callers can continue to use [`Self::new`]; native callers that
+	/// discovered a repository layout should use this constructor so linked-worktree module stores
+	/// are resolved against this checkout's own git directory.
+	pub fn new_located(
+		repo: Repository<F, H>,
+		work: W,
+		git_dir: impl Into<PathBuf>,
+		worktree_root: impl Into<PathBuf>,
+	) -> Self {
+		Self {
+			repo,
+			work,
+			git_dir: git_dir.into(),
+			worktree_root: Some(worktree_root.into()),
 		}
 	}
 
@@ -45,6 +67,11 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// linked worktree this is `<main>/.git/worktrees/<name>`, not the shared common dir.
 	pub fn git_dir(&self) -> &Path {
 		&self.git_dir
+	}
+
+	/// The native root of this working tree, when the caller has repository-layout authority.
+	pub(crate) fn worktree_root(&self) -> Option<&Path> {
+		self.worktree_root.as_deref()
 	}
 
 	/// Resolve a revision spec, including the index-relative forms the repository resolver cannot:
@@ -1616,6 +1643,14 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			crate::CheckoutMode::Overlay
 		};
 		crate::checkout::run(self, tree, mode, excludes_file).await
+	}
+
+	/// Populate an initially unattached working directory from `tree` without replacing any existing
+	/// entry. Exact target-compatible entries are reused so an interrupted population can be retried;
+	/// mismatched or additional content is refused. The index is published only after the complete
+	/// working tree has been verified.
+	pub async fn populate(&self, tree: ObjectId<H>) -> Result<(), WorktreeError> {
+		crate::checkout::populate(self, tree).await
 	}
 
 	/// Two-tree merge checkout (git's `read-tree -m -u`) from `head` to `target`: apply only the

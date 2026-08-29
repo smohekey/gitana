@@ -186,6 +186,42 @@ where
 		}
 	}
 
+	/// Atomically edit the current repository config, re-reading and re-applying `edit` after a CAS race.
+	///
+	/// The closure must be idempotent: it may run more than once, each time against the newest file. This
+	/// prevents independent concurrent edits from being lost, unlike mutating a stale snapshot and passing
+	/// it to [`write_config`](Self::write_config).
+	pub async fn update_config<Edit, E>(&self, mut edit: Edit) -> Result<(), E>
+	where
+		Edit: FnMut(&mut gitana_config::GitConfig) -> Result<(), E>,
+		E: From<RepositoryError>,
+	{
+		let store = self.objects.file_store();
+		loop {
+			let (mut config, expected) = match store.read_path_versioned("config").await {
+				Ok((bytes, version)) => {
+					let text = std::str::from_utf8(&bytes)
+						.map_err(|_| RepositoryError::UnsupportedFormat("config is not UTF-8".to_owned()))?;
+					let config = gitana_config::GitConfig::parse(text)
+						.map_err(|error| RepositoryError::UnsupportedFormat(error.to_string()))?;
+					(config, Some(version))
+				}
+				Err(FileStoreError::NotFound) => (gitana_config::GitConfig::new(), None),
+				Err(error) => return Err(RepositoryError::from(error).into()),
+			};
+			edit(&mut config)?;
+			let bytes = config.render().into_bytes();
+			match store
+				.write_path_cas("config", &bytes, expected.as_ref())
+				.await
+			{
+				Ok(_) => return Ok(()),
+				Err(FileStoreError::VersionMismatch) => continue,
+				Err(error) => return Err(RepositoryError::from(error).into()),
+			}
+		}
+	}
+
 	/// Read a blob's content.
 	pub async fn read_blob(&self, id: ObjectId<H>) -> Result<Vec<u8>, RepositoryError> {
 		let (kind, payload) = self.objects.read_object(&id).await?;
@@ -549,5 +585,50 @@ where
 			)));
 		}
 		Ok(config)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use gitana_file_store_memory::MemoryFileStore;
+	use gitana_object::Sha256;
+	use gitana_object_store::ObjectStore;
+
+	use crate::{Repository, RepositoryError};
+
+	#[tokio::test]
+	async fn update_config_preserves_independent_edits() {
+		let files = MemoryFileStore::new();
+		let repository = Repository::<_, Sha256>::new(ObjectStore::new(files));
+		repository.init().await.unwrap();
+
+		repository
+			.update_config::<_, RepositoryError>(|config| {
+				config
+					.set("submodule", Some("one"), "url", "../one")
+					.map_err(|error| RepositoryError::UnsupportedFormat(error.to_string()))?;
+				Ok(())
+			})
+			.await
+			.unwrap();
+		repository
+			.update_config::<_, RepositoryError>(|config| {
+				config
+					.set("submodule", Some("two"), "url", "../two")
+					.map_err(|error| RepositoryError::UnsupportedFormat(error.to_string()))?;
+				Ok(())
+			})
+			.await
+			.unwrap();
+
+		let config = repository.read_config().await.unwrap();
+		assert_eq!(
+			config.get_raw("submodule", Some("one"), "url"),
+			Some(Some("../one"))
+		);
+		assert_eq!(
+			config.get_raw("submodule", Some("two"), "url"),
+			Some(Some("../two"))
+		);
 	}
 }

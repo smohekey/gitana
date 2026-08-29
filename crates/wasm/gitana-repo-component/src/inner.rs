@@ -173,6 +173,9 @@ impl Inner {
 		match ops::parse_remote_url(url)? {
 			RemoteUrl::Http(origin) => Self::clone_http(git_dir, work_dir, &origin),
 			RemoteUrl::Ssh(ssh) => Self::clone_ssh(git_dir, work_dir, &ssh, url),
+			RemoteUrl::Local(_) => Err(RepoError::Invalid(
+				"local filesystem remotes are unsupported in the component".to_owned(),
+			)),
 		}
 	}
 

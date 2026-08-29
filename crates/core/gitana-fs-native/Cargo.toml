@@ -1,0 +1,31 @@
+[package]
+description = "Capability-scoped native filesystem namespace transactions for Gitana."
+edition.workspace = true
+license.workspace = true
+name = "gitana-fs-native"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# This crate is the single native boundary for operations Rust's safe standard-library API cannot
+# express on Windows. Keep the exception local and require every unsafe operation to be explicit.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+
+[target.'cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "redox", target_os = "tvos", target_os = "visionos", target_os = "watchos"))'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+	"Win32_Foundation",
+	"Win32_Globalization",
+	"Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true

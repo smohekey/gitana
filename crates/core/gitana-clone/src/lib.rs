@@ -10,7 +10,7 @@
 //! This is deliberately narrower than `gta clone`: no `insteadOf` URL rewriting from ambient git
 //! config, no interactive prompting, no reflog identity. Credentials come only from the provider, and a
 //! headless clone writes no `clone: from …` reflog entry. Only the HTTP(S) transport is supported;
-//! an SSH URL is refused.
+//! SSH and local filesystem URLs are refused.
 
 use std::path::{Path, PathBuf};
 
@@ -62,10 +62,11 @@ impl CredentialProvider for Anonymous {
 
 /// Clone the repository at `url` into `destination`, authenticating through `credentials`.
 ///
-/// `url` must be an HTTP(S) remote; an SSH URL is [`CloneError::UnsupportedTransport`]. `destination`
-/// must be empty or absent — a non-empty directory is [`CloneError::DestinationNotEmpty`], mirroring
-/// git's refusal to clone over existing content. The repository is created in whatever object format
-/// the remote advertises. `deepen` requests a shallow clone (an empty [`Deepen`] is a full clone).
+/// `url` must be an HTTP(S) remote; SSH and local filesystem URLs are
+/// [`CloneError::UnsupportedTransport`]. `destination` must be empty or absent — a non-empty directory
+/// is [`CloneError::DestinationNotEmpty`], mirroring git's refusal to clone over existing content. The
+/// repository is created in whatever object format the remote advertises. `deepen` requests a shallow
+/// clone (an empty [`Deepen`] is a full clone).
 ///
 /// Credentials are resolved only through `credentials`: an anonymous provider clones a public
 /// repository, and a provider returning a token authenticates against a private one. No credential is
@@ -82,7 +83,7 @@ pub async fn clone_url(
 	})?;
 	let origin = match remote {
 		RemoteUrl::Http(origin) => origin,
-		RemoteUrl::Ssh(_) => return Err(CloneError::UnsupportedTransport),
+		RemoteUrl::Ssh(_) | RemoteUrl::Local(_) => return Err(CloneError::UnsupportedTransport),
 	};
 	ensure_empty_destination(destination)?;
 	let git_dir = destination.join(".git");
@@ -134,8 +135,9 @@ pub async fn clone_url(
 /// remote-tracking refs, and a shallow boundary would make that judgement wrong. Local tags are left
 /// untouched (`TagFetch::None`), so they remain a faithful record of local-only work rather than being
 /// overwritten by the remote's. `worktree_root` is a standalone checkout whose git directory is
-/// `<worktree_root>/.git`. HTTP(S) only; an SSH URL is [`FetchError::UnsupportedTransport`]. Headless,
-/// like [`clone_url`]: no reflog identity, and credentials come only from `credentials`.
+/// `<worktree_root>/.git`. HTTP(S) only; SSH and local filesystem URLs are
+/// [`FetchError::UnsupportedTransport`]. Headless, like [`clone_url`]: no reflog identity, and
+/// credentials come only from `credentials`.
 pub async fn fetch_url(
 	url: &str,
 	worktree_root: &Path,
@@ -147,7 +149,7 @@ pub async fn fetch_url(
 	})?;
 	let origin = match remote {
 		RemoteUrl::Http(origin) => origin,
-		RemoteUrl::Ssh(_) => return Err(FetchError::UnsupportedTransport),
+		RemoteUrl::Ssh(_) | RemoteUrl::Local(_) => return Err(FetchError::UnsupportedTransport),
 	};
 	let git_dir = worktree_root.join(".git");
 
@@ -401,7 +403,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_malformed_url_is_reported() {
+	async fn a_local_path_is_unsupported() {
 		let temp = tempfile::tempdir().unwrap();
 		let error = clone_url(
 			"not a url",
@@ -410,8 +412,8 @@ mod tests {
 			&Deepen::default(),
 		)
 		.await
-		.expect_err("a malformed URL must be refused");
-		assert!(matches!(error, CloneError::Url { .. }));
+		.expect_err("a local path must be refused");
+		assert!(matches!(error, CloneError::UnsupportedTransport));
 	}
 
 	#[tokio::test]
@@ -443,11 +445,11 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn fetch_reports_a_malformed_url() {
+	async fn fetch_refuses_a_local_path() {
 		let temp = tempfile::tempdir().unwrap();
 		let error = fetch_url("not a url", temp.path(), Anonymous)
 			.await
-			.expect_err("a malformed URL must be refused");
-		assert!(matches!(error, FetchError::Url { .. }));
+			.expect_err("a local path must be refused");
+		assert!(matches!(error, FetchError::UnsupportedTransport));
 	}
 }

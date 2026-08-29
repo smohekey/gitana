@@ -32,7 +32,7 @@ pub use self::{
 	detect::detect_hash_kind,
 	error::RepositoryError,
 	head::HeadState,
-	head_lock::HeadLock,
+	head_lock::{HeadLock, PreparedDetachedHead},
 	merge::TreeMerge,
 	mode::FileMode,
 	rebase_state::RebaseState,

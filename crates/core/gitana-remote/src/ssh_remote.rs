@@ -167,13 +167,13 @@ fn parse_port(port: &str) -> Result<Option<u16>> {
 
 /// The index of the scp separator `:` in `url`, or `None` if `url` is not scp-like. The separator is the
 /// first `:` that comes before any `/` and is not inside a leading `[…]` IPv6 bracket. On Windows a
-/// leading DOS drive prefix (`C:\repo` / `C:/repo`) is a local path, not an scp host, so it is excluded
-/// there (git's `has_dos_drive_prefix`); on other platforms `C:repo` is a valid scp remote (host `C`).
+/// native path prefix (`C:\repo`, `\\?\C:\repo`, or a UNC prefix) denotes a local path, not an scp
+/// host, so it is excluded there; on other platforms `C:repo` is a valid scp remote (host `C`).
 fn scp_separator(url: &str) -> Option<usize> {
 	if url.contains("://") {
 		return None;
 	}
-	if has_dos_drive_prefix(url) {
+	if has_windows_path_prefix(url) {
 		return None;
 	}
 	// A bracketed IPv6 host may sit at the start or right after a `user@` (git's `@[`); the host/path
@@ -195,16 +195,18 @@ fn scp_separator(url: &str) -> Option<usize> {
 	}
 }
 
-/// Whether `url` begins with a Windows DOS drive prefix (`<letter>:`). Only meaningful on Windows —
-/// there `C:\repo` is a local path, not the scp remote `C:repo` — so it is always `false` elsewhere.
+/// Whether `url` begins with any Windows-native path prefix. Using the platform parser covers DOS,
+/// UNC, device, and verbatim prefixes without stripping the verbatim spelling needed by long paths.
 #[cfg(windows)]
-fn has_dos_drive_prefix(url: &str) -> bool {
-	let bytes = url.as_bytes();
-	bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+fn has_windows_path_prefix(url: &str) -> bool {
+	matches!(
+		std::path::Path::new(url).components().next(),
+		Some(std::path::Component::Prefix(_))
+	)
 }
 
 #[cfg(not(windows))]
-fn has_dos_drive_prefix(_url: &str) -> bool {
+fn has_windows_path_prefix(_url: &str) -> bool {
 	false
 }
 
@@ -374,10 +376,16 @@ mod tests {
 
 	#[test]
 	#[cfg(windows)]
-	fn drive_letter_is_a_local_path_on_windows() {
-		// On Windows `C:\repo` / `C:/repo` is a local path, not the scp remote `C:repo`.
-		assert_eq!(scp_separator("C:/repo"), None);
-		assert_eq!(scp_separator("C:\\repo"), None);
-		assert!(!SshRemote::is_scp_like("C:/repo"));
+	fn native_windows_paths_are_not_scp_remotes() {
+		for path in [
+			"C:/repo",
+			"C:\\repo",
+			r"\\?\C:\repo",
+			r"\\server\share\repo",
+			r"\\?\UNC\server\share\repo",
+		] {
+			assert_eq!(scp_separator(path), None, "{path}");
+			assert!(!SshRemote::is_scp_like(path), "{path}");
+		}
 	}
 }

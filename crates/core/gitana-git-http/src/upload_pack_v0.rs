@@ -20,7 +20,9 @@ use crate::GitHttpError;
 use crate::deepen::Deepen;
 use crate::negotiate::{common_haves, ok_to_give_up};
 use crate::pack::{build_pack, build_pack_shallow, build_pack_thin};
-use crate::shallow::{compute_shallow, reachable_commits, reachable_tag_wants};
+use crate::shallow::{
+	compute_shallow, reachable_commits, reachable_tag_wants, validate_source_wants,
+};
 use crate::sideband::write_sideband_pack;
 
 /// Parsed v0 upload-pack arguments.
@@ -56,28 +58,43 @@ pub async fn upload_pack_v0<F: FileStore, H: HashAlgorithm>(
 	}
 
 	let mut out = Vec::new();
+	let source_shallow = repo.read_shallow().await?;
+	validate_source_wants(repo, &parsed.wants, &source_shallow).await?;
+	let source_boundary: HashSet<ObjectId<H>> = source_shallow.iter().copied().collect();
 
-	// The client's own shallow commits always bound the have-walk (it lacks their parents), whether or
-	// not this request deepens.
+	// Both peers' shallow commits bound the have-walk: neither side can claim ancestry below a boundary
+	// merely because the corresponding parent objects happen to remain in the source object store.
 	let have_boundary: HashSet<ObjectId<H>> = parsed.client_shallow.iter().copied().collect();
+	let have_boundary: HashSet<ObjectId<H>> =
+		have_boundary.union(&source_boundary).copied().collect();
 
-	// Only an actual `deepen*` directive recomputes the boundary and emits a shallow-update section; a
-	// normal fetch from a shallow client keeps its boundary and gets a plain (have-bounded) pack.
+	// A deepen directive computes a new client boundary. Otherwise either peer's existing shallow
+	// frontier remains a hard cut; only newly relevant source boundaries are emitted to the client.
 	let mut wants = parsed.wants.clone();
 	let mut boundary = HashSet::new();
 	let mut shallow_included: Option<HashSet<ObjectId<H>>> = None;
-	if !parsed.deepen.is_empty() {
-		let plan = compute_shallow(repo, &parsed.wants, &parsed.deepen, &parsed.client_shallow).await?;
-		for oid in &plan.shallow {
-			write_pkt(&mut out, format!("shallow {oid}\n").as_bytes())?;
+	if !parsed.deepen.is_empty() || !parsed.client_shallow.is_empty() || !source_shallow.is_empty() {
+		let plan = compute_shallow(
+			repo,
+			&parsed.wants,
+			&parsed.haves,
+			&parsed.deepen,
+			&parsed.client_shallow,
+			&source_shallow,
+		)
+		.await?;
+		if !parsed.deepen.is_empty() || !plan.shallow.is_empty() || !plan.unshallow.is_empty() {
+			for oid in &plan.shallow {
+				write_pkt(&mut out, format!("shallow {oid}\n").as_bytes())?;
+			}
+			for oid in &plan.unshallow {
+				write_pkt(&mut out, format!("unshallow {oid}\n").as_bytes())?;
+			}
+			write_flush(&mut out); // ends the shallow-update section
 		}
-		for oid in &plan.unshallow {
-			write_pkt(&mut out, format!("unshallow {oid}\n").as_bytes())?;
-		}
-		write_flush(&mut out); // ends the shallow-update section
 		// Stateless v0: the client first probes for the shallow boundary without `done`, and expects
 		// only the shallow-update section (no NAK, no pack) — the pack round follows with `done`.
-		if !parsed.done {
+		if !parsed.deepen.is_empty() && !parsed.done {
 			return Ok(out);
 		}
 		// Seed the walk with the newly-exposed ancestors (deepen / `--unshallow`), which the client's
@@ -86,24 +103,20 @@ pub async fn upload_pack_v0<F: FileStore, H: HashAlgorithm>(
 		boundary = plan.boundary;
 		shallow_included = Some(plan.included);
 	}
-	// Negotiation acknowledgments (`multi_ack_detailed`) for a plain fetch. The shallow/deepen paths keep
-	// the historical single `NAK` (git and gitana's client both read the pack past any ack lines), and a
-	// shallow `!done` probe already returned above; only a plain fetch negotiates with `have`s here.
+	// Negotiation completion is independent of whether the eventual pack needs shallow-aware walks.
+	// A deepen-only boundary probe returned above, but every ordinary round without `done` must still
+	// acknowledge its common `have`s and return without a pack so the client can offer a later batch.
 	let shallow_context = !boundary.is_empty() || !have_boundary.is_empty();
-	if shallow_context {
-		write_pkt(&mut out, b"NAK\n")?;
-	} else {
-		let commons = common_haves(repo, &parsed.haves).await?;
-		if !parsed.done {
-			// A negotiation round: acknowledge the commons, signal `ready` once every want has a common
-			// ancestor, and return WITHOUT a pack — the client sends another round (deeper haves, or `done`).
-			let ready = ok_to_give_up(repo, &parsed.wants, &commons).await?;
-			write_v0_negotiation_acks(&mut out, &commons, ready)?;
-			return Ok(out);
-		}
-		// The client sent `done`: a final `ACK <common>` (or `NAK` when nothing is shared), then the pack.
-		write_v0_final_ack(&mut out, &commons)?;
+	let commons = common_haves(repo, &parsed.haves).await?;
+	if !parsed.done {
+		// A negotiation round: acknowledge the commons, signal `ready` once every want has a common
+		// ancestor, and return WITHOUT a pack — the client sends another round (deeper haves, or `done`).
+		let ready = ok_to_give_up(repo, &parsed.wants, &commons, &source_boundary).await?;
+		write_v0_negotiation_acks(&mut out, &commons, ready)?;
+		return Ok(out);
 	}
+	// The client sent `done`: a final `ACK <common>` (or `NAK` when nothing is shared), then the pack.
+	write_v0_final_ack(&mut out, &commons)?;
 
 	// `include-tag`: append the annotated tags reachable within what this request sends, so a
 	// single-branch clone/fetch (shallow or not) still receives tags pointing into the fetched history.

@@ -7,14 +7,14 @@ use anyhow::{Result, bail};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_porcelain::{Deepen, Identity, TagFetch};
 use gitana_remote::{
-	self as transport, Connection, HttpPackFetcher, PackFetcher, RemoteUrl, SshConnection,
-	SshPackFetcher,
+	self as transport, Connection, HttpPackFetcher, LocalConnection, LocalPackFetcher, PackFetcher,
+	RemoteUrl, SshConnection, SshPackFetcher,
 };
 
 use crate::dispatch;
 use crate::identity::CliIdentity;
 use crate::shallow::build_fetch_deepen;
-use crate::{git_config, repo, transport_for, url_rewrite};
+use crate::{CommandContext, git_config, repo, transport_for, url_rewrite};
 
 /// Fetch all branches from the origin into `refs/remotes/origin/*`. By default git's tag auto-follow
 /// also lands tags reachable from the fetched branches; `all_tags` (`--tags`) mirrors every advertised
@@ -48,6 +48,13 @@ pub async fn run(
 	let config = git_config::from_repo(&found.git_dir, &found.common_dir).await?;
 	let url = url_rewrite::resolve_fetch_url(&config, "origin")?;
 	let remote = RemoteUrl::parse(&url)?;
+	if let Some(command) = CommandContext::current() {
+		command.authorize(
+			&config,
+			&remote,
+			gitana_remote::ProtocolContext::UserInitiated,
+		)?;
+	}
 	// A credential-free form for the "Fetched from" line — *all* userinfo stripped (a token can occupy
 	// the username field), since the raw `url` is only for the auth-bearing transport parse above.
 	let display = transport::anonymize_url(&url);
@@ -97,6 +104,59 @@ pub async fn run(
 			)
 			.await
 		}
+		RemoteUrl::Local(path) => {
+			let source = local_path(&askpass_cwd, &path);
+			let source_layout = repo::inspect_root(&source).await?;
+			match dispatch::detect_algorithm(&source_layout.common_dir)? {
+				HashKind::Sha1 => {
+					let source =
+						repo::open_generic::<Sha1>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let connection = LocalConnection::open(source).await?;
+					let body = connection.advertisement().to_vec();
+					let source =
+						repo::open_generic::<Sha1>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let mut fetcher = LocalPackFetcher::new(source);
+					fetch_dispatch(
+						&mut fetcher,
+						&found,
+						&body,
+						&display,
+						tags,
+						&deepen,
+						unshallow,
+					)
+					.await
+				}
+				HashKind::Sha256 => {
+					let source =
+						repo::open_generic::<Sha256>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let connection = LocalConnection::open(source).await?;
+					let body = connection.advertisement().to_vec();
+					let source =
+						repo::open_generic::<Sha256>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let mut fetcher = LocalPackFetcher::new(source);
+					fetch_dispatch(
+						&mut fetcher,
+						&found,
+						&body,
+						&display,
+						tags,
+						&deepen,
+						unshallow,
+					)
+					.await
+				}
+			}
+		}
+	}
+}
+
+fn local_path(cwd: &Path, path: &str) -> std::path::PathBuf {
+	let path = std::path::PathBuf::from(path);
+	if path.is_absolute() {
+		path
+	} else {
+		cwd.join(path)
 	}
 }
 

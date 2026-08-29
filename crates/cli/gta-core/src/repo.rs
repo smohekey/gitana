@@ -19,7 +19,22 @@ use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
 
 use crate::{Backend, WorkDir};
 
-pub use gitana_repository_layout::{DiscoveryError, RepositoryLayout, discover, try_discover};
+pub use gitana_repository_layout::{
+	DiscoveryError, RepositoryLayout, discover, inspect_root, try_discover,
+};
+
+/// The stable local-transport URL selected by exact-root repository inspection.
+///
+/// [`RepositoryLayout`] paths are already canonical and absolute. Deriving the URL from the layout
+/// avoids resolving the caller's ambient spelling a second time after source capabilities have been
+/// retained, when a symlink in that spelling could already point at a different repository.
+pub(crate) fn local_source_url(layout: &RepositoryLayout) -> Result<String> {
+	let root = layout.worktree_root.as_deref().unwrap_or(&layout.git_dir);
+	root
+		.to_str()
+		.map(ToOwned::to_owned)
+		.ok_or_else(|| anyhow!("local remote path is not valid UTF-8: {}", root.display()))
+}
 
 /// The error for a work-tree operation run in a bare repo (or outside a work tree).
 fn work_tree_required() -> anyhow::Error {
@@ -220,4 +235,41 @@ pub(crate) fn is_bare(common_dir: &Path) -> bool {
 
 fn canonical(path: &Path) -> PathBuf {
 	std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+	use std::os::unix::fs::symlink;
+
+	use super::*;
+
+	fn create_bare_repository(path: &Path) {
+		std::fs::create_dir_all(path.join("objects")).unwrap();
+		std::fs::create_dir_all(path.join("refs")).unwrap();
+		std::fs::write(path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+	}
+
+	#[tokio::test]
+	async fn local_source_url_stays_bound_to_the_inspected_layout() {
+		let temporary = tempfile::tempdir().unwrap();
+		let source_a = temporary.path().join("source-a");
+		let source_b = temporary.path().join("source-b");
+		let alias = temporary.path().join("source");
+		create_bare_repository(&source_a);
+		create_bare_repository(&source_b);
+		symlink(&source_a, &alias).unwrap();
+
+		let layout = inspect_root(&alias).await.unwrap();
+		std::fs::remove_file(&alias).unwrap();
+		symlink(&source_b, &alias).unwrap();
+
+		assert_eq!(
+			local_source_url(&layout).unwrap(),
+			std::fs::canonicalize(&source_a).unwrap().to_str().unwrap()
+		);
+		assert_ne!(
+			local_source_url(&layout).unwrap(),
+			std::fs::canonicalize(&alias).unwrap().to_str().unwrap()
+		);
+	}
 }

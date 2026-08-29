@@ -15,7 +15,7 @@ use gitana_remote::{Connection, PackFetcher, PushRefspec, Refspec};
 use gitana_repository::{HeadState, ReflogIntent, Repository};
 use gitana_worktree::WorkTree;
 
-use crate::Signer;
+use crate::{PreparedClone, Signer};
 
 /// How a [`fetch`] treats the remote's tags (git's default / `--tags` / `--no-tags`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -575,6 +575,29 @@ pub async fn pull_upstream<F: FileStore, H: HashAlgorithm>(
 	Ok(advertised.oid_of(branch))
 }
 
+/// Fetch the closure rooted at an exact object id without updating refs.
+///
+/// Callers should perform their normal refspec fetch first and use this only when a durable recorded id
+/// remains absent, as submodule update does after the remote branch containing that commit moved. The
+/// remote may refuse an unadvertised want; that refusal is returned unchanged.
+pub async fn fetch_object<F: FileStore, H: HashAlgorithm>(
+	fetcher: &mut impl PackFetcher,
+	repo: &Repository<F, H>,
+	oid: ObjectId<H>,
+) -> Result<()> {
+	if repo.objects().exists_object(&oid).await? {
+		return Ok(());
+	}
+	let haves = gitana_remote::local_haves(repo).await?;
+	fetcher
+		.fetch_pack(repo, &[oid], &haves, &Deepen::default(), false)
+		.await?;
+	if !repo.objects().exists_object(&oid).await? {
+		bail!("remote did not provide requested object {oid}");
+	}
+	Ok(())
+}
+
 /// Clone the advertised repository into `work` (whose `.git` backs `repo`): initialise it (writing
 /// a config matching `H`), download every advertised tip, recreate the refs and `HEAD`, save the
 /// origin, and check out `HEAD`. The ref advertisement and the pack both come over `connection` (an
@@ -596,6 +619,36 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	persist_url: &str,
 	sparse: bool,
 ) -> Result<()> {
+	let prepared = prepare_clone(connection, &repo, deepen, reflog, persist_url).await?;
+
+	// The `git_dir` a `WorkTree` carries is inert — the index and all git-dir files route through the
+	// `FileStore` — so a placeholder path suffices, as elsewhere in the worktree layer.
+	let worktree = WorkTree::new(repo, work, "");
+	// `--sparse` must establish its config before the first checkout so excluded paths are never written.
+	if sparse {
+		worktree
+			.apply_sparse_set(&gitana_worktree::SparseSet::Cone(Vec::new()))
+			.await?;
+	}
+	if let Some(commit) = prepared.head {
+		let tree = worktree.repository().commit_tree(commit).await?;
+		worktree.checkout(tree, true, None).await?;
+	}
+	Ok(())
+}
+
+/// Prepare a cloned repository without creating or populating a working tree.
+///
+/// This is the shared acquisition primitive for normal clone and submodule materialisation: it writes
+/// repository metadata, objects, refs, `HEAD`, and `remote.origin`, then returns the resolved head for a
+/// caller that wants a checkout. The source URL and optional reflog identity follow [`clone`].
+pub async fn prepare_clone<F: FileStore, H: HashAlgorithm>(
+	connection: &mut impl Connection,
+	repo: &Repository<F, H>,
+	deepen: &Deepen,
+	reflog: Option<CloneReflog<'_>>,
+	persist_url: &str,
+) -> Result<PreparedClone<H>> {
 	repo.init().await?;
 
 	let advertised = parse_advertisement::<H>(connection.advertisement())?;
@@ -605,7 +658,7 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	let roots = shallow_wants(&advertised);
 	download_clone(
 		connection,
-		&repo,
+		repo,
 		&advertised,
 		deepen,
 		&roots,
@@ -613,24 +666,40 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	)
 	.await?;
 
-	// Point HEAD at the remote's default branch *before* recreating the refs, so that when the loop
-	// writes that branch, `update_ref`'s "split HEAD update" cascades clone's reflog into `logs/HEAD`
-	// as a creation (old = zero), exactly as git records it. Retargeting an unborn branch logs nothing
-	// (and we pass Skip regardless), so no stray HEAD entry precedes the branch write.
-	let head_target = advertised
-		.head_target
-		.clone()
-		.unwrap_or_else(|| "refs/heads/main".to_owned());
-	repo
-		.refs()
-		.set_head_symbolic(&head_target, ReflogIntent::Skip)
-		.await?;
+	// Protocol v0's `symref=HEAD:...` capability is optional. In its absence Git guesses a branch
+	// whose advertised tip matches HEAD, preferring init.defaultBranch, then master, then the first
+	// matching branch. A direct HEAD remains detached only when no branch identifies that commit.
+	let default_branch = clone_default_branch(repo).await?;
+	let head_state = infer_clone_head(&advertised, &default_branch);
+	let clone_reflog = reflog.map(|r| (r.committer, format!("clone: from {}", r.url)));
+	// Establish HEAD before recreating advertised refs. A symbolic HEAD lets its selected branch
+	// cascade clone's reflog into `logs/HEAD`. A direct HEAD is detached while its initial symbolic
+	// target is still unborn, so its clone entry starts at the zero object id just like git's.
+	match &head_state {
+		HeadState::Symbolic(target) => {
+			repo
+				.refs()
+				.set_head_symbolic(target, ReflogIntent::Skip)
+				.await?;
+		}
+		HeadState::Detached(oid) => {
+			let intent = match &clone_reflog {
+				Some((committer, message)) => ReflogIntent::Log { committer, message },
+				None => ReflogIntent::Skip,
+			};
+			repo
+				.refs()
+				.lock_head()
+				.await?
+				.finish_detached(*oid, intent)
+				.await?;
+		}
+	}
 
 	// Recreate the refs and HEAD locally. A shallow clone fetches only branch history (see
 	// `download`), so an advertised ref whose target is outside that closure — e.g. a tag on the
 	// truncated history — is skipped rather than recreated as a dangling ref pointing at a missing
 	// object. A full clone holds the whole closure, so nothing is skipped there.
-	let clone_reflog = reflog.map(|r| (r.committer, format!("clone: from {}", r.url)));
 	let shallow = !deepen.is_empty();
 	for (name, oid) in &advertised.refs {
 		if name.starts_with("refs/") {
@@ -640,8 +709,8 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			// Only the checked-out branch (HEAD's target) carries clone's reflog — writing it cascades the
 			// entry into `logs/HEAD`. The other refs gta recreates here stand in for git's remote-tracking
 			// refs, which git leaves unlogged, so they pass Skip.
-			let intent = match &clone_reflog {
-				Some((c, msg)) if *name == head_target => ReflogIntent::Log {
+			let intent = match (&head_state, &clone_reflog) {
+				(HeadState::Symbolic(target), Some((c, msg))) if name == target => ReflogIntent::Log {
 					committer: c,
 					message: msg,
 				},
@@ -653,26 +722,49 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	// Persist the remote (the caller-resolved URL, scheme-agnostic) through the file store.
 	gitana_remote::save_remote_origin(repo.objects().file_store(), persist_url).await?;
 
-	// Populate the working tree from HEAD (if the repo had any commits).
+	// Return the prepared HEAD so the caller can populate its chosen working tree.
 	let head = repo.refs().resolve_head().await?;
-	// The `git_dir` a `WorkTree` carries is inert — the index and all git-dir files route through the
-	// `FileStore` — so a placeholder path suffices, as elsewhere in the worktree layer.
-	let worktree = WorkTree::new(repo, work, "");
-	// `--sparse` (git's clone --sparse): initialise cone sparse-checkout with the default set (root files
-	// only) BEFORE any checkout, so only the in-cone paths are ever written — rather than materialising the
-	// whole tree and removing most of it. Written even for an empty remote (git's clone --sparse still lays
-	// down the config + pattern file so a later first checkout is sparse); with a HEAD the subsequent
-	// checkout honours the patterns just written (the index is still empty, so this reapply is a no-op).
-	if sparse {
-		worktree
-			.apply_sparse_set(&gitana_worktree::SparseSet::Cone(Vec::new()))
-			.await?;
+	Ok(PreparedClone { head })
+}
+
+async fn clone_default_branch<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+) -> Result<String> {
+	let config = repo.effective_config().await?;
+	match config.get_raw("init", None, "defaultbranch") {
+		None => Ok("main".to_owned()),
+		Some(Some(branch)) if !branch.is_empty() => Ok(branch.to_owned()),
+		Some(_) => bail!("init.defaultBranch requires a non-empty value"),
 	}
-	if let Some(commit) = head {
-		let tree = worktree.repository().commit_tree(commit).await?;
-		worktree.checkout(tree, true, None).await?;
+}
+
+fn infer_clone_head<H: HashAlgorithm>(
+	advertised: &Advertised<H>,
+	default_branch: &str,
+) -> HeadState<H> {
+	if let Some(target) = &advertised.head_target {
+		return HeadState::Symbolic(target.clone());
 	}
-	Ok(())
+	let Some(head) = advertised.oid_of("HEAD") else {
+		return HeadState::Symbolic(format!("refs/heads/{default_branch}"));
+	};
+	let configured = format!("refs/heads/{default_branch}");
+	for preferred in [&configured[..], "refs/heads/master"] {
+		if advertised
+			.refs
+			.iter()
+			.any(|(name, oid)| name == preferred && *oid == head)
+		{
+			return HeadState::Symbolic(preferred.to_owned());
+		}
+	}
+	advertised
+		.refs
+		.iter()
+		.find(|(name, oid)| name.starts_with("refs/heads/") && *oid == head)
+		.map_or(HeadState::Detached(head), |(name, _)| {
+			HeadState::Symbolic(name.clone())
+		})
 }
 
 /// Download a **clone**'s objects over a [`Connection`] (the single-round counterpart of [`download`],
@@ -1307,6 +1399,62 @@ mod tests {
 
 	use super::*;
 	use crate::test_support::{TestIdentity, TestSigner, fixture, stage};
+
+	#[test]
+	fn clone_head_without_symref_infers_a_matching_branch() {
+		use gitana_object::Sha256;
+
+		let head = ObjectId::<Sha256>::from_hex(&"1".repeat(64)).unwrap();
+		let advertised = Advertised {
+			refs: vec![
+				("HEAD".to_owned(), head),
+				("refs/heads/trunk".to_owned(), head),
+			],
+			..Default::default()
+		};
+		assert_eq!(
+			infer_clone_head(&advertised, "main"),
+			HeadState::Symbolic("refs/heads/trunk".to_owned())
+		);
+	}
+
+	#[test]
+	fn clone_head_guess_prefers_the_configured_default_branch() {
+		use gitana_object::Sha256;
+
+		let head = ObjectId::<Sha256>::from_hex(&"2".repeat(64)).unwrap();
+		let advertised = Advertised {
+			refs: vec![
+				("HEAD".to_owned(), head),
+				("refs/heads/other".to_owned(), head),
+				("refs/heads/trunk".to_owned(), head),
+			],
+			..Default::default()
+		};
+		assert_eq!(
+			infer_clone_head(&advertised, "trunk"),
+			HeadState::Symbolic("refs/heads/trunk".to_owned())
+		);
+	}
+
+	#[test]
+	fn clone_head_without_a_matching_branch_remains_detached() {
+		use gitana_object::Sha256;
+
+		let head = ObjectId::<Sha256>::from_hex(&"3".repeat(64)).unwrap();
+		let branch = ObjectId::<Sha256>::from_hex(&"4".repeat(64)).unwrap();
+		let advertised = Advertised {
+			refs: vec![
+				("HEAD".to_owned(), head),
+				("refs/heads/main".to_owned(), branch),
+			],
+			..Default::default()
+		};
+		assert_eq!(
+			infer_clone_head(&advertised, "main"),
+			HeadState::Detached(head)
+		);
+	}
 
 	#[test]
 	fn deepen_requires_matching_server_capability() {

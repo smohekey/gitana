@@ -65,12 +65,17 @@ mod meta;
 mod work_dir_fs;
 pub use file_kind::FileKind;
 pub use meta::Meta;
-pub use work_dir_fs::{DirEntry, WorkDirFs};
+pub use work_dir_fs::{DirEntry, PopulationEntry, WorkDirFs};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod cap_work_dir;
 #[cfg(not(target_arch = "wasm32"))]
 pub use cap_work_dir::CapWorkDir;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod directory_identity;
+#[cfg(not(target_arch = "wasm32"))]
+pub use directory_identity::same_directory_identity;
 
 #[cfg(target_arch = "wasm32")]
 mod descriptor_backend;
@@ -1081,8 +1086,22 @@ async fn lock_backoff() {
 }
 
 fn read_current_version(fs: &dyn Backend, path: &str) -> Result<Option<Version>> {
-	match fs.read(path) {
-		Ok(bytes) => Ok(Some(version_of(&bytes))),
+	match fs.kind(path) {
+		Ok(FileKind::File) => match fs.read(path) {
+			Ok(bytes) => {
+				// Refuse a final-component replacement that happened between classification and read.
+				// In particular, never let a symlink with matching target bytes satisfy a CAS token.
+				if fs.kind(path).map_err(backend_err)? != FileKind::File {
+					return Err(FileStoreError::VersionMismatch);
+				}
+				Ok(Some(version_of(&bytes)))
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+				Err(FileStoreError::VersionMismatch)
+			}
+			Err(error) => Err(backend_err(error)),
+		},
+		Ok(_) => Err(FileStoreError::VersionMismatch),
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
 		Err(error) => Err(backend_err(error)),
 	}
@@ -1111,6 +1130,55 @@ fn read_err(error: std::io::Error) -> FileStoreError {
 		// packed-ref fallback resolve the child, diverging from git's unknown-revision result.
 		std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory => FileStoreError::NotFound,
 		_ => FileStoreError::Backend(error.to_string()),
+	}
+}
+
+#[cfg(all(test, unix))]
+mod conditional_write_tests {
+	use cap_std::{ambient_authority, fs::Dir};
+	use gitana_file_store::{FileStore, FileStoreError};
+
+	use super::LocalFileStore;
+
+	#[tokio::test]
+	async fn cas_does_not_follow_a_final_component_symlink() {
+		let temporary = tempfile::tempdir().unwrap();
+		std::fs::write(temporary.path().join("target"), b"old").unwrap();
+		std::os::unix::fs::symlink("target", temporary.path().join("marker")).unwrap();
+		let store = LocalFileStore::from_dir(
+			Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap(),
+		);
+		let (_, followed_version) = store.read_path_versioned("marker").await.unwrap();
+
+		assert!(matches!(
+			store
+				.write_path_cas("marker", b"replacement", Some(&followed_version))
+				.await,
+			Err(FileStoreError::VersionMismatch)
+		));
+		assert!(
+			std::fs::symlink_metadata(temporary.path().join("marker"))
+				.unwrap()
+				.file_type()
+				.is_symlink()
+		);
+		assert_eq!(
+			std::fs::read(temporary.path().join("target")).unwrap(),
+			b"old"
+		);
+
+		std::fs::remove_file(temporary.path().join("marker")).unwrap();
+		std::os::unix::fs::symlink("missing", temporary.path().join("marker")).unwrap();
+		assert!(matches!(
+			store.write_path_cas("marker", b"replacement", None).await,
+			Err(FileStoreError::VersionMismatch)
+		));
+		assert!(
+			std::fs::symlink_metadata(temporary.path().join("marker"))
+				.unwrap()
+				.file_type()
+				.is_symlink()
+		);
 	}
 }
 

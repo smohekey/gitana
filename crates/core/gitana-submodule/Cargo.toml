@@ -1,0 +1,42 @@
+[package]
+description = "Capability-scoped consumer operations for Git submodules."
+edition.workspace = true
+license.workspace = true
+name = "gitana-submodule"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+[lints]
+workspace = true
+
+[dependencies]
+gitana-config.workspace = true
+gitana-file-store.workspace = true
+gitana-file-store-local.workspace = true
+gitana-object.workspace = true
+gitana-object-store.workspace = true
+gitana-repository.workspace = true
+gitana-repository-layout.workspace = true
+gitana-remote.workspace = true
+gitana-worktree.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+caseless.workspace = true
+gitana-fs-native.workspace = true
+unicode-normalization.workspace = true
+
+[target.'cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "redox", target_os = "tvos", target_os = "visionos", target_os = "watchos"))'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

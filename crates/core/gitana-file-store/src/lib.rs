@@ -120,7 +120,9 @@ pub trait FileStore: Send + Sync {
 	/// Conditionally write `bytes` at `path`, returning the new [`Version`].
 	///
 	/// `expected == None` requires the path to be absent; `expected == Some(v)`
-	/// requires the current version to equal `v`. Otherwise [`FileStoreError::VersionMismatch`].
+	/// requires the current regular value's version to equal `v`. Otherwise
+	/// [`FileStoreError::VersionMismatch`]. Filesystem backends inspect the final component without
+	/// following links, so a symlink, directory, or special entry satisfies neither expectation.
 	fn write_path_cas(
 		&self,
 		path: &str,

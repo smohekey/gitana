@@ -14,9 +14,9 @@ use crate::{FileKind, LocalFileStore};
 ///
 /// git splits such a repository's files in two: a per-worktree git directory holds the files that
 /// are private to one checkout (`HEAD`, `index`, `ORIG_HEAD`, `MERGE_HEAD`/`MERGE_MSG`,
-/// `logs/HEAD`), while a shared *common* directory holds everything else (`objects`, `refs/heads`,
-/// `refs/tags`, `refs/remotes`, `packed-refs`, `config`). This store routes each git-relative path
-/// to whichever underlying [`LocalFileStore`] owns it.
+/// `logs/HEAD`, and that checkout's `modules/` repositories), while a shared *common* directory holds
+/// everything else (`objects`, `refs/heads`, `refs/tags`, `refs/remotes`, `packed-refs`, `config`).
+/// This store routes each git-relative path to whichever underlying [`LocalFileStore`] owns it.
 ///
 /// For an ordinary (non-linked) repository the two directories coincide, so the routing is a
 /// transparent no-op — every path resolves to the same place either way.
@@ -94,8 +94,8 @@ impl WorktreeFileStore {
 /// rather than in the shared common dir. Follows git's worktree layout for the paths gitana touches:
 /// `HEAD` (and its ref-transaction `HEAD.lock`), `index` (and its `index.lock`), the in-progress
 /// operation state (`MERGE_HEAD`/`MERGE_MSG`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, and gitana's
-/// `REBASE_*` files), and the per-worktree ref namespaces. gitana's other refs (`refs/heads`,
-/// `refs/tags`, `refs/remotes`) are shared.
+/// `REBASE_*` files), the per-worktree ref namespaces, and `modules/` (submodule repositories owned
+/// by this checkout). gitana's other refs (`refs/heads`, `refs/tags`, `refs/remotes`) are shared.
 ///
 /// Routing the operation state per-worktree is critical: otherwise a rebase/cherry-pick/revert
 /// started in one linked worktree would be visible — and `--abort`/`--continue`-able — from another,
@@ -120,6 +120,12 @@ fn is_per_worktree(path: &str) -> bool {
 	path == "index"
 		|| path == "config.worktree"
 		|| path == "logs/HEAD"
+		// Submodule repositories created from a linked worktree belong to that checkout and live under
+		// `<common>/worktrees/<id>/modules/`, rather than the shared `<common>/modules/` namespace.
+		// Route the root as well as every descendant so reads, writes, locks, and durability barriers
+		// all use the same owning directory.
+		|| path == "modules"
+		|| path.starts_with("modules/")
 		// `info/sparse-checkout` is per-worktree (git stores it under `worktrees/<name>/info/`, and enabling
 		// sparse-checkout sets a per-worktree `core.sparseCheckout` via `extensions.worktreeConfig`) — unlike
 		// `info/exclude`, which stays shared in the common dir.
@@ -359,6 +365,10 @@ mod tests {
 			"REBASE_TODO",
 			"COMMIT_EDITMSG",
 			"index",
+			"modules",
+			"modules/one/HEAD",
+			"modules/nested/one/config",
+			"modules/one/refs/heads/main.lock",
 			// The lock files must route with their targets, so a ref transaction / index write locks
 			// the real per-worktree file (interoperably with git).
 			"HEAD.lock",
@@ -389,6 +399,7 @@ mod tests {
 			"config",
 			"packed-refs",
 			"objects/aa/bbcc",
+			"modules-shared/one/HEAD",
 			"refs/heads/main",
 			"refs/heads/main.lock",
 			"refs/heads/UPPER", // uppercase, but not top-level (under refs/) → shared

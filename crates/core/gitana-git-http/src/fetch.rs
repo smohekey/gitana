@@ -22,7 +22,9 @@ use crate::GitHttpError;
 use crate::deepen::Deepen;
 use crate::negotiate::{common_haves, ok_to_give_up};
 use crate::pack::{build_pack, build_pack_shallow, build_pack_thin};
-use crate::shallow::{compute_shallow, reachable_commits, reachable_tag_wants};
+use crate::shallow::{
+	compute_shallow, reachable_commits, reachable_tag_wants, validate_source_wants,
+};
 use crate::sideband::write_sideband_pack;
 
 /// Parsed `fetch` arguments.
@@ -56,10 +58,13 @@ pub async fn fetch<H: HashAlgorithm>(
 	}
 
 	let mut out = Vec::new();
+	let source_shallow = repo.read_shallow().await?;
+	validate_source_wants(repo, &args.wants, &source_shallow).await?;
+	let source_boundary: HashSet<ObjectId<H>> = source_shallow.iter().copied().collect();
 
 	if args.done {
 		// Negotiation already concluded: send the pack straight away.
-		return finish_with_pack(out, repo, &args).await;
+		return finish_with_pack(out, repo, &args, &source_shallow, &source_boundary).await;
 	}
 
 	// Negotiation round: acknowledge the haves we actually have, and decide whether we can build the pack
@@ -76,7 +81,7 @@ pub async fn fetch<H: HashAlgorithm>(
 	for oid in &common {
 		write_pkt(&mut out, format!("ACK {oid}\n").as_bytes())?;
 	}
-	if !ok_to_give_up(repo, &args.wants, &common).await? {
+	if !ok_to_give_up(repo, &args.wants, &common, &source_boundary).await? {
 		// Commons found but a want still has no common ancestor: keep negotiating (no `ready`, no pack).
 		write_flush(&mut out);
 		return Ok(out);
@@ -84,7 +89,7 @@ pub async fn fetch<H: HashAlgorithm>(
 	// We have a sufficient cut point, so we can build the pack now.
 	write_pkt(&mut out, b"ready\n")?;
 	write_delim(&mut out);
-	finish_with_pack(out, repo, &args).await
+	finish_with_pack(out, repo, &args, &source_shallow, &source_boundary).await
 }
 
 /// Append the `packfile` section (side-band pack) and close the response, preceded by a `shallow-info`
@@ -93,19 +98,30 @@ async fn finish_with_pack<H: HashAlgorithm>(
 	mut out: Vec<u8>,
 	repo: &Repository<impl FileStore, H>,
 	args: &FetchArgs<H>,
+	source_shallow: &[ObjectId<H>],
+	source_boundary: &HashSet<ObjectId<H>>,
 ) -> Result<Vec<u8>, GitHttpError> {
 	// The client's own shallow commits always bound the have-walk (it lacks their parents), whether or
 	// not this request deepens — otherwise a plain fetch from a shallow clone could subtract ancestors
 	// the client does not actually have.
 	let have_boundary: HashSet<ObjectId<H>> = args.client_shallow.iter().copied().collect();
+	let have_boundary: HashSet<ObjectId<H>> = have_boundary.union(source_boundary).copied().collect();
 
-	// Only an actual `deepen*` directive recomputes the boundary and emits a `shallow-info` section; a
-	// normal fetch from a shallow client keeps its boundary and gets a plain (have-bounded) pack.
+	// A deepen directive computes a new client boundary. Otherwise either peer's existing shallow
+	// frontier remains a hard cut; only newly relevant source boundaries enter `shallow-info`.
 	let mut wants = args.wants.clone();
 	let mut boundary = HashSet::new();
 	let mut shallow_included: Option<HashSet<ObjectId<H>>> = None;
-	if !args.deepen.is_empty() {
-		let plan = compute_shallow(repo, &args.wants, &args.deepen, &args.client_shallow).await?;
+	if !args.deepen.is_empty() || !args.client_shallow.is_empty() || !source_shallow.is_empty() {
+		let plan = compute_shallow(
+			repo,
+			&args.wants,
+			&args.haves,
+			&args.deepen,
+			&args.client_shallow,
+			source_shallow,
+		)
+		.await?;
 		if !plan.shallow.is_empty() || !plan.unshallow.is_empty() {
 			write_pkt(&mut out, b"shallow-info\n")?;
 			for oid in &plan.shallow {

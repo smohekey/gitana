@@ -65,15 +65,25 @@ pub async fn on_repo<C: RepoCommand>(cwd: &Path, command: C) -> Result<()> {
 /// algorithm. Errors in a bare repository (no work tree).
 pub async fn on_worktree<C: WorkTreeCommand>(cwd: &Path, command: C) -> Result<()> {
 	let (found, prefix) = repo::discover_worktree_with_prefix(cwd).await?;
-	let work = found.worktree_root.clone().expect("discovered work tree");
-	let work = repo::open_work_dir(&work)?;
+	let worktree_root = found.worktree_root.clone().expect("discovered work tree");
+	let work = repo::open_work_dir(&worktree_root)?;
 	match detect_algorithm(&found.common_dir)? {
 		HashKind::Sha1 => {
-			let wt = WorkTree::new(open::<Sha1>(&found).await?, work, found.git_dir);
+			let wt = WorkTree::new_located(
+				open::<Sha1>(&found).await?,
+				work,
+				found.git_dir,
+				worktree_root,
+			);
 			command.run(wt, prefix).await
 		}
 		HashKind::Sha256 => {
-			let wt = WorkTree::new(open::<Sha256>(&found).await?, work, found.git_dir);
+			let wt = WorkTree::new_located(
+				open::<Sha256>(&found).await?,
+				work,
+				found.git_dir,
+				worktree_root,
+			);
 			command.run(wt, prefix).await
 		}
 	}
@@ -126,10 +136,15 @@ async fn resolve_object<H: HashAlgorithm>(
 			.worktree_root
 			.clone()
 			.ok_or_else(|| anyhow!("this operation must be run in a work tree"))?;
-		let work = repo::open_work_dir(&work)?;
-		WorkTree::new(open::<H>(found).await?, work, found.git_dir.clone())
-			.rev_parse(spec)
-			.await?
+		let directory = repo::open_work_dir(&work)?;
+		WorkTree::new_located(
+			open::<H>(found).await?,
+			directory,
+			found.git_dir.clone(),
+			work,
+		)
+		.rev_parse(spec)
+		.await?
 	} else {
 		repo.rev_parse(spec).await?
 	};

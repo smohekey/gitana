@@ -347,7 +347,7 @@ impl Pathspec {
 /// at least one positive (or there are no positives) **and** matches no negative (`:(exclude)` / `:!` /
 /// `:^`) — git's rule, so `. :!vendor` stages everything except `vendor`. Each positive remembers
 /// whether it matched anything, for git's "did not match any files" error.
-pub(crate) struct PathspecSet {
+pub struct PathspecSet {
 	// `AtomicBool` (not `Cell`) so `PathspecSet` stays `Sync`: `WorkTree::add` holds a `&PathspecSet`
 	// across awaits, and callers `tokio::spawn` that future, so it must remain `Send`.
 	positive: Vec<(String, Pathspec, std::sync::atomic::AtomicBool)>,
@@ -364,7 +364,7 @@ const _: fn() = || {
 impl PathspecSet {
 	/// Parse each raw spec (relative to `prefix`) into the set, routing `:(exclude)` ones to the
 	/// negatives. Rejects the same forms [`Pathspec::parse`] does (empty/absolute/escape/unknown magic).
-	pub(crate) fn parse(specs: &[&str], prefix: &str) -> Result<Self, WorktreeError> {
+	pub fn parse(specs: &[&str], prefix: &str) -> Result<Self, WorktreeError> {
 		let mut positive = Vec::new();
 		let mut negative = Vec::new();
 		for &spec in specs {
@@ -389,7 +389,7 @@ impl PathspecSet {
 
 	/// Whether `path` is selected by the set (matches a positive — or there are none — and no negative).
 	/// Records the positives that matched, for [`unmatched`](Self::unmatched).
-	pub(crate) fn matches(&self, path: &str) -> bool {
+	pub fn matches(&self, path: &str) -> bool {
 		let mut positive_hit = self.positive.is_empty();
 		for (_, pathspec, matched) in &self.positive {
 			if pathspec.matches(path) {
@@ -403,7 +403,7 @@ impl PathspecSet {
 	/// The original text of the first positive pathspec that matched nothing (git's "did not match any
 	/// files"), or `None` if every positive matched. Call after iterating all candidate paths through
 	/// [`matches`](Self::matches).
-	pub(crate) fn unmatched(&self) -> Option<&str> {
+	pub fn unmatched(&self) -> Option<&str> {
 		self
 			.positive
 			.iter()

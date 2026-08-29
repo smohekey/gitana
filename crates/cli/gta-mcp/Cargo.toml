@@ -11,10 +11,14 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
-clap-mcp = { workspace = true, features = ["derive", "http"] }
+clap-mcp.workspace = true
 gta-core.workspace = true
-tokio = { workspace = true, features = ["rt"] }
+rmcp.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "net"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "time"] }

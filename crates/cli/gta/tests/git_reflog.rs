@@ -113,6 +113,50 @@ fn disabled_first_commit_writes_no_reflog_sha1() {
 	check_disabled_first_commit("sha1");
 }
 
+#[cfg(unix)]
+#[test]
+fn repository_bare_fallback_merges_symlinked_common_and_worktree_config() {
+	use std::os::unix::fs::symlink;
+
+	let (g, h) = two_repos("sha1");
+	for (repository, external_name) in [(&g, "gta-config"), (&h, "git-config")] {
+		let config = repository.join(".git/config");
+		let external = repository.parent().unwrap().join(external_name);
+		let contents = std::fs::read_to_string(&config).unwrap();
+		let mut contents = contents
+			.lines()
+			.filter(|line| !line.to_ascii_lowercase().contains("logallrefupdates"))
+			.collect::<Vec<_>>()
+			.join("\n");
+		contents.push('\n');
+		contents.push_str("[extensions]\n\tworktreeConfig = true\n[core]\n\tbare = true\n");
+		std::fs::write(&external, contents).unwrap();
+		std::fs::remove_file(&config).unwrap();
+		symlink(&external, &config).unwrap();
+		std::fs::write(
+			repository.join(".git/config.worktree"),
+			"[user]\n\tname = Worktree\n",
+		)
+		.unwrap();
+	}
+
+	both(&g, &h, &["branch", "common-bare"]);
+	assert_absent(&g, "logs/refs/heads/common-bare");
+	assert_absent(&h, "logs/refs/heads/common-bare");
+
+	for repository in [&g, &h] {
+		std::fs::write(
+			repository.join(".git/config.worktree"),
+			"[core]\n\tbare = false\n",
+		)
+		.unwrap();
+	}
+	both(&g, &h, &["branch", "worktree-nonbare"]);
+	assert_log_eq(&g, &h, "logs/refs/heads/worktree-nonbare");
+
+	cleanup(&g, &h);
+}
+
 /// A branch created off a detached HEAD records the literal `HEAD`, and disabling
 /// `core.logAllRefUpdates` suppresses new reflogs (branch and the worktree's per-worktree HEAD).
 fn check_edge_cases(fmt: &str) {

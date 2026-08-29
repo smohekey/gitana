@@ -135,6 +135,54 @@ fn annotated_tag_is_a_tag_object_and_bare_name_stays_lightweight() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+#[test]
+fn malformed_reflog_policy_rejects_a_lightweight_tag_before_mutation() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("gta-tag-malformed-reflog-policy");
+	let w = work.to_str().unwrap();
+	git(w, &["init", "--object-format=sha256", "-q", "."]);
+	git(w, &["config", "user.name", "T"]);
+	git(w, &["config", "user.email", "t@e"]);
+	std::fs::write(work.join("a.txt"), b"hello\n").unwrap();
+	git(w, &["add", "."]);
+	git(w, &["commit", "-q", "-m", "first"]);
+
+	let git_output = Command::new("git")
+		.args([
+			"-C",
+			w,
+			"-c",
+			"core.logAllRefUpdates=definitely-not-a-boolean",
+			"tag",
+			"git-bad",
+		])
+		.output()
+		.expect("run git tag with malformed reflog policy");
+	assert!(!git_output.status.success());
+	assert!(!work.join(".git/refs/tags/git-bad").exists());
+
+	let gta_output = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args([
+			"-C",
+			w,
+			"-c",
+			"core.logAllRefUpdates=definitely-not-a-boolean",
+			"tag",
+			"gta-bad",
+		])
+		.output()
+		.expect("run gta tag with malformed reflog policy");
+	assert!(
+		!gta_output.status.success(),
+		"gta must reject the same malformed policy as git"
+	);
+	assert!(!work.join(".git/refs/tags/gta-bad").exists());
+}
+
 fn skip() -> bool {
 	if !git_supports_sha256() {
 		eprintln!("skipping: git without --object-format=sha256");

@@ -21,6 +21,23 @@ pub struct HeadLock<S, H: HashAlgorithm> {
 	_hash: PhantomData<H>,
 }
 
+/// A detached `HEAD` publication whose namespace, reflog policy, old value, and reflog destination
+/// have already been validated while retaining `HEAD.lock`.
+///
+/// Checkout code prepares this capability before mutating the index or worktree, then consumes it
+/// after checkout. Dropping it publishes nothing and releases the lock. On native targets
+/// [`finish`](Self::finish) transfers the capability to an owned task so cancellation cannot expose
+/// an unlocked, half-published `HEAD` update.
+#[must_use = "a prepared detached HEAD retains HEAD.lock; finish it after checkout, or drop it"]
+pub struct PreparedDetachedHead<S, H: HashAlgorithm> {
+	files: S,
+	effective: Option<gitana_config::GitConfig>,
+	lock: PathLock,
+	target: ObjectId<H>,
+	reflog_content: Option<Vec<u8>>,
+	_hash: PhantomData<H>,
+}
+
 impl<S, H> HeadLock<S, H>
 where
 	S: FileStore + 'static,
@@ -57,6 +74,63 @@ where
 		let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
 		store
 			.commit_checkout(lock, branch, create, checkout_reflog)
+			.await
+	}
+
+	/// Publish a detached checkout at `target`, consuming the held `HEAD.lock`.
+	pub async fn finish_detached(
+		self,
+		target: ObjectId<H>,
+		reflog: ReflogIntent<'_>,
+	) -> Result<(), RepositoryError> {
+		self.prepare_detached(target, reflog).await?.finish().await
+	}
+
+	/// Validate a detached checkout publication without writing it, retaining `HEAD.lock` in the
+	/// returned capability. This lets callers reject deterministic HEAD/reflog failures before they
+	/// mutate a worktree.
+	pub async fn prepare_detached(
+		self,
+		target: ObjectId<H>,
+		reflog: ReflogIntent<'_>,
+	) -> Result<PreparedDetachedHead<S, H>, RepositoryError> {
+		let HeadLock {
+			files,
+			effective,
+			lock,
+			_hash,
+		} = self;
+		let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+		let reflog_content = store.prepare_detached_checkout(target, reflog).await?;
+		Ok(PreparedDetachedHead {
+			files,
+			effective,
+			lock,
+			target,
+			reflog_content,
+			_hash: PhantomData,
+		})
+	}
+}
+
+impl<S, H> PreparedDetachedHead<S, H>
+where
+	S: FileStore + 'static,
+	H: HashAlgorithm,
+{
+	/// Publish the already-prepared reflog and detached HEAD, consuming the retained lock.
+	pub async fn finish(self) -> Result<(), RepositoryError> {
+		let PreparedDetachedHead {
+			files,
+			effective,
+			lock,
+			target,
+			reflog_content,
+			_hash,
+		} = self;
+		let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+		store
+			.commit_prepared_detached_checkout(lock, target, reflog_content)
 			.await
 	}
 }

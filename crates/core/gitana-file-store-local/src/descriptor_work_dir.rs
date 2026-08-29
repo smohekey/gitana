@@ -18,7 +18,7 @@ use wasip2::filesystem::types::{
 	Descriptor, DescriptorFlags, DescriptorStat, DescriptorType, ErrorCode, OpenFlags, PathFlags,
 };
 
-use crate::{DirEntry, FileKind, Meta, WorkDirFs, io_error};
+use crate::{DirEntry, FileKind, Meta, PopulationEntry, WorkDirFs, io_error};
 
 /// How many bytes to request per positional `descriptor.read` call when slurping a file.
 const READ_CHUNK: u64 = 64 * 1024;
@@ -145,6 +145,21 @@ impl WorkDirFs for DescriptorWorkDir {
 		Ok(())
 	}
 
+	fn populate_new(&self, path: &str, entry: PopulationEntry<'_>) -> io::Result<bool> {
+		let components = path.split('/').collect::<Vec<_>>();
+		if components.is_empty()
+			|| components
+				.iter()
+				.any(|component| component.is_empty() || matches!(*component, "." | ".."))
+		{
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"invalid population path",
+			));
+		}
+		populate_new_at(&self.dir, &components, entry)
+	}
+
 	fn symlink(&self, target: &[u8], path: &str) -> io::Result<()> {
 		// WASI's `symlink-at` takes the target as a `string`; git symlink blobs are conventionally
 		// UTF-8 paths. A non-UTF-8 target cannot be expressed and fails closed.
@@ -185,6 +200,111 @@ impl WorkDirFs for DescriptorWorkDir {
 		}
 		self.remove_dir(path)
 	}
+}
+
+/// Walk and create population parents with no symlink-follow flag. Recursion deliberately keeps
+/// every opened descriptor alive until the leaf operation completes, pinning the accepted chain.
+fn populate_new_at(
+	dir: &Descriptor,
+	components: &[&str],
+	entry: PopulationEntry<'_>,
+) -> io::Result<bool> {
+	let [name] = components else {
+		let component = components[0];
+		let child = match dir.open_at(
+			PathFlags::empty(),
+			component,
+			OpenFlags::DIRECTORY,
+			DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
+		) {
+			Ok(child) => child,
+			Err(ErrorCode::NoEntry) => {
+				match dir.create_directory_at(component) {
+					Ok(()) | Err(ErrorCode::Exist) => {}
+					Err(code) => return Err(io_error(code)),
+				}
+				dir
+					.open_at(
+						PathFlags::empty(),
+						component,
+						OpenFlags::DIRECTORY,
+						DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
+					)
+					.map_err(io_error)?
+			}
+			Err(code) => return Err(io_error(code)),
+		};
+		return populate_new_at(&child, &components[1..], entry);
+	};
+
+	match entry {
+		PopulationEntry::Directory => match dir.create_directory_at(name) {
+			Ok(()) => Ok(true),
+			Err(ErrorCode::Exist) => Ok(false),
+			Err(code) => Err(io_error(code)),
+		},
+		PopulationEntry::Regular { bytes, .. } => {
+			let file = match dir.open_at(
+				PathFlags::empty(),
+				name,
+				OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+				DescriptorFlags::READ | DescriptorFlags::WRITE,
+			) {
+				Ok(file) => file,
+				Err(ErrorCode::Exist) => return Ok(false),
+				Err(code) => return Err(io_error(code)),
+			};
+			if let Err(source) = write_descriptor(&file, bytes) {
+				return Err(io::Error::new(
+					source.kind(),
+					format!(
+						"{source}; partial population file '{name}' was preserved because WASI has no identity-conditioned unlink"
+					),
+				));
+			}
+			let current = dir
+				.open_at(
+					PathFlags::empty(),
+					name,
+					OpenFlags::empty(),
+					DescriptorFlags::READ,
+				)
+				.map_err(io_error)?;
+			if !file.is_same_object(&current) {
+				return Err(io::Error::new(
+					io::ErrorKind::AlreadyExists,
+					format!("population file '{name}' changed while it was being written"),
+				));
+			}
+			Ok(true)
+		}
+		PopulationEntry::Symlink(target) => {
+			let target = std::str::from_utf8(target)
+				.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "non-utf8 symlink target"))?;
+			match dir.symlink_at(target, name) {
+				Ok(()) => Ok(true),
+				Err(ErrorCode::Exist) => Ok(false),
+				Err(code) => Err(io_error(code)),
+			}
+		}
+	}
+}
+
+fn write_descriptor(file: &Descriptor, bytes: &[u8]) -> io::Result<()> {
+	let mut offset = 0u64;
+	while (offset as usize) < bytes.len() {
+		let written = file
+			.write(&bytes[offset as usize..], offset)
+			.map_err(io_error)?;
+		if written == 0 {
+			return Err(io::Error::new(
+				io::ErrorKind::WriteZero,
+				"wasi descriptor write made no progress",
+			));
+		}
+		offset += written;
+	}
+	Ok(())
 }
 
 /// The capability-neutral [`Meta`] for a WASI `descriptor-stat`. Permission and identity fields are

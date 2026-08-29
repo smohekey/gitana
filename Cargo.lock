@@ -421,6 +421,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cap-fs-ext"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d78e5a3368ae89b7cb68186411452b4b9fac8b41be9c19bf3f47c2d2c8e36e6b"
+dependencies = [
+ "cap-primitives 4.0.2",
+ "cap-std 4.0.2",
+ "io-lifetimes 3.0.1",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "cap-net-ext"
 version = "3.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -504,6 +516,15 @@ dependencies = [
  "once_cell",
  "rustix",
  "winx",
+]
+
+[[package]]
+name = "caseless"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b6fd507454086c8edfd769ca6ada439193cdb209c7681712ef6275cccbfe5d8"
+dependencies = [
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -600,7 +621,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5068aada7cd9e117bb001cac5db93f584851c4c363b1fe0e1e1b1982d1aca355"
 dependencies = [
  "async-trait",
- "axum",
  "chrono",
  "clap",
  "clap-mcp-macros",
@@ -1631,8 +1651,13 @@ name = "gitana-config-native"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cap-fs-ext 4.0.2",
+ "cap-std 4.0.2",
  "gitana-config",
+ "gitana-fs-native",
+ "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1670,9 +1695,11 @@ dependencies = [
 name = "gitana-file-store-local"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext 4.0.2",
  "cap-std 4.0.2",
  "gitana-file-store",
  "gitana-file-store-conformance",
+ "gitana-fs-native",
  "sha2",
  "tempfile",
  "tokio",
@@ -1687,6 +1714,17 @@ dependencies = [
  "gitana-file-store",
  "gitana-file-store-conformance",
  "tokio",
+]
+
+[[package]]
+name = "gitana-fs-native"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext 4.0.2",
+ "cap-std 4.0.2",
+ "rustix",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1794,8 +1832,9 @@ dependencies = [
  "gitana-file-store-memory",
  "gitana-git-http",
  "gitana-object",
+ "gitana-object-store",
  "gitana-repository",
- "reqwest 0.12.28",
+ "reqwest",
  "tempfile",
  "tokio",
 ]
@@ -1865,6 +1904,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitana-submodule"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext 4.0.2",
+ "cap-std 4.0.2",
+ "caseless",
+ "gitana-config",
+ "gitana-file-store",
+ "gitana-file-store-local",
+ "gitana-fs-native",
+ "gitana-object",
+ "gitana-object-store",
+ "gitana-remote",
+ "gitana-repository",
+ "gitana-repository-layout",
+ "gitana-worktree",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "unicode-normalization",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "gitana-trust"
 version = "0.1.0"
 dependencies = [
@@ -1886,6 +1953,7 @@ dependencies = [
  "gitana-config",
  "gitana-file-store",
  "gitana-file-store-local",
+ "gitana-fs-native",
  "gitana-object",
  "gitana-object-store",
  "gitana-repository",
@@ -1918,9 +1986,11 @@ dependencies = [
  "gitana-git-http",
  "gitana-object",
  "gitana-object-store",
+ "gitana-remote",
  "gitana-repository",
  "gta-core",
  "gta-mcp",
+ "sha2",
  "tempfile",
  "tokio",
 ]
@@ -1930,6 +2000,7 @@ name = "gta-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cap-fs-ext 4.0.2",
  "cap-std 4.0.2",
  "gitana-config",
  "gitana-config-native",
@@ -1938,6 +2009,7 @@ dependencies = [
  "gitana-file-store",
  "gitana-file-store-local",
  "gitana-file-store-memory",
+ "gitana-fs-native",
  "gitana-git-http",
  "gitana-identity",
  "gitana-linked-worktree",
@@ -1947,6 +2019,7 @@ dependencies = [
  "gitana-remote",
  "gitana-repository",
  "gitana-repository-layout",
+ "gitana-submodule",
  "gitana-trust",
  "gitana-worktree",
  "rpassword",
@@ -1962,9 +2035,12 @@ name = "gta-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "clap-mcp",
  "gta-core",
+ "rmcp",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -3342,40 +3418,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reqwest"
-version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
-dependencies = [
- "base64",
- "bytes",
- "futures-core",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "js-sys",
- "log",
- "percent-encoding",
- "pin-project-lite",
- "serde",
- "serde_json",
- "sync_wrapper",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http",
- "tower-service",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-streams",
- "web-sys",
-]
-
-[[package]]
 name = "rfc6979"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3415,6 +3457,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d1f571c72940a19d9532fe52dbea8bc9912bf1d766c2970bb824056b86f3f59"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "futures",
@@ -3425,7 +3468,6 @@ dependencies = [
  "pin-project-lite",
  "process-wrap",
  "rand 0.10.1",
- "reqwest 0.13.4",
  "rmcp-macros",
  "schemars",
  "serde",
@@ -4325,6 +4367,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4547,19 +4598,6 @@ dependencies = [
  "gitana-object-store",
  "tokio",
  "wasip2",
-]
-
-[[package]]
-name = "wasm-streams"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
-dependencies = [
- "futures-util",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
 ]
 
 [[package]]
@@ -4846,7 +4884,7 @@ dependencies = [
  "async-trait",
  "bitflags",
  "bytes",
- "cap-fs-ext",
+ "cap-fs-ext 3.4.5",
  "cap-net-ext",
  "cap-std 3.4.5",
  "cap-time-ext",

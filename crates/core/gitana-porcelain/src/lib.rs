@@ -14,6 +14,7 @@ mod commit;
 mod commit_error;
 pub mod conflict;
 mod merge;
+mod prepared_clone;
 mod prune;
 mod rebase;
 mod remote;
@@ -27,11 +28,12 @@ pub use commit::{commit, commit_signed};
 pub use commit_error::CommitError;
 pub use gitana_git_http::Deepen;
 pub use merge::{MergeOutcome, abort_merge, continue_merge, merge};
+pub use prepared_clone::PreparedClone;
 pub use prune::{gc, prune};
 pub use rebase::{RebaseOutcome, abort_rebase, continue_rebase, rebase, skip_rebase};
 pub use remote::{
 	CloneReflog, FetchOutcome, FetchReflog, PushOutcome, PushResult, PushTags, TagFetch, clone,
-	fetch, pull_upstream, push, push_signed,
+	fetch, fetch_object, prepare_clone, pull_upstream, push, push_signed,
 };
 pub use revert::{RevertOutcome, abort_revert, continue_revert, revert};
 pub use tag::{tag, tag_signed};

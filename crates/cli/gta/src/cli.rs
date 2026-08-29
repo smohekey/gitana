@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -15,6 +17,9 @@ pub(crate) struct Cli {
 	/// Run as if started in `<dir>`.
 	#[arg(short = 'C', value_name = "dir", global = true)]
 	directory: Option<PathBuf>,
+	/// Pass a command-scope configuration parameter. Must precede the subcommand.
+	#[arg(short = 'c', value_name = "key=value")]
+	config: Vec<String>,
 	#[command(subcommand)]
 	command: Command,
 }
@@ -479,6 +484,11 @@ enum Command {
 		#[arg(long = "follow-tags", conflicts_with = "tags")]
 		follow_tags: bool,
 	},
+	/// Inspect, initialize, or update one level of tracked submodules.
+	Submodule {
+		#[command(subcommand)]
+		action: SubmoduleAction,
+	},
 	/// List, add, remove, or retarget the configured remotes.
 	Remote {
 		/// With no sub-command, also print each remote's fetch/push URL.
@@ -501,6 +511,27 @@ enum Command {
 	SparseCheckout {
 		#[command(subcommand)]
 		action: SparseCheckoutAction,
+	},
+}
+
+#[derive(Subcommand)]
+enum SubmoduleAction {
+	/// Show the recorded and checked-out state of tracked submodules.
+	Status {
+		#[arg(value_name = "path")]
+		paths: Vec<String>,
+	},
+	/// Register selected submodule URLs and activate them.
+	Init {
+		#[arg(value_name = "path")]
+		paths: Vec<String>,
+	},
+	/// Materialize and check out selected submodules at the recorded commits.
+	Update {
+		#[arg(long)]
+		init: bool,
+		#[arg(value_name = "path")]
+		paths: Vec<String>,
 	},
 }
 
@@ -703,15 +734,51 @@ enum RemoteAction {
 }
 
 impl Cli {
-	async fn dispatch(self) -> Result<()> {
+	fn dispatch(self) -> Pin<Box<dyn Future<Output = Result<()>>>> {
+		Box::pin(self.dispatch_inner())
+	}
+
+	async fn dispatch_inner(self) -> Result<()> {
+		// A directly scoped global/system single-key read is git's one lazy-config exception: it does
+		// not inspect command-scope values. Every other command eagerly validates the effective ambient
+		// stack before dispatch, especially before a mutating command can publish state.
+		let scoped_keyed_config_read = matches!(
+			&self.command,
+			Command::Config {
+				get_all: false,
+				add: false,
+				replace_all: false,
+				unset: false,
+				list: false,
+				global: true,
+				system: false,
+				value: None,
+				..
+			} | Command::Config {
+				get_all: false,
+				add: false,
+				replace_all: false,
+				unset: false,
+				list: false,
+				global: false,
+				system: true,
+				value: None,
+				..
+			}
+		);
 		let cwd = match self.directory {
 			Some(dir) => dir,
 			None => std::env::current_dir()?,
 		};
 		// Establish the command's working directory so relative config-file overrides
 		// (GIT_CONFIG_GLOBAL/SYSTEM) resolve against it, as git does under `-C`.
+		let context = gta_core::CommandContext::from_env(cwd.clone(), self.config);
+		if !scoped_keyed_config_read {
+			context.preflight().await?;
+		}
+		let command_context = context.clone();
 		let command = self.command;
-		gta_core::with_command_cwd(cwd.clone(), async move {
+		let dispatch = async move {
 			match command {
 				Command::Init {
 					path,
@@ -957,6 +1024,9 @@ impl Cli {
 					)
 					.await
 				}
+				Command::Submodule { action } => {
+					commands::submodule::run(&cwd, &command_context, submodule_action(action)).await
+				}
 				Command::Remote { verbose, action } => {
 					commands::remote::run(&cwd, remote_action(verbose, action)).await
 				}
@@ -968,8 +1038,17 @@ impl Cli {
 					commands::sparse_checkout::run(&cwd, sparse_checkout_action(action)).await
 				}
 			}
-		})
-		.await
+		};
+		context.scope(dispatch).await
+	}
+}
+
+fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
+	use commands::submodule::Action;
+	match action {
+		SubmoduleAction::Status { paths } => Action::Status { paths },
+		SubmoduleAction::Init { paths } => Action::Init { paths },
+		SubmoduleAction::Update { init, paths } => Action::Update { init, paths },
 	}
 }
 

@@ -962,6 +962,63 @@ fn scoped_keyed_read_tolerates_bad_count_unlike_list_or_local() {
 }
 
 #[test]
+fn scoped_keyed_read_ignores_invalid_command_config_unlike_other_operations() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-config-scoped-command-config");
+	let w = work.to_str().unwrap();
+	let config_dir = unique_tmp("gta-scoped-command-config-files");
+	let global = config_dir.join("global");
+	let system = config_dir.join("system");
+	std::fs::write(&global, "[user]\n\tname = Global\n").unwrap();
+	std::fs::write(&system, "[user]\n\tname = System\n").unwrap();
+	let env = [
+		("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+		("GIT_CONFIG_SYSTEM", system.to_str().unwrap()),
+	];
+
+	for (scope, expected) in [("--global", "Global"), ("--system", "System")] {
+		let args = ["-c", "invalid", "config", scope, "user.name"];
+		assert_eq!(ok_stdout(gta_env(w, &args, &env)).trim(), expected);
+		assert_eq!(ok_stdout(git_env(w, &args, &env)).trim(), expected);
+	}
+
+	for args in [
+		&["-c", "invalid", "config", "--global", "--list"][..],
+		&[
+			"-c",
+			"invalid",
+			"config",
+			"--global",
+			"--get-all",
+			"user.name",
+		][..],
+		&["-c", "invalid", "config", "--local", "user.name"][..],
+		&[
+			"-c",
+			"invalid",
+			"config",
+			"--global",
+			"user.name",
+			"Changed",
+		][..],
+	] {
+		assert!(
+			!gta_env(w, args, &env).status.success(),
+			"gta {args:?} must validate command config"
+		);
+		assert!(
+			!git_env(w, args, &env).status.success(),
+			"git {args:?} validates command config (oracle)"
+		);
+	}
+
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&config_dir).ok();
+}
+
+#[test]
 fn scoped_read_of_missing_file_errors_but_merged_skips() {
 	if !git_supports_sha256() {
 		return;
@@ -1799,6 +1856,42 @@ fn command_scope_relative_include_is_rejected_like_git() {
 	);
 	assert!(!git_env(w, &["config", "user.email"], &env).status.success());
 	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn command_scope_include_errors_fail_before_init_mutates() {
+	let root = unique_tmp("gta-c-relinc-init");
+	let target = root.join("target");
+	let args = [
+		"-c",
+		"include.path=relative",
+		"init",
+		target.to_str().unwrap(),
+	];
+	let gta = gta_env(root.to_str().unwrap(), &args, &[]);
+	assert!(
+		!gta.status.success(),
+		"gta accepted a relative command include"
+	);
+	assert!(
+		!target.exists(),
+		"config expansion must fail before init creates its target"
+	);
+
+	let git_target = root.join("git-target");
+	let git_args = [
+		"-c",
+		"include.path=relative",
+		"init",
+		git_target.to_str().unwrap(),
+	];
+	let git = git_env(root.to_str().unwrap(), &git_args, &[]);
+	assert!(
+		!git.status.success(),
+		"git oracle unexpectedly accepted the include"
+	);
+	assert!(!git_target.exists());
+	std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]

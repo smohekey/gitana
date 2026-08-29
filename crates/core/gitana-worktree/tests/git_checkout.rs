@@ -120,6 +120,58 @@ async fn checkout_refuses_to_clobber_dirty_files() {
 }
 
 #[tokio::test]
+async fn populate_never_clobbers_content_and_resumes_exact_partial_state() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let (work, first) = two_commits("populate-no-clobber");
+	let w = work.to_str().unwrap();
+	let wt = make_repo(&work);
+	let tree = wt
+		.repository()
+		.commit_tree(ObjectId::<Sha256>::from_hex(&first).unwrap())
+		.await
+		.unwrap();
+	let before = std::fs::read(work.join(".git/index")).unwrap();
+
+	for path in ["a.txt", "c.txt", "run.sh"] {
+		std::fs::remove_file(work.join(path)).unwrap();
+	}
+	std::fs::remove_dir_all(work.join("sub")).unwrap();
+	std::fs::write(work.join("a.txt"), b"concurrent user data\n").unwrap();
+	assert!(matches!(
+		wt.populate(tree).await,
+		Err(WorktreeError::UntrackedOverwrite(path)) if path == "a.txt"
+	));
+	assert_eq!(
+		std::fs::read(work.join("a.txt")).unwrap(),
+		b"concurrent user data\n"
+	);
+	assert_eq!(std::fs::read(work.join(".git/index")).unwrap(), before);
+
+	std::fs::remove_file(work.join("a.txt")).unwrap();
+	std::fs::write(work.join("unexpected"), b"preserve me\n").unwrap();
+	assert!(matches!(
+		wt.populate(tree).await,
+		Err(WorktreeError::UntrackedOverwrite(path)) if path == "unexpected"
+	));
+	assert_eq!(
+		std::fs::read(work.join("unexpected")).unwrap(),
+		b"preserve me\n"
+	);
+
+	std::fs::remove_file(work.join("unexpected")).unwrap();
+	wt.populate(tree).await.unwrap();
+	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"A1\n");
+	assert_eq!(std::fs::read(work.join("sub/b.txt")).unwrap(), b"B\n");
+	assert!(!work.join("c.txt").exists());
+	assert!(git(&["-C", w, "diff", &first]).is_empty());
+	assert!(git(&["-C", w, "diff", "--cached", &first]).is_empty());
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
 async fn checkout_switches_file_directory_type_without_force() {
 	if !git_supports_sha256() {
 		return;

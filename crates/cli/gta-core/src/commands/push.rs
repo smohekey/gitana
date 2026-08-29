@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::Backend;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_porcelain::PushTags;
 use gitana_remote::{
@@ -16,7 +16,7 @@ use gitana_remote::{
 };
 use gitana_repository::Repository;
 
-use crate::{git_config, transport_for, url_rewrite};
+use crate::{CommandContext, git_config, transport_for, url_rewrite};
 
 use crate::dispatch;
 use crate::repo;
@@ -72,6 +72,13 @@ pub async fn run(
 	let config = git_config::from_repo(&found.git_dir, &found.common_dir).await?;
 	let url = url_rewrite::resolve_push_url(&config, "origin")?;
 	let remote = RemoteUrl::parse(&url)?;
+	if let Some(command) = CommandContext::current() {
+		command.authorize(
+			&config,
+			&remote,
+			gitana_remote::ProtocolContext::UserInitiated,
+		)?;
+	}
 	// A credential-free form for display and the push certificate's pushee — *all* userinfo stripped (a
 	// token can occupy the username field), so no credential reaches a print or a signed certificate. The
 	// raw `url` is only for the auth-bearing transport parse above.
@@ -132,6 +139,7 @@ pub async fn run(
 			)
 			.await
 		}
+		RemoteUrl::Local(_) => bail!("push to a local filesystem remote is not yet supported"),
 	}
 }
 

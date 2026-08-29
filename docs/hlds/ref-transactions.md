@@ -259,6 +259,17 @@ Deltas from the design above and from `codex` review, recorded here rather than 
     (which a bare `transact` would do, deadlocking on the held lock). Verified byte-for-byte against git
     2.55 — all three `logs/HEAD` entries in order (`… commit (initial)`, `branch: Created from main`,
     `<tip> <tip> checkout: moving from X to X`).
+  - **Detached checkout has an explicit prepare/finish split.**
+    `HeadLock::prepare_detached` validates the HEAD and reflog namespaces, resolves the effective
+    reflog policy, and snapshots the old HEAD/reflog while retaining `HEAD.lock`. Its opaque
+    `PreparedDetachedHead` publishes those prepared bytes only when consumed by `finish`; dropping
+    it aborts without writes. Submodule update prepares before changing its index/worktree, moving
+    malformed reflog policy and directory/file conflicts ahead of checkout. As with ref transactions,
+    catastrophic commit-phase I/O remains outside this preflight guarantee.
+- **Effective reflog policy is transaction preflight, even for skipped entries.** Every ref
+  transaction parses `core.logAllRefUpdates` before acquiring locks or mutating refs, including a
+  transaction whose operations all carry `ReflogIntent::Skip`. This matches Git's rejection of a
+  malformed policy for commands such as `tag` while still suppressing the actual reflog write.
 
 ## Implementation notes (as built, Phase 3)
 

@@ -349,9 +349,10 @@ mod native {
 					|| repo.merge_head().await?.is_some()
 					|| repo.cherry_pick_head().await?.is_some()
 					|| repo.revert_head().await?.is_some();
-				let status = WorkTree::new(repo, work, git_dir.to_path_buf())
-					.status(None)
-					.await?;
+				let status =
+					WorkTree::new_located(repo, work, git_dir.to_path_buf(), destination.to_path_buf())
+						.status(None)
+						.await?;
 				(status, has_stash, operation_in_progress)
 			}
 			HashKind::Sha256 => {
@@ -361,9 +362,10 @@ mod native {
 					|| repo.merge_head().await?.is_some()
 					|| repo.cherry_pick_head().await?.is_some()
 					|| repo.revert_head().await?.is_some();
-				let status = WorkTree::new(repo, work, git_dir.to_path_buf())
-					.status(None)
-					.await?;
+				let status =
+					WorkTree::new_located(repo, work, git_dir.to_path_buf(), destination.to_path_buf())
+						.status(None)
+						.await?;
 				(status, has_stash, operation_in_progress)
 			}
 		};
@@ -392,13 +394,13 @@ mod native {
 		let status = match detect_kind(&store).await? {
 			HashKind::Sha1 => {
 				let repo = Repository::<_, Sha1>::new(ObjectStore::new(store));
-				WorkTree::new(repo, work, git_dir.to_path_buf())
+				WorkTree::new_located(repo, work, git_dir.to_path_buf(), destination.to_path_buf())
 					.status(None)
 					.await?
 			}
 			HashKind::Sha256 => {
 				let repo = Repository::<_, Sha256>::new(ObjectStore::new(store));
-				WorkTree::new(repo, work, git_dir.to_path_buf())
+				WorkTree::new_located(repo, work, git_dir.to_path_buf(), destination.to_path_buf())
 					.status(None)
 					.await?
 			}
