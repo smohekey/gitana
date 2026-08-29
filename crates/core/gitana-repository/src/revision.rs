@@ -10,6 +10,7 @@ use gitana_file_store::FileStore;
 use gitana_object::{
 	Commit, HashAlgorithm, ObjectId, ObjectKind, Signature, parse_commit, parse_tag, parse_tree,
 };
+use gitana_path::{GitPath, GitPathspec};
 
 use crate::{Repository, RepositoryError};
 
@@ -25,17 +26,31 @@ enum Op {
 /// Resolve a revision spec to an object id.
 pub(crate) async fn rev_parse<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
-	spec: &str,
+	spec: &[u8],
 ) -> Result<ObjectId<H>, RepositoryError> {
+	if spec.contains(&0) {
+		return Err(RepositoryError::InvalidRef(
+			"revision specifications cannot contain NUL bytes".to_owned(),
+		));
+	}
 	// `<rev>:<path>` — the blob or tree at `<path>` within `<rev>`'s tree. (The `:path`/`:n:path`
 	// index forms, which start with `:`, are not supported.)
-	if let Some(colon) = spec.find(':')
+	if let Some(colon) = spec.iter().position(|byte| *byte == b':')
 		&& colon > 0
 	{
-		let base = resolve_rev(repo, &spec[..colon]).await?;
+		let base = revision_text(&spec[..colon])?;
+		let base = resolve_rev(repo, base).await?;
 		return object_at_path(repo, base, &spec[colon + 1..]).await;
 	}
-	resolve_rev(repo, spec).await
+	resolve_rev(repo, revision_text(spec)?).await
+}
+
+fn revision_text(spec: &[u8]) -> Result<&str, RepositoryError> {
+	std::str::from_utf8(spec).map_err(|_| {
+		RepositoryError::InvalidRevisionEncoding(
+			GitPathspec::from_bytes(spec.to_vec()).expect("rev_parse rejects NUL bytes"),
+		)
+	})
 }
 
 /// Resolve a revision spec without a `:path` suffix: a base (ref/oid/`HEAD`) and `~`/`^` ops.
@@ -60,35 +75,51 @@ async fn resolve_rev<H: HashAlgorithm>(
 async fn object_at_path<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	base: ObjectId<H>,
-	path: &str,
+	path: &[u8],
 ) -> Result<ObjectId<H>, RepositoryError> {
 	let mut tree = peel_to_tree(repo, base).await?;
+	let supplied_path = GitPathspec::from_bytes(path.to_vec()).expect("rev_parse rejects NUL bytes");
 	// A trailing slash (`<rev>:<path>/`) requires the path to name a directory.
-	let require_dir = path.ends_with('/');
-	let path = path.trim_end_matches('/');
-	if path.is_empty() {
+	let require_dir = path.ends_with(b"/");
+	let mut path = path;
+	while let Some(trimmed) = path.strip_suffix(b"/") {
+		path = trimmed;
+	}
+	let path =
+		GitPath::from_bytes(path.to_vec()).map_err(|reason| RepositoryError::InvalidTreePath {
+			path: supplied_path.clone(),
+			reason,
+		})?;
+	if path.is_root() {
 		return Ok(tree);
 	}
-	let parts: Vec<&str> = path.split('/').collect();
+	let parts: Vec<&[u8]> = path.components().collect();
 	for (depth, part) in parts.iter().enumerate() {
 		let (kind, payload) = repo.objects().read_object(&tree).await?;
 		if kind != ObjectKind::Tree {
-			return Err(RepositoryError::InvalidRef(format!(
-				"path '{path}': '{}' is not a directory",
-				parts[..depth].join("/")
-			)));
+			let mut parent = Vec::new();
+			for (index, component) in parts[..depth].iter().enumerate() {
+				if index > 0 {
+					parent.push(b'/');
+				}
+				parent.extend_from_slice(component);
+			}
+			let parent = GitPath::from_bytes(parent).expect("tree path components remain canonical");
+			return Err(RepositoryError::TreePathComponentNotDirectory {
+				path,
+				component: parent,
+			});
 		}
 		let entry = parse_tree::<H>(&payload)?
 			.into_iter()
-			.find(|entry| entry.name == *part)
-			.ok_or_else(|| {
-				RepositoryError::InvalidRef(format!("path '{path}' does not exist in {base}"))
+			.find(|entry| entry.name.as_bytes() == *part)
+			.ok_or_else(|| RepositoryError::MissingTreePath {
+				path: path.clone(),
+				base: base.to_string(),
 			})?;
 		if depth + 1 == parts.len() {
 			if require_dir && entry.mode != "40000" {
-				return Err(RepositoryError::InvalidRef(format!(
-					"path '{path}/' is not a directory"
-				)));
+				return Err(RepositoryError::TreePathNotDirectory(supplied_path));
 			}
 			return Ok(entry.id);
 		}

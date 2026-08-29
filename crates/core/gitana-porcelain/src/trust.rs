@@ -376,7 +376,8 @@ async fn write_trust_commit<F: FileStore, H: HashAlgorithm>(
 	let blob = repo.write_blob(&document.to_json()).await?;
 	let tree = repo
 		.write_tree(&[TreeBuildEntry {
-			path: TRUST_DOCUMENT_PATH.to_owned(),
+			path: gitana_path::GitPath::from_utf8(TRUST_DOCUMENT_PATH)
+				.expect("the trust document path is a valid Git path"),
 			mode: FileMode::Regular,
 			id: blob,
 		}])

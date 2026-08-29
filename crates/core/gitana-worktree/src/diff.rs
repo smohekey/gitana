@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::{Meta, WorkDirFs};
 use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_path::{GitPath, GitTreePath};
 use gitana_repository::Repository;
 
 use crate::fsmeta::{blob_of, effective_mode};
@@ -31,8 +32,8 @@ fn gitlink_content<H: HashAlgorithm>(oid: &ObjectId<H>) -> Vec<u8> {
 /// absent on that side (an addition or deletion).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
-	/// Repository-relative path (`/`-separated).
-	pub path: String,
+	/// Exact recursively presented path (`/`-separated), retaining raw tree-entry boundaries.
+	pub path: GitTreePath,
 	/// Content and git mode on the "old" (left) side, or `None` if absent.
 	pub old: Option<(Vec<u8>, u32)>,
 	/// Content and git mode on the "new" (right) side, or `None` if absent.
@@ -65,7 +66,7 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			match wt.work().lstat(&entry.path)? {
 				None => {
 					out.push(FileDiff {
-						path: entry.path.clone(),
+						path: entry.path.clone().into(),
 						old: Some((gitlink_content(&entry.oid), entry.mode)),
 						new: None,
 					});
@@ -81,7 +82,7 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 				Some(meta) if meta.kind.is_file() => {
 					let new = read_worktree(wt.work(), &entry.path, &meta)?;
 					out.push(FileDiff {
-						path: entry.path.clone(),
+						path: entry.path.clone().into(),
 						old: Some((gitlink_content(&entry.oid), entry.mode)),
 						new: Some((new, effective_mode(&meta, 0o100644))),
 					});
@@ -97,7 +98,7 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 						&& head != entry.oid
 					{
 						out.push(FileDiff {
-							path: entry.path.clone(),
+							path: entry.path.clone().into(),
 							old: Some((gitlink_content(&entry.oid), entry.mode)),
 							new: Some((gitlink_content(&head), entry.mode)),
 						});
@@ -116,7 +117,7 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			// Deleted in the working tree.
 			let old = wt.repository().read_blob(entry.oid).await?;
 			out.push(FileDiff {
-				path: entry.path.clone(),
+				path: entry.path.clone().into(),
 				old: Some((old, entry.mode)),
 				new: None,
 			});
@@ -132,7 +133,7 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 				let old = wt.repository().read_blob(entry.oid).await?;
 				let new = read_worktree(wt.work(), &entry.path, &meta)?;
 				out.push(FileDiff {
-					path: entry.path.clone(),
+					path: entry.path.clone().into(),
 					old: Some((old, entry.mode)),
 					// The new-side mode is the *effective* mode: under a capability that cannot report the
 					// executable bit (WASI), it inherits the bit from the index entry, so a content-only
@@ -151,21 +152,21 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 pub(crate) async fn staged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
 ) -> Result<Vec<FileDiff>, WorktreeError> {
-	let index: BTreeMap<String, (u32, ObjectId<H>)> = wt
+	let index: BTreeMap<GitTreePath, (u32, ObjectId<H>)> = wt
 		.load_index()
 		.await?
 		.entries
 		.iter()
 		.filter(|e| e.stage == 0)
-		.map(|e| (e.path.clone(), (e.mode, e.oid)))
+		.map(|e| (e.path.clone().into(), (e.mode, e.oid)))
 		.collect();
 
-	let head: BTreeMap<String, (u32, ObjectId<H>)> =
+	let head: BTreeMap<GitTreePath, (u32, ObjectId<H>)> =
 		match wt.repository().refs().resolve_head().await? {
 			Some(commit) => {
 				let tree = wt.repository().commit_tree(commit).await?;
 				wt.repository()
-					.read_tree(tree)
+					.read_tree_raw(tree)
 					.await?
 					.into_iter()
 					.map(|(path, mode, oid)| (path, (parse_mode(&mode), oid)))
@@ -174,7 +175,7 @@ pub(crate) async fn staged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			None => BTreeMap::new(),
 		};
 
-	let paths: BTreeSet<&String> = index.keys().chain(head.keys()).collect();
+	let paths: BTreeSet<&GitTreePath> = index.keys().chain(head.keys()).collect();
 	let mut out = Vec::new();
 	for path in paths {
 		let old = head.get(path);
@@ -207,7 +208,7 @@ pub async fn trees<F: FileStore, H: HashAlgorithm>(
 		None => BTreeMap::new(),
 	};
 	let new = tree_entries(repo, new).await?;
-	let paths: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+	let paths: BTreeSet<&GitTreePath> = old.keys().chain(new.keys()).collect();
 	let mut out = Vec::new();
 	for path in paths {
 		let (o, n) = (old.get(path), new.get(path));
@@ -228,10 +229,10 @@ pub async fn trees<F: FileStore, H: HashAlgorithm>(
 async fn tree_entries<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	tree: ObjectId<H>,
-) -> Result<BTreeMap<String, (u32, ObjectId<H>)>, WorktreeError> {
+) -> Result<BTreeMap<GitTreePath, (u32, ObjectId<H>)>, WorktreeError> {
 	Ok(
 		repo
-			.read_tree(tree)
+			.read_tree_raw(tree)
 			.await?
 			.into_iter()
 			.map(|(path, mode, oid)| (path, (parse_mode(&mode), oid)))
@@ -253,7 +254,7 @@ async fn side<F: FileStore, H: HashAlgorithm>(
 }
 
 /// Read a working-tree path's blob bytes: the file contents, or a symlink's target.
-fn read_worktree<W: WorkDirFs>(work: &W, path: &str, meta: &Meta) -> std::io::Result<Vec<u8>> {
+fn read_worktree<W: WorkDirFs>(work: &W, path: &GitPath, meta: &Meta) -> std::io::Result<Vec<u8>> {
 	if meta.kind.is_symlink() {
 		work.read_link(path)
 	} else {

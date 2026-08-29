@@ -18,9 +18,18 @@ mod support;
 
 use anyhow::{Result, anyhow};
 use gitana_object::{HashAlgorithm, ObjectId, Sha1, Sha256};
+use gitana_repo_host::exports::gitana::repo::porcelain::{RevisionSpec, SparseEntry};
 use gitana_repository::{FileMode, ReflogIntent, TreeBuildEntry};
 
 use self::support::{AUTHOR, Session, committer, native_repo};
+
+fn sparse_utf8(value: &str) -> SparseEntry {
+	SparseEntry::Utf8(value.to_owned())
+}
+
+fn revision_utf8(value: &str) -> RevisionSpec {
+	RevisionSpec::Utf8(value.to_owned())
+}
 
 /// Build a one-commit ordinary repository natively in `git_dir`: `hello.txt` = "hello v1\n",
 /// `dir/inner.txt` = "inner\n", and an executable `tool` on `refs/heads/main`, with a symbolic
@@ -33,7 +42,7 @@ async fn seed_repo<H: HashAlgorithm>(git_dir: &std::path::Path) -> Result<String
 	let inner = repo.write_blob(b"inner\n").await?;
 	let tool = repo.write_blob(b"#!/bin/sh\nexit 0\n").await?;
 	let entry = |path: &str, mode: FileMode, id: ObjectId<H>| TreeBuildEntry {
-		path: path.to_owned(),
+		path: gitana_path::GitPath::from_utf8(path).unwrap(),
 		mode,
 		id,
 	};
@@ -87,7 +96,7 @@ async fn worktree_porcelain_round_trip<H: HashAlgorithm>() -> Result<()> {
 
 	// -- checkout: the branch tip's tree materialises into the (empty) work dir and index.
 	porcelain
-		.call_checkout(&mut *store, handle, "main", false)
+		.call_checkout(&mut *store, handle, &revision_utf8("main"), false)
 		.await?
 		.map_err(|error| anyhow!("checkout: {error:?}"))?;
 	assert_eq!(std::fs::read(work_dir.join("hello.txt"))?, b"hello v1\n");
@@ -136,14 +145,25 @@ async fn worktree_porcelain_round_trip<H: HashAlgorithm>() -> Result<()> {
 	let hello = dirty
 		.changed
 		.iter()
-		.find(|entry| entry.path == "hello.txt")
+		.find(|entry| support::wit_path_bytes(&entry.path) == b"hello.txt")
 		.ok_or_else(|| anyhow!("hello.txt not in status: {dirty:?}"))?;
 	assert_eq!((hello.index.as_str(), hello.worktree.as_str()), (" ", "M"));
-	assert_eq!(dirty.untracked, vec!["new.txt".to_owned()]);
+	assert_eq!(dirty.untracked.len(), 1);
+	assert_eq!(
+		support::wit_path_bytes(&dirty.untracked[0].path),
+		b"new.txt"
+	);
+	assert!(!dirty.untracked[0].directory);
 
 	// -- add: stage everything under the work-tree root (`.`, as `gta add .` does).
 	porcelain
-		.call_add(&mut *store, handle, &[".".to_owned()], "", false)
+		.call_add(
+			&mut *store,
+			handle,
+			&[support::wit_path(".")],
+			&support::wit_path(""),
+			false,
+		)
 		.await?
 		.map_err(|error| anyhow!("add: {error:?}"))?;
 
@@ -157,7 +177,7 @@ async fn worktree_porcelain_round_trip<H: HashAlgorithm>() -> Result<()> {
 		staged
 			.changed
 			.iter()
-			.find(|entry| entry.path == path)
+			.find(|entry| support::wit_path_bytes(&entry.path) == path.as_bytes())
 			.map(|entry| (entry.index.as_str(), entry.worktree.as_str()))
 	};
 	assert_eq!(code("hello.txt"), Some(("M", " ")));
@@ -198,7 +218,13 @@ async fn worktree_porcelain_round_trip<H: HashAlgorithm>() -> Result<()> {
 	//    as a staged removal, and committing drops it from the tree.
 	std::fs::remove_file(work_dir.join("hello.txt"))?;
 	porcelain
-		.call_add(&mut *store, handle, &[".".to_owned()], "", false)
+		.call_add(
+			&mut *store,
+			handle,
+			&[support::wit_path(".")],
+			&support::wit_path(""),
+			false,
+		)
 		.await?
 		.map_err(|error| anyhow!("add: {error:?}"))?;
 	let deleted = porcelain
@@ -209,7 +235,7 @@ async fn worktree_porcelain_round_trip<H: HashAlgorithm>() -> Result<()> {
 		deleted
 			.changed
 			.iter()
-			.find(|entry| entry.path == "hello.txt")
+			.find(|entry| support::wit_path_bytes(&entry.path) == b"hello.txt")
 			.map(|entry| (entry.index.as_str(), entry.worktree.as_str())),
 		Some(("D", " ")),
 		"hello.txt should be a staged deletion: {deleted:?}"
@@ -233,6 +259,157 @@ async fn worktree_porcelain_round_trip<H: HashAlgorithm>() -> Result<()> {
 	Ok(())
 }
 
+#[tokio::test]
+async fn wasi_worktree_rejects_unrepresentable_git_path_bytes() -> Result<()> {
+	use gitana_repo_host::exports::gitana::repo::porcelain::{GitPath, RepoError};
+
+	let git = tempfile::tempdir()?;
+	seed_repo::<Sha256>(git.path()).await?;
+	let work = tempfile::tempdir()?;
+	let mut session = Session::open_worktree(git.path(), git.path(), work.path()).await?;
+	let result = session
+		.repo
+		.gitana_repo_porcelain()
+		.repository()
+		.call_add(
+			&mut session.store,
+			session.handle,
+			&[GitPath::Bytes(b"raw-\xff".to_vec())],
+			&GitPath::Utf8(String::new()),
+			false,
+		)
+		.await?;
+	assert!(matches!(result, Err(RepoError::UnsupportedFormat(_))));
+	Ok(())
+}
+
+#[tokio::test]
+async fn wasi_force_checkout_preflights_unrepresentable_tree_paths() -> Result<()> {
+	use gitana_repo_host::exports::gitana::repo::porcelain::RepoError;
+
+	let git = tempfile::tempdir()?;
+	seed_repo::<Sha256>(git.path()).await?;
+	let work = tempfile::tempdir()?;
+	let mut session = Session::open_worktree(git.path(), git.path(), work.path()).await?;
+	let porcelain = session.repo.gitana_repo_porcelain().repository();
+	porcelain
+		.call_checkout(
+			&mut session.store,
+			session.handle,
+			&revision_utf8("main"),
+			false,
+		)
+		.await?
+		.map_err(|error| anyhow!("initial checkout: {error:?}"))?;
+
+	let before_file = std::fs::read(work.path().join("hello.txt"))?;
+	let before_index = std::fs::read(git.path().join("index"))?;
+	let repo = native_repo::<Sha256>(git.path())?;
+	let ordinary = repo.write_blob(b"changed before raw path\n").await?;
+	let raw = repo.write_blob(b"unrepresentable\n").await?;
+	let target = repo
+		.write_tree(&[
+			TreeBuildEntry {
+				path: gitana_path::GitPath::from_utf8("hello.txt")?,
+				mode: FileMode::Regular,
+				id: ordinary,
+			},
+			TreeBuildEntry {
+				path: gitana_path::GitPath::from_bytes(b"z-raw-\xff".to_vec())?,
+				mode: FileMode::Regular,
+				id: raw,
+			},
+		])
+		.await?;
+
+	let result = porcelain
+		.call_checkout(
+			&mut session.store,
+			session.handle,
+			&revision_utf8(&target.to_hex()),
+			true,
+		)
+		.await?;
+	assert!(
+		matches!(result, Err(RepoError::UnsupportedFormat(_))),
+		"WASI must classify the raw target path as unsupported-format: {result:?}"
+	);
+	assert_eq!(std::fs::read(work.path().join("hello.txt"))?, before_file);
+	assert_eq!(std::fs::read(git.path().join("index"))?, before_index);
+	assert!(!git.path().join("index.lock").exists());
+	Ok(())
+}
+
+#[tokio::test]
+async fn wasi_checkout_accepts_a_raw_revision_path_suffix() -> Result<()> {
+	let git = tempfile::tempdir()?;
+	seed_repo::<Sha256>(git.path()).await?;
+	let repo = native_repo::<Sha256>(git.path())?;
+	let blob = repo.write_blob(b"selected subtree\n").await?;
+	let tree = repo
+		.write_tree(&[TreeBuildEntry {
+			path: gitana_path::GitPath::from_bytes(b"raw-\xff/portable.txt".to_vec())?,
+			mode: FileMode::Regular,
+			id: blob,
+		}])
+		.await?;
+	let mut spec = tree.to_hex().into_bytes();
+	spec.extend_from_slice(b":raw-\xff");
+
+	let work = tempfile::tempdir()?;
+	let mut session = Session::open_worktree(git.path(), git.path(), work.path()).await?;
+	let result = session
+		.repo
+		.gitana_repo_porcelain()
+		.repository()
+		.call_checkout(
+			&mut session.store,
+			session.handle,
+			&RevisionSpec::Bytes(spec),
+			false,
+		)
+		.await?;
+	result.map_err(|error| anyhow!("checkout raw revision suffix: {error:?}"))?;
+	assert_eq!(
+		std::fs::read(work.path().join("portable.txt"))?,
+		b"selected subtree\n"
+	);
+	Ok(())
+}
+
+#[tokio::test]
+async fn wasi_sparse_errors_render_byte_patterns_reversibly() -> Result<()> {
+	use gitana_repo_host::exports::gitana::repo::porcelain::RepoError;
+
+	let git = tempfile::tempdir()?;
+	seed_repo::<Sha256>(git.path()).await?;
+	let work = tempfile::tempdir()?;
+	let mut session = Session::open_worktree(git.path(), git.path(), work.path()).await?;
+	let porcelain = session.repo.gitana_repo_porcelain().repository();
+	let raw = porcelain
+		.call_sparse_set(
+			&mut session.store,
+			session.handle,
+			&[SparseEntry::Bytes(b"raw-\xff*".to_vec())],
+			true,
+		)
+		.await?;
+	let literal = porcelain
+		.call_sparse_set(
+			&mut session.store,
+			session.handle,
+			&[SparseEntry::Utf8("\"raw-\\377*\"".to_owned())],
+			true,
+		)
+		.await?;
+	let invalid = |result| match result {
+		Err(RepoError::Invalid(message)) => message,
+		other => panic!("expected invalid sparse path, got {other:?}"),
+	};
+	assert_ne!(invalid(raw), invalid(literal));
+	Ok(())
+}
+
 /// The sparse-checkout surface over the component: `sparse-set`/`list`/`add`/`disable`, driving the
 /// engine through the granted descriptors and — crucially — writing git's config (the common-dir
 /// `config`'s `extensions.worktreeConfig`, and the per-worktree `config.worktree`) through them.
@@ -250,7 +427,7 @@ async fn worktree_sparse_round_trip<H: HashAlgorithm>() -> Result<()> {
 
 	// -- full checkout first: the `dir/` subtree and the root files all materialise.
 	porcelain
-		.call_checkout(&mut *store, handle, "main", false)
+		.call_checkout(&mut *store, handle, &revision_utf8("main"), false)
 		.await?
 		.map_err(|error| anyhow!("checkout: {error:?}"))?;
 	assert!(work_dir.join("dir/inner.txt").exists());
@@ -299,7 +476,7 @@ async fn worktree_sparse_round_trip<H: HashAlgorithm>() -> Result<()> {
 	// -- a cone `sparse-set` with a glob metacharacter is rejected as `invalid` (the component applies the
 	//    same literal-directory validation as the CLI, rather than rendering a broken `/*/` pattern file).
 	match porcelain
-		.call_sparse_set(&mut *store, handle, &["*".to_owned()], true)
+		.call_sparse_set(&mut *store, handle, &[sparse_utf8("*")], true)
 		.await?
 	{
 		Err(gitana_repo_host::exports::gitana::repo::porcelain::RepoError::Invalid(message)) => {
@@ -314,7 +491,7 @@ async fn worktree_sparse_round_trip<H: HashAlgorithm>() -> Result<()> {
 	// -- a cone `sparse-set` naming a tracked *file* (not a directory) is rejected as `invalid`, the same
 	//    index check the native CLI applies.
 	match porcelain
-		.call_sparse_set(&mut *store, handle, &["hello.txt".to_owned()], true)
+		.call_sparse_set(&mut *store, handle, &[sparse_utf8("hello.txt")], true)
 		.await?
 	{
 		Err(gitana_repo_host::exports::gitana::repo::porcelain::RepoError::Invalid(message)) => {
@@ -331,7 +508,13 @@ async fn worktree_sparse_round_trip<H: HashAlgorithm>() -> Result<()> {
 	// -- adding the now-excluded `dir` is refused as `invalid` (the engine's PathspecAdvisory is mapped
 	//    to a precise WIT error, not a generic backend failure).
 	match porcelain
-		.call_add(&mut *store, handle, &["dir".to_owned()], "", false)
+		.call_add(
+			&mut *store,
+			handle,
+			&[support::wit_path("dir")],
+			&support::wit_path(""),
+			false,
+		)
 		.await?
 	{
 		Err(gitana_repo_host::exports::gitana::repo::porcelain::RepoError::Invalid(message)) => {
@@ -345,7 +528,7 @@ async fn worktree_sparse_round_trip<H: HashAlgorithm>() -> Result<()> {
 
 	// -- add `dir`: the subtree is materialised, and list now names it.
 	porcelain
-		.call_sparse_add(&mut *store, handle, &["dir".to_owned()])
+		.call_sparse_add(&mut *store, handle, &[sparse_utf8("dir")])
 		.await?
 		.map_err(|error| anyhow!("sparse-add: {error:?}"))?;
 	assert_eq!(std::fs::read(work_dir.join("dir/inner.txt"))?, b"inner\n");
@@ -354,7 +537,11 @@ async fn worktree_sparse_round_trip<H: HashAlgorithm>() -> Result<()> {
 		.await?
 		.map_err(|error| anyhow!("sparse-list: {error:?}"))?
 		.ok_or_else(|| anyhow!("expected sparse-checkout enabled"))?;
-	assert_eq!(listed.entries, vec!["dir".to_owned()]);
+	assert!(
+		matches!(listed.entries.as_slice(), [SparseEntry::Utf8(entry)] if entry == "dir"),
+		"unexpected sparse entries: {:?}",
+		listed.entries
+	);
 
 	// -- disable: the whole tree is restored and list reports no set.
 	porcelain
@@ -388,6 +575,26 @@ async fn worktree_sparse_round_trip<H: HashAlgorithm>() -> Result<()> {
 		.map_err(|error| anyhow!("sparse-list: {error:?}"))?
 		.ok_or_else(|| anyhow!("expected sparse-checkout enabled"))?;
 	assert!(!listed.cone, "the empty set is non-cone, got {listed:?}");
+
+	// A non-UTF-8 non-cone pattern crosses the WIT boundary and is returned byte-for-byte by list.
+	porcelain
+		.call_sparse_add(
+			&mut *store,
+			handle,
+			&[SparseEntry::Bytes(b"raw-\xff".to_vec())],
+		)
+		.await?
+		.map_err(|error| anyhow!("sparse-add raw pattern: {error:?}"))?;
+	let listed = porcelain
+		.call_sparse_list(&mut *store, handle)
+		.await?
+		.map_err(|error| anyhow!("sparse-list raw pattern: {error:?}"))?
+		.ok_or_else(|| anyhow!("expected sparse-checkout enabled"))?;
+	assert!(
+		matches!(listed.entries.last(), Some(SparseEntry::Bytes(entry)) if entry == b"raw-\xff"),
+		"raw sparse entry was not preserved: {:?}",
+		listed.entries
+	);
 
 	Ok(())
 }

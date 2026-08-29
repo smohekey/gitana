@@ -11,6 +11,7 @@ use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
+use gitana_path::GitPath;
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
 
@@ -47,7 +48,7 @@ pub trait WorkTreeCommand {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		prefix: String,
+		prefix: GitPath,
 	) -> Result<()>;
 }
 
@@ -99,7 +100,7 @@ pub trait ObjectCommand {
 
 /// Resolve `spec` to an object in the repository containing `cwd`, then run `command`
 /// under the repo's hash algorithm.
-pub async fn on_object<C: ObjectCommand>(cwd: &Path, spec: &str, command: C) -> Result<()> {
+pub async fn on_object<C: ObjectCommand>(cwd: &Path, spec: &[u8], command: C) -> Result<()> {
 	let found = repo::discover(cwd).await?;
 	match detect_algorithm(&found.common_dir)? {
 		HashKind::Sha1 => {
@@ -118,10 +119,10 @@ pub async fn on_object<C: ObjectCommand>(cwd: &Path, spec: &str, command: C) -> 
 /// repository alone, so object-only lookups do not require a work tree.
 async fn resolve_object<H: HashAlgorithm>(
 	found: &RepositoryLayout,
-	spec: &str,
+	spec: &[u8],
 ) -> Result<(Repository<Backend, H>, ObjectId<H>)> {
 	let repo = open::<H>(found).await?;
-	let oid = if spec.starts_with(':') {
+	let oid = if spec.starts_with(b":") {
 		let work = found
 			.worktree_root
 			.clone()

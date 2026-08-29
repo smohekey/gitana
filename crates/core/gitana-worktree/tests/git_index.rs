@@ -62,12 +62,14 @@ fn round_trips_a_skip_worktree_entry() {
 	// We parse the skip-worktree flag...
 	let index =
 		Index::<Sha256>::parse(&std::fs::read(work.join(".git/index")).unwrap()).expect("parse");
+	let a = gitana_path::GitPath::from_utf8("a.txt").unwrap();
+	let b = gitana_path::GitPath::from_utf8("b.txt").unwrap();
 	assert!(
-		index.entry("b.txt").unwrap().skip_worktree,
+		index.entry(&b).unwrap().skip_worktree,
 		"b.txt should be parsed as skip-worktree"
 	);
 	assert!(
-		!index.entry("a.txt").unwrap().skip_worktree,
+		!index.entry(&a).unwrap().skip_worktree,
 		"a.txt should not be skip-worktree"
 	);
 

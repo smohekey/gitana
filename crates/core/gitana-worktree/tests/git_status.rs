@@ -122,6 +122,36 @@ async fn status_with_gitignore_matches_git() {
 }
 
 #[tokio::test]
+async fn status_quotes_an_untracked_directory_marker_like_git() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("status-quoted-directory");
+	let git_dir = work.join(".git");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+
+	let directory = work.join("line\ndir");
+	std::fs::create_dir(&directory).unwrap();
+	std::fs::write(directory.join("file"), b"content\n").unwrap();
+
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(&git_dir),
+	)));
+	let ours = WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
+		.status(None)
+		.await
+		.unwrap()
+		.porcelain_v1();
+	let theirs = git(&["-C", w, "status", "--porcelain=v1"]);
+
+	assert_eq!(ours, theirs, "quoted directory status must match git");
+	assert_eq!(ours, "?? \"line\\ndir/\"\n");
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
 async fn status_honors_core_filemode() {
 	use std::os::unix::fs::PermissionsExt;
 	if !git_supports_sha256() {
@@ -720,7 +750,7 @@ async fn status_seeds_excludes_file() {
 	)));
 	let ours = sorted(
 		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-			.status(Some(&content))
+			.status(Some(content.as_bytes()))
 			.await
 			.unwrap()
 			.porcelain_v1(),

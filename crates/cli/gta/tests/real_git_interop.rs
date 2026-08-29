@@ -29,7 +29,7 @@ async fn commit_on<H: HashAlgorithm>(
 	let blob = repo.write_blob(content).await.unwrap();
 	let tree = repo
 		.write_tree(&[TreeBuildEntry {
-			path: file.to_owned(),
+			path: gitana_path::GitPath::from_utf8(file).unwrap(),
 			mode: FileMode::Regular,
 			id: blob,
 		}])
@@ -607,7 +607,7 @@ async fn narrowed_unshallow_case(version: u8) {
 	// A disjoint `other` branch: x0 <- x1.
 	let repo = open::<Sha1>(&git_dir);
 	let entry = |id| TreeBuildEntry {
-		path: "b.txt".to_owned(),
+		path: gitana_path::GitPath::from_utf8("b.txt").unwrap(),
 		mode: FileMode::Regular,
 		id,
 	};

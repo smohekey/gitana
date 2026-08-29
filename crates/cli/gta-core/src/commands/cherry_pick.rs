@@ -19,7 +19,13 @@ use crate::signer;
 /// — as a new single-parent commit that preserves `commit`'s author. A conflict materialises an
 /// in-progress state (`CHERRY_PICK_HEAD`, `MERGE_MSG`, a conflicted index, work-tree markers) and
 /// exits non-zero; resolve it and `--continue` (or `gta commit`), or `--abort` to discard it.
-pub async fn run(cwd: &Path, commit: Option<String>, abort: bool, continue_: bool) -> Result<()> {
+pub async fn run(
+	cwd: &Path,
+	commit: Option<String>,
+	abort: bool,
+	continue_: bool,
+	result_path_mode: crate::ResultPathMode,
+) -> Result<()> {
 	if abort && continue_ {
 		bail!("--abort and --continue are incompatible");
 	}
@@ -29,6 +35,7 @@ pub async fn run(cwd: &Path, commit: Option<String>, abort: bool, continue_: boo
 			commit,
 			abort,
 			continue_,
+			result_path_mode,
 			cwd: cwd.to_path_buf(),
 		},
 	)
@@ -39,6 +46,7 @@ struct CherryPick {
 	commit: Option<String>,
 	abort: bool,
 	continue_: bool,
+	result_path_mode: crate::ResultPathMode,
 	/// The effective working directory, for resolving a relative `user.signingkey` (`-C`).
 	cwd: std::path::PathBuf,
 }
@@ -47,7 +55,7 @@ impl WorkTreeCommand for CherryPick {
 	async fn run<H: HashAlgorithm>(
 		self,
 		wt: WorkTree<Backend, crate::WorkDir, H>,
-		_prefix: String,
+		_prefix: gitana_path::GitPath,
 	) -> Result<()> {
 		if self.abort {
 			return gitana_porcelain::abort_cherry_pick(&wt).await;
@@ -67,7 +75,9 @@ impl WorkTreeCommand for CherryPick {
 		};
 		match gitana_porcelain::cherry_pick(&wt, &commit, &identity, signer.as_ref()).await? {
 			PickOutcome::Picked { commit } => println!("{commit}"),
-			PickOutcome::Conflict { paths } => return Err(conflict::report_conflicts(&paths)),
+			PickOutcome::Conflict { paths } => {
+				return Err(conflict::report_conflicts(&paths, self.result_path_mode));
+			}
 		}
 		Ok(())
 	}

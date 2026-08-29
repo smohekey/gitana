@@ -8,6 +8,7 @@
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_path::GitPath;
 
 use crate::checkout::validate_path;
 use crate::{Index, IndexEntry, Stat, WorkTree, WorktreeError};
@@ -31,7 +32,7 @@ where
 	// Carry the prior entries' index-only flags forward: git's `reset` preserves `skip_worktree`
 	// (a sparse path stays excluded) and `assume_valid` across the rebuild, so a reset must not
 	// silently un-sparse the repository.
-	let prior_flags: std::collections::HashMap<String, (bool, bool)> = wt
+	let prior_flags: std::collections::HashMap<GitPath, (bool, bool)> = wt
 		.load_index()
 		.await?
 		.entries

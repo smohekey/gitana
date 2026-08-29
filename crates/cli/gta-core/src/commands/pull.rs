@@ -20,7 +20,7 @@ use crate::signer;
 use crate::{git_config, repo, transport_for, url_rewrite};
 
 /// Pull `HEAD`'s branch from the origin.
-pub async fn run(cwd: &Path) -> Result<()> {
+pub async fn run(cwd: &Path, result_path_mode: crate::ResultPathMode) -> Result<()> {
 	let found = repo::discover(cwd).await?;
 	// The origin URL is `remote.origin.url` with `url.*.insteadOf` applied, read from the merged config.
 	let config = git_config::from_repo(&found.git_dir, &found.common_dir).await?;
@@ -42,14 +42,14 @@ pub async fn run(cwd: &Path) -> Result<()> {
 			let http = transport_for(config, &origin, askpass_cwd)?;
 			let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
 			let mut fetcher = HttpPackFetcher::new(&http, &origin);
-			pull_dispatch(&mut fetcher, &found, &body, &display, cwd).await
+			pull_dispatch(&mut fetcher, &found, &body, &display, cwd, result_path_mode).await
 		}
 		RemoteUrl::Ssh(ssh) => {
 			let ssh_cmd = crate::ssh::resolve_ssh_command(&config)?;
 			let connection = SshConnection::open(&ssh, "git-upload-pack", &ssh_cmd, &askpass_cwd).await?;
 			let body = connection.advertisement().to_vec();
 			let mut fetcher = SshPackFetcher::new(connection);
-			pull_dispatch(&mut fetcher, &found, &body, &display, cwd).await
+			pull_dispatch(&mut fetcher, &found, &body, &display, cwd, result_path_mode).await
 		}
 	}
 }
@@ -61,12 +61,13 @@ async fn pull_dispatch(
 	body: &[u8],
 	url: &str,
 	cwd: &Path,
+	result_path_mode: crate::ResultPathMode,
 ) -> Result<()> {
 	let local = dispatch::detect_algorithm(&found.common_dir)?;
 	transport::ensure_same_format(local, transport::negotiated_kind(body)?)?;
 	match local {
-		HashKind::Sha1 => pull_into::<Sha1>(fetcher, found, body, url, cwd).await,
-		HashKind::Sha256 => pull_into::<Sha256>(fetcher, found, body, url, cwd).await,
+		HashKind::Sha1 => pull_into::<Sha1>(fetcher, found, body, url, cwd, result_path_mode).await,
+		HashKind::Sha256 => pull_into::<Sha256>(fetcher, found, body, url, cwd, result_path_mode).await,
 	}
 }
 
@@ -79,6 +80,7 @@ async fn pull_into<H: HashAlgorithm>(
 	body: &[u8],
 	url: &str,
 	cwd: &Path,
+	result_path_mode: crate::ResultPathMode,
 ) -> Result<()> {
 	let work = found
 		.worktree_root
@@ -151,5 +153,5 @@ async fn pull_into<H: HashAlgorithm>(
 		signer.as_ref(),
 	)
 	.await?;
-	merge::render(outcome)
+	merge::render(outcome, result_path_mode)
 }

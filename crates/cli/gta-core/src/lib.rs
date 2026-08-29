@@ -9,6 +9,7 @@ mod dispatch;
 mod error;
 mod excludes;
 mod git_config;
+mod git_path;
 mod http_headers;
 mod identity;
 mod prompt;
@@ -21,9 +22,28 @@ mod url_rewrite;
 pub use credential::{CliCredentialProvider, transport_for};
 pub use error::{AddAdvisory, MergeConflict, SilentExit};
 pub use git_config::with_command_cwd;
+pub use git_path::{bytes_from_os, pathspec_from_os, render_error};
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
 pub use gitana_worktree::LsFilesOptions;
 pub use prompt::with_terminal_prompts_disabled;
+
+/// How a frontend chooses pathname quoting for human-readable Git output.
+#[derive(Clone, Copy)]
+pub enum PathQuoteMode {
+	/// Honour the repository's effective `core.quotePath` setting.
+	Config,
+	/// Always emit reversible C-style quoting for unsafe and non-UTF-8 bytes.
+	Always,
+}
+
+/// How a frontend renders pathname values embedded in command result messages.
+#[derive(Clone, Copy)]
+pub enum ResultPathMode {
+	/// Preserve valid UTF-8 for direct, human-facing CLI output.
+	Human,
+	/// Always emit reversible C-style quoting for machine consumption.
+	Reversible,
+}
 
 /// The local file-store backend every command operates over: a [`WorktreeFileStore`], which routes
 /// git's per-worktree files and shared files to the right directory so commands work the same in

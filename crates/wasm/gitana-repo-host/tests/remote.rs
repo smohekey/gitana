@@ -235,7 +235,7 @@ async fn commit_file<H: HashAlgorithm>(
 	let blob = repo.write_blob(content).await.unwrap();
 	let tree = repo
 		.write_tree(&[TreeBuildEntry {
-			path: file.to_owned(),
+			path: gitana_path::GitPath::from_utf8(file).unwrap(),
 			mode: FileMode::Regular,
 			id: blob,
 		}])

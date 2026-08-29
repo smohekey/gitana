@@ -4,6 +4,7 @@
 //! command and exits, exactly like `gta`.
 
 mod cli;
+mod git_path;
 
 use std::process::ExitCode;
 
@@ -26,7 +27,10 @@ fn main() -> ExitCode {
 				// the child's stderr — surfaces "not an ancestor" / "no common ancestor" to the client.
 				eprintln!("{}", silent.reason);
 			} else {
-				eprintln!("gta-mcp: {:#}", error.0);
+				eprintln!(
+					"gta-mcp: {}",
+					gta_core::render_error(&error.0, gta_core::ResultPathMode::Reversible)
+				);
 			}
 			ExitCode::FAILURE
 		}

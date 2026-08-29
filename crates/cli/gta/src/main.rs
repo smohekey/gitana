@@ -26,7 +26,10 @@ async fn main() -> ExitCode {
 				// byte-for-byte.
 				eprintln!("{advisory}");
 			} else {
-				eprintln!("gta: {error:#}");
+				eprintln!(
+					"gta: {}",
+					gta_core::render_error(&error, gta_core::ResultPathMode::Human)
+				);
 			}
 			ExitCode::FAILURE
 		}

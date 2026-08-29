@@ -43,6 +43,32 @@ fn cone_set_narrows_the_worktree() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// A real sparse index collapses an out-of-cone directory to a `040000` index entry whose oid is
+/// the existing subtree. Rebuilding the staged tree must preserve that directory entry: a clean
+/// commit stays a no-op and never writes a blob-mode entry pointing at a tree.
+#[test]
+fn clean_commit_from_a_sparse_index_preserves_directory_entries() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = repo("gta-sparse-index-commit");
+	let w = work.to_str().unwrap();
+	git(w, &["config", "user.name", "T"]);
+	git(w, &["config", "user.email", "t@e"]);
+	git(w, &["sparse-checkout", "init", "--cone", "--sparse-index"]);
+	git(w, &["sparse-checkout", "set", "a"]);
+	let sparse = git(w, &["ls-files", "--sparse"]);
+	assert!(sparse.lines().any(|line| line == "b/"), "{sparse}");
+	let head = git(w, &["rev-parse", "HEAD"]);
+
+	let error = gta_fail(w, &["commit", "-m", "must remain clean"]);
+	assert!(error.contains("nothing to commit"), "stderr: {error}");
+	assert_eq!(git(w, &["rev-parse", "HEAD"]), head);
+	git(w, &["fsck", "--full", "--strict"]);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 /// git rejects a cone argument that names a tracked *file* (a cone set takes directories); there is no
 /// `--skip-checks` in gta.
 #[test]

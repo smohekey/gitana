@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::Backend;
 use anyhow::{Result, bail};
 use gitana_object::HashAlgorithm;
+use gitana_path::GitPathspec;
 use gitana_worktree::WorkTree;
 
 use crate::commands::switch;
@@ -16,44 +17,44 @@ use crate::dispatch::{self, WorkTreeCommand};
 pub async fn run(
 	cwd: &Path,
 	force: bool,
-	target: Option<String>,
-	paths: Vec<String>,
+	target: Option<Vec<u8>>,
+	paths: Vec<GitPathspec>,
 ) -> Result<()> {
 	if paths.is_empty() {
 		let Some(name) = target else {
 			bail!("missing branch to switch to, or paths to restore after `--`");
 		};
-		return switch::run(cwd, &name, false, None, force).await;
+		let name = std::str::from_utf8(&name)
+			.map_err(|_| anyhow::anyhow!("branch names must be valid UTF-8"))?;
+		return switch::run(cwd, name, false, None, force).await;
 	}
 
 	dispatch::on_worktree(cwd, Checkout { target, paths }).await
 }
 
 struct Checkout {
-	target: Option<String>,
-	paths: Vec<String>,
+	target: Option<Vec<u8>>,
+	paths: Vec<GitPathspec>,
 }
 
 impl WorkTreeCommand for Checkout {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		prefix: String,
+		prefix: gitana_path::GitPath,
 	) -> Result<()> {
 		let source = match self.target {
-			Some(treeish) => Some(
-				worktree
-					.repository()
-					.rev_parse(&format!("{treeish}^{{tree}}"))
-					.await?,
-			),
+			Some(treeish) => {
+				let repo = worktree.repository();
+				let id = repo.rev_parse(&treeish).await?;
+				Some(repo.peel_to_tree(id).await?)
+			}
 			None => None,
 		};
-		let specs: Vec<&str> = self.paths.iter().map(String::as_str).collect();
 		// `checkout -- <paths>` restores the working tree from the index; `checkout <tree> -- <paths>`
 		// restores both the working tree and the index from the tree.
 		worktree
-			.restore(source, true, source.is_some(), &specs, &prefix)
+			.restore_pathspecs(source, true, source.is_some(), &self.paths, &prefix)
 			.await?;
 		Ok(())
 	}

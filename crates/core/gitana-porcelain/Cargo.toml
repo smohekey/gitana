@@ -24,6 +24,7 @@ gitana-file-store-local.workspace = true
 gitana-git-http.workspace = true
 gitana-object.workspace = true
 gitana-object-store.workspace = true
+gitana-path.workspace = true
 gitana-remote.workspace = true
 gitana-repository.workspace = true
 gitana-trust.workspace = true

@@ -22,7 +22,7 @@ async fn resolve_all<H: HashAlgorithm>(
 
 pub(crate) async fn rev_parse<H: HashAlgorithm>(
 	repo: &Repository<WorktreeFileStore, H>,
-	spec: &str,
+	spec: &[u8],
 ) -> Result<String, RepoError> {
 	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
 	Ok(id.to_hex())

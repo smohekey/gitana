@@ -3,9 +3,9 @@
 use wasip2::filesystem::types::Descriptor;
 
 use crate::bindings::exports::gitana::repo::porcelain::{
-	CommitInfo, FetchOutcome, Guest, GuestRepository, HashKind, HeadState, ObjectInfo, PushOutcome,
-	RefEntry, ReflogRequest, RepackReport, RepoError, Repository, SparseOutcome, SparsePatterns,
-	TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
+	CommitInfo, FetchOutcome, GitPath, Guest, GuestRepository, HashKind, HeadState, ObjectInfo,
+	PushOutcome, RefEntry, ReflogRequest, RepackReport, RepoError, Repository, RevisionSpec,
+	SparseEntry, SparseOutcome, SparsePatterns, TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
 };
 use crate::inner::Inner;
 
@@ -53,28 +53,32 @@ impl GuestRepository for GitanaRepository {
 		self.inner.read_config()
 	}
 
-	fn read_object(&self, spec: String) -> Result<ObjectInfo, RepoError> {
-		self.inner.read_object(&spec)
+	fn read_object(&self, spec: RevisionSpec) -> Result<ObjectInfo, RepoError> {
+		self
+			.inner
+			.read_object(&crate::ops::revision_from_wit(spec)?)
 	}
 
-	fn read_blob(&self, spec: String) -> Result<Vec<u8>, RepoError> {
-		self.inner.read_blob(&spec)
+	fn read_blob(&self, spec: RevisionSpec) -> Result<Vec<u8>, RepoError> {
+		self.inner.read_blob(&crate::ops::revision_from_wit(spec)?)
 	}
 
-	fn read_commit(&self, spec: String) -> Result<CommitInfo, RepoError> {
-		self.inner.read_commit(&spec)
+	fn read_commit(&self, spec: RevisionSpec) -> Result<CommitInfo, RepoError> {
+		self
+			.inner
+			.read_commit(&crate::ops::revision_from_wit(spec)?)
 	}
 
-	fn read_tag(&self, spec: String) -> Result<TagInfo, RepoError> {
-		self.inner.read_tag(&spec)
+	fn read_tag(&self, spec: RevisionSpec) -> Result<TagInfo, RepoError> {
+		self.inner.read_tag(&crate::ops::revision_from_wit(spec)?)
 	}
 
-	fn ls_tree(&self, spec: String) -> Result<Vec<TreeEntry>, RepoError> {
-		self.inner.ls_tree(&spec)
+	fn ls_tree(&self, spec: RevisionSpec) -> Result<Vec<TreeEntry>, RepoError> {
+		self.inner.ls_tree(&crate::ops::revision_from_wit(spec)?)
 	}
 
-	fn rev_parse(&self, spec: String) -> Result<String, RepoError> {
-		self.inner.rev_parse(&spec)
+	fn rev_parse(&self, spec: RevisionSpec) -> Result<String, RepoError> {
+		self.inner.rev_parse(&crate::ops::revision_from_wit(spec)?)
 	}
 
 	fn rev_list(&self, tips: Vec<String>, max_count: Option<u32>) -> Result<Vec<String>, RepoError> {
@@ -172,12 +176,14 @@ impl GuestRepository for GitanaRepository {
 		self.inner.status()
 	}
 
-	fn add(&self, pathspecs: Vec<String>, prefix: String, force: bool) -> Result<(), RepoError> {
+	fn add(&self, pathspecs: Vec<GitPath>, prefix: GitPath, force: bool) -> Result<(), RepoError> {
 		self.inner.add(&pathspecs, &prefix, force)
 	}
 
-	fn checkout(&self, tree_ish: String, force: bool) -> Result<(), RepoError> {
-		self.inner.checkout(&tree_ish, force)
+	fn checkout(&self, tree_ish: RevisionSpec, force: bool) -> Result<(), RepoError> {
+		self
+			.inner
+			.checkout(&crate::ops::revision_from_wit(tree_ish)?, force)
 	}
 
 	fn commit(
@@ -189,11 +195,11 @@ impl GuestRepository for GitanaRepository {
 		self.inner.commit(&message, &author, &committer)
 	}
 
-	fn sparse_set(&self, patterns: Vec<String>, cone: bool) -> Result<SparseOutcome, RepoError> {
+	fn sparse_set(&self, patterns: Vec<SparseEntry>, cone: bool) -> Result<SparseOutcome, RepoError> {
 		self.inner.sparse_set(patterns, cone)
 	}
 
-	fn sparse_add(&self, patterns: Vec<String>) -> Result<SparseOutcome, RepoError> {
+	fn sparse_add(&self, patterns: Vec<SparseEntry>) -> Result<SparseOutcome, RepoError> {
 		self.inner.sparse_add(patterns)
 	}
 

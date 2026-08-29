@@ -1,13 +1,18 @@
 #![cfg(unix)]
 
+use std::io;
 use std::path::PathBuf;
 use std::process::Command;
 
 use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::Sha256;
 use gitana_object_store::ObjectStore;
+use gitana_path::{GitPath, GitPathspec};
 use gitana_repository::Repository;
 use gitana_worktree::{IndexEntry, Stat, WorkTree, WorktreeError};
+
+mod support;
+use support::make_utf8_only_repo;
 
 fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
 	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
@@ -19,6 +24,62 @@ fn make_repo(work: &std::path::Path) -> WorkTree<LocalFileStore, CapWorkDir, Sha
 		open_dir(&git_dir),
 	)));
 	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(work)), git_dir)
+}
+
+#[tokio::test]
+async fn rm_preflights_backend_path_representation_before_deleting() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("rm-path-representation");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"keep\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+
+	let wt = make_utf8_only_repo(&work);
+	let mut index = wt.load_index().await.unwrap();
+	let raw_blob = wt.repository().write_blob(b"raw\n").await.unwrap();
+	index.upsert(IndexEntry {
+		stat: Stat::default(),
+		mode: 0o100644,
+		oid: raw_blob,
+		stage: 0,
+		assume_valid: false,
+		skip_worktree: false,
+		intent_to_add: false,
+		path: GitPath::from_bytes(b"z-raw-\xff".to_vec()).unwrap(),
+	});
+	wt.save_index(&index).await.unwrap();
+	let before_index = std::fs::read(work.join(".git/index")).unwrap();
+
+	let result = wt
+		.rm_pathspecs(
+			&[GitPathspec::from_utf8(".").unwrap()],
+			&GitPath::root(),
+			false,
+			true,
+			true,
+			false,
+		)
+		.await;
+	let error = match result {
+		Err(error) => error,
+		Ok(_) => panic!("rm unexpectedly succeeded"),
+	};
+	assert!(
+		matches!(error, WorktreeError::Io(ref error) if error.kind() == io::ErrorKind::Unsupported),
+		"unexpected error: {error:?}"
+	);
+	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"keep\n");
+	assert_eq!(
+		std::fs::read(work.join(".git/index")).unwrap(),
+		before_index
+	);
+	assert!(!work.join(".git/index.lock").exists());
+
+	std::fs::remove_dir_all(&work).ok();
 }
 
 #[tokio::test]
@@ -51,7 +112,7 @@ async fn rm_rejects_unsafe_index_path() {
 		assume_valid: false,
 		skip_worktree: false,
 		intent_to_add: false,
-		path: format!("../{name}"),
+		path: gitana_path::GitPath::from_utf8(".git/config").unwrap(),
 	});
 	wt.save_index(&index).await.unwrap();
 

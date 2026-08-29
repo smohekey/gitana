@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 gitana-file-store.workspace = true
+gitana-path.workspace = true
 sha2.workspace = true
 # `io-util` (AsyncReadExt) is needed on every target to drain streamed writes.
 tokio = { workspace = true, features = ["io-util"] }

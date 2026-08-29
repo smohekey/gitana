@@ -101,6 +101,7 @@ pub fn referenced_ids<H: HashAlgorithm>(
 
 #[cfg(test)]
 mod tests {
+	use gitana_path::GitPathComponent;
 	use std::collections::HashMap;
 
 	use super::*;
@@ -142,7 +143,7 @@ mod tests {
 	fn tree_with(name: &str, blob: ObjectId<Sha256>) -> Vec<u8> {
 		encode_tree(&[TreeEntry {
 			mode: "100644".to_owned(),
-			name: name.to_owned(),
+			name: GitPathComponent::from_utf8(name).unwrap().into(),
 			id: blob,
 		}])
 	}
@@ -151,12 +152,12 @@ mod tests {
 		encode_tree(&[
 			TreeEntry {
 				mode: "100644".to_owned(),
-				name: "f".to_owned(),
+				name: GitPathComponent::from_utf8("f").unwrap().into(),
 				id: blob,
 			},
 			TreeEntry {
 				mode: "160000".to_owned(),
-				name: "sub".to_owned(),
+				name: GitPathComponent::from_utf8("sub").unwrap().into(),
 				id: submodule,
 			},
 		])
@@ -237,12 +238,12 @@ mod tests {
 			encode_tree(&[
 				TreeEntry {
 					mode: "100644".to_owned(),
-					name: "s".to_owned(),
+					name: GitPathComponent::from_utf8("s").unwrap().into(),
 					id: shared,
 				},
 				TreeEntry {
 					mode: "100644".to_owned(),
-					name: "u".to_owned(),
+					name: GitPathComponent::from_utf8("u").unwrap().into(),
 					id: unique,
 				},
 			]),

@@ -30,7 +30,7 @@ pub enum ProtectionReason {
 	/// are carried so a caller knows what to clear before removal can proceed.
 	ResidualContent {
 		/// The residual (untracked/ignored) paths found, relative to the worktree, capped at a sample.
-		paths: Vec<String>,
+		paths: Vec<gitana_path::GitPath>,
 	},
 	/// The live checkout is *clean* in git's status sense, but a re-verification that **hashes** every present
 	/// tracked file (rather than trusting the index stat cache) found one whose content or mode diverges from the
@@ -40,7 +40,7 @@ pub enum ProtectionReason {
 	/// what to reconcile first.
 	ModifiedTrackedContent {
 		/// The present, content-diverged tracked paths, relative to the worktree.
-		paths: Vec<String>,
+		paths: Vec<gitana_path::GitPath>,
 	},
 	/// The live checkout uses a **sparse index** (`git sparse-checkout --sparse-index`), whose collapsed
 	/// `040000` sparse-directory entries gitana does not expand. A status computed over it reports spurious

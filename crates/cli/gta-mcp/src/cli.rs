@@ -11,6 +11,8 @@ use clap::{Parser, Subcommand};
 use clap_mcp::{ClapMcpToolError, IntoClapMcpToolError};
 use gta_core::commands;
 
+use crate::git_path::{McpGitPath, McpRevisionSpec};
+
 /// The clap-mcp output function (named by `#[clap_mcp_output_from]`): drive the parsed
 /// command to completion on a fresh current-thread runtime. Handlers print their output to
 /// stdout — which clap-mcp captures from the re-executed subprocess in MCP mode — so this
@@ -29,7 +31,10 @@ pub(crate) struct McpError(pub(crate) anyhow::Error);
 
 impl IntoClapMcpToolError for McpError {
 	fn into_tool_error(self) -> ClapMcpToolError {
-		ClapMcpToolError::text(format!("{:#}", self.0))
+		ClapMcpToolError::text(gta_core::render_error(
+			&self.0,
+			gta_core::ResultPathMode::Reversible,
+		))
 	}
 }
 
@@ -90,7 +95,7 @@ enum Command {
 		#[arg(short = 'p', group = "mode")]
 		pretty: bool,
 		/// The object (oid, abbreviation, or revision).
-		object: String,
+		object: McpRevisionSpec,
 	},
 	/// List the contents of a tree.
 	LsTree {
@@ -98,12 +103,12 @@ enum Command {
 		#[arg(short = 'r')]
 		recursive: bool,
 		/// A tree, commit, or revision.
-		treeish: String,
+		treeish: McpRevisionSpec,
 	},
 	/// Resolve a revision to an object id.
 	RevParse {
 		/// The revision (oid, abbreviation, ref, `HEAD`, `~`/`^`/`^{}`).
-		spec: String,
+		spec: McpRevisionSpec,
 	},
 	/// List commits reachable from a revision, newest first.
 	RevList {
@@ -148,11 +153,12 @@ enum Command {
 		/// Print repository-relative paths rather than paths relative to the current directory.
 		#[arg(long = "full-name")]
 		full_name: bool,
-		/// `\0`-terminate output lines and do not quote paths.
+		/// In direct CLI mode, terminate entries with NUL and emit exact path bytes.
 		#[arg(short = 'z')]
+		#[clap_mcp(skip)]
 		z: bool,
-		/// Pathspecs to filter by: files, directories, globs (`*.rs`), and magic (`:(exclude)`/`:!`, `:/`, `:(icase)`, `:(literal)`, `:(glob)`).
-		pathspecs: Vec<String>,
+		/// Pathspecs to filter by. Arbitrary bytes use `gitana-path-v1:base64url:<data>`.
+		pathspecs: Vec<McpGitPath>,
 	},
 	/// Point a ref at an object.
 	UpdateRef {
@@ -177,9 +183,9 @@ enum Command {
 		/// Allow adding otherwise-ignored files.
 		#[arg(short = 'f', long = "force")]
 		force: bool,
-		/// Pathspecs to stage: files, directories, `.`, globs (`*.rs`), and magic (`:(exclude)`/`:!`, `:/`, `:(icase)`, `:(literal)`, `:(glob)`).
+		/// Pathspecs to stage. Arbitrary bytes use `gitana-path-v1:base64url:<data>`.
 		#[arg(required = true)]
-		pathspecs: Vec<String>,
+		pathspecs: Vec<McpGitPath>,
 	},
 	/// Show the working-tree status (porcelain v1).
 	Status,
@@ -279,7 +285,7 @@ enum Command {
 	Show {
 		/// The object to show (default: HEAD).
 		#[arg(long)]
-		object: Option<String>,
+		object: Option<McpRevisionSpec>,
 	},
 	/// Read or write git configuration. A read without a scope resolves across git's precedence stack
 	/// (system → global → local); a write without a scope lands in the repository-local `.git/config`.
@@ -377,12 +383,13 @@ enum Command {
 		/// Discard local changes that would be overwritten.
 		#[arg(short = 'f', long = "force")]
 		force: bool,
-		/// Branch to switch to, or tree-ish to restore paths from.
+		/// Branch to switch to, or tree-ish to restore paths from. Arbitrary bytes in a tree suffix
+		/// use `gitana-revision-v1:base64url:<data>` for the complete revision argument.
 		#[arg(long)]
-		target: Option<String>,
-		/// Paths to restore. When given, restore mode; otherwise branch switch.
+		target: Option<McpRevisionSpec>,
+		/// Paths to restore. Arbitrary bytes use `gitana-path-v1:base64url:<data>`.
 		#[arg(long)]
-		paths: Vec<String>,
+		paths: Vec<McpGitPath>,
 	},
 	/// Restore working-tree and/or staged paths from a tree-ish, the index, or `HEAD`.
 	Restore {
@@ -392,12 +399,13 @@ enum Command {
 		/// Restore the index (staging area).
 		#[arg(long)]
 		staged: bool,
-		/// Tree-ish to restore from (default: the index, or `HEAD` with `staged`).
+		/// Tree-ish to restore from (default: the index, or `HEAD` with `staged`). Arbitrary bytes in a
+		/// tree suffix use `gitana-revision-v1:base64url:<data>` for the complete revision argument.
 		#[arg(long)]
-		source: Option<String>,
-		/// Paths to restore.
+		source: Option<McpRevisionSpec>,
+		/// Paths to restore. Arbitrary bytes use `gitana-path-v1:base64url:<data>`.
 		#[arg(long)]
-		paths: Vec<String>,
+		paths: Vec<McpGitPath>,
 	},
 	/// Reset the current branch (and optionally index/working tree) to a commit, or reset paths.
 	Reset {
@@ -410,12 +418,13 @@ enum Command {
 		/// Move `HEAD` and reset both the index and the working tree, discarding changes.
 		#[arg(long)]
 		hard: bool,
-		/// Commit to reset to, default `HEAD`.
+		/// Commit or tree-ish to reset from, default `HEAD`. Arbitrary bytes in a tree suffix use
+		/// `gitana-revision-v1:base64url:<data>` for the complete revision argument.
 		#[arg(long)]
-		target: Option<String>,
-		/// Paths to reset in the index; does not move `HEAD`.
+		target: Option<McpRevisionSpec>,
+		/// Paths to reset. Arbitrary bytes use `gitana-path-v1:base64url:<data>`.
 		#[arg(long)]
-		paths: Vec<String>,
+		paths: Vec<McpGitPath>,
 	},
 	/// Remove tracked files from the index and the working tree.
 	Rm {
@@ -431,9 +440,9 @@ enum Command {
 		/// Show what would be removed without removing it.
 		#[arg(long)]
 		dry_run: bool,
-		/// Paths to remove.
+		/// Paths to remove. Arbitrary bytes use `gitana-path-v1:base64url:<data>`.
 		#[arg(long)]
-		pathspecs: Vec<String>,
+		pathspecs: Vec<McpGitPath>,
 	},
 	/// Move or rename a tracked file or directory (filesystem move plus index update).
 	Mv {
@@ -446,9 +455,9 @@ enum Command {
 		/// Report each rename performed.
 		#[arg(long)]
 		verbose: bool,
-		/// One or more sources followed by the destination.
+		/// Sources then destination. Arbitrary bytes use `gitana-path-v1:base64url:<data>`.
 		#[arg(long, required = true)]
-		paths: Vec<String>,
+		paths: Vec<McpGitPath>,
 	},
 	/// Show changes between commits, the index, and the working tree.
 	Diff {
@@ -573,18 +582,20 @@ enum SparseCheckoutAction {
 	},
 	/// Replace the sparse-checkout set: cone directories, or (`--no-cone`) gitignore patterns.
 	Set {
-		/// Directories (cone) or patterns (`--no-cone`) to include.
+		/// Directories (cone) or patterns (`--no-cone`) to include. Arbitrary bytes use
+		/// `gitana-path-v1:base64url:<data>`.
 		#[arg(long = "pattern")]
-		patterns: Vec<String>,
+		patterns: Vec<McpGitPath>,
 		/// Use full gitignore-style patterns instead of cone mode.
 		#[arg(long = "no-cone")]
 		no_cone: bool,
 	},
 	/// Extend the current sparse-checkout set, keeping the configured mode.
 	Add {
-		/// Directories (cone) or patterns (`--no-cone`) to add.
+		/// Directories (cone) or patterns (`--no-cone`) to add. Arbitrary bytes use
+		/// `gitana-path-v1:base64url:<data>`.
 		#[arg(long = "pattern")]
-		patterns: Vec<String>,
+		patterns: Vec<McpGitPath>,
 	},
 	/// Print the current sparse-checkout set.
 	List,
@@ -809,11 +820,26 @@ impl Cli {
 					show_size,
 					pretty,
 					object,
-				} => commands::cat_file::run(&cwd, show_type, show_size, pretty, &object).await,
-				Command::LsTree { recursive, treeish } => {
-					commands::ls_tree::run(&cwd, recursive, &treeish).await
+				} => {
+					let object = object.into_bytes();
+					commands::cat_file::run(
+						&cwd,
+						show_type,
+						show_size,
+						pretty,
+						&object,
+						gta_core::PathQuoteMode::Always,
+					)
+					.await
 				}
-				Command::RevParse { spec } => commands::rev_parse::run(&cwd, &spec).await,
+				Command::LsTree { recursive, treeish } => {
+					let treeish = treeish.into_bytes();
+					commands::ls_tree::run(&cwd, recursive, &treeish, gta_core::PathQuoteMode::Always).await
+				}
+				Command::RevParse { spec } => {
+					let spec = spec.into_bytes();
+					commands::rev_parse::run(&cwd, &spec).await
+				}
 				Command::RevList { spec } => commands::rev_list::run(&cwd, &spec).await,
 				Command::MergeBase {
 					all,
@@ -832,6 +858,7 @@ impl Cli {
 					z,
 					pathspecs,
 				} => {
+					let pathspecs = crate::git_path::into_pathspecs(pathspecs);
 					commands::ls_files::run(
 						&cwd,
 						&pathspecs,
@@ -846,6 +873,7 @@ impl Cli {
 							z,
 							full_name,
 						},
+						gta_core::PathQuoteMode::Always,
 					)
 					.await
 				}
@@ -853,8 +881,17 @@ impl Cli {
 				Command::SymbolicRef { name, target } => {
 					commands::symbolic_ref::run(&cwd, &name, target).await
 				}
-				Command::Add { force, pathspecs } => commands::add::run(&cwd, &pathspecs, force).await,
-				Command::Status => commands::status::run(&cwd).await,
+				Command::Add { force, pathspecs } => {
+					let pathspecs = crate::git_path::into_pathspecs(pathspecs);
+					commands::add::run(
+						&cwd,
+						&pathspecs,
+						force,
+						gta_core::ResultPathMode::Reversible,
+					)
+					.await
+				}
+				Command::Status => commands::status::run(&cwd, gta_core::PathQuoteMode::Always).await,
 				Command::Commit {
 					message,
 					sign,
@@ -868,29 +905,77 @@ impl Cli {
 					ff_only,
 					abort,
 					continue_,
-				} => commands::merge::run(&cwd, commit, message, no_ff, ff_only, abort, continue_).await,
+				} => {
+					commands::merge::run(
+						&cwd,
+						commit,
+						message,
+						no_ff,
+						ff_only,
+						abort,
+						continue_,
+						gta_core::ResultPathMode::Reversible,
+					)
+					.await
+				}
 				Command::CherryPick {
 					commit,
 					abort,
 					continue_,
-				} => commands::cherry_pick::run(&cwd, commit, abort, continue_).await,
+				} => {
+					commands::cherry_pick::run(
+						&cwd,
+						commit,
+						abort,
+						continue_,
+						gta_core::ResultPathMode::Reversible,
+					)
+					.await
+				}
 				Command::Revert {
 					commit,
 					abort,
 					continue_,
-				} => commands::revert::run(&cwd, commit, abort, continue_).await,
+				} => {
+					commands::revert::run(
+						&cwd,
+						commit,
+						abort,
+						continue_,
+						gta_core::ResultPathMode::Reversible,
+					)
+					.await
+				}
 				Command::Rebase {
 					upstream,
 					onto,
 					abort,
 					continue_,
 					skip,
-				} => commands::rebase::run(&cwd, upstream, onto, abort, continue_, skip).await,
+				} => {
+					commands::rebase::run(
+						&cwd,
+						upstream,
+						onto,
+						abort,
+						continue_,
+						skip,
+						gta_core::ResultPathMode::Reversible,
+					)
+					.await
+				}
 				Command::Repack { geometric } => commands::repack::run(&cwd, geometric).await,
 				Command::Prune => commands::prune::run(&cwd).await,
 				Command::Gc => commands::gc::run(&cwd).await,
 				Command::Log => commands::log::run(&cwd).await,
-				Command::Show { object } => commands::show::run(&cwd, object).await,
+				Command::Show { object } => {
+					commands::show::run(
+						&cwd,
+						object.map(McpRevisionSpec::into_bytes),
+						gta_core::PathQuoteMode::Always,
+					)
+					.await
+				}
 				Command::Config {
 					get,
 					get_all,
@@ -956,34 +1041,84 @@ impl Cli {
 					force,
 					target,
 					paths,
-				} => commands::checkout::run(&cwd, force, target, paths).await,
+				} => {
+					commands::checkout::run(
+						&cwd,
+						force,
+						target.map(McpRevisionSpec::into_bytes),
+						crate::git_path::into_pathspecs(paths),
+					)
+					.await
+				}
 				Command::Restore {
 					worktree,
 					staged,
 					source,
 					paths,
-				} => commands::restore::run(&cwd, worktree, staged, source, paths).await,
+				} => {
+					commands::restore::run(
+						&cwd,
+						worktree,
+						staged,
+						source.map(McpRevisionSpec::into_bytes),
+						crate::git_path::into_pathspecs(paths),
+					)
+					.await
+				}
 				Command::Reset {
 					soft,
 					mixed,
 					hard,
 					target,
 					paths,
-				} => commands::reset::run(&cwd, soft, mixed, hard, target, paths).await,
+				} => {
+					commands::reset::run(
+						&cwd,
+						soft,
+						mixed,
+						hard,
+						target.map(McpRevisionSpec::into_bytes),
+						crate::git_path::into_pathspecs(paths),
+					)
+					.await
+				}
 				Command::Rm {
 					cached,
 					force,
 					recursive,
 					dry_run,
 					pathspecs,
-				} => commands::rm::run(&cwd, cached, force, recursive, dry_run, pathspecs).await,
+				} => {
+					commands::rm::run(
+						&cwd,
+						cached,
+						force,
+						recursive,
+						dry_run,
+						crate::git_path::into_pathspecs(pathspecs),
+						gta_core::ResultPathMode::Reversible,
+					)
+					.await
+				}
 				Command::Mv {
 					force,
 					dry_run,
 					verbose,
 					paths,
-				} => commands::mv::run(&cwd, force, dry_run, verbose, paths).await,
-				Command::Diff { cached } => commands::diff::run(&cwd, cached).await,
+				} => {
+					commands::mv::run(
+						&cwd,
+						force,
+						dry_run,
+						verbose,
+						crate::git_path::into_pathspecs(paths),
+						gta_core::ResultPathMode::Reversible,
+					)
+					.await
+				}
+				Command::Diff { cached } => {
+					commands::diff::run(&cwd, cached, gta_core::PathQuoteMode::Always).await
+				}
 				Command::Clone {
 					url,
 					path,
@@ -1012,7 +1147,7 @@ impl Cli {
 				)
 				.await
 				.map(|_| ()),
-				Command::Pull => commands::pull::run(&cwd).await,
+				Command::Pull => commands::pull::run(&cwd, gta_core::ResultPathMode::Reversible).await,
 				Command::Push {
 					repository,
 					refspecs,
@@ -1053,7 +1188,12 @@ impl Cli {
 					commands::worktree::run(&cwd, worktree_action(action)).await
 				}
 				Command::SparseCheckout { action } => {
-					commands::sparse_checkout::run(&cwd, sparse_checkout_action(action)).await
+					commands::sparse_checkout::run(
+						&cwd,
+						sparse_checkout_action(action),
+						gta_core::ResultPathMode::Reversible,
+					)
+					.await
 				}
 			}
 		}))
@@ -1066,8 +1206,13 @@ fn sparse_checkout_action(action: SparseCheckoutAction) -> commands::sparse_chec
 	use commands::sparse_checkout::Action;
 	match action {
 		SparseCheckoutAction::Init { no_cone } => Action::Init { no_cone },
-		SparseCheckoutAction::Set { patterns, no_cone } => Action::Set { patterns, no_cone },
-		SparseCheckoutAction::Add { patterns } => Action::Add { patterns },
+		SparseCheckoutAction::Set { patterns, no_cone } => Action::Set {
+			patterns: crate::git_path::into_pathspecs(patterns),
+			no_cone,
+		},
+		SparseCheckoutAction::Add { patterns } => Action::Add {
+			patterns: crate::git_path::into_pathspecs(patterns),
+		},
 		SparseCheckoutAction::List => Action::List,
 		SparseCheckoutAction::Disable => Action::Disable,
 		SparseCheckoutAction::Reapply => Action::Reapply,

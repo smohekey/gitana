@@ -18,6 +18,7 @@ use crate::signer;
 /// conflicts materialises an in-progress state (`MERGE_HEAD`, `MERGE_MSG`, a conflicted index, and
 /// work-tree markers) and exits non-zero; the user resolves it and then `--continue`s (or
 /// `gta commit`s), or `--abort`s to discard it.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
 	cwd: &Path,
 	commit: Option<String>,
@@ -26,6 +27,7 @@ pub async fn run(
 	ff_only: bool,
 	abort: bool,
 	continue_: bool,
+	result_path_mode: crate::ResultPathMode,
 ) -> Result<()> {
 	if abort && continue_ {
 		bail!("--abort and --continue are incompatible");
@@ -39,6 +41,7 @@ pub async fn run(
 			ff_only,
 			abort,
 			continue_,
+			result_path_mode,
 			cwd: cwd.to_path_buf(),
 		},
 	)
@@ -52,6 +55,7 @@ struct Merge {
 	ff_only: bool,
 	abort: bool,
 	continue_: bool,
+	result_path_mode: crate::ResultPathMode,
 	/// The effective working directory, for resolving a relative `user.signingkey` (`-C`).
 	cwd: std::path::PathBuf,
 }
@@ -60,7 +64,7 @@ impl WorkTreeCommand for Merge {
 	async fn run<H: HashAlgorithm>(
 		self,
 		wt: WorkTree<Backend, crate::WorkDir, H>,
-		_prefix: String,
+		_prefix: gitana_path::GitPath,
 	) -> Result<()> {
 		if self.abort {
 			return gitana_porcelain::abort_merge(&wt).await;
@@ -87,13 +91,16 @@ impl WorkTreeCommand for Merge {
 			signer.as_ref(),
 		)
 		.await?;
-		render(outcome)
+		render(outcome, self.result_path_mode)
 	}
 }
 
 /// Render a merge outcome to stdout, or turn a conflict into the process's exit. Shared with `pull`,
 /// which integrates the fetched upstream via the same merge.
-pub(crate) fn render<H: HashAlgorithm>(outcome: MergeOutcome<H>) -> Result<()> {
+pub(crate) fn render<H: HashAlgorithm>(
+	outcome: MergeOutcome<H>,
+	result_path_mode: crate::ResultPathMode,
+) -> Result<()> {
 	match outcome {
 		MergeOutcome::AlreadyUpToDate => println!("Already up to date."),
 		MergeOutcome::FastForward { from, to } => match from {
@@ -101,12 +108,46 @@ pub(crate) fn render<H: HashAlgorithm>(outcome: MergeOutcome<H>) -> Result<()> {
 			None => println!("Fast-forward"),
 		},
 		MergeOutcome::Made { .. } => println!("Merge made by the 'recursive' strategy."),
-		MergeOutcome::Conflict { paths } => return Err(conflict::report_conflicts(&paths)),
+		MergeOutcome::WouldOverwrite { paths } => {
+			bail!("{}", would_overwrite_message(&paths, result_path_mode));
+		}
+		MergeOutcome::Conflict { paths } => {
+			return Err(conflict::report_conflicts(&paths, result_path_mode));
+		}
 	}
 	Ok(())
+}
+
+fn would_overwrite_message(paths: &[gitana_path::GitPath], mode: crate::ResultPathMode) -> String {
+	let paths = paths
+		.iter()
+		.map(|path| crate::git_path::render_result_path(path, mode))
+		.collect::<Vec<_>>()
+		.join("\n  ");
+	format!(
+		"Your local changes to the following files would be overwritten by merge:\n  {paths}\nPlease commit your changes or stash them before you merge."
+	)
 }
 
 fn short<H: HashAlgorithm>(id: ObjectId<H>) -> String {
 	let hex = id.to_hex();
 	hex[..12.min(hex.len())].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn reversible_merge_refusal_distinguishes_human_path_collisions() {
+		let raw = gitana_path::GitPath::from_bytes(b"raw-\xff".to_vec()).unwrap();
+		let literal = gitana_path::GitPath::from_utf8("\"raw-\\377\"").unwrap();
+		let paths = [raw, literal];
+		let human = would_overwrite_message(&paths, crate::ResultPathMode::Human);
+		let reversible = would_overwrite_message(&paths, crate::ResultPathMode::Reversible);
+
+		assert_eq!(human.matches("  \"raw-\\377\"").count(), 2);
+		assert_eq!(reversible.matches("  \"raw-\\377\"").count(), 1);
+		assert!(reversible.contains("  \"\\\"raw-\\\\377\\\"\""));
+	}
 }

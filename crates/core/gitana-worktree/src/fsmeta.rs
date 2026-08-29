@@ -8,30 +8,29 @@
 
 use gitana_file_store_local::{Meta, WorkDirFs};
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind};
+use gitana_path::{GitPath, GitPathComponent};
 
 use crate::ignore::{self, DirIgnore};
 use crate::{Stat, WorktreeError};
 
 /// Join a work-tree-relative directory and an entry name into a `/`-separated path (an empty
 /// `dir_rel` — the work-tree root — yields the bare name).
-pub(crate) fn join_rel(dir_rel: &str, name: &str) -> String {
-	if dir_rel.is_empty() {
-		name.to_owned()
-	} else {
-		format!("{dir_rel}/{name}")
-	}
+pub(crate) fn join_rel(dir_rel: &GitPath, name: &GitPathComponent) -> GitPath {
+	dir_rel.join(name)
 }
 
 /// Read `dir_rel`'s `.gitignore` (if any) through `work`, parse it relative to `dir_rel`, and push
 /// it onto `stack`; returns whether one was present (so the caller can pop it after descending).
 pub(crate) fn push_gitignore<W: WorkDirFs>(
 	work: &W,
-	dir_rel: &str,
+	dir_rel: &GitPath,
 	stack: &mut Vec<DirIgnore>,
 ) -> Result<bool, WorktreeError> {
-	match work.read(&join_rel(dir_rel, ".gitignore")) {
+	let ignore_name = GitPathComponent::from_utf8(".gitignore")
+		.expect("the built-in gitignore name is a valid Git path component");
+	match work.read(&join_rel(dir_rel, &ignore_name)) {
 		Ok(bytes) => {
-			stack.push(ignore::parse(&String::from_utf8_lossy(&bytes), dir_rel));
+			stack.push(ignore::parse(&bytes, dir_rel));
 			Ok(true)
 		}
 		// No ignore file here: either the directory has none (`NotFound`), or `dir_rel` is not a directory
@@ -55,7 +54,7 @@ pub(crate) fn push_gitignore<W: WorkDirFs>(
 /// nor a symlink.
 pub(crate) fn blob_of<W: WorkDirFs, H: HashAlgorithm>(
 	work: &W,
-	path: &str,
+	path: &GitPath,
 	meta: &Meta,
 ) -> std::io::Result<Option<(ObjectId<H>, u32)>> {
 	if meta.kind.is_symlink() {

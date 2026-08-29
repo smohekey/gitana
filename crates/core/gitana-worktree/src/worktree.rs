@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use gitana_file_store::{FileStore, FileStoreError, WriteOutcome};
 use gitana_file_store_local::{Meta, WorkDirFs};
 use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_path::{GitPath, GitPathspec};
 use gitana_repository::Repository;
 
 use crate::excludes::StandardExcludes;
@@ -51,31 +52,44 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// `:<path>` (the staged blob, stage 0) and `:<n>:<path>` (merge stage `n`). Every other spec
 	/// — refs, oids, `HEAD`, `~`/`^`/`^{type}`, and `<rev>:<path>` — is delegated to
 	/// [`Repository::rev_parse`]. The path is repository-root-relative.
-	pub async fn rev_parse(&self, spec: &str) -> Result<ObjectId<H>, WorktreeError> {
-		match spec.strip_prefix(':') {
-			Some(rest) => self.resolve_index_spec(rest).await,
+	pub async fn rev_parse(&self, spec: impl AsRef<[u8]>) -> Result<ObjectId<H>, WorktreeError> {
+		let spec = spec.as_ref();
+		if spec.contains(&0) {
+			return Ok(self.repository().rev_parse(spec).await?);
+		}
+		match spec.strip_prefix(b":") {
+			Some(rest) => {
+				let original = GitPathspec::from_bytes(spec.to_vec())
+					.expect("revision specifications containing NUL were rejected above");
+				self.resolve_index_spec(rest, original).await
+			}
 			None => Ok(self.repository().rev_parse(spec).await?),
 		}
 	}
 
 	/// Resolve the part of an index spec after the leading `:` to the staged blob's id.
-	async fn resolve_index_spec(&self, rest: &str) -> Result<ObjectId<H>, WorktreeError> {
+	async fn resolve_index_spec(
+		&self,
+		rest: &[u8],
+		original: GitPathspec,
+	) -> Result<ObjectId<H>, WorktreeError> {
 		// `:/text` (commit-message search) is not an index lookup.
-		if rest.starts_with('/') {
-			return Err(WorktreeError::InvalidIndexSpec(rest.to_owned()));
+		if rest.starts_with(b"/") {
+			return Err(WorktreeError::InvalidIndexSpec(original));
 		}
 		// `:<n>:<path>` selects merge stage `n` (0–3); otherwise stage 0.
-		let bytes = rest.as_bytes();
-		let (stage, path) = match bytes {
+		let (stage, path) = match rest {
 			[digit, b':', ..] if digit.is_ascii_digit() => {
 				let stage = digit - b'0';
 				if stage > 3 {
-					return Err(WorktreeError::InvalidIndexSpec(rest.to_owned()));
+					return Err(WorktreeError::InvalidIndexSpec(original));
 				}
 				(stage, &rest[2..])
 			}
 			_ => (0, rest),
 		};
+		let path =
+			GitPath::from_bytes(path.to_vec()).map_err(|_| WorktreeError::InvalidIndexSpec(original))?;
 		self
 			.load_index()
 			.await?
@@ -89,7 +103,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				} else {
 					format!(" at stage {stage}")
 				};
-				WorktreeError::IndexPathMissing(path.to_owned(), at)
+				WorktreeError::IndexPathMissing(path.clone(), at)
 			})
 	}
 
@@ -183,7 +197,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			.get_bool_validated("core", None, "ignorecase")?
 			.unwrap_or(false);
 		let text = match self.files().read_path("info/sparse-checkout").await {
-			Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+			Ok(bytes) => bytes,
 			// No pattern file → no sparse narrowing (git does a full checkout), so sparse is inactive.
 			Err(FileStoreError::NotFound) => return Ok(None),
 			Err(error) => return Err(error.into()),
@@ -246,9 +260,13 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		};
 		let file_mode = crate::status::worktree_file_mode(self).await;
 		let lock = self.lock_index().await?;
-		// `apply_sparse` marks `lock` itself, at its first working-tree write (after the fallible index load) —
-		// so a failure while loading/inspecting the index still releases the lock cleanly.
-		match self.apply_sparse(&matcher, file_mode, &lock).await {
+		let prepared = async {
+			let index = self.load_index().await?;
+			self.preflight_sparse_paths(&index)?;
+			self.apply_sparse(index, &matcher, file_mode, &lock).await
+		}
+		.await;
+		match prepared {
 			Ok((index, outcome)) => {
 				self.commit_index(lock, &index).await?;
 				Ok(outcome)
@@ -264,15 +282,14 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// returns the updated index (for the caller to commit) and the reapply outcome.
 	async fn apply_sparse(
 		&self,
+		mut index: Index<H>,
 		matcher: &SparseCheckout,
 		file_mode: bool,
 		lock: &IndexLock<'_, F>,
 	) -> Result<(Index<H>, SparseReapply), WorktreeError> {
-		// Marks `lock` as mutating right before the FIRST working-tree write below — after `load_index` and
-		// each entry's fallible content hash, so a pre-mutation failure (a malformed index, an unreadable
-		// file) still releases the lock cleanly rather than stranding it. Index-only bit flips don't count:
-		// they are never written until the caller commits, so they leave no half-applied tree.
-		let mut index = self.load_index().await?;
+		// The caller has loaded the index and preflighted every stage-0 path against the filesystem backend.
+		// Marks `lock` as mutating right before the first working-tree write below. Index-only bit flips do
+		// not count: they are never written until the caller commits, so they leave no half-applied tree.
 		let mut left_dirty = Vec::new();
 		let mut not_updated = Vec::new();
 		for entry in index.entries.iter_mut() {
@@ -356,6 +373,10 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		let file_mode = crate::status::worktree_file_mode(self).await;
 		let lock = self.lock_index().await?;
 		let result: Result<(Index<H>, SparseReapply), WorktreeError> = async {
+			let index = self.load_index().await?;
+			// Reject a raw path that this backend cannot represent before config.worktree or the pattern file
+			// is changed. The same prepared index is then reconciled, so there is no validation/apply gap.
+			self.preflight_sparse_paths(&index)?;
 			// Enabling the config and writing the pattern file are the first PERSISTENT changes, so mark before
 			// them (not just before the worktree reconciliation): a cancellation that has already written
 			// `config.worktree` / `info/sparse-checkout` must not release `index.lock` and let a successor act
@@ -364,13 +385,13 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			self.write_sparse_enabled(true, set.is_cone()).await?;
 			self
 				.files()
-				.write_path_replace("info/sparse-checkout", set.render().as_bytes())
+				.write_path_replace("info/sparse-checkout", &set.render())
 				.await?;
 			// Apply under the held lock. The set was just enabled, so the matcher is present; a defensive
 			// `None` (e.g. an empty file) is a no-op. `apply_sparse` marks again at its first worktree write.
 			match self.sparse_checkout().await? {
-				Some(matcher) => self.apply_sparse(&matcher, file_mode, &lock).await,
-				None => Ok((self.load_index().await?, SparseReapply::default())),
+				Some(matcher) => self.apply_sparse(index, &matcher, file_mode, &lock).await,
+				None => Ok((index, SparseReapply::default())),
 			}
 		}
 		.await;
@@ -394,10 +415,15 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	pub async fn materialise_paths(
 		&self,
 		tree: ObjectId<H>,
-		paths: &[String],
-		force_gitlink_mounts: &std::collections::HashSet<String>,
+		paths: &[GitPath],
+		force_gitlink_mounts: &std::collections::HashSet<GitPath>,
 	) -> Result<(), WorktreeError> {
 		let entries = self.repository().read_tree(tree).await?;
+		for (path, _, _) in &entries {
+			if paths.iter().any(|selected| selected == path) {
+				self.work().validate_path_representable(path)?;
+			}
+		}
 		for (path, mode, oid) in &entries {
 			if paths.iter().any(|p| p == path) {
 				// A gitlink conflict path: git records the base/ours/theirs stages but does not materialise the
@@ -430,14 +456,16 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			return Ok(None);
 		};
 		let text = match self.files().read_path("info/sparse-checkout").await {
-			Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-			Err(FileStoreError::NotFound) => String::new(),
+			Ok(bytes) => bytes,
+			Err(FileStoreError::NotFound) => Vec::new(),
 			Err(error) => return Err(error.into()),
 		};
 		Ok(Some(match matcher {
 			// `list` recovers the directories; case-folding is irrelevant to `dirs()`, so pass `false`.
 			SparseCheckout::Cone(_) => SparseSet::Cone(crate::sparse::Cone::parse(&text, false).dirs()),
-			SparseCheckout::NonCone(_) => SparseSet::NonCone(text.lines().map(str::to_owned).collect()),
+			SparseCheckout::NonCone(_) => {
+				SparseSet::NonCone(crate::sparse::lines(&text).map(<[u8]>::to_vec).collect())
+			}
 		}))
 	}
 
@@ -447,7 +475,13 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	pub async fn disable_sparse(&self) -> Result<SparseReapply, WorktreeError> {
 		let file_mode = crate::status::worktree_file_mode(self).await;
 		let lock = self.lock_index().await?;
-		let outcome = match self.materialise_all_sparse(file_mode, &lock).await {
+		let prepared = async {
+			let index = self.load_index().await?;
+			self.preflight_sparse_paths(&index)?;
+			self.materialise_all_sparse(index, file_mode, &lock).await
+		}
+		.await;
+		let outcome = match prepared {
 			Ok((index, outcome)) => {
 				self.commit_index(lock, &index).await?;
 				outcome
@@ -468,12 +502,12 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// an ancestor slot blocks the write (recorded in `not_updated`), and the bit is cleared regardless.
 	async fn materialise_all_sparse(
 		&self,
+		mut index: Index<H>,
 		file_mode: bool,
 		lock: &IndexLock<'_, F>,
 	) -> Result<(Index<H>, SparseReapply), WorktreeError> {
-		// Marks `lock` right before the FIRST working-tree write below — after the fallible index load and
-		// per-entry content hash — so a pre-mutation failure releases the lock cleanly.
-		let mut index = self.load_index().await?;
+		// The caller has preflighted the prepared index before any mutation. Mark immediately before the
+		// first actual write below so an earlier inspection failure still releases the lock cleanly.
 		let mut not_updated = Vec::new();
 		for entry in index.entries.iter_mut() {
 			if entry.stage == 0 && entry.skip_worktree {
@@ -500,6 +534,18 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				not_updated,
 			},
 		))
+	}
+
+	/// Reject any stage-0 index path that the working-directory backend cannot represent. Sparse
+	/// reconciliation is a batch operation: validating the whole candidate set before its first write
+	/// prevents a deterministic encoding failure on a later entry from leaving earlier entries applied.
+	fn preflight_sparse_paths(&self, index: &Index<H>) -> Result<(), WorktreeError> {
+		for entry in &index.entries {
+			if entry.stage == 0 {
+				self.work().validate_path_representable(&entry.path)?;
+			}
+		}
+		Ok(())
 	}
 
 	/// Write git's sparse-checkout config: `extensions.worktreeConfig = true` in the common config (git
@@ -634,7 +680,28 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		pathspecs: &[&str],
 		prefix: &str,
 		force: bool,
-		excludes_file: Option<&str>,
+		excludes_file: Option<&[u8]>,
+	) -> Result<(), WorktreeError> {
+		let pathspecs = pathspecs
+			.iter()
+			.map(GitPathspec::from_utf8)
+			.collect::<Result<Vec<_>, _>>()
+			.map_err(|error| WorktreeError::InvalidPath(error.to_string()))?;
+		let prefix =
+			GitPath::from_utf8(prefix).map_err(|error| WorktreeError::InvalidPath(error.to_string()))?;
+		self
+			.add_pathspecs(&pathspecs, &prefix, force, excludes_file)
+			.await
+	}
+
+	/// Byte-preserving counterpart of [`Self::add`] for native and protocol
+	/// boundaries that can carry non-UTF-8 Git pathspecs.
+	pub async fn add_pathspecs(
+		&self,
+		pathspecs: &[GitPathspec],
+		prefix: &GitPath,
+		force: bool,
+		excludes_file: Option<&[u8]>,
 	) -> Result<(), WorktreeError> {
 		let mut index = self.load_index().await?;
 		// `add` with no pathspec at all is git's "Nothing specified, nothing added" no-op: it reads no
@@ -685,7 +752,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		// an *untracked* out-of-cone file matched by any pathspec, or an out-of-cone path named *explicitly*
 		// (a literal, or a glob rooted out-of-cone); a broad pathspec that merely sweeps over a tracked
 		// skip-worktree entry skips it silently.
-		let mut sparse_omitted: Vec<String> = Vec::new();
+		let mut sparse_omitted: Vec<GitPathspec> = Vec::new();
 		// A `:(exclude)` pathspec subtracts from what the positives stage; a set with only negatives stages
 		// the whole tree minus them, exactly like `add .` with the exclusions applied.
 		let set = crate::pathspec::PathspecSet::parse(pathspecs, prefix)?;
@@ -707,14 +774,14 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			let mut files = Vec::new();
 			walk_files(
 				self.work(),
-				"",
+				&GitPath::root(),
 				&mut ignore_stack,
 				&mut files,
 				&gitlinks,
 				force,
 				fold,
 			)?;
-			let walked: std::collections::HashSet<String> = files.iter().cloned().collect();
+			let walked: std::collections::HashSet<GitPath> = files.iter().cloned().collect();
 			for file in &files {
 				if !set.is_excluded(file) {
 					self
@@ -723,7 +790,14 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				}
 			}
 			self
-				.stage_tracked_outside_walk(&mut index, "", sparse.as_ref(), &set, &walked, fold)
+				.stage_tracked_outside_walk(
+					&mut index,
+					&GitPath::root(),
+					sparse.as_ref(),
+					&set,
+					&walked,
+					fold,
+				)
 				.await?;
 			self.save_index(&index).await?;
 			return finish_advisory(sparse_omitted, ignored);
@@ -732,21 +806,21 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		// staging* — so overlapping specs such as `add gone gone` or `add . gone` (where the first occurrence
 		// stages `gone`'s deletion, removing the entry) do not make the later occurrence report "did not
 		// match". Snapshot the initially-tracked (non-sparse) and unmerged paths for the match check below.
-		let initial_tracked: std::collections::HashSet<String> = index
+		let initial_tracked: std::collections::HashSet<GitPath> = index
 			.entries
 			.iter()
 			.filter(|entry| entry.stage == 0 && !entry.skip_worktree)
 			.map(|entry| entry.path.clone())
-			.chain(index.unmerged_paths().map(str::to_owned))
+			.chain(index.unmerged_paths().cloned())
 			.collect();
 		// The same snapshot including **out-of-cone (skip-worktree)** entries — a glob matches those too
 		// (they feed the sparse advice), and a repeated glob matches a path an earlier spec removed.
-		let initial_tracked_all: std::collections::HashSet<String> = index
+		let initial_tracked_all: std::collections::HashSet<GitPath> = index
 			.entries
 			.iter()
 			.filter(|entry| entry.stage == 0)
 			.map(|entry| entry.path.clone())
-			.chain(index.unmerged_paths().map(str::to_owned))
+			.chain(index.unmerged_paths().cloned())
 			.collect();
 		for (spec, pathspec) in set.positives() {
 			// A positive that can never match (a magic path resolving to root, `:/.`) is a no-op for `add`
@@ -770,12 +844,20 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				// ancestor and stages/matches the gitlink as git does. A broad glob (empty prefix) keeps its
 				// silent opacity — probed vs git 2.55.
 				let rooted = pathspec.rooted_prefix();
+				let mut probe = rooted.to_vec();
+				// A fixed prefix ending at a separator (`sub/*` -> `sub/`) denotes a path below
+				// that directory. Add a harmless component so the canonical GitPath retains that
+				// strict-ancestor relationship while preserving the old byte matcher semantics.
+				if probe.ends_with(b"/") {
+					probe.push(b'_');
+				}
 				if !rooted.is_empty()
-					&& let Some(submodule) = gitlink_ancestor(&index, rooted, fold)
+					&& let Ok(rooted) = GitPath::from_bytes(probe)
+					&& let Some(submodule) = gitlink_ancestor(&index, &rooted, fold)
 				{
 					return Err(WorktreeError::PathspecInSubmodule {
-						path: spec.to_owned(),
-						submodule,
+						path: spec.clone(),
+						submodule: submodule.clone(),
 					});
 				}
 				self
@@ -794,21 +876,22 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					.await?;
 				continue;
 			}
-			let rel = pathspec.as_str().to_owned();
+			let rel = GitPath::from_bytes(pathspec.as_bytes().to_vec())
+				.map_err(|_| WorktreeError::UnsafePathspec(spec.clone()))?;
 			let dir_only = pathspec.dir_only();
 			// The empty spec (`.` at the work-tree root) always names the root directory to walk.
-			if rel.is_empty() {
+			if rel.is_root() {
 				let mut files = Vec::new();
 				walk_files(
 					self.work(),
-					"",
+					&GitPath::root(),
 					&mut ignore_stack,
 					&mut files,
 					&gitlinks,
 					force,
 					fold,
 				)?;
-				let walked: std::collections::HashSet<String> = files.iter().cloned().collect();
+				let walked: std::collections::HashSet<GitPath> = files.iter().cloned().collect();
 				for file in &files {
 					if !set.is_excluded(file) {
 						self
@@ -817,7 +900,14 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					}
 				}
 				self
-					.stage_tracked_outside_walk(&mut index, "", sparse.as_ref(), &set, &walked, fold)
+					.stage_tracked_outside_walk(
+						&mut index,
+						&GitPath::root(),
+						sparse.as_ref(),
+						&set,
+						&walked,
+						fold,
+					)
 					.await?;
 				continue;
 			}
@@ -827,8 +917,8 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			// 'sub'".)
 			if let Some(submodule) = gitlink_ancestor(&index, &rel, fold) {
 				return Err(WorktreeError::PathspecInSubmodule {
-					path: rel,
-					submodule,
+					path: spec.clone(),
+					submodule: submodule.clone(),
 				});
 			}
 			match self.work().lstat(&rel)? {
@@ -859,9 +949,9 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					// deferred sparse advice), unlike a broad `.` walk that silently skips such paths, or a
 					// directory with any in-cone content (which stages that and skips the out-of-cone siblings).
 					if self.only_out_of_cone_dir(&index, &rel, &files, sparse.as_ref()) {
-						sparse_omitted.push(rel.clone());
+						sparse_omitted.push(pathspec_for_advisory(&rel));
 					}
-					let walked: std::collections::HashSet<String> = files.iter().cloned().collect();
+					let walked: std::collections::HashSet<GitPath> = files.iter().cloned().collect();
 					for file in &files {
 						self
 							.stage_walked(&mut index, file, sparse.as_ref(), &mut sparse_omitted, fold)
@@ -872,7 +962,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 						.await?;
 				}
 				// A trailing-slash spec required a directory but resolved to a file.
-				Some(_) if dir_only => return Err(WorktreeError::PathspecMatch(spec.to_owned())),
+				Some(_) if dir_only => return Err(WorktreeError::PathspecMatch(spec.clone())),
 				Some(_) => {
 					let out_of_cone = index.is_sparse(&rel)
 						|| sparse
@@ -884,13 +974,13 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 						// git 2.50.1). An UNTRACKED out-of-cone file instead has the exclusion applied first, so
 						// `add out/new.rs :!out/new.rs` is an empty selection and succeeds.
 						if index.entry(&rel).is_some() {
-							sparse_omitted.push(rel.clone());
+							sparse_omitted.push(pathspec_for_advisory(&rel));
 							continue;
 						}
 						if set.is_excluded(&rel) {
 							continue;
 						}
-						sparse_omitted.push(rel.clone());
+						sparse_omitted.push(pathspec_for_advisory(&rel));
 						continue;
 					}
 					// An in-cone file the negatives exclude is skipped (git: `add foo :!foo` stages nothing).
@@ -901,7 +991,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					// (the advisory itself comes from `collect_ignored_advisory`). Ignore never applies to a
 					// tracked path, so a tracked (any stage) or unmerged file still stages its modification.
 					let tracked =
-						index.entry(&rel).is_some() || index.unmerged_paths().any(|path| path == rel);
+						index.entry(&rel).is_some() || index.unmerged_paths().any(|path| path == &rel);
 					if !force && !tracked {
 						let stack = crate::checkout::ignore_prefix(self.work(), &rel, &excludes)?;
 						if self.ignored_report_path(&rel, &stack, fold)?.is_some() {
@@ -910,7 +1000,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 							// a plain literal gets — the glob matched no addable path (probed vs git 2.50.1:
 							// `add :(glob)ign/new` did not match, while `add ign/new` advises).
 							if pathspec.is_glob() {
-								return Err(WorktreeError::PathspecMatch(spec.to_owned()));
+								return Err(WorktreeError::PathspecMatch(spec.clone()));
 							}
 							continue;
 						}
@@ -932,35 +1022,32 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					// (`add out/new.rs`, `out/` out-of-cone, no such entry) is git's "did not match", not the
 					// sparse advice (probed vs git 2.50.1). A tracked skip-worktree entry absent by design is.
 					if index.is_sparse(&rel) {
-						sparse_omitted.push(rel.clone());
+						sparse_omitted.push(pathspec_for_advisory(&rel));
 						continue;
 					}
 					// A directory pathspec covering only out-of-cone (skip-worktree) tracked entries is
 					// reported the same way (`add b` when the whole `b/` subtree is excluded and absent) —
 					// git reports it rather than silently staging nothing.
 					if self.only_out_of_cone_dir(&index, &rel, &[], sparse.as_ref()) {
-						sparse_omitted.push(rel.clone());
+						sparse_omitted.push(pathspec_for_advisory(&rel));
 						continue;
 					}
 					// A sparse-excluded path (or a directory whose only entries are excluded) is
 					// invisible to `add`: git treats it as outside the sparse-checkout definition, so it
 					// neither matches the pathspec nor has its entry dropped. Ignore sparse entries when
 					// deciding whether anything matched, and never remove a sparse entry here.
-					let child_prefix = format!("{rel}/");
 					// Matched against the pre-staging snapshot (see `initial_tracked`), so an earlier positive
 					// that already removed this entry does not turn a later occurrence into "did not match". The
 					// snapshot already covers both stage-0 tracked paths and **unmerged** paths (only stages
 					// 1/2/3) — `add conflict` on a deleted unmerged path clears its higher stages and records
 					// the deletion rather than reporting "did not match" (probed vs git 2.50.1).
 					let matched = initial_tracked.contains(&rel)
-						|| initial_tracked
-							.iter()
-							.any(|path| path.starts_with(&child_prefix));
+						|| initial_tracked.iter().any(|path| path.is_below(&rel));
 					// A positive matching no tracked path is git's "did not match" — and a negative pathspec
 					// does NOT suppress that error (probed vs git 2.50.1: `add missing/ :!missing` and even
 					// `add missing` both fail). So the match check precedes the exclusion skip.
 					if !matched {
-						return Err(WorktreeError::PathspecMatch(spec.to_owned()));
+						return Err(WorktreeError::PathspecMatch(spec.clone()));
 					}
 					// Matched a tracked path the negatives exclude — nothing to stage or drop.
 					if set.is_excluded(&rel) {
@@ -1006,26 +1093,23 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// advises even for a tracked descendant (`ign/tracked` under `ign/`). The caller applies that rule.
 	fn ignored_report_path(
 		&self,
-		target: &str,
+		target: &GitPath,
 		stack: &[DirIgnore],
 		fold: bool,
-	) -> Result<Option<(String, bool)>, WorktreeError> {
-		let mut idx = 0;
-		while let Some(next) = target[idx..].find('/') {
-			let ancestor = &target[..idx + next];
+	) -> Result<Option<(GitPath, bool)>, WorktreeError> {
+		for ancestor in target.strict_ancestors() {
 			// Match against the ancestor's ACTUAL on-disk kind: normally a directory, but git also reports an
 			// ignored regular file that a pathspec descends through (`.gitignore` = `file`, `add x :!file/sub`
 			// → reports `file`). A dir-only rule (`file/`) then correctly won't match the regular file.
-			if let Some(meta) = self.work().lstat(ancestor)?
-				&& ignore::is_ignored_fold(ancestor, meta.kind.is_dir(), stack, fold)
+			if let Some(meta) = self.work().lstat(&ancestor)?
+				&& ignore::is_ignored_fold(&ancestor, meta.kind.is_dir(), stack, fold)
 			{
-				return Ok(Some((ancestor.to_owned(), false)));
+				return Ok(Some((ancestor, false)));
 			}
-			idx += next + 1;
 		}
 		match self.work().lstat(target)? {
 			Some(meta) if ignore::is_ignored_fold(target, meta.kind.is_dir(), stack, fold) => {
-				Ok(Some((target.to_owned(), true)))
+				Ok(Some((target.clone(), true)))
 			}
 			_ => Ok(None),
 		}
@@ -1040,25 +1124,32 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	fn resolve_icase_prefix(
 		&self,
 		pathspec: &crate::pathspec::Pathspec,
-	) -> Result<Option<String>, WorktreeError> {
-		let normalized = pathspec.as_str();
+	) -> Result<Option<GitPath>, WorktreeError> {
+		let normalized = pathspec.as_bytes();
 		let first_wild = normalized
-			.bytes()
+			.iter()
+			.copied()
 			.position(|b| matches!(b, b'*' | b'?' | b'[' | b'\\'))
 			.unwrap_or(normalized.len());
 		let literal = if first_wild == normalized.len() {
 			normalized
 		} else {
-			match normalized[..first_wild].rfind('/') {
+			match normalized[..first_wild]
+				.iter()
+				.rposition(|byte| *byte == b'/')
+			{
 				Some(slash) => &normalized[..slash],
-				None => "",
+				None => b"",
 			}
 		};
 		if literal.is_empty() {
 			return Ok(None);
 		}
-		let components: Vec<&str> = literal.split('/').filter(|part| !part.is_empty()).collect();
-		let mut resolved = String::new();
+		let components: Vec<&[u8]> = literal
+			.split(|byte| *byte == b'/')
+			.filter(|part| !part.is_empty())
+			.collect();
+		let mut resolved = GitPath::root();
 		for (i, component) in components.iter().enumerate() {
 			// `resolved` is always a confirmed directory here (the root, or a component the previous
 			// iteration verified is a directory), so `read_dir` never hits a non-directory.
@@ -1066,24 +1157,21 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				.work()
 				.read_dir(&resolved)?
 				.into_iter()
-				.find(|entry| entry.name.eq_ignore_ascii_case(component));
+				.find(|entry| entry.name.as_bytes().eq_ignore_ascii_case(component));
 			let Some(entry) = found else {
 				// A missing component stops resolution — the resolved-so-far prefix is returned, so an ignored
 				// existing ancestor still reports (`:(icase)IGN/MISSING` → `ign`, like `ign/missing` does).
 				break;
 			};
-			if !resolved.is_empty() {
-				resolved.push('/');
-			}
 			let is_dir = entry.kind.is_dir();
-			resolved.push_str(&entry.name);
+			resolved = resolved.join(&entry.name);
 			// Can't descend past a non-directory (`:(icase)FILE/sub` where `file` is a regular file): stop
 			// here, having recorded `file` so an ignore rule on it can still be reported.
 			if !is_dir && i + 1 < components.len() {
 				break;
 			}
 		}
-		if resolved.is_empty() {
+		if resolved.is_root() {
 			Ok(None)
 		} else {
 			Ok(Some(resolved))
@@ -1105,7 +1193,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		index: &Index<H>,
 		excludes: &[DirIgnore],
 		fold: bool,
-	) -> Result<Vec<String>, WorktreeError> {
+	) -> Result<Vec<GitPath>, WorktreeError> {
 		let mut ignored = Vec::new();
 		for pathspec in set.all() {
 			if pathspec.is_never_matching() {
@@ -1114,40 +1202,44 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			// A literal names its whole path; a glob names its literal base directory (`ign/*` → `ign`, an
 			// empty base at the root → skip: a broad glob never advises). An `:(icase)` spec is resolved to
 			// its actual worktree path first, so a differently-cased spelling still finds the ignored path.
-			let icase_probe;
-			let glob_base;
-			let probe: &str = if pathspec.is_icase() {
+			let probe = if pathspec.is_icase() {
 				match self.resolve_icase_prefix(pathspec)? {
-					Some(resolved) => {
-						icase_probe = resolved;
-						&icase_probe
-					}
+					Some(resolved) => resolved,
 					None => continue,
 				}
 			} else if pathspec.is_literal() {
-				pathspec.as_str()
+				GitPath::from_bytes(pathspec.as_bytes().to_vec()).map_err(|_| {
+					WorktreeError::UnsafePathspec(
+						GitPathspec::from_bytes(pathspec.as_bytes().to_vec())
+							.expect("a parsed pathspec contains no NUL"),
+					)
+				})?
 			} else {
 				// A glob's literal base, with backslash escapes decoded so an escaped separator
 				// (`dir\/foo`) yields `dir/foo` rather than the empty root `base_dir()` returns.
-				glob_base = glob_ignore_base(pathspec.as_str());
-				&glob_base
+				GitPath::from_bytes(glob_ignore_base(pathspec.as_bytes())).map_err(|_| {
+					WorktreeError::UnsafePathspec(
+						GitPathspec::from_bytes(pathspec.as_bytes().to_vec())
+							.expect("a parsed pathspec contains no NUL"),
+					)
+				})?
 			};
-			if probe.is_empty() {
+			if probe.is_root() {
 				continue;
 			}
 			// A path inside a tracked submodule mount is opaque — git never reads the submodule's own
 			// `.gitignore` for the superproject, and the spec is rejected as "is in submodule" anyway. Skip it
 			// here (index-only, before touching the mount) so probing the mount's contents cannot fail — e.g.
 			// an `EISDIR` if a directory named `.gitignore` sits inside it (probed vs git 2.55).
-			if gitlink_ancestor(index, probe, fold).is_some() {
+			if gitlink_ancestor(index, &probe, fold).is_some() {
 				continue;
 			}
-			let stack = crate::checkout::ignore_prefix(self.work(), probe, excludes)?;
-			if let Some((report, is_leaf)) = self.ignored_report_path(probe, &stack, fold)? {
+			let stack = crate::checkout::ignore_prefix(self.work(), &probe, excludes)?;
+			if let Some((report, is_leaf)) = self.ignored_report_path(&probe, &stack, fold)? {
 				// A leaf ignore-match on an already-tracked path does not advise — git stages it (ignore never
 				// applies to a tracked path, and there is no ignored ancestor directory to report).
 				let tracked =
-					index.entry(probe).is_some() || index.unmerged_paths().any(|path| path == probe);
+					index.entry(&probe).is_some() || index.unmerged_paths().any(|path| path == &probe);
 				if is_leaf && tracked {
 					continue;
 				}
@@ -1175,16 +1267,17 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		&self,
 		index: &mut Index<H>,
 		pathspec: &crate::pathspec::Pathspec,
-		spec: &str,
+		spec: &GitPathspec,
 		sparse: Option<&SparseCheckout>,
 		set: &crate::pathspec::PathspecSet,
-		initial_tracked: &std::collections::HashSet<String>,
-		omitted: &mut Vec<String>,
+		initial_tracked: &std::collections::HashSet<GitPath>,
+		omitted: &mut Vec<GitPathspec>,
 		force: bool,
 		excludes: &[DirIgnore],
 		fold: bool,
 	) -> Result<(), WorktreeError> {
-		let base = pathspec.base_dir();
+		let base = GitPath::from_bytes(pathspec.base_dir().to_vec())
+			.map_err(|_| WorktreeError::UnsafePathspec(spec.clone()))?;
 		// Tracked submodule (gitlink) mounts: the walker prunes these directories (opaque to `add`),
 		// so it never descends into a submodule to stage its contents nor fails on an unreadable child.
 		// Folded under `core.ignoreCase`; index-based (a gitlink stage with no tracked children) — a
@@ -1192,23 +1285,23 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		// pass (per-entry `gitlink_mount` would be O(N²)).
 		let gitlinks = opaque_gitlink_mounts(index, fold);
 		let mut files = Vec::new();
-		let mut stack = crate::checkout::ignore_prefix(self.work(), base, excludes)?;
+		let mut stack = crate::checkout::ignore_prefix(self.work(), &base, excludes)?;
 		// Don't walk into an explicitly-named ignored base (`add 'ign/*'` with `.gitignore` containing
 		// `ign/`): git stages no *untracked* file from it, so a glob whose only fresh candidates are ignored
 		// is git's "did not match" unless a tracked entry also matched. `force` walks it (staging the ignored
 		// content); a broad glob (empty base) is never a refused ignored base. The ignored-path advisory for
 		// the base is recorded by the caller's `collect_ignored_advisory` pass. Probed vs git 2.50.1.
 		let base_ignored =
-			!base.is_empty() && !force && self.ignored_report_path(base, &stack, fold)?.is_some();
+			!base.is_root() && !force && self.ignored_report_path(&base, &stack, fold)?.is_some();
 		// Walk only when the base directory exists and is not a refused ignored base — a glob under a missing
 		// directory matches no present file, though it may still match a tracked deletion below. The seeded
 		// `stack` carries the ancestor `.gitignore`s (root down to `base`'s parent) into the walk.
 		if !base_ignored
-			&& (base.is_empty() || matches!(self.work().lstat(base)?, Some(meta) if meta.kind.is_dir()))
+			&& (base.is_root() || matches!(self.work().lstat(&base)?, Some(meta) if meta.kind.is_dir()))
 		{
 			walk_files(
 				self.work(),
-				base,
+				&base,
 				&mut stack,
 				&mut files,
 				&gitlinks,
@@ -1217,7 +1310,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			)?;
 		}
 		let mut matched = false;
-		let mut staged: std::collections::HashSet<String> = std::collections::HashSet::new();
+		let mut staged: std::collections::HashSet<GitPath> = std::collections::HashSet::new();
 		// Track whether the walk recorded a *concrete* out-of-cone omission for this glob: git reports the
 		// concrete path (`out/new`) rather than the glob text (`out/*`) when the glob swept up an untracked
 		// out-of-cone file, and only falls back to the glob text when it matched a tracked skip-worktree
@@ -1257,7 +1350,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		// (a `.gitignore`d one) is restaged (git stages the modification), an absent one (or a file->directory
 		// change) is a deletion. Unmerged (conflict) paths, which have no stage-0 entry, resolve the same way.
 		// Snapshot first, since the removal loop mutates the index.
-		let child = |path: &str| {
+		let child = |path: &GitPath| {
 			(index
 				.entry(path)
 				.is_some_and(|entry| entry.stage == 0 && !entry.skip_worktree)
@@ -1265,7 +1358,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				&& sparse.is_none_or(|matcher| matcher.includes(path))
 				&& pathspec.matches(path)
 		};
-		let tracked: Vec<String> = index
+		let tracked: Vec<GitPath> = index
 			.entries
 			.iter()
 			.filter(|entry| entry.stage != 0 || !entry.skip_worktree)
@@ -1301,7 +1394,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		// match" (exit 128), which preempts the ignored advisory the caller collected for the base (probed vs
 		// git 2.50.1: `add 'ign/*'` advises only when a tracked path matches; otherwise it did not match).
 		if !matched {
-			return Err(WorktreeError::PathspecMatch(spec.to_owned()));
+			return Err(WorktreeError::PathspecMatch(spec.clone()));
 		}
 		// A glob rooted at a named directory (a non-empty literal base) EXPLICITLY targets that path, so a
 		// tracked out-of-cone match there is the deferred sparse advice — reported BEFORE exclusions, so
@@ -1311,8 +1404,8 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		// out-of-cone — is what keeps a non-cone glob that matches an included file from spuriously erroring.
 		// (An untracked out-of-cone file swept by any glob is already recorded by `stage_walked`.) Probed vs
 		// git 2.50.1.
-		if !base.is_empty() && out_of_cone_tracked && !walk_recorded_omission {
-			omitted.push(spec.to_owned());
+		if !base.is_root() && out_of_cone_tracked && !walk_recorded_omission {
+			omitted.push(spec.clone());
 		}
 		Ok(())
 	}
@@ -1330,15 +1423,14 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	fn only_out_of_cone_dir(
 		&self,
 		index: &Index<H>,
-		rel: &str,
-		walked: &[String],
+		rel: &GitPath,
+		walked: &[GitPath],
 		sparse: Option<&SparseCheckout>,
 	) -> bool {
 		let Some(matcher) = sparse else {
 			return false;
 		};
-		let child_prefix = format!("{rel}/");
-		let under = |path: &str| path == rel || path.starts_with(&child_prefix);
+		let under = |path: &GitPath| path.is_at_or_below(rel);
 		let covered =
 			!walked.is_empty() || index.entries.iter().any(|e| e.stage == 0 && under(&e.path));
 		if !covered {
@@ -1360,9 +1452,9 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	async fn stage_walked(
 		&self,
 		index: &mut Index<H>,
-		path: &str,
+		path: &GitPath,
 		sparse: Option<&SparseCheckout>,
-		omitted: &mut Vec<String>,
+		omitted: &mut Vec<GitPathspec>,
 		fold: bool,
 	) -> Result<(), WorktreeError> {
 		// "Untracked" means *no index entry at all* — NOT merely a cleared skip-worktree bit. A modified
@@ -1373,7 +1465,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			// A *discovered* untracked out-of-cone path is reported once even if several pathspecs sweep it
 			// up (`add . .` lists it once) — unlike an explicit tracked skip-worktree pathspec, which the
 			// literal arms record per occurrence (`add out/a out/a` lists it twice). Probed vs git 2.50.1.
-			push_unique(omitted, path.to_owned());
+			push_unique(omitted, pathspec_for_advisory(path));
 		}
 		self.stage_file(index, path, sparse, fold).await
 	}
@@ -1381,7 +1473,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	async fn stage_file(
 		&self,
 		index: &mut Index<H>,
-		path: &str,
+		path: &GitPath,
 		sparse: Option<&SparseCheckout>,
 		fold: bool,
 	) -> Result<(), WorktreeError> {
@@ -1440,7 +1532,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 						// A clean (stage-0) gitlink whose HEAD is merely unresolvable is left unchanged (as
 						// `ls-files -m` treats it), not an error.
 						None if index.unmerged_paths().any(|p| p == path) => {
-							return Err(WorktreeError::SubmoduleNoCommit(path.to_owned()));
+							return Err(WorktreeError::SubmoduleNoCommit(path.clone()));
 						}
 						None => {}
 					}
@@ -1469,28 +1561,23 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	async fn stage_tracked_outside_walk(
 		&self,
 		index: &mut Index<H>,
-		dir_rel: &str,
+		dir_rel: &GitPath,
 		sparse: Option<&SparseCheckout>,
 		set: &crate::pathspec::PathspecSet,
-		walked: &std::collections::HashSet<String>,
+		walked: &std::collections::HashSet<GitPath>,
 		fold: bool,
 	) -> Result<(), WorktreeError> {
-		let prefix = if dir_rel.is_empty() {
-			String::new()
-		} else {
-			format!("{dir_rel}/")
-		};
-		let admissible = |path: &str| {
+		let admissible = |path: &GitPath| {
 			// The exact `dir_rel` is admissible too, not just its `dir_rel/` children: when a tracked *file*
 			// `dir` is replaced by a directory, its stale file entry must be reconciled (staged as a
 			// deletion) even though it does not lie under `dir/` (probed vs git 2.50.1).
-			(path == dir_rel || path.starts_with(&prefix))
+			path.is_at_or_below(dir_rel)
 				&& sparse.is_none_or(|matcher| matcher.includes(path))
 				&& !set.is_excluded(path)
 				&& !walked.contains(path)
 		};
 		// Snapshot the candidate paths first, since the `lstat`/stage loop mutates the index.
-		let mut candidates: Vec<String> = index
+		let mut candidates: Vec<GitPath> = index
 			.entries
 			.iter()
 			// An out-of-cone entry's file is absent by design — its absence is not a deletion. Exclude it by
@@ -1509,7 +1596,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			index
 				.unmerged_paths()
 				.filter(|path| admissible(path))
-				.map(str::to_owned),
+				.cloned(),
 		);
 		// DEFERRED divergence: this reconciliation `lstat`s the EXACT index spelling. Under `core.ignoreCase`
 		// on a CASE-SENSITIVE filesystem, an indexed `Sub` whose on-disk mount is `sub` reports absent and the
@@ -1542,7 +1629,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// excludes file (`core.excludesFile`), which the caller resolves because it lives outside the
 	/// worktree; `None` when there is none. `core.ignoreCase` and `.git/info/exclude` are read
 	/// internally (see [`crate::excludes`]).
-	pub async fn status(&self, excludes_file: Option<&str>) -> Result<Status, WorktreeError> {
+	pub async fn status(&self, excludes_file: Option<&[u8]>) -> Result<Status, WorktreeError> {
 		crate::status::compute(self, excludes_file).await
 	}
 
@@ -1558,6 +1645,26 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		opts: &crate::LsFilesOptions,
 		config: &crate::LsFilesConfig<'_>,
 	) -> Result<crate::LsFilesOutput, WorktreeError> {
+		let pathspecs = pathspecs
+			.iter()
+			.map(GitPathspec::from_utf8)
+			.collect::<Result<Vec<_>, _>>()
+			.map_err(|error| WorktreeError::InvalidPath(error.to_string()))?;
+		let prefix =
+			GitPath::from_utf8(prefix).map_err(|error| WorktreeError::InvalidPath(error.to_string()))?;
+		self
+			.ls_files_pathspecs(&pathspecs, &prefix, opts, config)
+			.await
+	}
+
+	/// Byte-preserving counterpart of [`Self::ls_files`].
+	pub async fn ls_files_pathspecs(
+		&self,
+		pathspecs: &[GitPathspec],
+		prefix: &GitPath,
+		opts: &crate::LsFilesOptions,
+		config: &crate::LsFilesConfig<'_>,
+	) -> Result<crate::LsFilesOutput, WorktreeError> {
 		crate::ls_files::run(self, pathspecs, prefix, opts, config).await
 	}
 
@@ -1566,7 +1673,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// re-verification that catches edits `status()` can miss (a stat-preserving/same-size rewrite, a
 	/// coarse-timestamp filesystem) and skip-worktree edits `status()` omits entirely. See
 	/// [`crate::status::diverged_tracked_content`].
-	pub async fn diverged_tracked_content_paths(&self) -> Result<Vec<String>, WorktreeError> {
+	pub async fn diverged_tracked_content_paths(&self) -> Result<Vec<GitPath>, WorktreeError> {
 		crate::status::diverged_tracked_content(self).await
 	}
 
@@ -1608,7 +1715,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		&self,
 		tree: ObjectId<H>,
 		force: bool,
-		excludes_file: Option<&str>,
+		excludes_file: Option<&[u8]>,
 	) -> Result<(), WorktreeError> {
 		let mode = if force {
 			crate::CheckoutMode::Reset
@@ -1626,7 +1733,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		&self,
 		head: ObjectId<H>,
 		target: ObjectId<H>,
-		excludes_file: Option<&str>,
+		excludes_file: Option<&[u8]>,
 	) -> Result<(), WorktreeError> {
 		crate::checkout::run(
 			self,
@@ -1650,6 +1757,23 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		staged: bool,
 		pathspecs: &[&str],
 		prefix: &str,
+	) -> Result<(), WorktreeError> {
+		let pathspecs = utf8_pathspecs(pathspecs)?;
+		let prefix =
+			GitPath::from_utf8(prefix).map_err(|error| WorktreeError::InvalidPath(error.to_string()))?;
+		self
+			.restore_pathspecs(source, worktree, staged, &pathspecs, &prefix)
+			.await
+	}
+
+	/// Byte-preserving counterpart of [`Self::restore`].
+	pub async fn restore_pathspecs(
+		&self,
+		source: Option<ObjectId<H>>,
+		worktree: bool,
+		staged: bool,
+		pathspecs: &[GitPathspec],
+		prefix: &GitPath,
 	) -> Result<(), WorktreeError> {
 		crate::restore::run(
 			self, source, worktree, staged, pathspecs, prefix, true, true,
@@ -1685,6 +1809,19 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		pathspecs: &[&str],
 		prefix: &str,
 	) -> Result<(), WorktreeError> {
+		let pathspecs = utf8_pathspecs(pathspecs)?;
+		let prefix =
+			GitPath::from_utf8(prefix).map_err(|error| WorktreeError::InvalidPath(error.to_string()))?;
+		self.reset_index_pathspecs(tree, &pathspecs, &prefix).await
+	}
+
+	/// Byte-preserving counterpart of [`Self::reset_index_paths`].
+	pub async fn reset_index_pathspecs(
+		&self,
+		tree: ObjectId<H>,
+		pathspecs: &[GitPathspec],
+		prefix: &GitPath,
+	) -> Result<(), WorktreeError> {
 		crate::restore::run(
 			self,
 			Some(tree),
@@ -1713,6 +1850,25 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		recursive: bool,
 		dry_run: bool,
 	) -> Result<crate::RmOutcome, WorktreeError> {
+		let pathspecs = utf8_pathspecs(pathspecs)?;
+		let prefix =
+			GitPath::from_utf8(prefix).map_err(|error| WorktreeError::InvalidPath(error.to_string()))?;
+		self
+			.rm_pathspecs(&pathspecs, &prefix, cached, force, recursive, dry_run)
+			.await
+	}
+
+	/// Byte-preserving counterpart of [`Self::rm`].
+	#[allow(clippy::too_many_arguments)]
+	pub async fn rm_pathspecs(
+		&self,
+		pathspecs: &[GitPathspec],
+		prefix: &GitPath,
+		cached: bool,
+		force: bool,
+		recursive: bool,
+		dry_run: bool,
+	) -> Result<crate::RmOutcome, WorktreeError> {
 		crate::rm::run(self, pathspecs, prefix, cached, force, recursive, dry_run).await
 	}
 
@@ -1728,12 +1884,44 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		prefix: &str,
 		force: bool,
 		dry_run: bool,
-	) -> Result<Vec<(String, String)>, WorktreeError> {
+	) -> Result<Vec<(GitPath, GitPath)>, WorktreeError> {
+		let sources = utf8_pathspecs(sources)?;
+		let dest = GitPathspec::from_utf8(dest)
+			.map_err(|error| WorktreeError::InvalidPath(error.to_string()))?;
+		let prefix =
+			GitPath::from_utf8(prefix).map_err(|error| WorktreeError::InvalidPath(error.to_string()))?;
+		self
+			.mv_pathspecs(&sources, &dest, &prefix, force, dry_run)
+			.await
+	}
+
+	/// Byte-preserving counterpart of [`Self::mv`].
+	pub async fn mv_pathspecs(
+		&self,
+		sources: &[GitPathspec],
+		dest: &GitPathspec,
+		prefix: &GitPath,
+		force: bool,
+		dry_run: bool,
+	) -> Result<Vec<(GitPath, GitPath)>, WorktreeError> {
 		crate::mv::run(self, sources, dest, prefix, force, dry_run).await
 	}
 }
 
-fn entry<H: HashAlgorithm>(path: &str, mode: u32, oid: ObjectId<H>, meta: &Meta) -> IndexEntry<H> {
+fn utf8_pathspecs(pathspecs: &[&str]) -> Result<Vec<GitPathspec>, WorktreeError> {
+	pathspecs
+		.iter()
+		.map(GitPathspec::from_utf8)
+		.collect::<Result<Vec<_>, _>>()
+		.map_err(|error| WorktreeError::InvalidPath(error.to_string()))
+}
+
+fn entry<H: HashAlgorithm>(
+	path: &GitPath,
+	mode: u32,
+	oid: ObjectId<H>,
+	meta: &Meta,
+) -> IndexEntry<H> {
 	IndexEntry {
 		stat: stat_of(meta),
 		mode,
@@ -1759,7 +1947,10 @@ pub(crate) fn stat_matches<H: HashAlgorithm>(entry: &IndexEntry<H>, meta: &Meta)
 /// saved (git's exit-nonzero advice after a partial add). `sparse` keeps its argument/discovery order
 /// (git lists out-of-cone pathspecs in the order encountered); `ignored` is sorted lexicographically and
 /// de-duplicated (git lists ignored reports in byte order). Both probed vs git 2.50.1.
-fn finish_advisory(sparse: Vec<String>, mut ignored: Vec<String>) -> Result<(), WorktreeError> {
+fn finish_advisory(
+	sparse: Vec<GitPathspec>,
+	mut ignored: Vec<GitPath>,
+) -> Result<(), WorktreeError> {
 	ignored.sort_unstable();
 	ignored.dedup();
 	if sparse.is_empty() && ignored.is_empty() {
@@ -1770,13 +1961,18 @@ fn finish_advisory(sparse: Vec<String>, mut ignored: Vec<String>) -> Result<(), 
 }
 
 /// Append `value` to `list` unless already present, preserving first-seen order. Used for `add`'s
-/// ignored-report accumulator (git lists each reported ignored path once). The sparse-omission
-/// accumulator does NOT use this — git preserves duplicate out-of-cone pathspecs (`add out/a out/a`
-/// lists `out/a` twice), so those push unconditionally. Probed vs git 2.50.1.
-fn push_unique(list: &mut Vec<String>, value: String) {
+/// ignored-report accumulator and discovered sparse omissions (git lists each reported path once).
+/// Explicit sparse pathspecs do NOT use this — git preserves duplicate out-of-cone pathspecs
+/// (`add out/a out/a` lists `out/a` twice), so those push unconditionally. Probed vs git 2.50.1.
+fn push_unique<T: PartialEq>(list: &mut Vec<T>, value: T) {
 	if !list.contains(&value) {
 		list.push(value);
 	}
+}
+
+fn pathspec_for_advisory(path: &GitPath) -> GitPathspec {
+	GitPathspec::from_bytes(path.as_bytes().to_vec())
+		.expect("a validated Git path is also a valid pathspec value")
 }
 
 /// The path an ignore probe uses for a glob pathspec, decoding backslash escapes: `\X` becomes a
@@ -1785,27 +1981,27 @@ fn push_unique(list: &mut Vec<String>, value: String) {
 /// treats `\` as a wildcard boundary. Scanning stops at the first *unescaped* `*`/`?`/`[`, after which
 /// only the directory prefix (up to the last separator) is literal — matching git, which treats
 /// `dir\/foo` as the literal path `dir/foo` for ignore purposes. Probed vs git 2.50.1.
-fn glob_ignore_base(normalized: &str) -> String {
-	let mut decoded = String::new();
+fn glob_ignore_base(normalized: &[u8]) -> Vec<u8> {
+	let mut decoded = Vec::new();
 	let mut last_sep = 0usize;
 	let mut saw_wildcard = false;
-	let mut chars = normalized.chars();
-	while let Some(c) = chars.next() {
-		match c {
-			'\\' => match chars.next() {
-				Some('/') => {
-					decoded.push('/');
+	let mut bytes = normalized.iter().copied();
+	while let Some(byte) = bytes.next() {
+		match byte {
+			b'\\' => match bytes.next() {
+				Some(b'/') => {
+					decoded.push(b'/');
 					last_sep = decoded.len();
 				}
 				Some(other) => decoded.push(other),
 				None => {}
 			},
-			'*' | '?' | '[' => {
+			b'*' | b'?' | b'[' => {
 				saw_wildcard = true;
 				break;
 			}
-			'/' => {
-				decoded.push('/');
+			b'/' => {
+				decoded.push(b'/');
 				last_sep = decoded.len();
 			}
 			other => decoded.push(other),
@@ -1825,7 +2021,7 @@ fn glob_ignore_base(normalized: &str) -> String {
 /// entered regardless.
 /// Whether `path` is a submodule (gitlink) at ANY index stage (fold-aware) — including the stage 1/2/3
 /// entries of an unmerged conflict. `add` must never descend into such a mount.
-fn has_gitlink_stage<H: HashAlgorithm>(index: &Index<H>, path: &str, fold: bool) -> bool {
+fn has_gitlink_stage<H: HashAlgorithm>(index: &Index<H>, path: &GitPath, fold: bool) -> bool {
 	let key = fold_case(path, fold);
 	index
 		.entries
@@ -1836,8 +2032,9 @@ fn has_gitlink_stage<H: HashAlgorithm>(index: &Index<H>, path: &str, fold: bool)
 /// Whether `path` has a tracked child `path/…` at any index stage (fold-aware): a mixed subtree
 /// conflict where the on-disk directory holds tracked files, so `add` descends into it and stages
 /// `path/new` rather than treating it as an opaque submodule mount.
-fn has_tracked_child<H: HashAlgorithm>(index: &Index<H>, path: &str, fold: bool) -> bool {
-	let prefix = format!("{}/", fold_case(path, fold));
+fn has_tracked_child<H: HashAlgorithm>(index: &Index<H>, path: &GitPath, fold: bool) -> bool {
+	let mut prefix = fold_case(path, fold);
+	prefix.push(b'/');
 	index
 		.entries
 		.iter()
@@ -1851,7 +2048,7 @@ fn has_tracked_child<H: HashAlgorithm>(index: &Index<H>, path: &str, fold: bool)
 /// a gitlink stage AND no tracked children. A same-path blob stage (a blob-vs-gitlink conflict) does NOT
 /// make it non-opaque — git still treats the slot as a submodule boundary; only tracked `path/…` children
 /// (a subtree-vs-gitlink conflict) turn it into a directory `add` descends into.
-fn gitlink_mount<H: HashAlgorithm>(index: &Index<H>, path: &str, fold: bool) -> bool {
+fn gitlink_mount<H: HashAlgorithm>(index: &Index<H>, path: &GitPath, fold: bool) -> bool {
 	has_gitlink_stage(index, path, fold) && !has_tracked_child(index, path, fold)
 }
 
@@ -1862,8 +2059,8 @@ fn gitlink_mount<H: HashAlgorithm>(index: &Index<H>, path: &str, fold: bool) -> 
 fn opaque_gitlink_mounts<H: HashAlgorithm>(
 	index: &Index<H>,
 	fold: bool,
-) -> std::collections::HashSet<String> {
-	let mut mounts: std::collections::HashSet<String> = index
+) -> std::collections::HashSet<Vec<u8>> {
+	let mut mounts: std::collections::HashSet<Vec<u8>> = index
 		.entries
 		.iter()
 		.filter(|entry| entry.mode == 0o160000)
@@ -1874,15 +2071,13 @@ fn opaque_gitlink_mounts<H: HashAlgorithm>(
 	}
 	// Drop any gitlink key that has a tracked child (a subtree-vs-gitlink conflict, which `add` descends):
 	// walk each entry's ancestor keys and unmark a gitlink ancestor. O(total path components).
-	let mut with_child: std::collections::HashSet<String> = std::collections::HashSet::new();
+	let mut with_child: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
 	for entry in &index.entries {
-		let key = fold_case(&entry.path, fold);
-		let mut rest = key.as_str();
-		while let Some((parent, _)) = rest.rsplit_once('/') {
-			if mounts.contains(parent) {
-				with_child.insert(parent.to_owned());
+		for parent in entry.path.strict_ancestors() {
+			let parent = fold_case(&parent, fold);
+			if mounts.contains(&parent) {
+				with_child.insert(parent);
 			}
-			rest = parent;
 		}
 	}
 	mounts.retain(|key| !with_child.contains(key));
@@ -1890,11 +2085,11 @@ fn opaque_gitlink_mounts<H: HashAlgorithm>(
 }
 
 /// Case-fold `path` under `core.ignoreCase`, so an on-disk `sub` matches an indexed `Sub`.
-fn fold_case(path: &str, fold: bool) -> String {
+fn fold_case(path: &GitPath, fold: bool) -> Vec<u8> {
 	if fold {
-		path.to_ascii_lowercase()
+		path.ascii_folded()
 	} else {
-		path.to_owned()
+		path.as_bytes().to_vec()
 	}
 }
 
@@ -1902,46 +2097,48 @@ fn fold_case(path: &str, fold: bool) -> String {
 /// a submodule mount. `add` treats such a mount as opaque, never staging the submodule's own contents
 /// (which would replace the `160000` gitlink with an ordinary subtree). Fold-aware under
 /// `core.ignoreCase`, so `add sub/f` finds an indexed `Sub`.
-fn ancestor_is_gitlink<H: HashAlgorithm>(index: &Index<H>, path: &str, fold: bool) -> bool {
+fn ancestor_is_gitlink<H: HashAlgorithm>(index: &Index<H>, path: &GitPath, fold: bool) -> bool {
 	gitlink_ancestor(index, path, fold).is_some()
 }
 
 /// The nearest ancestor of `path` that is a tracked submodule (gitlink), if any — the submodule that
 /// `path` lies inside, in the INDEX's own casing (so the "is in submodule 'Sub'" error names it as git
 /// does). Fold-aware under `core.ignoreCase`, so `add sub/f` finds an indexed `Sub`.
-fn gitlink_ancestor<H: HashAlgorithm>(index: &Index<H>, path: &str, fold: bool) -> Option<String> {
-	let mut rest = path;
-	while let Some((parent, _)) = rest.rsplit_once('/') {
-		if gitlink_mount(index, parent, fold) {
-			let key = fold_case(parent, fold);
+fn gitlink_ancestor<H: HashAlgorithm>(
+	index: &Index<H>,
+	path: &GitPath,
+	fold: bool,
+) -> Option<GitPath> {
+	for parent in path.strict_ancestors().into_iter().rev() {
+		if gitlink_mount(index, &parent, fold) {
+			let key = fold_case(&parent, fold);
 			return index
 				.entries
 				.iter()
 				.find(|entry| entry.mode == 0o160000 && fold_case(&entry.path, fold) == key)
 				.map(|entry| entry.path.clone())
-				.or_else(|| Some(parent.to_owned()));
+				.or(Some(parent));
 		}
-		rest = parent;
 	}
 	None
 }
 
 fn walk_files<W: WorkDirFs>(
 	work: &W,
-	dir_rel: &str,
+	dir_rel: &GitPath,
 	stack: &mut Vec<DirIgnore>,
-	out: &mut Vec<String>,
-	gitlinks: &std::collections::HashSet<String>,
+	out: &mut Vec<GitPath>,
+	gitlinks: &std::collections::HashSet<Vec<u8>>,
 	force: bool,
 	fold: bool,
 ) -> Result<(), WorktreeError> {
 	// The gitlink set is folded under `core.ignoreCase` (see `add`); fold each lookup path the same way so
 	// a case-variant on-disk mount still matches.
-	let fold_key = |path: &str| {
+	let fold_key = |path: &GitPath| {
 		if fold {
-			path.to_ascii_lowercase()
+			path.ascii_folded()
 		} else {
-			path.to_owned()
+			path.as_bytes().to_vec()
 		}
 	};
 	// A walk ROOT that is itself a tracked gitlink mount (`gta add sub`, or a glob rooted at the mount)
@@ -2013,6 +2210,53 @@ mod tests {
 			CapWorkDir::from_dir(Dir::open_ambient_dir(root, ambient_authority()).unwrap()),
 			git_dir,
 		)
+	}
+
+	#[test]
+	fn ignored_advisory_sorts_and_deduplicates_before_rendering() {
+		let literal_collision = GitPath::from_utf8("\"raw-\\377\"").unwrap();
+		let raw_collision = GitPath::from_bytes(b"raw-\xff".to_vec()).unwrap();
+		let raw_late = GitPath::from_bytes(b"z-\xff".to_vec()).unwrap();
+		let plain = GitPath::from_utf8("a").unwrap();
+
+		let result = finish_advisory(
+			Vec::new(),
+			vec![
+				raw_late.clone(),
+				raw_collision.clone(),
+				plain.clone(),
+				literal_collision.clone(),
+				raw_collision.clone(),
+			],
+		);
+		let Err(WorktreeError::PathspecAdvisory { ignored, .. }) = result else {
+			panic!("expected an ignored-path advisory");
+		};
+		assert_eq!(
+			ignored,
+			vec![literal_collision, plain, raw_collision, raw_late]
+		);
+	}
+
+	#[test]
+	fn sparse_advisory_deduplicates_discoveries_before_rendering() {
+		let literal_collision = GitPath::from_utf8("\"raw-\\377\"").unwrap();
+		let raw_collision = GitPath::from_bytes(b"raw-\xff".to_vec()).unwrap();
+		let raw_spec = pathspec_for_advisory(&raw_collision);
+		let literal_spec = pathspec_for_advisory(&literal_collision);
+		let mut sparse = Vec::new();
+
+		push_unique(&mut sparse, raw_spec.clone());
+		push_unique(&mut sparse, literal_spec.clone());
+		push_unique(&mut sparse, raw_spec.clone());
+		// Explicit pathspec occurrences remain ordered duplicates.
+		sparse.push(literal_spec.clone());
+
+		let result = finish_advisory(sparse, Vec::new());
+		let Err(WorktreeError::PathspecAdvisory { sparse, .. }) = result else {
+			panic!("expected a sparse-path advisory");
+		};
+		assert_eq!(sparse, vec![raw_spec, literal_spec.clone(), literal_spec]);
 	}
 
 	/// Dropping a held `IndexLock` **before any worktree mutation** — a future cancelled between

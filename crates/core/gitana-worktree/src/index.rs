@@ -1,4 +1,5 @@
 use gitana_object::{HashAlgorithm, ObjectId, decode_ewah_bounded};
+use gitana_path::{GitPath, GitPathComponent};
 use gitana_repository::{FileMode, TreeBuildEntry};
 
 use crate::{IndexEntry, Stat, WorktreeError};
@@ -96,15 +97,17 @@ pub(crate) fn merge_split_index<H: HashAlgorithm>(
 		.collect();
 	// Additions: the split index's entries after the replacements.
 	entries.extend(split.entries.into_iter().skip(replace_positions.len()));
-	entries.sort_by(|a, b| key(a).cmp(&key(b)));
+	entries.sort_by(entry_cmp);
 	Ok(Index { entries })
 }
 
 const SIGNATURE: &[u8; 4] = b"DIRC";
 
-/// The tree file mode for a raw index mode (git stores one of three blob modes).
+/// The tree file mode for a raw index mode. A sparse index may also contain a collapsed
+/// directory entry whose oid names the already-built subtree.
 fn file_mode(mode: u32) -> FileMode {
 	match mode {
+		0o040000 => FileMode::Directory,
 		0o100755 => FileMode::Executable,
 		0o120000 => FileMode::Symlink,
 		0o160000 => FileMode::Gitlink,
@@ -116,10 +119,10 @@ fn file_mode(mode: u32) -> FileMode {
 ///
 /// Reads versions 2–4 and writes version 4 (prefix-compressed paths). Object ids and
 /// the trailing checksum are sized by the hash algorithm `H`. Entries are kept sorted
-/// by `(path, stage)`.
+/// by their serialized pathname (including a sparse directory's `/`) and stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Index<H: HashAlgorithm> {
-	/// Staged entries, sorted by `(path, stage)`.
+	/// Staged entries, sorted by their serialized pathname and stage.
 	pub entries: Vec<IndexEntry<H>>,
 }
 
@@ -162,18 +165,18 @@ impl<H: HashAlgorithm> Index<H> {
 	}
 
 	/// The stage-0 entry for `path`, if present.
-	pub fn entry(&self, path: &str) -> Option<&IndexEntry<H>> {
+	pub fn entry(&self, path: &GitPath) -> Option<&IndexEntry<H>> {
 		self
 			.entries
 			.iter()
-			.find(|entry| entry.path == path && entry.stage == 0)
+			.find(|entry| &entry.path == path && entry.stage == 0)
 	}
 
 	/// Whether `path` has a stage-0 entry excluded from the working tree (`skip_worktree` set) — a
 	/// sparse-checkout path. Such entries are invisible to working-tree pathspec operations
 	/// (`add`/`restore`): their absent file is neither restaged as a modification nor recorded as a
 	/// deletion, matching git's sparse-checkout pathspec exclusion.
-	pub fn is_sparse(&self, path: &str) -> bool {
+	pub fn is_sparse(&self, path: &GitPath) -> bool {
 		self.entry(path).is_some_and(|entry| entry.skip_worktree)
 	}
 
@@ -185,15 +188,15 @@ impl<H: HashAlgorithm> Index<H> {
 	}
 
 	/// Remove every entry for `path` (all stages), if any.
-	pub fn remove(&mut self, path: &str) {
-		self.entries.retain(|entry| entry.path != path);
+	pub fn remove(&mut self, path: &GitPath) {
+		self.entries.retain(|entry| &entry.path != path);
 	}
 
 	/// Record a merge conflict for `path`, replacing any existing entries with the present stages:
 	/// base (stage 1), ours (stage 2), theirs (stage 3), each `(mode, oid)` or absent.
 	pub fn record_conflict(
 		&mut self,
-		path: &str,
+		path: &GitPath,
 		base: Option<(u32, ObjectId<H>)>,
 		ours: Option<(u32, ObjectId<H>)>,
 		theirs: Option<(u32, ObjectId<H>)>,
@@ -209,19 +212,19 @@ impl<H: HashAlgorithm> Index<H> {
 					assume_valid: false,
 					skip_worktree: false,
 					intent_to_add: false,
-					path: path.to_owned(),
+					path: path.clone(),
 				});
 			}
 		}
 	}
 
 	/// The unmerged stages for `path` (base/ours/theirs), or `None` if it is not conflicted.
-	pub fn conflict(&self, path: &str) -> Option<Conflict<'_, H>> {
+	pub fn conflict(&self, path: &GitPath) -> Option<Conflict<'_, H>> {
 		let stage = |stage: u8| {
 			self
 				.entries
 				.iter()
-				.find(|entry| entry.path == path && entry.stage == stage)
+				.find(|entry| &entry.path == path && entry.stage == stage)
 		};
 		let conflict = Conflict {
 			base: stage(1),
@@ -239,11 +242,11 @@ impl<H: HashAlgorithm> Index<H> {
 	}
 
 	/// Whether `path` has any conflict (stage > 0) entry.
-	pub fn is_unmerged(&self, path: &str) -> bool {
+	pub fn is_unmerged(&self, path: &GitPath) -> bool {
 		self
 			.entries
 			.iter()
-			.any(|entry| entry.path == path && entry.stage != 0)
+			.any(|entry| &entry.path == path && entry.stage != 0)
 	}
 
 	/// Whether the index holds any unmerged path.
@@ -253,14 +256,14 @@ impl<H: HashAlgorithm> Index<H> {
 
 	/// The distinct paths with a conflict (stage > 0) entry, in sorted order. Entries are sorted by
 	/// `(path, stage)`, so same-path stages are adjacent.
-	pub fn unmerged_paths(&self) -> impl Iterator<Item = &str> {
-		let mut last: Option<&str> = None;
+	pub fn unmerged_paths(&self) -> impl Iterator<Item = &GitPath> {
+		let mut last: Option<&GitPath> = None;
 		self
 			.entries
 			.iter()
 			.filter(|entry| entry.stage != 0)
 			.filter_map(move |entry| {
-				let path = entry.path.as_str();
+				let path = &entry.path;
 				if last == Some(path) {
 					None
 				} else {
@@ -274,7 +277,7 @@ impl<H: HashAlgorithm> Index<H> {
 	fn insert_sorted(&mut self, entry: IndexEntry<H>) {
 		let position = self
 			.entries
-			.partition_point(|existing| key(existing) < key(&entry));
+			.partition_point(|existing| entry_cmp(existing, &entry).is_lt());
 		self.entries.insert(position, entry);
 	}
 
@@ -282,23 +285,23 @@ impl<H: HashAlgorithm> Index<H> {
 	/// an ancestor recorded as a file (`path` is now under a directory), or entries recorded
 	/// beneath `path` as a directory (`path` is now a file). Used when staging a type change,
 	/// the way `git add` rewrites the index to match the working tree.
-	pub fn remove_type_conflicts(&mut self, path: &str) {
-		let mut ancestor = String::new();
-		let mut components = path.split('/').peekable();
+	pub fn remove_type_conflicts(&mut self, path: &GitPath) {
+		let mut ancestor = GitPath::root();
+		let mut components = path.components().peekable();
 		while let Some(component) = components.next() {
 			if components.peek().is_none() {
 				break; // `path` itself is replaced by the caller's upsert
 			}
-			if !ancestor.is_empty() {
-				ancestor.push('/');
-			}
-			ancestor.push_str(component);
+			let component = GitPathComponent::from_bytes(component.to_vec())
+				.expect("components of a GitPath remain valid");
+			ancestor = ancestor.join(&component);
 			self.remove(&ancestor);
 		}
-		let dir_prefix = format!("{path}/");
+		let mut dir_prefix = path.as_bytes().to_vec();
+		dir_prefix.push(b'/');
 		self
 			.entries
-			.retain(|entry| !entry.path.starts_with(&dir_prefix));
+			.retain(|entry| !entry.path.as_bytes().starts_with(&dir_prefix));
 	}
 
 	/// Parse index bytes (DIRC v2–v4), verifying the trailing checksum.
@@ -387,8 +390,16 @@ impl<H: HashAlgorithm> Index<H> {
 				name
 			};
 
-			let path = String::from_utf8(path_bytes.clone())
-				.map_err(|_| WorktreeError::Malformed("non-UTF-8 path".to_owned()))?;
+			// Sparse indexes encode collapsed tree entries with a presentation-only trailing `/`.
+			// Keep the domain path canonical while retaining the raw spelling in `prev` for v4 prefix
+			// decompression. The tree mode is what distinguishes this from an invalid ordinary path.
+			let canonical_path = if mode & 0o170000 == 0o040000 {
+				path_bytes.strip_suffix(b"/").unwrap_or(&path_bytes)
+			} else {
+				&path_bytes
+			};
+			let path = GitPath::from_bytes(canonical_path.to_vec())
+				.map_err(|error| WorktreeError::Malformed(format!("invalid index path: {error}")))?;
 			prev = path_bytes;
 			entries.push(IndexEntry {
 				stat,
@@ -429,14 +440,14 @@ impl<H: HashAlgorithm> Index<H> {
 	/// Serialise to index version 4 (prefix-compressed paths) with an `H` trailer.
 	pub fn write_v4(&self) -> Vec<u8> {
 		let mut sorted: Vec<&IndexEntry<H>> = self.entries.iter().collect();
-		sorted.sort_by(|a, b| key(a).cmp(&key(b)));
+		sorted.sort_by(|a, b| entry_cmp(a, b));
 
 		let mut out = Vec::new();
 		out.extend_from_slice(SIGNATURE);
 		out.extend_from_slice(&4u32.to_be_bytes());
 		out.extend_from_slice(&(sorted.len() as u32).to_be_bytes());
 
-		let mut prev: &[u8] = &[];
+		let mut prev = Vec::new();
 		for entry in sorted {
 			for field in [
 				entry.stat.ctime_sec,
@@ -454,7 +465,15 @@ impl<H: HashAlgorithm> Index<H> {
 			}
 			out.extend_from_slice(entry.oid.as_bytes());
 
-			let name_len = entry.path.len().min(0xFFF) as u16;
+			let mut sparse_path = Vec::new();
+			let path = if entry.mode & 0o170000 == 0o040000 {
+				sparse_path.extend_from_slice(entry.path.as_bytes());
+				sparse_path.push(b'/');
+				sparse_path.as_slice()
+			} else {
+				entry.path.as_bytes()
+			};
+			let name_len = path.len().min(0xFFF) as u16;
 			let mut flags = name_len | ((entry.stage as u16) << 12);
 			if entry.assume_valid {
 				flags |= 0x8000;
@@ -473,12 +492,12 @@ impl<H: HashAlgorithm> Index<H> {
 				out.extend_from_slice(&extended.to_be_bytes());
 			}
 
-			let path = entry.path.as_bytes();
-			let common = common_prefix(prev, path);
+			let common = common_prefix(&prev, path);
 			out.extend_from_slice(&encode_varint((prev.len() - common) as u64));
 			out.extend_from_slice(&path[common..]);
 			out.push(0);
-			prev = path;
+			prev.clear();
+			prev.extend_from_slice(path);
 		}
 
 		let checksum = H::digest(&[&out]);
@@ -487,8 +506,19 @@ impl<H: HashAlgorithm> Index<H> {
 	}
 }
 
-fn key<H: HashAlgorithm>(entry: &IndexEntry<H>) -> (&[u8], u8) {
-	(entry.path.as_bytes(), entry.stage)
+fn entry_cmp<H: HashAlgorithm>(a: &IndexEntry<H>, b: &IndexEntry<H>) -> std::cmp::Ordering {
+	serialized_name(a)
+		.cmp(serialized_name(b))
+		.then_with(|| a.stage.cmp(&b.stage))
+}
+
+fn serialized_name<H: HashAlgorithm>(entry: &IndexEntry<H>) -> impl Iterator<Item = u8> + '_ {
+	entry
+		.path
+		.as_bytes()
+		.iter()
+		.copied()
+		.chain((entry.mode & 0o170000 == 0o040000).then_some(b'/'))
 }
 
 fn common_prefix(a: &[u8], b: &[u8]) -> usize {
@@ -581,7 +611,7 @@ mod tests {
 			assume_valid: false,
 			skip_worktree: false,
 			intent_to_add: false,
-			path: path.to_owned(),
+			path: GitPath::from_utf8(path).unwrap(),
 		}
 	}
 
@@ -595,8 +625,61 @@ mod tests {
 		let parsed = Index::parse(&index.write_v4()).expect("parse");
 		assert_eq!(parsed, index);
 		// Sorted by path.
-		let paths: Vec<&str> = parsed.entries.iter().map(|e| e.path.as_str()).collect();
+		let paths: Vec<&str> = parsed
+			.entries
+			.iter()
+			.map(|e| e.path.as_utf8().unwrap())
+			.collect();
 		assert_eq!(paths, ["README.md", "src/lib.rs", "src/main.rs"]);
+	}
+
+	#[test]
+	fn v4_round_trips_non_utf8_path_bytes() {
+		let mut raw = entry("placeholder", b"raw");
+		raw.path = GitPath::from_bytes(b"dir/raw-\xff".to_vec()).unwrap();
+		let mut index = Index::<Sha256>::new();
+		index.upsert(raw);
+
+		let parsed = Index::parse(&index.write_v4()).expect("parse");
+		assert_eq!(parsed, index);
+		assert_eq!(parsed.entries[0].path.as_bytes(), b"dir/raw-\xff");
+	}
+
+	#[test]
+	fn v4_round_trips_a_sparse_directory_as_a_canonical_path() {
+		let mut sparse = entry("out", b"tree");
+		sparse.mode = 0o040000;
+		sparse.skip_worktree = true;
+		let mut index = Index::<Sha256>::new();
+		index.upsert(sparse);
+
+		let bytes = index.write_v4();
+		assert!(bytes.windows(5).any(|window| window == b"out/\0"));
+		let parsed = Index::parse(&bytes).expect("parse");
+		assert_eq!(parsed, index);
+		assert_eq!(parsed.entries[0].path.as_bytes(), b"out");
+		let tree_entries = parsed.tree_entries();
+		assert_eq!(tree_entries.len(), 1);
+		assert_eq!(tree_entries[0].path.as_bytes(), b"out");
+		assert_eq!(tree_entries[0].mode, FileMode::Directory);
+		assert_eq!(tree_entries[0].id, parsed.entries[0].oid);
+	}
+
+	#[test]
+	fn sparse_directories_sort_by_their_serialized_trailing_slash() {
+		let regular = entry("foo.", b"file");
+		let mut sparse = entry("foo", b"tree");
+		sparse.mode = 0o040000;
+		sparse.skip_worktree = true;
+
+		let mut index = Index::<Sha256>::new();
+		index.upsert(sparse);
+		index.upsert(regular);
+		assert_eq!(index.entries[0].path.as_bytes(), b"foo.");
+		assert_eq!(index.entries[1].path.as_bytes(), b"foo");
+
+		let parsed = Index::parse(&index.write_v4()).expect("parse");
+		assert_eq!(parsed, index);
 	}
 
 	fn oid(content: &[u8]) -> ObjectId<Sha256> {
@@ -605,21 +688,23 @@ mod tests {
 
 	#[test]
 	fn record_conflict_round_trips_and_queries() {
+		let conflict_path = GitPath::from_utf8("f.txt").unwrap();
+		let clean_path = GitPath::from_utf8("clean.txt").unwrap();
 		let mut index = Index::new();
 		index.upsert(entry("clean.txt", b"x"));
 		index.record_conflict(
-			"f.txt",
+			&conflict_path,
 			Some((0o100644, oid(b"base"))),
 			Some((0o100644, oid(b"ours"))),
 			Some((0o100644, oid(b"theirs"))),
 		);
 
 		assert!(index.has_conflicts());
-		assert!(index.is_unmerged("f.txt"));
-		assert!(!index.is_unmerged("clean.txt"));
+		assert!(index.is_unmerged(&conflict_path));
+		assert!(!index.is_unmerged(&clean_path));
 		assert_eq!(index.unmerged_paths().collect::<Vec<_>>(), ["f.txt"]);
 
-		let conflict = index.conflict("f.txt").unwrap();
+		let conflict = index.conflict(&conflict_path).unwrap();
 		assert_eq!(conflict.base.unwrap().stage, 1);
 		assert_eq!(conflict.ours.unwrap().oid, oid(b"ours"));
 		assert_eq!(conflict.theirs.unwrap().oid, oid(b"theirs"));
@@ -630,9 +715,10 @@ mod tests {
 
 	#[test]
 	fn upsert_and_remove_resolve_a_conflict() {
+		let path = GitPath::from_utf8("f.txt").unwrap();
 		let mut index = Index::new();
 		index.record_conflict(
-			"f.txt",
+			&path,
 			Some((0o100644, oid(b"b"))),
 			Some((0o100644, oid(b"o"))),
 			Some((0o100644, oid(b"t"))),
@@ -640,32 +726,33 @@ mod tests {
 
 		// Staging the resolved file collapses every stage to a single stage-0 entry.
 		index.upsert(entry("f.txt", b"resolved"));
-		assert!(!index.is_unmerged("f.txt"));
-		assert!(index.conflict("f.txt").is_none());
+		assert!(!index.is_unmerged(&path));
+		assert!(index.conflict(&path).is_none());
 		assert_eq!(
 			index.entries.iter().filter(|e| e.path == "f.txt").count(),
 			1
 		);
-		assert_eq!(index.entry("f.txt").unwrap().stage, 0);
+		assert_eq!(index.entry(&path).unwrap().stage, 0);
 
 		// Removing drops the path entirely, even when conflicted.
-		index.record_conflict("f.txt", None, Some((0o100644, oid(b"o"))), None);
-		assert!(index.is_unmerged("f.txt"));
-		index.remove("f.txt");
+		index.record_conflict(&path, None, Some((0o100644, oid(b"o"))), None);
+		assert!(index.is_unmerged(&path));
+		index.remove(&path);
 		assert!(index.entries.iter().all(|e| e.path != "f.txt"));
 	}
 
 	#[test]
 	fn partial_conflict_reports_absent_stages() {
+		let path = GitPath::from_utf8("f.txt").unwrap();
 		// modify/delete: base and ours present, theirs deleted.
 		let mut index = Index::new();
 		index.record_conflict(
-			"f.txt",
+			&path,
 			Some((0o100644, oid(b"b"))),
 			Some((0o100644, oid(b"o"))),
 			None,
 		);
-		let conflict = index.conflict("f.txt").unwrap();
+		let conflict = index.conflict(&path).unwrap();
 		assert!(conflict.base.is_some() && conflict.ours.is_some() && conflict.theirs.is_none());
 	}
 

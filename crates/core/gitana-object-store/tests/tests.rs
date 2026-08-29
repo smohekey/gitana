@@ -32,7 +32,9 @@ fn sample_graph() -> Vec<PackedObject<Sha256>> {
 		ObjectKind::Tree,
 		encode_tree(&[TreeEntry {
 			mode: "100644".to_owned(),
-			name: "file.txt".to_owned(),
+			name: gitana_path::GitPathComponent::from_utf8("file.txt")
+				.unwrap()
+				.into(),
 			id: blob1,
 		}]),
 	);
@@ -1018,7 +1020,9 @@ async fn write_reachability_bitmap_is_read_back_by_our_reader() {
 			ObjectKind::Tree,
 			&encode_tree(&[TreeEntry {
 				mode: "100644".to_owned(),
-				name: "f".to_owned(),
+				name: gitana_path::GitPathComponent::from_utf8("f")
+					.unwrap()
+					.into(),
 				id: blob,
 			}]),
 		)
@@ -1150,7 +1154,9 @@ async fn write_reachability_bitmap_skips_a_loose_selected_commit() {
 			ObjectKind::Tree,
 			&encode_tree(&[TreeEntry {
 				mode: "100644".to_owned(),
-				name: "f".to_owned(),
+				name: gitana_path::GitPathComponent::from_utf8("f")
+					.unwrap()
+					.into(),
 				id: blob,
 			}]),
 		)
@@ -1387,7 +1393,9 @@ async fn packed_history(
 			ObjectKind::Tree,
 			&encode_tree(&[TreeEntry {
 				mode: "100644".to_owned(),
-				name: "f".to_owned(),
+				name: gitana_path::GitPathComponent::from_utf8("f")
+					.unwrap()
+					.into(),
 				id: blob,
 			}]),
 		)

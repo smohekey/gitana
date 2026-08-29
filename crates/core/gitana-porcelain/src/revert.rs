@@ -17,7 +17,7 @@ pub enum RevertOutcome<H: HashAlgorithm> {
 	Reverted { commit: ObjectId<H> },
 	/// The revert conflicted; an in-progress revert has been materialised (`REVERT_HEAD`, `MERGE_MSG`,
 	/// a conflicted index and work tree). The caller renders the paths and signals failure.
-	Conflict { paths: Vec<String> },
+	Conflict { paths: Vec<gitana_path::GitPath> },
 }
 
 /// Revert `commit_spec` on the current branch.

@@ -2,6 +2,7 @@ use std::io;
 use std::path::PathBuf;
 
 use cap_std::fs::{Dir, FileType, Metadata};
+use gitana_path::{GitPath, GitPathComponent};
 
 use crate::{DirEntry, FileKind, Meta, WorkDirFs};
 
@@ -10,10 +11,11 @@ use crate::{DirEntry, FileKind, Meta, WorkDirFs};
 /// from a real path (`CapWorkDir::from_dir(Dir::open_ambient_dir(work, …))`, at the program edge).
 ///
 /// On unix it reports the full `stat(2)` identity (mode/uid/gid/dev/ino) and stores symlink targets
-/// as raw bytes; on other targets it degrades to size-only metadata and writes a symlink's target as
-/// a regular file — the same fallback the working tree used before this capability existed. That
-/// unix-vs-other split is contained here, at the platform boundary, so nothing above it branches on
-/// the target.
+/// as raw bytes; working-tree names preserve raw bytes on byte-path unix filesystems, while macOS
+/// rejects non-UTF-8 names during preflight because its native filesystems cannot create them. On
+/// non-unix targets metadata degrades to size-only and a symlink's target is written as a regular
+/// file — the same fallback the working tree used before this capability existed. Those platform
+/// splits stay contained here so nothing above this boundary branches on the target.
 pub struct CapWorkDir {
 	dir: Dir,
 }
@@ -26,13 +28,18 @@ impl CapWorkDir {
 }
 
 impl WorkDirFs for CapWorkDir {
-	fn lstat(&self, path: &str) -> io::Result<Option<Meta>> {
+	fn validate_path_representable(&self, path: &GitPath) -> io::Result<()> {
+		validate_representable(path)
+	}
+
+	fn lstat(&self, path: &GitPath) -> io::Result<Option<Meta>> {
+		let native = native_path(path)?;
 		// The empty path is the work-tree root itself (e.g. a `.` pathspec normalises to `""`);
 		// `symlink_metadata("")` would report it missing, so stat the directory handle directly.
-		let result = if path.is_empty() {
+		let result = if path.is_root() {
 			self.dir.dir_metadata()
 		} else {
-			self.dir.symlink_metadata(path)
+			self.dir.symlink_metadata(&native)
 		};
 		match result {
 			Ok(md) => Ok(Some(meta_of(&md))),
@@ -59,61 +66,116 @@ impl WorkDirFs for CapWorkDir {
 		}
 	}
 
-	fn read(&self, path: &str) -> io::Result<Vec<u8>> {
-		self.dir.read(path)
+	fn read(&self, path: &GitPath) -> io::Result<Vec<u8>> {
+		self.dir.read(native_path(path)?)
 	}
 
-	fn read_link(&self, path: &str) -> io::Result<Vec<u8>> {
-		Ok(link_bytes(self.dir.read_link(path)?))
+	fn read_link(&self, path: &GitPath) -> io::Result<Vec<u8>> {
+		Ok(link_bytes(self.dir.read_link(native_path(path)?)?))
 	}
 
-	fn read_dir(&self, path: &str) -> io::Result<Vec<DirEntry>> {
-		let entries = if path.is_empty() {
+	fn read_dir(&self, path: &GitPath) -> io::Result<Vec<DirEntry>> {
+		let entries = if path.is_root() {
 			self.dir.entries()?
 		} else {
-			self.dir.read_dir(path)?
+			self.dir.read_dir(native_path(path)?)?
 		};
 		let mut out = Vec::new();
 		for entry in entries {
 			let entry = entry?;
 			out.push(DirEntry {
-				name: entry.file_name().to_string_lossy().into_owned(),
+				name: component_from_native(&entry.file_name())?,
 				kind: kind_of_type(&entry.file_type()?),
 			});
 		}
 		Ok(out)
 	}
 
-	fn write(&self, path: &str, bytes: &[u8], executable: bool) -> io::Result<()> {
-		self.dir.write(path, bytes)?;
+	fn write(&self, path: &GitPath, bytes: &[u8], executable: bool) -> io::Result<()> {
+		let native = native_path(path)?;
+		self.dir.write(&native, bytes)?;
 		// Normalise the mode either way, so replacing an executable file with a plain one (or the
 		// reverse) lands the right bit — mirroring git's checkout. A no-op where modes are absent.
-		set_exec(&self.dir, path, executable)
+		set_exec(&self.dir, &native, executable)
 	}
 
-	fn symlink(&self, target: &[u8], path: &str) -> io::Result<()> {
-		make_symlink(&self.dir, target, path)
+	fn symlink(&self, target: &[u8], path: &GitPath) -> io::Result<()> {
+		make_symlink(&self.dir, target, &native_path(path)?)
 	}
 
-	fn create_dir(&self, path: &str) -> io::Result<()> {
-		self.dir.create_dir(path)
+	fn create_dir(&self, path: &GitPath) -> io::Result<()> {
+		self.dir.create_dir(native_path(path)?)
 	}
 
-	fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-		self.dir.rename(from, &self.dir, to)
+	fn rename(&self, from: &GitPath, to: &GitPath) -> io::Result<()> {
+		self
+			.dir
+			.rename(native_path(from)?, &self.dir, native_path(to)?)
 	}
 
-	fn remove_file(&self, path: &str) -> io::Result<()> {
-		self.dir.remove_file(path)
+	fn remove_file(&self, path: &GitPath) -> io::Result<()> {
+		self.dir.remove_file(native_path(path)?)
 	}
 
-	fn remove_dir(&self, path: &str) -> io::Result<()> {
-		self.dir.remove_dir(path)
+	fn remove_dir(&self, path: &GitPath) -> io::Result<()> {
+		self.dir.remove_dir(native_path(path)?)
 	}
 
-	fn remove_dir_all(&self, path: &str) -> io::Result<()> {
-		self.dir.remove_dir_all(path)
+	fn remove_dir_all(&self, path: &GitPath) -> io::Result<()> {
+		self.dir.remove_dir_all(native_path(path)?)
 	}
+}
+
+#[cfg(unix)]
+fn native_path(path: &GitPath) -> io::Result<PathBuf> {
+	use std::ffi::OsString;
+	use std::os::unix::ffi::OsStringExt as _;
+	Ok(PathBuf::from(OsString::from_vec(path.as_bytes().to_vec())))
+}
+
+#[cfg(not(unix))]
+fn native_path(path: &GitPath) -> io::Result<PathBuf> {
+	let text = path.as_utf8().ok_or_else(|| {
+		io::Error::new(
+			io::ErrorKind::Unsupported,
+			"Git path is not representable on this platform",
+		)
+	})?;
+	Ok(PathBuf::from(text))
+}
+
+#[cfg(target_os = "macos")]
+fn validate_representable(path: &GitPath) -> io::Result<()> {
+	path.as_utf8().map(drop).ok_or_else(|| {
+		io::Error::new(
+			io::ErrorKind::Unsupported,
+			"Git path is not representable on this platform",
+		)
+	})
+}
+
+#[cfg(not(target_os = "macos"))]
+fn validate_representable(path: &GitPath) -> io::Result<()> {
+	native_path(path).map(drop)
+}
+
+#[cfg(unix)]
+fn component_from_native(name: &std::ffi::OsStr) -> io::Result<GitPathComponent> {
+	use std::os::unix::ffi::OsStrExt as _;
+	GitPathComponent::from_bytes(name.as_bytes().to_vec())
+		.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(not(unix))]
+fn component_from_native(name: &std::ffi::OsStr) -> io::Result<GitPathComponent> {
+	let text = name.to_str().ok_or_else(|| {
+		io::Error::new(
+			io::ErrorKind::Unsupported,
+			"native path is not representable as Git bytes",
+		)
+	})?;
+	GitPathComponent::from_utf8(text)
+		.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// The git-relevant kind of a cap-std `Metadata` (an `lstat`, so a symlink stays a symlink).
@@ -188,7 +250,7 @@ fn link_bytes(target: PathBuf) -> Vec<u8> {
 }
 
 #[cfg(unix)]
-fn make_symlink(dir: &Dir, target: &[u8], path: &str) -> io::Result<()> {
+fn make_symlink(dir: &Dir, target: &[u8], path: &std::path::Path) -> io::Result<()> {
 	use std::ffi::OsStr;
 	use std::os::unix::ffi::OsStrExt;
 	dir.symlink(OsStr::from_bytes(target), path)
@@ -197,18 +259,34 @@ fn make_symlink(dir: &Dir, target: &[u8], path: &str) -> io::Result<()> {
 /// Without unix symlinks, store the target as the file's content (a lossy but round-trippable
 /// fallback — the same one the working tree used before this capability).
 #[cfg(not(unix))]
-fn make_symlink(dir: &Dir, target: &[u8], path: &str) -> io::Result<()> {
+fn make_symlink(dir: &Dir, target: &[u8], path: &std::path::Path) -> io::Result<()> {
 	dir.write(path, target)
 }
 
 #[cfg(unix)]
-fn set_exec(dir: &Dir, path: &str, executable: bool) -> io::Result<()> {
+fn set_exec(dir: &Dir, path: &std::path::Path, executable: bool) -> io::Result<()> {
 	use cap_std::fs::{Permissions, PermissionsExt};
 	let mode = if executable { 0o755 } else { 0o644 };
 	dir.set_permissions(path, Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
-fn set_exec(_dir: &Dir, _path: &str, _executable: bool) -> io::Result<()> {
+fn set_exec(_dir: &Dir, _path: &std::path::Path, _executable: bool) -> io::Result<()> {
 	Ok(())
+}
+
+#[cfg(all(test, any(not(unix), target_os = "macos")))]
+mod tests {
+	use std::io;
+
+	use gitana_path::GitPath;
+
+	use super::validate_representable;
+
+	#[test]
+	fn preflight_rejects_non_utf8_git_bytes() {
+		let path = GitPath::from_bytes(b"raw-\xff".to_vec()).unwrap();
+		let error = validate_representable(&path).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+	}
 }

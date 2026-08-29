@@ -188,7 +188,9 @@ fn commit_objects(content: &[u8]) -> (Vec<PackedObject<Sha256>>, ObjectId<Sha256
 	let blob_id = ObjectId::<Sha256>::compute(ObjectKind::Blob, &blob);
 	let tree = encode_tree(&[TreeEntry {
 		mode: "100644".to_owned(),
-		name: "file.txt".to_owned(),
+		name: gitana_path::GitPathComponent::from_utf8("file.txt")
+			.unwrap()
+			.into(),
 		id: blob_id,
 	}]);
 	let tree_id = ObjectId::<Sha256>::compute(ObjectKind::Tree, &tree);

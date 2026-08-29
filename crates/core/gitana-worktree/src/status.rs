@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use gitana_file_store::{FileStore, FileStoreError};
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind};
+use gitana_path::{GitPath, GitPathComponent};
 
 use crate::excludes::StandardExcludes;
 use crate::fsmeta::{blob_of, effective_mode, join_rel, push_gitignore};
@@ -20,7 +21,7 @@ use crate::{Conflict, IndexEntry, WorkTree, WorktreeError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusEntry {
 	/// Repository-relative path.
-	pub path: String,
+	pub path: GitPath,
 	/// Index-vs-HEAD code (the `X` column of `git status --porcelain`).
 	pub index: char,
 	/// Worktree-vs-index code (the `Y` column).
@@ -34,25 +35,43 @@ pub struct StatusEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Status {
 	pub changed: Vec<StatusEntry>,
-	pub untracked: Vec<String>,
+	pub untracked: Vec<UntrackedEntry>,
+}
+
+/// One untracked filesystem entry. Directories are collapsed to a single entry
+/// while keeping the canonical path free of a presentation-only trailing slash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntrackedEntry {
+	pub path: GitPath,
+	pub directory: bool,
 }
 
 impl Status {
 	/// Render in `git status --porcelain=v1` form: tracked changes first, then untracked (`?? path`),
 	/// matching git's grouping rather than a single global path sort.
 	pub fn porcelain_v1(&self) -> String {
-		let mut out = String::new();
+		String::from_utf8(self.porcelain_v1_bytes(true)).expect("safe Git quoting is ASCII")
+	}
+
+	/// Render porcelain v1 as exact bytes under Git's `core.quotePath` policy.
+	pub fn porcelain_v1_bytes(&self, quote_non_ascii: bool) -> Vec<u8> {
+		let mut out = Vec::new();
 		for entry in &self.changed {
-			out.push(entry.index);
-			out.push(entry.worktree);
-			out.push(' ');
-			out.push_str(&entry.path);
-			out.push('\n');
+			out.push(entry.index as u8);
+			out.push(entry.worktree as u8);
+			out.push(b' ');
+			out.extend_from_slice(&entry.path.render_with_affixes(b"", b"", quote_non_ascii));
+			out.push(b'\n');
 		}
-		for path in &self.untracked {
-			out.push_str("?? ");
-			out.push_str(path);
-			out.push('\n');
+		for entry in &self.untracked {
+			out.extend_from_slice(b"?? ");
+			let suffix = if entry.directory {
+				b"/".as_slice()
+			} else {
+				b""
+			};
+			out.extend_from_slice(&entry.path.render_with_affixes(b"", suffix, quote_non_ascii));
+			out.push(b'\n');
 		}
 		out
 	}
@@ -60,7 +79,7 @@ impl Status {
 
 pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
-	excludes_file: Option<&str>,
+	excludes_file: Option<&[u8]>,
 ) -> Result<Status, WorktreeError> {
 	// `core.fileMode` (git's `trust_executable_bit`): when `false`, an executable-bit-only difference between
 	// the working tree and the index is *not* a modification. Resolved with git's worktree precedence — a
@@ -69,7 +88,7 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	// delete a genuinely-modified checkout, so the default and the override both fail safe toward `true`.
 	let file_mode = worktree_file_mode(wt).await;
 	let index = wt.load_index().await?;
-	let index_map: HashMap<String, (String, ObjectId<H>)> = index
+	let index_map: HashMap<GitPath, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
 		.filter(|e| e.stage == 0)
@@ -78,7 +97,7 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	let head_map = head_entries(wt).await?;
 
 	// Unmerged paths carry their conflict code (`UU`/`AA`/…) rather than the normal X/Y columns.
-	let unmerged: BTreeMap<String, (char, char)> = index
+	let unmerged: BTreeMap<GitPath, (char, char)> = index
 		.unmerged_paths()
 		.map(|path| {
 			let conflict = index.conflict(path).expect("unmerged path has a conflict");
@@ -95,7 +114,7 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	// A conflicted path is tracked (it has a working-tree file), so exclude it from untracked. Under
 	// `core.ignoreCase` git matches a working-tree entry to a tracked index path case-folded (a disk
 	// `FOO` counts as the tracked `foo`), so fold the membership keys the same way the lookups below do.
-	let tracked: HashSet<String> = index_map
+	let tracked: HashSet<Vec<u8>> = index_map
 		.keys()
 		.cloned()
 		.chain(unmerged.keys().cloned())
@@ -109,14 +128,15 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	// where the on-disk `sub/` holds tracked files, so it is a real directory to descend into (git reports
 	// `?? sub/new`), not an opaque submodule mount.
 	// Fold-aware under `core.ignoreCase`: a mixed `160000 Sub` + `sub/f` conflict compares by fold-key.
-	let has_tracked_child = |path: &str| {
-		let prefix = format!("{}/", fold_key(path, fold));
+	let has_tracked_child = |path: &GitPath| {
+		let mut prefix = fold_key(path, fold);
+		prefix.push(b'/');
 		index
 			.entries
 			.iter()
 			.any(|e| fold_key(&e.path, fold).starts_with(&prefix))
 	};
-	let gitlinks: HashSet<String> = index
+	let gitlinks: HashSet<Vec<u8>> = index
 		.entries
 		.iter()
 		.filter(|entry| entry.mode == 0o160000 && !has_tracked_child(&entry.path))
@@ -126,7 +146,7 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	let mut ignore_stack: Vec<DirIgnore> = base;
 	collect_untracked(
 		wt.work(),
-		"",
+		&GitPath::root(),
 		&tracked,
 		&gitlinks,
 		&mut ignore_stack,
@@ -134,10 +154,10 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		fold,
 	)?;
 
-	let mut merged: BTreeMap<String, StatusEntry> = BTreeMap::new();
+	let mut merged: BTreeMap<GitPath, StatusEntry> = BTreeMap::new();
 
 	// Index vs HEAD (the X column); unmerged paths are handled separately.
-	let all: BTreeSet<&String> = index_map.keys().chain(head_map.keys()).collect();
+	let all: BTreeSet<&GitPath> = index_map.keys().chain(head_map.keys()).collect();
 	for path in all {
 		if unmerged.contains_key(path) {
 			continue;
@@ -203,7 +223,25 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	// Untracked paths are reported separately (git lists them after the tracked changes), so a path
 	// that is both a tracked change and an untracked working file — e.g. after `rm --cached` — keeps
 	// both lines instead of one clobbering the other.
-	untracked.sort();
+	// Sort the raw names status presents. A collapsed directory's `/` is presentation-only and
+	// therefore absent from `GitPath`, but it must still participate in ordering (`foo.` before
+	// `foo/`) to match Git's porcelain byte order.
+	untracked.sort_by(|left, right| {
+		left
+			.path
+			.as_bytes()
+			.iter()
+			.copied()
+			.chain(left.directory.then_some(b'/'))
+			.cmp(
+				right
+					.path
+					.as_bytes()
+					.iter()
+					.copied()
+					.chain(right.directory.then_some(b'/')),
+			)
+	});
 
 	Ok(Status {
 		changed: merged.into_values().collect(),
@@ -227,7 +265,7 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 /// content at risk of loss — is returned.
 pub(crate) async fn diverged_tracked_content<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
-) -> Result<Vec<String>, WorktreeError> {
+) -> Result<Vec<GitPath>, WorktreeError> {
 	let file_mode = worktree_file_mode(wt).await;
 	let index = wt.load_index().await?;
 	let mut out = Vec::new();
@@ -348,7 +386,7 @@ pub(crate) async fn has_staged_changes<F: FileStore, W: WorkDirFs, H: HashAlgori
 	}
 	// Stage-0 index vs the HEAD tree: an added / removed / modified path is a staged change. Built the same way
 	// `compute`'s X column is, so the two agree.
-	let index_map: HashMap<String, (String, ObjectId<H>)> = index
+	let index_map: HashMap<GitPath, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
 		.filter(|e| e.stage == 0)
@@ -447,7 +485,7 @@ fn conflict_code<H: HashAlgorithm>(conflict: &Conflict<H>) -> (char, char) {
 	}
 }
 
-fn at<'a>(merged: &'a mut BTreeMap<String, StatusEntry>, path: &str) -> &'a mut StatusEntry {
+fn at<'a>(merged: &'a mut BTreeMap<GitPath, StatusEntry>, path: &GitPath) -> &'a mut StatusEntry {
 	merged
 		.entry(path.to_owned())
 		.or_insert_with(|| StatusEntry {
@@ -459,7 +497,7 @@ fn at<'a>(merged: &'a mut BTreeMap<String, StatusEntry>, path: &str) -> &'a mut 
 
 pub(crate) async fn head_entries<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
-) -> Result<HashMap<String, (String, ObjectId<H>)>, WorktreeError> {
+) -> Result<HashMap<GitPath, (String, ObjectId<H>)>, WorktreeError> {
 	let Some(commit) = wt.repository().refs().resolve_head().await? else {
 		return Ok(HashMap::new());
 	};
@@ -480,11 +518,11 @@ pub(crate) async fn head_entries<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 /// (their worktree status is handled separately).
 fn collect_untracked<W: WorkDirFs>(
 	work: &W,
-	dir_rel: &str,
-	tracked: &HashSet<String>,
-	gitlinks: &HashSet<String>,
+	dir_rel: &GitPath,
+	tracked: &HashSet<Vec<u8>>,
+	gitlinks: &HashSet<Vec<u8>>,
 	stack: &mut Vec<DirIgnore>,
-	out: &mut Vec<String>,
+	out: &mut Vec<UntrackedEntry>,
 	fold: bool,
 ) -> Result<(), WorktreeError> {
 	let pushed = push_gitignore(work, dir_rel, stack)?;
@@ -509,18 +547,24 @@ fn collect_untracked<W: WorkDirFs>(
 		// Membership is checked case-folded under `core.ignoreCase` (the `tracked` keys are already
 		// folded); the emitted path is always the real on-disk spelling.
 		if is_dir {
-			let prefix = format!("{rel}/");
-			let prefix_key = fold_key(&prefix, fold);
+			let mut prefix_key = fold_key(&rel, fold);
+			prefix_key.push(b'/');
 			if tracked.iter().any(|path| path.starts_with(&prefix_key)) {
 				collect_untracked(work, &rel, tracked, gitlinks, stack, out, fold)?;
 			} else if dir_has_unignored(work, &rel, stack, fold)? {
 				// A fully-untracked directory collapses to a single `dir/` — but only when it holds some
 				// non-ignored content. git omits a directory whose entire content is ignored (by any
 				// standard exclude source), so descend to check before collapsing.
-				out.push(prefix);
+				out.push(UntrackedEntry {
+					path: rel,
+					directory: true,
+				});
 			}
 		} else if !tracked.contains(&fold_key(&rel, fold)) {
-			out.push(rel);
+			out.push(UntrackedEntry {
+				path: rel,
+				directory: false,
+			});
 		}
 	}
 
@@ -536,7 +580,7 @@ fn collect_untracked<W: WorkDirFs>(
 /// ignore stack down to `dir_rel`'s parent; this pushes `dir_rel`'s own `.gitignore` while descending.
 fn dir_has_unignored<W: WorkDirFs>(
 	work: &W,
-	dir_rel: &str,
+	dir_rel: &GitPath,
 	stack: &mut Vec<DirIgnore>,
 	fold: bool,
 ) -> Result<bool, WorktreeError> {
@@ -547,7 +591,7 @@ fn dir_has_unignored<W: WorkDirFs>(
 	// safe direction (it refuses removal, never deletes).
 	if crate::ls_files::is_embedded_repo(work, dir_rel)
 		|| matches!(
-			work.lstat(&format!("{dir_rel}/.git")),
+			work.lstat(&dir_rel.join(&GitPathComponent::from_utf8(".git").expect("valid name"))),
 			Ok(Some(meta)) if !meta.kind.is_dir()
 		) {
 		return Ok(true);
@@ -590,18 +634,18 @@ fn dir_has_unignored<W: WorkDirFs>(
 /// The membership key for `path` under `core.ignoreCase`: ASCII-lower-cased when `fold`, else `path`
 /// unchanged. Used to make tracked-vs-untracked detection case-insensitive without altering the path
 /// git reports.
-fn fold_key(path: &str, fold: bool) -> String {
+fn fold_key(path: &GitPath, fold: bool) -> Vec<u8> {
 	if fold {
-		path.to_ascii_lowercase()
+		path.ascii_folded()
 	} else {
-		path.to_owned()
+		path.as_bytes().to_vec()
 	}
 }
 
 pub(crate) fn worktree_change<W: WorkDirFs, H: HashAlgorithm>(
 	work: &W,
 	entry: &IndexEntry<H>,
-	path: &str,
+	path: &GitPath,
 	file_mode: bool,
 ) -> Result<char, WorktreeError> {
 	let Some(meta) = work.lstat(path)? else {
@@ -652,11 +696,12 @@ mod tests {
 
 	/// The porcelain code for a conflict with the given stages present.
 	fn code(base: bool, ours: bool, theirs: bool) -> (char, char) {
+		let path = GitPath::from_utf8("f").unwrap();
 		let oid = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"x");
 		let stage = |present: bool| present.then_some((0o100644u32, oid));
 		let mut index = Index::new();
-		index.record_conflict("f", stage(base), stage(ours), stage(theirs));
-		conflict_code(&index.conflict("f").unwrap())
+		index.record_conflict(&path, stage(base), stage(ours), stage(theirs));
+		conflict_code(&index.conflict(&path).unwrap())
 	}
 
 	#[test]
@@ -668,6 +713,18 @@ mod tests {
 		assert_eq!(code(true, false, false), ('D', 'D')); // both deleted
 		assert_eq!(code(false, true, false), ('A', 'U')); // added by us
 		assert_eq!(code(false, false, true), ('U', 'A')); // added by them
+	}
+
+	#[test]
+	fn porcelain_quotes_an_untracked_directory_marker_with_its_path() {
+		let status = Status {
+			changed: Vec::new(),
+			untracked: vec![UntrackedEntry {
+				path: GitPath::from_utf8("line\ndir").unwrap(),
+				directory: true,
+			}],
+		};
+		assert_eq!(status.porcelain_v1(), "?? \"line\\ndir/\"\n");
 	}
 
 	/// The removal-safety re-verification must hash the working file rather than trust the index stat cache: a
@@ -711,7 +768,8 @@ mod tests {
 
 		// Build an entry whose stat cache exactly matches the on-disk file, but whose oid is for *different*
 		// content — the state a stat-preserving rewrite leaves behind.
-		let meta = wt.work().lstat("a.txt").unwrap().expect("a.txt exists");
+		let path = GitPath::from_utf8("a.txt").unwrap();
+		let meta = wt.work().lstat(&path).unwrap().expect("a.txt exists");
 		let entry = IndexEntry::<Sha256> {
 			stat: stat_of(&meta),
 			mode: mode_of(&meta),
@@ -720,12 +778,12 @@ mod tests {
 			assume_valid: false,
 			skip_worktree: false,
 			intent_to_add: false,
-			path: "a.txt".to_owned(),
+			path: path.clone(),
 		};
 
 		// The fast path is fooled — stat matches, so it reports the file unchanged.
 		assert_eq!(
-			worktree_change(wt.work(), &entry, "a.txt", true).unwrap(),
+			worktree_change(wt.work(), &entry, &path, true).unwrap(),
 			' ',
 			"the stat-cache fast path reports the diverged file as clean (the hole)"
 		);
@@ -781,7 +839,8 @@ mod tests {
 		);
 
 		// The entry's oid *matches* the working file's content — but nothing was written to the object store.
-		let meta = wt.work().lstat("a.txt").unwrap().expect("a.txt exists");
+		let path = GitPath::from_utf8("a.txt").unwrap();
+		let meta = wt.work().lstat(&path).unwrap().expect("a.txt exists");
 		let entry = IndexEntry::<Sha256> {
 			stat: stat_of(&meta),
 			mode: mode_of(&meta),
@@ -790,7 +849,7 @@ mod tests {
 			assume_valid: false,
 			skip_worktree: false,
 			intent_to_add: false,
-			path: "a.txt".to_owned(),
+			path,
 		};
 		let mut index = Index::new();
 		index.entries.push(entry);

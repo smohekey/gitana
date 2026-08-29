@@ -4,14 +4,48 @@
 //! conflicted paths as data; the CLI adapter renders the `CONFLICT` lines and decides the process's
 //! fate (printing and the non-zero exit are policy, not engine).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_path::GitPath;
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
+
+/// A merge-like operation would overwrite unstaged changes at one or more conflicted paths.
+///
+/// Paths remain typed until a frontend chooses human or reversible rendering. This preserves the
+/// historical list-shaped human message without exposing [`GitPath`]'s debug wrapper and lets MCP
+/// distinguish arbitrary byte paths from UTF-8 names that resemble their quoted spelling.
+#[derive(Debug)]
+pub struct ConflictOverwriteError {
+	paths: Vec<GitPath>,
+}
+
+impl ConflictOverwriteError {
+	/// Create a refusal for the conflicted paths whose local contents would be overwritten.
+	pub fn new(paths: Vec<GitPath>) -> Self {
+		Self { paths }
+	}
+
+	/// Render the refusal with the frontend's pathname policy.
+	pub fn render_with_paths(&self, render_path: impl Fn(&GitPath) -> String) -> String {
+		let paths = self.paths.iter().map(render_path).collect::<Vec<_>>();
+		format!(
+			"your local changes to {paths:?} would be overwritten by the merge; commit or stash them first"
+		)
+	}
+}
+
+impl fmt::Display for ConflictOverwriteError {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str(&self.render_with_paths(ToString::to_string))
+	}
+}
+
+impl std::error::Error for ConflictOverwriteError {}
 
 /// The merge-like operation currently in progress (`merge` / `cherry-pick` / `revert` / `rebase`), or
 /// `None` when the work tree is idle. The history-editing operations call this before starting so that
@@ -53,7 +87,7 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 	base_tree: ObjectId<H>,
 	ours_tree: ObjectId<H>,
 	theirs_tree: ObjectId<H>,
-	conflicts: &[String],
+	conflicts: &[GitPath],
 ) -> Result<()> {
 	let repository = wt.repository();
 	let base = tree_entry_map(repository, base_tree).await?;
@@ -70,16 +104,14 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 	// `materialise_paths` rewrites it from ours' blob, so an unstaged edit to that file MUST still block the
 	// merge (a gitlink on theirs alone does not make the path opaque). A gitlink `ours` is opaque and its
 	// mount is preserved by `materialise_paths`, so exempting it cannot delete local data.
-	let is_gitlink = |path: &String| ours.get(path).is_some_and(|(mode, _)| *mode == 0o160000);
+	let is_gitlink = |path: &GitPath| ours.get(path).is_some_and(|(mode, _)| *mode == 0o160000);
 	let diverged = wt.diverged_tracked_content_paths().await?;
-	let clobbered: Vec<&String> = conflicts
+	let clobbered: Vec<&GitPath> = conflicts
 		.iter()
 		.filter(|p| diverged.contains(*p) && !is_gitlink(p))
 		.collect();
 	if !clobbered.is_empty() {
-		bail!(
-			"your local changes to {clobbered:?} would be overwritten by the merge; commit or stash them first"
-		);
+		return Err(ConflictOverwriteError::new(clobbered.into_iter().cloned().collect()).into());
 	}
 
 	// Two-tree merge from HEAD's tree (`ours_tree`) to the merged result (conflict markers included): the
@@ -97,7 +129,7 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 	// tree"). Compute that set from the merged tree so a divergent-pointer conflict that keeps ours (merged
 	// == ours) is NOT force-materialised, while a theirs-only/moved incoming gitlink is.
 	let merged = tree_entry_map(repository, merged_tree).await?;
-	let force_gitlink_mounts: std::collections::HashSet<String> = conflicts
+	let force_gitlink_mounts: std::collections::HashSet<GitPath> = conflicts
 		.iter()
 		.filter(|path| {
 			merged.get(*path).is_some_and(|(mode, _)| *mode == 0o160000)
@@ -164,7 +196,7 @@ pub async fn restore_to_head<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 async fn tree_entry_map<F: FileStore, H: HashAlgorithm>(
 	repository: &Repository<F, H>,
 	tree: ObjectId<H>,
-) -> Result<HashMap<String, (u32, ObjectId<H>)>> {
+) -> Result<HashMap<GitPath, (u32, ObjectId<H>)>> {
 	let mut map = HashMap::new();
 	for (path, mode, oid) in repository.read_tree(tree).await? {
 		let mode = u32::from_str_radix(&mode, 8).unwrap_or(0o100644);
@@ -179,5 +211,27 @@ pub fn ensure_trailing_newline(message: String) -> String {
 		message
 	} else {
 		format!("{message}\n")
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn overwrite_error_preserves_human_shape_and_reversible_identity() {
+		let ordinary = ConflictOverwriteError::new(vec![GitPath::from_utf8("f.txt").unwrap()]);
+		assert_eq!(
+			ordinary.to_string(),
+			"your local changes to [\"f.txt\"] would be overwritten by the merge; commit or stash them first"
+		);
+
+		let raw = ConflictOverwriteError::new(vec![GitPath::from_bytes(b"raw-\xff".to_vec()).unwrap()]);
+		let literal = ConflictOverwriteError::new(vec![GitPath::from_utf8("\"raw-\\377\"").unwrap()]);
+		assert_eq!(raw.to_string(), literal.to_string());
+		assert_ne!(
+			raw.render_with_paths(|path| path.quote_with_affixes(b"", b"")),
+			literal.render_with_paths(|path| path.quote_with_affixes(b"", b""))
+		);
 	}
 }

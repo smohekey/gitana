@@ -12,7 +12,9 @@ use cap_std::ambient_authority;
 use gitana_file_store_local::LocalFileStore;
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, Tag, encode_tag};
 use gitana_object_store::ObjectStore;
-use gitana_repo_host::exports::gitana::repo::porcelain::{HashKind, RepoError};
+use gitana_repo_host::exports::gitana::repo::porcelain::{
+	GitPath as WitGitPath, HashKind, RepoError, RevisionSpec as WitRevisionSpec,
+};
 use gitana_repo_host::{
 	HostCredentialProvider, HostSshProvider, Repo, State, engine, grant_dir, instantiate_component,
 	store, store_with_credentials, store_with_ssh,
@@ -22,6 +24,21 @@ use wasmtime::component::{Component, ResourceAny};
 use wasmtime::{Engine, Store};
 
 pub const AUTHOR: &str = "A U Thor <author@example.com> 1719900000 +0000";
+
+pub fn wit_path(path: &str) -> WitGitPath {
+	WitGitPath::Utf8(path.to_owned())
+}
+
+pub fn wit_revision(spec: &str) -> WitRevisionSpec {
+	WitRevisionSpec::Utf8(spec.to_owned())
+}
+
+pub fn wit_path_bytes(path: &WitGitPath) -> &[u8] {
+	match path {
+		WitGitPath::Utf8(path) => path.as_bytes(),
+		WitGitPath::Bytes(path) => path,
+	}
+}
 
 /// A committer identity line `offset` seconds after the fixture epoch — rev-list
 /// ordering in the fixture is driven entirely by these.
@@ -130,7 +147,7 @@ pub async fn build_fixture<H: HashAlgorithm>() -> Result<Fixture> {
 	let tool = repo.write_blob(b"#!/bin/sh\nexit 0\n").await?;
 
 	let entry = |path: &str, mode: FileMode, id: ObjectId<H>| TreeBuildEntry {
-		path: path.to_owned(),
+		path: gitana_path::GitPath::from_utf8(path).unwrap(),
 		mode,
 		id,
 	};

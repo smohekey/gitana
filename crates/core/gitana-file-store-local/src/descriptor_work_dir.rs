@@ -14,6 +14,7 @@
 
 use std::io;
 
+use gitana_path::{GitPath, GitPathComponent};
 use wasip2::filesystem::types::{
 	Descriptor, DescriptorFlags, DescriptorStat, DescriptorType, ErrorCode, OpenFlags, PathFlags,
 };
@@ -37,7 +38,8 @@ impl DescriptorWorkDir {
 
 	/// Open `path` for reading, following symlinks within the sandbox (matching the native
 	/// capability's `Dir::read`/`Dir::open`).
-	fn open_for_read(&self, path: &str) -> io::Result<Descriptor> {
+	fn open_for_read(&self, path: &GitPath) -> io::Result<Descriptor> {
+		let path = utf8_path(path)?;
 		self
 			.dir
 			.open_at(
@@ -51,14 +53,18 @@ impl DescriptorWorkDir {
 }
 
 impl WorkDirFs for DescriptorWorkDir {
-	fn lstat(&self, path: &str) -> io::Result<Option<Meta>> {
+	fn validate_path_representable(&self, path: &GitPath) -> io::Result<()> {
+		utf8_path(path).map(drop)
+	}
+
+	fn lstat(&self, path: &GitPath) -> io::Result<Option<Meta>> {
 		// The empty path is the work-tree root itself; `stat-at ""` reports it missing, so stat the
 		// directory descriptor directly. Otherwise `lstat` with no `symlink-follow` so a final
 		// symlink reads as a symlink, matching how git walks the tree.
-		let result = if path.is_empty() {
+		let result = if path.is_root() {
 			self.dir.stat()
 		} else {
-			self.dir.stat_at(PathFlags::empty(), path)
+			self.dir.stat_at(PathFlags::empty(), utf8_path(path)?)
 		};
 		match result {
 			Ok(stat) => Ok(Some(meta_of(&stat))),
@@ -68,7 +74,7 @@ impl WorkDirFs for DescriptorWorkDir {
 		}
 	}
 
-	fn read(&self, path: &str) -> io::Result<Vec<u8>> {
+	fn read(&self, path: &GitPath) -> io::Result<Vec<u8>> {
 		let file = self.open_for_read(path)?;
 		let mut out = Vec::new();
 		let mut offset = 0u64;
@@ -84,22 +90,28 @@ impl WorkDirFs for DescriptorWorkDir {
 		Ok(out)
 	}
 
-	fn read_link(&self, path: &str) -> io::Result<Vec<u8>> {
+	fn read_link(&self, path: &GitPath) -> io::Result<Vec<u8>> {
 		// WASI hands back the target as a `string`; git stores those verbatim bytes as the blob.
-		Ok(self.dir.readlink_at(path).map_err(io_error)?.into_bytes())
+		Ok(
+			self
+				.dir
+				.readlink_at(utf8_path(path)?)
+				.map_err(io_error)?
+				.into_bytes(),
+		)
 	}
 
-	fn read_dir(&self, path: &str) -> io::Result<Vec<DirEntry>> {
+	fn read_dir(&self, path: &GitPath) -> io::Result<Vec<DirEntry>> {
 		// Keep the opened subdirectory descriptor alive for the whole iteration.
 		let opened;
-		let dir = if path.is_empty() {
+		let dir = if path.is_root() {
 			&self.dir
 		} else {
 			opened = self
 				.dir
 				.open_at(
 					PathFlags::SYMLINK_FOLLOW,
-					path,
+					utf8_path(path)?,
 					OpenFlags::DIRECTORY,
 					DescriptorFlags::READ,
 				)
@@ -110,21 +122,21 @@ impl WorkDirFs for DescriptorWorkDir {
 		let mut out = Vec::new();
 		while let Some(entry) = stream.read_directory_entry().map_err(io_error)? {
 			out.push(DirEntry {
-				name: entry.name,
+				name: GitPathComponent::from_utf8(entry.name).map_err(invalid_path)?,
 				kind: kind_of_type(entry.type_),
 			});
 		}
 		Ok(out)
 	}
 
-	fn write(&self, path: &str, bytes: &[u8], _executable: bool) -> io::Result<()> {
+	fn write(&self, path: &GitPath, bytes: &[u8], _executable: bool) -> io::Result<()> {
 		// Truncate-or-create, then rewrite from offset 0. WASI has no chmod, so the executable bit
 		// is silently dropped (a regular file is always `100644`) — the documented degradation.
 		let file = self
 			.dir
 			.open_at(
 				PathFlags::empty(),
-				path,
+				utf8_path(path)?,
 				OpenFlags::CREATE | OpenFlags::TRUNCATE,
 				DescriptorFlags::WRITE,
 			)
@@ -145,39 +157,47 @@ impl WorkDirFs for DescriptorWorkDir {
 		Ok(())
 	}
 
-	fn symlink(&self, target: &[u8], path: &str) -> io::Result<()> {
+	fn symlink(&self, target: &[u8], path: &GitPath) -> io::Result<()> {
 		// WASI's `symlink-at` takes the target as a `string`; git symlink blobs are conventionally
 		// UTF-8 paths. A non-UTF-8 target cannot be expressed and fails closed.
 		let target = std::str::from_utf8(target)
 			.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "non-utf8 symlink target"))?;
-		self.dir.symlink_at(target, path).map_err(io_error)
+		self
+			.dir
+			.symlink_at(target, utf8_path(path)?)
+			.map_err(io_error)
 	}
 
-	fn create_dir(&self, path: &str) -> io::Result<()> {
-		self.dir.create_directory_at(path).map_err(io_error)
+	fn create_dir(&self, path: &GitPath) -> io::Result<()> {
+		self
+			.dir
+			.create_directory_at(utf8_path(path)?)
+			.map_err(io_error)
 	}
 
-	fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-		self.dir.rename_at(from, &self.dir, to).map_err(io_error)
+	fn rename(&self, from: &GitPath, to: &GitPath) -> io::Result<()> {
+		self
+			.dir
+			.rename_at(utf8_path(from)?, &self.dir, utf8_path(to)?)
+			.map_err(io_error)
 	}
 
-	fn remove_file(&self, path: &str) -> io::Result<()> {
-		self.dir.unlink_file_at(path).map_err(io_error)
+	fn remove_file(&self, path: &GitPath) -> io::Result<()> {
+		self.dir.unlink_file_at(utf8_path(path)?).map_err(io_error)
 	}
 
-	fn remove_dir(&self, path: &str) -> io::Result<()> {
-		self.dir.remove_directory_at(path).map_err(io_error)
+	fn remove_dir(&self, path: &GitPath) -> io::Result<()> {
+		self
+			.dir
+			.remove_directory_at(utf8_path(path)?)
+			.map_err(io_error)
 	}
 
-	fn remove_dir_all(&self, path: &str) -> io::Result<()> {
+	fn remove_dir_all(&self, path: &GitPath) -> io::Result<()> {
 		// WASI has no recursive remove, so walk the tree depth-first: unlink files and symlinks,
 		// recurse into real subdirectories, then remove the now-empty directory itself.
 		for entry in self.read_dir(path)? {
-			let child = if path.is_empty() {
-				entry.name
-			} else {
-				format!("{path}/{}", entry.name)
-			};
+			let child = path.join(&entry.name);
 			match entry.kind {
 				FileKind::Dir => self.remove_dir_all(&child)?,
 				_ => self.remove_file(&child)?,
@@ -185,6 +205,19 @@ impl WorkDirFs for DescriptorWorkDir {
 		}
 		self.remove_dir(path)
 	}
+}
+
+fn utf8_path(path: &GitPath) -> io::Result<&str> {
+	path.as_utf8().ok_or_else(|| {
+		io::Error::new(
+			io::ErrorKind::Unsupported,
+			"WASI filesystem paths must be valid UTF-8",
+		)
+	})
+}
+
+fn invalid_path(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
+	io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 /// The capability-neutral [`Meta`] for a WASI `descriptor-stat`. Permission and identity fields are

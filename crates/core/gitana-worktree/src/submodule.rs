@@ -6,6 +6,7 @@
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_path::{GitPath, GitPathComponent};
 
 use crate::WorkTree;
 
@@ -19,13 +20,11 @@ use crate::WorkTree;
 /// rather than a false `M`.
 pub(crate) async fn submodule_head_oid<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
-	path: &str,
+	path: &GitPath,
 ) -> Option<ObjectId<H>> {
-	let gitfile = wt.work().read(&format!("{path}/.git")).ok()?;
-	let target = std::str::from_utf8(&gitfile)
-		.ok()?
-		.strip_prefix("gitdir:")?
-		.trim();
+	let git_name = GitPathComponent::from_utf8(".git").ok()?;
+	let gitfile = wt.work().read(&path.join(&git_name)).ok()?;
+	let target = trim_ascii(gitfile.strip_prefix(b"gitdir:")?);
 	let git_dir = resolve_module_gitdir(path, target)?;
 	let store = wt.repository().objects().file_store();
 
@@ -57,16 +56,57 @@ pub(crate) async fn submodule_head_oid<F: FileStore, W: WorkDirFs, H: HashAlgori
 /// Resolve a submodule gitfile's `gitdir:` `target` (relative to the submodule work-tree `path`) to a
 /// path *under* the superproject `.git/` — returning it relative to that git dir (`modules/<name>`).
 /// `None` for a target that escapes the work tree or does not live under `.git/` (an unhandled layout).
-fn resolve_module_gitdir(path: &str, target: &str) -> Option<String> {
-	let mut parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-	for component in target.split('/') {
+fn resolve_module_gitdir(path: &GitPath, target: &[u8]) -> Option<String> {
+	let mut parts: Vec<&[u8]> = path.components().collect();
+	for component in target.split(|byte| *byte == b'/') {
 		match component {
-			"" | "." => {}
-			".." => {
+			b"" | b"." => {}
+			b".." => {
 				parts.pop()?;
 			}
 			other => parts.push(other),
 		}
 	}
-	parts.join("/").strip_prefix(".git/").map(str::to_owned)
+	let mut resolved = Vec::new();
+	for (index, part) in parts.iter().enumerate() {
+		if index != 0 {
+			resolved.push(b'/');
+		}
+		resolved.extend_from_slice(part);
+	}
+	let relative = resolved.strip_prefix(b".git/")?;
+	Some(std::str::from_utf8(relative).ok()?.to_owned())
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+	while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+		bytes = &bytes[1..];
+	}
+	while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+		bytes = &bytes[..bytes.len() - 1];
+	}
+	bytes
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn resolves_a_module_below_a_raw_mount_path() {
+		let mount = GitPath::from_bytes(b"raw-\xff".to_vec()).unwrap();
+		assert_eq!(
+			resolve_module_gitdir(&mount, b"../.git/modules/sub"),
+			Some("modules/sub".to_owned())
+		);
+	}
+
+	#[test]
+	fn rejects_a_non_utf8_repository_store_key() {
+		let mount = GitPath::from_utf8("sub").unwrap();
+		assert_eq!(
+			resolve_module_gitdir(&mount, b"../.git/modules/raw-\xff"),
+			None
+		);
+	}
 }
