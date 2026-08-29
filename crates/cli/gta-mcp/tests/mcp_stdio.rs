@@ -41,4 +41,20 @@ fn mcp_stdio_advertises_gta_tools() {
 			"tools/list should advertise `{tool}`; got: {stdout}"
 		);
 	}
+
+	let tools = stdout
+		.lines()
+		.filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+		.find(|reply| reply["id"] == 2)
+		.expect("tools/list reply");
+	let ls_files = tools["result"]["tools"]
+		.as_array()
+		.expect("tools array")
+		.iter()
+		.find(|tool| tool["name"] == "ls-files")
+		.expect("ls-files tool");
+	assert!(
+		ls_files["inputSchema"]["properties"].get("z").is_none(),
+		"MCP ls-files must not advertise raw NUL-delimited output: {ls_files}"
+	);
 }

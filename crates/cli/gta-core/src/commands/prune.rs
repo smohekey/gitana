@@ -18,7 +18,7 @@ impl WorkTreeCommand for Prune {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		_prefix: String,
+		_prefix: gitana_path::GitPath,
 	) -> Result<()> {
 		let report = gitana_porcelain::prune(&worktree).await?;
 		println!("Pruned {} unreachable object(s).", report.pruned);

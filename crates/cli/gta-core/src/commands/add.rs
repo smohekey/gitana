@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use crate::Backend;
+use crate::{Backend, ResultPathMode};
 use anyhow::Result;
 use gitana_object::HashAlgorithm;
+use gitana_path::GitPathspec;
 use gitana_worktree::{WorkTree, WorktreeError};
 
 use crate::dispatch::{self, WorkTreeCommand};
@@ -10,13 +11,19 @@ use crate::error::AddAdvisory;
 
 /// Stage the given pathspecs (files, directories, or `.`), interpreted relative to `cwd`. `force`
 /// (git's `-f`/`--force`) stages explicitly-named ignored paths that would otherwise be refused.
-pub async fn run(cwd: &Path, pathspecs: &[String], force: bool) -> Result<()> {
+pub async fn run(
+	cwd: &Path,
+	pathspecs: &[GitPathspec],
+	force: bool,
+	result_path_mode: ResultPathMode,
+) -> Result<()> {
 	dispatch::on_worktree(
 		cwd,
 		Add {
 			cwd: cwd.to_owned(),
 			pathspecs,
 			force,
+			result_path_mode,
 		},
 	)
 	.await
@@ -24,17 +31,17 @@ pub async fn run(cwd: &Path, pathspecs: &[String], force: bool) -> Result<()> {
 
 struct Add<'a> {
 	cwd: std::path::PathBuf,
-	pathspecs: &'a [String],
+	pathspecs: &'a [GitPathspec],
 	force: bool,
+	result_path_mode: ResultPathMode,
 }
 
 impl WorkTreeCommand for Add<'_> {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		prefix: String,
+		prefix: gitana_path::GitPath,
 	) -> Result<()> {
-		let specs: Vec<&str> = self.pathspecs.iter().map(String::as_str).collect();
 		// git reads (and validates) advice.updateSparsePath / advice.addIgnoredFile during `add` setup —
 		// before touching the index — so a malformed boolean fails the command before anything is staged, on
 		// every add (probed vs git 2.50.1). Read them up front for that fail-before-staging parity, and reuse
@@ -58,13 +65,26 @@ impl WorkTreeCommand for Add<'_> {
 			crate::excludes::resolve_excludes_file(&config, &self.cwd, &prefix).await?
 		};
 		match worktree
-			.add(&specs, &prefix, self.force, excludes_file.as_deref())
+			.add_pathspecs(
+				self.pathspecs,
+				&prefix,
+				self.force,
+				excludes_file.as_deref(),
+			)
 			.await
 		{
 			Ok(()) => Ok(()),
 			// git stages everything it can, then exits non-zero rendering the sparse block (for out-of-cone
 			// pathspecs) and/or the ignored block (for ignored pathspecs). The staged work is already saved.
 			Err(WorktreeError::PathspecAdvisory { sparse, ignored }) => {
+				let sparse = sparse
+					.iter()
+					.map(|path| crate::git_path::render_result_pathspec(path, self.result_path_mode))
+					.collect();
+				let ignored = ignored
+					.iter()
+					.map(|path| crate::git_path::render_result_path(path, self.result_path_mode))
+					.collect();
 				Err(AddAdvisory::new(sparse, ignored, show_sparse_hints, show_ignored_hints).into())
 			}
 			Err(other) => Err(other.into()),

@@ -37,6 +37,6 @@ pub use ls_files_options::LsFilesOptions;
 pub use rm::RmOutcome;
 pub(crate) use sparse::SparseCheckout;
 pub use sparse::{SparseReapply, SparseSet};
-pub use status::{Status, StatusEntry};
+pub use status::{Status, StatusEntry, UntrackedEntry};
 pub(crate) use submodule::submodule_head_oid;
 pub use worktree::WorkTree;

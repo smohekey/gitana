@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use gitana_config::GitConfig;
+use gitana_path::GitPath;
 
 /// The content of git's standard excludes file for a command invoked at `cwd` with discovered `prefix`
 /// (the `/`-joined path below the work-tree root), or `None` when there is none. Resolved from the
@@ -19,8 +20,8 @@ use gitana_config::GitConfig;
 pub(crate) async fn resolve_excludes_file(
 	config: &GitConfig,
 	cwd: &Path,
-	prefix: &str,
-) -> Result<Option<String>> {
+	prefix: &GitPath,
+) -> Result<Option<Vec<u8>>> {
 	validate_excludes_file_setting(config)?;
 	let root = worktree_root(cwd, prefix).await;
 	read_excludes_file(config.get_string("core", None, "excludesfile"), &root).await
@@ -49,16 +50,15 @@ pub(crate) fn validate_excludes_file_setting(config: &GitConfig) -> Result<()> {
 /// current subdirectory. `cwd` is canonicalised first so a symlinked `-C` argument still yields the real
 /// root the `prefix` was measured against. The canonicalisation is async (offloaded) so it never blocks
 /// the runtime on a slow filesystem, as `docs/conventions.md` requires of async command paths.
-async fn worktree_root(cwd: &Path, prefix: &str) -> PathBuf {
+async fn worktree_root(cwd: &Path, prefix: &GitPath) -> PathBuf {
 	let cwd = tokio::fs::canonicalize(cwd)
 		.await
 		.unwrap_or_else(|_| cwd.to_owned());
-	let prefix = prefix.trim_matches('/');
-	if prefix.is_empty() {
+	if prefix.is_root() {
 		return cwd;
 	}
 	let mut root = cwd.as_path();
-	for _ in prefix.split('/') {
+	for _ in prefix.components() {
 		root = root.parent().unwrap_or(root);
 	}
 	root.to_owned()
@@ -70,7 +70,7 @@ async fn worktree_root(cwd: &Path, prefix: &str) -> PathBuf {
 /// to `~/.config/git/ignore`). A missing file contributes no patterns, but any other read failure — a
 /// configured path that is a directory or is unreadable — is an error, as it is for git. The filesystem
 /// reads are async (offloaded) so a slow/network-mounted excludes file never blocks the runtime.
-async fn read_excludes_file(configured: Option<&str>, root: &Path) -> Result<Option<String>> {
+async fn read_excludes_file(configured: Option<&str>, root: &Path) -> Result<Option<Vec<u8>>> {
 	let path = match configured {
 		Some("") => return Ok(None), // explicitly disabled
 		Some(value) => {
@@ -94,7 +94,7 @@ async fn read_excludes_file(configured: Option<&str>, root: &Path) -> Result<Opt
 		},
 	};
 	match tokio::fs::read(&path).await {
-		Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+		Ok(bytes) => Ok(Some(bytes)),
 		// A missing file is fine (a configured-but-absent path, or no XDG default, just adds no patterns).
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
 		// git is fatal ("cannot use … as an exclude file") only when the path is a *directory*; a regular
@@ -151,4 +151,20 @@ fn xdg_config_home() -> Option<PathBuf> {
 	std::env::var_os("HOME")
 		.filter(|home| !home.is_empty())
 		.map(|home| PathBuf::from(home).join(".config"))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::read_excludes_file;
+
+	#[tokio::test]
+	async fn reads_exclude_patterns_as_exact_bytes() {
+		let root = tempfile::tempdir().unwrap();
+		std::fs::write(root.path().join("exclude"), b"raw-\xff\n").unwrap();
+
+		let content = read_excludes_file(Some("exclude"), root.path())
+			.await
+			.unwrap();
+		assert_eq!(content.as_deref(), Some(b"raw-\xff\n".as_slice()));
+	}
 }

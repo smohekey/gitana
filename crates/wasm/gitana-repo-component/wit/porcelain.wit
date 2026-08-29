@@ -1,4 +1,4 @@
-package gitana:repo@0.13.0;
+package gitana:repo@0.14.0;
 
 /// HTTP credential resolution, granted by the host.
 ///
@@ -215,10 +215,26 @@ interface porcelain {
 		gitlink,
 	}
 
+	/// An exact repository-relative Git path. `utf8` is the convenient portable
+	/// spelling; `bytes` preserves names that are not Unicode. Filesystem-backed
+	/// operations may return `unsupported-format` when their host cannot represent
+	/// the supplied byte sequence without loss.
+	variant git-path {
+		utf8(string),
+		bytes(list<u8>),
+	}
+
+	/// A revision specification. `utf8` is the ordinary spelling; `bytes` preserves a non-Unicode
+	/// tree path suffix such as `HEAD:<path>` without changing its bytes.
+	variant revision-spec {
+		utf8(string),
+		bytes(list<u8>),
+	}
+
 	/// An input entry for `write-tree`.
 	record tree-build-entry {
 		/// Repo-relative path (`/` separators).
-		path: string,
+		path: git-path,
 		/// The entry's mode.
 		mode: file-mode,
 		/// The blob (or, for `symlink`, target-path blob) id (hex).
@@ -227,8 +243,9 @@ interface porcelain {
 
 	/// One entry of a recursively flattened tree (`ls-tree -r`).
 	record tree-entry {
-		/// Repo-relative path (`/` separators).
-		path: string,
+		/// Exact recursively presented path bytes (`/` separators). A damaged or foreign tree may
+		/// expose a noncanonical name here; filesystem-backed operations validate their inputs again.
+		path: git-path,
 		/// The octal mode string as stored (`100644`, `100755`, `120000`, `160000`).
 		mode: string,
 		/// The entry's object id (hex).
@@ -338,11 +355,18 @@ interface porcelain {
 	/// conflict letter (`U`/`A`/`D`) in both.
 	record status-entry {
 		/// Repository-relative path (`/` separators).
-		path: string,
+		path: git-path,
 		/// The index-vs-HEAD code (`X`), a single-character string.
 		index: string,
 		/// The worktree-vs-index code (`Y`), a single-character string.
 		worktree: string,
+	}
+
+	/// One untracked worktree entry. `directory` is true when the default status
+	/// collapse represents the entire untracked directory rather than one file.
+	record untracked-entry {
+		path: git-path,
+		directory: bool,
 	}
 
 	/// A working tree's status: tracked paths whose index or worktree code is not
@@ -353,7 +377,7 @@ interface porcelain {
 		/// Tracked paths with a non-clean or conflicted status.
 		changed: list<status-entry>,
 		/// Untracked paths and collapsed untracked directories.
-		untracked: list<string>,
+		untracked: list<untracked-entry>,
 	}
 
 	/// A sparse-checkout set — the arguments to `sparse-set`/`sparse-add` and what `sparse-list`
@@ -363,8 +387,15 @@ interface porcelain {
 	record sparse-patterns {
 		/// Whether this is cone mode (directories) rather than non-cone (patterns).
 		cone: bool,
-		/// The included directories (cone) or pattern lines (non-cone).
-		entries: list<string>,
+		/// The included directories (cone) or pattern lines (non-cone), preserving arbitrary Git bytes.
+		entries: list<sparse-entry>,
+	}
+
+	/// One sparse-checkout directory or pattern line. `utf8` is the portable spelling; `bytes`
+	/// preserves entries that are not Unicode.
+	variant sparse-entry {
+		utf8(string),
+		bytes(list<u8>),
 	}
 
 	/// The outcome of applying (or reapplying) sparse patterns. Both lists are paths the caller
@@ -372,10 +403,10 @@ interface porcelain {
 	/// sparse patterns" and "already present ... not updated despite sparse patterns" respectively.
 	record sparse-outcome {
 		/// Excluded-but-modified paths left in the working tree (skip-worktree not set).
-		left-dirty: list<string>,
+		left-dirty: list<git-path>,
 		/// Included paths not materialised because an untracked file occupies an ancestor slot: that
 		/// file is preserved and the path's skip-worktree bit is cleared, but nothing is written.
-		not-updated: list<string>,
+		not-updated: list<git-path>,
 	}
 
 	resource repository {
@@ -432,22 +463,22 @@ interface porcelain {
 		/// Resolve `spec` and read the raw object it names. Every `spec` in this
 		/// interface accepts the full rev-parse syntax (`HEAD`, ref names, hex or
 		/// abbreviated ids, `~`/`^`/`^{type}` forms, `<rev>:<path>`).
-		read-object: func(spec: string) -> result<object-info, repo-error>;
+		read-object: func(spec: revision-spec) -> result<object-info, repo-error>;
 
 		/// Resolve `spec` and read it as a blob.
-		read-blob: func(spec: string) -> result<list<u8>, repo-error>;
+		read-blob: func(spec: revision-spec) -> result<list<u8>, repo-error>;
 
 		/// Resolve `spec` and read it as a commit.
-		read-commit: func(spec: string) -> result<commit-info, repo-error>;
+		read-commit: func(spec: revision-spec) -> result<commit-info, repo-error>;
 
 		/// Resolve `spec` and read it as an annotated tag.
-		read-tag: func(spec: string) -> result<tag-info, repo-error>;
+		read-tag: func(spec: revision-spec) -> result<tag-info, repo-error>;
 
 		/// Recursively list the tree `spec` peels to (a commit, tag, or tree).
-		ls-tree: func(spec: string) -> result<list<tree-entry>, repo-error>;
+		ls-tree: func(spec: revision-spec) -> result<list<tree-entry>, repo-error>;
 
 		/// Resolve `spec` to an object id (hex).
-		rev-parse: func(spec: string) -> result<string, repo-error>;
+		rev-parse: func(spec: revision-spec) -> result<string, repo-error>;
 
 		/// The commits reachable from `tips` (each a spec), committer-date newest
 		/// first, truncated to `max-count` when given. Returns ids; compose with
@@ -546,13 +577,13 @@ interface porcelain {
 		/// refused with an `invalid` error (git's "paths are ignored, use -f"),
 		/// staging any tracked modifications beneath it; `force` (git's `-f`) stages
 		/// the ignored content too.
-		add: func(pathspecs: list<string>, prefix: string, force: bool) -> result<_, repo-error>;
+		add: func(pathspecs: list<git-path>, prefix: git-path, force: bool) -> result<_, repo-error>;
 
 		/// Materialise the tree that `tree-ish` peels to (a commit, tag, or tree
 		/// spec) into the working tree and index. Does not move `HEAD`. Without
 		/// `force`, fails with `conflict` rather than overwrite uncommitted local
 		/// changes or an untracked file.
-		checkout: func(tree-ish: string, force: bool) -> result<_, repo-error>;
+		checkout: func(tree-ish: revision-spec, force: bool) -> result<_, repo-error>;
 
 		/// Record a commit from the staged index on the current branch, returning
 		/// the new commit id (hex). Refuses an unmerged or empty index. `author`
@@ -570,11 +601,11 @@ interface porcelain {
 		/// config; `core.sparseCheckout`/`core.sparseCheckoutCone` per-worktree), writes
 		/// `info/sparse-checkout`, and materialises/omits working-tree files to match — returning any
 		/// excluded-but-modified paths left behind.
-		sparse-set: func(patterns: list<string>, cone: bool) -> result<sparse-outcome, repo-error>;
+		sparse-set: func(patterns: list<sparse-entry>, cone: bool) -> result<sparse-outcome, repo-error>;
 
 		/// Extend the current sparse-checkout set with `patterns`, keeping the configured mode, then apply
 		/// it (git's `sparse-checkout add`). Fails with `invalid` if sparse-checkout is not enabled.
-		sparse-add: func(patterns: list<string>) -> result<sparse-outcome, repo-error>;
+		sparse-add: func(patterns: list<sparse-entry>) -> result<sparse-outcome, repo-error>;
 
 		/// The current sparse-checkout set — the included directories (cone) or pattern lines (non-cone) —
 		/// or `none` when sparse-checkout is not enabled (git's `sparse-checkout list`).

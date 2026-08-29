@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::Backend;
 use anyhow::{Result, bail};
 use gitana_object::HashAlgorithm;
+use gitana_path::GitPathspec;
 use gitana_worktree::WorkTree;
 
 use crate::dispatch::{self, WorkTreeCommand};
@@ -19,8 +20,8 @@ pub async fn run(
 	soft: bool,
 	mixed: bool,
 	hard: bool,
-	target: Option<String>,
-	paths: Vec<String>,
+	target: Option<Vec<u8>>,
+	paths: Vec<GitPathspec>,
 ) -> Result<()> {
 	dispatch::on_worktree(
 		cwd,
@@ -41,15 +42,15 @@ struct Reset {
 	soft: bool,
 	mixed: bool,
 	hard: bool,
-	target: Option<String>,
-	paths: Vec<String>,
+	target: Option<Vec<u8>>,
+	paths: Vec<GitPathspec>,
 }
 
 impl WorkTreeCommand for Reset {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		prefix: String,
+		prefix: gitana_path::GitPath,
 	) -> Result<()> {
 		if [self.soft, self.mixed, self.hard]
 			.iter()
@@ -59,7 +60,7 @@ impl WorkTreeCommand for Reset {
 		{
 			bail!("--soft, --mixed, and --hard are mutually exclusive");
 		}
-		let rev = self.target.as_deref().unwrap_or("HEAD");
+		let rev = self.target.as_deref().unwrap_or(b"HEAD");
 		let repo = worktree.repository();
 
 		if !self.paths.is_empty() {
@@ -74,14 +75,17 @@ impl WorkTreeCommand for Reset {
 			let tree = if self.target.is_none() && repo.refs().resolve_head().await?.is_none() {
 				repo.write_tree(&[]).await?
 			} else {
-				repo.rev_parse(&format!("{rev}^{{tree}}")).await?
+				let target = repo.rev_parse(rev).await?;
+				repo.peel_to_tree(target).await?
 			};
-			let specs: Vec<&str> = self.paths.iter().map(String::as_str).collect();
-			worktree.reset_index_paths(tree, &specs, &prefix).await?;
+			worktree
+				.reset_index_pathspecs(tree, &self.paths, &prefix)
+				.await?;
 			return Ok(());
 		}
 
-		let commit = repo.rev_parse(&format!("{rev}^{{commit}}")).await?;
+		let target = repo.rev_parse(rev).await?;
+		let commit = repo.peel_to_commit(target).await?;
 
 		// Materialise the index/working tree before moving the branch, so a failure (e.g. an unsafe
 		// tree path) leaves `HEAD` where it was — the same order `switch` checks out before moving.
@@ -103,6 +107,10 @@ impl WorkTreeCommand for Reset {
 		}
 
 		let committer = identity::signature_or_default(repo, "COMMITTER").await?;
+		let rev = match std::str::from_utf8(rev) {
+			Ok(rev) => rev.to_owned(),
+			Err(_) => gitana_path::quote_bytes(rev),
+		};
 		repo
 			.reset_head(commit, &committer, &format!("reset: moving to {rev}"))
 			.await?;

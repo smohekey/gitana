@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_path::{GitPath, GitPathspec};
 
 use crate::checkout::{
 	remove_gitlink_mount, remove_worktree_path, validate_path, write_worktree_file,
@@ -30,8 +31,8 @@ pub(crate) async fn run<F, W, H>(
 	source: Option<ObjectId<H>>,
 	worktree: bool,
 	staged: bool,
-	pathspecs: &[&str],
-	prefix: &str,
+	pathspecs: &[GitPathspec],
+	prefix: &GitPath,
 	require_match: bool,
 	exclude_sparse: bool,
 ) -> Result<(), WorktreeError>
@@ -44,7 +45,7 @@ where
 
 	// The `(path, mode, oid)` content a selected path is restored from: the source tree, or the
 	// current index when there is no tree source.
-	let source_entries: Vec<(String, String, ObjectId<H>)> = match source {
+	let source_entries: Vec<(GitPath, String, ObjectId<H>)> = match source {
 		Some(tree) => wt.repository().read_tree(tree).await?,
 		None => index
 			.entries
@@ -57,14 +58,14 @@ where
 	// The paths a pathspec may select: everything in the source, plus every currently-tracked
 	// index path. The latter lets a path that exists now but not in the source be matched for
 	// removal (the worktree file deleted, the index entry dropped).
-	let index_paths: Vec<String> = index
+	let index_paths: Vec<GitPath> = index
 		.entries
 		.iter()
 		.filter(|e| e.stage == 0)
 		.map(|e| e.path.clone())
 		.collect();
-	let mut universe: BTreeSet<&str> = source_entries.iter().map(|(p, _, _)| p.as_str()).collect();
-	universe.extend(index_paths.iter().map(String::as_str));
+	let mut universe: BTreeSet<&GitPath> = source_entries.iter().map(|(p, _, _)| p).collect();
+	universe.extend(index_paths.iter());
 
 	// Select the paths each pathspec matches. With `require_match`, a pathspec that matches
 	// nothing is an error (`restore`/`checkout`); without it, an unmatched pathspec is silently
@@ -77,7 +78,7 @@ where
 	// a recreated omitted file from the index), so a present skip-worktree entry is materialized and must
 	// stay selectable. Path-limited `reset` (`exclude_sparse` false) is different — git *does* update an
 	// explicitly named sparse entry's staged blob while keeping its bit — so it does not exclude them.
-	let mut sparse: BTreeSet<&str> = BTreeSet::new();
+	let mut sparse: BTreeSet<&GitPath> = BTreeSet::new();
 	if exclude_sparse {
 		for entry in index
 			.entries
@@ -85,7 +86,7 @@ where
 			.filter(|e| e.stage == 0 && e.skip_worktree)
 		{
 			if wt.work().lstat(&entry.path)?.is_none() {
-				sparse.insert(entry.path.as_str());
+				sparse.insert(&entry.path);
 			}
 		}
 	}
@@ -103,7 +104,7 @@ where
 	// which git treats as an implicit repository-root `.` minus the exclusions. Without this guard a
 	// direct `restore(…, &[], …)` (or `reset_index_paths(…, &[], …)`) would select the whole universe.
 	let negative_only = set.is_positive_empty() && !pathspecs.is_empty();
-	let mut selected: BTreeSet<&str> = BTreeSet::new();
+	let mut selected: BTreeSet<&GitPath> = BTreeSet::new();
 	// A negative-only set selects the *whole* repo minus the exclusions — git's implicit positive for an
 	// all-negative set is the repo-root `.`, NOT prefix-scoped (probed vs git 2.50.1: from a subdir,
 	// `restore :!nope` restores paths outside that subdir too). Track whether any candidate existed at
@@ -127,10 +128,12 @@ where
 			// The implicit root `.` fails to match only when there is nothing to match against — an empty
 			// repo, or one whose every path is sparse-excluded (git then reports both `:!<spec>` and `.`).
 			if !had_candidate {
-				return Err(WorktreeError::PathspecMatch(".".to_owned()));
+				return Err(WorktreeError::PathspecMatch(
+					GitPathspec::from_utf8(".").expect("the implicit root pathspec is valid"),
+				));
 			}
 		} else if let Some(spec) = set.unmatched() {
-			return Err(WorktreeError::PathspecMatch(spec.to_owned()));
+			return Err(WorktreeError::PathspecMatch(spec.clone()));
 		}
 	}
 
@@ -157,6 +160,11 @@ where
 	}
 	for &path in &selected {
 		validate_path(path)?;
+		if worktree {
+			// A worktree restore applies every selected path as one batch. Reject a path the backend
+			// cannot represent before the first sibling write/removal marks the index lock as mutating.
+			wt.work().validate_path_representable(path)?;
+		}
 		// A null-OID gitlink is not a valid cache entry — reject it (git's "cache entry has null sha1")
 		// for a STAGED restore too, not just the worktree preflight above, before the upsert persists it.
 		if let Some((_, mode, oid)) = source_entries.iter().find(|(p, _, _)| p == path) {
@@ -224,16 +232,12 @@ where
 					// when the gitlink ancestor is itself selected (so the mount is materialised); if the pathspec
 					// picked just the descendant, git removes it normally, so we must too.
 					let under_incoming_gitlink = source_entries.iter().any(|(sp, sm, _)| {
-						if sm != "160000" || !selected.contains(sp.as_str()) {
+						if sm != "160000" || !selected.contains(sp) {
 							return false;
 						}
 						// Exact prefix, plus a fold-aware one under `core.ignoreCase` / an `:(icase)` pathspec so a
 						// recased descendant `sub/file` is recognised as inside a selected gitlink `Sub` and preserved.
-						path.starts_with(&format!("{sp}/"))
-							|| (fold
-								&& path
-									.to_ascii_lowercase()
-									.starts_with(&format!("{}/", sp.to_ascii_lowercase())))
+						path.is_below_with_ascii_case(sp, fold)
 					});
 					// Removing a gitlink itself rmdir's only its EMPTY mount (git leaves a populated submodule, or
 					// a file the user put at the slot) via the mode-aware helper — `remove_worktree_path` never

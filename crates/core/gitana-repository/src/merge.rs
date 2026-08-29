@@ -12,7 +12,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use gitana_file_store::FileStore;
-use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, TreeEntry, encode_tree, parse_tree};
+use gitana_object::{
+	HashAlgorithm, ObjectError, ObjectId, ObjectKind, TreeEntry, encode_tree, parse_tree,
+};
+use gitana_path::{GitPath, GitPathComponent, GitTreeEntryName};
 
 use crate::{FileMode, Repository, RepositoryError};
 
@@ -20,7 +23,7 @@ use crate::{FileMode, Repository, RepositoryError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeMerge<H: HashAlgorithm> {
 	pub tree: ObjectId<H>,
-	pub conflicts: Vec<String>,
+	pub conflicts: Vec<GitPath>,
 }
 
 /// Three-way merge the `ours` and `theirs` trees against their common `base` tree.
@@ -43,7 +46,9 @@ pub(crate) async fn merge_trees<H: HashAlgorithm>(
 /// Boxed recursive future for [`merge_tree`]: the merged subtree id (`None` if empty) and the
 /// conflicted paths relative to that subtree.
 type MergeTreeFuture<'a, H> = Pin<
-	Box<dyn Future<Output = Result<(Option<ObjectId<H>>, Vec<String>), RepositoryError>> + Send + 'a>,
+	Box<
+		dyn Future<Output = Result<(Option<ObjectId<H>>, Vec<GitPath>), RepositoryError>> + Send + 'a,
+	>,
 >;
 
 /// How an entry of a given name appears on one side of the merge.
@@ -85,18 +90,20 @@ fn merge_tree<'a, H: HashAlgorithm>(
 		let ours_map = by_name(&ours_entries);
 		let theirs_map = by_name(&theirs_entries);
 
-		let mut names: BTreeSet<&str> = BTreeSet::new();
+		let mut names: BTreeSet<&GitTreeEntryName> = BTreeSet::new();
 		names.extend(base_map.keys().copied());
 		names.extend(ours_map.keys().copied());
 		names.extend(theirs_map.keys().copied());
 
 		let mut entries: Vec<TreeEntry<H>> = Vec::new();
-		let mut conflicts: Vec<String> = Vec::new();
+		let mut conflicts: Vec<GitPath> = Vec::new();
 
-		for name in names {
-			let base_entry = base_map.get(name).copied();
-			let ours_entry = ours_map.get(name).copied();
-			let theirs_entry = theirs_map.get(name).copied();
+		for tree_name in names {
+			let base_entry = base_map.get(tree_name).copied();
+			let ours_entry = ours_map.get(tree_name).copied();
+			let theirs_entry = theirs_map.get(tree_name).copied();
+			let name = GitPathComponent::try_from(tree_name).map_err(|_| ObjectError::InvalidTreeName)?;
+			let name = &name;
 
 			// Trivial resolutions first.
 			let resolved = if ours_entry == theirs_entry {
@@ -118,7 +125,7 @@ fn merge_tree<'a, H: HashAlgorithm>(
 						conflicts.extend(
 							sub_conflicts
 								.into_iter()
-								.map(|path| format!("{name}/{path}")),
+								.map(|path| GitPath::root().join(name).join_path(&path)),
 						);
 						if let Some(id) = id {
 							entries.push(tree_entry(name, id));
@@ -149,7 +156,7 @@ fn merge_tree<'a, H: HashAlgorithm>(
 					// conflict flag, not a second path. Applies to blob-vs-tree the same as gitlink-vs-tree; full
 					// D/F relocation is a separate general-merge concern, not submodule-specific.
 					_ => {
-						conflicts.push(name.to_owned());
+						conflicts.push(GitPath::root().join(name));
 						ours_entry.or(theirs_entry)
 					}
 				}
@@ -175,11 +182,11 @@ fn merge_tree<'a, H: HashAlgorithm>(
 /// The mode resolves three-way via [`resolve_mode`].
 async fn merge_blobs<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
-	name: &str,
+	name: &GitPathComponent,
 	base: Option<&TreeEntry<H>>,
 	ours: &TreeEntry<H>,
 	theirs: &TreeEntry<H>,
-	conflicts: &mut Vec<String>,
+	conflicts: &mut Vec<GitPath>,
 ) -> Result<TreeEntry<H>, RepositoryError> {
 	let base_id = base.map(|entry| entry.id);
 	let (id, content_conflict) = if ours.id == theirs.id || Some(theirs.id) == base_id {
@@ -217,11 +224,11 @@ async fn merge_blobs<H: HashAlgorithm>(
 
 	let (mode, mode_conflict) = resolve_mode(&ours.mode, &theirs.mode, base.map(|b| b.mode.as_str()));
 	if content_conflict || mode_conflict {
-		conflicts.push(name.to_owned());
+		conflicts.push(GitPath::root().join(name));
 	}
 	Ok(TreeEntry {
 		mode,
-		name: name.to_owned(),
+		name: name.clone().into(),
 		id,
 	})
 }
@@ -253,14 +260,16 @@ async fn read_entries<H: HashAlgorithm>(
 	Ok(parse_tree::<H>(&payload)?)
 }
 
-fn by_name<H: HashAlgorithm>(entries: &[TreeEntry<H>]) -> HashMap<&str, &TreeEntry<H>> {
-	entries.iter().map(|e| (e.name.as_str(), e)).collect()
+fn by_name<H: HashAlgorithm>(
+	entries: &[TreeEntry<H>],
+) -> HashMap<&GitTreeEntryName, &TreeEntry<H>> {
+	entries.iter().map(|entry| (&entry.name, entry)).collect()
 }
 
-fn tree_entry<H: HashAlgorithm>(name: &str, id: ObjectId<H>) -> TreeEntry<H> {
+fn tree_entry<H: HashAlgorithm>(name: &GitPathComponent, id: ObjectId<H>) -> TreeEntry<H> {
 	TreeEntry {
 		mode: FileMode::Directory.as_str().to_owned(),
-		name: name.to_owned(),
+		name: name.clone().into(),
 		id,
 	}
 }
@@ -298,7 +307,7 @@ mod tests {
 		for (path, content) in files {
 			let id = repo.write_blob(content.as_bytes()).await.unwrap();
 			entries.push(TreeBuildEntry {
-				path: (*path).to_owned(),
+				path: GitPath::from_utf8(path).unwrap(),
 				mode: FileMode::Regular,
 				id,
 			});
@@ -316,7 +325,7 @@ mod tests {
 		let id = repo.write_blob(content).await.unwrap();
 		repo
 			.write_tree(&[TreeBuildEntry {
-				path: "f.bin".to_owned(),
+				path: GitPath::from_utf8("f.bin").unwrap(),
 				mode,
 				id,
 			}])
@@ -330,7 +339,7 @@ mod tests {
 			.await
 			.unwrap()
 			.into_iter()
-			.map(|(path, _, _)| path)
+			.map(|(path, _, _)| path.as_utf8().unwrap().to_owned())
 			.collect();
 		paths.sort();
 		paths

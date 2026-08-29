@@ -182,7 +182,7 @@ pub struct WorktreeInspection {
 	/// is pristine (solely tracked files); a non-empty one is content safe removal must preserve (never
 	/// delete), the conservative gate that keeps a non-git-faithful `.gitignore` match from ever authorising
 	/// deletion of a git-untracked file. `None` when no status was requested / not a live checkout.
-	pub residual_paths: Option<Vec<String>>,
+	pub residual_paths: Option<Vec<gitana_path::GitPath>>,
 	/// The live checkout's stage-0 tracked paths present on disk whose content or mode **diverges from the
 	/// index**, verified by hashing the working file rather than trusting the index stat cache. Catches edits
 	/// `status` can miss (a stat-preserving/same-size rewrite, a coarse-timestamp filesystem) and skip-worktree
@@ -190,7 +190,7 @@ pub struct WorktreeInspection {
 	/// An empty `Some(vec)` means every present tracked file hashes equal to the index (reconstructable); a
 	/// non-empty one is tracked-file content safe removal must preserve. `None` when no status was requested /
 	/// not a live checkout.
-	pub diverged_tracked_content: Option<Vec<String>>,
+	pub diverged_tracked_content: Option<Vec<gitana_path::GitPath>>,
 	/// Whether the live checkout uses a **sparse index** (`git sparse-checkout --sparse-index`) — its index
 	/// carries a collapsed `040000` sparse-directory entry gitana does not expand, so a status computed over it
 	/// reports spurious add/delete pairs. Computed under the same condition as

@@ -10,17 +10,26 @@ use crate::bindings::exports::gitana::repo::porcelain::RepoError;
 /// Map engine errors onto the WIT `repo-error` surface. Anything without a more
 /// precise variant is a `backend` failure.
 pub(crate) fn repo_error(error: RepositoryError) -> RepoError {
+	let rendered = error.render_with_paths(
+		|path| path.quote_with_affixes(b"", b""),
+		gitana_path::GitPathspec::quote,
+	);
 	match error {
 		RepositoryError::UnknownRevision(spec) => RepoError::UnknownRevision(spec),
 		RepositoryError::AmbiguousRevision(hex) => RepoError::Ambiguous(hex),
 		RepositoryError::InvalidRef(message) => RepoError::Invalid(message),
+		RepositoryError::InvalidRevisionEncoding(_)
+		| RepositoryError::InvalidTreePath { .. }
+		| RepositoryError::MissingTreePath { .. }
+		| RepositoryError::TreePathComponentNotDirectory { .. }
+		| RepositoryError::TreePathNotDirectory(_) => RepoError::Invalid(rendered),
 		RepositoryError::RefMoved { name } => RepoError::RefMoved(name),
 		RepositoryError::MissingObject(id) => RepoError::NotFound(format!("missing object {id}")),
 		RepositoryError::UnsupportedFormat(message) => RepoError::UnsupportedFormat(message),
 		RepositoryError::Object(error) => RepoError::Invalid(error.to_string()),
 		RepositoryError::FileStore(error) => file_store_error(error),
 		RepositoryError::ObjectStore(error) => object_store_error(error),
-		other => RepoError::Backend(other.to_string()),
+		_ => RepoError::Backend(rendered),
 	}
 }
 
@@ -49,15 +58,24 @@ fn file_store_error(error: FileStoreError) -> RepoError {
 /// `invalid`; file-store and repository errors defer to their own mappings so
 /// not-found/ref-moved stay precise.
 pub(crate) fn worktree_error(error: WorktreeError) -> RepoError {
+	let rendered = error.render_with_paths(
+		|path| path.quote_with_affixes(b"", b""),
+		gitana_path::GitPathspec::quote,
+	);
 	match error {
 		WorktreeError::FileStore(error) => file_store_error(error),
 		WorktreeError::Repository(error) => repo_error(error),
-		conflict @ (WorktreeError::Conflict(_) | WorktreeError::UntrackedOverwrite(_)) => {
-			RepoError::Conflict(conflict.to_string())
+		WorktreeError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+			RepoError::UnsupportedFormat(error.to_string())
+		}
+		WorktreeError::Conflict(_) | WorktreeError::UntrackedOverwrite(_) => {
+			RepoError::Conflict(rendered)
 		}
 		WorktreeError::ChecksumMismatch => RepoError::Corruption("index checksum mismatch".to_owned()),
-		invalid @ (WorktreeError::Malformed(_)
+		WorktreeError::Malformed(_)
 		| WorktreeError::UnsafePath(_)
+		| WorktreeError::UnsafePathspec(_)
+		| WorktreeError::InvalidPath(_)
 		| WorktreeError::PathspecMatch(_)
 		| WorktreeError::EmptyPathspec
 		| WorktreeError::AbsolutePathspec(_)
@@ -76,7 +94,41 @@ pub(crate) fn worktree_error(error: WorktreeError) -> RepoError {
 		| WorktreeError::SubmodulePathIsSymlink(_)
 		| WorktreeError::NullGitlinkOid(_)
 		| WorktreeError::UnsupportedFileType(_)
-		| WorktreeError::Config(_)) => RepoError::Invalid(invalid.to_string()),
-		other => RepoError::Backend(other.to_string()),
+		| WorktreeError::Config(_) => RepoError::Invalid(rendered),
+		_ => RepoError::Backend(rendered),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::io;
+
+	use gitana_worktree::WorktreeError;
+
+	use super::{RepoError, worktree_error};
+
+	#[test]
+	fn unsupported_worktree_io_maps_to_unsupported_format() {
+		let mapped = worktree_error(WorktreeError::Io(io::Error::new(
+			io::ErrorKind::Unsupported,
+			"Git path is not representable on this host",
+		)));
+
+		match mapped {
+			RepoError::UnsupportedFormat(message) => {
+				assert_eq!(message, "Git path is not representable on this host");
+			}
+			other => panic!("expected unsupported-format, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn other_worktree_io_remains_a_backend_error() {
+		let mapped = worktree_error(WorktreeError::Io(io::Error::new(
+			io::ErrorKind::PermissionDenied,
+			"permission denied",
+		)));
+
+		assert!(matches!(mapped, RepoError::Backend(_)));
 	}
 }

@@ -8,14 +8,19 @@
 
 #![cfg(unix)]
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
+use gitana_path::GitPath;
 use gitana_repository::Repository;
-use gitana_worktree::{SparseSet, WorkTree, WorktreeError};
+use gitana_worktree::{IndexEntry, SparseSet, Stat, WorkTree, WorktreeError};
+
+mod support;
+use support::{Utf8OnlyWorkDir, make_utf8_only_repo};
 
 fn open_dir(path: impl AsRef<Path>) -> cap_std::fs::Dir {
 	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
@@ -27,6 +32,176 @@ fn make_repo(work: &Path) -> WorkTree<LocalFileStore, CapWorkDir, Sha256> {
 		open_dir(&git_dir),
 	)));
 	WorkTree::new(repo, CapWorkDir::from_dir(open_dir(work)), git_dir)
+}
+
+async fn add_raw_index_entry(
+	wt: &WorkTree<LocalFileStore, Utf8OnlyWorkDir, Sha256>,
+	path: &[u8],
+	skip_worktree: bool,
+) {
+	let oid = wt.repository().write_blob(b"raw\n").await.unwrap();
+	let mut index = wt.load_index().await.unwrap();
+	index.upsert(IndexEntry {
+		stat: Stat::default(),
+		mode: 0o100644,
+		oid,
+		stage: 0,
+		assume_valid: false,
+		skip_worktree,
+		intent_to_add: false,
+		path: GitPath::from_bytes(path.to_vec()).unwrap(),
+	});
+	wt.save_index(&index).await.unwrap();
+}
+
+fn assert_unsupported(error: &WorktreeError) {
+	assert!(
+		matches!(error, WorktreeError::Io(error) if error.kind() == io::ErrorKind::Unsupported),
+		"unexpected error: {error:?}"
+	);
+}
+
+#[tokio::test]
+async fn sparse_reapply_preflights_backend_path_representation() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("sparse-reapply-path-representation");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::create_dir_all(work.join("a")).unwrap();
+	std::fs::write(work.join("a/valid"), b"valid\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+
+	let wt = make_utf8_only_repo(&work);
+	add_raw_index_entry(&wt, b"z-raw-\xff", true).await;
+	git(&["-C", w, "config", "extensions.worktreeConfig", "true"]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckout",
+		"true",
+	]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckoutCone",
+		"true",
+	]);
+	std::fs::write(work.join(".git/info/sparse-checkout"), b"/*\n!/*/\n").unwrap();
+	let before_index = std::fs::read(work.join(".git/index")).unwrap();
+
+	let error = wt.reapply_sparse().await.unwrap_err();
+	assert_unsupported(&error);
+	assert_eq!(std::fs::read(work.join("a/valid")).unwrap(), b"valid\n");
+	assert_eq!(
+		std::fs::read(work.join(".git/index")).unwrap(),
+		before_index
+	);
+	assert!(!work.join(".git/index.lock").exists());
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn sparse_set_preflights_before_persisting_configuration() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("sparse-set-path-representation");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"valid\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+
+	let wt = make_utf8_only_repo(&work);
+	add_raw_index_entry(&wt, b"z-raw-\xff", false).await;
+	let before_config = std::fs::read(work.join(".git/config")).unwrap();
+	let before_index = std::fs::read(work.join(".git/index")).unwrap();
+	let error = wt
+		.apply_sparse_set(&SparseSet::cone_utf8(["included"]).unwrap())
+		.await
+		.unwrap_err();
+	assert_unsupported(&error);
+	assert_eq!(
+		std::fs::read(work.join(".git/config")).unwrap(),
+		before_config
+	);
+	assert_eq!(
+		std::fs::read(work.join(".git/index")).unwrap(),
+		before_index
+	);
+	assert!(!work.join(".git/config.worktree").exists());
+	assert!(!work.join(".git/info/sparse-checkout").exists());
+	assert!(!work.join(".git/index.lock").exists());
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn sparse_disable_preflights_backend_path_representation() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("sparse-disable-path-representation");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"valid\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+
+	let wt = make_utf8_only_repo(&work);
+	let mut index = wt.load_index().await.unwrap();
+	index
+		.entries
+		.iter_mut()
+		.find(|entry| entry.path == GitPath::from_utf8("a.txt").unwrap() && entry.stage == 0)
+		.unwrap()
+		.skip_worktree = true;
+	wt.save_index(&index).await.unwrap();
+	std::fs::remove_file(work.join("a.txt")).unwrap();
+	add_raw_index_entry(&wt, b"z-raw-\xff", true).await;
+	git(&["-C", w, "config", "extensions.worktreeConfig", "true"]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckout",
+		"true",
+	]);
+	git(&[
+		"-C",
+		w,
+		"config",
+		"--worktree",
+		"core.sparseCheckoutCone",
+		"true",
+	]);
+	std::fs::write(work.join(".git/info/sparse-checkout"), b"/*\n!/*/\n").unwrap();
+	let before_index = std::fs::read(work.join(".git/index")).unwrap();
+	let before_worktree_config = std::fs::read(work.join(".git/config.worktree")).unwrap();
+
+	let error = wt.disable_sparse().await.unwrap_err();
+	assert_unsupported(&error);
+	assert!(!work.join("a.txt").exists());
+	assert_eq!(
+		std::fs::read(work.join(".git/index")).unwrap(),
+		before_index
+	);
+	assert_eq!(
+		std::fs::read(work.join(".git/config.worktree")).unwrap(),
+		before_worktree_config
+	);
+	assert!(!work.join(".git/index.lock").exists());
+
+	std::fs::remove_dir_all(&work).ok();
 }
 
 /// A full checkout of `root.txt`, `a/f`, `a/b/g`, `x/h`, then cone sparse-checkout enabled for `a`
@@ -1539,7 +1714,7 @@ async fn apply_sparse_set_cone_matches_git() {
 	let w = work.to_str().unwrap();
 
 	let outcome = make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 	assert!(outcome.left_dirty.is_empty());
@@ -1594,7 +1769,7 @@ async fn cone_matches_case_insensitively_under_ignorecase() {
 
 	// Cone `set Dir` (capitalised) against the lowercase index path.
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["Dir".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["Dir"]).unwrap())
 		.await
 		.unwrap();
 
@@ -1615,13 +1790,13 @@ async fn current_sparse_set_lists_cone_dirs() {
 	}
 	let work = full_checkout("sparse-list");
 	let wt = make_repo(&work);
-	wt.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+	wt.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 
 	assert_eq!(
 		make_repo(&work).current_sparse_set().await.unwrap(),
-		Some(SparseSet::Cone(vec!["a".to_owned()]))
+		Some(SparseSet::cone_utf8(["a"]).unwrap())
 	);
 }
 
@@ -1635,7 +1810,7 @@ async fn disable_sparse_materialises_and_matches_git() {
 	let work = full_checkout("sparse-disable");
 	let w = work.to_str().unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 	assert!(!work.join("x/h").exists());
@@ -1669,7 +1844,7 @@ async fn widening_preserves_an_untracked_file_at_an_ancestor_slot() {
 	// Exclude `x/` (skip-worktree; the emptied `x/` is pruned), then drop an untracked regular file
 	// into the freed `x` slot — occupying the parent that materialising `x/h` would need.
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 	assert!(!work.join("x").exists());
@@ -1677,7 +1852,7 @@ async fn widening_preserves_an_untracked_file_at_an_ancestor_slot() {
 
 	// Widen to include `x`: `x/h` cannot be materialised (the untracked file is in the way).
 	let outcome = make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned(), "x".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a", "x"]).unwrap())
 		.await
 		.unwrap();
 	assert_eq!(outcome.not_updated, vec!["x/h".to_owned()]);
@@ -1711,7 +1886,7 @@ async fn widening_preserves_an_untracked_symlink_at_an_ancestor_slot() {
 	}
 	let work = full_checkout("sparse-widen-symlink");
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 	assert!(!work.join("x").exists());
@@ -1719,7 +1894,7 @@ async fn widening_preserves_an_untracked_symlink_at_an_ancestor_slot() {
 	std::os::unix::fs::symlink("gone", work.join("x")).unwrap();
 
 	let outcome = make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned(), "x".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a", "x"]).unwrap())
 		.await
 		.unwrap();
 	assert_eq!(outcome.not_updated, vec!["x/h".to_owned()]);
@@ -1741,7 +1916,7 @@ async fn widening_tolerates_an_escaping_symlink_ancestor() {
 	}
 	let work = full_checkout("sparse-widen-escsym");
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 	assert!(!work.join("x").exists());
@@ -1750,7 +1925,7 @@ async fn widening_tolerates_an_escaping_symlink_ancestor() {
 	std::os::unix::fs::symlink("/tmp", work.join("x")).unwrap();
 
 	let outcome = make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned(), "x".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a", "x"]).unwrap())
 		.await
 		.unwrap();
 	assert_eq!(outcome.not_updated, vec!["x/h".to_owned()]);
@@ -1770,7 +1945,7 @@ async fn disable_preserves_an_untracked_file_at_an_ancestor_slot() {
 	let work = full_checkout("sparse-disable-anc");
 	let w = work.to_str().unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 	std::fs::write(work.join("x"), b"untracked\n").unwrap();
@@ -1795,7 +1970,7 @@ async fn widening_preserves_a_present_modified_excluded_file() {
 	let work = full_checkout("sparse-widen-preserve");
 	let w = work.to_str().unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 	assert!(!work.join("x/h").exists());
@@ -1804,7 +1979,7 @@ async fn widening_preserves_a_present_modified_excluded_file() {
 	std::fs::create_dir_all(work.join("x")).unwrap();
 	std::fs::write(work.join("x/h"), b"LOCAL EDIT\n").unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned(), "x".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a", "x"]).unwrap())
 		.await
 		.unwrap();
 
@@ -1830,7 +2005,7 @@ async fn add_refuses_a_new_out_of_cone_file() {
 	let work = full_checkout("sparse-add-refuse");
 	let w = work.to_str().unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 
@@ -1882,7 +2057,7 @@ async fn reapply_reconciles_a_recreated_omitted_file() {
 	let work = full_checkout("sparse-reapply-present");
 	let w = work.to_str().unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 	assert!(!work.join("x/h").exists());
@@ -1907,7 +2082,7 @@ async fn explicit_add_of_an_out_of_cone_path_is_refused() {
 	}
 	let work = full_checkout("sparse-add-explicit");
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 	// A new out-of-cone file, named explicitly.
@@ -1930,7 +2105,7 @@ async fn explicit_add_of_an_out_of_cone_directory_is_refused() {
 	let work = full_checkout("sparse-add-dir");
 	let w = work.to_str().unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 
@@ -1961,7 +2136,7 @@ async fn add_of_an_in_cone_directory_stages_it() {
 	let work = full_checkout("sparse-add-incone-dir");
 	let w = work.to_str().unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 	std::fs::write(work.join("a/f"), b"CHANGED\n").unwrap();
@@ -2017,7 +2192,7 @@ async fn add_of_a_directory_with_only_a_dirty_excluded_file_is_refused() {
 	let work = full_checkout("sparse-add-dirty-excluded");
 	let w = work.to_str().unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 	// Recreate + modify the excluded file; reapply leaves it (bit cleared, present).
@@ -2049,7 +2224,7 @@ async fn force_checkout_removes_a_recreated_excluded_file() {
 	let work = full_checkout("sparse-force-checkout");
 	let w = work.to_str().unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 	// Recreate the omitted file, then force-checkout HEAD (git's reset --hard materialises through this).
@@ -2080,7 +2255,7 @@ async fn mv_refuses_an_out_of_cone_destination() {
 	let work = full_checkout("sparse-mv-dest");
 	let w = work.to_str().unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 
@@ -2114,7 +2289,7 @@ async fn mv_refuses_a_directory_whose_children_leave_the_cone() {
 	git(&["-C", w, "add", "-A"]);
 	commit(w, "base");
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 
@@ -2143,7 +2318,7 @@ async fn rm_leaves_sparse_entries() {
 	let work = full_checkout("sparse-rm");
 	let w = work.to_str().unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 
@@ -2167,7 +2342,7 @@ async fn rm_preserves_a_dirty_excluded_file() {
 	let work = full_checkout("sparse-rm-dirty");
 	let w = work.to_str().unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::Cone(vec!["a".to_owned()]))
+		.apply_sparse_set(&SparseSet::cone_utf8(["a"]).unwrap())
 		.await
 		.unwrap();
 	// Recreate + modify the excluded file; reapply leaves it (bit cleared, present).
@@ -2206,10 +2381,7 @@ async fn non_cone_root_only_omits_subdirectories() {
 	let work = full_checkout("sparse-noncone-root");
 	let w = work.to_str().unwrap();
 	make_repo(&work)
-		.apply_sparse_set(&SparseSet::NonCone(vec![
-			"/*".to_owned(),
-			"!/*/".to_owned(),
-		]))
+		.apply_sparse_set(&SparseSet::non_cone_utf8(["/*", "!/*/"]))
 		.await
 		.unwrap();
 

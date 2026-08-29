@@ -3,6 +3,7 @@
 //! test. It is not used by the binary itself.
 
 mod cli;
+mod git_path;
 
 use clap::CommandFactory;
 

@@ -129,7 +129,9 @@ fn trust_commit(
 	objects.insert(blob_id, (ObjectKind::Blob, blob));
 	let tree = encode_tree(&[TreeEntry {
 		mode: "100644".to_owned(),
-		name: "trust.json".to_owned(),
+		name: gitana_path::GitPathComponent::from_utf8("trust.json")
+			.unwrap()
+			.into(),
 		id: blob_id,
 	}]);
 	let tree_id = ObjectId::compute(ObjectKind::Tree, &tree);

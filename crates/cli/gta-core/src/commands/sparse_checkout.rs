@@ -3,14 +3,19 @@
 //! only their working-tree files are removed. The pattern model, config, and apply engine live in
 //! [`gitana_worktree`]; this command parses the sub-action and drives that surface.
 
+use std::borrow::Cow;
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
 use gitana_object::HashAlgorithm;
+use gitana_path::{GitPath, GitPathspec};
 use gitana_worktree::{SparseReapply, SparseSet, WorkTree};
 
-use crate::Backend;
 use crate::dispatch::{self, WorkTreeCommand};
+use crate::{Backend, ResultPathMode};
+
+use super::SparseCheckoutError;
 
 /// A `gta sparse-checkout` operation.
 pub enum Action {
@@ -21,11 +26,11 @@ pub enum Action {
 	/// Replace the sparse-checkout set with `patterns` — cone directories, or (`--no-cone`)
 	/// gitignore-style patterns — and apply it.
 	Set {
-		patterns: Vec<String>,
+		patterns: Vec<GitPathspec>,
 		no_cone: bool,
 	},
 	/// Extend the current sparse-checkout set with `patterns`, keeping the configured mode.
-	Add { patterns: Vec<String> },
+	Add { patterns: Vec<GitPathspec> },
 	/// Print the current sparse-checkout set (cone directories, or non-cone pattern lines).
 	List,
 	/// Disable sparse-checkout, materialising the whole working tree.
@@ -36,19 +41,27 @@ pub enum Action {
 }
 
 /// Manage the working tree's sparse-checkout.
-pub async fn run(cwd: &Path, action: Action) -> Result<()> {
-	dispatch::on_worktree(cwd, SparseCheckout { action }).await
+pub async fn run(cwd: &Path, action: Action, result_path_mode: ResultPathMode) -> Result<()> {
+	dispatch::on_worktree(
+		cwd,
+		SparseCheckout {
+			action,
+			result_path_mode,
+		},
+	)
+	.await
 }
 
 struct SparseCheckout {
 	action: Action,
+	result_path_mode: ResultPathMode,
 }
 
 impl WorkTreeCommand for SparseCheckout {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		prefix: String,
+		prefix: gitana_path::GitPath,
 	) -> Result<()> {
 		match self.action {
 			Action::Init { no_cone } => {
@@ -64,7 +77,10 @@ impl WorkTreeCommand for SparseCheckout {
 					_ if no_cone => noncone_default(),
 					_ => SparseSet::Cone(Vec::new()),
 				};
-				report_left(worktree.apply_sparse_set(&set).await?);
+				report_left(
+					worktree.apply_sparse_set(&set).await?,
+					self.result_path_mode,
+				);
 			}
 			Action::Set { patterns, no_cone } => {
 				let set = if no_cone {
@@ -74,14 +90,17 @@ impl WorkTreeCommand for SparseCheckout {
 					if patterns.is_empty() {
 						noncone_default()
 					} else {
-						SparseSet::NonCone(patterns)
+						SparseSet::NonCone(pattern_bytes(patterns)?)
 					}
 				} else {
 					let dirs = cone_dirs(&prefix, patterns)?;
 					reject_tracked_files(&worktree, &dirs).await?;
 					SparseSet::Cone(dirs)
 				};
-				report_left(worktree.apply_sparse_set(&set).await?);
+				report_left(
+					worktree.apply_sparse_set(&set).await?,
+					self.result_path_mode,
+				);
 			}
 			Action::Add { patterns } => {
 				let current = worktree
@@ -98,22 +117,29 @@ impl WorkTreeCommand for SparseCheckout {
 					}
 					SparseSet::NonCone(mut lines) => {
 						reject_noncone_subdir(&prefix)?;
-						lines.extend(patterns);
+						lines.extend(pattern_bytes(patterns)?);
 						SparseSet::NonCone(lines)
 					}
 				};
-				report_left(worktree.apply_sparse_set(&merged).await?);
+				report_left(
+					worktree.apply_sparse_set(&merged).await?,
+					self.result_path_mode,
+				);
 			}
 			Action::List => match worktree.current_sparse_set().await? {
 				Some(set) => {
+					let mut stdout = std::io::stdout().lock();
 					for entry in set.entries() {
-						println!("{entry}");
+						let entry = render_sparse_entry(entry, self.result_path_mode);
+						stdout.write_all(&entry)?;
+						stdout.write_all(b"\n")?;
 					}
+					stdout.flush()?;
 				}
 				None => bail!("this worktree is not sparse"),
 			},
-			Action::Disable => report_left(worktree.disable_sparse().await?),
-			Action::Reapply => report_left(worktree.reapply_sparse().await?),
+			Action::Disable => report_left(worktree.disable_sparse().await?, self.result_path_mode),
+			Action::Reapply => report_left(worktree.reapply_sparse().await?, self.result_path_mode),
 		}
 		Ok(())
 	}
@@ -122,15 +148,15 @@ impl WorkTreeCommand for SparseCheckout {
 /// git's non-cone default set — `/*` then `!/*/`, i.e. everything at the root with no directories, so
 /// only root files are materialised (the same shape as the default cone set).
 fn noncone_default() -> SparseSet {
-	SparseSet::NonCone(vec!["/*".to_owned(), "!/*/".to_owned()])
+	SparseSet::non_cone_utf8(["/*", "!/*/"])
 }
 
 /// git refuses a non-cone `set`/`add` run from a subdirectory: non-cone patterns are always evaluated
 /// from the work-tree root, so a subdirectory invocation would be ambiguous (probed against git 2.50.1
 /// — "please run from the toplevel directory in non-cone mode"). Cone mode, by contrast, resolves its
 /// directory arguments against the prefix, so this restriction is non-cone only.
-fn reject_noncone_subdir(prefix: &str) -> Result<()> {
-	if !prefix.is_empty() {
+fn reject_noncone_subdir(prefix: &gitana_path::GitPath) -> Result<()> {
+	if !prefix.is_root() {
 		bail!("please run from the toplevel directory in non-cone mode");
 	}
 	Ok(())
@@ -142,18 +168,18 @@ fn reject_noncone_subdir(prefix: &str) -> Result<()> {
 /// `--skip-checks` escape in gta.
 async fn reject_tracked_files<H: HashAlgorithm>(
 	worktree: &WorkTree<Backend, crate::WorkDir, H>,
-	dirs: &[String],
+	dirs: &[GitPath],
 ) -> Result<()> {
 	let index = worktree.load_index().await?;
 	for dir in dirs {
 		// The root ("") is always a directory; every other arg must not be an exact tracked-file path.
-		if !dir.is_empty()
+		if !dir.is_root()
 			&& index
 				.entries
 				.iter()
 				.any(|entry| entry.stage == 0 && entry.path == *dir)
 		{
-			bail!("'{dir}' is a tracked file, not a directory");
+			return Err(SparseCheckoutError::TrackedFile(dir.clone()).into());
 		}
 	}
 	Ok(())
@@ -161,9 +187,9 @@ async fn reject_tracked_files<H: HashAlgorithm>(
 
 /// Resolve cone directory arguments against the invocation prefix — git interprets `set <dir>`
 /// relative to the current directory, resolving `.`/`..` components (so `-C a/b set .` means the
-/// recursive directory `a/b`, and `../x` climbs out of the prefix). A leading `/` is root-relative
-/// (the prefix is ignored). A path that climbs above the work-tree root is rejected.
-fn cone_dirs(prefix: &str, dirs: Vec<String>) -> Result<Vec<String>> {
+/// recursive directory `a/b`, and `../x` climbs out of the prefix). A leading `/` or a path that
+/// climbs above the work-tree root is rejected.
+fn cone_dirs(prefix: &GitPath, dirs: Vec<GitPathspec>) -> Result<Vec<GitPath>> {
 	dirs
 		.into_iter()
 		.map(|dir| resolve_cone_dir(prefix, &dir))
@@ -172,70 +198,176 @@ fn cone_dirs(prefix: &str, dirs: Vec<String>) -> Result<Vec<String>> {
 
 /// Resolve one cone directory argument against `prefix`, collapsing `.`/`..` and rejecting an escape
 /// above the root. Returns the work-tree-root-relative directory (empty string for the root).
-fn resolve_cone_dir(prefix: &str, dir: &str) -> Result<String> {
+fn resolve_cone_dir(prefix: &GitPath, dir: impl AsRef<[u8]>) -> Result<GitPath> {
+	let dir = GitPathspec::from_bytes(dir.as_ref().to_vec())?;
+	let bytes = dir.as_bytes();
 	// Cone directories are literal paths, not globs: git rejects one containing pattern metacharacters
 	// (without `--skip-checks`), because a stray `*`/`?`/`[` would silently disable cone matching and pull
 	// in sibling directories. Reject them rather than render an invalid cone pattern.
-	if dir.contains(['*', '?', '[', ']', '\\']) {
-		bail!("'{dir}' contains a pattern character; cone directories must be literal paths");
+	if bytes
+		.iter()
+		.any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'\\'))
+	{
+		return Err(SparseCheckoutError::PatternCharacter(dir).into());
 	}
 	// git rejects a leading slash in cone mode: a cone argument is a directory resolved against the
 	// invocation prefix, not a root-anchored pattern (probed against git 2.50.1 — `set /x` fails with
 	// "specify directories rather than patterns (no leading slash)").
-	if dir.starts_with('/') {
-		bail!("'{dir}': specify directories rather than patterns (no leading slash) in cone mode");
+	if bytes.starts_with(b"/") {
+		return Err(SparseCheckoutError::LeadingSlash(dir).into());
 	}
-	let mut components: Vec<&str> = Vec::new();
-	for segment in prefix.split('/').chain(dir.split('/')) {
+	let mut components: Vec<Vec<u8>> = prefix.components().map(<[u8]>::to_vec).collect();
+	for segment in bytes.split(|byte| *byte == b'/') {
 		match segment {
-			"" | "." => {}
-			".." => {
+			b"" | b"." => {}
+			b".." => {
 				if components.pop().is_none() {
-					bail!("'{dir}' is outside the repository");
+					return Err(SparseCheckoutError::OutsideRepository(dir).into());
 				}
 			}
-			segment => components.push(segment),
+			segment => components.push(segment.to_vec()),
 		}
 	}
-	Ok(components.join("/"))
+	let mut bytes = Vec::new();
+	for (index, component) in components.iter().enumerate() {
+		if index > 0 {
+			bytes.push(b'/');
+		}
+		bytes.extend_from_slice(component);
+	}
+	GitPath::from_bytes(bytes).map_err(Into::into)
+}
+
+fn pattern_bytes(patterns: Vec<GitPathspec>) -> Result<Vec<Vec<u8>>> {
+	Ok(patterns.into_iter().map(GitPathspec::into_bytes).collect())
+}
+
+fn render_sparse_entry(entry: &[u8], result_path_mode: ResultPathMode) -> Cow<'_, [u8]> {
+	match result_path_mode {
+		ResultPathMode::Human => Cow::Borrowed(entry),
+		ResultPathMode::Reversible => Cow::Owned(gitana_path::quote_bytes(entry).into_bytes()),
+	}
 }
 
 /// Warn — as git does — about paths the reapply could not fully apply: one left in the working tree
 /// because it had local modifications the reapply would otherwise have removed, and one that could not
 /// be materialised because an untracked file occupies an ancestor slot. The user resolves those and
 /// re-runs `reapply`.
-fn report_left(outcome: SparseReapply) {
-	for path in outcome.left_dirty {
-		eprintln!("warning: '{path}' is not up to date and was left despite sparse patterns");
+fn report_left(outcome: SparseReapply, result_path_mode: ResultPathMode) {
+	for warning in sparse_warnings(&outcome, result_path_mode) {
+		eprintln!("{warning}");
 	}
-	for path in outcome.not_updated {
-		eprintln!("warning: '{path}' was already present and thus not updated despite sparse patterns");
-	}
+}
+
+fn sparse_warnings(outcome: &SparseReapply, result_path_mode: ResultPathMode) -> Vec<String> {
+	let left_dirty = outcome.left_dirty.iter().map(|path| {
+		let path = crate::git_path::render_result_path(path, result_path_mode);
+		format!("warning: '{path}' is not up to date and was left despite sparse patterns")
+	});
+	let not_updated = outcome.not_updated.iter().map(|path| {
+		let path = crate::git_path::render_result_path(path, result_path_mode);
+		format!("warning: '{path}' was already present and thus not updated despite sparse patterns")
+	});
+	left_dirty.chain(not_updated).collect()
 }
 
 #[cfg(test)]
 mod tests {
-	use super::resolve_cone_dir;
+	use gitana_path::GitPath;
+	use gitana_worktree::SparseReapply;
+
+	use crate::ResultPathMode;
+
+	use super::{render_sparse_entry, resolve_cone_dir, sparse_warnings};
+
+	fn path(value: &str) -> GitPath {
+		GitPath::from_utf8(value).unwrap()
+	}
 
 	#[test]
 	fn resolves_cone_dir_against_the_prefix() {
 		// From the root, an argument is used as-is (normalised).
-		assert_eq!(resolve_cone_dir("", "a/b").unwrap(), "a/b");
+		assert_eq!(resolve_cone_dir(&path(""), "a/b").unwrap(), "a/b");
 		// From a subdirectory, `.` is the recursive prefix directory, and a relative arg scopes under it.
-		assert_eq!(resolve_cone_dir("a/b", ".").unwrap(), "a/b");
-		assert_eq!(resolve_cone_dir("a/b", "c").unwrap(), "a/b/c");
+		assert_eq!(resolve_cone_dir(&path("a/b"), ".").unwrap(), "a/b");
+		assert_eq!(resolve_cone_dir(&path("a/b"), "c").unwrap(), "a/b/c");
 		// `..` climbs out of the prefix.
-		assert_eq!(resolve_cone_dir("a/b", "../x").unwrap(), "a/x");
-		assert_eq!(resolve_cone_dir("a/b", "../../x").unwrap(), "x");
+		assert_eq!(resolve_cone_dir(&path("a/b"), "../x").unwrap(), "a/x");
+		assert_eq!(resolve_cone_dir(&path("a/b"), "../../x").unwrap(), "x");
 		// Climbing above the root is rejected.
-		assert!(resolve_cone_dir("a/b", "../../../x").is_err());
-		assert!(resolve_cone_dir("", "..").is_err());
+		assert!(resolve_cone_dir(&path("a/b"), "../../../x").is_err());
+		assert!(resolve_cone_dir(&path(""), "..").is_err());
 	}
 
 	#[test]
 	fn rejects_a_leading_slash_in_cone_mode() {
 		// git rejects a leading slash in cone `set`/`add` ("no leading slash") — it is not root-relative.
-		assert!(resolve_cone_dir("", "/a").is_err());
-		assert!(resolve_cone_dir("a/b", "/x").is_err());
+		assert!(resolve_cone_dir(&path(""), "/a").is_err());
+		assert!(resolve_cone_dir(&path("a/b"), "/x").is_err());
+	}
+
+	#[test]
+	fn preserves_a_raw_invocation_prefix() {
+		let prefix = GitPath::from_bytes(b"raw-\xff/sub".to_vec()).unwrap();
+		assert_eq!(
+			resolve_cone_dir(&prefix, "../kept").unwrap().as_bytes(),
+			b"raw-\xff/kept"
+		);
+	}
+
+	#[test]
+	fn sparse_list_entries_use_the_frontend_path_mode() {
+		let raw = b"raw-\xff/**";
+		let literal = b"\"raw-\\377/**\"";
+
+		assert_eq!(
+			render_sparse_entry(raw, ResultPathMode::Human).as_ref(),
+			raw.as_slice()
+		);
+		assert_eq!(
+			render_sparse_entry(raw, ResultPathMode::Reversible).as_ref(),
+			b"\"raw-\\377/**\"".as_slice()
+		);
+		assert_ne!(
+			render_sparse_entry(raw, ResultPathMode::Reversible),
+			render_sparse_entry(literal, ResultPathMode::Reversible)
+		);
+	}
+
+	#[test]
+	fn sparse_warnings_use_the_frontend_path_mode() {
+		let utf8 = SparseReapply {
+			left_dirty: vec![path("café")],
+			not_updated: vec![path("dir/file")],
+		};
+		assert_eq!(
+			sparse_warnings(&utf8, ResultPathMode::Human),
+			[
+				"warning: 'café' is not up to date and was left despite sparse patterns",
+				"warning: 'dir/file' was already present and thus not updated despite sparse patterns",
+			]
+		);
+
+		let outcome = |path: GitPath| SparseReapply {
+			left_dirty: vec![path.clone()],
+			not_updated: vec![path],
+		};
+		let raw = outcome(GitPath::from_bytes(b"raw-\xff".to_vec()).unwrap());
+		let literal = outcome(GitPath::from_utf8("\"raw-\\377\"").unwrap());
+		let raw_human = sparse_warnings(&raw, ResultPathMode::Human);
+		let literal_human = sparse_warnings(&literal, ResultPathMode::Human);
+		let raw_reversible = sparse_warnings(&raw, ResultPathMode::Reversible);
+		let literal_reversible = sparse_warnings(&literal, ResultPathMode::Reversible);
+
+		assert_eq!(raw_human, literal_human);
+		assert_eq!(raw_reversible.len(), 2);
+		assert_eq!(
+			raw_reversible.len(),
+			literal_reversible.len(),
+			"both warning categories must be rendered"
+		);
+		for (raw, literal) in raw_reversible.iter().zip(&literal_reversible) {
+			assert_ne!(raw, literal);
+		}
 	}
 }

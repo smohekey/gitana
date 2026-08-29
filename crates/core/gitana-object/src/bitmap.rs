@@ -462,6 +462,7 @@ mod tests {
 
 	#[test]
 	fn builds_reachability_and_type_bitmaps() {
+		use gitana_path::GitPathComponent;
 		use std::collections::HashMap;
 
 		use crate::{
@@ -481,7 +482,7 @@ mod tests {
 			ObjectKind::Tree,
 			encode_tree(&[TreeEntry {
 				mode: "100644".to_owned(),
-				name: "f".to_owned(),
+				name: GitPathComponent::from_utf8("f").unwrap().into(),
 				id: blob,
 			}]),
 		);
@@ -572,6 +573,7 @@ mod tests {
 
 	#[test]
 	fn skips_submodule_gitlinks() {
+		use gitana_path::GitPathComponent;
 		use std::collections::HashMap;
 
 		use crate::{
@@ -593,12 +595,12 @@ mod tests {
 			encode_tree(&[
 				TreeEntry {
 					mode: "100644".to_owned(),
-					name: "f".to_owned(),
+					name: GitPathComponent::from_utf8("f").unwrap().into(),
 					id: blob,
 				},
 				TreeEntry {
 					mode: "160000".to_owned(),
-					name: "sub".to_owned(),
+					name: GitPathComponent::from_utf8("sub").unwrap().into(),
 					id: gitlink,
 				},
 			]),

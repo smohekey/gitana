@@ -32,6 +32,8 @@ pub mod revert;
 pub mod rm;
 pub mod show;
 pub mod sparse_checkout;
+mod sparse_checkout_error;
+pub(crate) use self::sparse_checkout_error::SparseCheckoutError;
 pub mod status;
 pub mod switch;
 pub mod symbolic_ref;

@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use gitana_path::GitTreeEntryName;
+
 use crate::text::as_str;
 use crate::{HashAlgorithm, ObjectError, ObjectId};
 
@@ -10,8 +12,8 @@ const STANDARD_MODES: [&[u8]; 5] = [b"100644", b"100755", b"120000", b"40000", b
 pub struct TreeEntry<H: HashAlgorithm> {
 	/// The octal mode string (e.g. `100644`, `40000`).
 	pub mode: String,
-	/// The entry name.
-	pub name: String,
+	/// The exact entry name bytes, which may be non-canonical in damaged or foreign objects.
+	pub name: GitTreeEntryName,
 	/// The id of the referenced object.
 	pub id: ObjectId<H>,
 }
@@ -36,7 +38,8 @@ pub fn parse_tree<H: HashAlgorithm>(payload: &[u8]) -> Result<Vec<TreeEntry<H>>,
 			.iter()
 			.position(|&b| b == 0)
 			.ok_or(ObjectError::MalformedHeader)?;
-		let name = as_str(&rest[..nul])?.to_owned();
+		let name = GitTreeEntryName::from_bytes(rest[..nul].to_vec())
+			.map_err(|_| ObjectError::InvalidTreeName)?;
 		rest = &rest[nul + 1..];
 
 		if rest.len() < H::RAW_LEN {
@@ -179,7 +182,7 @@ mod tests {
 		.unwrap();
 		let tree = encode_tree(&[TreeEntry {
 			mode: "100644".to_owned(),
-			name: "greeting.txt".to_owned(),
+			name: GitTreeEntryName::from_utf8("greeting.txt").unwrap(),
 			id: blob,
 		}]);
 		let id = ObjectId::<Sha256>::compute(ObjectKind::Tree, &tree);
@@ -197,12 +200,12 @@ mod tests {
 		let entries = vec![
 			TreeEntry {
 				mode: "40000".to_owned(),
-				name: "dir".to_owned(),
+				name: GitTreeEntryName::from_utf8("dir").unwrap(),
 				id: dir,
 			},
 			TreeEntry {
 				mode: "100644".to_owned(),
-				name: "file.txt".to_owned(),
+				name: GitTreeEntryName::from_utf8("file.txt").unwrap(),
 				id: blob,
 			},
 		];
@@ -221,12 +224,12 @@ mod tests {
 		let entries = vec![
 			TreeEntry {
 				mode: "40000".to_owned(),
-				name: "dir".to_owned(),
+				name: GitTreeEntryName::from_utf8("dir").unwrap(),
 				id: dir,
 			},
 			TreeEntry {
 				mode: "100644".to_owned(),
-				name: "file.txt".to_owned(),
+				name: GitTreeEntryName::from_utf8("file.txt").unwrap(),
 				id: blob,
 			},
 		];
@@ -245,7 +248,19 @@ mod tests {
 		payload.extend_from_slice(blob.as_bytes());
 
 		validate_tree_structure::<Sha256>(&payload).expect("valid raw tree");
-		assert!(parse_tree::<Sha256>(&payload).is_err());
+		let entries = parse_tree::<Sha256>(&payload).expect("parse raw tree");
+		assert_eq!(entries[1].name.as_bytes(), b"\xffafter");
+	}
+
+	#[test]
+	fn parses_a_structurally_readable_noncanonical_name() {
+		let payload = raw_entry::<Sha256>(b"100644", b".", &[1; 32]);
+		let entries = parse_tree::<Sha256>(&payload).expect("parse malformed tree for inspection");
+		assert_eq!(entries[0].name.as_bytes(), b".");
+		assert!(matches!(
+			validate_tree_structure::<Sha256>(&payload),
+			Err(ObjectError::InvalidTreeName)
+		));
 	}
 
 	#[test]

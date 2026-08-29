@@ -11,7 +11,14 @@ use anyhow::{Result, anyhow, bail};
 use gitana_object::{ObjectId, ObjectKind, Sha256};
 use gitana_repo_host::exports::gitana::repo::porcelain::{HeadState, RepoError};
 
-use self::support::{Session, build_fixture, native_repo};
+use self::support::{Session, build_fixture, native_repo, wit_path_bytes, wit_revision};
+
+fn invalid_message<T: std::fmt::Debug>(result: Result<T, RepoError>) -> String {
+	match result {
+		Err(RepoError::Invalid(message)) => message,
+		other => panic!("expected invalid error, got {other:?}"),
+	}
+}
 
 #[tokio::test]
 async fn cas_matrix_and_packed_delete() -> Result<()> {
@@ -231,7 +238,7 @@ async fn typed_revision_errors() -> Result<()> {
 	let handle = session.handle;
 
 	let ambiguous = porcelain
-		.call_rev_parse(&mut *store, handle, &prefix)
+		.call_rev_parse(&mut *store, handle, &wit_revision(&prefix))
 		.await?;
 	assert!(
 		matches!(ambiguous, Err(RepoError::Ambiguous(_))),
@@ -239,14 +246,14 @@ async fn typed_revision_errors() -> Result<()> {
 	);
 
 	let unknown = porcelain
-		.call_rev_parse(&mut *store, handle, "nope")
+		.call_rev_parse(&mut *store, handle, &wit_revision("nope"))
 		.await?;
 	assert!(
 		matches!(unknown, Err(RepoError::UnknownRevision(_))),
 		"{unknown:?}"
 	);
 	let unknown_full = porcelain
-		.call_rev_parse(&mut *store, handle, &"0".repeat(64))
+		.call_rev_parse(&mut *store, handle, &wit_revision(&"0".repeat(64)))
 		.await?;
 	assert!(
 		matches!(unknown_full, Err(RepoError::UnknownRevision(_))),
@@ -254,7 +261,7 @@ async fn typed_revision_errors() -> Result<()> {
 	);
 
 	let invalid = porcelain
-		.call_rev_parse(&mut *store, handle, "main^{banana}")
+		.call_rev_parse(&mut *store, handle, &wit_revision("main^{banana}"))
 		.await?;
 	assert!(matches!(invalid, Err(RepoError::Invalid(_))), "{invalid:?}");
 
@@ -306,7 +313,7 @@ async fn init_creates_a_fresh_repository() -> Result<()> {
 				&mut *store,
 				handle,
 				&[TreeBuildEntry {
-					path: "file.txt".to_owned(),
+					path: support::wit_path("file.txt"),
 					mode: FileMode::Regular,
 					id: blob,
 				}],
@@ -379,17 +386,17 @@ async fn repack_then_read_through_the_descriptor_backend() -> Result<()> {
 	// The spike only proved loose-object reads; these now go through the pack
 	// (and multi-pack-index) via the descriptor backend.
 	let commit = porcelain
-		.call_read_commit(&mut *store, handle, "HEAD")
+		.call_read_commit(&mut *store, handle, &wit_revision("HEAD"))
 		.await?
 		.map_err(|error| anyhow!("read-commit post-repack: {error:?}"))?;
 	assert_eq!(commit.id, fixture.m);
 	let blob = porcelain
-		.call_read_blob(&mut *store, handle, "HEAD:dir/inner.txt")
+		.call_read_blob(&mut *store, handle, &wit_revision("HEAD:dir/inner.txt"))
 		.await?
 		.map_err(|error| anyhow!("read-blob post-repack: {error:?}"))?;
 	assert_eq!(blob, b"inner\n");
 	let listed = porcelain
-		.call_ls_tree(&mut *store, handle, "HEAD")
+		.call_ls_tree(&mut *store, handle, &wit_revision("HEAD"))
 		.await?
 		.map_err(|error| anyhow!("ls-tree post-repack: {error:?}"))?;
 	assert_eq!(listed.len(), 3);
@@ -430,7 +437,7 @@ async fn write_tree_rejects_malformed_entries() -> Result<()> {
 		.await?
 		.map_err(|error| anyhow!("write-blob: {error:?}"))?;
 	let entry = |path: &str, id: &str| TreeBuildEntry {
-		path: path.to_owned(),
+		path: support::wit_path(path),
 		mode: FileMode::Regular,
 		id: id.to_owned(),
 	};
@@ -489,6 +496,157 @@ async fn write_tree_rejects_malformed_entries() -> Result<()> {
 	Ok(())
 }
 
+#[tokio::test]
+async fn ls_tree_preserves_structurally_readable_noncanonical_names() -> Result<()> {
+	let fixture = build_fixture::<Sha256>().await?;
+	let repo = native_repo::<Sha256>(fixture.dir.path())?;
+	let blob = repo.write_blob(b"content").await?;
+	let mut payload = b"100644 .\0".to_vec();
+	payload.extend_from_slice(blob.as_bytes());
+	let tree = repo
+		.objects()
+		.write_object(ObjectKind::Tree, &payload)
+		.await?;
+
+	let mut session = Session::open(fixture.dir.path()).await?;
+	let porcelain = session.repo.gitana_repo_porcelain().repository();
+	let listed = porcelain
+		.call_ls_tree(
+			&mut session.store,
+			session.handle,
+			&wit_revision(&tree.to_hex()),
+		)
+		.await?
+		.map_err(|error| anyhow!("ls-tree: {error:?}"))?;
+
+	assert_eq!(listed.len(), 1);
+	assert_eq!(wit_path_bytes(&listed[0].path), b".");
+	assert_eq!(listed[0].mode, "100644");
+	assert_eq!(listed[0].id, blob.to_hex());
+	Ok(())
+}
+
+#[tokio::test]
+async fn write_tree_round_trips_non_utf8_path_bytes() -> Result<()> {
+	use gitana_repo_host::exports::gitana::repo::porcelain::{FileMode, GitPath, TreeBuildEntry};
+
+	let fixture = build_fixture::<Sha256>().await?;
+	let mut session = Session::open(fixture.dir.path()).await?;
+	let porcelain = session.repo.gitana_repo_porcelain().repository();
+	let store = &mut session.store;
+	let handle = session.handle;
+	let blob = porcelain
+		.call_write_blob(&mut *store, handle, b"raw path\n")
+		.await?
+		.map_err(|error| anyhow!("write-blob: {error:?}"))?;
+	let raw = b"dir/raw-\xff".to_vec();
+	let tree = porcelain
+		.call_write_tree(
+			&mut *store,
+			handle,
+			&[TreeBuildEntry {
+				path: GitPath::Bytes(raw.clone()),
+				mode: FileMode::Regular,
+				id: blob,
+			}],
+		)
+		.await?
+		.map_err(|error| anyhow!("write-tree: {error:?}"))?;
+	let entries = porcelain
+		.call_ls_tree(&mut *store, handle, &wit_revision(&tree))
+		.await?
+		.map_err(|error| anyhow!("ls-tree: {error:?}"))?;
+
+	assert_eq!(entries.len(), 1);
+	assert!(matches!(&entries[0].path, GitPath::Bytes(path) if path == &raw));
+	Ok(())
+}
+
+#[tokio::test]
+async fn wit_revision_and_tree_errors_render_byte_paths_reversibly() -> Result<()> {
+	use gitana_repo_host::exports::gitana::repo::porcelain::{
+		FileMode as WitFileMode, GitPath as WitGitPath, RevisionSpec, TreeBuildEntry as WitTreeEntry,
+	};
+
+	let fixture = build_fixture::<Sha256>().await?;
+	let native = native_repo::<Sha256>(fixture.dir.path())?;
+	let blob = native.write_blob(b"not a commit\n").await?;
+	let raw = gitana_path::GitPath::from_bytes(b"raw-\xff".to_vec())?;
+	let literal = gitana_path::GitPath::from_utf8("\"raw-\\377\"")?;
+	let tree = native
+		.write_tree(&[
+			gitana_repository::TreeBuildEntry {
+				path: raw.clone(),
+				mode: gitana_repository::FileMode::Regular,
+				id: blob,
+			},
+			gitana_repository::TreeBuildEntry {
+				path: literal.clone(),
+				mode: gitana_repository::FileMode::Regular,
+				id: blob,
+			},
+		])
+		.await?;
+
+	let mut session = Session::open(fixture.dir.path()).await?;
+	let porcelain = session.repo.gitana_repo_porcelain().repository();
+	let spec = |path: &[u8]| {
+		let mut spec = tree.to_hex().into_bytes();
+		spec.push(b':');
+		spec.extend_from_slice(path);
+		RevisionSpec::Bytes(spec)
+	};
+	let raw_error = porcelain
+		.call_read_commit(&mut session.store, session.handle, &spec(raw.as_bytes()))
+		.await?;
+	let literal_error = porcelain
+		.call_read_commit(
+			&mut session.store,
+			session.handle,
+			&spec(literal.as_bytes()),
+		)
+		.await?;
+	let raw_error = invalid_message(raw_error);
+	let literal_error = invalid_message(literal_error);
+	assert_ne!(raw_error, literal_error);
+	assert!(raw_error.contains("raw-\\377"), "{raw_error}");
+	assert!(
+		literal_error.contains("\\\"raw-\\\\377\\\""),
+		"{literal_error}"
+	);
+
+	let duplicate = |path: WitGitPath| {
+		[
+			WitTreeEntry {
+				path: path.clone(),
+				mode: WitFileMode::Regular,
+				id: blob.to_hex(),
+			},
+			WitTreeEntry {
+				path,
+				mode: WitFileMode::Regular,
+				id: blob.to_hex(),
+			},
+		]
+	};
+	let raw_error = porcelain
+		.call_write_tree(
+			&mut session.store,
+			session.handle,
+			&duplicate(WitGitPath::Bytes(raw.into_bytes())),
+		)
+		.await?;
+	let literal_error = porcelain
+		.call_write_tree(
+			&mut session.store,
+			session.handle,
+			&duplicate(WitGitPath::Utf8(literal.as_utf8().unwrap().to_owned())),
+		)
+		.await?;
+	assert_ne!(invalid_message(raw_error), invalid_message(literal_error));
+	Ok(())
+}
+
 /// A gitlink (submodule) entry names a commit that need not be present in this repository, so
 /// `write-tree` records it without object validation — the exact contrast to the `not_a_blob` case
 /// above, where the *same* commit id is rejected under `regular`. The recorded tree entry is a
@@ -511,7 +669,7 @@ async fn write_tree_records_a_gitlink() -> Result<()> {
 				&mut *store,
 				handle,
 				&[TreeBuildEntry {
-					path: "sub".to_owned(),
+					path: support::wit_path("sub"),
 					mode: FileMode::Gitlink,
 					id: id.clone(),
 				}],
@@ -519,11 +677,11 @@ async fn write_tree_records_a_gitlink() -> Result<()> {
 			.await?
 			.map_err(|error| anyhow!("write-tree gitlink: {error:?}"))?;
 		let entries = porcelain
-			.call_ls_tree(&mut *store, handle, &tree)
+			.call_ls_tree(&mut *store, handle, &wit_revision(&tree))
 			.await?
 			.map_err(|error| anyhow!("ls-tree: {error:?}"))?;
 		assert_eq!(entries.len(), 1, "one gitlink entry");
-		assert_eq!(entries[0].path, "sub");
+		assert_eq!(support::wit_path_bytes(&entries[0].path), b"sub");
 		assert_eq!(entries[0].mode, "160000", "recorded as a gitlink");
 		assert_eq!(entries[0].id, id, "pointing at the submodule commit");
 	}
@@ -536,7 +694,7 @@ async fn write_tree_records_a_gitlink() -> Result<()> {
 			&mut *store,
 			handle,
 			&[TreeBuildEntry {
-				path: "sub".to_owned(),
+				path: support::wit_path("sub"),
 				mode: FileMode::Gitlink,
 				id: null_id,
 			}],
@@ -558,7 +716,7 @@ async fn write_tree_records_a_gitlink() -> Result<()> {
 			&mut *store,
 			handle,
 			&[TreeBuildEntry {
-				path: "sub".to_owned(),
+				path: support::wit_path("sub"),
 				mode: FileMode::Gitlink,
 				id: blob,
 			}],

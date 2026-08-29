@@ -1,0 +1,14 @@
+[package]
+description = "Byte-preserving validated Git repository paths."
+edition.workspace = true
+license.workspace = true
+name = "gitana-path"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

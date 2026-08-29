@@ -87,7 +87,9 @@ impl<H: HashAlgorithm> Builder<H> {
 			ObjectKind::Tree,
 			encode_tree(&[TreeEntry {
 				mode: "100644".to_owned(),
-				name: "trust.json".to_owned(),
+				name: gitana_path::GitPathComponent::from_utf8("trust.json")
+					.unwrap()
+					.into(),
 				id: blob,
 			}]),
 		);

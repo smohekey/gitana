@@ -156,6 +156,73 @@ fn show_tree_lists_entries() {
 }
 
 #[test]
+fn show_tree_and_tree_tag_preserve_raw_names_like_git() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("gta-show-tree-raw");
+	let w = work.to_str().unwrap();
+	git(w, &["init", "--object-format=sha256", "-q", "."]);
+	let blob = git_stdin(w, &["hash-object", "-w", "--stdin"], b"content\n");
+	let blob = blob.trim();
+	let mut names = vec![
+		b"caf\xc3\xa9".to_vec(),
+		b"line\nfile".to_vec(),
+		b"slash\\name".to_vec(),
+		b"raw-\xff".to_vec(),
+	];
+	names.sort();
+	let expected_names = names
+		.iter()
+		.flat_map(|name| name.iter().copied().chain(std::iter::once(b'\n')))
+		.collect::<Vec<_>>();
+	let mut tree_input = Vec::new();
+	for name in &names {
+		tree_input.extend_from_slice(format!("100644 blob {blob}\t").as_bytes());
+		tree_input.extend_from_slice(name);
+		tree_input.push(0);
+	}
+	let tree = git_stdin(w, &["mktree", "-z"], &tree_input);
+	let tree = tree.trim();
+	git(
+		w,
+		&[
+			"-c",
+			"user.name=T",
+			"-c",
+			"user.email=t@e",
+			"tag",
+			"-a",
+			"tree-tag",
+			"-m",
+			"tree tag",
+			tree,
+		],
+	);
+
+	for quote_path in ["true", "false"] {
+		git(w, &["config", "core.quotePath", quote_path]);
+		for object in [tree, "tree-tag"] {
+			let ours = gta_bytes(w, &["show", object], b"");
+			let theirs = git_bytes(w, &["show", object]);
+			assert!(
+				ours.ends_with(&expected_names),
+				"gta object={object}, core.quotePath={quote_path}: {ours:?}"
+			);
+			assert!(
+				theirs.ends_with(&expected_names),
+				"git object={object}, core.quotePath={quote_path}: {theirs:?}"
+			);
+			if object == tree {
+				assert_eq!(ours, theirs, "core.quotePath={quote_path}");
+			}
+		}
+	}
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
 fn show_tag_displays_tag_then_target() {
 	if !git_supports_sha256() {
 		return;
@@ -251,6 +318,79 @@ fn show_and_cat_file_work_in_a_bare_repo() {
 }
 
 #[test]
+fn cat_file_tree_honours_core_quotepath() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("gta-cat-file-quotepath");
+	let w = work.to_str().unwrap();
+	gta(w, &["init"], b"");
+	std::fs::write(work.join("café"), b"content\n").unwrap();
+	git(w, &["add", "."]);
+	commit(w, "base");
+	let tree = git(w, &["rev-parse", "HEAD^{tree}"]);
+	let tree = tree.trim();
+
+	for value in ["true", "false"] {
+		git(w, &["config", "core.quotePath", value]);
+		assert_eq!(
+			gta(w, &["cat-file", "-p", tree], b""),
+			git(w, &["cat-file", "-p", tree]),
+			"core.quotePath={value}"
+		);
+	}
+
+	git(w, &["config", "core.quotePath", "bogus"]);
+	for mode in ["-p", "-t"] {
+		let error = gta_fail(w, &["cat-file", mode, tree]);
+		assert!(error.contains("not a boolean"), "stderr: {error}");
+	}
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn malformed_tree_names_remain_inspectable() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("gta-show-malformed-tree");
+	let w = work.to_str().unwrap();
+	git(w, &["init", "--object-format=sha256", "-q", "."]);
+	let blob = git_stdin(w, &["hash-object", "-w", "--stdin"], b"content");
+	let blob = gitana_object::ObjectId::<gitana_object::Sha256>::from_hex(blob.trim()).unwrap();
+	let mut payload = b"100644 .\0".to_vec();
+	payload.extend_from_slice(blob.as_bytes());
+	let tree = git_stdin(
+		w,
+		&["hash-object", "-t", "tree", "--literally", "-w", "--stdin"],
+		&payload,
+	);
+	let tree = tree.trim();
+
+	assert_eq!(
+		gta(w, &["cat-file", "-p", tree], b""),
+		git(w, &["cat-file", "-p", tree])
+	);
+	assert_eq!(gta(w, &["ls-tree", tree], b""), git(w, &["ls-tree", tree]));
+	assert_eq!(
+		gta(w, &["ls-tree", "-r", tree], b""),
+		git(w, &["ls-tree", "-r", tree])
+	);
+	assert_eq!(gta(w, &["show", tree], b""), git(w, &["show", tree]));
+
+	git(w, &["config", "user.name", "T"]);
+	git(w, &["config", "user.email", "t@e"]);
+	let commit = git_stdin(w, &["commit-tree", tree], b"malformed\n");
+	let shown = gta(w, &["show", commit.trim()], b"");
+	assert!(shown.contains("diff --git a/. b/."), "{shown}");
+	assert!(shown.contains("+++ b/."), "{shown}");
+	assert!(shown.contains("+content"), "{shown}");
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
 fn show_defaults_to_head() {
 	if !git_supports_sha256() {
 		return;
@@ -280,6 +420,10 @@ fn commit(dir: &str, msg: &str) {
 }
 
 fn gta(dir: &str, args: &[&str], stdin: &[u8]) -> String {
+	String::from_utf8(gta_bytes(dir, args, stdin)).expect("gta stdout utf8")
+}
+
+fn gta_bytes(dir: &str, args: &[&str], stdin: &[u8]) -> Vec<u8> {
 	let out = assert_cmd::Command::cargo_bin("gta")
 		.unwrap()
 		.args(["-C", dir])
@@ -292,7 +436,7 @@ fn gta(dir: &str, args: &[&str], stdin: &[u8]) -> String {
 		"gta {args:?} failed: {}",
 		String::from_utf8_lossy(&out.stderr)
 	);
-	String::from_utf8(out.stdout).expect("gta stdout utf8")
+	out.stdout
 }
 
 fn gta_fail(dir: &str, args: &[&str]) -> String {
@@ -307,6 +451,10 @@ fn gta_fail(dir: &str, args: &[&str]) -> String {
 }
 
 fn git(dir: &str, args: &[&str]) -> String {
+	String::from_utf8(git_bytes(dir, args)).expect("git stdout utf8")
+}
+
+fn git_bytes(dir: &str, args: &[&str]) -> Vec<u8> {
 	let mut full = vec!["-C", dir];
 	full.extend_from_slice(args);
 	let out = Command::new("git").args(&full).output().expect("run git");
@@ -315,7 +463,7 @@ fn git(dir: &str, args: &[&str]) -> String {
 		"git {args:?} failed: {}",
 		String::from_utf8_lossy(&out.stderr)
 	);
-	String::from_utf8(out.stdout).expect("git stdout utf8")
+	out.stdout
 }
 
 fn git_stdin(dir: &str, args: &[&str], stdin: &[u8]) -> String {

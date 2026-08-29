@@ -1,4 +1,5 @@
 use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_path::GitPath;
 
 /// The `stat(2)` fields git caches per index entry to detect changes without
 /// re-hashing. All are stored as 32-bit values, exactly as the index format does.
@@ -41,5 +42,5 @@ pub struct IndexEntry<H: HashAlgorithm> {
 	/// must round-trip through the index and be honoured by the two-tree merge.
 	pub intent_to_add: bool,
 	/// The repository-relative path (forward slashes).
-	pub path: String,
+	pub path: GitPath,
 }

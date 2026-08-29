@@ -31,7 +31,7 @@ async fn add_commit(
 		.await
 		.expect("blob");
 	entries.push(TreeBuildEntry {
-		path: format!("file{i}.txt"),
+		path: gitana_path::GitPath::from_utf8(format!("file{i}.txt")).unwrap(),
 		mode: FileMode::Regular,
 		id: blob,
 	});

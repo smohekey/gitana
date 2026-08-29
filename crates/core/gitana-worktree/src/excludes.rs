@@ -39,7 +39,7 @@ pub(crate) struct StandardExcludes {
 /// worktree sandbox; `None` when there is none.
 pub(crate) async fn standard_excludes<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
-	excludes_file: Option<&str>,
+	excludes_file: Option<&[u8]>,
 ) -> Result<StandardExcludes, WorktreeError> {
 	Ok(StandardExcludes {
 		fold: ignore_case(wt).await?,
@@ -53,7 +53,7 @@ pub(crate) async fn standard_excludes<F: FileStore, W: WorkDirFs, H: HashAlgorit
 /// the base only for its non-force overwrite guard.
 pub(crate) async fn load_base<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
-	excludes_file: Option<&str>,
+	excludes_file: Option<&[u8]>,
 ) -> Result<Vec<DirIgnore>, WorktreeError> {
 	// Lowest priority first, so a later per-directory `.gitignore` (pushed on top by the caller)
 	// overrides them — git's last-match-wins precedence over the stack.
@@ -155,14 +155,43 @@ pub(crate) async fn ignore_case<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 /// absent or unreadable (permission-denied) contributes no patterns, as git warns and continues.
 pub(crate) async fn read_info_exclude<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
-) -> Result<Option<String>, WorktreeError> {
+) -> Result<Option<Vec<u8>>, WorktreeError> {
 	let store = wt.repository().objects().file_store();
 	if store.is_dir("info/exclude").await.unwrap_or(false) {
 		return Err(WorktreeError::ExcludeFile(".git/info/exclude".to_owned()));
 	}
 	match store.read_path("info/exclude").await {
-		Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+		Ok(bytes) => Ok(Some(bytes)),
 		// Absent, or unreadable (permission-denied) — git warns and continues with no patterns.
 		Err(_) => Ok(None),
+	}
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+	use cap_std::{ambient_authority, fs::Dir};
+	use gitana_file_store_local::{CapWorkDir, LocalFileStore};
+	use gitana_object::Sha256;
+	use gitana_object_store::ObjectStore;
+	use gitana_repository::Repository;
+
+	use super::read_info_exclude;
+	use crate::WorkTree;
+
+	#[tokio::test]
+	async fn reads_info_exclude_as_exact_bytes() {
+		let root = tempfile::tempdir().unwrap();
+		let git_dir = root.path().join(".git");
+		std::fs::create_dir_all(git_dir.join("info")).unwrap();
+		std::fs::write(git_dir.join("info/exclude"), b"raw-\xff\n").unwrap();
+		let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap(),
+		)));
+		let work =
+			CapWorkDir::from_dir(Dir::open_ambient_dir(root.path(), ambient_authority()).unwrap());
+		let worktree = WorkTree::new(repo, work, &git_dir);
+
+		let content = read_info_exclude(&worktree).await.unwrap();
+		assert_eq!(content.as_deref(), Some(b"raw-\xff\n".as_slice()));
 	}
 }

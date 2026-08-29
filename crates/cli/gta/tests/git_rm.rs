@@ -200,6 +200,30 @@ fn rm_dry_run_changes_nothing() {
 }
 
 #[test]
+fn rm_human_output_preserves_valid_utf8() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("gta-rm-utf8");
+	let w = work.to_str().unwrap();
+	gta(w, &["init"], b"");
+	std::fs::write(work.join("café"), b"content\n").unwrap();
+	git(w, &["add", "."]);
+	commit(w, "base");
+
+	for value in ["true", "false"] {
+		git(w, &["config", "core.quotePath", value]);
+		assert_eq!(
+			gta(w, &["rm", "--dry-run", "café"], b""),
+			git(w, &["rm", "--dry-run", "café"]),
+			"human output must ignore core.quotePath={value}"
+		);
+	}
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
 fn rm_refuses_to_remove_a_path_now_occupied_by_a_directory() {
 	if !git_supports_sha256() {
 		return;

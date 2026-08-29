@@ -351,7 +351,7 @@ async fn push_over_ssh<H: HashAlgorithm>() -> Result<()> {
 	let blob = client.write_blob(b"world\n").await?;
 	let tree = client
 		.write_tree(&[gitana_repository::TreeBuildEntry {
-			path: "hello.txt".to_owned(),
+			path: gitana_path::GitPath::from_utf8("hello.txt").unwrap(),
 			mode: gitana_repository::FileMode::Regular,
 			id: blob,
 		}])

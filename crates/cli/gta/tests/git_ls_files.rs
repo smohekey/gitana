@@ -82,6 +82,32 @@ fn assert_same(repo: &Path, subrel: &str, args: &[&str]) {
 	);
 }
 
+/// Compare gta's non-expanding sparse-index output with git's explicit `--sparse` presentation.
+/// gta intentionally keeps collapsed sparse-directory entries opaque rather than expanding the index.
+fn assert_same_as_git_sparse(repo: &Path, args: &[&str]) {
+	let git_args: Vec<&str> = std::iter::once("ls-files")
+		.chain(std::iter::once("--sparse"))
+		.chain(args.iter().copied())
+		.collect();
+	let gta_args: Vec<&str> = std::iter::once("ls-files")
+		.chain(args.iter().copied())
+		.collect();
+	let git_out = git_raw(repo, &git_args);
+	let gta_out = gta_raw(repo, &gta_args);
+	assert_eq!(
+		gta_out.stdout,
+		git_out.stdout,
+		"stdout mismatch for sparse `ls-files {args:?}`\n git: {:?}\n gta: {:?}",
+		String::from_utf8_lossy(&git_out.stdout),
+		String::from_utf8_lossy(&gta_out.stdout),
+	);
+	assert_eq!(
+		gta_out.status.code().map(|c| c != 0),
+		git_out.status.code().map(|c| c != 0),
+		"exit-nonzero mismatch for sparse `ls-files {args:?}`"
+	);
+}
+
 /// Pathspec filtering, the selection sets and their combinations, `-z`, quoting, cwd-relative output
 /// and `--full-name`, and `--error-unmatch` — all against a single rich working tree.
 #[test]
@@ -215,6 +241,38 @@ fn ls_files_sparse_matches_git() {
 	std::fs::remove_dir_all(&repo).ok();
 }
 
+/// A collapsed sparse-index directory retains its serialized trailing slash for both output and
+/// pathspec matching. gta keeps these entries opaque, equivalent to git's explicit `--sparse` mode.
+#[test]
+fn ls_files_sparse_directory_marker_matches_git_sparse() {
+	let repo = git_repo("lsf-sparse-dir");
+	std::fs::create_dir_all(repo.join("keep")).unwrap();
+	std::fs::create_dir_all(repo.join("out")).unwrap();
+	std::fs::write(repo.join("keep/file"), "k\n").unwrap();
+	std::fs::write(repo.join("out/file"), "o\n").unwrap();
+	git_ok(&repo, &["add", "-A"]);
+	git_ok(&repo, &["commit", "-qm", "init"]);
+	git_ok(
+		&repo,
+		&["sparse-checkout", "init", "--cone", "--sparse-index"],
+	);
+	git_ok(&repo, &["sparse-checkout", "set", "keep"]);
+
+	for case in [
+		&[][..],
+		&["out/"][..],
+		&["out/*"][..],
+		&["--error-unmatch", "out/"][..],
+		&["-s"][..],
+		&["-z"][..],
+		&["-z", "out/*"][..],
+	] {
+		assert_same_as_git_sparse(&repo, case);
+	}
+
+	std::fs::remove_dir_all(&repo).ok();
+}
+
 /// An exclusion-only pathspec is still scoped to the current subtree: `-C sub ls-files ':!a'` lists
 /// `sub/` minus `a`, cwd-relative — not the whole repository.
 #[test]
@@ -327,7 +385,41 @@ fn ls_files_others_embedded_repo_is_opaque() {
 	);
 	std::fs::write(inner.join("f.txt"), "f\n").unwrap();
 
+	for case in [
+		&["-o"][..],
+		&["-o", "inner/"][..],
+		&["-o", "inner/*"][..],
+		&["-o", "--error-unmatch", "inner/"][..],
+	] {
+		assert_same(&repo, "", case);
+	}
+
+	std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Opaque directory entries sort by the name that `ls-files` serializes, including the trailing
+/// slash. In raw byte order `.` precedes `/`, so `foo.` must be emitted before `foo/`.
+#[test]
+fn ls_files_others_sorts_opaque_directories_by_presented_name() {
+	let repo = git_repo("lsf-embed-order");
+	std::fs::write(repo.join("top"), "t\n").unwrap();
+	git_ok(&repo, &["add", "-A"]);
+	git_ok(&repo, &["commit", "-qm", "init"]);
+	std::fs::write(repo.join("foo."), "file\n").unwrap();
+	let inner = repo.join("foo");
+	std::fs::create_dir_all(&inner).unwrap();
+	git_ok(
+		&inner,
+		&["init", "-q", "-b", "main", inner.to_str().unwrap()],
+	);
+	std::fs::write(inner.join("inside"), "content\n").unwrap();
+
+	let git_lines = git_raw(&repo, &["ls-files", "-o"]);
+	assert_eq!(git_lines.stdout, b"foo.\nfoo/\n");
 	assert_same(&repo, "", &["-o"]);
+	let git_nul = git_raw(&repo, &["ls-files", "-o", "-z"]);
+	assert_eq!(git_nul.stdout, b"foo.\0foo/\0");
+	assert_same(&repo, "", &["-o", "-z"]);
 
 	std::fs::remove_dir_all(&repo).ok();
 }

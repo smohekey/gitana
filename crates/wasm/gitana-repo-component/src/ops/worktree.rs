@@ -9,11 +9,15 @@ use gitana_object::HashAlgorithm;
 use gitana_worktree::{SparseReapply, SparseSet, WorkTree};
 
 use crate::bindings::exports::gitana::repo::porcelain::{
-	RepoError, SparseOutcome as WitSparseOutcome, SparsePatterns as WitSparsePatterns,
-	StatusEntry as WitStatusEntry, WorktreeStatus as WitWorktreeStatus,
+	GitPath as WitGitPath, RepoError, SparseEntry as WitSparseEntry,
+	SparseOutcome as WitSparseOutcome, SparsePatterns as WitSparsePatterns,
+	StatusEntry as WitStatusEntry, UntrackedEntry as WitUntrackedEntry,
+	WorktreeStatus as WitWorktreeStatus,
 };
 
-use super::{HostIdentity, repo_error, worktree_error};
+use super::{
+	HostIdentity, display_path, git_path_into_wit, into_worktree_text, repo_error, worktree_error,
+};
 
 /// The working tree the worktree ops run over — the concrete `W` is the wasm descriptor capability.
 type Tree<H> = WorkTree<WorktreeFileStore, DescriptorWorkDir, H>;
@@ -27,31 +31,43 @@ pub(crate) async fn status<H: HashAlgorithm>(wt: &Tree<H>) -> Result<WitWorktree
 			.changed
 			.into_iter()
 			.map(|entry| WitStatusEntry {
-				path: entry.path,
+				path: git_path_into_wit(entry.path),
 				index: entry.index.to_string(),
 				worktree: entry.worktree.to_string(),
 			})
 			.collect(),
-		untracked: status.untracked,
+		untracked: status
+			.untracked
+			.into_iter()
+			.map(|entry| WitUntrackedEntry {
+				path: git_path_into_wit(entry.path),
+				directory: entry.directory,
+			})
+			.collect(),
 	})
 }
 
 pub(crate) async fn add<H: HashAlgorithm>(
 	wt: &Tree<H>,
-	pathspecs: &[String],
-	prefix: &str,
+	pathspecs: &[WitGitPath],
+	prefix: &WitGitPath,
 	force: bool,
 ) -> Result<(), RepoError> {
+	let pathspecs = pathspecs
+		.iter()
+		.map(into_worktree_text)
+		.collect::<Result<Vec<_>, _>>()?;
+	let prefix = into_worktree_text(prefix)?;
 	let specs: Vec<&str> = pathspecs.iter().map(String::as_str).collect();
 	// No global excludes file in the sandbox; `core.ignoreCase` and `.git/info/exclude` are read internally.
-	wt.add(&specs, prefix, force, None)
+	wt.add(&specs, &prefix, force, None)
 		.await
 		.map_err(worktree_error)
 }
 
 pub(crate) async fn checkout<H: HashAlgorithm>(
 	wt: &Tree<H>,
-	tree_ish: &str,
+	tree_ish: &[u8],
 	force: bool,
 ) -> Result<(), RepoError> {
 	// Resolve the spec (commit/tag/tree) and peel it to the tree checkout materialises.
@@ -78,9 +94,10 @@ pub(crate) async fn commit<H: HashAlgorithm>(
 
 pub(crate) async fn sparse_set<H: HashAlgorithm>(
 	wt: &Tree<H>,
-	patterns: Vec<String>,
+	patterns: Vec<WitSparseEntry>,
 	cone: bool,
 ) -> Result<WitSparseOutcome, RepoError> {
+	let patterns = sparse_entry_bytes(patterns)?;
 	let set = if cone {
 		let dirs = cone_dirs(patterns)?;
 		reject_tracked_files(wt, &dirs).await?;
@@ -89,7 +106,7 @@ pub(crate) async fn sparse_set<H: HashAlgorithm>(
 		// An empty non-cone set is git's non-cone default — root files only (`/*` then `!/*/`) — not an
 		// empty pattern file, which would omit even the root files. Matches the native CLI and the WIT
 		// contract that an empty set initializes to root files.
-		SparseSet::NonCone(vec!["/*".to_owned(), "!/*/".to_owned()])
+		SparseSet::non_cone_utf8(["/*", "!/*/"])
 	} else {
 		SparseSet::NonCone(patterns)
 	};
@@ -103,7 +120,7 @@ pub(crate) async fn sparse_set<H: HashAlgorithm>(
 /// index check so it does not silently persist a broken set.
 async fn reject_tracked_files<H: HashAlgorithm>(
 	wt: &Tree<H>,
-	dirs: &[String],
+	dirs: &[gitana_path::GitPath],
 ) -> Result<(), RepoError> {
 	let index = wt.load_index().await.map_err(worktree_error)?;
 	for dir in dirs {
@@ -114,7 +131,8 @@ async fn reject_tracked_files<H: HashAlgorithm>(
 				.any(|entry| entry.stage == 0 && entry.path == *dir)
 		{
 			return Err(RepoError::Invalid(format!(
-				"'{dir}' is a tracked file, not a directory"
+				"'{}' is a tracked file, not a directory",
+				display_path(dir)
 			)));
 		}
 	}
@@ -127,43 +145,58 @@ async fn reject_tracked_files<H: HashAlgorithm>(
 /// component operates on an opened work tree), so directories are root-relative. Without this a raw
 /// pattern such as `*` reaches `SparseSet::Cone` and renders an invalid cone file (`/*/`) that silently
 /// falls back to non-cone matching — broadening the checkout and reporting `cone=false`.
-fn cone_dirs(patterns: Vec<String>) -> Result<Vec<String>, RepoError> {
+fn cone_dirs(patterns: Vec<Vec<u8>>) -> Result<Vec<gitana_path::GitPath>, RepoError> {
 	patterns
 		.into_iter()
 		.map(|dir| {
-			if dir.contains(['*', '?', '[', ']', '\\']) {
+			let display = gitana_path::GitPathspec::from_bytes(dir.clone())
+				.map_err(|error| RepoError::Invalid(error.to_string()))?;
+			let display = display.quote();
+			if dir
+				.iter()
+				.any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'\\'))
+			{
 				return Err(RepoError::Invalid(format!(
-					"'{dir}' contains a pattern character; cone directories must be literal paths"
+					"'{display}' contains a pattern character; cone directories must be literal paths"
 				)));
 			}
-			if dir.starts_with('/') {
+			if dir.starts_with(b"/") {
 				return Err(RepoError::Invalid(format!(
-					"'{dir}': cone directories must not start with a slash"
+					"'{display}': cone directories must not start with a slash"
 				)));
 			}
-			let mut components: Vec<&str> = Vec::new();
-			for segment in dir.split('/') {
+			let mut components: Vec<Vec<u8>> = Vec::new();
+			for segment in dir.split(|byte| *byte == b'/') {
 				match segment {
-					"" | "." => {}
-					".." => {
+					b"" | b"." => {}
+					b".." => {
 						if components.pop().is_none() {
 							return Err(RepoError::Invalid(format!(
-								"'{dir}' is outside the repository"
+								"'{display}' is outside the repository"
 							)));
 						}
 					}
-					segment => components.push(segment),
+					segment => components.push(segment.to_vec()),
 				}
 			}
-			Ok(components.join("/"))
+			let mut path = Vec::new();
+			for (index, component) in components.iter().enumerate() {
+				if index > 0 {
+					path.push(b'/');
+				}
+				path.extend_from_slice(component);
+			}
+			gitana_path::GitPath::from_bytes(path)
+				.map_err(|error| RepoError::Invalid(format!("invalid cone directory '{display}': {error}")))
 		})
 		.collect()
 }
 
 pub(crate) async fn sparse_add<H: HashAlgorithm>(
 	wt: &Tree<H>,
-	patterns: Vec<String>,
+	patterns: Vec<WitSparseEntry>,
 ) -> Result<WitSparseOutcome, RepoError> {
+	let patterns = sparse_entry_bytes(patterns)?;
 	let current = wt.current_sparse_set().await.map_err(worktree_error)?;
 	// `add` keeps the configured mode, extending the current set; sparse must already be enabled.
 	let merged = match current {
@@ -191,10 +224,37 @@ pub(crate) async fn sparse_list<H: HashAlgorithm>(
 	wt: &Tree<H>,
 ) -> Result<Option<WitSparsePatterns>, RepoError> {
 	let set = wt.current_sparse_set().await.map_err(worktree_error)?;
-	Ok(set.map(|set| WitSparsePatterns {
-		cone: set.is_cone(),
-		entries: set.entries().to_vec(),
-	}))
+	set
+		.map(|set| {
+			let entries = set.entries().map(sparse_entry_into_wit).collect();
+			Ok(WitSparsePatterns {
+				cone: set.is_cone(),
+				entries,
+			})
+		})
+		.transpose()
+}
+
+fn sparse_entry_bytes(entries: Vec<WitSparseEntry>) -> Result<Vec<Vec<u8>>, RepoError> {
+	entries
+		.into_iter()
+		.map(|entry| {
+			let bytes = match entry {
+				WitSparseEntry::Utf8(entry) => entry.into_bytes(),
+				WitSparseEntry::Bytes(entry) => entry,
+			};
+			gitana_path::GitPathspec::from_bytes(bytes.clone())
+				.map_err(|error| RepoError::Invalid(error.to_string()))?;
+			Ok(bytes)
+		})
+		.collect()
+}
+
+fn sparse_entry_into_wit(entry: &[u8]) -> WitSparseEntry {
+	match std::str::from_utf8(entry) {
+		Ok(entry) => WitSparseEntry::Utf8(entry.to_owned()),
+		Err(_) => WitSparseEntry::Bytes(entry.to_vec()),
+	}
 }
 
 pub(crate) async fn sparse_disable<H: HashAlgorithm>(
@@ -214,8 +274,16 @@ pub(crate) async fn sparse_reapply<H: HashAlgorithm>(
 /// Map the engine reapply outcome to the boundary record.
 fn sparse_outcome(outcome: SparseReapply) -> WitSparseOutcome {
 	WitSparseOutcome {
-		left_dirty: outcome.left_dirty,
-		not_updated: outcome.not_updated,
+		left_dirty: outcome
+			.left_dirty
+			.into_iter()
+			.map(git_path_into_wit)
+			.collect(),
+		not_updated: outcome
+			.not_updated
+			.into_iter()
+			.map(git_path_into_wit)
+			.collect(),
 	}
 }
 

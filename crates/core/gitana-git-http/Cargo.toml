@@ -21,6 +21,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 gitana-file-store-memory.workspace = true
+gitana-path.workspace = true
 proptest.workspace = true
 serde_json.workspace = true
 ssh-key = { workspace = true, features = ["ed25519"] }

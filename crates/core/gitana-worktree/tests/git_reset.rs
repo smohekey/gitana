@@ -7,7 +7,7 @@ use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::{ObjectId, ObjectKind, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
-use gitana_worktree::{WorkTree, WorktreeError};
+use gitana_worktree::WorkTree;
 
 fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
 	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
@@ -86,10 +86,10 @@ async fn reset_index_rejects_unsafe_tree_path() {
 		.await
 		.unwrap();
 
-	assert!(matches!(
-		wt.reset_index(hostile).await,
-		Err(WorktreeError::UnsafePath(_))
-	));
+	assert!(
+		wt.reset_index(hostile).await.is_err(),
+		"the byte-preserving tree parser or the worktree guard must reject traversal"
+	);
 	assert_eq!(
 		wt.load_index().await.unwrap(),
 		before,

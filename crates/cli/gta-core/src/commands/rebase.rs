@@ -27,6 +27,7 @@ pub async fn run(
 	abort: bool,
 	continue_: bool,
 	skip: bool,
+	result_path_mode: crate::ResultPathMode,
 ) -> Result<()> {
 	if [abort, continue_, skip].iter().filter(|&&f| f).count() > 1 {
 		bail!("--abort, --continue, and --skip are mutually exclusive");
@@ -39,6 +40,7 @@ pub async fn run(
 			abort,
 			continue_,
 			skip,
+			result_path_mode,
 			cwd: cwd.to_path_buf(),
 		},
 	)
@@ -51,6 +53,7 @@ struct Rebase {
 	abort: bool,
 	continue_: bool,
 	skip: bool,
+	result_path_mode: crate::ResultPathMode,
 	/// The effective working directory, for resolving a relative `user.signingkey` (`-C`).
 	cwd: std::path::PathBuf,
 }
@@ -59,7 +62,7 @@ impl WorkTreeCommand for Rebase {
 	async fn run<H: HashAlgorithm>(
 		self,
 		wt: WorkTree<Backend, crate::WorkDir, H>,
-		_prefix: String,
+		_prefix: gitana_path::GitPath,
 	) -> Result<()> {
 		let identity = CliIdentity::new(wt.repository());
 		if self.abort {
@@ -74,12 +77,15 @@ impl WorkTreeCommand for Rebase {
 		} else {
 			gitana_porcelain::rebase(&wt, self.upstream, self.onto, &identity, signer.as_ref()).await?
 		};
-		render(outcome)
+		render(outcome, self.result_path_mode)
 	}
 }
 
 /// Render a rebase outcome to stdout, or turn a conflict into the process's exit.
-fn render<H: HashAlgorithm>(outcome: RebaseOutcome<H>) -> Result<()> {
+fn render<H: HashAlgorithm>(
+	outcome: RebaseOutcome<H>,
+	result_path_mode: crate::ResultPathMode,
+) -> Result<()> {
 	match outcome {
 		RebaseOutcome::UpToDate { branch } => {
 			println!("Current branch {} is up to date.", branch_short(&branch));
@@ -102,9 +108,7 @@ fn render<H: HashAlgorithm>(outcome: RebaseOutcome<H>) -> Result<()> {
 			subject,
 			paths,
 		} => {
-			for path in &paths {
-				println!("CONFLICT (content): Merge conflict in {path}");
-			}
+			crate::commands::conflict::print_conflicts(&paths, result_path_mode);
 			println!("could not apply {} {}", short(commit), subject);
 			println!(
 				"hint: resolve the conflicts, `gta add` them, then run `gta rebase --continue` (or --skip / --abort)"

@@ -1,13 +1,18 @@
 #![cfg(unix)]
 
+use std::io;
 use std::path::PathBuf;
 use std::process::Command;
 
 use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::{ObjectId, ObjectKind, Sha256};
 use gitana_object_store::ObjectStore;
+use gitana_path::{GitPath, GitPathspec};
 use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 use gitana_worktree::{IndexEntry, Stat, WorkTree, WorktreeError};
+
+mod support;
+use support::make_utf8_only_repo;
 
 fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
 	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
@@ -55,6 +60,62 @@ fn two_commits(tag: &str) -> (PathBuf, String) {
 	commit(w, "two");
 
 	(work, first)
+}
+
+#[tokio::test]
+async fn worktree_restore_preflights_backend_path_representation() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("restore-path-representation");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"old\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+
+	let before_index = std::fs::read(work.join(".git/index")).unwrap();
+	let wt = make_utf8_only_repo(&work);
+	let ordinary_blob = wt.repository().write_blob(b"new\n").await.unwrap();
+	let raw_blob = wt.repository().write_blob(b"raw\n").await.unwrap();
+	let target_tree = wt
+		.repository()
+		.write_tree(&[
+			TreeBuildEntry {
+				path: GitPath::from_utf8("a.txt").unwrap(),
+				mode: FileMode::Regular,
+				id: ordinary_blob,
+			},
+			TreeBuildEntry {
+				path: GitPath::from_bytes(b"z-raw-\xff".to_vec()).unwrap(),
+				mode: FileMode::Regular,
+				id: raw_blob,
+			},
+		])
+		.await
+		.unwrap();
+	let error = wt
+		.restore_pathspecs(
+			Some(target_tree),
+			true,
+			false,
+			&[GitPathspec::from_utf8(".").unwrap()],
+			&GitPath::root(),
+		)
+		.await
+		.unwrap_err();
+	assert!(
+		matches!(error, WorktreeError::Io(ref error) if error.kind() == io::ErrorKind::Unsupported),
+		"unexpected error: {error:?}"
+	);
+	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"old\n");
+	assert_eq!(
+		std::fs::read(work.join(".git/index")).unwrap(),
+		before_index
+	);
+	assert!(!work.join(".git/index.lock").exists());
+
+	std::fs::remove_dir_all(&work).ok();
 }
 
 #[tokio::test]
@@ -343,7 +404,7 @@ async fn restore_rejects_pathspec_above_root() {
 	std::fs::write(work.join("a.txt"), b"dirty\n").unwrap();
 	assert!(matches!(
 		wt.restore(None, true, false, &["../a.txt"], "").await,
-		Err(WorktreeError::UnsafePath(_))
+		Err(WorktreeError::UnsafePathspec(_))
 	));
 	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"dirty\n");
 
@@ -637,10 +698,12 @@ async fn staged_restore_rejects_unsafe_tree_path() {
 		.unwrap();
 
 	let before = wt.load_index().await.unwrap();
-	assert!(matches!(
-		wt.restore(Some(hostile), false, true, &["."], "").await,
-		Err(WorktreeError::UnsafePath(_))
-	));
+	assert!(
+		wt.restore(Some(hostile), false, true, &["."], "")
+			.await
+			.is_err(),
+		"the byte-preserving tree parser or the worktree guard must reject traversal"
+	);
 	// The index is untouched, and nothing was written outside the work tree.
 	assert_eq!(wt.load_index().await.unwrap(), before);
 	assert!(!escape_outside.exists());
@@ -660,7 +723,7 @@ async fn worktree_restore_from_unsafe_tree_leaves_filesystem_unchanged() {
 	let hostile = wt
 		.repository()
 		.write_tree(&[TreeBuildEntry {
-			path: ".git/config".to_owned(),
+			path: gitana_path::GitPath::from_utf8(".git/config").unwrap(),
 			mode: FileMode::Regular,
 			id: blob,
 		}])
@@ -690,7 +753,7 @@ async fn restore_rejects_unsafe_index_path() {
 	let wt = make_repo(&work);
 
 	// Inject a hostile entry directly into the index, as a corrupt or hostile index might carry.
-	let (escape_spec, escape_outside) = escape_path(&work);
+	let config_before = std::fs::read(work.join(".git/config")).unwrap();
 	let mut index = wt.load_index().await.unwrap();
 	let blob = wt.repository().write_blob(b"PWN\n").await.unwrap();
 	index.upsert(IndexEntry {
@@ -701,7 +764,7 @@ async fn restore_rejects_unsafe_index_path() {
 		assume_valid: false,
 		skip_worktree: false,
 		intent_to_add: false,
-		path: escape_spec,
+		path: gitana_path::GitPath::from_utf8(".git/config").unwrap(),
 	});
 	wt.save_index(&index).await.unwrap();
 
@@ -710,7 +773,10 @@ async fn restore_rejects_unsafe_index_path() {
 		wt.restore(None, true, false, &["."], "").await,
 		Err(WorktreeError::UnsafePath(_))
 	));
-	assert!(!escape_outside.exists());
+	assert_eq!(
+		std::fs::read(work.join(".git/config")).unwrap(),
+		config_before
+	);
 
 	std::fs::remove_dir_all(&work).ok();
 }

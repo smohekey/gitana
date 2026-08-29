@@ -43,7 +43,7 @@ impl WorkTreeCommand for Switch<'_> {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		prefix: String,
+		prefix: gitana_path::GitPath,
 	) -> Result<()> {
 		let repo = worktree.repository();
 		let branch = format!("refs/heads/{}", self.name);

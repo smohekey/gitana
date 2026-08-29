@@ -8,12 +8,12 @@ use gitana_repository::Repository;
 use crate::dispatch::{self, RepoCommand};
 
 /// Resolve a revision spec to an object id.
-pub async fn run(cwd: &Path, spec: &str) -> Result<()> {
+pub async fn run(cwd: &Path, spec: &[u8]) -> Result<()> {
 	dispatch::on_repo(cwd, RevParse { spec }).await
 }
 
 struct RevParse<'a> {
-	spec: &'a str,
+	spec: &'a [u8],
 }
 
 impl RepoCommand for RevParse<'_> {

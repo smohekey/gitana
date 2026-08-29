@@ -37,7 +37,9 @@ fn sample_graph() -> Vec<PackedObject<Sha256>> {
 		ObjectKind::Tree,
 		encode_tree(&[TreeEntry {
 			mode: "100644".to_owned(),
-			name: "file.txt".to_owned(),
+			name: gitana_path::GitPathComponent::from_utf8("file.txt")
+				.unwrap()
+				.into(),
 			id: blob1,
 		}]),
 	);
@@ -45,7 +47,9 @@ fn sample_graph() -> Vec<PackedObject<Sha256>> {
 		ObjectKind::Tree,
 		encode_tree(&[TreeEntry {
 			mode: "100644".to_owned(),
-			name: "file.txt".to_owned(),
+			name: gitana_path::GitPathComponent::from_utf8("file.txt")
+				.unwrap()
+				.into(),
 			id: blob2,
 		}]),
 	);

@@ -12,10 +12,13 @@ mod support;
 use anyhow::{Result, anyhow, bail};
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, Sha1, Sha256, parse_commit};
 use gitana_repo_host::exports::gitana::repo::porcelain::{
-	FileMode as WitMode, HashKind, HeadState, ObjectKind as WitKind, RepoError, TreeBuildEntry,
+	FileMode as WitMode, HashKind, HeadState, ObjectKind as WitKind, RepoError, RevisionSpec,
+	TreeBuildEntry,
 };
 
-use self::support::{AUTHOR, Session, build_fixture, committer, native_repo};
+use self::support::{
+	AUTHOR, Session, build_fixture, committer, native_repo, wit_path, wit_path_bytes, wit_revision,
+};
 
 const GUEST_BLOB: &[u8] = b"hello from wasm gitana\n";
 
@@ -46,7 +49,7 @@ async fn roundtrip<H: HashAlgorithm>(expected_kind: HashKind) -> Result<()> {
 	// -- reads ------------------------------------------------------------------
 
 	let commit = porcelain
-		.call_read_commit(&mut *store, handle, "HEAD")
+		.call_read_commit(&mut *store, handle, &wit_revision("HEAD"))
 		.await?
 		.map_err(|error| anyhow!("read-commit: {error:?}"))?;
 	assert_eq!(commit.id, fixture.m);
@@ -69,7 +72,7 @@ async fn roundtrip<H: HashAlgorithm>(expected_kind: HashKind) -> Result<()> {
 		("annot", Some(&fixture.annot), WitKind::Tag),
 	] {
 		let object = porcelain
-			.call_read_object(&mut *store, handle, spec)
+			.call_read_object(&mut *store, handle, &wit_revision(spec))
 			.await?
 			.map_err(|error| anyhow!("read-object {spec}: {error:?}"))?;
 		if let Some(id) = id {
@@ -85,13 +88,28 @@ async fn roundtrip<H: HashAlgorithm>(expected_kind: HashKind) -> Result<()> {
 	}
 
 	let inner = porcelain
-		.call_read_blob(&mut *store, handle, "HEAD:dir/inner.txt")
+		.call_read_blob(&mut *store, handle, &wit_revision("HEAD:dir/inner.txt"))
 		.await?
 		.map_err(|error| anyhow!("read-blob: {error:?}"))?;
 	assert_eq!(inner, b"inner\n");
+	let raw_blob = native.write_blob(b"raw path\n").await?;
+	let raw_tree = native
+		.write_tree(&[gitana_repository::TreeBuildEntry {
+			path: gitana_path::GitPath::from_bytes(b"raw-\xff".to_vec())?,
+			mode: gitana_repository::FileMode::Regular,
+			id: raw_blob,
+		}])
+		.await?;
+	let mut raw_spec = raw_tree.to_hex().into_bytes();
+	raw_spec.extend_from_slice(b":raw-\xff");
+	let raw = porcelain
+		.call_read_blob(&mut *store, handle, &RevisionSpec::Bytes(raw_spec))
+		.await?
+		.map_err(|error| anyhow!("read raw-path blob: {error:?}"))?;
+	assert_eq!(raw, b"raw path\n");
 
 	let tag = porcelain
-		.call_read_tag(&mut *store, handle, "annot")
+		.call_read_tag(&mut *store, handle, &wit_revision("annot"))
 		.await?
 		.map_err(|error| anyhow!("read-tag: {error:?}"))?;
 	assert_eq!(tag.id, fixture.annot);
@@ -103,7 +121,7 @@ async fn roundtrip<H: HashAlgorithm>(expected_kind: HashKind) -> Result<()> {
 
 	// ls-tree equals the native recursive read, incl. the executable's mode.
 	let listed = porcelain
-		.call_ls_tree(&mut *store, handle, "HEAD")
+		.call_ls_tree(&mut *store, handle, &wit_revision("HEAD"))
 		.await?
 		.map_err(|error| anyhow!("ls-tree: {error:?}"))?;
 	let native_tree = native
@@ -111,13 +129,13 @@ async fn roundtrip<H: HashAlgorithm>(expected_kind: HashKind) -> Result<()> {
 		.await?;
 	assert_eq!(listed.len(), native_tree.len());
 	for (entry, (path, mode, id)) in listed.iter().zip(&native_tree) {
-		assert_eq!(&entry.path, path);
+		assert_eq!(wit_path_bytes(&entry.path), path.as_bytes());
 		assert_eq!(&entry.mode, mode);
 		assert_eq!(entry.id, id.to_hex());
 	}
 	let tool = listed
 		.iter()
-		.find(|entry| entry.path == "tool")
+		.find(|entry| wit_path_bytes(&entry.path) == b"tool")
 		.expect("tool entry");
 	assert_eq!(tool.mode, "100755");
 
@@ -131,7 +149,7 @@ async fn roundtrip<H: HashAlgorithm>(expected_kind: HashKind) -> Result<()> {
 		("lw", &fixture.b),
 	] {
 		let resolved = porcelain
-			.call_rev_parse(&mut *store, handle, spec)
+			.call_rev_parse(&mut *store, handle, &wit_revision(spec))
 			.await?
 			.map_err(|error| anyhow!("rev-parse {spec}: {error:?}"))?;
 		assert_eq!(&resolved, expected, "{spec}");
@@ -254,7 +272,7 @@ async fn roundtrip<H: HashAlgorithm>(expected_kind: HashKind) -> Result<()> {
 
 	// A guest-built tree + commit + ref, verified natively end-to-end.
 	let entries = vec![TreeBuildEntry {
-		path: "guest/data.txt".to_owned(),
+		path: wit_path("guest/data.txt"),
 		mode: WitMode::Regular,
 		id: written.clone(),
 	}];
@@ -337,14 +355,14 @@ async fn roundtrip<H: HashAlgorithm>(expected_kind: HashKind) -> Result<()> {
 	// -- typed errors -------------------------------------------------------------
 
 	let missing = porcelain
-		.call_read_commit(&mut *store, handle, "does-not-exist")
+		.call_read_commit(&mut *store, handle, &wit_revision("does-not-exist"))
 		.await?;
 	assert!(
 		matches!(missing, Err(RepoError::UnknownRevision(_))),
 		"expected unknown-revision, got {missing:?}"
 	);
 	let not_a_commit = porcelain
-		.call_read_commit(&mut *store, handle, "HEAD^{tree}")
+		.call_read_commit(&mut *store, handle, &wit_revision("HEAD^{tree}"))
 		.await?;
 	assert!(
 		matches!(not_a_commit, Err(RepoError::Invalid(_))),

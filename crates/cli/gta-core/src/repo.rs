@@ -13,6 +13,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use gitana_object::HashAlgorithm;
 use gitana_object_store::ObjectStore;
+use gitana_path::GitPath;
 use gitana_repository::Repository;
 
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
@@ -70,7 +71,7 @@ pub fn open_work_dir(work: &Path) -> Result<WorkDir> {
 /// `WorkTree<_, H>` for whichever hash algorithm the repo uses. The prefix is the `/`-joined path
 /// from the work-tree root down to `start` (empty at the root), making pathspecs relative to the
 /// caller's subdirectory, the way `git -C <subdir>` does.
-pub async fn discover_worktree_with_prefix(start: &Path) -> Result<(RepositoryLayout, String)> {
+pub async fn discover_worktree_with_prefix(start: &Path) -> Result<(RepositoryLayout, GitPath)> {
 	// Resolve symlinks before discovering, so the prefix reflects the physical location of the
 	// caller's directory under the work tree (e.g. `-C linksub` where `linksub -> sub`).
 	// Otherwise the lexical name would be matched/recorded as a tracked path. Discovery canonicalizes
@@ -83,13 +84,9 @@ pub async fn discover_worktree_with_prefix(start: &Path) -> Result<(RepositoryLa
 		.as_ref()
 		.ok_or_else(work_tree_required)?;
 	// `work` is the canonical `start` with trailing components removed, so this strip succeeds.
-	let prefix = start
-		.strip_prefix(work)
-		.unwrap_or(Path::new(""))
-		.components()
-		.map(|component| component.as_os_str().to_string_lossy())
-		.collect::<Vec<_>>()
-		.join("/");
+	let prefix = crate::git_path::repository_path_from_native(
+		start.strip_prefix(work).unwrap_or(Path::new("")),
+	)?;
 	Ok((found, prefix))
 }
 

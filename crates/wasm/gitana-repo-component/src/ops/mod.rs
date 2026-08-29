@@ -3,6 +3,7 @@
 //! WIT types happen here, at the boundary.
 
 mod error;
+mod git_path;
 mod host_identity;
 mod include_resolver;
 mod objects;
@@ -15,6 +16,10 @@ mod worktree;
 
 pub(crate) use self::{
 	error::{repo_error, worktree_error},
+	git_path::{
+		display_path, display_revision, from_wit as git_path_from_wit, into_wit as git_path_into_wit,
+		into_worktree_text, revision_from_wit, tree_path_into_wit,
+	},
 	host_identity::HostIdentity,
 	include_resolver::FileStoreIncludeResolver,
 	objects::{

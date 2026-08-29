@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::Backend;
 use anyhow::{Result, bail};
 use gitana_object::HashAlgorithm;
+use gitana_path::GitPathspec;
 use gitana_worktree::WorkTree;
 
 use crate::dispatch::{self, WorkTreeCommand};
@@ -17,8 +18,8 @@ pub async fn run(
 	cwd: &Path,
 	worktree: bool,
 	staged: bool,
-	source: Option<String>,
-	paths: Vec<String>,
+	source: Option<Vec<u8>>,
+	paths: Vec<GitPathspec>,
 ) -> Result<()> {
 	dispatch::on_worktree(
 		cwd,
@@ -35,15 +36,15 @@ pub async fn run(
 struct Restore {
 	worktree: bool,
 	staged: bool,
-	source: Option<String>,
-	paths: Vec<String>,
+	source: Option<Vec<u8>>,
+	paths: Vec<GitPathspec>,
 }
 
 impl WorkTreeCommand for Restore {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		prefix: String,
+		prefix: gitana_path::GitPath,
 	) -> Result<()> {
 		if self.paths.is_empty() {
 			bail!("you must specify path(s) to restore");
@@ -53,20 +54,18 @@ impl WorkTreeCommand for Restore {
 		let restore_worktree = self.worktree || !self.staged;
 
 		let tree = match self.source {
-			Some(treeish) => Some(
-				worktree
-					.repository()
-					.rev_parse(&format!("{treeish}^{{tree}}"))
-					.await?,
-			),
+			Some(treeish) => {
+				let repo = worktree.repository();
+				let id = repo.rev_parse(&treeish).await?;
+				Some(repo.peel_to_tree(id).await?)
+			}
 			// Restoring the index defaults to `HEAD`; a worktree-only restore defaults to the index.
 			None if self.staged => Some(worktree.repository().rev_parse("HEAD^{tree}").await?),
 			None => None,
 		};
 
-		let specs: Vec<&str> = self.paths.iter().map(String::as_str).collect();
 		worktree
-			.restore(tree, restore_worktree, self.staged, &specs, &prefix)
+			.restore_pathspecs(tree, restore_worktree, self.staged, &self.paths, &prefix)
 			.await?;
 		Ok(())
 	}
