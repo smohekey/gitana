@@ -382,6 +382,94 @@ where
 			.map_err(|(_, error)| error)
 	}
 
+	/// Compare-and-set the branch this worktree's symbolic `HEAD` names while the caller already
+	/// holds this store's `HEAD.lock`.
+	///
+	/// This is the ref-publication half needed by a larger caller-owned transaction that must keep
+	/// `HEAD` stable across work outside the repository engine (for example, publishing a matching
+	/// worktree index). The caller must acquire and retain the exact store's `HEAD.lock` for the whole
+	/// call. Unlike [`Self::update_ref`], this method deliberately does not acquire or release that
+	/// lock; it locks the branch and `packed-refs`, revalidates that `HEAD` still names `name`, applies
+	/// the compare-and-set, and writes the normal branch and mirrored `HEAD` reflogs under the caller's
+	/// lock.
+	///
+	/// On native targets, ref validation and publication still run in an owned task. A caller that can
+	/// be cancelled must therefore keep its `HEAD.lock` durable until this future resolves or its own
+	/// recovery protocol proves the retained publication has finished.
+	pub async fn update_ref_under_head_lock(
+		&self,
+		name: &str,
+		new: ObjectId<H>,
+		expected: Option<ObjectId<H>>,
+		reflog: ReflogIntent<'_>,
+	) -> Result<(), RepositoryError> {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let files = self.files.shared_handle();
+			let effective = self.effective.cloned();
+			let name = name.to_owned();
+			let reflog = OwnedReflogIntent::from(reflog);
+			match tokio::spawn(async move {
+				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+				store
+					.update_ref_under_head_lock_inline(&name, new, expected, reflog.borrow())
+					.await
+			})
+			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		self
+			.update_ref_under_head_lock_inline(name, new, expected, reflog)
+			.await
+	}
+
+	async fn update_ref_under_head_lock_inline(
+		&self,
+		name: &str,
+		new: ObjectId<H>,
+		expected: Option<ObjectId<H>>,
+		reflog: ReflogIntent<'_>,
+	) -> Result<(), RepositoryError> {
+		let policy = self.reflog_policy().await?;
+		let op = RefOp {
+			name: name.to_owned(),
+			expected,
+			new: Some(new),
+			reflog,
+		};
+		let ops = std::slice::from_ref(&op);
+		let acquired = self
+			.lock_all(&[name.to_owned(), PACKED_REFS.to_owned()])
+			.await
+			.map_err(|(_, error)| error)?;
+		let result = async {
+			// `HEAD` is stable because the caller owns HEAD.lock. Require the exact current branch rather
+			// than silently degrading to a branch-only update without the mirrored HEAD reflog.
+			if self.read_symbolic("HEAD").await?.as_deref() != Some(name) {
+				return Err(RepositoryError::RefMoved {
+					name: "HEAD".to_owned(),
+				});
+			}
+			let cascades = [true];
+			let olds = self
+				.validate_locked(ops, &cascades, policy)
+				.await
+				.map_err(|(_, error)| error)?;
+			self
+				.commit_validated(ops, &olds, &cascades, policy)
+				.await
+				.map_err(|(_, error)| error)
+		}
+		.await;
+		self.release_locks(acquired).await;
+		result
+	}
+
 	/// Delete a ref, requiring its current resolved value to equal `expected` (CAS).
 	///
 	/// Removes the loose ref file (if any), drops the ref from `packed-refs` (if present), and deletes
@@ -3245,6 +3333,79 @@ mod tests {
 			.await
 			.expect("releasing the checkout lock lets the move through");
 		assert_eq!(store.resolve("refs/heads/main").await.unwrap(), Some(next));
+	}
+
+	/// A larger transaction that owns `HEAD.lock` can still advance the current branch without
+	/// deadlocking on its own lock. The specialized publication retains the caller's lock and keeps
+	/// the same CAS and split-HEAD semantics as an ordinary update.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn update_current_branch_under_caller_owned_head_lock() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+		let next = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"next");
+		store
+			.update_ref("refs/heads/main", tip, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		store
+			.set_symbolic("HEAD", "refs/heads/main", ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		let head_lock = files
+			.try_lock_path("HEAD.lock")
+			.await
+			.unwrap()
+			.expect("acquire caller-owned HEAD lock");
+		store
+			.update_ref_under_head_lock("refs/heads/main", next, Some(tip), ReflogIntent::Skip)
+			.await
+			.expect("publish under the existing HEAD lock");
+		assert_eq!(store.resolve("refs/heads/main").await.unwrap(), Some(next));
+		assert!(
+			files.exists("HEAD.lock").await.unwrap(),
+			"the caller still owns HEAD.lock"
+		);
+		drop(head_lock);
+		assert!(!files.exists("HEAD.lock").await.unwrap());
+	}
+
+	/// The specialized path is only valid for the exact branch named by the locked symbolic HEAD;
+	/// refusing another branch prevents a caller mistake from skipping the mirrored HEAD semantics.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn update_under_head_lock_rejects_a_non_current_branch() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+		let next = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"next");
+		store
+			.update_ref("refs/heads/main", tip, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		store
+			.update_ref("refs/heads/other", tip, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		store
+			.set_symbolic("HEAD", "refs/heads/main", ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		let head_lock = files
+			.try_lock_path("HEAD.lock")
+			.await
+			.unwrap()
+			.expect("acquire caller-owned HEAD lock");
+		let error = store
+			.update_ref_under_head_lock("refs/heads/other", next, Some(tip), ReflogIntent::Skip)
+			.await
+			.expect_err("the locked HEAD names another branch");
+		assert!(matches!(&error, crate::RepositoryError::RefMoved { name } if name == "HEAD"));
+		assert_eq!(store.resolve("refs/heads/other").await.unwrap(), Some(tip));
+		drop(head_lock);
 	}
 
 	/// Deleting a nested ref frees its parent name while keeping the namespace anchors: after

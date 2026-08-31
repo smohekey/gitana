@@ -299,6 +299,41 @@ where
 			.await
 	}
 
+	/// Record an already-written commit while the caller owns this worktree's authenticated
+	/// `HEAD.lock` as part of a larger publication transaction.
+	///
+	/// This has the same CAS and reflog semantics as [`Self::record_commit`], but delegates to
+	/// [`RefStore::update_ref_under_head_lock`] so it does not deadlock by reacquiring the caller's
+	/// lock. The caller must retain that lock until this method resolves and until its encompassing
+	/// publication no longer needs `HEAD` pinned.
+	pub async fn record_commit_under_head_lock(
+		&self,
+		target: &str,
+		parent: Option<ObjectId<H>>,
+		commit: ObjectId<H>,
+		committer: &str,
+		message: &str,
+	) -> Result<(), RepositoryError> {
+		let subject = message.lines().next().unwrap_or("");
+		let reflog = if parent.is_none() {
+			format!("commit (initial): {subject}")
+		} else {
+			format!("commit: {subject}")
+		};
+		self
+			.refs()
+			.update_ref_under_head_lock(
+				target,
+				commit,
+				parent,
+				ReflogIntent::Log {
+					committer,
+					message: &reflog,
+				},
+			)
+			.await
+	}
+
 	/// Create a commit on the branch `HEAD` points at, advancing the branch via CAS
 	/// and appending reflog entries to the branch and `HEAD`. Returns the commit id.
 	/// Detached HEAD is not yet supported.
