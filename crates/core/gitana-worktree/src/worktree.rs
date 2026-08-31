@@ -735,7 +735,14 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		}
 	}
 
-	pub(crate) async fn stage_pathspecs_into(
+	/// Stage `pathspecs` into a caller-owned index without acquiring or publishing
+	/// `index.lock`.
+	///
+	/// This is the low-level counterpart of [`Self::add_pathspecs`] for callers
+	/// that already hold an external index transaction. The caller is responsible
+	/// for serializing concurrent index writers and for durably publishing or
+	/// discarding the resulting index.
+	pub async fn stage_pathspecs_into(
 		&self,
 		index: &mut Index<H>,
 		pathspecs: &[GitPathspec],
