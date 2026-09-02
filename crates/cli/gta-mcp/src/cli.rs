@@ -538,7 +538,7 @@ enum Command {
 		#[arg(long = "follow-tags", conflicts_with = "tags")]
 		follow_tags: bool,
 	},
-	/// Inspect, initialize, or update one level of tracked submodules.
+	/// Inspect, initialize, update, or deinitialize one level of tracked submodules.
 	Submodule {
 		#[command(subcommand)]
 		action: SubmoduleAction,
@@ -585,6 +585,18 @@ enum SubmoduleAction {
 		#[arg(long)]
 		init: bool,
 		#[arg(long = "path")]
+		paths: Vec<String>,
+	},
+	/// Remove selected submodule worktrees while retaining their repositories.
+	Deinit {
+		/// Bypass the local-change refusal; the displaced checkout is still retained.
+		#[arg(short = 'f', long)]
+		force: bool,
+		/// Deinitialize every tracked submodule.
+		#[arg(long, conflicts_with = "paths", required_unless_present = "paths")]
+		all: bool,
+		/// Submodule paths to deinitialize.
+		#[arg(long = "path", conflicts_with = "all", required_unless_present = "all")]
 		paths: Vec<String>,
 	},
 }
@@ -1127,6 +1139,7 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 		SubmoduleAction::Status { paths } => Action::Status { paths },
 		SubmoduleAction::Init { paths } => Action::Init { paths },
 		SubmoduleAction::Update { init, paths } => Action::Update { init, paths },
+		SubmoduleAction::Deinit { force, all, paths } => Action::Deinit { force, all, paths },
 	}
 }
 

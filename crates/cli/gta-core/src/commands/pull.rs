@@ -17,13 +17,18 @@ use crate::commands::merge;
 use crate::dispatch;
 use crate::identity::CliIdentity;
 use crate::signer;
-use crate::{CommandContext, git_config, repo, transport_for, url_rewrite};
+use crate::{
+	CommandContext, RepositoryLayoutIdentity, WorkDir, git_config, repo, transport_for, url_rewrite,
+};
 
 /// Pull `HEAD`'s branch from the origin.
 pub async fn run(cwd: &Path) -> Result<()> {
 	let found = repo::discover(cwd).await?;
+	let identity = repo::capture_worktree_layout_identity(&found)?;
 	// The origin URL is `remote.origin.url` with `url.*.insteadOf` applied, read from the merged config.
-	let config = git_config::from_repo(&found.git_dir, &found.common_dir).await?;
+	let (setup, common, git, _) = repo::command_setup_lease(&found, identity).await?;
+	let config = git_config::for_worktree_at(common, git, &found.common_dir, &found.git_dir).await?;
+	drop(setup);
 	let url = url_rewrite::resolve_fetch_url(&config, "origin")?;
 	let remote = RemoteUrl::parse(&url)?;
 	if let Some(command) = CommandContext::current() {
@@ -49,14 +54,14 @@ pub async fn run(cwd: &Path) -> Result<()> {
 			let http = transport_for(config, &origin, askpass_cwd)?;
 			let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
 			let mut fetcher = HttpPackFetcher::new(&http, &origin);
-			pull_dispatch(&mut fetcher, &found, &body, &display, cwd).await
+			pull_dispatch(&mut fetcher, &found, identity, &body, &display, cwd).await
 		}
 		RemoteUrl::Ssh(ssh) => {
 			let ssh_cmd = crate::ssh::resolve_ssh_command(&config)?;
 			let connection = SshConnection::open(&ssh, "git-upload-pack", &ssh_cmd, &askpass_cwd).await?;
 			let body = connection.advertisement().to_vec();
 			let mut fetcher = SshPackFetcher::new(connection);
-			pull_dispatch(&mut fetcher, &found, &body, &display, cwd).await
+			pull_dispatch(&mut fetcher, &found, identity, &body, &display, cwd).await
 		}
 		RemoteUrl::Local(path) => {
 			let source = {
@@ -68,26 +73,55 @@ pub async fn run(cwd: &Path) -> Result<()> {
 				}
 			};
 			let source_layout = repo::inspect_root(&source).await?;
-			match dispatch::detect_algorithm(&source_layout.common_dir)? {
+			let source_identity = repo::capture_repository_layout_identity(&source_layout)?;
+			let (source_setup, common, git) =
+				repo::revalidated_local_source_setup(&source_layout, source_identity, None).await?;
+			match dispatch::detect_algorithm_at(&common, &source_layout.common_dir).await? {
 				HashKind::Sha1 => {
-					let source =
-						repo::open_generic::<Sha1>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let second_common = common.try_clone()?;
+					let second_git = git.try_clone()?;
+					let source = repo::open_generic_from_dirs::<Sha1>(
+						common,
+						git,
+						&source_layout.git_dir,
+						&source_layout.common_dir,
+					)
+					.await?;
 					let connection = LocalConnection::open(source).await?;
 					let body = connection.advertisement().to_vec();
-					let source =
-						repo::open_generic::<Sha1>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let source = repo::open_generic_from_dirs::<Sha1>(
+						second_common,
+						second_git,
+						&source_layout.git_dir,
+						&source_layout.common_dir,
+					)
+					.await?;
+					drop(source_setup);
 					let mut fetcher = LocalPackFetcher::new(source);
-					pull_dispatch(&mut fetcher, &found, &body, &display, cwd).await
+					pull_dispatch(&mut fetcher, &found, identity, &body, &display, cwd).await
 				}
 				HashKind::Sha256 => {
-					let source =
-						repo::open_generic::<Sha256>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let second_common = common.try_clone()?;
+					let second_git = git.try_clone()?;
+					let source = repo::open_generic_from_dirs::<Sha256>(
+						common,
+						git,
+						&source_layout.git_dir,
+						&source_layout.common_dir,
+					)
+					.await?;
 					let connection = LocalConnection::open(source).await?;
 					let body = connection.advertisement().to_vec();
-					let source =
-						repo::open_generic::<Sha256>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let source = repo::open_generic_from_dirs::<Sha256>(
+						second_common,
+						second_git,
+						&source_layout.git_dir,
+						&source_layout.common_dir,
+					)
+					.await?;
+					drop(source_setup);
 					let mut fetcher = LocalPackFetcher::new(source);
-					pull_dispatch(&mut fetcher, &found, &body, &display, cwd).await
+					pull_dispatch(&mut fetcher, &found, identity, &body, &display, cwd).await
 				}
 			}
 		}
@@ -98,15 +132,18 @@ pub async fn run(cwd: &Path) -> Result<()> {
 async fn pull_dispatch(
 	fetcher: &mut impl PackFetcher,
 	found: &repo::RepositoryLayout,
+	identity: RepositoryLayoutIdentity,
 	body: &[u8],
 	url: &str,
 	cwd: &Path,
 ) -> Result<()> {
-	let local = dispatch::detect_algorithm(&found.common_dir)?;
+	let (setup, common, _, _) = repo::command_setup_lease(found, identity).await?;
+	let local = dispatch::detect_algorithm_at(&common, &found.common_dir).await?;
+	drop(setup);
 	transport::ensure_same_format(local, transport::negotiated_kind(body)?)?;
 	match local {
-		HashKind::Sha1 => pull_into::<Sha1>(fetcher, found, body, url, cwd).await,
-		HashKind::Sha256 => pull_into::<Sha256>(fetcher, found, body, url, cwd).await,
+		HashKind::Sha1 => pull_into::<Sha1>(fetcher, found, identity, body, url, cwd).await,
+		HashKind::Sha256 => pull_into::<Sha256>(fetcher, found, identity, body, url, cwd).await,
 	}
 }
 
@@ -116,6 +153,7 @@ async fn pull_dispatch(
 async fn pull_into<H: HashAlgorithm>(
 	fetcher: &mut impl PackFetcher,
 	found: &repo::RepositoryLayout,
+	identity: RepositoryLayoutIdentity,
 	body: &[u8],
 	url: &str,
 	cwd: &Path,
@@ -124,32 +162,39 @@ async fn pull_into<H: HashAlgorithm>(
 		.worktree_root
 		.clone()
 		.context("cannot pull in a bare repository")?;
-	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir).await?;
+	let (setup, common, git, work_dir) = repo::command_setup_lease(found, identity).await?;
+	let work_dir = work_dir.context("cannot pull in a bare repository")?;
+	let repository =
+		repo::open_generic_from_dirs::<H>(common, git, &found.git_dir, &found.common_dir).await?;
+	let bare = repo::repository_bare_snapshot(&repository).await?;
+	drop(setup);
 	let worktree = WorkTree::new_located(
 		repository,
-		repo::open_work_dir(&work)?,
+		WorkDir::from_dir(work_dir),
 		found.git_dir.clone(),
-		work,
+		work.clone(),
 	);
 
 	// Every branch checked out in a worktree. `update_head_ok` below exempts only *this* worktree's
 	// branch (advanced by the merge); a branch checked out in another worktree is still refused, since
 	// pull's merge advances only this worktree's HEAD.
-	let checkouts = repo::branch_checkouts(&found.common_dir)
+	let checkouts = repo::branch_checkouts(&found.common_dir, bare)
 		.into_iter()
 		.map(|(branch, path)| (branch, path.display().to_string()))
 		.collect::<Vec<_>>();
 	// `update_head_ok`: a fetch refspec may map straight into the checked-out branch (a mirror config
 	// like `+refs/heads/*:refs/heads/*`); the merge below advances that branch and the work tree.
-	let identity = CliIdentity::new(worktree.repository());
 	// Under a pull, git reflogs the tracking-ref updates with the `pull` action (not `fetch`), honouring
 	// `GIT_REFLOG_ACTION` if set. The merge step below records HEAD/branch separately; this covers only
 	// the tracking refs.
-	let committer = identity.committer_or_default().await?;
+	let committer = CliIdentity::new(worktree.repository())
+		.committer_or_default()
+		.await?;
 	let action = crate::identity::reflog_action("pull");
-	let outcome = gitana_porcelain::fetch(
+	let outcome = gitana_porcelain::fetch_with_bare(
 		fetcher,
 		worktree.repository(),
+		bare,
 		body,
 		true,
 		gitana_porcelain::TagFetch::Auto,
@@ -179,6 +224,13 @@ async fn pull_into<H: HashAlgorithm>(
 		.await?
 		.with_context(|| format!("origin has no {short} to merge (or a refspec excludes it)"))?;
 	let message = format!("Merge branch '{short}' of {url}");
+	drop(worktree);
+
+	// Fetch must not retain shared-config serialization across network I/O. Reacquire it only for
+	// integration, then bind it to the repository backend so a cancelled merge cannot release the
+	// lease while a detached config or checkout worker can still observe the Windows publication gap.
+	let worktree = open_merge_worktree::<H>(found, identity, &work).await?;
+	let identity = CliIdentity::new(worktree.repository());
 
 	// A pull's merge commit is signed when git config requests it, like a plain `gta merge`.
 	let signer = signer::config_signer(worktree.repository(), cwd).await?;
@@ -193,4 +245,126 @@ async fn pull_into<H: HashAlgorithm>(
 	)
 	.await?;
 	merge::render(outcome)
+}
+
+/// Reopen the pull target for post-fetch integration under worker-bound config serialization.
+async fn open_merge_worktree<H: HashAlgorithm>(
+	found: &repo::RepositoryLayout,
+	identity: RepositoryLayoutIdentity,
+	work: &Path,
+) -> Result<WorkTree<crate::Backend, crate::WorkDir, H>> {
+	let (setup, common, git, work_dir) = repo::command_setup_lease(found, identity)
+		.await
+		.with_context(|| format!("pull worktree changed during fetch: {}", work.display()))?;
+	let work_dir =
+		work_dir.with_context(|| format!("pull worktree changed during fetch: {}", work.display()))?;
+	let repository = repo::open_generic_from_dirs_with_worker_lease::<H>(
+		common,
+		git,
+		&found.git_dir,
+		&found.common_dir,
+		setup,
+	)
+	.await?;
+	Ok(WorkTree::new_located(
+		repository,
+		WorkDir::from_dir(work_dir),
+		found.git_dir.clone(),
+		work.to_owned(),
+	))
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod tests {
+	use std::sync::mpsc::{RecvTimeoutError, channel};
+	use std::time::Duration;
+
+	use cap_std::{ambient_authority, fs::Dir};
+	use gitana_object::Sha1;
+	use gitana_submodule::acquire_submodule_config_mutation_lease;
+
+	use super::open_merge_worktree;
+	use crate::repo;
+
+	#[tokio::test]
+	async fn merge_worktree_retains_setup_serialization_until_dropped() {
+		let temporary = tempfile::tempdir().unwrap();
+		let work = temporary.path().join("work");
+		let git = work.join(".git");
+		std::fs::create_dir_all(git.join("objects")).unwrap();
+		std::fs::create_dir_all(git.join("refs")).unwrap();
+		std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		std::fs::write(
+			git.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+		)
+		.unwrap();
+		let layout = repo::inspect_root(&work).await.unwrap();
+		let identity = repo::capture_worktree_layout_identity(&layout).unwrap();
+		let worktree = open_merge_worktree::<Sha1>(&layout, identity, &work)
+			.await
+			.unwrap();
+
+		let (started_sender, started_receiver) = channel();
+		let (acquired_sender, acquired_receiver) = channel();
+		let mutation_git = git.clone();
+		let mutation = std::thread::spawn(move || {
+			let common = Dir::open_ambient_dir(&mutation_git, ambient_authority()).unwrap();
+			started_sender.send(()).unwrap();
+			let lease = acquire_submodule_config_mutation_lease(&common, &mutation_git).unwrap();
+			acquired_sender.send(()).unwrap();
+			lease
+		});
+		started_receiver.recv().unwrap();
+		assert!(matches!(
+			acquired_receiver.recv_timeout(Duration::from_millis(50)),
+			Err(RecvTimeoutError::Timeout)
+		));
+
+		drop(worktree);
+		acquired_receiver
+			.recv_timeout(Duration::from_secs(1))
+			.expect("merge worktree must release setup serialization when dropped");
+		drop(mutation.join().unwrap());
+	}
+
+	#[tokio::test]
+	async fn merge_worktree_rejects_a_public_checkout_replaced_during_fetch() {
+		let temporary = tempfile::tempdir().unwrap();
+		let work = temporary.path().join("work");
+		let retained = temporary.path().join("retained");
+		let git = temporary.path().join("module.git");
+		std::fs::create_dir_all(&work).unwrap();
+		std::fs::create_dir_all(git.join("objects")).unwrap();
+		std::fs::create_dir_all(git.join("refs")).unwrap();
+		std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		std::fs::write(
+			git.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+		)
+		.unwrap();
+		std::fs::write(work.join(".git"), "gitdir: ../module.git\n").unwrap();
+		let found = repo::inspect_root(&work).await.unwrap();
+		let identity = repo::capture_worktree_layout_identity(&found).unwrap();
+
+		std::fs::rename(&work, &retained).unwrap();
+		std::fs::create_dir(&work).unwrap();
+		std::fs::write(work.join(".git"), "gitdir: ../module.git\n").unwrap();
+
+		let error = match open_merge_worktree::<Sha1>(&found, identity, &work).await {
+			Ok(_) => panic!("a replaced public checkout must not be reopened for integration"),
+			Err(error) => error,
+		};
+		assert!(
+			error
+				.to_string()
+				.contains("pull worktree changed during fetch"),
+			"unexpected error: {error:#}"
+		);
+		assert_eq!(
+			std::fs::read(work.join(".git")).unwrap(),
+			b"gitdir: ../module.git\n"
+		);
+		assert!(retained.join(".git").is_file());
+	}
 }

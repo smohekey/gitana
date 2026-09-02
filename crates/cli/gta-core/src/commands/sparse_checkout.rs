@@ -37,7 +37,16 @@ pub enum Action {
 
 /// Manage the working tree's sparse-checkout.
 pub async fn run(cwd: &Path, action: Action) -> Result<()> {
-	dispatch::on_worktree(cwd, SparseCheckout { action }).await
+	let writes_shared_config = matches!(
+		&action,
+		Action::Init { .. } | Action::Set { .. } | Action::Add { .. } | Action::Disable
+	);
+	let command = SparseCheckout { action };
+	if writes_shared_config {
+		dispatch::on_worktree_config_mutation(cwd, command).await
+	} else {
+		dispatch::on_worktree_config_read(cwd, command).await
+	}
 }
 
 struct SparseCheckout {

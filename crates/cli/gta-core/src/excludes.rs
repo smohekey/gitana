@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use cap_std::fs::Dir;
 use gitana_config::GitConfig;
 
 /// The content of git's standard excludes file for a command invoked at `cwd` with discovered `prefix`
@@ -24,6 +25,94 @@ pub(crate) async fn resolve_excludes_file(
 	validate_excludes_file_setting(config)?;
 	let root = worktree_root(cwd, prefix).await;
 	read_excludes_file(config.get_string("core", None, "excludesfile"), &root).await
+}
+
+/// Resolve excludes for an exact already-opened worktree. Relative configured paths are read
+/// through that capability so renaming the worktree cannot redirect or strand the lookup.
+pub(crate) async fn resolve_excludes_file_at(
+	config: &GitConfig,
+	worktree: Dir,
+	worktree_root: &Path,
+) -> Result<Option<String>> {
+	validate_excludes_file_setting(config)?;
+	let Some(configured) = config.get_string("core", None, "excludesfile") else {
+		return read_excludes_file(None, worktree_root).await;
+	};
+	if configured.is_empty() {
+		return Ok(None);
+	}
+	let expanded = expand_tilde(configured)?;
+	if expanded.as_os_str().is_empty() {
+		return Ok(None);
+	}
+	let (relative, display) = if expanded.is_absolute() {
+		let Some(relative) = absolute_path_in_worktree(&expanded, worktree_root).await else {
+			return read_excludes_file(Some(configured), worktree_root).await;
+		};
+		let relative = if relative.as_os_str().is_empty() {
+			PathBuf::from(".")
+		} else {
+			relative
+		};
+		(relative, expanded)
+	} else {
+		let display = worktree_root.join(&expanded);
+		(expanded, display)
+	};
+	let metadata_worktree = worktree.try_clone()?;
+	match gitana_config_native::read_file_at(worktree, &relative, &display).await {
+		Ok(Some(bytes)) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+		Ok(None) => Ok(None),
+		Err(error) => {
+			let has_kind = |kind| {
+				error.chain().any(|cause| {
+					cause
+						.downcast_ref::<std::io::Error>()
+						.is_some_and(|error| error.kind() == kind)
+				})
+			};
+			if has_kind(std::io::ErrorKind::NotFound) {
+				return Ok(None);
+			}
+			if has_kind(std::io::ErrorKind::PermissionDenied) {
+				match metadata_worktree.metadata(&relative) {
+					Ok(metadata) if !metadata.is_dir() => return Ok(None),
+					Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+						return Ok(None);
+					}
+					Ok(_) | Err(_) => {}
+				}
+			}
+			Err(error.context(format!(
+				"cannot use {} as an exclude file",
+				display.display()
+			)))
+		}
+	}
+}
+
+/// Translate an absolute spelling beneath `worktree_root` into a capability-relative path.
+///
+/// Repository discovery and a configured value can use different native aliases for the same
+/// directory (notably `/private/var` and `/var` on macOS). After deinit displaces the checkout the
+/// file itself is absent at the public name, so resolve the nearest existing ancestor and append the
+/// unresolved suffix rather than requiring the final file to remain ambiently reachable.
+async fn absolute_path_in_worktree(path: &Path, worktree_root: &Path) -> Option<PathBuf> {
+	if let Ok(relative) = path.strip_prefix(worktree_root) {
+		return Some(relative.to_owned());
+	}
+	let canonical_root = tokio::fs::canonicalize(worktree_root).await.ok()?;
+	for ancestor in path.ancestors() {
+		let Ok(canonical_ancestor) = tokio::fs::canonicalize(ancestor).await else {
+			continue;
+		};
+		let Ok(base) = canonical_ancestor.strip_prefix(&canonical_root) else {
+			continue;
+		};
+		let suffix = path.strip_prefix(ancestor).ok()?;
+		return Some(base.join(suffix));
+	}
+	None
 }
 
 /// Reject a `core.excludesFile` that is present but *valueless* (`[core]\n\texcludesFile`), which git

@@ -5,6 +5,46 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+#[cfg(unix)]
+#[test]
+fn status_does_not_require_writing_the_repository() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-status-read-only");
+	let w = work.to_str().unwrap();
+	write(&work, "tracked.txt", "tracked\n");
+	commit_all(w, "base");
+	let git_dir = work.join(".git");
+	let mutation_lock = git_dir.join("gitana-submodule-config.lock");
+	let original_mode = std::fs::metadata(&git_dir).unwrap().permissions().mode();
+	let mut read_only = std::fs::metadata(&git_dir).unwrap().permissions();
+	read_only.set_mode(0o555);
+	std::fs::set_permissions(&git_dir, read_only).unwrap();
+
+	let result = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", w, "status"])
+		.output()
+		.expect("run gta status");
+	let lock_was_created = mutation_lock.exists();
+	let mut restored = std::fs::metadata(&git_dir).unwrap().permissions();
+	restored.set_mode(original_mode);
+	std::fs::set_permissions(&git_dir, restored).unwrap();
+
+	assert!(
+		result.status.success(),
+		"read-only gta status failed: {}",
+		String::from_utf8_lossy(&result.stderr)
+	);
+	assert_eq!(result.stdout, b"");
+	assert!(!lock_was_created, "status created the config mutation lock");
+	std::fs::remove_dir_all(&work).ok();
+}
+
 #[test]
 fn changed_entries_precede_untracked() {
 	if !git_supports_sha256() {

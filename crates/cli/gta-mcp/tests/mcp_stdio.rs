@@ -64,6 +64,7 @@ fn mcp_stdio_advertises_gta_tools() {
 		"clone",
 		"worktree_add",
 		"submodule_status",
+		"submodule_deinit",
 		"remote_set_url",
 	] {
 		assert!(

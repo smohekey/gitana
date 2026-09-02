@@ -17,4 +17,4 @@ pub use self::namespace::{
 	remove_dir_all_if_identity, remove_dir_if_identity, remove_file_if_identity, rename_noreplace,
 	rename_noreplace_if_identity, replace_if_identities, replace_if_identity,
 };
-pub use self::path::{paths_equivalent, strip_path_prefix};
+pub use self::path::{lexical_normalize, paths_equivalent, strip_path_prefix};

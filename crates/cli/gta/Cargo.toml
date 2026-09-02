@@ -20,13 +20,16 @@ assert_cmd = { workspace = true }
 axum = { workspace = true }
 cap-std = { workspace = true }
 flate2 = { workspace = true }
-gitana-git-http = { workspace = true }
+gitana-config.workspace = true
 gitana-file-store-local = { workspace = true }
+gitana-git-http = { workspace = true }
 gitana-object.workspace = true
 gitana-object-store = { workspace = true }
 gitana-repository = { workspace = true }
 gitana-remote.workspace = true
+gitana-submodule.workspace = true
 gta-mcp = { workspace = true }
+serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net"] }

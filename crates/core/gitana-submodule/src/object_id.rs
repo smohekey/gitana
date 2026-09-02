@@ -1,4 +1,4 @@
-use gitana_object::{HashAlgorithm, HashKind, ObjectId};
+use gitana_object::HashKind;
 
 /// A runtime-tagged object id returned by hash-generic submodule operations.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8,14 +8,18 @@ pub struct SubmoduleObjectId {
 }
 
 impl SubmoduleObjectId {
-	pub(crate) fn from_typed<H: HashAlgorithm>(oid: ObjectId<H>) -> Self {
+	#[cfg(not(target_arch = "wasm32"))]
+	pub(crate) fn from_typed<H: gitana_object::HashAlgorithm>(
+		oid: gitana_object::ObjectId<H>,
+	) -> Self {
 		Self {
 			kind: kind::<H>(),
 			hex: oid.to_hex(),
 		}
 	}
 
-	pub(crate) fn zero<H: HashAlgorithm>() -> Self {
+	#[cfg(not(target_arch = "wasm32"))]
+	pub(crate) fn zero<H: gitana_object::HashAlgorithm>() -> Self {
 		Self {
 			kind: kind::<H>(),
 			hex: "0".repeat(H::RAW_LEN * 2),
@@ -31,7 +35,8 @@ impl SubmoduleObjectId {
 	}
 }
 
-pub(crate) fn kind<H: HashAlgorithm>() -> HashKind {
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn kind<H: gitana_object::HashAlgorithm>() -> HashKind {
 	match H::NAME {
 		"sha1" => HashKind::Sha1,
 		"sha256" => HashKind::Sha256,

@@ -33,7 +33,7 @@ pub async fn run(
 	// matches `git hash-object` in a sha1 repo. Outside any repository, `-w` has nowhere to
 	// write (propagate the discovery error), and a bare compute falls back to sha256 (the
 	// format `gta init` defaults to).
-	match repo::discover(cwd).await {
+	match repo::discover_layout(cwd).await {
 		Ok(_) => {
 			dispatch::on_repo(
 				cwd,

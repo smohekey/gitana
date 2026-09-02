@@ -23,6 +23,7 @@ use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, anyhow};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt as _};
@@ -32,10 +33,13 @@ use cap_std::{
 };
 use gitana_config::{ConfigError, GitConfig, GitConfigSource, IncludeContext, IncludeResolver};
 use gitana_fs_native::{
-	EntryIdentity, file_identity, remove_file_if_identity, rename_noreplace_if_identity,
-	replace_if_identities,
+	EntryIdentity, directory_identity, file_identity, remove_file_if_identity,
+	rename_noreplace_if_identity, replace_if_identities,
 };
 use tokio::io::AsyncWriteExt;
+
+const PREPARED_CONFIG_ATTEMPTS: u64 = 100;
+static PREPARED_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 tokio::task_local! {
 	/// The directory the command operates in (the `-C` directory, else the process cwd), established
@@ -99,18 +103,20 @@ pub enum ConfigScope {
 /// remote commands (which resolve credentials before opening the repo) call it directly with the
 /// discovered layout's `git_dir`/`common_dir`.
 pub async fn from_repo(git_dir: &Path, common: &Path) -> Result<GitConfig> {
+	let guard = ConfigInputGuard::default();
 	let gitdir = canonical_gitdir(git_dir).await;
 	let gitdir_absolute = logical_gitdir(&gitdir).await;
 	let branch = head_branch(git_dir).await;
-	let mut base = global_and_system_layers().await?;
+	let mut base = global_and_system_layers(&guard).await?;
 	let repository_start = base.len();
-	base.push(local_layer(common).await?);
+	base.push(local_layer(common, &guard).await?);
 	assemble_merged(
 		base,
 		Some(repository_start),
 		Some(&gitdir),
 		gitdir_absolute.as_deref(),
 		branch.as_deref(),
+		&guard,
 	)
 	.await
 }
@@ -129,9 +135,10 @@ pub async fn from_repo(git_dir: &Path, common: &Path) -> Result<GitConfig> {
 /// choice is immaterial; a leading UTF-8 **BOM** is still rejected by the parser, a tracked gitana-config
 /// gap. `extensions.worktreeConfig` itself is read from the *unexpanded* local file, as git reads it.
 pub async fn for_worktree(common: &Path, git_dir: &Path) -> Result<GitConfig> {
+	let guard = ConfigInputGuard::default();
 	let gitdir = canonical_gitdir(git_dir).await;
 	let branch = head_branch(git_dir).await;
-	let local = local_layer(common).await?;
+	let local = local_layer(common, &guard).await?;
 	// `extensions.worktreeConfig` is a repository-format extension: git honours it **only** from the
 	// repository-local config, ignoring any global/system setting, and reads it from the file directly
 	// (before includes). git validates it eagerly — a malformed value aborts even when a later occurrence
@@ -140,11 +147,11 @@ pub async fn for_worktree(common: &Path, git_dir: &Path) -> Result<GitConfig> {
 		.source
 		.get_bool_validated("extensions", None, "worktreeconfig")?
 		.unwrap_or(false);
-	let mut base = global_and_system_layers().await?;
+	let mut base = global_and_system_layers(&guard).await?;
 	let repository_start = base.len();
 	base.push(local);
 	if worktree_config
-		&& let Some(worktree_layer) = read_layer(&git_dir.join("config.worktree")).await?
+		&& let Some(worktree_layer) = read_layer(&git_dir.join("config.worktree"), &guard).await?
 	{
 		base.push(worktree_layer);
 	}
@@ -155,6 +162,7 @@ pub async fn for_worktree(common: &Path, git_dir: &Path) -> Result<GitConfig> {
 		Some(&gitdir),
 		gitdir_absolute.as_deref(),
 		branch.as_deref(),
+		&guard,
 	)
 	.await
 }
@@ -169,13 +177,50 @@ pub async fn for_worktree_at(
 	common_path: &Path,
 	git_dir_path: &Path,
 ) -> Result<GitConfig> {
+	for_worktree_at_with_guard(
+		common,
+		git_dir,
+		common_path,
+		git_dir_path,
+		ConfigInputGuard::default(),
+	)
+	.await
+}
+
+/// Build the effective configuration while rejecting every consulted config path whose pinned
+/// resolution traverses one of `forbidden_ancestors`. Deinit uses this before retiring selected
+/// checkouts so recovery never depends on an effective-config input that will become unreachable.
+pub async fn for_worktree_at_excluding(
+	common: Dir,
+	git_dir: Dir,
+	common_path: &Path,
+	git_dir_path: &Path,
+	forbidden_ancestors: Vec<Dir>,
+) -> Result<GitConfig> {
+	let guard = config_input_guard(&forbidden_ancestors)?;
+	for_worktree_at_with_guard(common, git_dir, common_path, git_dir_path, guard).await
+}
+
+async fn for_worktree_at_with_guard(
+	common: Dir,
+	git_dir: Dir,
+	common_path: &Path,
+	git_dir_path: &Path,
+	guard: ConfigInputGuard,
+) -> Result<GitConfig> {
 	let branch = head_branch_at(&git_dir);
-	let local = local_layer_at(common.try_clone()?, common_path, Path::new("config")).await?;
+	let local = local_layer_at(
+		common.try_clone()?,
+		common_path,
+		Path::new("config"),
+		&guard,
+	)
+	.await?;
 	let worktree_config = local
 		.source
 		.get_bool_validated("extensions", None, "worktreeconfig")?
 		.unwrap_or(false);
-	let mut base = global_and_system_layers().await?;
+	let mut base = global_and_system_layers(&guard).await?;
 	let repository_start = base.len();
 	base.push(local);
 	if worktree_config
@@ -183,6 +228,7 @@ pub async fn for_worktree_at(
 			git_dir,
 			&git_dir_path.join("config.worktree"),
 			Path::new("config.worktree"),
+			&guard,
 		)
 		.await?
 	{
@@ -196,6 +242,7 @@ pub async fn for_worktree_at(
 		Some(&gitdir),
 		gitdir_absolute.as_deref(),
 		branch.as_deref(),
+		&guard,
 	)
 	.await
 }
@@ -241,7 +288,16 @@ pub fn validate_command_config(entries: &[String]) -> Result<()> {
 /// `gitdir:`/`onbranch:` conditions never match, but `hasconfig:remote.*.url:` can still match a
 /// global/system remote URL.
 pub async fn from_ambient() -> Result<GitConfig> {
-	assemble_merged(global_and_system_layers().await?, None, None, None, None).await
+	let guard = ConfigInputGuard::default();
+	assemble_merged(
+		global_and_system_layers(&guard).await?,
+		None,
+		None,
+		None,
+		None,
+		&guard,
+	)
+	.await
 }
 
 /// The single file an explicit `config --global` / `--system` operation reads and writes (git scopes
@@ -345,11 +401,31 @@ where
 	T: Send + 'static,
 	F: FnOnce(&mut GitConfig) -> Result<T> + Send + 'static,
 {
+	edit_file_at_guarded(directory, path, display_path, (), edit).await
+}
+
+/// Atomically edit a capability-relative config file while retaining `keepalive` for the complete
+/// blocking transaction.
+pub async fn edit_file_at_guarded<K, T, F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	keepalive: K,
+	edit: F,
+) -> Result<T>
+where
+	K: Send + 'static,
+	T: Send + 'static,
+	F: FnOnce(&mut GitConfig) -> Result<T> + Send + 'static,
+{
 	let path = path.to_owned();
 	let display_path = display_path.to_owned();
-	tokio::task::spawn_blocking(move || edit_file_at_sync(directory, &path, &display_path, edit))
-		.await
-		.map_err(|error| anyhow!("config edit worker failed: {error}"))?
+	tokio::task::spawn_blocking(move || {
+		let _keepalive = keepalive;
+		edit_file_at_sync(directory, &path, &display_path, edit)
+	})
+	.await
+	.map_err(|error| anyhow!("config edit worker failed: {error}"))?
 }
 
 /// The exact config target and entry identity published by a tracked capability-relative edit.
@@ -359,6 +435,82 @@ where
 pub struct ConfigPublication {
 	pinned: PinnedConfig,
 	identity: EntryIdentity,
+}
+
+/// Durable identity of the exact namespace reached after resolving a config path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigTargetIdentity {
+	parent: EntryIdentity,
+	target: Option<EntryIdentity>,
+	symlinks: Vec<EntryIdentity>,
+}
+
+impl ConfigTargetIdentity {
+	/// Rebuild an identity recorded in a durable caller-owned journal.
+	pub fn from_parts(
+		parent: EntryIdentity,
+		target: Option<EntryIdentity>,
+		symlinks: Vec<EntryIdentity>,
+	) -> Self {
+		Self {
+			parent,
+			target,
+			symlinks,
+		}
+	}
+
+	/// Return the resolved target's parent-directory identity.
+	pub fn parent(&self) -> EntryIdentity {
+		self.parent
+	}
+
+	/// Return the final regular-file identity, or `None` when the target was absent.
+	pub fn target(&self) -> Option<EntryIdentity> {
+		self.target
+	}
+
+	/// Return the ordered identities of every symlink followed while resolving the target.
+	pub fn symlinks(&self) -> &[EntryIdentity] {
+		&self.symlinks
+	}
+}
+
+/// Identity and private sibling name reserved for a journaled config image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedConfigPublication {
+	name: OsString,
+	identity: EntryIdentity,
+}
+
+impl PreparedConfigPublication {
+	/// Rebuild a publication recorded in a durable caller-owned journal.
+	pub fn from_parts(name: OsString, identity: EntryIdentity) -> Self {
+		Self { name, identity }
+	}
+
+	/// Return the private sibling name containing the prepared image.
+	pub fn name(&self) -> &OsStr {
+		&self.name
+	}
+
+	/// Return the prepared file's stable identity.
+	pub fn identity(&self) -> EntryIdentity {
+		self.identity
+	}
+}
+
+/// Which durable config image is being validated during publication recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedConfigImage {
+	Before,
+	After,
+}
+
+/// Whether a prepared config image was published now or had already been published before recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedConfigOutcome {
+	Published,
+	AlreadyPublished,
 }
 
 /// Atomically edit a capability-relative config file and return a token for the exact publication.
@@ -372,9 +524,27 @@ where
 	T: Send + 'static,
 	F: FnOnce(&mut GitConfig) -> Result<T> + Send + 'static,
 {
+	edit_file_at_tracked_guarded(directory, path, display_path, (), edit).await
+}
+
+/// Atomically edit and track a capability-relative config file while retaining `keepalive` for the
+/// complete blocking transaction.
+pub async fn edit_file_at_tracked_guarded<K, T, F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	keepalive: K,
+	edit: F,
+) -> Result<(T, ConfigPublication)>
+where
+	K: Send + 'static,
+	T: Send + 'static,
+	F: FnOnce(&mut GitConfig) -> Result<T> + Send + 'static,
+{
 	let path = path.to_owned();
 	let display_path = display_path.to_owned();
 	tokio::task::spawn_blocking(move || {
+		let _keepalive = keepalive;
 		edit_file_at_tracked_sync(directory, &path, &display_path, edit)
 	})
 	.await
@@ -391,8 +561,25 @@ where
 	T: Send + 'static,
 	F: FnOnce(&mut GitConfig) -> Result<T> + Send + 'static,
 {
+	edit_file_at_if_current_guarded(publication, display_path, (), edit).await
+}
+
+/// Edit the exact tracked config target while retaining `keepalive` for the complete blocking
+/// transaction.
+pub async fn edit_file_at_if_current_guarded<K, T, F>(
+	publication: ConfigPublication,
+	display_path: &Path,
+	keepalive: K,
+	edit: F,
+) -> Result<T>
+where
+	K: Send + 'static,
+	T: Send + 'static,
+	F: FnOnce(&mut GitConfig) -> Result<T> + Send + 'static,
+{
 	let display_path = display_path.to_owned();
 	tokio::task::spawn_blocking(move || {
+		let _keepalive = keepalive;
 		edit_file_at_if_current_sync(publication, &display_path, edit)
 	})
 	.await
@@ -414,14 +601,318 @@ pub async fn read_file_at(
 		.map_err(|error| anyhow!("config read worker failed: {error}"))?
 }
 
+/// Read a config file and return the exact resolved target identity with its bytes.
+pub async fn read_file_at_identified(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+) -> Result<(Option<Vec<u8>>, ConfigTargetIdentity)> {
+	let path = path.to_owned();
+	let display_path = display_path.to_owned();
+	tokio::task::spawn_blocking(move || read_file_at_identified_sync(directory, &path, &display_path))
+		.await
+		.map_err(|error| anyhow!("identified config read worker failed: {error}"))?
+}
+
+/// Read a config file, return its exact resolved identity, and report whether the resolved target
+/// lives inside `ancestor`.
+///
+/// Containment is computed from the same retained target-parent capability used for the read and
+/// identity, then the complete symlink chain and target name are revalidated before returning.
+pub async fn read_file_at_identified_with_containment(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	ancestor: Dir,
+) -> Result<(Option<Vec<u8>>, ConfigTargetIdentity, bool)> {
+	let path = path.to_owned();
+	let display_path = display_path.to_owned();
+	tokio::task::spawn_blocking(move || {
+		read_file_at_identified_with_containment_sync(directory, &path, &display_path, ancestor)
+	})
+	.await
+	.map_err(|error| anyhow!("identified config containment worker failed: {error}"))?
+}
+
+/// Reserve an empty private config inode only while the planned target remains current.
+///
+/// The caller must durably record the returned identity before placing config bytes in it with
+/// [`prepare_reserved_file_at`]. An interrupted reservation can therefore leave only an empty,
+/// secret-free private file outside the recovery journal.
+pub async fn reserve_file_at_if_current(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: ConfigTargetIdentity,
+) -> Result<PreparedConfigPublication> {
+	reserve_file_at_if_current_guarded(directory, path, display_path, expected, ()).await
+}
+
+/// Reserve an empty private config inode while retaining `keepalive` for the complete blocking
+/// transaction.
+pub async fn reserve_file_at_if_current_guarded<K>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: ConfigTargetIdentity,
+	keepalive: K,
+) -> Result<PreparedConfigPublication>
+where
+	K: Send + 'static,
+{
+	let path = path.to_owned();
+	let display_path = display_path.to_owned();
+	tokio::task::spawn_blocking(move || {
+		let _keepalive = keepalive;
+		reserve_file_at_if_current_sync(directory, &path, &display_path, &expected)
+	})
+	.await
+	.map_err(|error| anyhow!("config reservation worker failed: {error}"))?
+}
+
+/// Render and fsync a config image into an exact, already-journaled private inode.
+///
+/// Recovery may call this repeatedly after cancellation or a partial write; every attempt truncates
+/// and rewrites only the recorded inode while the complete planned resolution remains current.
+pub async fn prepare_reserved_file_at<T, F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: ConfigTargetIdentity,
+	prepared: PreparedConfigPublication,
+	edit: F,
+) -> Result<T>
+where
+	T: Send + 'static,
+	F: FnOnce(&mut GitConfig) -> Result<T> + Send + 'static,
+{
+	prepare_reserved_file_at_guarded(directory, path, display_path, expected, prepared, (), edit)
+		.await
+}
+
+/// Render and fsync a journaled config image while retaining `keepalive` for the complete blocking
+/// transaction.
+pub async fn prepare_reserved_file_at_guarded<K, T, F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: ConfigTargetIdentity,
+	prepared: PreparedConfigPublication,
+	keepalive: K,
+	edit: F,
+) -> Result<T>
+where
+	K: Send + 'static,
+	T: Send + 'static,
+	F: FnOnce(&mut GitConfig) -> Result<T> + Send + 'static,
+{
+	let path = path.to_owned();
+	let display_path = display_path.to_owned();
+	tokio::task::spawn_blocking(move || {
+		let _keepalive = keepalive;
+		prepare_reserved_file_at_sync(directory, &path, &display_path, &expected, &prepared, edit)
+	})
+	.await
+	.map_err(|error| anyhow!("reserved config preparation worker failed: {error}"))?
+}
+
+/// Publish or recover one journaled private config image.
+///
+/// Publication first moves the recorded private inode to Git's canonical lock name, then replaces
+/// the planned target conditionally. Recovery accepts only the planned target, the recorded inode
+/// at the lock, or that inode already installed as the target.
+pub async fn publish_prepared_file_at<F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: ConfigTargetIdentity,
+	prepared: PreparedConfigPublication,
+	validate: F,
+) -> Result<PreparedConfigOutcome>
+where
+	F: Fn(PreparedConfigImage, &GitConfig) -> Result<()> + Send + 'static,
+{
+	publish_prepared_file_at_guarded(
+		directory,
+		path,
+		display_path,
+		expected,
+		prepared,
+		(),
+		validate,
+	)
+	.await
+}
+
+/// Publish or recover one journaled private config image while retaining `keepalive` for the
+/// complete blocking namespace operation.
+///
+/// This is the cancellation-safe entry point for callers whose serialization guard would
+/// otherwise be dropped with the awaiting future while [`tokio::task::spawn_blocking`] continues.
+pub async fn publish_prepared_file_at_guarded<K, F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: ConfigTargetIdentity,
+	prepared: PreparedConfigPublication,
+	keepalive: K,
+	validate: F,
+) -> Result<PreparedConfigOutcome>
+where
+	K: Send + 'static,
+	F: Fn(PreparedConfigImage, &GitConfig) -> Result<()> + Send + 'static,
+{
+	publish_prepared_file_at_guarded_with_boundary(
+		directory,
+		path,
+		display_path,
+		expected,
+		prepared,
+		keepalive,
+		(|| Ok(()), validate),
+	)
+	.await
+}
+
+/// Publish or recover one journaled config image and run `boundary` inside the same blocking worker
+/// immediately before the target namespace is replaced.
+pub async fn publish_prepared_file_at_guarded_with_boundary<K, B, F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: ConfigTargetIdentity,
+	prepared: PreparedConfigPublication,
+	keepalive: K,
+	validation: (B, F),
+) -> Result<PreparedConfigOutcome>
+where
+	K: Send + 'static,
+	B: Fn() -> Result<()> + Send + 'static,
+	F: Fn(PreparedConfigImage, &GitConfig) -> Result<()> + Send + 'static,
+{
+	let path = path.to_owned();
+	let display_path = display_path.to_owned();
+	let (boundary, validate) = validation;
+	tokio::task::spawn_blocking(move || {
+		let _keepalive = keepalive;
+		publish_prepared_file_at_sync(
+			directory,
+			&path,
+			&display_path,
+			&expected,
+			prepared,
+			boundary,
+			validate,
+		)
+	})
+	.await
+	.map_err(|error| anyhow!("prepared config publication worker failed: {error}"))?
+}
+
+/// Restore the planned before-image when Windows config publication was interrupted after
+/// displacing the target but before installing the prepared image.
+///
+/// This operation does not publish or retire the prepared after-image. It restores only the exact
+/// journaled namespace state so callers can reload repository configuration before resuming their
+/// own durable state machine.
+pub async fn restore_prepared_file_before_image_at<F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: ConfigTargetIdentity,
+	prepared: PreparedConfigPublication,
+	validate: F,
+) -> Result<bool>
+where
+	F: Fn(PreparedConfigImage, &GitConfig) -> Result<()> + Send + 'static,
+{
+	restore_prepared_file_before_image_at_guarded(
+		directory,
+		path,
+		display_path,
+		expected,
+		prepared,
+		(),
+		validate,
+	)
+	.await
+}
+
+/// Inspect whether a journaled Windows publication is in the exact absent-target state that
+/// requires before-image restoration before ordinary repository configuration can be loaded.
+///
+/// Active before and after images are accepted without mutation. A changed resolution, foreign
+/// target, or mismatched private inode fails closed.
+pub async fn prepared_file_before_image_requires_restore_at<F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: ConfigTargetIdentity,
+	prepared: PreparedConfigPublication,
+	validate: F,
+) -> Result<bool>
+where
+	F: Fn(PreparedConfigImage, &GitConfig) -> Result<()> + Send + 'static,
+{
+	let path = path.to_owned();
+	let display_path = display_path.to_owned();
+	tokio::task::spawn_blocking(move || {
+		prepared_file_before_image_requires_restore_at_sync(
+			directory,
+			&path,
+			&display_path,
+			&expected,
+			&prepared,
+			validate,
+		)
+	})
+	.await
+	.map_err(|error| anyhow!("prepared config inspection worker failed: {error}"))?
+}
+
+/// Restore one journaled before-image while retaining `keepalive` for the complete blocking
+/// namespace operation.
+pub async fn restore_prepared_file_before_image_at_guarded<K, F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: ConfigTargetIdentity,
+	prepared: PreparedConfigPublication,
+	keepalive: K,
+	validate: F,
+) -> Result<bool>
+where
+	K: Send + 'static,
+	F: Fn(PreparedConfigImage, &GitConfig) -> Result<()> + Send + 'static,
+{
+	let path = path.to_owned();
+	let display_path = display_path.to_owned();
+	tokio::task::spawn_blocking(move || {
+		let _keepalive = keepalive;
+		restore_prepared_file_before_image_at_sync(
+			directory,
+			&path,
+			&display_path,
+			&expected,
+			prepared,
+			validate,
+		)
+	})
+	.await
+	.map_err(|error| anyhow!("prepared config restoration worker failed: {error}"))?
+}
+
 struct PinnedConfigTarget {
 	directory: Dir,
 	name: OsString,
+	identity: Option<EntryIdentity>,
 }
 
 struct PinnedConfig {
 	target: PinnedConfigTarget,
 	symlinks: Vec<PinnedConfigSymlink>,
+	traversed_directories: Vec<Dir>,
+	resolved_path: PathBuf,
 }
 
 struct PinnedConfigSymlink {
@@ -429,6 +920,39 @@ struct PinnedConfigSymlink {
 	name: OsString,
 	identity: EntryIdentity,
 	target: PathBuf,
+}
+
+type ConfigInputGuard = Vec<EntryIdentity>;
+
+fn config_input_guard(directories: &[Dir]) -> Result<ConfigInputGuard> {
+	directories
+		.iter()
+		.map(directory_identity)
+		.collect::<std::io::Result<Vec<_>>>()
+		.map_err(Into::into)
+}
+
+fn ensure_config_input_outside(
+	guard: &ConfigInputGuard,
+	pinned: &PinnedConfig,
+	display_path: &Path,
+) -> Result<()> {
+	for ancestor in guard {
+		let mut contained = directory_is_within_identity(&pinned.target.directory, *ancestor)?;
+		for symlink in &pinned.symlinks {
+			contained |= directory_is_within_identity(&symlink.directory, *ancestor)?;
+		}
+		for directory in &pinned.traversed_directories {
+			contained |= directory_is_within_identity(directory, *ancestor)?;
+		}
+		if contained {
+			return Err(anyhow!(
+				"effective config input '{}' is inside a selected checkout",
+				display_path.display()
+			));
+		}
+	}
+	Ok(())
 }
 
 enum ConfigTargetState {
@@ -455,7 +979,7 @@ fn edit_file_at_tracked_sync<T, F>(
 where
 	F: FnOnce(&mut GitConfig) -> Result<T>,
 {
-	let pinned = pin_config_target(directory, path)?;
+	let pinned = pin_config_target(directory, path, display_path)?;
 	edit_pinned_config(pinned, None, display_path, edit)
 }
 
@@ -549,8 +1073,7 @@ where
 	drop(lock_file);
 	cleanup.armed = false;
 
-	#[cfg(not(windows))]
-	target.directory.try_clone()?.into_std_file().sync_all()?;
+	sync_config_directory(&target.directory)?;
 	ensure_config_symlinks_unchanged(&pinned, display_path)?;
 	Ok((
 		result,
@@ -562,11 +1085,783 @@ where
 }
 
 fn read_file_at_sync(directory: Dir, path: &Path, display_path: &Path) -> Result<Option<Vec<u8>>> {
-	let pinned = pin_config_target(directory, path)?;
+	let pinned = pin_config_target(directory, path, display_path)?;
 	let (bytes, state) = read_pinned_config_bytes(&pinned.target, display_path)?;
 	ensure_config_symlinks_unchanged(&pinned, display_path)?;
 	ensure_config_target_unchanged(&pinned.target, &state, display_path)?;
 	Ok(bytes)
+}
+
+fn read_config_input_sync(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	guard: &ConfigInputGuard,
+) -> Result<Option<(Vec<u8>, PathBuf)>> {
+	let pinned = pin_config_target(directory, path, display_path)?;
+	let (bytes, state) = read_pinned_config_bytes(&pinned.target, display_path)?;
+	ensure_config_input_outside(guard, &pinned, display_path)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	ensure_config_target_unchanged(&pinned.target, &state, display_path)?;
+	Ok(bytes.map(|bytes| (bytes, pinned.resolved_path)))
+}
+
+fn config_input_is_not_found(error: &anyhow::Error) -> bool {
+	error.chain().any(|cause| {
+		cause
+			.downcast_ref::<std::io::Error>()
+			.is_some_and(|error| error.kind() == ErrorKind::NotFound)
+	})
+}
+
+fn read_file_at_identified_sync(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+) -> Result<(Option<Vec<u8>>, ConfigTargetIdentity)> {
+	let pinned = pin_config_target(directory, path, display_path)?;
+	let (bytes, state) = read_pinned_config_bytes(&pinned.target, display_path)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	ensure_config_target_unchanged(&pinned.target, &state, display_path)?;
+	let identity = durable_target_identity(&pinned, &state)?;
+	Ok((bytes, identity))
+}
+
+fn read_file_at_identified_with_containment_sync(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	ancestor: Dir,
+) -> Result<(Option<Vec<u8>>, ConfigTargetIdentity, bool)> {
+	let pinned = pin_config_target(directory, path, display_path)?;
+	let (bytes, state) = read_pinned_config_bytes(&pinned.target, display_path)?;
+	let mut contained = directory_is_within(&pinned.target.directory, &ancestor)?;
+	for symlink in &pinned.symlinks {
+		contained |= directory_is_within(&symlink.directory, &ancestor)?;
+	}
+	for directory in &pinned.traversed_directories {
+		contained |= directory_is_within(directory, &ancestor)?;
+	}
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	ensure_config_target_unchanged(&pinned.target, &state, display_path)?;
+	let identity = durable_target_identity(&pinned, &state)?;
+	Ok((bytes, identity, contained))
+}
+
+fn directory_is_within(directory: &Dir, ancestor: &Dir) -> Result<bool> {
+	directory_is_within_identity(directory, directory_identity(ancestor)?)
+}
+
+fn directory_is_within_identity(directory: &Dir, expected: EntryIdentity) -> Result<bool> {
+	let mut current = directory.try_clone()?;
+	loop {
+		let current_identity = directory_identity(&current)?;
+		if current_identity == expected {
+			return Ok(true);
+		}
+		let parent = current.open_parent_dir(ambient_authority())?;
+		if directory_identity(&parent)? == current_identity {
+			return Ok(false);
+		}
+		current = parent;
+	}
+}
+
+fn reserve_file_at_if_current_sync(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: &ConfigTargetIdentity,
+) -> Result<PreparedConfigPublication> {
+	let pinned = pin_config_target(directory, path, display_path)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	let (_, state) = read_pinned_config_bytes(&pinned.target, display_path)?;
+	ensure_target_identity(&pinned, &state, expected, display_path)?;
+	let (name, file, identity) = create_private_config_file(&pinned.target, display_path)?;
+	let result = (|| {
+		file.sync_all()?;
+		ensure_config_symlinks_unchanged(&pinned, display_path)?;
+		ensure_config_target_unchanged(&pinned.target, &state, display_path)?;
+		ensure_target_identity(&pinned, &state, expected, display_path)?;
+		sync_config_directory(&pinned.target.directory)
+	})();
+	drop(file);
+	if let Err(error) = result {
+		let _ = remove_file_if_identity(&pinned.target.directory, &name, identity);
+		let _ = sync_config_directory(&pinned.target.directory);
+		return Err(error);
+	}
+	Ok(PreparedConfigPublication { name, identity })
+}
+
+fn prepare_reserved_file_at_sync<T, F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: &ConfigTargetIdentity,
+	prepared: &PreparedConfigPublication,
+	edit: F,
+) -> Result<T>
+where
+	F: FnOnce(&mut GitConfig) -> Result<T>,
+{
+	let pinned = pin_config_target(directory, path, display_path)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	let (mut config, state) = read_pinned_config_target(&pinned.target, display_path)?;
+	ensure_target_identity(&pinned, &state, expected, display_path)?;
+	let result = edit(&mut config)?;
+	let bytes = config.render();
+	let mut options = OpenOptions::new();
+	options.read(true).write(true).follow(FollowSymlinks::No);
+	#[cfg(windows)]
+	{
+		use cap_std::fs::OpenOptionsExt as _;
+		use windows_sys::Win32::Storage::FileSystem::{
+			FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+		};
+		options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+	}
+	let mut file = pinned
+		.target
+		.directory
+		.open_with(&prepared.name, &options)
+		.map_err(|error| anyhow!("opening reserved {}: {error}", display_path.display()))?;
+	if file_identity(&file)? != prepared.identity {
+		return Err(anyhow!(
+			"reserved config identity changed before preparing {}",
+			display_path.display()
+		));
+	}
+	if let ConfigTargetState::File { permissions, .. } = &state {
+		let _ = file.set_permissions(permissions.clone());
+	}
+	file.set_len(0)?;
+	file.write_all(bytes.as_bytes())?;
+	file.sync_all()?;
+	ensure_named_state(
+		&pinned.target.directory,
+		&prepared.name,
+		Some(prepared.identity),
+		display_path,
+	)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	ensure_config_target_unchanged(&pinned.target, &state, display_path)?;
+	ensure_target_identity(&pinned, &state, expected, display_path)?;
+	sync_config_directory(&pinned.target.directory)?;
+	Ok(result)
+}
+
+fn publish_prepared_file_at_sync<B, F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: &ConfigTargetIdentity,
+	prepared: PreparedConfigPublication,
+	boundary: B,
+	validate: F,
+) -> Result<PreparedConfigOutcome>
+where
+	B: Fn() -> Result<()>,
+	F: Fn(PreparedConfigImage, &GitConfig) -> Result<()>,
+{
+	let pinned = pin_config_target(directory, path, display_path)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	let (target_config, target_state) = read_pinned_config_target(&pinned.target, display_path)?;
+	let target_identity = durable_target_identity(&pinned, &target_state)?;
+	if same_config_resolution(&target_identity, expected)
+		&& target_identity.target == Some(prepared.identity)
+	{
+		validate(PreparedConfigImage::After, &target_config)?;
+		let private_identity =
+			named_file_identity(&pinned.target.directory, &prepared.name, display_path)?;
+		if private_identity.is_some() && private_identity != expected.target {
+			return Err(anyhow!(
+				"prepared config namespace changed after publishing {}",
+				display_path.display()
+			));
+		}
+		let lock_name = config_lock_name(&pinned.target.name);
+		match named_file_identity(&pinned.target.directory, &lock_name, display_path)? {
+			None => {}
+			Some(lock) if expected.target == Some(lock) => {
+				remove_file_if_identity(&pinned.target.directory, &lock_name, lock).map_err(|error| {
+					anyhow!(
+						"retiring displaced config lock for {}: {error}",
+						display_path.display()
+					)
+				})?;
+			}
+			Some(_) => {
+				return Err(anyhow!(
+					"config lock changed after publishing {}",
+					display_path.display()
+				));
+			}
+		}
+		sync_config_directory(&pinned.target.directory)?;
+		ensure_config_symlinks_unchanged(&pinned, display_path)?;
+		if let Some(displaced) = private_identity {
+			remove_file_if_identity(&pinned.target.directory, &prepared.name, displaced).map_err(
+				|error| {
+					anyhow!(
+						"retiring displaced config for {}: {error}",
+						display_path.display()
+					)
+				},
+			)?;
+			sync_config_directory(&pinned.target.directory)?;
+		}
+		return Ok(PreparedConfigOutcome::AlreadyPublished);
+	}
+	if same_config_resolution(&target_identity, expected)
+		&& target_identity.target.is_none()
+		&& let Some(displaced) = expected.target
+	{
+		let private_identity =
+			named_file_identity(&pinned.target.directory, &prepared.name, display_path)?;
+		let lock_name = config_lock_name(&pinned.target.name);
+		let lock_identity = named_file_identity(&pinned.target.directory, &lock_name, display_path)?;
+		if private_identity != Some(displaced) || lock_identity != Some(prepared.identity) {
+			return Err(anyhow!(
+				"prepared config namespace changed while recovering {}",
+				display_path.display()
+			));
+		}
+		let before = read_named_config(&pinned.target.directory, &prepared.name, display_path)?;
+		validate(PreparedConfigImage::Before, &before)?;
+		let after = read_named_config(&pinned.target.directory, &lock_name, display_path)?;
+		validate(PreparedConfigImage::After, &after)?;
+		ensure_config_symlinks_unchanged(&pinned, display_path)?;
+		boundary()?;
+		rename_noreplace_if_identity(
+			&pinned.target.directory,
+			&lock_name,
+			prepared.identity,
+			&pinned.target.directory,
+			&pinned.target.name,
+		)
+		.map_err(|error| anyhow!("publishing {}: {error}", display_path.display()))?;
+		sync_config_directory(&pinned.target.directory)?;
+		ensure_published_config_identity(&pinned, expected, &prepared, &validate, display_path)?;
+		remove_file_if_identity(&pinned.target.directory, &prepared.name, displaced).map_err(
+			|error| {
+				anyhow!(
+					"retiring displaced config for {}: {error}",
+					display_path.display()
+				)
+			},
+		)?;
+		sync_config_directory(&pinned.target.directory)?;
+		return Ok(PreparedConfigOutcome::Published);
+	}
+	if &target_identity != expected {
+		return Err(anyhow!(
+			"config target changed after deinit was planned: {}",
+			display_path.display()
+		));
+	}
+	validate(PreparedConfigImage::Before, &target_config)?;
+
+	let lock_name = config_lock_name(&pinned.target.name);
+	let private_identity =
+		named_file_identity(&pinned.target.directory, &prepared.name, display_path)?;
+	let lock_identity = named_file_identity(&pinned.target.directory, &lock_name, display_path)?;
+	match (private_identity, lock_identity) {
+		(Some(private), None) if private == prepared.identity => {
+			let after = read_named_config(&pinned.target.directory, &prepared.name, display_path)?;
+			validate(PreparedConfigImage::After, &after)?;
+			rename_noreplace_if_identity(
+				&pinned.target.directory,
+				&prepared.name,
+				prepared.identity,
+				&pinned.target.directory,
+				&lock_name,
+			)
+			.map_err(|error| anyhow!("locking {}: {error}", display_path.display()))?;
+			sync_config_directory(&pinned.target.directory)?;
+		}
+		(None, Some(lock)) if lock == prepared.identity => {
+			let after = read_named_config(&pinned.target.directory, &lock_name, display_path)?;
+			validate(PreparedConfigImage::After, &after)?;
+		}
+		_ => {
+			return Err(anyhow!(
+				"prepared config namespace changed before publishing {}",
+				display_path.display()
+			));
+		}
+	}
+
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	let (current_config, current_state) = read_pinned_config_target(&pinned.target, display_path)?;
+	if &durable_target_identity(&pinned, &current_state)? != expected {
+		return Err(anyhow!(
+			"config target changed before publishing {}",
+			display_path.display()
+		));
+	}
+	validate(PreparedConfigImage::Before, &current_config)?;
+	let locked_config = read_named_config(&pinned.target.directory, &lock_name, display_path)?;
+	validate(PreparedConfigImage::After, &locked_config)?;
+	boundary()?;
+	publish_journaled_config_target(
+		&pinned.target,
+		&lock_name,
+		&prepared,
+		&current_state,
+		display_path,
+	)?;
+	sync_config_directory(&pinned.target.directory)?;
+	ensure_published_config_identity(&pinned, expected, &prepared, &validate, display_path)?;
+	#[cfg(windows)]
+	if let ConfigTargetState::File { identity, .. } = current_state {
+		remove_file_if_identity(&pinned.target.directory, &prepared.name, identity).map_err(
+			|error| {
+				anyhow!(
+					"retiring displaced config for {}: {error}",
+					display_path.display()
+				)
+			},
+		)?;
+		sync_config_directory(&pinned.target.directory)?;
+	}
+	Ok(PreparedConfigOutcome::Published)
+}
+
+fn restore_prepared_file_before_image_at_sync<F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: &ConfigTargetIdentity,
+	prepared: PreparedConfigPublication,
+	validate: F,
+) -> Result<bool>
+where
+	F: Fn(PreparedConfigImage, &GitConfig) -> Result<()>,
+{
+	let pinned = pin_config_target(directory, path, display_path)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	let (target_config, target_state) = read_pinned_config_target(&pinned.target, display_path)?;
+	let target_identity = durable_target_identity(&pinned, &target_state)?;
+	if &target_identity == expected {
+		validate(PreparedConfigImage::Before, &target_config)?;
+		sync_config_directory(&pinned.target.directory)?;
+		ensure_config_symlinks_unchanged(&pinned, display_path)?;
+		return Ok(false);
+	}
+	if same_config_resolution(&target_identity, expected)
+		&& target_identity.target == Some(prepared.identity)
+	{
+		validate(PreparedConfigImage::After, &target_config)?;
+		sync_config_directory(&pinned.target.directory)?;
+		ensure_config_symlinks_unchanged(&pinned, display_path)?;
+		return Ok(false);
+	}
+	if !same_config_resolution(&target_identity, expected) || target_identity.target.is_some() {
+		return Err(anyhow!(
+			"config target changed while restoring the before-image for {}",
+			display_path.display()
+		));
+	}
+	let Some(displaced) = expected.target else {
+		return Ok(false);
+	};
+	let lock_name = config_lock_name(&pinned.target.name);
+	ensure_named_state(
+		&pinned.target.directory,
+		&prepared.name,
+		Some(displaced),
+		display_path,
+	)?;
+	ensure_named_state(
+		&pinned.target.directory,
+		&lock_name,
+		Some(prepared.identity),
+		display_path,
+	)?;
+	let before = read_named_config_if_identity(
+		&pinned.target.directory,
+		&prepared.name,
+		displaced,
+		display_path,
+	)?;
+	validate(PreparedConfigImage::Before, &before)?;
+	let after = read_named_config_if_identity(
+		&pinned.target.directory,
+		&lock_name,
+		prepared.identity,
+		display_path,
+	)?;
+	validate(PreparedConfigImage::After, &after)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	ensure_named_state(
+		&pinned.target.directory,
+		&prepared.name,
+		Some(displaced),
+		display_path,
+	)?;
+	ensure_named_state(
+		&pinned.target.directory,
+		&lock_name,
+		Some(prepared.identity),
+		display_path,
+	)?;
+	rename_noreplace_if_identity(
+		&pinned.target.directory,
+		&prepared.name,
+		displaced,
+		&pinned.target.directory,
+		&pinned.target.name,
+	)
+	.map_err(|error| anyhow!("restoring {}: {error}", display_path.display()))?;
+	sync_config_directory(&pinned.target.directory)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	let (restored_config, restored_state) = read_pinned_config_target(&pinned.target, display_path)?;
+	if durable_target_identity(&pinned, &restored_state)? != *expected {
+		return Err(anyhow!(
+			"planned config before-image was not restored to {}",
+			display_path.display()
+		));
+	}
+	validate(PreparedConfigImage::Before, &restored_config)?;
+	ensure_named_state(
+		&pinned.target.directory,
+		&lock_name,
+		Some(prepared.identity),
+		display_path,
+	)?;
+	Ok(true)
+}
+
+fn prepared_file_before_image_requires_restore_at_sync<F>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: &ConfigTargetIdentity,
+	prepared: &PreparedConfigPublication,
+	validate: F,
+) -> Result<bool>
+where
+	F: Fn(PreparedConfigImage, &GitConfig) -> Result<()>,
+{
+	let pinned = pin_config_target(directory, path, display_path)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	let (target_config, target_state) = read_pinned_config_target(&pinned.target, display_path)?;
+	let target_identity = durable_target_identity(&pinned, &target_state)?;
+	if &target_identity == expected {
+		validate(PreparedConfigImage::Before, &target_config)?;
+		ensure_config_symlinks_unchanged(&pinned, display_path)?;
+		return Ok(false);
+	}
+	if same_config_resolution(&target_identity, expected)
+		&& target_identity.target == Some(prepared.identity)
+	{
+		validate(PreparedConfigImage::After, &target_config)?;
+		ensure_config_symlinks_unchanged(&pinned, display_path)?;
+		return Ok(false);
+	}
+	if !same_config_resolution(&target_identity, expected) || target_identity.target.is_some() {
+		return Err(anyhow!(
+			"config target changed while inspecting the before-image for {}",
+			display_path.display()
+		));
+	}
+	let Some(displaced) = expected.target else {
+		return Ok(false);
+	};
+	let lock_name = config_lock_name(&pinned.target.name);
+	ensure_named_state(
+		&pinned.target.directory,
+		&prepared.name,
+		Some(displaced),
+		display_path,
+	)?;
+	ensure_named_state(
+		&pinned.target.directory,
+		&lock_name,
+		Some(prepared.identity),
+		display_path,
+	)?;
+	let before = read_named_config_if_identity(
+		&pinned.target.directory,
+		&prepared.name,
+		displaced,
+		display_path,
+	)?;
+	validate(PreparedConfigImage::Before, &before)?;
+	let after = read_named_config_if_identity(
+		&pinned.target.directory,
+		&lock_name,
+		prepared.identity,
+		display_path,
+	)?;
+	validate(PreparedConfigImage::After, &after)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	ensure_named_state(
+		&pinned.target.directory,
+		&prepared.name,
+		Some(displaced),
+		display_path,
+	)?;
+	ensure_named_state(
+		&pinned.target.directory,
+		&lock_name,
+		Some(prepared.identity),
+		display_path,
+	)?;
+	Ok(true)
+}
+
+fn ensure_published_config_identity<F>(
+	pinned: &PinnedConfig,
+	expected: &ConfigTargetIdentity,
+	prepared: &PreparedConfigPublication,
+	validate: &F,
+	display_path: &Path,
+) -> Result<()>
+where
+	F: Fn(PreparedConfigImage, &GitConfig) -> Result<()>,
+{
+	ensure_config_symlinks_unchanged(pinned, display_path)?;
+	let (published_config, published_state) =
+		read_pinned_config_target(&pinned.target, display_path)?;
+	let published_identity = durable_target_identity(pinned, &published_state)?;
+	if !same_config_resolution(&published_identity, expected)
+		|| published_identity.target != Some(prepared.identity)
+	{
+		return Err(anyhow!(
+			"prepared config identity was not published to {}",
+			display_path.display()
+		));
+	}
+	validate(PreparedConfigImage::After, &published_config)
+}
+
+fn publish_journaled_config_target(
+	target: &PinnedConfigTarget,
+	lock_name: &OsStr,
+	prepared: &PreparedConfigPublication,
+	state: &ConfigTargetState,
+	display_path: &Path,
+) -> Result<()> {
+	#[cfg(not(windows))]
+	return publish_config_target(target, lock_name, prepared.identity, state, display_path);
+	#[cfg(windows)]
+	{
+		match state {
+			ConfigTargetState::Missing => rename_noreplace_if_identity(
+				&target.directory,
+				lock_name,
+				prepared.identity,
+				&target.directory,
+				&target.name,
+			)
+			.map_err(|error| anyhow!("writing {}: {error}", display_path.display())),
+			ConfigTargetState::File { identity, .. } => {
+				rename_noreplace_if_identity(
+					&target.directory,
+					&target.name,
+					*identity,
+					&target.directory,
+					&prepared.name,
+				)
+				.map_err(|error| anyhow!("displacing {}: {error}", display_path.display()))?;
+				sync_config_directory(&target.directory)?;
+				rename_noreplace_if_identity(
+					&target.directory,
+					lock_name,
+					prepared.identity,
+					&target.directory,
+					&target.name,
+				)
+				.map_err(|error| anyhow!("writing {}: {error}", display_path.display()))
+			}
+		}
+	}
+}
+
+fn durable_target_identity(
+	pinned: &PinnedConfig,
+	state: &ConfigTargetState,
+) -> Result<ConfigTargetIdentity> {
+	let target = match state {
+		ConfigTargetState::Missing => None,
+		ConfigTargetState::File { identity, .. } => Some(*identity),
+	};
+	Ok(ConfigTargetIdentity {
+		parent: directory_identity(&pinned.target.directory)?,
+		target,
+		symlinks: pinned.symlinks.iter().map(|link| link.identity).collect(),
+	})
+}
+
+fn ensure_target_identity(
+	pinned: &PinnedConfig,
+	state: &ConfigTargetState,
+	expected: &ConfigTargetIdentity,
+	display_path: &Path,
+) -> Result<()> {
+	if &durable_target_identity(pinned, state)? == expected {
+		Ok(())
+	} else {
+		Err(anyhow!(
+			"config target changed after deinit was planned: {}",
+			display_path.display()
+		))
+	}
+}
+
+fn same_config_resolution(left: &ConfigTargetIdentity, right: &ConfigTargetIdentity) -> bool {
+	left.parent == right.parent && left.symlinks == right.symlinks
+}
+
+fn create_private_config_file(
+	target: &PinnedConfigTarget,
+	display_path: &Path,
+) -> Result<(OsString, cap_std::fs::File, EntryIdentity)> {
+	for _ in 0..PREPARED_CONFIG_ATTEMPTS {
+		let sequence = PREPARED_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
+		let name = OsString::from(format!(
+			".gitana-config-prepared.{}.{}",
+			std::process::id(),
+			sequence
+		));
+		let mut options = OpenOptions::new();
+		options
+			.write(true)
+			.create_new(true)
+			.follow(FollowSymlinks::No);
+		#[cfg(windows)]
+		{
+			use cap_std::fs::OpenOptionsExt as _;
+			use windows_sys::Win32::Storage::FileSystem::{
+				FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+			};
+			options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+		}
+		match target.directory.open_with(&name, &options) {
+			Ok(file) => {
+				let identity = file_identity(&file)?;
+				return Ok((name, file, identity));
+			}
+			Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+			Err(error) => {
+				return Err(anyhow!(
+					"preparing private config for '{}': {error}",
+					display_path.display()
+				));
+			}
+		}
+	}
+	Err(anyhow!(
+		"could not reserve a private config image for '{}'",
+		display_path.display()
+	))
+}
+
+fn config_lock_name(target: &OsStr) -> OsString {
+	let mut name = target.to_owned();
+	name.push(".lock");
+	name
+}
+
+fn named_file_identity(
+	directory: &Dir,
+	name: &OsStr,
+	display_path: &Path,
+) -> Result<Option<EntryIdentity>> {
+	match directory.symlink_metadata(name) {
+		Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+			Ok(Some(EntryIdentity::from_metadata(&metadata)))
+		}
+		Ok(_) => Err(anyhow!(
+			"config transaction entry is not a regular file while accessing {}",
+			display_path.display()
+		)),
+		Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+		Err(error) => Err(anyhow!("checking {}: {error}", display_path.display())),
+	}
+}
+
+fn ensure_named_state(
+	directory: &Dir,
+	name: &OsStr,
+	expected: Option<EntryIdentity>,
+	display_path: &Path,
+) -> Result<()> {
+	if named_file_identity(directory, name, display_path)? == expected {
+		Ok(())
+	} else {
+		Err(anyhow!(
+			"config transaction namespace changed while accessing {}",
+			display_path.display()
+		))
+	}
+}
+
+fn read_named_config(directory: &Dir, name: &OsStr, display_path: &Path) -> Result<GitConfig> {
+	let mut options = OpenOptions::new();
+	options.read(true).follow(FollowSymlinks::No);
+	let mut file = directory
+		.open_with(name, &options)
+		.map_err(|error| anyhow!("reading prepared {}: {error}", display_path.display()))?;
+	let metadata = file.metadata()?;
+	if !metadata.is_file() || metadata.file_type().is_symlink() {
+		return Err(anyhow!(
+			"prepared config for {} is not a regular file",
+			display_path.display()
+		));
+	}
+	let mut bytes = Vec::new();
+	file.read_to_end(&mut bytes)?;
+	let text =
+		String::from_utf8(bytes).map_err(|_| anyhow!("{} is not UTF-8", display_path.display()))?;
+	Ok(GitConfig::parse(&text)?)
+}
+
+fn read_named_config_if_identity(
+	directory: &Dir,
+	name: &OsStr,
+	expected: EntryIdentity,
+	display_path: &Path,
+) -> Result<GitConfig> {
+	let mut options = OpenOptions::new();
+	options.read(true).follow(FollowSymlinks::No);
+	let mut file = directory
+		.open_with(name, &options)
+		.map_err(|error| anyhow!("reading prepared {}: {error}", display_path.display()))?;
+	let metadata = file.metadata()?;
+	if !metadata.is_file() || metadata.file_type().is_symlink() || file_identity(&file)? != expected {
+		return Err(anyhow!(
+			"prepared config identity changed while accessing {}",
+			display_path.display()
+		));
+	}
+	let mut bytes = Vec::new();
+	file.read_to_end(&mut bytes)?;
+	ensure_named_state(directory, name, Some(expected), display_path)?;
+	let text =
+		String::from_utf8(bytes).map_err(|_| anyhow!("{} is not UTF-8", display_path.display()))?;
+	Ok(GitConfig::parse(&text)?)
+}
+
+fn sync_config_directory(directory: &Dir) -> Result<()> {
+	let mut options = OpenOptions::new();
+	#[cfg(not(windows))]
+	options.read(true);
+	#[cfg(windows)]
+	{
+		use cap_std::fs::OpenOptionsExt as _;
+		use windows_sys::Win32::Storage::FileSystem::{
+			FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+		};
+		options
+			.read(true)
+			.write(true)
+			.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+	}
+	directory.open_with(".", &options)?.sync_all()?;
+	Ok(())
 }
 
 fn read_pinned_config_target(
@@ -626,11 +1921,33 @@ fn ensure_config_symlinks_unchanged(pinned: &PinnedConfig, display_path: &Path) 
 	Ok(())
 }
 
-fn pin_config_target(directory: Dir, path: &Path) -> Result<PinnedConfig> {
+fn pin_config_target(directory: Dir, path: &Path, display_path: &Path) -> Result<PinnedConfig> {
 	let mut symlink_hops = 0;
 	let mut symlinks = Vec::new();
-	let target = resolve_config_target(directory, path, &mut symlink_hops, &mut symlinks)?;
-	Ok(PinnedConfig { target, symlinks })
+	let mut traversed_directories = Vec::new();
+	let mut resolved_path = if path.is_absolute() {
+		PathBuf::new()
+	} else {
+		let mut root = display_path.to_owned();
+		for _ in path.components() {
+			root.pop();
+		}
+		root
+	};
+	let target = resolve_config_target(
+		directory,
+		path,
+		&mut symlink_hops,
+		&mut symlinks,
+		&mut traversed_directories,
+		&mut resolved_path,
+	)?;
+	Ok(PinnedConfig {
+		target,
+		symlinks,
+		traversed_directories,
+		resolved_path,
+	})
 }
 
 fn ensure_config_target_unchanged(
@@ -699,22 +2016,20 @@ fn resolve_config_target(
 	path: &Path,
 	symlink_hops: &mut usize,
 	symlinks: &mut Vec<PinnedConfigSymlink>,
+	traversed_directories: &mut Vec<Dir>,
+	resolved_path: &mut PathBuf,
 ) -> Result<PinnedConfigTarget> {
 	let (mut directory, relative) = if path.is_absolute() {
-		let parent = path
-			.parent()
-			.ok_or_else(|| anyhow!("config path '{}' has no parent", path.display()))?;
+		let (anchor, relative) = absolute_config_anchor(path)?;
+		*resolved_path = anchor.clone();
 		(
-			Dir::open_ambient_dir(parent, ambient_authority())?,
-			Path::new(
-				path
-					.file_name()
-					.ok_or_else(|| anyhow!("config path '{}' has no file name", path.display()))?,
-			),
+			Dir::open_ambient_dir(anchor, ambient_authority())?,
+			relative,
 		)
 	} else {
-		(directory, path)
+		(directory, path.to_owned())
 	};
+	traversed_directories.push(directory.try_clone()?);
 
 	if let Some(parent) = relative.parent() {
 		for component in parent.components() {
@@ -723,10 +2038,20 @@ fn resolve_config_target(
 				Component::CurDir => {}
 				Component::ParentDir => {
 					directory = directory.open_parent_dir(ambient_authority())?;
+					resolved_path.pop();
+					traversed_directories.push(directory.try_clone()?);
 				}
 				Component::Normal(name) => {
-					let target = resolve_config_name(directory, name, symlink_hops, symlinks)?;
+					let target = resolve_config_name(
+						directory,
+						name,
+						symlink_hops,
+						symlinks,
+						traversed_directories,
+						resolved_path,
+					)?;
 					directory = open_resolved_config_directory(target)?;
+					traversed_directories.push(directory.try_clone()?);
 				}
 				Component::Prefix(_) | Component::RootDir => {
 					return Err(anyhow!(
@@ -740,14 +2065,54 @@ fn resolve_config_target(
 	let name = relative
 		.file_name()
 		.ok_or_else(|| anyhow!("config path '{}' has no file name", path.display()))?;
-	resolve_config_name(directory, name, symlink_hops, symlinks)
+	resolve_config_name(
+		directory,
+		name,
+		symlink_hops,
+		symlinks,
+		traversed_directories,
+		resolved_path,
+	)
+}
+
+fn absolute_config_anchor(path: &Path) -> Result<(PathBuf, PathBuf)> {
+	use std::path::Component;
+
+	let mut components = path.components();
+	let mut anchor = PathBuf::new();
+	match components.next() {
+		Some(Component::Prefix(prefix)) => {
+			anchor.push(prefix.as_os_str());
+			match components.next() {
+				Some(Component::RootDir) => anchor.push(std::path::MAIN_SEPARATOR_STR),
+				_ => return Err(anyhow!("config path '{}' is not absolute", path.display())),
+			}
+		}
+		Some(Component::RootDir) => anchor.push(std::path::MAIN_SEPARATOR_STR),
+		_ => return Err(anyhow!("config path '{}' is not absolute", path.display())),
+	}
+	Ok((anchor, components.collect()))
 }
 
 /// Open a directory component only if the name still identifies the non-symlink entry resolved
 /// above. A legitimate config symlink is followed explicitly by [`resolve_config_name`]; following a
 /// replacement symlink here would let a concurrent namespace swap redirect the transaction.
 fn open_resolved_config_directory(target: PinnedConfigTarget) -> Result<Dir> {
-	Ok(target.directory.open_dir_nofollow(&target.name)?)
+	let Some(expected) = target.identity else {
+		return match target.directory.open_dir_nofollow(&target.name) {
+			Ok(_) => Err(anyhow!("config directory changed while resolving")),
+			Err(error) => Err(error.into()),
+		};
+	};
+	let directory = target.directory.open_dir_nofollow(&target.name)?;
+	if directory_identity(&directory)? != expected {
+		return Err(anyhow!("config directory changed while resolving"));
+	}
+	let current = target.directory.symlink_metadata(&target.name)?;
+	if !current.file_type().is_dir() || EntryIdentity::from_metadata(&current) != expected {
+		return Err(anyhow!("config directory changed while resolving"));
+	}
+	Ok(directory)
 }
 
 fn resolve_config_name(
@@ -755,6 +2120,8 @@ fn resolve_config_name(
 	name: &OsStr,
 	symlink_hops: &mut usize,
 	symlinks: &mut Vec<PinnedConfigSymlink>,
+	traversed_directories: &mut Vec<Dir>,
+	resolved_path: &mut PathBuf,
 ) -> Result<PinnedConfigTarget> {
 	match directory.symlink_metadata(name) {
 		Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -774,16 +2141,31 @@ fn resolve_config_name(
 				identity,
 				target: target.clone(),
 			});
-			resolve_config_target(directory, &target, symlink_hops, symlinks)
+			resolve_config_target(
+				directory,
+				&target,
+				symlink_hops,
+				symlinks,
+				traversed_directories,
+				resolved_path,
+			)
 		}
-		Ok(_) => Ok(PinnedConfigTarget {
-			directory,
-			name: name.to_owned(),
-		}),
-		Err(error) if error.kind() == ErrorKind::NotFound => Ok(PinnedConfigTarget {
-			directory,
-			name: name.to_owned(),
-		}),
+		Ok(metadata) => {
+			resolved_path.push(name);
+			Ok(PinnedConfigTarget {
+				directory,
+				name: name.to_owned(),
+				identity: Some(EntryIdentity::from_metadata(&metadata)),
+			})
+		}
+		Err(error) if error.kind() == ErrorKind::NotFound => {
+			resolved_path.push(name);
+			Ok(PinnedConfigTarget {
+				directory,
+				name: name.to_owned(),
+				identity: None,
+			})
+		}
 		Err(error) => Err(error.into()),
 	}
 }
@@ -915,6 +2297,7 @@ async fn assemble_merged(
 	gitdir: Option<&Path>,
 	gitdir_absolute: Option<&Path>,
 	branch: Option<&str>,
+	guard: &ConfigInputGuard,
 ) -> Result<GitConfig> {
 	let base_len = base.len();
 	if let Some(env) = env_config_source()? {
@@ -928,7 +2311,7 @@ async fn assemble_merged(
 			fileless: true,
 		});
 	}
-	expand_layers(&mut base, gitdir, gitdir_absolute, branch).await?;
+	expand_layers(&mut base, gitdir, gitdir_absolute, branch, guard).await?;
 	let mut sources = sources_of(base);
 	// Peel the command-scope source(s) back off the top so they overlay (highest precedence for reads)
 	// while `from_sources_or_empty` keeps the writable source on the base's last layer (the local file).
@@ -944,7 +2327,7 @@ async fn assemble_merged(
 /// first): system, then the global file(s). The system layer is suppressed here — the merged read —
 /// when `$GIT_CONFIG_NOSYSTEM` is set; an explicit `--system` scope still targets the file (see
 /// [`system_path`]), matching git.
-async fn global_and_system_layers() -> Result<Vec<ConfigLayer>> {
+async fn global_and_system_layers(guard: &ConfigInputGuard) -> Result<Vec<ConfigLayer>> {
 	let mut paths = Vec::new();
 	if !env_bool("GIT_CONFIG_NOSYSTEM")? {
 		paths.push(system_path());
@@ -952,7 +2335,7 @@ async fn global_and_system_layers() -> Result<Vec<ConfigLayer>> {
 	paths.extend(global_paths());
 	let mut layers = Vec::new();
 	for path in paths {
-		if let Some(layer) = read_layer(&path).await? {
+		if let Some(layer) = read_layer(&path, guard).await? {
 			layers.push(layer);
 		}
 	}
@@ -962,9 +2345,9 @@ async fn global_and_system_layers() -> Result<Vec<ConfigLayer>> {
 /// The repository-local layer (`<common>/config`). An absent file yields an empty writable source
 /// anchored at `common` — matching git, which resolves from the ambient layers when `.git/config` does
 /// not exist yet. A present-but-malformed file is an error (via [`read_layer`]).
-async fn local_layer(common: &Path) -> Result<ConfigLayer> {
+async fn local_layer(common: &Path, guard: &ConfigInputGuard) -> Result<ConfigLayer> {
 	Ok(
-		read_layer(&common.join("config"))
+		read_layer(&common.join("config"), guard)
 			.await?
 			.unwrap_or_else(|| ConfigLayer {
 				source: GitConfigSource::new(),
@@ -975,9 +2358,14 @@ async fn local_layer(common: &Path) -> Result<ConfigLayer> {
 	)
 }
 
-async fn local_layer_at(directory: Dir, common: &Path, path: &Path) -> Result<ConfigLayer> {
+async fn local_layer_at(
+	directory: Dir,
+	common: &Path,
+	path: &Path,
+	guard: &ConfigInputGuard,
+) -> Result<ConfigLayer> {
 	Ok(
-		read_layer_at(directory, &common.join(path), path)
+		read_layer_at(directory, &common.join(path), path, guard)
 			.await?
 			.unwrap_or_else(|| ConfigLayer {
 				source: GitConfigSource::new(),
@@ -992,8 +2380,16 @@ async fn read_layer_at(
 	directory: Dir,
 	display_path: &Path,
 	relative_path: &Path,
+	guard: &ConfigInputGuard,
 ) -> Result<Option<ConfigLayer>> {
-	let Some(bytes) = read_file_at(directory, relative_path, display_path).await? else {
+	let guard = guard.clone();
+	let path = relative_path.to_owned();
+	let display = display_path.to_owned();
+	let Some((bytes, resolved_path)) =
+		tokio::task::spawn_blocking(move || read_config_input_sync(directory, &path, &display, &guard))
+			.await
+			.map_err(|error| anyhow!("config input worker failed: {error}"))??
+	else {
 		return Ok(None);
 	};
 	let text =
@@ -1006,7 +2402,10 @@ async fn read_layer_at(
 			.parent()
 			.map(Path::to_path_buf)
 			.unwrap_or_default(),
-		real_dir: canonical_dir(display_path).await,
+		real_dir: resolved_path
+			.parent()
+			.map(Path::to_path_buf)
+			.unwrap_or_default(),
 		fileless: false,
 	}))
 }
@@ -1014,9 +2413,36 @@ async fn read_layer_at(
 /// Parse one config file into a [`ConfigLayer`], or `None` if it is absent. A file that exists but
 /// cannot be read or parsed is an error — git aborts on a bad config, so a lower-precedence one must
 /// not be silently ignored.
-async fn read_layer(path: &Path) -> Result<Option<ConfigLayer>> {
-	match tokio::fs::read(path).await {
-		Ok(bytes) => {
+async fn read_layer(path: &Path, guard: &ConfigInputGuard) -> Result<Option<ConfigLayer>> {
+	let input = if guard.is_empty() {
+		match tokio::fs::read(path).await {
+			Ok(bytes) => Some((
+				bytes,
+				tokio::fs::canonicalize(path)
+					.await
+					.unwrap_or_else(|_| path.to_path_buf()),
+			)),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+			Err(error) => return Err(anyhow!("reading {}: {error}", path.display())),
+		}
+	} else {
+		let directory = Dir::open_ambient_dir(".", ambient_authority())?;
+		let path = path.to_owned();
+		let display = path.clone();
+		let guard = guard.clone();
+		let result = tokio::task::spawn_blocking(move || {
+			read_config_input_sync(directory, &path, &display, &guard)
+		})
+		.await
+		.map_err(|error| anyhow!("config input worker failed: {error}"))?;
+		match result {
+			Ok(bytes) => bytes,
+			Err(error) if config_input_is_not_found(&error) => None,
+			Err(error) => return Err(error),
+		}
+	};
+	match input {
+		Some((bytes, resolved_path)) => {
 			let text =
 				std::str::from_utf8(&bytes).map_err(|_| anyhow!("{} is not UTF-8", path.display()))?;
 			let source = GitConfigSource::parse(text)
@@ -1026,26 +2452,15 @@ async fn read_layer(path: &Path) -> Result<Option<ConfigLayer>> {
 				// Lexical parent — the path git reached the file through — for relative `include.path`.
 				dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
 				// Real (symlink-resolved) parent for `gitdir:./`, as git realpaths the config file.
-				real_dir: canonical_dir(path).await,
+				real_dir: resolved_path
+					.parent()
+					.map(Path::to_path_buf)
+					.unwrap_or_default(),
 				fileless: false,
 			}))
 		}
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-		Err(error) => Err(anyhow!("reading {}: {error}", path.display())),
+		None => Ok(None),
 	}
-}
-
-/// The real (symlink-resolved) parent directory of a config file, for `gitdir:./` matching — git
-/// realpaths the config file before taking its directory. Falls back to the lexical parent if
-/// canonicalization fails.
-async fn canonical_dir(path: &Path) -> PathBuf {
-	let canonical = tokio::fs::canonicalize(path)
-		.await
-		.unwrap_or_else(|_| path.to_path_buf());
-	canonical
-		.parent()
-		.map(Path::to_path_buf)
-		.unwrap_or_default()
 }
 
 /// The real (symlink-resolved, absolute) git directory for `includeIf "gitdir:"`/`"onbranch:"`
@@ -1129,27 +2544,56 @@ fn head_branch_at(git_dir: &Dir) -> Option<String> {
 /// A [`tokio::fs`]-backed [`IncludeResolver`], the native driver for git-config include expansion. An
 /// absent target reads as `None` (git silently skips it); a present-but-unreadable or non-UTF-8 target
 /// is an error, as git aborts on a bad included file.
-struct FsIncludeResolver;
+struct FsIncludeResolver {
+	guard: ConfigInputGuard,
+}
 
 impl IncludeResolver for FsIncludeResolver {
 	async fn read(&self, path: &Path) -> Result<Option<(String, PathBuf)>, ConfigError> {
-		match tokio::fs::read(path).await {
-			Ok(bytes) => {
+		let input = if self.guard.is_empty() {
+			match tokio::fs::read(path).await {
+				Ok(bytes) => Some((
+					bytes,
+					tokio::fs::canonicalize(path)
+						.await
+						.unwrap_or_else(|_| path.to_path_buf()),
+				)),
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+				Err(error) => {
+					return Err(ConfigError::Parse(format!(
+						"reading include {}: {error}",
+						path.display()
+					)));
+				}
+			}
+		} else {
+			let directory = Dir::open_ambient_dir(".", ambient_authority()).map_err(|error| {
+				ConfigError::Parse(format!(
+					"opening include root for {}: {error}",
+					path.display()
+				))
+			})?;
+			let requested = path.to_owned();
+			let display = requested.clone();
+			let guard = self.guard.clone();
+			let result = tokio::task::spawn_blocking(move || {
+				read_config_input_sync(directory, &requested, &display, &guard)
+			})
+			.await
+			.map_err(|error| ConfigError::Parse(format!("include worker failed: {error}")))?;
+			match result {
+				Ok(bytes) => bytes,
+				Err(error) if config_input_is_not_found(&error) => None,
+				Err(error) => return Err(ConfigError::Parse(format!("{error:#}"))),
+			}
+		};
+		match input {
+			Some((bytes, resolved_path)) => {
 				let text = String::from_utf8(bytes)
 					.map_err(|_| ConfigError::Parse(format!("{} is not UTF-8", path.display())))?;
-				// Report the file's real path so the engine matches a nested `gitdir:./` against its real
-				// directory (git realpaths each included file for that condition). If canonicalization fails
-				// — it should not, the file was just read — fall back to the requested path.
-				let canonical = tokio::fs::canonicalize(path)
-					.await
-					.unwrap_or_else(|_| path.to_path_buf());
-				Ok(Some((text, canonical)))
+				Ok(Some((text, resolved_path)))
 			}
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-			Err(error) => Err(ConfigError::Parse(format!(
-				"reading include {}: {error}",
-				path.display()
-			))),
+			None => Ok(None),
 		}
 	}
 }
@@ -1166,9 +2610,12 @@ async fn expand_layers(
 	gitdir: Option<&Path>,
 	gitdir_absolute: Option<&Path>,
 	branch: Option<&str>,
+	guard: &ConfigInputGuard,
 ) -> Result<()> {
 	let home = home_dir();
-	let resolver = FsIncludeResolver;
+	let resolver = FsIncludeResolver {
+		guard: guard.clone(),
+	};
 	// Pre-scan: hasconfig is forced true inside the scan, so it consults no remote URLs itself.
 	let prescan_ctx = IncludeContext {
 		home: home.as_deref(),
@@ -1413,11 +2860,18 @@ pub fn parse_git_bool(value: &str) -> Option<bool> {
 mod tests {
 	#[cfg(unix)]
 	use super::{
-		PinnedConfigTarget, edit_file_at, edit_file_at_if_current, edit_file_at_tracked,
-		ensure_config_target_unchanged, open_resolved_config_directory, publish_config_target,
-		read_pinned_config_bytes, resolve_config_name,
+		PinnedConfigTarget, PreparedConfigImage, PreparedConfigOutcome, edit_file_at,
+		edit_file_at_guarded, edit_file_at_if_current, edit_file_at_tracked,
+		ensure_config_target_unchanged, open_resolved_config_directory, prepare_reserved_file_at,
+		prepare_reserved_file_at_guarded, publish_config_target, publish_prepared_file_at,
+		publish_prepared_file_at_guarded, read_config_input_sync, read_file_at_identified,
+		read_file_at_identified_with_containment, read_pinned_config_bytes, reserve_file_at_if_current,
+		resolve_config_name, restore_prepared_file_before_image_at,
 	};
-	use super::{for_worktree, from_ambient, validate_command_config, with_command_config};
+	use super::{
+		for_worktree, for_worktree_at_excluding, from_ambient, validate_command_config,
+		with_command_config,
+	};
 	#[cfg(unix)]
 	use cap_std::{ambient_authority, fs::Dir};
 	#[cfg(unix)]
@@ -1488,6 +2942,238 @@ mod tests {
 
 	#[cfg(unix)]
 	#[tokio::test]
+	async fn config_containment_uses_the_pinned_target_parent() {
+		use std::os::unix::fs::symlink;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let module = temporary.path().join("module");
+		let checkout = temporary.path().join("checkout");
+		let external = temporary.path().join("external");
+		std::fs::create_dir(&module).unwrap();
+		std::fs::create_dir(&checkout).unwrap();
+		std::fs::create_dir(&external).unwrap();
+		std::fs::write(checkout.join("config-real"), b"[core]\n\tbare = false\n").unwrap();
+		std::fs::hard_link(checkout.join("config-real"), external.join("config-real")).unwrap();
+		symlink("../checkout/config-real", module.join("config")).unwrap();
+
+		let module_dir = Dir::open_ambient_dir(&module, ambient_authority()).unwrap();
+		let checkout_dir = Dir::open_ambient_dir(&checkout, ambient_authority()).unwrap();
+		let (inside_bytes, inside_target, inside) = read_file_at_identified_with_containment(
+			module_dir.try_clone().unwrap(),
+			Path::new("config"),
+			&module.join("config"),
+			checkout_dir.try_clone().unwrap(),
+		)
+		.await
+		.unwrap();
+		assert_eq!(inside_bytes.unwrap(), b"[core]\n\tbare = false\n");
+		assert!(inside);
+
+		std::fs::remove_file(module.join("config")).unwrap();
+		symlink("../external/config-real", module.join("config")).unwrap();
+		let (outside_bytes, outside_target, outside) = read_file_at_identified_with_containment(
+			module_dir,
+			Path::new("config"),
+			&module.join("config"),
+			checkout_dir,
+		)
+		.await
+		.unwrap();
+		assert_eq!(outside_bytes.unwrap(), b"[core]\n\tbare = false\n");
+		assert!(!outside);
+		assert_ne!(inside_target, outside_target);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn config_containment_includes_every_pinned_symlink_parent() {
+		use std::os::unix::fs::symlink;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let module = temporary.path().join("module");
+		let checkout = temporary.path().join("checkout");
+		let external = temporary.path().join("external");
+		std::fs::create_dir(&module).unwrap();
+		std::fs::create_dir(&checkout).unwrap();
+		std::fs::create_dir(checkout.join("subdir")).unwrap();
+		std::fs::create_dir(&external).unwrap();
+		std::fs::write(external.join("config-real"), b"[core]\n\tbare = false\n").unwrap();
+		symlink("../checkout/hop", module.join("config")).unwrap();
+		symlink("../external/config-real", checkout.join("hop")).unwrap();
+
+		let module_dir = Dir::open_ambient_dir(&module, ambient_authority()).unwrap();
+		let checkout_dir = Dir::open_ambient_dir(&checkout, ambient_authority()).unwrap();
+		let (bytes, _, contained) = read_file_at_identified_with_containment(
+			module_dir,
+			Path::new("config"),
+			&module.join("config"),
+			checkout_dir,
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(bytes.unwrap(), b"[core]\n\tbare = false\n");
+		assert!(contained);
+
+		std::fs::remove_file(module.join("config")).unwrap();
+		symlink(
+			checkout.join("subdir/../../external/config-real"),
+			module.join("config"),
+		)
+		.unwrap();
+		let module_dir = Dir::open_ambient_dir(&module, ambient_authority()).unwrap();
+		let checkout_dir = Dir::open_ambient_dir(&checkout, ambient_authority()).unwrap();
+		let (bytes, _, contained) = read_file_at_identified_with_containment(
+			module_dir,
+			Path::new("config"),
+			&module.join("config"),
+			checkout_dir,
+		)
+		.await
+		.unwrap();
+		assert_eq!(bytes.unwrap(), b"[core]\n\tbare = false\n");
+		assert!(contained);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn config_containment_includes_ordinary_directories_before_parent_components() {
+		use std::os::unix::fs::symlink;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let module = temporary.path().join("module");
+		let checkout = temporary.path().join("checkout");
+		let external = temporary.path().join("external");
+		std::fs::create_dir(&module).unwrap();
+		std::fs::create_dir(&checkout).unwrap();
+		std::fs::create_dir(checkout.join("subdir")).unwrap();
+		std::fs::create_dir(&external).unwrap();
+		std::fs::write(external.join("config-real"), b"[core]\n\tbare = false\n").unwrap();
+		symlink(
+			"../checkout/subdir/../../external/config-real",
+			module.join("config"),
+		)
+		.unwrap();
+
+		let module_dir = Dir::open_ambient_dir(&module, ambient_authority()).unwrap();
+		let checkout_dir = Dir::open_ambient_dir(&checkout, ambient_authority()).unwrap();
+		let (bytes, _, contained) = read_file_at_identified_with_containment(
+			module_dir,
+			Path::new("config"),
+			&module.join("config"),
+			checkout_dir,
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(bytes.unwrap(), b"[core]\n\tbare = false\n");
+		assert!(contained);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn guarded_effective_config_rejects_an_include_inside_a_selected_checkout() {
+		let temporary = tempfile::tempdir().unwrap();
+		let module = temporary.path().join("module");
+		let checkout = temporary.path().join("checkout");
+		let external = temporary.path().join("external");
+		std::fs::create_dir(&module).unwrap();
+		std::fs::create_dir(&checkout).unwrap();
+		std::fs::create_dir(&external).unwrap();
+		let checkout_include = checkout.join("effective.inc");
+		std::fs::write(&checkout_include, "[user]\n\tname = Checkout\n").unwrap();
+		std::fs::write(
+			module.join("config"),
+			format!(
+				"[core]\n\trepositoryformatversion = 0\n[include]\n\tpath = {}\n",
+				checkout_include.display()
+			),
+		)
+		.unwrap();
+
+		let common = Dir::open_ambient_dir(&module, ambient_authority()).unwrap();
+		let git = common.try_clone().unwrap();
+		let checkout_dir = Dir::open_ambient_dir(&checkout, ambient_authority()).unwrap();
+		let error = for_worktree_at_excluding(common, git, &module, &module, vec![checkout_dir])
+			.await
+			.unwrap_err();
+		assert!(
+			format!("{error:#}").contains("effective config input"),
+			"unexpected error: {error:#}"
+		);
+
+		let external_include = external.join("effective.inc");
+		std::fs::write(&external_include, "[user]\n\tname = External\n").unwrap();
+		std::fs::write(
+			module.join("config"),
+			format!(
+				"[core]\n\trepositoryformatversion = 0\n[include]\n\tpath = {}\n",
+				external_include.display()
+			),
+		)
+		.unwrap();
+		let common = Dir::open_ambient_dir(&module, ambient_authority()).unwrap();
+		let git = common.try_clone().unwrap();
+		let checkout_dir = Dir::open_ambient_dir(&checkout, ambient_authority()).unwrap();
+		let config = for_worktree_at_excluding(common, git, &module, &module, vec![checkout_dir])
+			.await
+			.unwrap();
+		assert_eq!(config.get_raw("user", None, "name"), Some(Some("External")));
+
+		let missing_include = external.join("missing/effective.inc");
+		std::fs::write(
+			module.join("config"),
+			format!(
+				"[core]\n\trepositoryformatversion = 0\n[include]\n\tpath = {}\n",
+				missing_include.display()
+			),
+		)
+		.unwrap();
+		let common = Dir::open_ambient_dir(&module, ambient_authority()).unwrap();
+		let git = common.try_clone().unwrap();
+		let checkout_dir = Dir::open_ambient_dir(&checkout, ambient_authority()).unwrap();
+		for_worktree_at_excluding(common, git, &module, &module, vec![checkout_dir])
+			.await
+			.expect("a missing include parent remains an absent input");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn guarded_config_reads_return_the_path_from_the_pinned_resolution() {
+		use std::os::unix::fs::symlink;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let module = temporary.path().join("module");
+		let original = temporary.path().join("original");
+		let replacement = temporary.path().join("replacement");
+		let guard = temporary.path().join("guard");
+		std::fs::create_dir(&module).unwrap();
+		std::fs::create_dir(&original).unwrap();
+		std::fs::create_dir(&replacement).unwrap();
+		std::fs::create_dir(&guard).unwrap();
+		std::fs::write(original.join("config"), "[user]\n\tname = Original\n").unwrap();
+		std::fs::write(replacement.join("config"), "[user]\n\tname = Replacement\n").unwrap();
+		symlink("../original/config", module.join("config")).unwrap();
+
+		let directory = Dir::open_ambient_dir(&module, ambient_authority()).unwrap();
+		let guard = Dir::open_ambient_dir(&guard, ambient_authority()).unwrap();
+		let input = read_config_input_sync(
+			directory,
+			Path::new("config"),
+			&module.join("config"),
+			&vec![gitana_fs_native::directory_identity(&guard).unwrap()],
+		)
+		.unwrap()
+		.unwrap();
+		std::fs::remove_file(module.join("config")).unwrap();
+		symlink("../replacement/config", module.join("config")).unwrap();
+
+		assert_eq!(input.0, b"[user]\n\tname = Original\n");
+		assert_eq!(input.1, original.join("config"));
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
 	async fn pinned_edit_cannot_be_redirected_by_directory_replacement() {
 		use std::os::unix::fs::symlink;
 
@@ -1524,6 +3210,750 @@ mod tests {
 	}
 
 	#[cfg(unix)]
+	#[tokio::test]
+	async fn prepared_config_publication_recovers_before_and_after_the_atomic_replace() {
+		let temporary = tempfile::tempdir().unwrap();
+		let config = temporary.path().join("config");
+		std::fs::write(&config, "[core]\n\tbare = true\n").unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let (_, target) =
+			read_file_at_identified(directory.try_clone().unwrap(), Path::new("config"), &config)
+				.await
+				.unwrap();
+		let prepared = reserve_file_at_if_current(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+		)
+		.await
+		.unwrap();
+		prepare_reserved_file_at(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+			prepared.clone(),
+			|config| {
+				config.set("core", None, "bare", "false")?;
+				Ok(())
+			},
+		)
+		.await
+		.unwrap();
+		let recovery = prepared.clone();
+		let validate = |image: PreparedConfigImage, config: &gitana_config::GitConfig| {
+			let expected = match image {
+				PreparedConfigImage::Before => "true",
+				PreparedConfigImage::After => "false",
+			};
+			anyhow::ensure!(config.get_string("core", None, "bare") == Some(expected));
+			Ok(())
+		};
+		assert_eq!(
+			publish_prepared_file_at(
+				directory.try_clone().unwrap(),
+				Path::new("config"),
+				&config,
+				target.clone(),
+				prepared,
+				validate,
+			)
+			.await
+			.unwrap(),
+			PreparedConfigOutcome::Published
+		);
+		assert_eq!(
+			publish_prepared_file_at(
+				directory,
+				Path::new("config"),
+				&config,
+				target,
+				recovery,
+				validate,
+			)
+			.await
+			.unwrap(),
+			PreparedConfigOutcome::AlreadyPublished
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn cancelled_config_edit_retains_its_keepalive_until_the_worker_finishes() {
+		use std::sync::Arc;
+		use std::sync::atomic::{AtomicBool, Ordering};
+
+		struct DropProbe(Arc<AtomicBool>);
+
+		impl Drop for DropProbe {
+			fn drop(&mut self) {
+				self.0.store(true, Ordering::SeqCst);
+			}
+		}
+
+		let temporary = tempfile::tempdir().unwrap();
+		let config = temporary.path().join("config");
+		std::fs::write(&config, "[core]\n\tbare = true\n").unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let entered = Arc::new(AtomicBool::new(false));
+		let release = Arc::new(AtomicBool::new(false));
+		let dropped = Arc::new(AtomicBool::new(false));
+		let worker_entered = Arc::clone(&entered);
+		let worker_release = Arc::clone(&release);
+		let keepalive = DropProbe(Arc::clone(&dropped));
+		let task = tokio::spawn(async move {
+			edit_file_at_guarded(
+				directory,
+				Path::new("config"),
+				&config,
+				keepalive,
+				move |config| {
+					worker_entered.store(true, Ordering::SeqCst);
+					while !worker_release.load(Ordering::SeqCst) {
+						std::thread::sleep(std::time::Duration::from_millis(1));
+					}
+					config.set("core", None, "bare", "false")?;
+					Ok(())
+				},
+			)
+			.await
+		});
+
+		while !entered.load(Ordering::SeqCst) {
+			tokio::task::yield_now().await;
+		}
+		task.abort();
+		tokio::task::yield_now().await;
+		assert!(!dropped.load(Ordering::SeqCst));
+
+		release.store(true, Ordering::SeqCst);
+		for _ in 0..1_000 {
+			if dropped.load(Ordering::SeqCst) {
+				break;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(1));
+		}
+		assert!(dropped.load(Ordering::SeqCst));
+		assert!(
+			std::fs::read_to_string(temporary.path().join("config"))
+				.unwrap()
+				.contains("bare = false")
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn cancelled_config_preparation_retains_its_keepalive_until_the_worker_finishes() {
+		use std::sync::Arc;
+		use std::sync::atomic::{AtomicBool, Ordering};
+
+		struct DropProbe(Arc<AtomicBool>);
+
+		impl Drop for DropProbe {
+			fn drop(&mut self) {
+				self.0.store(true, Ordering::SeqCst);
+			}
+		}
+
+		let temporary = tempfile::tempdir().unwrap();
+		let config = temporary.path().join("config");
+		std::fs::write(&config, "[core]\n\tbare = true\n").unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let (_, target) =
+			read_file_at_identified(directory.try_clone().unwrap(), Path::new("config"), &config)
+				.await
+				.unwrap();
+		let prepared = reserve_file_at_if_current(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+		)
+		.await
+		.unwrap();
+		let prepared_path = temporary.path().join(prepared.name());
+		let entered = Arc::new(AtomicBool::new(false));
+		let release = Arc::new(AtomicBool::new(false));
+		let dropped = Arc::new(AtomicBool::new(false));
+		let worker_entered = Arc::clone(&entered);
+		let worker_release = Arc::clone(&release);
+		let keepalive = DropProbe(Arc::clone(&dropped));
+		let task = tokio::spawn(async move {
+			prepare_reserved_file_at_guarded(
+				directory,
+				Path::new("config"),
+				&config,
+				target,
+				prepared,
+				keepalive,
+				move |config| {
+					worker_entered.store(true, Ordering::SeqCst);
+					while !worker_release.load(Ordering::SeqCst) {
+						std::thread::sleep(std::time::Duration::from_millis(1));
+					}
+					config.set("core", None, "bare", "false")?;
+					Ok(())
+				},
+			)
+			.await
+		});
+
+		while !entered.load(Ordering::SeqCst) {
+			tokio::task::yield_now().await;
+		}
+		task.abort();
+		tokio::task::yield_now().await;
+		assert!(!dropped.load(Ordering::SeqCst));
+
+		release.store(true, Ordering::SeqCst);
+		for _ in 0..1_000 {
+			if dropped.load(Ordering::SeqCst) {
+				break;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(1));
+		}
+		assert!(dropped.load(Ordering::SeqCst));
+		assert!(
+			std::fs::read_to_string(prepared_path)
+				.unwrap()
+				.contains("bare = false")
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn cancelled_publication_retains_its_keepalive_until_the_worker_finishes() {
+		use std::sync::Arc;
+		use std::sync::atomic::{AtomicBool, Ordering};
+
+		struct DropProbe(Arc<AtomicBool>);
+
+		impl Drop for DropProbe {
+			fn drop(&mut self) {
+				self.0.store(true, Ordering::SeqCst);
+			}
+		}
+
+		let temporary = tempfile::tempdir().unwrap();
+		let config = temporary.path().join("config");
+		std::fs::write(&config, "[core]\n\tbare = true\n").unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let (_, target) =
+			read_file_at_identified(directory.try_clone().unwrap(), Path::new("config"), &config)
+				.await
+				.unwrap();
+		let prepared = reserve_file_at_if_current(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+		)
+		.await
+		.unwrap();
+		prepare_reserved_file_at(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+			prepared.clone(),
+			|config| {
+				config.set("core", None, "bare", "false")?;
+				Ok(())
+			},
+		)
+		.await
+		.unwrap();
+
+		let entered = Arc::new(AtomicBool::new(false));
+		let release = Arc::new(AtomicBool::new(false));
+		let dropped = Arc::new(AtomicBool::new(false));
+		let worker_entered = Arc::clone(&entered);
+		let worker_release = Arc::clone(&release);
+		let keepalive = DropProbe(Arc::clone(&dropped));
+		let task = tokio::spawn(async move {
+			publish_prepared_file_at_guarded(
+				directory,
+				Path::new("config"),
+				&config,
+				target,
+				prepared,
+				keepalive,
+				move |_, _| {
+					worker_entered.store(true, Ordering::SeqCst);
+					while !worker_release.load(Ordering::SeqCst) {
+						std::thread::sleep(std::time::Duration::from_millis(1));
+					}
+					Ok(())
+				},
+			)
+			.await
+		});
+
+		while !entered.load(Ordering::SeqCst) {
+			tokio::task::yield_now().await;
+		}
+		task.abort();
+		tokio::task::yield_now().await;
+		assert!(!dropped.load(Ordering::SeqCst));
+
+		release.store(true, Ordering::SeqCst);
+		for _ in 0..1_000 {
+			if dropped.load(Ordering::SeqCst) {
+				break;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(1));
+		}
+		assert!(dropped.load(Ordering::SeqCst));
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn prepared_config_publication_recovers_windows_displacement_states() {
+		for published in [false, true] {
+			let temporary = tempfile::tempdir().unwrap();
+			let config = temporary.path().join("config");
+			std::fs::write(&config, "[core]\n\tbare = true\n").unwrap();
+			let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+			let (_, target) =
+				read_file_at_identified(directory.try_clone().unwrap(), Path::new("config"), &config)
+					.await
+					.unwrap();
+			let prepared = reserve_file_at_if_current(
+				directory.try_clone().unwrap(),
+				Path::new("config"),
+				&config,
+				target.clone(),
+			)
+			.await
+			.unwrap();
+			prepare_reserved_file_at(
+				directory.try_clone().unwrap(),
+				Path::new("config"),
+				&config,
+				target.clone(),
+				prepared.clone(),
+				|config| {
+					config.set("core", None, "bare", "false")?;
+					Ok(())
+				},
+			)
+			.await
+			.unwrap();
+			directory
+				.rename(prepared.name(), &directory, "config.lock")
+				.unwrap();
+			directory
+				.rename("config", &directory, prepared.name())
+				.unwrap();
+			if published {
+				directory
+					.rename("config.lock", &directory, "config")
+					.unwrap();
+			}
+
+			let outcome = publish_prepared_file_at(
+				directory,
+				Path::new("config"),
+				&config,
+				target,
+				prepared.clone(),
+				|image, config| {
+					let expected = match image {
+						PreparedConfigImage::Before => "true",
+						PreparedConfigImage::After => "false",
+					};
+					anyhow::ensure!(config.get_string("core", None, "bare") == Some(expected));
+					Ok(())
+				},
+			)
+			.await
+			.unwrap();
+			assert_eq!(
+				outcome,
+				if published {
+					PreparedConfigOutcome::AlreadyPublished
+				} else {
+					PreparedConfigOutcome::Published
+				}
+			);
+			assert!(
+				std::fs::read_to_string(&config)
+					.unwrap()
+					.contains("bare = false")
+			);
+			assert!(!temporary.path().join(prepared.name()).exists());
+			assert!(!temporary.path().join("config.lock").exists());
+		}
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn prepared_config_before_image_restoration_preserves_the_after_image() {
+		let temporary = tempfile::tempdir().unwrap();
+		let config = temporary.path().join("config");
+		std::fs::write(&config, "[core]\n\tbare = true\n").unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let (_, target) =
+			read_file_at_identified(directory.try_clone().unwrap(), Path::new("config"), &config)
+				.await
+				.unwrap();
+		let prepared = reserve_file_at_if_current(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+		)
+		.await
+		.unwrap();
+		prepare_reserved_file_at(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+			prepared.clone(),
+			|config| {
+				config.set("core", None, "bare", "false")?;
+				Ok(())
+			},
+		)
+		.await
+		.unwrap();
+		directory
+			.rename(prepared.name(), &directory, "config.lock")
+			.unwrap();
+		directory
+			.rename("config", &directory, prepared.name())
+			.unwrap();
+		let validate = |image: PreparedConfigImage, config: &gitana_config::GitConfig| {
+			let expected = match image {
+				PreparedConfigImage::Before => "true",
+				PreparedConfigImage::After => "false",
+			};
+			anyhow::ensure!(config.get_string("core", None, "bare") == Some(expected));
+			Ok(())
+		};
+
+		assert!(
+			restore_prepared_file_before_image_at(
+				directory.try_clone().unwrap(),
+				Path::new("config"),
+				&config,
+				target.clone(),
+				prepared.clone(),
+				validate,
+			)
+			.await
+			.unwrap()
+		);
+		assert!(
+			std::fs::read_to_string(&config)
+				.unwrap()
+				.contains("bare = true")
+		);
+		assert!(temporary.path().join("config.lock").is_file());
+		assert!(!temporary.path().join(prepared.name()).exists());
+		assert!(
+			!restore_prepared_file_before_image_at(
+				directory.try_clone().unwrap(),
+				Path::new("config"),
+				&config,
+				target.clone(),
+				prepared.clone(),
+				validate,
+			)
+			.await
+			.unwrap()
+		);
+		assert_eq!(
+			publish_prepared_file_at(
+				directory,
+				Path::new("config"),
+				&config,
+				target,
+				prepared,
+				validate,
+			)
+			.await
+			.unwrap(),
+			PreparedConfigOutcome::Published
+		);
+		assert!(
+			std::fs::read_to_string(&config)
+				.unwrap()
+				.contains("bare = false")
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn prepared_config_before_image_restoration_rejects_a_replaced_after_image() {
+		let temporary = tempfile::tempdir().unwrap();
+		let config = temporary.path().join("config");
+		std::fs::write(&config, "[core]\n\tbare = true\n").unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let (_, target) =
+			read_file_at_identified(directory.try_clone().unwrap(), Path::new("config"), &config)
+				.await
+				.unwrap();
+		let prepared = reserve_file_at_if_current(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+		)
+		.await
+		.unwrap();
+		prepare_reserved_file_at(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+			prepared.clone(),
+			|config| {
+				config.set("core", None, "bare", "false")?;
+				Ok(())
+			},
+		)
+		.await
+		.unwrap();
+		directory
+			.rename(prepared.name(), &directory, "config.lock")
+			.unwrap();
+		directory
+			.rename("config", &directory, prepared.name())
+			.unwrap();
+		std::fs::rename(
+			temporary.path().join("config.lock"),
+			temporary.path().join("retained-lock"),
+		)
+		.unwrap();
+		std::fs::write(
+			temporary.path().join("config.lock"),
+			"[foreign]\n\tvalue = true\n",
+		)
+		.unwrap();
+
+		let result = restore_prepared_file_before_image_at(
+			directory,
+			Path::new("config"),
+			&config,
+			target,
+			prepared.clone(),
+			|_, _| Ok(()),
+		)
+		.await;
+		assert!(result.is_err());
+		assert!(!config.exists());
+		assert!(temporary.path().join(prepared.name()).is_file());
+		assert_eq!(
+			std::fs::read_to_string(temporary.path().join("config.lock")).unwrap(),
+			"[foreign]\n\tvalue = true\n"
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn prepared_config_publication_rejects_a_same_content_target_replacement() {
+		let temporary = tempfile::tempdir().unwrap();
+		let config = temporary.path().join("config");
+		let before = "[core]\n\tbare = true\n";
+		std::fs::write(&config, before).unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let (_, target) =
+			read_file_at_identified(directory.try_clone().unwrap(), Path::new("config"), &config)
+				.await
+				.unwrap();
+		assert!(target.target().is_some());
+		let prepared = reserve_file_at_if_current(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+		)
+		.await
+		.unwrap();
+		prepare_reserved_file_at(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+			prepared.clone(),
+			|config| {
+				config.set("core", None, "bare", "false")?;
+				Ok(())
+			},
+		)
+		.await
+		.unwrap();
+		std::fs::rename(&config, temporary.path().join("planned-config")).unwrap();
+		std::fs::write(&config, before).unwrap();
+
+		let result = publish_prepared_file_at(
+			directory,
+			Path::new("config"),
+			&config,
+			target,
+			prepared,
+			|_, _| Ok(()),
+		)
+		.await;
+		assert!(result.is_err());
+		assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+		assert!(!temporary.path().join("config.lock").exists());
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn config_reservation_rejects_a_replaced_resolved_parent_with_the_same_target_inode() {
+		use std::os::unix::fs::symlink;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let target_parent = temporary.path().join("target");
+		let retained_parent = temporary.path().join("retained-target");
+		std::fs::create_dir(&target_parent).unwrap();
+		std::fs::write(target_parent.join("config"), "[core]\n\tbare = true\n").unwrap();
+		let config = temporary.path().join("config");
+		symlink("target/config", &config).unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let (_, target) =
+			read_file_at_identified(directory.try_clone().unwrap(), Path::new("config"), &config)
+				.await
+				.unwrap();
+
+		std::fs::rename(&target_parent, &retained_parent).unwrap();
+		std::fs::create_dir(&target_parent).unwrap();
+		std::fs::hard_link(retained_parent.join("config"), target_parent.join("config")).unwrap();
+		let result = reserve_file_at_if_current(directory, Path::new("config"), &config, target).await;
+		assert!(result.is_err());
+		assert_eq!(
+			std::fs::read_to_string(retained_parent.join("config")).unwrap(),
+			"[core]\n\tbare = true\n"
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn journaled_config_reservation_rewrites_a_partial_image() {
+		let temporary = tempfile::tempdir().unwrap();
+		let config = temporary.path().join("config");
+		std::fs::write(&config, "[core]\n\tbare = true\n").unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let (_, target) =
+			read_file_at_identified(directory.try_clone().unwrap(), Path::new("config"), &config)
+				.await
+				.unwrap();
+		let prepared = reserve_file_at_if_current(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+		)
+		.await
+		.unwrap();
+		std::fs::write(temporary.path().join(prepared.name()), b"partial").unwrap();
+		prepare_reserved_file_at(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+			prepared.clone(),
+			|config| {
+				config.set("core", None, "bare", "false")?;
+				Ok(())
+			},
+		)
+		.await
+		.unwrap();
+		assert_eq!(
+			publish_prepared_file_at(
+				directory,
+				Path::new("config"),
+				&config,
+				target,
+				prepared,
+				|_, _| Ok(()),
+			)
+			.await
+			.unwrap(),
+			PreparedConfigOutcome::Published
+		);
+		assert!(
+			std::fs::read_to_string(config)
+				.unwrap()
+				.contains("bare = false")
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn prepared_config_recovery_retires_the_displaced_target_left_at_the_lock() {
+		let temporary = tempfile::tempdir().unwrap();
+		let config = temporary.path().join("config");
+		std::fs::write(&config, "[core]\n\tbare = true\n").unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let (_, target) =
+			read_file_at_identified(directory.try_clone().unwrap(), Path::new("config"), &config)
+				.await
+				.unwrap();
+		let prepared = reserve_file_at_if_current(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+		)
+		.await
+		.unwrap();
+		prepare_reserved_file_at(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+			prepared.clone(),
+			|config| {
+				config.set("core", None, "bare", "false")?;
+				Ok(())
+			},
+		)
+		.await
+		.unwrap();
+		directory
+			.rename(prepared.name(), &directory, "config.lock")
+			.unwrap();
+		directory
+			.rename("config", &directory, "config.old")
+			.unwrap();
+		directory
+			.rename("config.lock", &directory, "config")
+			.unwrap();
+		directory
+			.rename("config.old", &directory, "config.lock")
+			.unwrap();
+
+		assert_eq!(
+			publish_prepared_file_at(
+				directory,
+				Path::new("config"),
+				&config,
+				target,
+				prepared,
+				|image, config| {
+					let expected = match image {
+						PreparedConfigImage::Before => "true",
+						PreparedConfigImage::After => "false",
+					};
+					anyhow::ensure!(config.get_string("core", None, "bare") == Some(expected));
+					Ok(())
+				},
+			)
+			.await
+			.unwrap(),
+			PreparedConfigOutcome::AlreadyPublished
+		);
+		assert!(!temporary.path().join("config.lock").exists());
+	}
+
+	#[cfg(unix)]
 	#[test]
 	fn config_publication_preserves_a_same_content_replacement_after_validation() {
 		use std::ffi::OsString;
@@ -1536,6 +3966,7 @@ mod tests {
 		let target = PinnedConfigTarget {
 			directory: directory.try_clone().unwrap(),
 			name: OsString::from("config"),
+			identity: Some(entry_identity(&directory, OsStr::new("config")).unwrap()),
 		};
 		let (_, state) = read_pinned_config_bytes(&target, &temporary.path().join("config")).unwrap();
 		ensure_config_target_unchanged(&target, &state, &temporary.path().join("config")).unwrap();
@@ -1583,6 +4014,7 @@ mod tests {
 		let target = PinnedConfigTarget {
 			directory: directory.try_clone().unwrap(),
 			name: OsString::from("config"),
+			identity: None,
 		};
 		directory.write("config.lock", b"owned").unwrap();
 		let expected = entry_identity(&directory, OsStr::new("config.lock")).unwrap();
@@ -1616,6 +4048,7 @@ mod tests {
 		let target = PinnedConfigTarget {
 			directory: directory.try_clone().unwrap(),
 			name: OsString::from("config"),
+			identity: Some(entry_identity(&directory, OsStr::new("config")).unwrap()),
 		};
 		let (_, state) = read_pinned_config_bytes(&target, &temporary.path().join("config")).unwrap();
 		directory.write("config.lock", b"owned-new").unwrap();
@@ -1654,8 +4087,16 @@ mod tests {
 		std::fs::write(foreign.join("config"), "[foreign]\n\tuntouched = true\n").unwrap();
 
 		let parent = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
-		let resolved =
-			resolve_config_name(parent, OsStr::new("module"), &mut 0, &mut Vec::new()).unwrap();
+		let mut resolved_path = temporary.path().to_owned();
+		let resolved = resolve_config_name(
+			parent,
+			OsStr::new("module"),
+			&mut 0,
+			&mut Vec::new(),
+			&mut Vec::new(),
+			&mut resolved_path,
+		)
+		.unwrap();
 		std::fs::rename(&original, &retained).unwrap();
 		symlink(&foreign, &original).unwrap();
 
@@ -1665,6 +4106,78 @@ mod tests {
 			"[foreign]\n\tuntouched = true\n"
 		);
 		assert!(!foreign.join("config.lock").exists());
+	}
+
+	#[test]
+	fn resolved_config_directory_cannot_be_replaced_by_another_directory() {
+		use std::ffi::OsStr;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let original = temporary.path().join("module");
+		let retained = temporary.path().join("retained");
+		std::fs::create_dir(&original).unwrap();
+
+		let parent = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let mut resolved_path = temporary.path().to_owned();
+		let resolved = resolve_config_name(
+			parent,
+			OsStr::new("module"),
+			&mut 0,
+			&mut Vec::new(),
+			&mut Vec::new(),
+			&mut resolved_path,
+		)
+		.unwrap();
+		std::fs::rename(&original, &retained).unwrap();
+		std::fs::create_dir(&original).unwrap();
+
+		assert!(open_resolved_config_directory(resolved).is_err());
+	}
+
+	#[test]
+	fn missing_resolved_config_directory_preserves_not_found() {
+		use std::ffi::OsStr;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let parent = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let mut resolved_path = temporary.path().to_owned();
+		let resolved = resolve_config_name(
+			parent,
+			OsStr::new("missing"),
+			&mut 0,
+			&mut Vec::new(),
+			&mut Vec::new(),
+			&mut resolved_path,
+		)
+		.unwrap();
+		let error = open_resolved_config_directory(resolved).err().unwrap();
+
+		assert!(error.chain().any(|cause| {
+			cause
+				.downcast_ref::<std::io::Error>()
+				.is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+		}));
+	}
+
+	#[test]
+	fn missing_resolved_config_directory_rejects_a_late_creation() {
+		use std::ffi::OsStr;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let parent = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let mut resolved_path = temporary.path().to_owned();
+		let resolved = resolve_config_name(
+			parent,
+			OsStr::new("created"),
+			&mut 0,
+			&mut Vec::new(),
+			&mut Vec::new(),
+			&mut resolved_path,
+		)
+		.unwrap();
+		std::fs::create_dir(temporary.path().join("created")).unwrap();
+
+		assert!(open_resolved_config_directory(resolved).is_err());
 	}
 
 	#[cfg(unix)]

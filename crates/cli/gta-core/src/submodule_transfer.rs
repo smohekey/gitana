@@ -1,7 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use cap_std::{ambient_authority, fs::Dir};
+use cap_std::fs::Dir;
 use gitana_config::GitConfig;
 use gitana_file_store::FileStore;
 use gitana_file_store_local::LocalFileStore;
@@ -112,6 +112,7 @@ impl<'a> SubmoduleTransfer<'a> {
 	async fn prepare_source_inner(
 		&self,
 		request: PrepareSource,
+		lease: gitana_submodule::SubmoduleMutationLease,
 	) -> Result<PreparedTransfer<PreparedSubmoduleSource>> {
 		let config = &self.superproject;
 		let ResolvedSubmoduleSource {
@@ -167,18 +168,19 @@ impl<'a> SubmoduleTransfer<'a> {
 			RemoteUrl::Local(path) => {
 				let source_path = resolve_local_path(self.worktree_root, &path);
 				let source_layout = repo::inspect_root(&source_path).await?;
+				let source_identity = repo::capture_repository_layout_identity(&source_layout)?;
+				let (source_setup, common, git) =
+					repo::revalidated_local_source_setup(&source_layout, source_identity, Some(&lease))
+						.await?;
 				let persist_url = if Path::new(&path).is_relative() || rewritten != request.source_url {
 					repo::local_source_url(&source_layout)?
 				} else {
 					request.persist_url
 				};
-				let common = Dir::open_ambient_dir(&source_layout.common_dir, ambient_authority())
-					.with_context(|| format!("opening {}", source_layout.common_dir.display()))?;
-				let git = Dir::open_ambient_dir(&source_layout.git_dir, ambient_authority())
-					.with_context(|| format!("opening {}", source_layout.git_dir.display()))?;
 				let files = Backend::new(common, git);
 				let source_kind = detect_hash_kind(&files).await?;
 				gitana_remote::ensure_same_format(request.hash_kind, source_kind)?;
+				drop(source_setup);
 				(persist_url, PreparedTransport::Local { files })
 			}
 		};
@@ -286,16 +288,21 @@ impl<'a> SubmoduleTransfer<'a> {
 		Ok(())
 	}
 
-	async fn fetch_inner(&self, request: FetchRepository) -> Result<FetchedTransfer> {
+	async fn fetch_inner(
+		&self,
+		request: FetchRepository,
+		lease: gitana_submodule::SubmoduleMutationLease,
+	) -> Result<FetchedTransfer> {
 		match request.hash_kind {
-			HashKind::Sha1 => self.fetch_typed::<Sha1>(request).await,
-			HashKind::Sha256 => self.fetch_typed::<Sha256>(request).await,
+			HashKind::Sha1 => self.fetch_typed::<Sha1>(request, lease).await,
+			HashKind::Sha256 => self.fetch_typed::<Sha256>(request, lease).await,
 		}
 	}
 
 	async fn fetch_typed<H: HashAlgorithm>(
 		&self,
 		request: FetchRepository,
+		lease: gitana_submodule::SubmoduleMutationLease,
 	) -> Result<FetchedTransfer> {
 		let FetchRepository {
 			source,
@@ -356,14 +363,31 @@ impl<'a> SubmoduleTransfer<'a> {
 			RemoteUrl::Local(path) => {
 				let source_path = resolve_local_path(&worktree_dir, &path);
 				let source_layout = repo::inspect_root(&source_path).await?;
-				let source_kind = dispatch::detect_algorithm(&source_layout.common_dir)?;
+				let source_identity = repo::capture_repository_layout_identity(&source_layout)?;
+				let (source_setup, common, git) =
+					repo::revalidated_local_source_setup(&source_layout, source_identity, Some(&lease))
+						.await?;
+				let source_kind = dispatch::detect_algorithm_at(&common, &source_layout.common_dir).await?;
 				gitana_remote::ensure_same_format(kind::<H>(), source_kind)?;
-				let source =
-					repo::open_generic::<H>(&source_layout.git_dir, &source_layout.common_dir).await?;
+				let second_common = common.try_clone()?;
+				let second_git = git.try_clone()?;
+				let source = repo::open_generic_from_dirs::<H>(
+					common,
+					git,
+					&source_layout.git_dir,
+					&source_layout.common_dir,
+				)
+				.await?;
 				let connection = LocalConnection::open(source).await?;
 				let advertisement = connection.advertisement().to_vec();
-				let source =
-					repo::open_generic::<H>(&source_layout.git_dir, &source_layout.common_dir).await?;
+				let source = repo::open_generic_from_dirs::<H>(
+					second_common,
+					second_git,
+					&source_layout.git_dir,
+					&source_layout.common_dir,
+				)
+				.await?;
+				drop(source_setup);
 				let mut fetcher = LocalPackFetcher::new(source);
 				normal_then_exact(&mut fetcher, &repository, &advertisement, recorded).await?;
 			}
@@ -397,10 +421,11 @@ impl RepositoryTransfer for SubmoduleTransfer<'_> {
 	async fn prepare_source(
 		&self,
 		request: PrepareSource,
+		lease: gitana_submodule::SubmoduleMutationLease,
 	) -> Result<PreparedTransfer<Self::PreparedSource>, Self::Error> {
 		let secret = request.source_url.clone();
 		self
-			.prepare_source_inner(request)
+			.prepare_source_inner(request, lease)
 			.await
 			.map_err(|error| TransferError::new(error, [secret]))
 	}
@@ -419,11 +444,15 @@ impl RepositoryTransfer for SubmoduleTransfer<'_> {
 			.map_err(|error| TransferError::new(error, [secret]))
 	}
 
-	async fn fetch_recorded(&self, request: FetchRepository) -> Result<FetchedTransfer, Self::Error> {
+	async fn fetch_recorded(
+		&self,
+		request: FetchRepository,
+		lease: gitana_submodule::SubmoduleMutationLease,
+	) -> Result<FetchedTransfer, Self::Error> {
 		let secret = request.source.source_url.clone();
 		let display = request.display_git_dir.clone();
 		self
-			.fetch_inner(request)
+			.fetch_inner(request, lease)
 			.await
 			.with_context(|| format!("updating module repository {}", display.display()))
 			.map_err(|error| TransferError::new(error, [secret]))

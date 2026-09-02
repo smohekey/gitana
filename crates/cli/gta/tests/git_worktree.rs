@@ -349,6 +349,82 @@ fn check_add_list_remove(object_format: &str) {
 	std::fs::remove_dir_all(&base).ok();
 }
 
+#[test]
+fn destructive_worktree_operations_preserve_pending_deinit_recovery() {
+	let base = unique_tmp("gta-wt-deinit-recovery");
+	let base_s = base.to_str().unwrap();
+	let repo = base.join("repo");
+	let repo_s = repo.to_str().unwrap();
+
+	gta(base_s, &["init", "--object-format=sha1", repo_s], b"");
+	git(repo_s, &["config", "user.name", "T"]);
+	git(repo_s, &["config", "user.email", "t@e"]);
+	std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+	gta(repo_s, &["add", "."], b"");
+	gta(repo_s, &["commit", "-m", "base"], b"");
+
+	let owner = base.join("owner");
+	let owner_s = owner.to_str().unwrap();
+	gta(repo_s, &["worktree", "add", owner_s], b"");
+	let admin = repo.join(".git/worktrees/owner");
+	let control = admin.join("gitana-submodule-deinit");
+	std::fs::create_dir(&control).unwrap();
+
+	let moved = base.join("moved");
+	let move_error = gta_fail(
+		repo_s,
+		&["worktree", "move", "-ff", owner_s, moved.to_str().unwrap()],
+	);
+	assert!(move_error.contains("pending submodule deinit"));
+	assert!(owner.is_dir(), "the recovery owner's checkout is preserved");
+	assert!(!moved.exists(), "the destination namespace is unchanged");
+	assert!(control.is_dir(), "the recovery control directory survives");
+
+	let retained = admin.join("modules/one/.gitana-submodule-deinit-retired.test/file.txt");
+	std::fs::create_dir_all(retained.parent().unwrap()).unwrap();
+	std::fs::write(&retained, b"retained\n").unwrap();
+	let remove_error = gta_fail(repo_s, &["worktree", "remove", "--force", owner_s]);
+	assert!(remove_error.contains("pending submodule deinit"));
+	assert!(owner.is_dir(), "forced removal preserves the checkout");
+	assert!(
+		admin.is_dir(),
+		"forced removal preserves the admin directory"
+	);
+	assert!(
+		retained.is_file(),
+		"forced removal preserves retained module data"
+	);
+
+	std::fs::remove_dir_all(&owner).unwrap();
+	let dry_run = gta_stderr(repo_s, &["worktree", "prune", "-n", "-v"]);
+	assert!(dry_run.contains("Removing worktrees/owner"));
+	assert!(admin.is_dir(), "dry-run prune preserves the recovery owner");
+	assert!(control.is_dir(), "dry-run prune preserves the intent");
+	assert!(retained.is_file(), "dry-run prune preserves retained data");
+
+	let prune_error = gta_fail(repo_s, &["worktree", "prune", "-v"]);
+	assert!(prune_error.contains("pending submodule deinit"));
+	assert!(admin.is_dir(), "real prune preserves the recovery owner");
+	assert!(control.is_dir(), "real prune preserves the intent");
+	assert!(retained.is_file(), "real prune preserves retained data");
+
+	std::fs::remove_dir(&control).unwrap();
+	std::fs::write(&control, b"malformed\n").unwrap();
+	let malformed = gta_fail(repo_s, &["worktree", "prune", "-v"]);
+	assert!(malformed.contains("deinit control path") && malformed.contains("not a directory"));
+	assert!(admin.is_dir(), "malformed recovery still blocks pruning");
+	assert!(
+		control.is_file(),
+		"the malformed control entry is preserved"
+	);
+	assert!(
+		retained.is_file(),
+		"malformed recovery preserves retained data"
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
 /// A branch's ref is shared across worktrees, so `worktree add` must refuse a branch already checked
 /// out elsewhere — as git does — and, unlike git, must not leave a dangling admin directory behind.
 #[test]

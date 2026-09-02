@@ -1,5 +1,20 @@
 use std::path::{Path, PathBuf};
 
+/// Remove `.` and collapse `..` components without consulting the filesystem.
+pub fn lexical_normalize(path: &Path) -> PathBuf {
+	let mut normalized = PathBuf::new();
+	for component in path.components() {
+		match component {
+			std::path::Component::CurDir => {}
+			std::path::Component::ParentDir => {
+				normalized.pop();
+			}
+			other => normalized.push(other.as_os_str()),
+		}
+	}
+	normalized
+}
+
 /// Compare normalized native paths using the platform's component semantics.
 pub fn paths_equivalent(left: &Path, right: &Path) -> bool {
 	strip_path_prefix(left, right).is_some_and(|suffix| suffix.as_os_str().is_empty())
@@ -43,7 +58,15 @@ fn strip_path_prefix_by(
 mod tests {
 	use std::path::Path;
 
-	use super::strip_path_prefix_by;
+	use super::{lexical_normalize, strip_path_prefix_by};
+
+	#[test]
+	fn lexical_normalization_collapses_dot_components_without_filesystem_access() {
+		assert_eq!(
+			lexical_normalize(Path::new("/repo/.git/modules/./one/../../two")),
+			Path::new("/repo/.git/two")
+		);
+	}
 
 	#[test]
 	fn windows_style_component_comparison_preserves_the_suffix() {

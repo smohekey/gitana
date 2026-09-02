@@ -159,6 +159,7 @@ pub async fn run(
 			RemoteUrl::Local(path) => {
 				let source = local_path(&command_cwd, &path);
 				let found = repo::inspect_root(&source).await?;
+				let source_identity = repo::capture_repository_layout_identity(&found)?;
 				let (local_reflog_url, local_persist_url) =
 					if rewritten_url == url && Path::new(&path).is_relative() {
 						let absolute = repo::local_source_url(&found)?;
@@ -171,13 +172,18 @@ pub async fn run(
 				} else {
 					Deepen::default()
 				};
-				let kind = crate::dispatch::detect_algorithm(&found.common_dir)?;
-				let worktree = destination.start()?;
-				let git_dir = worktree.join(".git");
-				create_skeleton(&git_dir)?;
+				let (source_setup, common, git) =
+					repo::revalidated_local_source_setup(&found, source_identity, None).await?;
+				let kind = crate::dispatch::detect_algorithm_at(&common, &found.common_dir).await?;
 				match kind {
 					HashKind::Sha1 => {
-						let source = repo::open_generic::<Sha1>(&found.git_dir, &found.common_dir).await?;
+						let source =
+							repo::open_generic_from_dirs::<Sha1>(common, git, &found.git_dir, &found.common_dir)
+								.await?;
+						drop(source_setup);
+						let worktree = destination.start()?;
+						let git_dir = worktree.join(".git");
+						create_skeleton(&git_dir)?;
 						let mut connection = LocalConnection::open(source).await?;
 						clone_over(
 							&mut connection,
@@ -192,7 +198,17 @@ pub async fn run(
 						.await?;
 					}
 					HashKind::Sha256 => {
-						let source = repo::open_generic::<Sha256>(&found.git_dir, &found.common_dir).await?;
+						let source = repo::open_generic_from_dirs::<Sha256>(
+							common,
+							git,
+							&found.git_dir,
+							&found.common_dir,
+						)
+						.await?;
+						drop(source_setup);
+						let worktree = destination.start()?;
+						let git_dir = worktree.join(".git");
+						create_skeleton(&git_dir)?;
 						let mut connection = LocalConnection::open(source).await?;
 						clone_over(
 							&mut connection,

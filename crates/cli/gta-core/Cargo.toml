@@ -38,10 +38,10 @@ gitana-worktree.workspace = true
 rpassword = "7"
 rprompt = "2"
 sha2.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "process"] }
+tokio = { workspace = true, features = ["fs", "io-util", "process", "rt", "time"] }
 
 [dev-dependencies]
 gitana-file-store-memory.workspace = true
 ssh-key = { workspace = true, features = ["ed25519", "rand_core"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

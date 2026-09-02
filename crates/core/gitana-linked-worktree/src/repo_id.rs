@@ -112,7 +112,7 @@ mod native {
 	use cap_std::fs::Dir;
 	use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
 	use gitana_object::HashKind;
-	use gitana_repository::{RepositoryError, detect_hash_kind};
+	use gitana_repository::{Config, RepositoryError, detect_hash_kind};
 
 	/// Detect the repository's object format, mapping an unsupported format to the documented
 	/// [`LinkedWorktreeError::UnsupportedObjectFormat`] variant (the raw `detect_hash_kind` returns a
@@ -125,6 +125,36 @@ mod native {
 			Ok(kind) => Ok(kind),
 			Err(RepositoryError::UnsupportedFormat(msg)) => {
 				Err(LinkedWorktreeError::UnsupportedObjectFormat(msg))
+			}
+			Err(other) => Err(other.into()),
+		}
+	}
+
+	/// Detect the object format from the common config's ambient repository path. Enumeration uses
+	/// this after its caller has serialized and validated the config namespace so a supported config
+	/// symlink is followed instead of rejected by the confined repository file store.
+	pub(crate) fn detect_kind_at(common_dir: &Path) -> Result<HashKind, LinkedWorktreeError> {
+		let config_path = common_dir.join("config");
+		let bytes = match std::fs::read(&config_path) {
+			Ok(bytes) => bytes,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+				return Err(LinkedWorktreeError::UnsupportedObjectFormat(
+					"no config file".to_owned(),
+				));
+			}
+			Err(error) => {
+				return Err(LinkedWorktreeError::io(
+					"reading repository format",
+					&config_path,
+					error,
+				));
+			}
+		};
+		match Config::parse_bytes(&bytes) {
+			Ok(config) if config.object_format == "sha256" => Ok(HashKind::Sha256),
+			Ok(_) => Ok(HashKind::Sha1),
+			Err(RepositoryError::UnsupportedFormat(message)) => {
+				Err(LinkedWorktreeError::UnsupportedObjectFormat(message))
 			}
 			Err(other) => Err(other.into()),
 		}
@@ -309,6 +339,6 @@ mod native {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use native::{
-	detect_kind, open_store_raw, open_work_dir, reject_unsupported_repository_format,
+	detect_kind, detect_kind_at, open_store_raw, open_work_dir, reject_unsupported_repository_format,
 	validate_repository_structure,
 };

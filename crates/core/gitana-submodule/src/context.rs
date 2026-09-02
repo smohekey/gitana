@@ -5,7 +5,7 @@ use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
 use caseless::Caseless;
 use gitana_file_store_local::{CapWorkDir, LocalFileStore, WorkDirFs, WorktreeFileStore};
-use gitana_fs_native::paths_equivalent;
+use gitana_fs_native::{EntryIdentity, directory_identity};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
@@ -15,8 +15,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::{
 	ConfigViews, ConfigurationProvider, InitConfigResult, InitConfigUpdate, InitNotice, InitOutcome,
-	InitReport, InitRequest, SubmoduleDeclaration, SubmoduleError, SubmoduleObjectId, SubmoduleQuery,
-	SubmoduleStatus, SubmoduleStatusState, resolve_relative_url,
+	InitReport, InitRequest, MarkerTargetResolver, SubmoduleDeclaration, SubmoduleError,
+	SubmoduleObjectId, SubmoduleQuery, SubmoduleStatus, SubmoduleStatusState, resolve_relative_url,
 };
 
 /// An explicit, capability-scoped superproject context.
@@ -100,10 +100,56 @@ impl SubmoduleContext {
 		request: &InitRequest,
 		configuration: &C,
 	) -> Result<InitReport, SubmoduleError> {
-		match self.hash_kind {
-			HashKind::Sha1 => self.init_typed::<Sha1, C>(request, configuration).await,
-			HashKind::Sha256 => self.init_typed::<Sha256, C>(request, configuration).await,
+		let setup = self.acquire_config_setup_lease().await?;
+		self.ensure_no_repository_deinit_recovery()?;
+		let effective = configuration.reload().await?;
+		let planned = match self.hash_kind {
+			HashKind::Sha1 => {
+				self
+					.init_typed::<Sha1, C>(request, configuration, &effective, None)
+					.await?
+			}
+			HashKind::Sha256 => {
+				self
+					.init_typed::<Sha256, C>(request, configuration, &effective, None)
+					.await?
+			}
+		};
+		if let Some(report) = planned {
+			return Ok(report);
 		}
+		drop(setup);
+
+		let lock = self.acquire_config_update_lock()?;
+		lock.validate()?;
+		self.ensure_no_repository_deinit_recovery()?;
+		let report = self
+			.init_unlocked(request, configuration, lock.lease())
+			.await?;
+		lock.validate()?;
+		Ok(report)
+	}
+
+	pub(crate) async fn init_unlocked<C: ConfigurationProvider>(
+		&self,
+		request: &InitRequest,
+		configuration: &C,
+		lease: crate::SubmoduleMutationLease,
+	) -> Result<InitReport, SubmoduleError> {
+		let effective = configuration.reload().await?;
+		let report = match self.hash_kind {
+			HashKind::Sha1 => {
+				self
+					.init_typed::<Sha1, C>(request, configuration, &effective, Some(lease))
+					.await?
+			}
+			HashKind::Sha256 => {
+				self
+					.init_typed::<Sha256, C>(request, configuration, &effective, Some(lease))
+					.await?
+			}
+		};
+		Ok(report.expect("a mutation lease always completes initialization planning"))
 	}
 
 	async fn status_typed<H: HashAlgorithm, C: ConfigurationProvider>(
@@ -163,7 +209,9 @@ impl SubmoduleContext {
 		&self,
 		request: &InitRequest,
 		configuration: &C,
-	) -> Result<InitReport, SubmoduleError> {
+		effective: &gitana_config::GitConfig,
+		lease: Option<crate::SubmoduleMutationLease>,
+	) -> Result<Option<InitReport>, SubmoduleError> {
 		struct Planned {
 			name: String,
 			path: String,
@@ -177,7 +225,6 @@ impl SubmoduleContext {
 		let index = worktree.load_index().await?;
 		let selected = self.select_gitlinks(&index, &request.query)?;
 		let declarations = declarations_by_path(self.declarations().await?)?;
-		let effective = &self.configs.superproject;
 		// Resolve the superproject remote only if a selected, as-yet-unregistered module actually
 		// needs a relative URL expanded. An absolute URL must not be made to fail by an unrelated,
 		// malformed branch remote setting.
@@ -209,7 +256,7 @@ impl SubmoduleContext {
 							.ok_or_else(|| SubmoduleError::MissingUrl(path.clone()))?;
 						let resolved = if declared.starts_with("./") || declared.starts_with("../") {
 							if base.is_none() {
-								base = Some(self.branch_remote_base(&worktree).await?);
+								base = Some(self.branch_remote_base(&worktree, effective).await?);
 							}
 							let base = base.as_ref().expect("relative URL base was loaded");
 							resolve_relative_url(&base.url, declared).map_err(|_| {
@@ -264,14 +311,22 @@ impl SubmoduleContext {
 				update_if_absent: entry.update.clone(),
 			})
 			.collect();
+		if !updates.is_empty() && lease.is_none() {
+			return Ok(None);
+		}
 		let applied = if updates.is_empty() {
 			InitConfigResult::default()
 		} else {
-			configuration.apply_init(&updates).await?
+			configuration
+				.apply_init(
+					&updates,
+					lease.expect("non-empty initialization updates require a mutation lease"),
+				)
+				.await?
 		};
 		let installed: HashSet<String> = applied.registered_urls.into_iter().collect();
 
-		Ok(InitReport {
+		Ok(Some(InitReport {
 			notices: base
 				.and_then(|base| base.missing_remote_key)
 				.map(|missing_key| InitNotice::AuthoritativeSuperproject { missing_key })
@@ -290,7 +345,15 @@ impl SubmoduleContext {
 					}
 				})
 				.collect(),
-		})
+		}))
+	}
+
+	pub(crate) async fn acquire_config_setup_lease(
+		&self,
+	) -> Result<crate::SubmoduleMutationLease, SubmoduleError> {
+		let common = self.clone_dir(&self.common, &self.layout.common_dir)?;
+		let common_dir = self.layout.common_dir.clone();
+		acquire_config_setup_lease_at(common, common_dir).await
 	}
 
 	pub(crate) fn select_gitlinks<H: HashAlgorithm>(
@@ -298,8 +361,20 @@ impl SubmoduleContext {
 		index: &gitana_worktree::Index<H>,
 		query: &SubmoduleQuery,
 	) -> Result<Vec<String>, SubmoduleError> {
+		self.select_gitlinks_with_prior_path(index, query, None)
+	}
+
+	pub(crate) fn select_gitlinks_with_prior_path<H: HashAlgorithm>(
+		&self,
+		index: &gitana_worktree::Index<H>,
+		query: &SubmoduleQuery,
+		prior_path: Option<&str>,
+	) -> Result<Vec<String>, SubmoduleError> {
 		let specs: Vec<&str> = query.pathspecs.iter().map(String::as_str).collect();
 		let set = PathspecSet::parse(&specs, &self.prefix)?;
+		if let Some(prior_path) = prior_path {
+			set.matches(prior_path);
+		}
 		let mut selected = Vec::new();
 		let mut seen = HashSet::new();
 		for entry in &index.entries {
@@ -319,6 +394,7 @@ impl SubmoduleContext {
 	async fn branch_remote_base<H: HashAlgorithm>(
 		&self,
 		worktree: &WorkTree<WorktreeFileStore, CapWorkDir, H>,
+		effective: &gitana_config::GitConfig,
 	) -> Result<RelativeUrlBase, SubmoduleError> {
 		let branch = worktree
 			.repository()
@@ -326,12 +402,10 @@ impl SubmoduleContext {
 			.read_symbolic("HEAD")
 			.await?
 			.and_then(|head| head.strip_prefix("refs/heads/").map(str::to_owned));
-		let remote = match branch.as_deref().map(|branch| {
-			self
-				.configs
-				.superproject
-				.get_raw("branch", Some(branch), "remote")
-		}) {
+		let remote = match branch
+			.as_deref()
+			.map(|branch| effective.get_raw("branch", Some(branch), "remote"))
+		{
 			Some(Some(Some(remote))) => remote,
 			Some(Some(None)) => {
 				return Err(SubmoduleError::MissingValue(format!(
@@ -347,7 +421,7 @@ impl SubmoduleContext {
 				missing_remote_key: None,
 			});
 		}
-		match crate::remote_url::first_fetch_url(&self.configs.superproject, remote)? {
+		match crate::remote_url::first_fetch_url(effective, remote)? {
 			Some(url) => Ok(RelativeUrlBase {
 				url: url.to_owned(),
 				missing_remote_key: None,
@@ -387,7 +461,10 @@ impl SubmoduleContext {
 			.map_err(|_| SubmoduleError::ForeignMount(declaration.path.clone()))?;
 		let target = parse_marker_target(marker)
 			.ok_or_else(|| SubmoduleError::ForeignMount(declaration.path.clone()))?;
-		if !self.marker_targets_expected(declaration, target) {
+		if !self
+			.marker_targets_expected(declaration, target, configuration)
+			.await?
+		{
 			return Err(SubmoduleError::ForeignMount(declaration.path.clone()));
 		}
 
@@ -396,6 +473,20 @@ impl SubmoduleContext {
 		let directory = self
 			.open_git_subdir_nofollow(&relative)
 			.map_err(|_| SubmoduleError::InvalidRepository(declaration.name.clone()))?;
+		let expected_identity =
+			directory_identity(&directory).map_err(|source| SubmoduleError::Io {
+				path: module_git_dir.clone(),
+				source,
+			})?;
+		let setup_directory = directory.try_clone().map_err(|source| SubmoduleError::Io {
+			path: module_git_dir.clone(),
+			source,
+		})?;
+		let module_setup =
+			acquire_config_setup_lease_at(setup_directory, module_git_dir.clone()).await?;
+		module_setup.validate()?;
+		let directory =
+			self.reopen_module_directory(declaration, &relative, &module_git_dir, expected_identity)?;
 		let config_directory = directory.try_clone().map_err(|source| SubmoduleError::Io {
 			path: module_git_dir.clone(),
 			source,
@@ -407,25 +498,50 @@ impl SubmoduleContext {
 		{
 			return Err(SubmoduleError::InvalidRepository(declaration.name.clone()));
 		}
+		module_setup.validate()?;
+		self.reopen_module_directory(declaration, &relative, &module_git_dir, expected_identity)?;
 		let files = LocalFileStore::from_dir(directory);
 		let repository = Repository::<_, H>::new(ObjectStore::new(files));
-		Ok(repository.refs().resolve_head().await?)
+		let head = repository.refs().resolve_head().await?;
+		module_setup.validate()?;
+		self.reopen_module_directory(declaration, &relative, &module_git_dir, expected_identity)?;
+		Ok(head)
 	}
 
-	pub(crate) fn marker_targets_expected(
+	fn reopen_module_directory(
+		&self,
+		declaration: &SubmoduleDeclaration,
+		relative: &Path,
+		display: &Path,
+		expected: EntryIdentity,
+	) -> Result<Dir, SubmoduleError> {
+		let directory = self
+			.open_git_subdir_nofollow(relative)
+			.map_err(|_| SubmoduleError::InvalidRepository(declaration.name.clone()))?;
+		if directory_identity(&directory).map_err(|source| SubmoduleError::Io {
+			path: display.to_owned(),
+			source,
+		})? != expected
+		{
+			return Err(SubmoduleError::InvalidRepository(declaration.name.clone()));
+		}
+		Ok(directory)
+	}
+
+	pub(crate) async fn marker_targets_expected<R: MarkerTargetResolver>(
 		&self,
 		declaration: &SubmoduleDeclaration,
 		target: &str,
-	) -> bool {
+		configuration: &R,
+	) -> Result<bool, SubmoduleError> {
 		let mount = self.worktree_root().join(&declaration.path);
-		let target = Path::new(target);
-		let resolved = if target.is_absolute() {
-			target.to_path_buf()
-		} else {
-			mount.join(target)
+		let Ok(expected) = self.open_git_subdir_nofollow(&Path::new("modules").join(&declaration.name))
+		else {
+			return Ok(false);
 		};
-		let expected = self.layout.git_dir.join("modules").join(&declaration.name);
-		paths_equivalent(&lexical_normalize(&resolved), &lexical_normalize(&expected))
+		configuration
+			.marker_target_matches(&mount, target, expected)
+			.await
 	}
 
 	pub(crate) fn open_git_subdir_nofollow(&self, relative: &Path) -> std::io::Result<Dir> {
@@ -521,6 +637,21 @@ impl SubmoduleContext {
 			.as_deref()
 			.expect("constructor rejects a bare repository")
 	}
+}
+
+async fn acquire_config_setup_lease_at(
+	directory: Dir,
+	display_path: PathBuf,
+) -> Result<crate::SubmoduleMutationLease, SubmoduleError> {
+	tokio::task::spawn_blocking(move || {
+		crate::update_operation::acquire_submodule_config_setup_lease(&directory, &display_path)
+	})
+	.await
+	.map_err(|error| {
+		SubmoduleError::Configuration(format!(
+			"waiting for submodule configuration setup: {error}"
+		))
+	})?
 }
 
 fn local_url_base(path: &Path) -> Result<String, SubmoduleError> {
@@ -694,20 +825,6 @@ fn is_ntfs_dot_git_alias(component: &str) -> bool {
 		}
 	}
 	true
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-	let mut normalized = PathBuf::new();
-	for component in path.components() {
-		match component {
-			Component::CurDir => {}
-			Component::ParentDir => {
-				normalized.pop();
-			}
-			other => normalized.push(other.as_os_str()),
-		}
-	}
-	normalized
 }
 
 #[cfg(test)]

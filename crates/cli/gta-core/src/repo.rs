@@ -7,21 +7,310 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use gitana_object::HashAlgorithm;
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
+use gitana_submodule::{
+	SubmoduleError, SubmoduleMutationLease, acquire_submodule_config_mutation_lease,
+	acquire_submodule_config_setup_lease, deinit_recovery_git_dirs,
+	pending_deinit_configs_require_restore, repository_has_pending_deinit,
+	restore_pending_deinit_configs, try_acquire_submodule_config_setup_lease,
+};
 
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
-
-use crate::{Backend, WorkDir};
-
-pub use gitana_repository_layout::{
-	DiscoveryError, RepositoryLayout, discover, inspect_root, try_discover,
+use gitana_fs_native::directory_identity;
+use gitana_repository_layout::{
+	discover as discover_layout_impl, try_discover as try_discover_layout_impl,
 };
+
+use crate::submodule_configuration::WorktreeConfiguration;
+use crate::{Backend, RepositoryLayoutIdentity, WorkDir};
+
+pub use gitana_repository_layout::{DiscoveryError, RepositoryLayout, inspect_root};
+
+const SETUP_RECOVERY_BACKOFF_INITIAL: Duration = Duration::from_millis(10);
+const SETUP_RECOVERY_BACKOFF_MAX: Duration = Duration::from_millis(250);
+
+/// Discover the containing repository without performing command-setup recovery.
+///
+/// This is reserved for callers that must distinguish a genuine absence before deciding whether a
+/// repository command will run. Actual repository operations must use [`discover`].
+pub(crate) async fn discover_layout(start: &Path) -> Result<RepositoryLayout, DiscoveryError> {
+	discover_layout_impl(start).await
+}
+
+/// Discover the containing repository for an ordinary command.
+///
+/// Callers that read repository configuration must retain [`command_setup_lease`] through those
+/// reads so a concurrent Windows deinit cannot expose its temporary config displacement.
+pub async fn discover(start: &Path) -> Result<RepositoryLayout> {
+	Ok(discover_layout_impl(start).await?)
+}
+
+/// Like [`discover`], while preserving the outside-repository `None` result.
+pub async fn try_discover(start: &Path) -> Result<Option<RepositoryLayout>> {
+	let Some(layout) = try_discover_layout_impl(start).await? else {
+		return Ok(None);
+	};
+	Ok(Some(layout))
+}
+
+/// Retain submodule config serialization while a command reads its hash kind and effective config.
+///
+/// Lock acquisition waits in a blocking worker. If a crashed Windows deinit left the shared config
+/// displaced, this drops the read lease, restores the exact journaled before-image, and reacquires
+/// serialization before returning.
+pub(crate) async fn command_setup_lease(
+	layout: &RepositoryLayout,
+	expected: RepositoryLayoutIdentity,
+) -> Result<(SubmoduleMutationLease, Dir, Dir, Option<Dir>)> {
+	let mut recovery_backoff = SETUP_RECOVERY_BACKOFF_INITIAL;
+	loop {
+		let lease = acquire_setup_lease_once(layout).await?;
+		let (common, git, worktree) = revalidate_repository_layout(layout, expected).await?;
+		if !pending_configs_require_restore_at(layout, &common, &git).await? {
+			lease.validate()?;
+			return Ok((lease, common, git, worktree));
+		}
+		drop(lease);
+		match restore_command_setup(layout, common, git).await {
+			Ok(()) => recovery_backoff = SETUP_RECOVERY_BACKOFF_INITIAL,
+			Err(error) if matches!(error.downcast_ref(), Some(SubmoduleError::UpdateLocked)) => {
+				backoff_after_setup_recovery_lock(&mut recovery_backoff).await;
+			}
+			Err(error) => return Err(error),
+		}
+	}
+}
+
+/// Retain shared-config serialization for read-only linked-worktree enumeration.
+///
+/// Listing deliberately omits symlinked administrative namespaces. When the resolved shared-config
+/// target is present it therefore must not require the stricter recovery-owner enumeration used by
+/// writers. A missing resolved target can be a recoverable Windows publication gap, so that state
+/// still takes the normal recovery-aware setup path.
+pub(crate) async fn worktree_list_setup_lease(
+	layout: &RepositoryLayout,
+	expected: RepositoryLayoutIdentity,
+) -> Result<(SubmoduleMutationLease, Dir, Dir, Option<Dir>)> {
+	let lease = acquire_setup_lease_once(layout).await?;
+	let (common, git, worktree) = revalidate_repository_layout(layout, expected).await?;
+	let config_path = layout.common_dir.join("config");
+	let config = gitana_config_native::read_file_at(
+		common
+			.try_clone()
+			.with_context(|| format!("opening {}", layout.common_dir.display()))?,
+		Path::new("config"),
+		&config_path,
+	)
+	.await?;
+	if config.is_some() {
+		lease.validate()?;
+		return Ok((lease, common, git, worktree));
+	}
+	drop(lease);
+	command_setup_lease(layout, expected).await
+}
+
+/// Serialize exact-root local-source config reads without assuming recovery authority.
+///
+/// Clone and transfer sources are inspected as independent repositories and never restore or
+/// advance a deinit transaction owned by that source. Standalone readers wait for a live config
+/// publisher. A transfer already retaining an unrelated mutation lease tries without waiting so
+/// reciprocal local sources cannot form a cross-repository lock cycle.
+pub(crate) async fn local_source_setup_lease(
+	layout: &RepositoryLayout,
+	held: Option<&SubmoduleMutationLease>,
+) -> Result<SubmoduleMutationLease> {
+	let common = Dir::open_ambient_dir(&layout.common_dir, ambient_authority())
+		.map_err(|error| anyhow!("opening {}: {error}", layout.common_dir.display()))?;
+	if let Some(held) = held
+		&& held
+			.covers_config_directory(&common)
+			.map_err(|error| anyhow!("identifying {}: {error}", layout.common_dir.display()))?
+	{
+		held.validate()?;
+		return Ok(held.clone());
+	}
+	if held.is_some() {
+		try_acquire_setup_lease_once(layout).await
+	} else {
+		acquire_setup_lease_once(layout).await
+	}
+}
+
+/// Wait for source serialization, then bind all subsequent reads to the repository inspected
+/// before the wait.
+pub(crate) async fn revalidated_local_source_setup(
+	layout: &RepositoryLayout,
+	expected: RepositoryLayoutIdentity,
+	held: Option<&SubmoduleMutationLease>,
+) -> Result<(SubmoduleMutationLease, Dir, Dir)> {
+	let lease = local_source_setup_lease(layout, held).await?;
+	let (common, git, _) = revalidate_repository_layout(layout, expected).await?;
+	lease.validate()?;
+	Ok((lease, common, git))
+}
+
+async fn acquire_setup_lease_once(layout: &RepositoryLayout) -> Result<SubmoduleMutationLease> {
+	let common_dir = layout.common_dir.clone();
+	let lease = tokio::task::spawn_blocking(move || {
+		let common = Dir::open_ambient_dir(&common_dir, ambient_authority()).map_err(|source| {
+			SubmoduleError::Open {
+				path: common_dir.clone(),
+				source,
+			}
+		})?;
+		acquire_submodule_config_setup_lease(&common, &common_dir)
+	})
+	.await
+	.map_err(|error| anyhow!("waiting for repository command setup lock: {error}"))?
+	.map_err(anyhow::Error::from)?;
+	lease.validate()?;
+	Ok(lease)
+}
+
+async fn try_acquire_setup_lease_once(layout: &RepositoryLayout) -> Result<SubmoduleMutationLease> {
+	let common_dir = layout.common_dir.clone();
+	let lease = tokio::task::spawn_blocking(move || {
+		let common = Dir::open_ambient_dir(&common_dir, ambient_authority()).map_err(|source| {
+			SubmoduleError::Open {
+				path: common_dir.clone(),
+				source,
+			}
+		})?;
+		try_acquire_submodule_config_setup_lease(&common, &common_dir)
+	})
+	.await
+	.map_err(|error| anyhow!("trying repository command setup lock: {error}"))?
+	.map_err(anyhow::Error::from)?;
+	lease.validate()?;
+	Ok(lease)
+}
+
+/// Retain exclusive shared-config serialization through a frontend-owned configuration mutation.
+///
+/// This uses the same missing-config recovery loop as command setup, but takes the mutation form of
+/// the stable guard and the repository-owned named lock before returning.
+pub(crate) async fn command_config_mutation_lease(
+	layout: &RepositoryLayout,
+	expected: RepositoryLayoutIdentity,
+) -> Result<(SubmoduleMutationLease, Dir, Dir, Option<Dir>)> {
+	let mut recovery_backoff = SETUP_RECOVERY_BACKOFF_INITIAL;
+	loop {
+		let (lock_common, _, _) = revalidate_repository_layout(layout, expected).await?;
+		let common_dir = layout.common_dir.clone();
+		let lease = tokio::task::spawn_blocking(move || {
+			acquire_submodule_config_mutation_lease(&lock_common, &common_dir)
+		})
+		.await
+		.map_err(|error| anyhow!("waiting for repository config mutation lock: {error}"))??;
+
+		let (common, git, worktree) = revalidate_repository_layout(layout, expected).await?;
+		if !pending_configs_require_restore_at(layout, &common, &git).await? {
+			lease.validate()?;
+			return Ok((lease, common, git, worktree));
+		}
+		drop(lease);
+		match restore_command_setup(layout, common, git).await {
+			Ok(()) => recovery_backoff = SETUP_RECOVERY_BACKOFF_INITIAL,
+			Err(error) if matches!(error.downcast_ref(), Some(SubmoduleError::UpdateLocked)) => {
+				backoff_after_setup_recovery_lock(&mut recovery_backoff).await;
+			}
+			Err(error) => return Err(error),
+		}
+	}
+}
+
+async fn backoff_after_setup_recovery_lock(delay: &mut Duration) {
+	tokio::time::sleep(*delay).await;
+	*delay = delay.saturating_mul(2).min(SETUP_RECOVERY_BACKOFF_MAX);
+}
+
+fn has_pending_deinit_at(layout: &RepositoryLayout, common: &Dir, git: &Dir) -> Result<bool> {
+	Ok(repository_has_pending_deinit(common, git, layout)?)
+}
+
+async fn pending_configs_require_restore_at(
+	layout: &RepositoryLayout,
+	common: &Dir,
+	git: &Dir,
+) -> Result<bool> {
+	for (git_dir, git) in deinit_recovery_git_dirs(common, git, layout)? {
+		let configuration = WorktreeConfiguration::new(
+			common
+				.try_clone()
+				.map_err(|error| anyhow!("opening {}: {error}", layout.common_dir.display()))?,
+			git
+				.try_clone()
+				.map_err(|error| anyhow!("opening {}: {error}", git_dir.display()))?,
+			&layout.common_dir,
+			&git_dir,
+		);
+		if pending_deinit_configs_require_restore(git, &git_dir, &configuration).await? {
+			return Ok(true);
+		}
+	}
+	Ok(false)
+}
+
+/// Reject pending recovery through repository directories already bound to a checked layout.
+///
+/// The caller must retain the corresponding setup or mutation lease while checking and throughout
+/// the operation so the result remains atomic with deinit intent publication.
+pub(crate) fn ensure_no_pending_deinit_at(
+	layout: &RepositoryLayout,
+	common: &Dir,
+	git: &Dir,
+) -> Result<()> {
+	if has_pending_deinit_at(layout, common, git)? {
+		return pending_deinit_error();
+	}
+	Ok(())
+}
+
+fn pending_deinit_error() -> Result<()> {
+	Err(
+		SubmoduleError::RecoveryRequired(
+			"a pending submodule deinit must be completed with 'gta submodule deinit' before changing repository configuration"
+				.to_owned(),
+		)
+		.into(),
+	)
+}
+
+async fn restore_command_setup(layout: &RepositoryLayout, common: Dir, git: Dir) -> Result<()> {
+	for (git_dir, git) in deinit_recovery_git_dirs(&common, &git, layout)? {
+		let recovery_git = git
+			.try_clone()
+			.map_err(|error| anyhow!("opening {}: {error}", git_dir.display()))?;
+		let configuration = WorktreeConfiguration::new(
+			common
+				.try_clone()
+				.map_err(|error| anyhow!("opening {}: {error}", layout.common_dir.display()))?,
+			git,
+			&layout.common_dir,
+			&git_dir,
+		);
+		restore_pending_deinit_configs(
+			recovery_git,
+			&git_dir,
+			common
+				.try_clone()
+				.map_err(|error| anyhow!("opening {}: {error}", layout.common_dir.display()))?,
+			&layout.common_dir,
+			&configuration,
+		)
+		.await?;
+	}
+	Ok(())
+}
 
 /// The stable local-transport URL selected by exact-root repository inspection.
 ///
@@ -34,6 +323,120 @@ pub(crate) fn local_source_url(layout: &RepositoryLayout) -> Result<String> {
 		.to_str()
 		.map(ToOwned::to_owned)
 		.ok_or_else(|| anyhow!("local remote path is not valid UTF-8: {}", root.display()))
+}
+
+/// Capture the filesystem identities behind a discovered repository layout before waiting.
+pub(crate) fn capture_repository_layout_identity(
+	layout: &RepositoryLayout,
+) -> Result<RepositoryLayoutIdentity> {
+	let worktree = layout
+		.worktree_root
+		.as_deref()
+		.map(|path| open_identity_directory(path, "work tree"))
+		.transpose()?;
+	let git = open_identity_directory(&layout.git_dir, "worktree Git directory")?;
+	let common = open_identity_directory(&layout.common_dir, "common Git directory")?;
+	Ok(RepositoryLayoutIdentity {
+		worktree: worktree
+			.as_ref()
+			.map(directory_identity)
+			.transpose()
+			.with_context(|| {
+				format!(
+					"identifying work tree {}",
+					layout
+						.worktree_root
+						.as_deref()
+						.expect("opened work tree")
+						.display()
+				)
+			})?,
+		git: directory_identity(&git)
+			.with_context(|| format!("identifying Git directory {}", layout.git_dir.display()))?,
+		common: directory_identity(&common).with_context(|| {
+			format!(
+				"identifying common Git directory {}",
+				layout.common_dir.display()
+			)
+		})?,
+	})
+}
+
+/// Capture a discovered worktree, rejecting bare repositories.
+pub(crate) fn capture_worktree_layout_identity(
+	layout: &RepositoryLayout,
+) -> Result<RepositoryLayoutIdentity> {
+	if layout.worktree_root.is_none() {
+		return Err(work_tree_required());
+	}
+	capture_repository_layout_identity(layout)
+}
+
+fn open_identity_directory(path: &Path, kind: &str) -> Result<Dir> {
+	Dir::open_ambient_dir(path, ambient_authority())
+		.with_context(|| format!("opening {kind} {}", path.display()))
+}
+
+/// Verify that a serialized command still names the worktree discovered before it waited.
+///
+/// The caller must retain the repository's setup or mutation lease. Exact-root inspection rejects
+/// an empty replacement or a checkout rebound to another repository, while the inode comparison
+/// also rejects a replacement that recreates the same marker and administrative paths. The
+/// returned capabilities are the exact directories whose identities were checked.
+pub(crate) async fn revalidate_repository_layout(
+	layout: &RepositoryLayout,
+	expected: RepositoryLayoutIdentity,
+) -> Result<(Dir, Dir, Option<Dir>)> {
+	let root = layout
+		.worktree_root
+		.as_deref()
+		.unwrap_or(&layout.common_dir);
+	let subject = if layout.worktree_root.is_some() {
+		"worktree"
+	} else {
+		"repository"
+	};
+	let current = inspect_root(root).await.with_context(|| {
+		format!(
+			"{subject} changed while waiting for repository setup: {}",
+			root.display()
+		)
+	})?;
+	if &current != layout {
+		bail!(
+			"{subject} changed while waiting for repository setup: {}",
+			root.display()
+		);
+	}
+	let worktree = layout
+		.worktree_root
+		.as_deref()
+		.map(|path| open_identity_directory(path, "work tree"))
+		.transpose()?;
+	let git = open_identity_directory(&layout.git_dir, "worktree Git directory")?;
+	let common = open_identity_directory(&layout.common_dir, "common Git directory")?;
+	let actual = RepositoryLayoutIdentity {
+		worktree: worktree
+			.as_ref()
+			.map(directory_identity)
+			.transpose()
+			.with_context(|| format!("identifying work tree {}", root.display()))?,
+		git: directory_identity(&git)
+			.with_context(|| format!("identifying Git directory {}", layout.git_dir.display()))?,
+		common: directory_identity(&common).with_context(|| {
+			format!(
+				"identifying common Git directory {}",
+				layout.common_dir.display()
+			)
+		})?,
+	};
+	if actual != expected {
+		bail!(
+			"{subject} changed while waiting for repository setup: {}",
+			root.display()
+		);
+	}
+	Ok((common, git, worktree))
 }
 
 /// The error for a work-tree operation run in a bare repo (or outside a work tree).
@@ -56,18 +459,70 @@ pub async fn open_generic<H: HashAlgorithm>(
 	git_dir: &Path,
 	common_dir: &Path,
 ) -> Result<Repository<Backend, H>> {
+	open_generic_inner(git_dir, common_dir, None).await
+}
+
+/// Open a repository from directory capabilities already rebound to a discovered layout.
+pub(crate) async fn open_generic_from_dirs<H: HashAlgorithm>(
+	common: Dir,
+	git: Dir,
+	git_dir: &Path,
+	common_dir: &Path,
+) -> Result<Repository<Backend, H>> {
+	open_generic_from_dirs_inner(common, git, git_dir, common_dir, None).await
+}
+
+/// Open a capability-pinned repository whose detached workers retain config serialization.
+pub(crate) async fn open_generic_from_dirs_with_worker_lease<H: HashAlgorithm>(
+	common: Dir,
+	git: Dir,
+	git_dir: &Path,
+	common_dir: &Path,
+	lease: SubmoduleMutationLease,
+) -> Result<Repository<Backend, H>> {
+	let keepalive: Arc<dyn Send + Sync> = Arc::new(lease);
+	open_generic_from_dirs_inner(common, git, git_dir, common_dir, Some(keepalive)).await
+}
+
+async fn open_generic_inner<H: HashAlgorithm>(
+	git_dir: &Path,
+	common_dir: &Path,
+	worker_keepalive: Option<Arc<dyn Send + Sync>>,
+) -> Result<Repository<Backend, H>> {
 	// The store is capability-pure: open the (already-created) directories here, at the
 	// program edge, and hand the capabilities in.
 	let common = Dir::open_ambient_dir(common_dir, ambient_authority())
 		.map_err(|error| anyhow!("opening {}: {error}", common_dir.display()))?;
 	let git = Dir::open_ambient_dir(git_dir, ambient_authority())
 		.map_err(|error| anyhow!("opening {}: {error}", git_dir.display()))?;
-	let mut repo = Repository::new(ObjectStore::new(WorktreeFileStore::new(common, git)));
+	open_generic_from_dirs_inner(common, git, git_dir, common_dir, worker_keepalive).await
+}
+
+async fn open_generic_from_dirs_inner<H: HashAlgorithm>(
+	common: Dir,
+	git: Dir,
+	git_dir: &Path,
+	common_dir: &Path,
+	worker_keepalive: Option<Arc<dyn Send + Sync>>,
+) -> Result<Repository<Backend, H>> {
+	let config_common = common
+		.try_clone()
+		.map_err(|error| anyhow!("opening {}: {error}", common_dir.display()))?;
+	let config_git = git
+		.try_clone()
+		.map_err(|error| anyhow!("opening {}: {error}", git_dir.display()))?;
+	let effective =
+		crate::git_config::for_worktree_at(config_common, config_git, common_dir, git_dir).await?;
+	let store = match worker_keepalive {
+		Some(keepalive) => WorktreeFileStore::new_with_worker_keepalive(common, git, keepalive),
+		None => WorktreeFileStore::new(common, git),
+	};
+	let mut repo = Repository::new(ObjectStore::new(store));
 	// The effective config includes this worktree's `config.worktree` layer when
 	// `extensions.worktreeConfig` is set, matching git's precedence (system < global < local <
-	// config.worktree). `for_worktree` degrades to `from_repo` when the extension is off or the file is
-	// absent, so an ordinary repository is unaffected.
-	repo.set_effective_config(crate::git_config::for_worktree(common_dir, git_dir).await?);
+	// config.worktree). `for_worktree_at` degrades to the common config when the extension is off or
+	// the file is absent, and reads both repository-owned layers through the retained capabilities.
+	repo.set_effective_config(effective);
 	Ok(repo)
 }
 
@@ -133,7 +588,7 @@ pub(crate) fn branch_checkout_location(
 	exclude: Option<&Path>,
 ) -> Option<PathBuf> {
 	let exclude = exclude.map(canonical);
-	worktree_git_dirs(common_dir)
+	worktree_git_dirs(common_dir, is_bare(common_dir))
 		.into_iter()
 		.find(|candidate| {
 			exclude.as_ref() != Some(&canonical(candidate))
@@ -149,9 +604,10 @@ pub(crate) fn branch_checkout_location(
 ///
 /// The *current* worktree is included; the fetch guard tells it apart from the others by `HEAD` (a
 /// `pull` may still advance the current branch via its merge step, whereas any other checked-out branch
-/// is refused outright). Detached / unborn worktrees contribute nothing.
-pub(crate) fn branch_checkouts(common_dir: &Path) -> Vec<(String, PathBuf)> {
-	worktree_git_dirs(common_dir)
+/// is refused outright). Detached / unborn worktrees contribute nothing. `bare` is the caller's
+/// serialized repository-config snapshot so this scan never rereads a temporarily displaced config.
+pub(crate) fn branch_checkouts(common_dir: &Path, bare: bool) -> Vec<(String, PathBuf)> {
+	worktree_git_dirs(common_dir, bare)
 		.into_iter()
 		.filter_map(|candidate| {
 			head_symbolic_target(&candidate).map(|branch| (branch, worktree_path_of(&candidate)))
@@ -159,12 +615,27 @@ pub(crate) fn branch_checkouts(common_dir: &Path) -> Vec<(String, PathBuf)> {
 		.collect()
 }
 
+/// Capture repository-owned `core.bare` from the symlink-aware effective config installed when the
+/// repository was opened. System, global, and command-scope values cannot redefine repository
+/// identity, while `config.worktree` remains part of the repository-owned stack when enabled.
+pub(crate) async fn repository_bare_snapshot<H: HashAlgorithm>(
+	repository: &Repository<Backend, H>,
+) -> Result<bool> {
+	Ok(
+		repository
+			.effective_config()
+			.await?
+			.get_repository_bool("core", None, "bare")?
+			.unwrap_or(false),
+	)
+}
+
 /// Every worktree's git directory for the repository at `common_dir`: the main worktree (`common_dir`
 /// itself, unless the repo is bare, where its HEAD is not a checkout) and each
 /// `<common_dir>/worktrees/<name>`.
-fn worktree_git_dirs(common_dir: &Path) -> Vec<PathBuf> {
+fn worktree_git_dirs(common_dir: &Path, bare: bool) -> Vec<PathBuf> {
 	let mut git_dirs = Vec::new();
-	if !is_bare(common_dir) {
+	if !bare {
 		git_dirs.push(common_dir.to_path_buf());
 	}
 	if let Ok(entries) = std::fs::read_dir(common_dir.join("worktrees")) {
@@ -243,10 +714,95 @@ mod tests {
 
 	use super::*;
 
+	#[tokio::test(start_paused = true)]
+	async fn setup_recovery_lock_backoff_grows_and_caps() {
+		let mut delay = SETUP_RECOVERY_BACKOFF_INITIAL;
+		let mut observed = Vec::new();
+		for _ in 0..7 {
+			let started = tokio::time::Instant::now();
+			backoff_after_setup_recovery_lock(&mut delay).await;
+			observed.push(tokio::time::Instant::now() - started);
+		}
+
+		assert_eq!(
+			observed,
+			[
+				Duration::from_millis(10),
+				Duration::from_millis(20),
+				Duration::from_millis(40),
+				Duration::from_millis(80),
+				Duration::from_millis(160),
+				Duration::from_millis(250),
+				Duration::from_millis(250),
+			]
+		);
+		assert_eq!(delay, SETUP_RECOVERY_BACKOFF_MAX);
+	}
+
+	#[test]
+	fn branch_checkouts_uses_the_callers_bare_snapshot_during_a_missing_config_window() {
+		let temporary = tempfile::tempdir().unwrap();
+		let common = temporary.path().join("common.git");
+		let linked = temporary.path().join("linked");
+		let linked_git = common.join("worktrees/linked");
+		std::fs::create_dir_all(&linked_git).unwrap();
+		std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		std::fs::write(linked_git.join("HEAD"), "ref: refs/heads/dev\n").unwrap();
+		std::fs::write(
+			linked_git.join("gitdir"),
+			format!("{}\n", linked.join(".git").display()),
+		)
+		.unwrap();
+
+		assert_eq!(
+			branch_checkouts(&common, true),
+			vec![("refs/heads/dev".to_owned(), linked)]
+		);
+	}
+
 	fn create_bare_repository(path: &Path) {
 		std::fs::create_dir_all(path.join("objects")).unwrap();
 		std::fs::create_dir_all(path.join("refs")).unwrap();
 		std::fs::write(path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+	}
+
+	#[tokio::test]
+	async fn config_mutation_rejects_a_replacement_before_creating_its_lock() {
+		let temporary = tempfile::tempdir().unwrap();
+		let visible = temporary.path().join("repository.git");
+		let replacement = temporary.path().join("replacement.git");
+		create_bare_repository(&visible);
+		create_bare_repository(&replacement);
+		let layout = inspect_root(&visible).await.unwrap();
+		let identity = capture_repository_layout_identity(&layout).unwrap();
+		let parent = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let visible_name = visible.file_name().unwrap();
+		let replacement_name = replacement.file_name().unwrap();
+		let visible_identity = gitana_fs_native::entry_identity(&parent, visible_name).unwrap();
+		let replacement_identity = gitana_fs_native::entry_identity(&parent, replacement_name).unwrap();
+		gitana_fs_native::replace_if_identities(
+			&parent,
+			replacement_name,
+			replacement_identity,
+			visible_name,
+			visible_identity,
+		)
+		.unwrap();
+
+		let error = match command_config_mutation_lease(&layout, identity).await {
+			Ok(_) => panic!("config mutation must reject the replacement repository"),
+			Err(error) => error,
+		};
+		assert!(
+			error
+				.to_string()
+				.contains("repository changed while waiting for repository setup"),
+			"unexpected error: {error:#}"
+		);
+		assert!(
+			!visible.join("gitana-submodule-config.lock").exists(),
+			"validation must precede creation of the replacement repository's mutation lock"
+		);
 	}
 
 	#[tokio::test]
@@ -271,5 +827,167 @@ mod tests {
 			local_source_url(&layout).unwrap(),
 			std::fs::canonicalize(&alias).unwrap().to_str().unwrap()
 		);
+	}
+
+	#[tokio::test]
+	async fn standalone_local_source_setup_waits_without_bootstrapping_recovery() {
+		use std::sync::mpsc::{RecvTimeoutError, channel};
+		use std::time::Duration;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let source = temporary.path().join("source.git");
+		create_bare_repository(&source);
+		let layout = inspect_root(&source).await.unwrap();
+		let common = Dir::open_ambient_dir(&layout.common_dir, ambient_authority()).unwrap();
+		let mutation = acquire_submodule_config_mutation_lease(&common, &layout.common_dir).unwrap();
+		let control = layout.git_dir.join("gitana-submodule-deinit");
+		std::fs::create_dir(&control).unwrap();
+		std::fs::write(control.join("intent.json"), b"not a recoverable intent").unwrap();
+
+		let (started_sender, started_receiver) = channel();
+		let (acquired_sender, acquired_receiver) = channel();
+		let waiter = std::thread::spawn(move || {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.build()
+				.unwrap();
+			started_sender.send(()).unwrap();
+			let lease = runtime
+				.block_on(local_source_setup_lease(&layout, None))
+				.unwrap();
+			acquired_sender.send(()).unwrap();
+			lease
+		});
+		started_receiver.recv().unwrap();
+		assert!(matches!(
+			acquired_receiver.recv_timeout(Duration::from_millis(50)),
+			Err(RecvTimeoutError::Timeout)
+		));
+
+		drop(mutation);
+		acquired_receiver
+			.recv_timeout(Duration::from_secs(1))
+			.expect("source config reads wait for a live mutation");
+		drop(waiter.join().unwrap());
+		assert!(
+			!source.join("config").exists(),
+			"source serialization must not recover or synthesize config"
+		);
+		assert_eq!(
+			std::fs::read(control.join("intent.json")).unwrap(),
+			b"not a recoverable intent"
+		);
+	}
+
+	#[tokio::test]
+	async fn local_source_setup_rejects_a_repository_replaced_while_waiting() {
+		let temporary = tempfile::tempdir().unwrap();
+		let source = temporary.path().join("source.git");
+		let retained = temporary.path().join("source-retained.git");
+		create_bare_repository(&source);
+		std::fs::write(
+			source.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+		)
+		.unwrap();
+		create_bare_repository(&retained);
+		std::fs::write(
+			retained.join("config"),
+			"[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = sha256\n",
+		)
+		.unwrap();
+		let parent = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let source_name = source.file_name().unwrap();
+		let retained_name = retained.file_name().unwrap();
+		let source_entry = gitana_fs_native::entry_identity(&parent, source_name).unwrap();
+		let retained_entry = gitana_fs_native::entry_identity(&parent, retained_name).unwrap();
+		let layout = inspect_root(&source).await.unwrap();
+		let identity = capture_repository_layout_identity(&layout).unwrap();
+		let common = Dir::open_ambient_dir(&layout.common_dir, ambient_authority()).unwrap();
+		let mutation = acquire_submodule_config_mutation_lease(&common, &layout.common_dir).unwrap();
+
+		let operation = revalidated_local_source_setup(&layout, identity, None);
+		let replace = async {
+			tokio::task::yield_now().await;
+			gitana_fs_native::replace_if_identities(
+				&parent,
+				retained_name,
+				retained_entry,
+				source_name,
+				source_entry,
+			)
+			.unwrap();
+			drop(mutation);
+		};
+		let (result, ()) = tokio::join!(operation, replace);
+
+		let error = match result {
+			Ok(_) => panic!("a replacement source must be rejected after the wait"),
+			Err(error) => error,
+		};
+		assert!(
+			error
+				.to_string()
+				.contains("repository changed while waiting for repository setup"),
+			"unexpected error: {error:#}"
+		);
+		assert_eq!(
+			std::fs::read_to_string(source.join("config")).unwrap(),
+			"[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = sha256\n"
+		);
+	}
+
+	#[tokio::test]
+	async fn reciprocal_local_sources_fail_fast_instead_of_forming_a_lock_cycle() {
+		let temporary = tempfile::tempdir().unwrap();
+		let first_source = temporary.path().join("first.git");
+		let second_source = temporary.path().join("second.git");
+		create_bare_repository(&first_source);
+		create_bare_repository(&second_source);
+		let first_layout = inspect_root(&first_source).await.unwrap();
+		let second_layout = inspect_root(&second_source).await.unwrap();
+		let first_common =
+			Dir::open_ambient_dir(&first_layout.common_dir, ambient_authority()).unwrap();
+		let second_common =
+			Dir::open_ambient_dir(&second_layout.common_dir, ambient_authority()).unwrap();
+		let first_mutation =
+			acquire_submodule_config_mutation_lease(&first_common, &first_layout.common_dir).unwrap();
+		let second_mutation =
+			acquire_submodule_config_mutation_lease(&second_common, &second_layout.common_dir).unwrap();
+
+		let error = match local_source_setup_lease(&second_layout, Some(&first_mutation)).await {
+			Ok(_) => panic!("an unrelated held lease must make source contention fail fast"),
+			Err(error) => error,
+		};
+		assert!(matches!(
+			error.downcast_ref::<SubmoduleError>(),
+			Some(SubmoduleError::UpdateLocked)
+		));
+		let error = match local_source_setup_lease(&first_layout, Some(&second_mutation)).await {
+			Ok(_) => panic!("reciprocal source contention must not wait"),
+			Err(error) => error,
+		};
+		assert!(matches!(
+			error.downcast_ref::<SubmoduleError>(),
+			Some(SubmoduleError::UpdateLocked)
+		));
+		drop(second_mutation);
+		drop(first_mutation);
+	}
+
+	#[tokio::test]
+	async fn local_source_setup_reuses_a_held_lock_for_the_same_repository() {
+		let temporary = tempfile::tempdir().unwrap();
+		let source = temporary.path().join("source.git");
+		create_bare_repository(&source);
+		let layout = inspect_root(&source).await.unwrap();
+		let common = Dir::open_ambient_dir(&layout.common_dir, ambient_authority()).unwrap();
+		let mutation = acquire_submodule_config_mutation_lease(&common, &layout.common_dir).unwrap();
+
+		let reused = local_source_setup_lease(&layout, Some(&mutation))
+			.await
+			.unwrap();
+		assert!(reused.covers_config_directory(&common).unwrap());
+		drop(reused);
+		drop(mutation);
 	}
 }

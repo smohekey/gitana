@@ -155,6 +155,66 @@ impl GitConfig {
 			.collect()
 	}
 
+	/// Return the highest-precedence repository-owned raw value, excluding system, global, and
+	/// command-scope sources. The inner `None` preserves a present-but-valueless variable.
+	pub fn get_repository_raw(
+		&self,
+		section: &str,
+		subsection: Option<&str>,
+		name: &str,
+	) -> Option<Option<&str>> {
+		self
+			.sources
+			.get(self.repository_sources.clone())?
+			.iter()
+			.rev()
+			.find_map(|source| source.get_raw(section, subsection, name))
+	}
+
+	/// Return the highest-precedence worktree-local raw value from the repository-owned stack.
+	///
+	/// The first repository source is the common local config; any later repository source is a
+	/// worktree-local overlay. The inner `None` preserves a present-but-valueless variable.
+	pub fn get_worktree_raw(
+		&self,
+		section: &str,
+		subsection: Option<&str>,
+		name: &str,
+	) -> Option<Option<&str>> {
+		let range = self.repository_sources.clone();
+		if range.start >= range.end {
+			return None;
+		}
+		self
+			.sources
+			.get(range.start + 1..range.end)?
+			.iter()
+			.rev()
+			.find_map(|source| source.get_raw(section, subsection, name))
+	}
+
+	/// Return the repository-owned raw value that would remain after unsetting every own occurrence
+	/// from the common local config. This models a write to the base `config` while preserving values
+	/// spliced from its includes and any higher worktree-local source.
+	pub fn get_repository_raw_after_common_unset(
+		&self,
+		section: &str,
+		subsection: Option<&str>,
+		name: &str,
+	) -> Option<Option<String>> {
+		let range = self.repository_sources.clone();
+		if range.start >= range.end {
+			return None;
+		}
+		let mut sources = self.sources[range].to_vec();
+		sources[0].unset(section, subsection, name);
+		sources
+			.iter()
+			.rev()
+			.find_map(|source| source.get_raw(section, subsection, name))
+			.map(|value| value.map(str::to_owned))
+	}
+
 	/// Interpret the effective (highest-precedence) value as a git boolean. `None` if unset anywhere.
 	pub fn get_bool(
 		&self,
@@ -593,6 +653,42 @@ mod tests {
 				.unwrap(),
 			Some(false),
 			"worktree local must override common local while command config remains excluded"
+		);
+	}
+
+	#[test]
+	fn repository_raw_distinguishes_common_worktree_and_ambient_values() {
+		let mut common = GitConfig::from_sources(vec![
+			source("[core]\n\tworktree = system\n"),
+			source("[core]\n\tworktree = common\n"),
+			source(""),
+		])
+		.with_repository_sources(1..3);
+		common.overlay([source("[core]\n\tworktree = command\n")]);
+		assert_eq!(
+			common.get_repository_raw("core", None, "worktree"),
+			Some(Some("common"))
+		);
+		assert_eq!(common.get_worktree_raw("core", None, "worktree"), None);
+
+		let mut overridden = GitConfig::from_sources(vec![
+			source("[core]\n\tworktree = system\n"),
+			source("[core]\n\tworktree = common\n"),
+			source("[core]\n\tworktree\n"),
+		])
+		.with_repository_sources(1..3);
+		overridden.overlay([source("[core]\n\tworktree = command\n")]);
+		assert_eq!(
+			overridden.get_repository_raw("core", None, "worktree"),
+			Some(None)
+		);
+		assert_eq!(
+			overridden.get_worktree_raw("core", None, "worktree"),
+			Some(None)
+		);
+		assert_eq!(
+			overridden.get_repository_raw_after_common_unset("core", None, "worktree"),
+			Some(None)
 		);
 	}
 

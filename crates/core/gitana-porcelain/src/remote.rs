@@ -109,6 +109,46 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	checkouts: &[(String, String)],
 	reflog: Option<FetchReflog<'_>>,
 ) -> Result<FetchOutcome<H>> {
+	// `core.bare` is repository identity, so consult only the local config. Frontends that must
+	// serialize this read with another config publisher use `fetch_with_bare` instead.
+	let bare = repo
+		.read_config()
+		.await
+		.ok()
+		.and_then(|local| local.get_bool("core", None, "bare").ok().flatten())
+		.unwrap_or(false);
+	fetch_with_bare(
+		fetcher,
+		repo,
+		bare,
+		advertisement,
+		update_head_ok,
+		tags,
+		prune,
+		deepen,
+		checkouts,
+		reflog,
+	)
+	.await
+}
+
+/// Fetch using a caller-supplied snapshot of the repository-local `core.bare` value.
+///
+/// This is equivalent to [`fetch`], but permits a frontend to read repository identity while holding
+/// its own config-serialization guard and release that guard before the transfer begins.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
+	fetcher: &mut impl PackFetcher,
+	repo: &Repository<F, H>,
+	bare: bool,
+	advertisement: &[u8],
+	update_head_ok: bool,
+	tags: TagFetch,
+	prune: bool,
+	deepen: &Deepen,
+	checkouts: &[(String, String)],
+	reflog: Option<FetchReflog<'_>>,
+) -> Result<FetchOutcome<H>> {
 	let advertised = parse_advertisement::<H>(advertisement)?;
 	let haves = gitana_remote::local_haves(repo).await?;
 
@@ -142,12 +182,6 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	// is likewise empty for a bare repo, so nothing is refused. `core.bare` is repo identity — read it
 	// from the **local** config only, never the merged view, so a global/system `core.bare` (a footgun)
 	// cannot flip a non-bare worktree into refusing a fetch into its own branch (or vice versa).
-	let bare = repo
-		.read_config()
-		.await
-		.ok()
-		.and_then(|local| local.get_bool("core", None, "bare").ok().flatten())
-		.unwrap_or(false);
 	let checked_out = match (bare, repo.refs().read_head().await?) {
 		(false, HeadState::Symbolic(branch)) => Some(branch),
 		_ => None,
@@ -1392,13 +1426,103 @@ fn ensure_atomic_supported<H: HashAlgorithm>(
 mod tests {
 	use std::cell::RefCell;
 
+	use gitana_file_store_local::LocalFileStore;
 	use gitana_git_http::{ProtocolVersion, Service, advertise, make_nonce, peek_push_cert};
-	use gitana_object::{write_flush, write_pkt};
+	use gitana_object::{Sha256, write_flush, write_pkt};
+	use gitana_object_store::ObjectStore;
 	use gitana_trust::{TrustedKey, verify_sshsig};
 	use gitana_worktree::Index;
 
 	use super::*;
-	use crate::test_support::{TestIdentity, TestSigner, fixture, stage};
+	use crate::test_support::{TestIdentity, TestSigner, fixture, open_dir, stage};
+
+	struct NoopFetcher;
+
+	impl PackFetcher for NoopFetcher {
+		async fn fetch_pack<F: FileStore, H: HashAlgorithm>(
+			&mut self,
+			_repo: &Repository<F, H>,
+			_wants: &[ObjectId<H>],
+			_haves: &[ObjectId<H>],
+			_deepen: &Deepen,
+			_include_tag: bool,
+		) -> Result<()> {
+			Ok(())
+		}
+	}
+
+	#[tokio::test]
+	async fn fetch_uses_the_callers_bare_snapshot_without_rereading_local_config() {
+		let (directory, worktree) = fixture().await;
+		let blob = worktree.repository().write_blob(b"hello\n").await.unwrap();
+		let mut index = Index::new();
+		stage(&mut index, "f.txt", blob);
+		worktree.save_index(&index).await.unwrap();
+		crate::commit(&worktree, "root", &TestIdentity::default())
+			.await
+			.unwrap();
+
+		let mut config = worktree.repository().read_config().await.unwrap();
+		config
+			.set(
+				"remote",
+				Some("origin"),
+				"fetch",
+				"+refs/heads/*:refs/heads/*",
+			)
+			.unwrap();
+		let advertisement = advertise(
+			worktree.repository(),
+			Service::UploadPack,
+			ProtocolVersion::V0,
+			None,
+		)
+		.await
+		.unwrap();
+		let mut repository = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+			open_dir(directory.path().join(".git")),
+		)));
+		repository.set_effective_config(config);
+		std::fs::remove_file(directory.path().join(".git/config")).unwrap();
+
+		let refused = fetch_with_bare(
+			&mut NoopFetcher,
+			&repository,
+			false,
+			&advertisement,
+			false,
+			TagFetch::Auto,
+			false,
+			&Deepen::default(),
+			&[],
+			None,
+		)
+		.await;
+		let refused = match refused {
+			Ok(_) => panic!("a non-bare repository must refuse its current branch"),
+			Err(error) => error,
+		};
+		assert!(
+			refused
+				.to_string()
+				.contains("refusing to fetch into branch")
+		);
+
+		fetch_with_bare(
+			&mut NoopFetcher,
+			&repository,
+			true,
+			&advertisement,
+			false,
+			TagFetch::Auto,
+			false,
+			&Deepen::default(),
+			&[],
+			None,
+		)
+		.await
+		.unwrap();
+	}
 
 	#[test]
 	fn clone_head_without_symref_infers_a_matching_branch() {

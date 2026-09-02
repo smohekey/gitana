@@ -5,6 +5,10 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[cfg(any(unix, windows))]
+use cap_std::{ambient_authority, fs::Dir};
+#[cfg(any(unix, windows))]
+use gitana_submodule::acquire_submodule_config_mutation_lease;
 use sha2::{Digest, Sha256};
 
 #[test]
@@ -55,6 +59,3078 @@ fn update_init_materializes_the_recorded_commit_in_a_detached_worktree() {
 		format!(" {} modules/one\n", fixture.old)
 	);
 	assert_mount_points_at_per_worktree_repository(&fixture.consumer);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn submodule_status_waits_for_each_module_config_publication() {
+	let fixture = Fixture::new("status-module-config-locked");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let module = Dir::open_ambient_dir(&module_git_dir, ambient_authority()).unwrap();
+	let mutation = acquire_submodule_config_mutation_lease(&module, &module_git_dir).unwrap();
+	let config = module_git_dir.join("config");
+	let displaced = module_git_dir.join("config.status-displaced");
+	std::fs::rename(&config, &displaced).unwrap();
+
+	let mut child = Command::new(env!("CARGO_BIN_EXE_gta"))
+		.args(["-C", fixture.consumer.to_str().unwrap()])
+		.args(["submodule", "status"])
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped())
+		.spawn()
+		.expect("start status while the module config is displaced");
+	std::thread::sleep(std::time::Duration::from_millis(250));
+	let early = child.try_wait().unwrap();
+	std::fs::rename(&displaced, &config).unwrap();
+	drop(mutation);
+	assert!(
+		early.is_none(),
+		"status observed the module's transient absent-config window"
+	);
+	let status = child.wait_with_output().unwrap();
+	assert_success(&status, "status after module config publication");
+	assert_eq!(stdout(&status), format!(" {} modules/one\n", fixture.old));
+}
+
+#[cfg(unix)]
+#[test]
+fn submodule_status_rejects_a_module_repository_replaced_while_waiting() {
+	let fixture = Fixture::new("status-module-replaced-while-waiting");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let displaced = module_git_dir.with_file_name("one.status-displaced");
+	let module = Dir::open_ambient_dir(&module_git_dir, ambient_authority()).unwrap();
+	let mutation = acquire_submodule_config_mutation_lease(&module, &module_git_dir).unwrap();
+
+	let mut child = Command::new(env!("CARGO_BIN_EXE_gta"))
+		.args(["-C", fixture.consumer.to_str().unwrap()])
+		.args(["submodule", "status"])
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped())
+		.spawn()
+		.expect("start status behind the module config guard");
+	std::thread::sleep(std::time::Duration::from_millis(250));
+	assert!(
+		child.try_wait().unwrap().is_none(),
+		"status did not wait for module serialization"
+	);
+	std::fs::rename(&module_git_dir, &displaced).unwrap();
+	std::fs::create_dir(&module_git_dir).unwrap();
+	drop(mutation);
+
+	let status = child.wait_with_output().unwrap();
+	assert!(
+		!status.status.success(),
+		"status must reject a replaced module repository"
+	);
+	assert!(
+		stderr(&status).contains("submodule repository for 'one' is corrupt"),
+		"unexpected error: {}",
+		stderr(&status)
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_submodule_status_rejects_a_checkout_retired_while_waiting() {
+	let fixture = Fixture::new("nested-status-retired-while-waiting");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let mount = fixture.consumer.join("modules/one");
+	let retained = fixture.consumer.join("modules/.one-retired");
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let module = Dir::open_ambient_dir(&module_git_dir, ambient_authority()).unwrap();
+	let mutation = acquire_submodule_config_mutation_lease(&module, &module_git_dir).unwrap();
+
+	let mut child = Command::new(env!("CARGO_BIN_EXE_gta"))
+		.args(["-C", mount.to_str().unwrap()])
+		.args(["submodule", "status"])
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped())
+		.spawn()
+		.expect("start nested status behind the module config guard");
+	std::thread::sleep(std::time::Duration::from_millis(250));
+	assert!(
+		child.try_wait().unwrap().is_none(),
+		"nested status did not wait for module serialization"
+	);
+	std::fs::rename(&mount, &retained).unwrap();
+	std::fs::create_dir(&mount).unwrap();
+	drop(mutation);
+
+	let status = child.wait_with_output().unwrap();
+	assert!(
+		!status.status.success(),
+		"nested status must not continue through the retired checkout"
+	);
+	assert!(
+		stderr(&status).contains("worktree changed while waiting for repository setup"),
+		"unexpected error: {}",
+		stderr(&status)
+	);
+	assert_eq!(std::fs::read_dir(&mount).unwrap().count(), 0);
+	assert!(retained.join("file.txt").is_file());
+}
+
+#[test]
+fn deinit_clears_the_mount_but_retains_the_repository_for_reattachment() {
+	let fixture = Fixture::new("deinit-reattach");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+
+	let deinit = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&deinit, "submodule deinit");
+	assert_eq!(stdout(&deinit), "Cleared directory 'modules/one'\n");
+	assert!(
+		stderr(&deinit).contains("Submodule 'one' unregistered"),
+		"unregistration is reported: {}",
+		stderr(&deinit)
+	);
+	assert!(fixture.consumer.join("modules/one").is_dir());
+	assert_eq!(
+		std::fs::read_dir(fixture.consumer.join("modules/one"))
+			.unwrap()
+			.count(),
+		0,
+		"the public mount remains as an empty directory"
+	);
+	assert!(module_git_dir.is_dir(), "the retained repository survives");
+	assert_eq!(
+		std::fs::read_to_string(retired_checkout(&module_git_dir).join("file.txt")).unwrap(),
+		"old\n",
+		"the displaced checkout is retained losslessly"
+	);
+	assert!(
+		!std::fs::read_to_string(module_git_dir.join("config"))
+			.unwrap()
+			.lines()
+			.any(|line| line.trim_start().starts_with("worktree =")),
+		"the retained repository is detached from the removed worktree"
+	);
+	assert!(
+		!std::fs::read_to_string(fixture.consumer.join(".git/config"))
+			.unwrap()
+			.contains("[submodule \"one\"]"),
+		"the writable local registration is removed"
+	);
+
+	let update = gta(&fixture.consumer, true, &["submodule", "update", "--init"]);
+	assert_success(&update, "reattach retained repository");
+	assert_eq!(
+		std::fs::read_to_string(fixture.consumer.join("modules/one/file.txt")).unwrap(),
+		"old\n"
+	);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn deinit_refuses_a_busy_module_config_before_mutating_any_namespace() {
+	let fixture = Fixture::new("deinit-module-config-locked");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let module = Dir::open_ambient_dir(&module_git_dir, ambient_authority()).unwrap();
+	let mutation = acquire_submodule_config_mutation_lease(&module, &module_git_dir).unwrap();
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(!refused.status.success(), "a busy module config must fail");
+	assert!(
+		stderr(&refused).contains("submodule update is already running"),
+		"unexpected error: {}",
+		stderr(&refused)
+	);
+	assert!(fixture.consumer.join("modules/one/file.txt").is_file());
+	assert!(
+		std::fs::read_to_string(fixture.consumer.join(".git/config"))
+			.unwrap()
+			.contains("[submodule \"one\"]")
+	);
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
+
+	drop(mutation);
+	let retry = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&retry, "deinit after the module config writer exits");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn deinit_refuses_a_module_repository_with_pending_nested_recovery() {
+	let fixture = Fixture::new("deinit-module-nested-recovery");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let nested_control = module_git_dir.join("gitana-submodule-deinit");
+	std::fs::create_dir(&nested_control).unwrap();
+	let super_config = fixture.consumer.join(".git/config");
+	let super_before = std::fs::read(&super_config).unwrap();
+	let module_config = module_git_dir.join("config");
+	let module_before = std::fs::read(&module_config).unwrap();
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!refused.status.success(),
+		"nested recovery must block parent deinit"
+	);
+	assert!(
+		stderr(&refused).contains("pending submodule deinit recovery in module 'one'"),
+		"unexpected nested recovery error: {}",
+		stderr(&refused)
+	);
+	assert!(fixture.consumer.join("modules/one/file.txt").is_file());
+	assert_eq!(std::fs::read(&super_config).unwrap(), super_before);
+	assert_eq!(std::fs::read(&module_config).unwrap(), module_before);
+	assert!(
+		!git_path(&fixture.consumer, "gitana-submodule-deinit").exists(),
+		"parent deinit must not publish an intent"
+	);
+
+	std::fs::remove_dir(&nested_control).unwrap();
+	let retry = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&retry, "deinit after nested recovery is cleared");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn update_refuses_a_busy_retained_module_config_before_attachment() {
+	let fixture = Fixture::new("update-module-config-locked");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			false,
+			&["submodule", "deinit", "modules/one"],
+		),
+		"deinit retained repository",
+	);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			false,
+			&["submodule", "init", "modules/one"],
+		),
+		"register retained repository",
+	);
+
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let module = Dir::open_ambient_dir(&module_git_dir, ambient_authority()).unwrap();
+	let mutation = acquire_submodule_config_mutation_lease(&module, &module_git_dir).unwrap();
+	let mount = fixture.consumer.join("modules/one");
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "update", "modules/one"],
+	);
+	assert!(!refused.status.success(), "a busy module config must fail");
+	assert!(
+		stderr(&refused).contains("submodule update is already running"),
+		"unexpected error: {}",
+		stderr(&refused)
+	);
+	assert_eq!(std::fs::read_dir(&mount).unwrap().count(), 0);
+	assert!(
+		!std::fs::read_to_string(module_git_dir.join("config"))
+			.unwrap()
+			.lines()
+			.any(|line| line.trim_start().starts_with("worktree =")),
+		"the busy retained repository must stay detached"
+	);
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-update").exists());
+
+	drop(mutation);
+	let retry = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "modules/one"],
+	);
+	assert_success(&retry, "reattach after the module config writer exits");
+	assert!(mount.join(".git").is_file());
+	assert!(mount.join("file.txt").is_file());
+	assert!(
+		std::fs::read_to_string(module_git_dir.join("config"))
+			.unwrap()
+			.lines()
+			.any(|line| line.trim_start().starts_with("worktree =")),
+		"retry must restore the retained repository attachment"
+	);
+}
+
+#[test]
+fn deinit_refuses_visible_changes_but_force_retires_them() {
+	let fixture = Fixture::new("deinit-force");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	std::fs::write(fixture.consumer.join("modules/one/file.txt"), b"changed\n").unwrap();
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!refused.status.success(),
+		"a visible modification must fail"
+	);
+	assert!(
+		stderr(&refused).contains(
+			"contains local modifications; use --force to deinitialize while retaining the checkout and its local changes"
+		),
+		"unexpected error: {}",
+		stderr(&refused)
+	);
+	assert_eq!(
+		std::fs::read_to_string(fixture.consumer.join("modules/one/file.txt")).unwrap(),
+		"changed\n"
+	);
+
+	let forced = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "--force", "modules/one"],
+	);
+	assert_success(&forced, "forced submodule deinit");
+	assert_eq!(
+		std::fs::read_dir(fixture.consumer.join("modules/one"))
+			.unwrap()
+			.count(),
+		0
+	);
+	assert_eq!(
+		std::fs::read_to_string(
+			retired_checkout(&git_path(&fixture.consumer, "modules/one")).join("file.txt")
+		)
+		.unwrap(),
+		"changed\n"
+	);
+}
+
+#[test]
+fn deinit_refuses_a_clean_checkout_at_a_different_commit_without_force() {
+	let fixture = Fixture::new("deinit-clean-wrong-head");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	std::fs::write(module.join("file.txt"), b"local commit\n").unwrap();
+	git_ok(&module, &["add", "file.txt"]);
+	commit(&module, "local module commit");
+	assert_ne!(git(&module, &["rev-parse", "HEAD"]).trim(), fixture.old);
+	assert!(git(&module, &["status", "--porcelain"]).trim().is_empty());
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!refused.status.success(),
+		"a divergent clean HEAD must fail"
+	);
+	assert!(stderr(&refused).contains("contains local modifications"));
+	assert!(module.join("file.txt").is_file());
+
+	let forced = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "--force", "modules/one"],
+	);
+	assert_success(
+		&forced,
+		"force may bypass the divergent HEAD cleanliness proof",
+	);
+}
+
+#[test]
+fn deinit_retires_ignored_content_without_force_and_requires_a_selection() {
+	let fixture = Fixture::new("deinit-ignored");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	std::fs::create_dir_all(module_git_dir.join("info")).unwrap();
+	std::fs::write(module_git_dir.join("info/exclude"), b"ignored\n").unwrap();
+	std::fs::write(fixture.consumer.join("modules/one/ignored"), b"ignored\n").unwrap();
+
+	let missing = gta(&fixture.consumer, false, &["submodule", "deinit"]);
+	assert!(
+		!missing.status.success(),
+		"deinit must require --all or paths"
+	);
+
+	let deinit = gta(&fixture.consumer, false, &["submodule", "deinit", "--all"]);
+	assert_success(&deinit, "deinit with ignored content");
+	assert_eq!(
+		std::fs::read_dir(fixture.consumer.join("modules/one"))
+			.unwrap()
+			.count(),
+		0
+	);
+	assert_eq!(
+		std::fs::read_to_string(
+			retired_checkout(&git_path(&fixture.consumer, "modules/one")).join("ignored")
+		)
+		.unwrap(),
+		"ignored\n"
+	);
+}
+
+#[test]
+fn deinit_all_retires_an_unpublished_control_after_gitlink_removal() {
+	let fixture = Fixture::new("deinit-unpublished-control");
+	let control = git_path(&fixture.consumer, "gitana-submodule-deinit");
+	std::fs::create_dir(&control).unwrap();
+	std::fs::write(control.join("intent.lock"), b"partial intent").unwrap();
+	git_ok(
+		&fixture.consumer,
+		&["update-index", "--force-remove", "modules/one"],
+	);
+
+	let blocked = gta(
+		&fixture.consumer,
+		false,
+		&["config", "--local", "test.pending", "blocked"],
+	);
+	assert!(
+		!blocked.status.success(),
+		"unpublished control state must block config mutation"
+	);
+	assert!(
+		stderr(&blocked).contains("pending submodule deinit"),
+		"unexpected error: {}",
+		stderr(&blocked)
+	);
+
+	let deinit = gta(&fixture.consumer, false, &["submodule", "deinit", "--all"]);
+	assert_success(&deinit, "retire unpublished control state");
+	assert!(!control.exists(), "the active control name must be retired");
+
+	let git_dir = control.parent().unwrap();
+	let retired = std::fs::read_dir(git_dir)
+		.unwrap()
+		.filter_map(Result::ok)
+		.map(|entry| entry.path())
+		.filter(|path| {
+			path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name.starts_with(".gitana-submodule-deinit-retired."))
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(
+		retired.len(),
+		1,
+		"the incomplete control state is preserved"
+	);
+	assert_eq!(
+		std::fs::read(retired[0].join("intent.lock")).unwrap(),
+		b"partial intent"
+	);
+
+	let write = gta(
+		&fixture.consumer,
+		false,
+		&["config", "--local", "test.pending", "recovered"],
+	);
+	assert_success(&write, "config mutation after control retirement");
+	assert_eq!(
+		git(&fixture.consumer, &["config", "--get", "test.pending"]).trim(),
+		"recovered"
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_all_recovers_an_active_intent_after_gitlink_removal() {
+	let fixture = Fixture::new("deinit-intent-removed-gitlink");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let control = write_prepared_deinit_intent(&fixture, "removed-gitlink");
+	git_ok(
+		&fixture.consumer,
+		&["update-index", "--force-remove", "modules/one"],
+	);
+
+	let recovered = gta(&fixture.consumer, false, &["submodule", "deinit", "--all"]);
+	assert_success(&recovered, "recover after removing the recorded gitlink");
+	assert_eq!(stdout(&recovered), "Cleared directory 'modules/one'\n");
+	assert!(!control.exists(), "the active recovery journal is retired");
+	assert_eq!(
+		std::fs::read_dir(fixture.consumer.join("modules/one"))
+			.unwrap()
+			.count(),
+		0
+	);
+	assert!(retired_checkout(&git_path(&fixture.consumer, "modules/one")).is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_path_recovers_the_persisted_gitlink_after_the_index_oid_changes() {
+	let fixture = Fixture::new("deinit-intent-changed-gitlink");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let control = write_prepared_deinit_intent(&fixture, "changed-gitlink");
+	let next = fixture.commit_source("next\n", "next");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{next},modules/one"),
+		],
+	);
+
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&recovered, "recover the persisted gitlink identity");
+	assert_eq!(
+		stdout(&recovered),
+		"Cleared directory 'modules/one'\n",
+		"the replacement gitlink must not start a second transition"
+	);
+	assert!(!control.exists(), "the active recovery journal is retired");
+	assert!(retired_checkout(&git_path(&fixture.consumer, "modules/one")).is_dir());
+}
+
+#[test]
+fn deinit_force_still_refuses_a_foreign_mount_marker() {
+	let fixture = Fixture::new("deinit-foreign-force");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let marker = fixture.consumer.join("modules/one/.git");
+	std::fs::write(&marker, b"gitdir: ../../foreign\n").unwrap();
+
+	let deinit = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "--force", "modules/one"],
+	);
+	assert!(!deinit.status.success(), "force must not bypass ownership");
+	assert!(
+		stderr(&deinit).contains("foreign or non-empty content"),
+		"unexpected error: {}",
+		stderr(&deinit)
+	);
+	assert_eq!(std::fs::read(&marker).unwrap(), b"gitdir: ../../foreign\n");
+}
+
+#[test]
+fn deinit_force_still_validates_the_module_repository_format() {
+	let fixture = Fixture::new("deinit-force-format");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = git_path(&fixture.consumer, "modules/one");
+	git_ok(
+		&module,
+		&[
+			"config",
+			"--file",
+			"config",
+			"core.repositoryFormatVersion",
+			"1",
+		],
+	);
+	git_ok(
+		&module,
+		&[
+			"config",
+			"--file",
+			"config",
+			"extensions.objectFormat",
+			"sha256",
+		],
+	);
+	let module_before = std::fs::read(module.join("config")).unwrap();
+	let super_before = std::fs::read(fixture.consumer.join(".git/config")).unwrap();
+
+	let deinit = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "--force", "modules/one"],
+	);
+	assert!(
+		!deinit.status.success(),
+		"force must not bypass repository validation"
+	);
+	assert!(fixture.consumer.join("modules/one/.git").is_file());
+	assert_eq!(std::fs::read(module.join("config")).unwrap(), module_before);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".git/config")).unwrap(),
+		super_before
+	);
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
+}
+
+#[test]
+fn deinit_validates_an_already_unmounted_module_repository() {
+	let fixture = Fixture::new("deinit-unmounted-format");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let mount = fixture.consumer.join("modules/one");
+	std::fs::remove_dir_all(&mount).unwrap();
+	std::fs::create_dir(&mount).unwrap();
+	let module = git_path(&fixture.consumer, "modules/one");
+	git_ok(
+		&module,
+		&[
+			"config",
+			"--file",
+			"config",
+			"core.repositoryFormatVersion",
+			"1",
+		],
+	);
+	git_ok(
+		&module,
+		&[
+			"config",
+			"--file",
+			"config",
+			"extensions.objectFormat",
+			"sha256",
+		],
+	);
+	let module_before = std::fs::read(module.join("config")).unwrap();
+	let super_before = std::fs::read(fixture.consumer.join(".git/config")).unwrap();
+
+	let deinit = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!deinit.status.success(),
+		"unmounted modules still require repository validation"
+	);
+	assert_eq!(std::fs::read_dir(&mount).unwrap().count(), 0);
+	assert_eq!(std::fs::read(module.join("config")).unwrap(), module_before);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".git/config")).unwrap(),
+		super_before
+	);
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
+}
+
+#[test]
+fn deinit_all_preflights_every_checkout_before_clearing_the_first() {
+	let fixture = Fixture::new("deinit-preflight-all");
+	add_second_module_mapping(&fixture);
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initialize both modules",
+	);
+	std::fs::write(fixture.consumer.join("modules/two/file.txt"), b"changed\n").unwrap();
+
+	let deinit = gta(&fixture.consumer, false, &["submodule", "deinit", "--all"]);
+	assert!(
+		!deinit.status.success(),
+		"the dirty second module must fail"
+	);
+	assert!(
+		fixture.consumer.join("modules/one/.git").is_file(),
+		"complete preflight must preserve the clean first module"
+	);
+	assert!(
+		fixture.consumer.join("modules/two/.git").is_file(),
+		"the dirty module must remain mounted"
+	);
+}
+
+#[test]
+fn deinit_all_preflights_every_module_config_attachment_before_mutation() {
+	let fixture = Fixture::new("deinit-preflight-config-all");
+	add_second_module_mapping(&fixture);
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initialize both modules",
+	);
+	let second_git_dir = git_path(&fixture.consumer, "modules/two");
+	git_ok(
+		&second_git_dir,
+		&["config", "--file", "config", "core.worktree", "sentinel"],
+	);
+	let super_before = std::fs::read(fixture.consumer.join(".git/config")).unwrap();
+
+	let deinit = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "--force", "--all"],
+	);
+	assert!(!deinit.status.success(), "the foreign attachment must fail");
+	assert!(stderr(&deinit).contains("core.worktree points to 'sentinel'"));
+	assert!(fixture.consumer.join("modules/one/.git").is_file());
+	assert!(fixture.consumer.join("modules/two/.git").is_file());
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".git/config")).unwrap(),
+		super_before
+	);
+	assert!(
+		!git_path(&fixture.consumer, "gitana-submodule-deinit").exists(),
+		"batch preflight must publish no intent"
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_all_rejects_a_shared_config_target_inside_a_later_checkout_before_mutation() {
+	let fixture = Fixture::new("deinit-preflight-shared-config-containment-all");
+	add_second_module_mapping(&fixture);
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initialize both modules",
+	);
+	let config = fixture.consumer.join(".git/config");
+	let contained_target = fixture.consumer.join("modules/two/super-config-real");
+	std::fs::rename(&config, &contained_target).unwrap();
+	std::os::unix::fs::symlink("../modules/two/super-config-real", &config).unwrap();
+	let super_before = std::fs::read(&contained_target).unwrap();
+	let first_module_config = git_path(&fixture.consumer, "modules/one/config");
+	let second_module_config = git_path(&fixture.consumer, "modules/two/config");
+	let first_before = std::fs::read(&first_module_config).unwrap();
+	let second_before = std::fs::read(&second_module_config).unwrap();
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "--force", "--all"],
+	);
+	assert!(
+		!refused.status.success(),
+		"contained config target must fail"
+	);
+	assert!(
+		stderr(&refused).contains("superproject config target is inside the selected checkout"),
+		"unexpected diagnostic: {}",
+		stderr(&refused),
+	);
+	assert!(fixture.consumer.join("modules/one/.git").is_file());
+	assert!(fixture.consumer.join("modules/two/.git").is_file());
+	assert!(fixture.consumer.join("modules/one/file.txt").is_file());
+	assert!(fixture.consumer.join("modules/two/file.txt").is_file());
+	assert_eq!(std::fs::read(&first_module_config).unwrap(), first_before);
+	assert_eq!(std::fs::read(&second_module_config).unwrap(), second_before);
+	assert_eq!(std::fs::read(&contained_target).unwrap(), super_before);
+	assert!(
+		std::fs::symlink_metadata(&config)
+			.unwrap()
+			.file_type()
+			.is_symlink(),
+		"preflight must preserve the shared config symlink",
+	);
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
+
+	let external_target = fixture.root.join("external-superproject-config");
+	std::fs::remove_file(&config).unwrap();
+	std::fs::rename(&contained_target, &external_target).unwrap();
+	std::os::unix::fs::symlink(&external_target, &config).unwrap();
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			false,
+			&["submodule", "deinit", "--force", "--all"],
+		),
+		"deinit through external shared config symlink",
+	);
+	assert_eq!(
+		std::fs::read_dir(fixture.consumer.join("modules/one"))
+			.unwrap()
+			.count(),
+		0,
+	);
+	assert_eq!(
+		std::fs::read_dir(fixture.consumer.join("modules/two"))
+			.unwrap()
+			.count(),
+		0,
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_all_rejects_a_module_config_target_inside_another_checkout_before_mutation() {
+	let fixture = Fixture::new("deinit-preflight-cross-module-config-containment");
+	add_second_module_mapping(&fixture);
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initialize both modules",
+	);
+	let first_config = git_path(&fixture.consumer, "modules/one/config");
+	let second_config = git_path(&fixture.consumer, "modules/two/config");
+	let contained_target = fixture.consumer.join("modules/two/one-config-real");
+	std::fs::rename(&first_config, &contained_target).unwrap();
+	std::os::unix::fs::symlink(&contained_target, &first_config).unwrap();
+	let first_before = std::fs::read(&contained_target).unwrap();
+	let second_before = std::fs::read(&second_config).unwrap();
+	let super_before = std::fs::read(fixture.consumer.join(".git/config")).unwrap();
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "--force", "--all"],
+	);
+	assert!(
+		!refused.status.success(),
+		"cross-module config target must fail"
+	);
+	assert!(
+		stderr(&refused).contains("module config target is inside the selected checkout"),
+		"unexpected diagnostic: {}",
+		stderr(&refused),
+	);
+	assert!(fixture.consumer.join("modules/one/.git").is_file());
+	assert!(fixture.consumer.join("modules/two/.git").is_file());
+	assert_eq!(std::fs::read(&contained_target).unwrap(), first_before);
+	assert_eq!(std::fs::read(&second_config).unwrap(), second_before);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".git/config")).unwrap(),
+		super_before
+	);
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
+}
+
+#[test]
+fn deinit_all_rejects_a_module_include_inside_another_selected_checkout() {
+	let fixture = Fixture::new("deinit-cross-module-config-include");
+	add_second_module_mapping(&fixture);
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initialize both modules",
+	);
+	let first_config = git_path(&fixture.consumer, "modules/one/config");
+	let second_config = git_path(&fixture.consumer, "modules/two/config");
+	let included = fixture.consumer.join("modules/two/one-effective.inc");
+	std::fs::write(&included, "[core]\n\texcludesFile = absent/ignore\n").unwrap();
+	let mut first_before = std::fs::read_to_string(&first_config).unwrap();
+	first_before.push_str(&format!("[include]\n\tpath = {}\n", included.display()));
+	std::fs::write(&first_config, &first_before).unwrap();
+	let second_before = std::fs::read(&second_config).unwrap();
+	let super_before = std::fs::read(fixture.consumer.join(".git/config")).unwrap();
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "--force", "--all"],
+	);
+	assert!(!refused.status.success(), "cross-module include must fail");
+	assert!(
+		stderr(&refused).contains("effective config input"),
+		"unexpected diagnostic: {}",
+		stderr(&refused)
+	);
+	assert!(fixture.consumer.join("modules/one/.git").is_file());
+	assert!(fixture.consumer.join("modules/two/.git").is_file());
+	assert_eq!(
+		std::fs::read_to_string(&first_config).unwrap(),
+		first_before
+	);
+	assert_eq!(std::fs::read(&second_config).unwrap(), second_before);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".git/config")).unwrap(),
+		super_before
+	);
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_rejects_aliased_module_and_superproject_config_targets_before_mutation() {
+	let fixture = Fixture::new("deinit-aliased-config-targets");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_config = git_path(&fixture.consumer, "modules/one/config");
+	let super_config = fixture.consumer.join(".git/config");
+	let control = git_path(&fixture.consumer, "gitana-submodule-deinit");
+	let shared_config = fixture.root.join("aliased-config");
+	let mut shared_bytes = std::fs::read(&module_config).unwrap();
+	shared_bytes.extend_from_slice(
+		format!(
+			"\n[submodule \"one\"]\n\turl = {}\n\tactive = true\n",
+			fixture.source.display()
+		)
+		.as_bytes(),
+	);
+	std::fs::write(&shared_config, &shared_bytes).unwrap();
+	std::fs::remove_file(&module_config).unwrap();
+	std::fs::remove_file(&super_config).unwrap();
+	std::os::unix::fs::symlink(&shared_config, &module_config).unwrap();
+	std::os::unix::fs::symlink(&shared_config, &super_config).unwrap();
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "--force", "modules/one"],
+	);
+	assert!(
+		!refused.status.success(),
+		"aliased config targets must fail"
+	);
+	assert!(
+		stderr(&refused)
+			.contains("deinit config targets for module 'one' and superproject resolve to the same file"),
+		"unexpected diagnostic: {}",
+		stderr(&refused),
+	);
+	assert_eq!(std::fs::read(&shared_config).unwrap(), shared_bytes);
+	assert!(fixture.consumer.join("modules/one/.git").is_file());
+	assert!(fixture.consumer.join("modules/one/file.txt").is_file());
+	assert!(!control.exists(), "alias preflight must publish no intent");
+}
+
+#[test]
+fn deinit_rejects_every_worktree_local_core_worktree_override() {
+	for (tag, use_equivalent_override) in [
+		("deinit-worktree-config-foreign", false),
+		("deinit-worktree-config-equivalent", true),
+	] {
+		let fixture = Fixture::new(tag);
+		assert_success(
+			&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+			"initial update",
+		);
+		let module = git_path(&fixture.consumer, "modules/one");
+		let expected = git(
+			&module,
+			&["config", "--file", "config", "--get", "core.worktree"],
+		);
+		git_ok(
+			&module,
+			&[
+				"config",
+				"--file",
+				"config",
+				"extensions.worktreeConfig",
+				"true",
+			],
+		);
+		let override_value = if use_equivalent_override {
+			expected.trim()
+		} else {
+			"sentinel"
+		};
+		std::fs::write(
+			module.join("config.worktree"),
+			format!("[core]\n\tworktree = {override_value}\n"),
+		)
+		.unwrap();
+		let module_before = std::fs::read(module.join("config")).unwrap();
+		let worktree_before = std::fs::read(module.join("config.worktree")).unwrap();
+		let super_before = std::fs::read(fixture.consumer.join(".git/config")).unwrap();
+
+		let deinit = gta(
+			&fixture.consumer,
+			false,
+			&["submodule", "deinit", "--force", "modules/one"],
+		);
+		assert!(!deinit.status.success(), "worktree override must fail");
+		assert!(
+			stderr(&deinit).contains("worktree-local config defines core.worktree"),
+			"unexpected error: {}",
+			stderr(&deinit)
+		);
+		assert!(fixture.consumer.join("modules/one/.git").is_file());
+		assert_eq!(std::fs::read(module.join("config")).unwrap(), module_before);
+		assert_eq!(
+			std::fs::read(module.join("config.worktree")).unwrap(),
+			worktree_before
+		);
+		assert_eq!(
+			std::fs::read(fixture.consumer.join(".git/config")).unwrap(),
+			super_before
+		);
+		assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
+	}
+}
+
+#[test]
+fn deinit_rejects_an_included_core_worktree_that_would_survive_the_base_edit() {
+	let fixture = Fixture::new("deinit-included-worktree");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = git_path(&fixture.consumer, "modules/one");
+	let expected = git(
+		&module,
+		&["config", "--file", "config", "--get", "core.worktree"],
+	);
+	std::fs::write(
+		module.join("attachment.inc"),
+		format!("[core]\n\tworktree = {}\n", expected.trim()),
+	)
+	.unwrap();
+	let mut base = std::fs::read_to_string(module.join("config")).unwrap();
+	base.push_str("[include]\n\tpath = attachment.inc\n");
+	std::fs::write(module.join("config"), &base).unwrap();
+	let super_before = std::fs::read(fixture.consumer.join(".git/config")).unwrap();
+
+	let deinit = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "--force", "modules/one"],
+	);
+	assert!(!deinit.status.success(), "surviving include must fail");
+	assert!(
+		stderr(&deinit).contains("would still define core.worktree"),
+		"unexpected error: {}",
+		stderr(&deinit)
+	);
+	assert!(fixture.consumer.join("modules/one/.git").is_file());
+	assert_eq!(
+		std::fs::read_to_string(module.join("config")).unwrap(),
+		base
+	);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".git/config")).unwrap(),
+		super_before
+	);
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
+}
+
+#[test]
+fn deinit_rejects_an_effective_config_include_inside_the_selected_checkout() {
+	let fixture = Fixture::new("deinit-checkout-contained-include");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let checkout = fixture.consumer.join("modules/one");
+	let module = git_path(&fixture.consumer, "modules/one");
+	let included = checkout.join("effective.inc");
+	std::fs::write(&included, "[core]\n\texcludesFile = absent/ignore\n").unwrap();
+	let mut module_config = std::fs::read_to_string(module.join("config")).unwrap();
+	module_config.push_str(&format!("[include]\n\tpath = {}\n", included.display()));
+	std::fs::write(module.join("config"), &module_config).unwrap();
+	let super_before = std::fs::read(fixture.consumer.join(".git/config")).unwrap();
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "--force", "modules/one"],
+	);
+	assert!(
+		!refused.status.success(),
+		"checkout-contained include must fail"
+	);
+	assert!(
+		stderr(&refused).contains("effective config input"),
+		"unexpected diagnostic: {}",
+		stderr(&refused)
+	);
+	assert!(checkout.join(".git").is_file());
+	assert_eq!(
+		std::fs::read_to_string(module.join("config")).unwrap(),
+		module_config
+	);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".git/config")).unwrap(),
+		super_before
+	);
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
+}
+
+#[test]
+fn deinit_accepts_equivalent_core_worktree_path_spellings() {
+	for (tag, absolute) in [
+		("deinit-worktree-absolute", true),
+		("deinit-worktree-dotted", false),
+	] {
+		let fixture = Fixture::new(tag);
+		assert_success(
+			&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+			"initial update",
+		);
+		let module = git_path(&fixture.consumer, "modules/one");
+		let current = git(
+			&module,
+			&["config", "--file", "config", "--get", "core.worktree"],
+		);
+		let spelling = if absolute {
+			fixture
+				.consumer
+				.join("modules/one")
+				.to_string_lossy()
+				.into_owned()
+		} else {
+			format!("./{}/../one", current.trim())
+		};
+		git_ok(
+			&module,
+			&["config", "--file", "config", "core.worktree", &spelling],
+		);
+
+		let deinit = gta(
+			&fixture.consumer,
+			false,
+			&["submodule", "deinit", "modules/one"],
+		);
+		assert_success(&deinit, "deinit with equivalent core.worktree spelling");
+		assert_eq!(
+			std::fs::read_dir(fixture.consumer.join("modules/one"))
+				.unwrap()
+				.count(),
+			0
+		);
+	}
+}
+
+#[test]
+fn deinit_rechecks_worktree_relative_excludes_through_the_displaced_mount() {
+	let fixture = Fixture::new("deinit-relative-excludes");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let checkout = fixture.consumer.join("modules/one");
+	git_ok(&checkout, &["config", "core.excludesFile", "local.ignore"]);
+	std::fs::write(
+		checkout.join("local.ignore"),
+		b"local.ignore\nignored-after-swap\n",
+	)
+	.unwrap();
+	std::fs::write(checkout.join("ignored-after-swap"), b"retained\n").unwrap();
+
+	let deinit = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&deinit, "deinit with worktree-local excludes");
+	let retired = retired_checkout(&git_path(&fixture.consumer, "modules/one"));
+	assert_eq!(
+		std::fs::read_to_string(retired.join("ignored-after-swap")).unwrap(),
+		"retained\n"
+	);
+}
+
+#[test]
+fn deinit_rechecks_absolute_in_worktree_excludes_through_the_displaced_mount() {
+	let fixture = Fixture::new("deinit-absolute-excludes");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let checkout = fixture.consumer.join("modules/one");
+	let excludes = checkout.join("local.ignore");
+	git_ok(
+		&checkout,
+		&["config", "core.excludesFile", excludes.to_str().unwrap()],
+	);
+	std::fs::write(&excludes, b"local.ignore\nignored-after-swap\n").unwrap();
+	std::fs::write(checkout.join("ignored-after-swap"), b"retained\n").unwrap();
+
+	let deinit = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&deinit, "deinit with absolute worktree-local excludes");
+	let retired = retired_checkout(&git_path(&fixture.consumer, "modules/one"));
+	assert_eq!(
+		std::fs::read_to_string(retired.join("ignored-after-swap")).unwrap(),
+		"retained\n"
+	);
+}
+
+#[test]
+fn deinit_treats_a_missing_relative_excludes_parent_as_absent() {
+	let fixture = Fixture::new("deinit-missing-excludes-parent");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let checkout = fixture.consumer.join("modules/one");
+	git_ok(&checkout, &["config", "core.excludesFile", "absent/ignore"]);
+	assert!(!checkout.join("absent").exists());
+
+	let deinit = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&deinit, "deinit with an absent excludes file");
+}
+
+#[test]
+fn deinit_rejects_a_relative_excludes_directory() {
+	let fixture = Fixture::new("deinit-excludes-directory");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let checkout = fixture.consumer.join("modules/one");
+	git_ok(&checkout, &["config", "core.excludesFile", "exclude-dir"]);
+	std::fs::create_dir(checkout.join("exclude-dir")).unwrap();
+
+	let deinit = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(!deinit.status.success(), "an excludes directory must fail");
+	assert!(
+		stderr(&deinit).contains("cannot use") && stderr(&deinit).contains("as an exclude file"),
+		"unexpected error: {}",
+		stderr(&deinit)
+	);
+	assert!(checkout.join("file.txt").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_recovery_refuses_content_created_in_the_public_empty_mount() {
+	let fixture = Fixture::new("deinit-public-mount-race");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.public-mount-race";
+	let retired_name = ".gitana-submodule-deinit-retired.public-mount-race";
+	let prepared = parent.join(prepared_name);
+	let retired = module_git_dir.join(retired_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-public-mount-race-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::rename(&prepared, &retired).unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"retired",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		Some("module_repository"),
+	);
+	std::fs::write(target.join("concurrent"), b"foreign\n").unwrap();
+	let module_before = std::fs::read(module_git_dir.join("config")).unwrap();
+	let super_before = std::fs::read(fixture.consumer.join(".git/config")).unwrap();
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!refused.status.success(),
+		"concurrent public content must fail"
+	);
+	assert_eq!(
+		std::fs::read(module_git_dir.join("config")).unwrap(),
+		module_before
+	);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".git/config")).unwrap(),
+		super_before
+	);
+	assert!(git_path(&fixture.consumer, "gitana-submodule-deinit").is_dir());
+
+	std::fs::remove_file(target.join("concurrent")).unwrap();
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&recovered, "retry after removing public obstruction");
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_recovery_rechecks_the_public_mount_after_config_publication() {
+	let fixture = Fixture::new("deinit-terminal-mount-race");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.terminal-mount-race";
+	let retired_name = ".gitana-submodule-deinit-retired.terminal-mount-race";
+	let prepared = parent.join(prepared_name);
+	let retired = module_git_dir.join(retired_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-terminal-mount-race-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::rename(&prepared, &retired).unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"retired",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		Some("module_repository"),
+	);
+	let module_publication =
+		publish_deinit_config_for_test(&module_git_dir.join("config"), "module", |config| {
+			config.unset("core", None, "worktree");
+		});
+	let super_publication =
+		publish_deinit_config_for_test(&fixture.consumer.join(".git/config"), "super", |config| {
+			config.remove_subsection("submodule", "one");
+		});
+	let control = git_path(&fixture.consumer, "gitana-submodule-deinit");
+	let mut intent: serde_json::Value =
+		serde_json::from_slice(&std::fs::read(control.join("intent.json")).unwrap()).unwrap();
+	intent["phase"] = serde_json::json!("super_config_applied");
+	intent["module_publication"] = module_publication;
+	intent["super_publication"] = super_publication;
+	std::fs::write(
+		control.join("intent.json"),
+		serde_json::to_vec(&intent).unwrap(),
+	)
+	.unwrap();
+	std::fs::write(target.join("concurrent"), b"foreign\n").unwrap();
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!refused.status.success(),
+		"terminal public content must fail"
+	);
+	assert!(control.is_dir(), "terminal failure must retain recovery");
+	assert!(
+		!std::fs::read_to_string(module_git_dir.join("config"))
+			.unwrap()
+			.contains("worktree")
+	);
+	assert!(
+		!std::fs::read_to_string(fixture.consumer.join(".git/config"))
+			.unwrap()
+			.contains("[submodule \"one\"]")
+	);
+
+	std::fs::remove_file(target.join("concurrent")).unwrap();
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&recovered, "terminal mount retry");
+}
+
+#[test]
+fn pending_deinit_recovery_blocks_mutations_but_not_status() {
+	let fixture = Fixture::new("deinit-recovery-routing");
+	let control = git_path(&fixture.consumer, "gitana-submodule-deinit");
+	std::fs::create_dir(&control).unwrap();
+
+	let init = gta(&fixture.consumer, false, &["submodule", "init"]);
+	assert!(
+		!init.status.success(),
+		"init must not bypass deinit recovery"
+	);
+	assert!(stderr(&init).contains("must be completed with 'gta submodule deinit'"));
+
+	let update = gta(&fixture.consumer, false, &["submodule", "update"]);
+	assert!(
+		!update.status.success(),
+		"update must not bypass deinit recovery"
+	);
+	assert!(stderr(&update).contains("must be completed with 'gta submodule deinit'"));
+
+	let status = gta(&fixture.consumer, false, &["submodule", "status"]);
+	assert_success(&status, "read-only status during recovery");
+	assert_eq!(stdout(&status), format!("-{} modules/one\n", fixture.old));
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_worktree_deinit_intent_blocks_shared_config_mutations() {
+	use std::os::unix::fs::MetadataExt as _;
+
+	let fixture = Fixture::new("deinit-linked-mutation-gate");
+	let owner = fixture.root.join("deinit-owner");
+	let sibling = fixture.root.join("deinit-sibling");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"worktree",
+			"add",
+			"-q",
+			"-b",
+			"deinit-mutation-owner",
+			owner.to_str().unwrap(),
+		],
+	);
+	git_ok(
+		&fixture.consumer,
+		&[
+			"worktree",
+			"add",
+			"-q",
+			"-b",
+			"deinit-mutation-sibling",
+			sibling.to_str().unwrap(),
+		],
+	);
+	assert_success(
+		&gta(&owner, true, &["submodule", "update", "--init"]),
+		"initial owner update",
+	);
+	git_ok(&owner, &["config", "--remove-section", "submodule.one"]);
+
+	let module_git_dir = git_path(&owner, "modules/one");
+	let parent = owner.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.linked-mutation-gate";
+	let retired_name = ".gitana-submodule-deinit-retired.linked-mutation-gate";
+	let prepared = parent.join(prepared_name);
+	let retired = module_git_dir.join(retired_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-linked-mutation-gate-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::rename(&prepared, &retired).unwrap();
+	write_deinit_intent_v4_at(
+		&owner,
+		&fixture.old,
+		"retired",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		Some("module_repository"),
+	);
+
+	let shared_config = git_path(&owner, "config");
+	let before = std::fs::read(&shared_config).unwrap();
+	let before_metadata = std::fs::symlink_metadata(&shared_config).unwrap();
+	for args in [
+		vec!["submodule", "init"],
+		vec!["submodule", "update", "--init"],
+		vec!["submodule", "deinit", "modules/one"],
+	] {
+		let refused = gta(&sibling, true, &args);
+		assert!(
+			!refused.status.success(),
+			"sibling mutation must not bypass the owner's deinit: {args:?}"
+		);
+		assert!(
+			stderr(&refused).contains("pending submodule deinit"),
+			"unexpected error for {args:?}: {}",
+			stderr(&refused)
+		);
+		let after_metadata = std::fs::symlink_metadata(&shared_config).unwrap();
+		assert_eq!(after_metadata.dev(), before_metadata.dev());
+		assert_eq!(after_metadata.ino(), before_metadata.ino());
+		assert_eq!(std::fs::read(&shared_config).unwrap(), before);
+	}
+
+	let recovered = gta(&owner, false, &["submodule", "deinit", "modules/one"]);
+	assert_success(&recovered, "resume the owning linked-worktree deinit");
+	assert!(!git_path(&owner, "gitana-submodule-deinit").exists());
+	assert!(retired.join("file.txt").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_worktree_config_writers_preserve_a_prepublication_deinit_intent() {
+	use std::os::unix::fs::MetadataExt as _;
+
+	let fixture = Fixture::new("deinit-linked-config-writer-gate");
+	let owner = fixture.root.join("deinit-config-owner");
+	let sibling = fixture.root.join("deinit-config-sibling");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"worktree",
+			"add",
+			"-q",
+			"-b",
+			"deinit-config-owner",
+			owner.to_str().unwrap(),
+		],
+	);
+	git_ok(
+		&fixture.consumer,
+		&[
+			"worktree",
+			"add",
+			"-q",
+			"-b",
+			"deinit-config-sibling",
+			sibling.to_str().unwrap(),
+		],
+	);
+	assert_success(
+		&gta(&owner, true, &["submodule", "update", "--init"]),
+		"initial owner update",
+	);
+
+	let module_git_dir = git_path(&owner, "modules/one");
+	let parent = owner.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.config-writer-gate";
+	let retired_name = ".gitana-submodule-deinit-retired.config-writer-gate";
+	let prepared = parent.join(prepared_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	write_deinit_intent_v4_at(
+		&owner,
+		&fixture.old,
+		"prepared",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		None,
+	);
+
+	let shared_config = git_path(&owner, "config");
+	let before = std::fs::read(&shared_config).unwrap();
+	let before_metadata = std::fs::symlink_metadata(&shared_config).unwrap();
+
+	assert_success(
+		&gta(
+			&sibling,
+			true,
+			&["config", "--local", "--get", "submodule.one.url"],
+		),
+		"serialized config read during recovery",
+	);
+	assert_success(
+		&gta(&sibling, true, &["remote"]),
+		"serialized remote read during recovery",
+	);
+	assert_success(
+		&gta(&sibling, true, &["sparse-checkout", "reapply"]),
+		"sparse reapply without a shared-config write",
+	);
+
+	for args in [
+		vec!["config", "--local", "test.pending", "value"],
+		vec![
+			"remote",
+			"add",
+			"blocked",
+			"https://example.invalid/blocked",
+		],
+		vec!["sparse-checkout", "init"],
+	] {
+		let refused = gta(&sibling, true, &args);
+		assert!(
+			!refused.status.success(),
+			"shared-config writer must not bypass the owner's deinit: {args:?}"
+		);
+		assert!(
+			stderr(&refused).contains("pending submodule deinit"),
+			"unexpected error for {args:?}: {}",
+			stderr(&refused)
+		);
+		let after_metadata = std::fs::symlink_metadata(&shared_config).unwrap();
+		assert_eq!(after_metadata.dev(), before_metadata.dev());
+		assert_eq!(after_metadata.ino(), before_metadata.ino());
+		assert_eq!(std::fs::read(&shared_config).unwrap(), before);
+	}
+
+	let recovered = gta(&owner, false, &["submodule", "deinit", "modules/one"]);
+	assert_success(&recovered, "resume the prepublication deinit");
+	assert!(!git_path(&owner, "gitana-submodule-deinit").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_resumes_a_durable_post_swap_intent() {
+	use std::os::unix::fs::MetadataExt as _;
+
+	let fixture = Fixture::new("deinit-resume");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let module_config_path = module_git_dir.join("config");
+	let super_config_path = fixture.consumer.join(".git/config");
+	let core_worktree = git(&module_git_dir, &["config", "--get", "core.worktree"])
+		.trim()
+		.to_owned();
+	let module_transition = deinit_transition(&module_config_path, |config| {
+		config.unset("core", None, "worktree");
+	});
+	let super_transition = deinit_transition(&super_config_path, |config| {
+		config.remove_subsection("submodule", "one");
+	});
+
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.recovery-test";
+	let retired_name = ".gitana-submodule-deinit-retired.recovery-test";
+	let prepared = parent.join(prepared_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-test-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+
+	let control = git_path(&fixture.consumer, "gitana-submodule-deinit");
+	std::fs::create_dir(&control).unwrap();
+	std::fs::write(
+		control.join("intent.json"),
+		serde_json::to_vec(&serde_json::json!({
+				"version": 4,
+				"phase": "detached",
+			"name": "one",
+			"path": "modules/one",
+			"recorded": fixture.old,
+			"force": false,
+			"core_worktree": core_worktree,
+			"module_transition": module_transition,
+			"module_publication": null,
+			"super_transition": super_transition,
+			"super_publication": null,
+			"parent": "modules",
+			"target": "one",
+				"prepared": prepared_name,
+				"displaced": prepared_name,
+				"retired": retired_name,
+				"rollback": null,
+				"retirement_location": null,
+			"mount_identity": {
+				"device": mount_metadata.dev(),
+				"inode": mount_metadata.ino()
+			},
+				"prepared_identity": {
+					"device": prepared_metadata.dev(),
+					"inode": prepared_metadata.ino()
+				},
+				"public_identity": {
+					"device": prepared_metadata.dev(),
+					"inode": prepared_metadata.ino()
+				},
+				"module_identity": {
+					"device": module_metadata.dev(),
+					"inode": module_metadata.ino()
+				}
+		}))
+		.unwrap(),
+	)
+	.unwrap();
+
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&recovered, "resume post-swap deinit intent");
+	assert_eq!(stdout(&recovered), "Cleared directory 'modules/one'\n");
+	assert!(!prepared.exists(), "the displaced checkout is retired");
+	assert!(
+		module_git_dir.join(retired_name).is_dir(),
+		"the checkout is preserved under the recorded retirement name"
+	);
+	assert!(!control.exists(), "the active deinit journal is retired");
+	assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_post_swap_recovery_rolls_back_a_clean_checkout_at_the_wrong_commit() {
+	let fixture = Fixture::new("deinit-post-swap-wrong-head");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let checkout = fixture.consumer.join("modules/one");
+	std::fs::write(checkout.join("file.txt"), b"local commit\n").unwrap();
+	git_ok(&checkout, &["add", "file.txt"]);
+	commit(&checkout, "local module commit");
+	assert!(git(&checkout, &["status", "--porcelain"]).trim().is_empty());
+
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.wrong-head";
+	let retired_name = ".gitana-submodule-deinit-retired.wrong-head";
+	let prepared = parent.join(prepared_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-wrong-head-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"detached",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		None,
+	);
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!refused.status.success(),
+		"post-swap divergent HEAD must fail"
+	);
+	assert!(stderr(&refused).contains("contains local modifications"));
+	assert_eq!(
+		std::fs::read_to_string(target.join("file.txt")).unwrap(),
+		"local commit\n"
+	);
+	assert!(
+		!prepared.exists(),
+		"lossless rollback restores the original mount"
+	);
+	assert!(
+		!git_path(&fixture.consumer, "gitana-submodule-deinit").exists(),
+		"completed rollback retires the intent"
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_recovery_preserves_writes_through_a_retained_file_descriptor() {
+	use std::io::{Seek as _, SeekFrom, Write as _};
+
+	let fixture = Fixture::new("deinit-retained-descriptor");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.retained-descriptor";
+	let retired_name = ".gitana-submodule-deinit-retired.retained-descriptor";
+	let prepared = parent.join(prepared_name);
+	let retired = module_git_dir.join(retired_name);
+	let mut retained_file = std::fs::OpenOptions::new()
+		.write(true)
+		.open(target.join("file.txt"))
+		.unwrap();
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-retained-descriptor-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::rename(&prepared, &retired).unwrap();
+
+	retained_file.seek(SeekFrom::Start(0)).unwrap();
+	retained_file.write_all(b"written after proof\n").unwrap();
+	retained_file.set_len(20).unwrap();
+	retained_file.sync_all().unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"retiring",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		None,
+	);
+
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&recovered, "resume checkout retirement");
+	assert_eq!(
+		std::fs::read_to_string(retired.join("file.txt")).unwrap(),
+		"written after proof\n"
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_recovery_accepts_a_recorded_cross_filesystem_sibling_retirement() {
+	let fixture = Fixture::new("deinit-sibling-retirement");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.sibling-retirement";
+	let retired_name = ".gitana-submodule-deinit-retired.sibling-retirement";
+	let prepared = parent.join(prepared_name);
+	let retired = parent.join(retired_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-sibling-retirement-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::rename(&prepared, &retired).unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"retired",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		Some("worktree_sibling"),
+	);
+
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&recovered, "resume sibling retirement");
+	assert_eq!(
+		std::fs::read_to_string(retired.join("file.txt")).unwrap(),
+		"old\n"
+	);
+	assert_eq!(std::fs::read_dir(target).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_recovery_rewrites_a_partial_journaled_module_config_reservation() {
+	let fixture = Fixture::new("deinit-module-config-recovery");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.module-config";
+	let retired_name = ".gitana-submodule-deinit-retired.module-config";
+	let prepared = parent.join(prepared_name);
+	let retired = module_git_dir.join(retired_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-module-config-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::rename(&prepared, &retired).unwrap();
+	let config_publication = module_git_dir.join(".gitana-config-prepared.recovery-test");
+	std::fs::write(&config_publication, b"partial config image").unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"module_config_reserved",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		Some(&config_publication),
+		Some("module_repository"),
+	);
+
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&recovered, "rewrite and resume the reserved module config");
+	assert!(retired.join("file.txt").is_file());
+	assert!(
+		!std::fs::read_to_string(fixture.consumer.join(".git/config"))
+			.unwrap()
+			.contains("[submodule \"one\"]")
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_submodule_status_restores_a_displaced_module_config_before_validation() {
+	let fixture = Fixture::new("deinit-displaced-module-config");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.displaced-module-config";
+	let retired_name = ".gitana-submodule-deinit-retired.displaced-module-config";
+	let prepared = parent.join(prepared_name);
+	let retired = module_git_dir.join(retired_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-displaced-module-config-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::rename(&prepared, &retired).unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"retired",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		Some("module_repository"),
+	);
+	let module_publication = prepare_displaced_deinit_config_for_test(
+		&module_git_dir.join("config"),
+		"module-displaced",
+		|config| {
+			config.unset("core", None, "worktree");
+		},
+	);
+	let control = git_path(&fixture.consumer, "gitana-submodule-deinit");
+	let mut intent: serde_json::Value =
+		serde_json::from_slice(&std::fs::read(control.join("intent.json")).unwrap()).unwrap();
+	intent["phase"] = serde_json::json!("module_config_prepared");
+	intent["module_publication"] = module_publication;
+	std::fs::write(
+		control.join("intent.json"),
+		serde_json::to_vec(&intent).unwrap(),
+	)
+	.unwrap();
+	assert!(!module_git_dir.join("config").exists());
+	let status = gta(&fixture.consumer, false, &["submodule", "status"]);
+	assert_success(
+		&status,
+		"submodule status after restoring the displaced module config",
+	);
+	assert!(module_git_dir.join("config").is_file());
+	assert!(
+		control.is_dir(),
+		"setup restoration must not advance the deinit intent"
+	);
+
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&recovered, "restore and resume displaced module config");
+	assert!(!control.exists());
+	assert!(module_git_dir.join("config").is_file());
+	assert!(retired.join("file.txt").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_command_setup_restores_a_displaced_superproject_config_without_advancing_deinit() {
+	let fixture = Fixture::new("deinit-displaced-super-config");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.displaced-super-config";
+	let retired_name = ".gitana-submodule-deinit-retired.displaced-super-config";
+	let prepared = parent.join(prepared_name);
+	let retired = module_git_dir.join(retired_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-displaced-super-config-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::rename(&prepared, &retired).unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"retired",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		Some("module_repository"),
+	);
+	let module_publication =
+		publish_deinit_config_for_test(&module_git_dir.join("config"), "module-setup", |config| {
+			config.unset("core", None, "worktree");
+		});
+	let super_config = fixture.consumer.join(".git/config");
+	let super_publication =
+		prepare_displaced_deinit_config_for_test(&super_config, "super-displaced", |config| {
+			config.remove_subsection("submodule", "one");
+		});
+	let control = git_path(&fixture.consumer, "gitana-submodule-deinit");
+	let mut intent: serde_json::Value =
+		serde_json::from_slice(&std::fs::read(control.join("intent.json")).unwrap()).unwrap();
+	intent["phase"] = serde_json::json!("super_config_prepared");
+	intent["module_publication"] = module_publication;
+	intent["super_publication"] = super_publication;
+	std::fs::write(
+		control.join("intent.json"),
+		serde_json::to_vec(&intent).unwrap(),
+	)
+	.unwrap();
+	assert!(!super_config.exists());
+
+	let status = gta(&fixture.consumer, false, &["status"]);
+	assert_success(&status, "ordinary status after restoring the setup config");
+	assert!(super_config.is_file());
+	assert!(
+		control.is_dir(),
+		"status must not advance the deinit intent"
+	);
+	let init = gta(&fixture.consumer, false, &["submodule", "init"]);
+	assert!(
+		!init.status.success(),
+		"init must still report pending recovery"
+	);
+	assert!(stderr(&init).contains("must be completed with 'gta submodule deinit'"));
+
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(
+		&recovered,
+		"resume after setup restored superproject config",
+	);
+	assert!(!control.exists());
+	assert!(retired.join("file.txt").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn worktree_list_restores_a_displaced_symlinked_superproject_config() {
+	use std::os::unix::fs::symlink;
+
+	let fixture = Fixture::new("worktree-list-displaced-symlinked-super-config");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.worktree-list-symlink";
+	let retired_name = ".gitana-submodule-deinit-retired.worktree-list-symlink";
+	let prepared = parent.join(prepared_name);
+	let retired = module_git_dir.join(retired_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-worktree-list-symlink-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::rename(&prepared, &retired).unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"retired",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		Some("module_repository"),
+	);
+	let module_publication =
+		publish_deinit_config_for_test(&module_git_dir.join("config"), "module-list", |config| {
+			config.unset("core", None, "worktree");
+		});
+
+	let super_config = fixture.consumer.join(".git/config");
+	let external_config = fixture.root.join("worktree-list-config-real");
+	std::fs::rename(&super_config, &external_config).unwrap();
+	symlink("../../worktree-list-config-real", &super_config).unwrap();
+	let super_transition = symlinked_deinit_transition(&super_config, &external_config, |config| {
+		config.remove_subsection("submodule", "one");
+	});
+	let super_publication =
+		prepare_displaced_deinit_config_for_test(&external_config, "super-list-symlink", |config| {
+			config.remove_subsection("submodule", "one");
+		});
+	let control = git_path(&fixture.consumer, "gitana-submodule-deinit");
+	let mut intent: serde_json::Value =
+		serde_json::from_slice(&std::fs::read(control.join("intent.json")).unwrap()).unwrap();
+	intent["phase"] = serde_json::json!("super_config_prepared");
+	intent["module_publication"] = module_publication;
+	intent["super_transition"] = super_transition;
+	intent["super_publication"] = super_publication;
+	std::fs::write(
+		control.join("intent.json"),
+		serde_json::to_vec(&intent).unwrap(),
+	)
+	.unwrap();
+	assert!(super_config.is_symlink());
+	assert!(!external_config.exists());
+
+	let listed = gta(
+		&fixture.consumer,
+		false,
+		&["worktree", "list", "--porcelain"],
+	);
+	assert_success(
+		&listed,
+		"worktree list after restoring symlinked config target",
+	);
+	assert!(external_config.is_file());
+	assert!(super_config.is_symlink());
+	assert!(
+		control.is_dir(),
+		"worktree list must not advance the deinit intent"
+	);
+
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&recovered, "resume after worktree list restored config");
+	assert!(!control.exists());
+	assert!(retired.join("file.txt").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_command_in_a_sibling_worktree_restores_the_owning_deinit_config() {
+	let fixture = Fixture::new("deinit-sibling-command-setup");
+	let owner = fixture.root.join("owner-worktree");
+	let sibling = fixture.root.join("sibling-worktree");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"worktree",
+			"add",
+			"-q",
+			"-b",
+			"deinit-owner",
+			owner.to_str().unwrap(),
+		],
+	);
+	git_ok(
+		&fixture.consumer,
+		&[
+			"worktree",
+			"add",
+			"-q",
+			"-b",
+			"deinit-sibling",
+			sibling.to_str().unwrap(),
+		],
+	);
+	assert_success(
+		&gta(&owner, true, &["submodule", "update", "--init"]),
+		"initial linked-worktree update",
+	);
+
+	let module_git_dir = git_path(&owner, "modules/one");
+	let parent = owner.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.sibling-command-setup";
+	let retired_name = ".gitana-submodule-deinit-retired.sibling-command-setup";
+	let prepared = parent.join(prepared_name);
+	let retired = module_git_dir.join(retired_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-sibling-command-setup-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::rename(&prepared, &retired).unwrap();
+	write_deinit_intent_v4_at(
+		&owner,
+		&fixture.old,
+		"retired",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		Some("module_repository"),
+	);
+	let module_publication =
+		publish_deinit_config_for_test(&module_git_dir.join("config"), "sibling-module", |config| {
+			config.unset("core", None, "worktree");
+		});
+	let super_config = git_path(&owner, "config");
+	let super_publication =
+		prepare_displaced_deinit_config_for_test(&super_config, "sibling-super", |config| {
+			config.remove_subsection("submodule", "one");
+		});
+	let control = git_path(&owner, "gitana-submodule-deinit");
+	let mut intent: serde_json::Value =
+		serde_json::from_slice(&std::fs::read(control.join("intent.json")).unwrap()).unwrap();
+	intent["phase"] = serde_json::json!("super_config_prepared");
+	intent["module_publication"] = module_publication;
+	intent["super_publication"] = super_publication;
+	std::fs::write(
+		control.join("intent.json"),
+		serde_json::to_vec(&intent).unwrap(),
+	)
+	.unwrap();
+	assert!(!super_config.exists());
+
+	let status = gta(&sibling, false, &["status"]);
+	assert_success(
+		&status,
+		"sibling status after restoring the owning setup config",
+	);
+	assert!(super_config.is_file());
+	assert!(
+		control.is_dir(),
+		"status must not advance the owning intent"
+	);
+
+	let recovered = gta(&owner, false, &["submodule", "deinit", "modules/one"]);
+	assert_success(&recovered, "resume the owning linked-worktree deinit");
+	assert!(!control.exists());
+	assert!(retired.join("file.txt").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_command_in_a_bare_common_repository_restores_a_linked_deinit_config() {
+	let fixture = Fixture::new("deinit-bare-command-setup");
+	let bare = fixture.root.join("bare-consumer.git");
+	let owner = fixture.root.join("bare-owner-worktree");
+	git_ok(
+		&fixture.root,
+		&[
+			"clone",
+			"-q",
+			"--bare",
+			fixture.consumer.to_str().unwrap(),
+			bare.to_str().unwrap(),
+		],
+	);
+	git_ok(
+		&bare,
+		&[
+			"worktree",
+			"add",
+			"-q",
+			"-b",
+			"deinit-owner",
+			owner.to_str().unwrap(),
+		],
+	);
+	assert_success(
+		&gta(&owner, true, &["submodule", "update", "--init"]),
+		"initial bare-linked worktree update",
+	);
+
+	let module_git_dir = git_path(&owner, "modules/one");
+	let parent = owner.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.bare-command-setup";
+	let retired_name = ".gitana-submodule-deinit-retired.bare-command-setup";
+	let prepared = parent.join(prepared_name);
+	let retired = module_git_dir.join(retired_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-bare-command-setup-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::rename(&prepared, &retired).unwrap();
+	write_deinit_intent_v4_at(
+		&owner,
+		&fixture.old,
+		"retired",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		Some("module_repository"),
+	);
+	let module_publication =
+		publish_deinit_config_for_test(&module_git_dir.join("config"), "bare-module", |config| {
+			config.unset("core", None, "worktree");
+		});
+	let super_config = bare.join("config");
+	let super_publication =
+		prepare_displaced_deinit_config_for_test(&super_config, "bare-super", |config| {
+			config.remove_subsection("submodule", "one");
+		});
+	let control = git_path(&owner, "gitana-submodule-deinit");
+	let mut intent: serde_json::Value =
+		serde_json::from_slice(&std::fs::read(control.join("intent.json")).unwrap()).unwrap();
+	intent["phase"] = serde_json::json!("super_config_prepared");
+	intent["module_publication"] = module_publication;
+	intent["super_publication"] = super_publication;
+	std::fs::write(
+		control.join("intent.json"),
+		serde_json::to_vec(&intent).unwrap(),
+	)
+	.unwrap();
+	assert!(!super_config.exists());
+
+	let rev_parse = gta(&bare, false, &["rev-parse", "HEAD"]);
+	assert_success(
+		&rev_parse,
+		"ordinary bare command after restoring the linked-worktree config",
+	);
+	assert!(super_config.is_file());
+	assert!(
+		control.is_dir(),
+		"bootstrap must not advance the owning intent"
+	);
+
+	let recovered = gta(&owner, false, &["submodule", "deinit", "modules/one"]);
+	assert_success(&recovered, "resume the bare-linked worktree deinit");
+	assert!(!control.exists());
+	assert!(retired.join("file.txt").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_recovery_rejects_a_same_config_module_repository_replacement() {
+	let fixture = Fixture::new("deinit-module-replacement");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let module_config = std::fs::read(module_git_dir.join("config")).unwrap();
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.module-replacement";
+	let retired_name = ".gitana-submodule-deinit-retired.module-replacement";
+	let prepared = parent.join(prepared_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-module-replacement-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"detached",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		None,
+	);
+
+	let original_module = module_git_dir.with_file_name("one-original");
+	std::fs::rename(&module_git_dir, &original_module).unwrap();
+	std::fs::create_dir(&module_git_dir).unwrap();
+	std::fs::write(module_git_dir.join("config"), &module_config).unwrap();
+
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!recovered.status.success(),
+		"a replacement repository must fail"
+	);
+	assert_eq!(
+		std::fs::read(module_git_dir.join("config")).unwrap(),
+		module_config,
+		"the foreign same-config repository is not edited"
+	);
+	assert!(
+		prepared.join("file.txt").is_file(),
+		"the checkout remains recoverable"
+	);
+	assert!(
+		git_path(&fixture.consumer, "gitana-submodule-deinit").is_dir(),
+		"the intent remains pending"
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_recovery_rejects_a_new_worktree_local_attachment_override() {
+	let fixture = Fixture::new("deinit-worktree-config-recovery");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let checkout = fixture.consumer.join("modules/one");
+	git_ok(&checkout, &["config", "extensions.worktreeConfig", "true"]);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.worktree-config-recovery";
+	let retired_name = ".gitana-submodule-deinit-retired.worktree-config-recovery";
+	let prepared = parent.join(prepared_name);
+	let retired = module_git_dir.join(retired_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-worktree-config-recovery-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::rename(&prepared, &retired).unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"retired",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		Some("module_repository"),
+	);
+	let module_before = std::fs::read(module_git_dir.join("config")).unwrap();
+	let super_before = std::fs::read(fixture.consumer.join(".git/config")).unwrap();
+	std::fs::write(
+		module_git_dir.join("config.worktree"),
+		b"[core]\n\tworktree = ../../../foreign\n",
+	)
+	.unwrap();
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!refused.status.success(),
+		"a new worktree-local attachment must fail recovery"
+	);
+	assert_eq!(
+		std::fs::read(module_git_dir.join("config")).unwrap(),
+		module_before,
+		"the planned module config is not edited"
+	);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".git/config")).unwrap(),
+		super_before,
+		"the superproject registration is not edited"
+	);
+	assert!(retired.join("file.txt").is_file());
+	let control = git_path(&fixture.consumer, "gitana-submodule-deinit");
+	assert!(control.is_dir(), "the recovery intent remains pending");
+
+	std::fs::remove_file(module_git_dir.join("config.worktree")).unwrap();
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&recovered, "retry after removing the attachment override");
+	assert!(!control.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_recovery_finishes_a_journaled_dirty_rollback() {
+	let fixture = Fixture::new("deinit-rollback-recovery");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.rollback-recovery";
+	let retired_name = ".gitana-submodule-deinit-retired.rollback-recovery";
+	let prepared = parent.join(prepared_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-rollback-recovery-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::write(prepared.join("file.txt"), b"dirty after proof\n").unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"rolling_back",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		None,
+	);
+
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!recovered.status.success(),
+		"the recovered dirty checkout is still refused"
+	);
+	assert_eq!(
+		std::fs::read_to_string(target.join("file.txt")).unwrap(),
+		"dirty after proof\n"
+	);
+	assert!(
+		target.join(".git").is_file(),
+		"the original mount is restored"
+	);
+	assert!(
+		!git_path(&fixture.consumer, "gitana-submodule-deinit").exists(),
+		"the rollback-complete journal is cleared"
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_rollback_preserves_content_created_in_the_public_empty_directory() {
+	let fixture = Fixture::new("deinit-rollback-public-content");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.rollback-public-content";
+	let retired_name = ".gitana-submodule-deinit-retired.rollback-public-content";
+	let prepared = parent.join(prepared_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-rollback-public-content-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::write(target.join("concurrent"), b"foreign\n").unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"rolling_back",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		None,
+	);
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!refused.status.success(),
+		"rollback must not hide public content"
+	);
+	assert_eq!(
+		std::fs::read_to_string(target.join("concurrent")).unwrap(),
+		"foreign\n"
+	);
+	assert!(
+		prepared.join(".git").is_file(),
+		"the checkout remains displaced"
+	);
+	assert!(git_path(&fixture.consumer, "gitana-submodule-deinit").is_dir());
+
+	std::fs::remove_file(target.join("concurrent")).unwrap();
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!recovered.status.success(),
+		"the original local-modification refusal is retained"
+	);
+	assert!(target.join(".git").is_file());
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_recovery_clears_a_rollback_completed_before_intent_retirement() {
+	let fixture = Fixture::new("deinit-rollback-completed");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.rollback-completed";
+	let retired_name = ".gitana-submodule-deinit-retired.rollback-completed";
+	let prepared = parent.join(prepared_name);
+	std::fs::create_dir(&prepared).unwrap();
+	std::fs::write(target.join("file.txt"), b"dirty after proof\n").unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	std::fs::remove_dir(&prepared).unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"rolled_back",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		None,
+	);
+
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!recovered.status.success(),
+		"the restored dirty checkout remains refused"
+	);
+	assert_eq!(
+		std::fs::read_to_string(target.join("file.txt")).unwrap(),
+		"dirty after proof\n"
+	);
+	assert!(
+		!prepared.exists(),
+		"recovery accepts a crash after exact rollback cleanup"
+	);
+	assert!(
+		!git_path(&fixture.consumer, "gitana-submodule-deinit").exists(),
+		"the completed rollback cannot wedge recovery"
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_recovery_clears_a_cleaned_rollback_without_fresh_force() {
+	let fixture = Fixture::new("deinit-rollback-cleaned");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.rollback-cleaned";
+	let retired_name = ".gitana-submodule-deinit-retired.rollback-cleaned";
+	let prepared = parent.join(prepared_name);
+	std::fs::create_dir(&prepared).unwrap();
+	std::fs::write(target.join("file.txt"), b"dirty after proof\n").unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	std::fs::remove_dir(&prepared).unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"rollback_cleaned",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		None,
+	);
+
+	let recovered = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!recovered.status.success(),
+		"the persisted dirty-checkout refusal remains visible"
+	);
+	assert!(stderr(&recovered).contains("local modifications"));
+	assert_eq!(
+		std::fs::read_to_string(target.join("file.txt")).unwrap(),
+		"dirty after proof\n"
+	);
+	assert!(
+		!git_path(&fixture.consumer, "gitana-submodule-deinit").exists(),
+		"rollback-cleaned recovery must retire its journal without --force"
+	);
+}
+
+#[cfg(unix)]
+fn publish_deinit_config_for_test(
+	path: &Path,
+	purpose: &str,
+	edit: impl FnOnce(&mut gitana_config::GitConfig),
+) -> serde_json::Value {
+	use std::os::unix::fs::MetadataExt as _;
+
+	let mut config =
+		gitana_config::GitConfig::parse(&std::fs::read_to_string(path).unwrap()).unwrap();
+	edit(&mut config);
+	let prepared_name = format!(".gitana-config-prepared.{purpose}-recovery-test");
+	let prepared = path.parent().unwrap().join(&prepared_name);
+	std::fs::write(&prepared, config.render()).unwrap();
+	let metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	std::fs::rename(&prepared, path).unwrap();
+	serde_json::json!({
+		"name": prepared_name,
+		"device": metadata.dev(),
+		"inode": metadata.ino()
+	})
+}
+
+#[cfg(unix)]
+fn prepare_displaced_deinit_config_for_test(
+	path: &Path,
+	purpose: &str,
+	edit: impl FnOnce(&mut gitana_config::GitConfig),
+) -> serde_json::Value {
+	use std::os::unix::fs::MetadataExt as _;
+
+	let mut config =
+		gitana_config::GitConfig::parse(&std::fs::read_to_string(path).unwrap()).unwrap();
+	edit(&mut config);
+	let prepared_name = format!(".gitana-config-prepared.{purpose}-recovery-test");
+	let prepared = path.parent().unwrap().join(&prepared_name);
+	let lock = path.with_file_name(format!(
+		"{}.lock",
+		path.file_name().unwrap().to_string_lossy()
+	));
+	std::fs::write(&prepared, config.render()).unwrap();
+	let metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	std::fs::rename(&prepared, &lock).unwrap();
+	std::fs::rename(path, &prepared).unwrap();
+	serde_json::json!({
+		"name": prepared_name,
+		"device": metadata.dev(),
+		"inode": metadata.ino()
+	})
+}
+
+#[cfg(unix)]
+fn deinit_transition(
+	path: &Path,
+	edit: impl FnOnce(&mut gitana_config::GitConfig),
+) -> serde_json::Value {
+	use std::os::unix::fs::MetadataExt as _;
+
+	let text = std::fs::read_to_string(path).unwrap();
+	let metadata = std::fs::metadata(path).unwrap();
+	let parent_metadata = std::fs::metadata(path.parent().unwrap()).unwrap();
+	let mut config = gitana_config::GitConfig::parse(&text).unwrap();
+	let before_fingerprint = format!("{:x}", Sha256::digest(config.render().as_bytes()));
+	edit(&mut config);
+	let after_fingerprint = format!("{:x}", Sha256::digest(config.render().as_bytes()));
+	serde_json::json!({
+		"before_fingerprint": before_fingerprint,
+		"after_fingerprint": after_fingerprint,
+		"target": {
+			"parent": {
+				"device": parent_metadata.dev(),
+				"inode": parent_metadata.ino()
+			},
+			"entry": {
+				"state": "file",
+				"device": metadata.dev(),
+				"inode": metadata.ino()
+			},
+			"symlinks": []
+		}
+	})
+}
+
+#[cfg(unix)]
+fn symlinked_deinit_transition(
+	link: &Path,
+	target: &Path,
+	edit: impl FnOnce(&mut gitana_config::GitConfig),
+) -> serde_json::Value {
+	use std::os::unix::fs::MetadataExt as _;
+
+	let text = std::fs::read_to_string(target).unwrap();
+	let target_metadata = std::fs::symlink_metadata(target).unwrap();
+	let parent_metadata = std::fs::metadata(target.parent().unwrap()).unwrap();
+	let link_metadata = std::fs::symlink_metadata(link).unwrap();
+	let mut config = gitana_config::GitConfig::parse(&text).unwrap();
+	let before_fingerprint = format!("{:x}", Sha256::digest(config.render().as_bytes()));
+	edit(&mut config);
+	let after_fingerprint = format!("{:x}", Sha256::digest(config.render().as_bytes()));
+	serde_json::json!({
+		"before_fingerprint": before_fingerprint,
+		"after_fingerprint": after_fingerprint,
+		"target": {
+			"parent": {
+				"device": parent_metadata.dev(),
+				"inode": parent_metadata.ino()
+			},
+			"entry": {
+				"state": "file",
+				"device": target_metadata.dev(),
+				"inode": target_metadata.ino()
+			},
+			"symlinks": [{
+				"device": link_metadata.dev(),
+				"inode": link_metadata.ino()
+			}]
+		}
+	})
+}
+
+#[cfg(unix)]
+fn write_prepared_deinit_intent(fixture: &Fixture, suffix: &str) -> PathBuf {
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let target = fixture.consumer.join("modules/one");
+	let prepared_name = format!(".gitana-submodule-deinit-prepared.{suffix}");
+	let retired_name = format!(".gitana-submodule-deinit-retired.{suffix}");
+	let prepared = fixture.consumer.join("modules").join(&prepared_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	write_deinit_intent_v4(
+		fixture,
+		"prepared",
+		&prepared_name,
+		&retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		None,
+	);
+	git_path(&fixture.consumer, "gitana-submodule-deinit")
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn write_deinit_intent_v4(
+	fixture: &Fixture,
+	phase: &str,
+	prepared_name: &str,
+	retired_name: &str,
+	mount_metadata: &std::fs::Metadata,
+	prepared_metadata: &std::fs::Metadata,
+	module_metadata: &std::fs::Metadata,
+	module_publication: Option<&Path>,
+	retirement_location: Option<&str>,
+) {
+	write_deinit_intent_v4_at(
+		&fixture.consumer,
+		&fixture.old,
+		phase,
+		prepared_name,
+		retired_name,
+		mount_metadata,
+		prepared_metadata,
+		module_metadata,
+		module_publication,
+		retirement_location,
+	);
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn write_deinit_intent_v4_at(
+	repository: &Path,
+	recorded: &str,
+	phase: &str,
+	prepared_name: &str,
+	retired_name: &str,
+	mount_metadata: &std::fs::Metadata,
+	prepared_metadata: &std::fs::Metadata,
+	module_metadata: &std::fs::Metadata,
+	module_publication: Option<&Path>,
+	retirement_location: Option<&str>,
+) {
+	use std::os::unix::fs::MetadataExt as _;
+
+	let module_git_dir = git_path(repository, "modules/one");
+	let module_config_path = module_git_dir.join("config");
+	let super_config_path = git_path(repository, "config");
+	let core_worktree = git(&module_git_dir, &["config", "--get", "core.worktree"])
+		.trim()
+		.to_owned();
+	let module_transition = deinit_transition(&module_config_path, |config| {
+		config.unset("core", None, "worktree");
+	});
+	let super_transition = deinit_transition(&super_config_path, |config| {
+		config.remove_subsection("submodule", "one");
+	});
+	let module_publication = module_publication.map(|path| {
+		let metadata = std::fs::symlink_metadata(path).unwrap();
+		serde_json::json!({
+			"name": path.file_name().unwrap().to_str().unwrap(),
+			"device": metadata.dev(),
+			"inode": metadata.ino()
+		})
+	});
+	let control = git_path(repository, "gitana-submodule-deinit");
+	std::fs::create_dir(&control).unwrap();
+	std::fs::write(
+		control.join("intent.json"),
+		serde_json::to_vec(&serde_json::json!({
+			"version": 4,
+			"phase": phase,
+			"name": "one",
+			"path": "modules/one",
+			"recorded": recorded,
+			"force": false,
+			"core_worktree": core_worktree,
+			"module_transition": module_transition,
+			"module_publication": module_publication,
+			"super_transition": super_transition,
+			"super_publication": null,
+			"parent": "modules",
+			"target": "one",
+			"prepared": prepared_name,
+			"displaced": prepared_name,
+			"retired": retired_name,
+			"rollback": null,
+			"retirement_location": retirement_location,
+			"mount_identity": {
+				"device": mount_metadata.dev(),
+				"inode": mount_metadata.ino()
+			},
+			"prepared_identity": {
+				"device": prepared_metadata.dev(),
+				"inode": prepared_metadata.ino()
+			},
+			"public_identity": {
+				"device": prepared_metadata.dev(),
+				"inode": prepared_metadata.ino()
+			},
+			"module_identity": {
+				"device": module_metadata.dev(),
+				"inode": module_metadata.ino()
+			}
+		}))
+		.unwrap(),
+	)
+	.unwrap();
+}
+
+fn retired_checkout(module_git_dir: &Path) -> PathBuf {
+	let retired: Vec<_> = std::fs::read_dir(module_git_dir)
+		.unwrap()
+		.map(|entry| entry.unwrap().path())
+		.filter(|path| {
+			path.file_name().is_some_and(|name| {
+				name
+					.to_string_lossy()
+					.starts_with(".gitana-submodule-deinit-retired.")
+			})
+		})
+		.collect();
+	assert_eq!(retired.len(), 1, "expected exactly one retired checkout");
+	retired.into_iter().next().unwrap()
 }
 
 #[test]
@@ -1954,6 +5030,69 @@ fn bare_local_submodule_urls_resolve_from_the_worktree_root() {
 }
 
 #[test]
+fn update_init_reuses_the_superproject_lock_for_a_self_source() {
+	let fixture = Fixture::new("self-source-lock-reuse");
+	let recorded = git(&fixture.consumer, &["rev-parse", "HEAD"])
+		.trim()
+		.to_owned();
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.url",
+			fixture.consumer.to_str().unwrap(),
+		],
+	);
+	git_ok(
+		&fixture.consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{recorded},modules/one"),
+		],
+	);
+
+	let update = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--init", "modules/one"],
+	);
+	assert_success(&update, "update --init from the locked superproject itself");
+	assert_eq!(
+		git(
+			&fixture.consumer.join("modules/one"),
+			&["rev-parse", "HEAD"]
+		)
+		.trim(),
+		recorded
+	);
+}
+
+#[test]
+fn existing_update_reuses_the_module_lock_for_a_self_origin() {
+	let fixture = Fixture::new("self-origin-lock-reuse");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(
+		&module,
+		&["config", "remote.origin.url", module.to_str().unwrap()],
+	);
+
+	let update = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "modules/one"],
+	);
+	assert_success(&update, "update from the locked module repository itself");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), fixture.old);
+}
+
+#[test]
 fn existing_relative_module_origins_resolve_from_the_module_worktree() {
 	let fixture = Fixture::new("relative-existing-module-origin");
 	assert_success(
@@ -2282,6 +5421,54 @@ fn module_scoped_recovery_rejects_a_changed_module_origin() {
 		stderr(&recovered)
 	);
 	assert!(control.join("intent.json").is_file());
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn module_scoped_recovery_locks_config_before_source_validation() {
+	let fixture = Fixture::new("module-recovery-config-locked");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	let module_origin = git(&module, &["config", "--get", "remote.origin.url"])
+		.trim()
+		.to_owned();
+	git_ok(
+		&fixture.consumer,
+		&["submodule", "deinit", "-f", "modules/one"],
+	);
+	let control = write_v4_recovery_intent(
+		&fixture,
+		"one",
+		"modules/one",
+		&fixture.old,
+		&module_origin,
+		"module",
+	);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let module_directory = Dir::open_ambient_dir(&module_git_dir, ambient_authority()).unwrap();
+	let mutation =
+		acquire_submodule_config_mutation_lease(&module_directory, &module_git_dir).unwrap();
+	let config = module_git_dir.join("config");
+	let displaced = module_git_dir.join("config.recovery-displaced");
+	std::fs::rename(&config, &displaced).unwrap();
+
+	let refused = gta(&fixture.consumer, true, &["submodule", "update", "--init"]);
+	assert!(!refused.status.success(), "a busy module config must fail");
+	assert!(
+		stderr(&refused).contains("submodule update is already running"),
+		"recovery read the displaced config before taking its guard: {}",
+		stderr(&refused),
+	);
+	assert!(control.join("intent.json").is_file());
+
+	std::fs::rename(&displaced, &config).unwrap();
+	drop(mutation);
+	let recovered = gta(&fixture.consumer, true, &["submodule", "update", "--init"]);
+	assert_success(&recovered, "retry module-scoped recovery");
+	assert!(!control.exists());
 }
 
 #[test]
@@ -2862,13 +6049,29 @@ fn no_op_init_does_not_acquire_the_repository_config_lock() {
 		"initial init",
 	);
 	let config = initialized.consumer.join(".git/config");
+	let git_dir = initialized.consumer.join(".git");
+	let update_lock = git_dir.join("gitana-submodule-update.lock");
+	let config_lock = git_dir.join("gitana-submodule-config.lock");
+	let _ = std::fs::remove_file(&update_lock);
+	let _ = std::fs::remove_file(&config_lock);
 	let before = std::fs::read(&config).unwrap();
 	let before_metadata = std::fs::metadata(&config).unwrap();
-	std::fs::write(initialized.consumer.join(".git/config.lock"), b"held").unwrap();
+	std::fs::write(git_dir.join("config.lock"), b"held").unwrap();
+	#[cfg(unix)]
+	let original_permissions = {
+		use std::os::unix::fs::PermissionsExt as _;
+		let permissions = std::fs::metadata(&git_dir).unwrap().permissions();
+		std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+		permissions
+	};
 
 	let repeated = gta(&initialized.consumer, false, &["submodule", "init"]);
+	#[cfg(unix)]
+	std::fs::set_permissions(&git_dir, original_permissions).unwrap();
 	assert_success(&repeated, "already-initialized no-op init");
 	assert_eq!(std::fs::read(&config).unwrap(), before);
+	assert!(!update_lock.exists(), "no-op init created its update lock");
+	assert!(!config_lock.exists(), "no-op init created its config lock");
 	let after_metadata = std::fs::metadata(&config).unwrap();
 	assert_eq!(after_metadata.permissions(), before_metadata.permissions());
 	#[cfg(unix)]
@@ -2883,11 +6086,33 @@ fn no_op_init_does_not_acquire_the_repository_config_lock() {
 		&["update-index", "--force-remove", "modules/one"],
 	);
 	let empty_config = empty.consumer.join(".git/config");
+	let empty_git_dir = empty.consumer.join(".git");
+	let empty_update_lock = empty_git_dir.join("gitana-submodule-update.lock");
+	let empty_config_lock = empty_git_dir.join("gitana-submodule-config.lock");
+	let _ = std::fs::remove_file(&empty_update_lock);
+	let _ = std::fs::remove_file(&empty_config_lock);
 	let empty_before = std::fs::read(&empty_config).unwrap();
-	std::fs::write(empty.consumer.join(".git/config.lock"), b"held").unwrap();
+	std::fs::write(empty_git_dir.join("config.lock"), b"held").unwrap();
+	#[cfg(unix)]
+	let empty_original_permissions = {
+		use std::os::unix::fs::PermissionsExt as _;
+		let permissions = std::fs::metadata(&empty_git_dir).unwrap().permissions();
+		std::fs::set_permissions(&empty_git_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+		permissions
+	};
 	let no_gitlinks = gta(&empty.consumer, false, &["submodule", "init"]);
+	#[cfg(unix)]
+	std::fs::set_permissions(&empty_git_dir, empty_original_permissions).unwrap();
 	assert_success(&no_gitlinks, "no-gitlink no-op init");
 	assert_eq!(std::fs::read(&empty_config).unwrap(), empty_before);
+	assert!(
+		!empty_update_lock.exists(),
+		"empty-selection init created its update lock"
+	);
+	assert!(
+		!empty_config_lock.exists(),
+		"empty-selection init created its config lock"
+	);
 }
 
 #[test]
@@ -3120,6 +6345,102 @@ fn submodule_update_preserves_module_config_symlink_and_target_mode() {
 		std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
 		0o600
 	);
+
+	let deinit = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert_success(&deinit, "deinit through symlinked module config");
+	assert!(
+		std::fs::symlink_metadata(&config)
+			.unwrap()
+			.file_type()
+			.is_symlink(),
+		"deinit must preserve the module config symlink"
+	);
+	assert!(
+		!std::fs::read_to_string(&target)
+			.unwrap()
+			.lines()
+			.any(|line| line.trim_start().starts_with("worktree =")),
+		"deinit must remove core.worktree from the symlink target"
+	);
+	assert_eq!(
+		std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+		0o600
+	);
+
+	let reattach = gta(&fixture.consumer, true, &["submodule", "update", "--init"]);
+	assert_success(&reattach, "reattach through symlinked module config");
+	assert!(
+		std::fs::symlink_metadata(&config)
+			.unwrap()
+			.file_type()
+			.is_symlink(),
+		"reattachment must preserve the module config symlink"
+	);
+	assert!(fixture.consumer.join("modules/one/file.txt").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn deinit_rejects_a_module_config_target_inside_the_selected_checkout_before_mutation() {
+	let fixture = Fixture::new("checkout-contained-module-config");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let checkout = fixture.consumer.join("modules/one");
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let config = module_git_dir.join("config");
+	let contained_target = checkout.join("config-real");
+	std::fs::rename(&config, &contained_target).unwrap();
+	std::os::unix::fs::symlink("../../../modules/one/config-real", &config).unwrap();
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "--force", "modules/one"],
+	);
+	assert!(
+		!refused.status.success(),
+		"contained config target must fail"
+	);
+	assert!(
+		stderr(&refused).contains("is inside the selected checkout"),
+		"unexpected diagnostic: {}",
+		stderr(&refused)
+	);
+	assert!(checkout.join("file.txt").is_file());
+	assert!(checkout.join(".git").is_file());
+	assert!(
+		std::fs::read_to_string(&contained_target)
+			.unwrap()
+			.lines()
+			.any(|line| line.trim_start().starts_with("worktree =")),
+		"preflight failure must preserve the module attachment"
+	);
+	assert!(
+		std::fs::read_to_string(fixture.consumer.join(".git/config"))
+			.unwrap()
+			.contains("[submodule \"one\"]"),
+		"preflight failure must preserve registration"
+	);
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
+
+	let external_target = fixture.root.join("external-module-config");
+	std::fs::remove_file(&config).unwrap();
+	std::fs::rename(&contained_target, &external_target).unwrap();
+	std::os::unix::fs::symlink(&external_target, &config).unwrap();
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			false,
+			&["submodule", "deinit", "--force", "modules/one"],
+		),
+		"deinit through external module config symlink",
+	);
 }
 
 #[test]
@@ -3164,7 +6485,7 @@ fn a_later_failure_reports_and_preserves_the_completed_module_prefix() {
 }
 
 #[test]
-fn a_post_init_lock_failure_still_reports_the_completed_initialization() {
+fn an_update_lock_failure_precedes_initialization() {
 	let fixture = Fixture::new("post-init-lock");
 	let lock_path = fixture.consumer.join(".git/gitana-submodule-update.lock");
 	let lock = std::fs::OpenOptions::new()
@@ -3179,18 +6500,16 @@ fn a_post_init_lock_failure_still_reports_the_completed_initialization() {
 	let update = gta(&fixture.consumer, true, &["submodule", "update", "--init"]);
 	assert!(!update.status.success(), "the held update lock must fail");
 	assert!(
-		stderr(&update).contains("Submodule 'one'"),
-		"completed initialization must still be reported: {}",
+		!stderr(&update).contains("Submodule 'one'"),
+		"initialization must not start before acquiring the shared mutation lock: {}",
 		stderr(&update)
 	);
 	assert!(stderr(&update).contains("already running"));
-	assert_eq!(
-		git(
-			&fixture.consumer,
-			&["config", "--get", "submodule.one.active"]
-		)
-		.trim(),
-		"true"
+	assert!(
+		!std::fs::read_to_string(fixture.consumer.join(".git/config"))
+			.unwrap()
+			.contains("active = true"),
+		"the rejected update must not initialize the module"
 	);
 	assert!(!git_path(&fixture.consumer, "modules/one").exists());
 }

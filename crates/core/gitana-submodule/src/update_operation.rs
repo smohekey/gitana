@@ -3,10 +3,12 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
+use gitana_config::GitConfig;
 use gitana_file_store::{DurabilityTarget, FileStore};
 use gitana_file_store_local::{CapWorkDir, LocalFileStore, WorkDirFs, same_directory_identity};
 use gitana_fs_native::{
@@ -25,8 +27,9 @@ use crate::context::{
 };
 use crate::{
 	ConfigurationProvider, FetchRepository, FetchSource, InitRequest, PrepareRepository,
-	PrepareSource, RepositoryTransfer, SubmoduleContext, SubmoduleDeclaration, SubmoduleError,
-	SubmoduleObjectId, UpdateFailure, UpdateOutcome, UpdateOutcomeState, UpdateReport, UpdateRequest,
+	PrepareSource, RepositoryTransfer, SharedConfigGuard, SubmoduleContext, SubmoduleDeclaration,
+	SubmoduleError, SubmoduleObjectId, UpdateFailure, UpdateOutcome, UpdateOutcomeState,
+	UpdateReport, UpdateRequest,
 };
 
 const CONTROL_DIR: &str = "gitana-submodule-update";
@@ -37,9 +40,16 @@ const INTENT_NAME: &str = "intent.json";
 const INTENT_LOCK_NAME: &str = "intent.lock";
 const STAGED_REPOSITORY_NAME: &str = "repository";
 const UPDATE_LOCK: &str = "gitana-submodule-update.lock";
+const SHARED_CONFIG_LOCK: &str = "gitana-submodule-config.lock";
 const MARKER_TEMP_ATTEMPTS: u64 = 100;
 static MARKER_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CONTROL_RETIRE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+enum SharedConfigAccess {
+	Setup,
+	Mutation,
+}
 
 struct Planned<H: HashAlgorithm> {
 	declaration: SubmoduleDeclaration,
@@ -48,6 +58,7 @@ struct Planned<H: HashAlgorithm> {
 	state: Option<UpdateOutcomeState>,
 	recovering: bool,
 	intent_identity: Option<EntryIdentity>,
+	module_config_lease: Option<crate::SubmoduleMutationLease>,
 	pointers: ModulePointers,
 }
 
@@ -73,9 +84,9 @@ impl DirectoryNamespace<'_> {
 	}
 }
 
-struct ModulePointers {
-	core_worktree: String,
-	marker: String,
+pub(crate) struct ModulePointers {
+	pub(crate) core_worktree: String,
+	pub(crate) marker: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,46 +136,93 @@ struct ConditionalFileCleanup {
 	armed: bool,
 }
 
-/// A per-worktree update lease tied to both the retained Git directory and the named lock entry.
+/// A submodule mutation lease tied to the per-worktree lock and, when needed, the common config lock.
 ///
 /// The directory lock prevents a second Gitana invocation from entering the shared staging
-/// namespace if an unrelated process detaches the named lock on Unix. The entry identity still
-/// detects that namespace tampering so the current operation fails closed at its next boundary.
-struct UpdateLockGuard {
+/// namespace if an unrelated process detaches a named lock on Unix. Each entry identity still
+/// detects namespace tampering so the current operation fails closed at its next boundary.
+pub(crate) struct UpdateLockGuard {
+	state: Arc<UpdateLockState>,
+}
+
+struct UpdateLockState {
 	directory: Dir,
 	identity: EntryIdentity,
 	display_path: PathBuf,
 	_directory_lock: Option<File>,
 	_named_lock: File,
+	shared_directory: Option<Dir>,
+	shared_identity: Option<EntryIdentity>,
+	shared_config_directory_identity: Option<EntryIdentity>,
+	shared_display_path: Option<PathBuf>,
+	shared_config_guard: Option<Arc<SharedConfigGuard>>,
+	_shared_named_lock: Option<File>,
 }
 
 impl UpdateLockGuard {
-	fn validate(&self) -> Result<(), SubmoduleError> {
-		let metadata = self
-			.directory
-			.symlink_metadata(UPDATE_LOCK)
-			.map_err(|source| {
-				if source.kind() == std::io::ErrorKind::NotFound {
-					SubmoduleError::RecoveryRequired(
-						"submodule update lock entry changed while held".to_owned(),
-					)
-				} else {
-					SubmoduleError::Io {
-						path: self.display_path.clone(),
-						source,
-					}
-				}
-			})?;
-		if !metadata.is_file()
-			|| metadata.file_type().is_symlink()
-			|| EntryIdentity::from_metadata(&metadata) != self.identity
-		{
-			return Err(SubmoduleError::RecoveryRequired(
-				"submodule update lock entry changed while held".to_owned(),
-			));
+	pub(crate) fn lease(&self) -> crate::SubmoduleMutationLease {
+		match self.state.shared_config_directory_identity {
+			Some(identity) => crate::SubmoduleMutationLease::retain_config_directory(
+				Arc::clone(&self.state),
+				identity,
+				self.state.shared_config_guard.as_ref().map(Arc::clone),
+			),
+			None => crate::SubmoduleMutationLease::retain(Arc::clone(&self.state)),
+		}
+	}
+
+	pub(crate) fn validate(&self) -> Result<(), SubmoduleError> {
+		validate_lock_entry(
+			&self.state.directory,
+			UPDATE_LOCK,
+			self.state.identity,
+			&self.state.display_path,
+			"submodule update lock entry changed while held",
+		)?;
+		if let (Some(directory), Some(identity), Some(display_path)) = (
+			self.state.shared_directory.as_ref(),
+			self.state.shared_identity,
+			self.state.shared_display_path.as_ref(),
+		) {
+			validate_lock_entry(
+				directory,
+				SHARED_CONFIG_LOCK,
+				identity,
+				display_path,
+				"shared submodule config lock entry changed while held",
+			)?;
+		}
+		if let Some(guard) = &self.state.shared_config_guard {
+			guard.validate()?;
 		}
 		Ok(())
 	}
+}
+
+fn validate_lock_entry(
+	directory: &Dir,
+	name: &str,
+	expected: EntryIdentity,
+	display_path: &Path,
+	changed: &str,
+) -> Result<(), SubmoduleError> {
+	let metadata = directory.symlink_metadata(name).map_err(|source| {
+		if source.kind() == std::io::ErrorKind::NotFound {
+			SubmoduleError::RecoveryRequired(changed.to_owned())
+		} else {
+			SubmoduleError::Io {
+				path: display_path.to_owned(),
+				source,
+			}
+		}
+	})?;
+	if !metadata.is_file()
+		|| metadata.file_type().is_symlink()
+		|| EntryIdentity::from_metadata(&metadata) != expected
+	{
+		return Err(SubmoduleError::RecoveryRequired(changed.to_owned()));
+	}
+	Ok(())
 }
 
 impl Drop for ConditionalFileCleanup {
@@ -243,18 +301,47 @@ impl SubmoduleContext {
 				.module_pointers(declaration)
 				.map_err(UpdateFailure::preflight)?;
 			self
-				.preflight_module_namespaces(declaration, &module_pointers)
+				.preflight_module_namespaces(declaration, &module_pointers, configuration)
+				.await
 				.map_err(UpdateFailure::preflight)?;
 			pointers.insert(path.clone(), module_pointers);
 		}
+		let lock = if request.initialize {
+			self.acquire_config_update_lock()
+		} else {
+			self.acquire_update_lock()
+		}
+		.map_err(UpdateFailure::preflight)?;
+		lock.validate().map_err(UpdateFailure::preflight)?;
+		let mutation_lease = lock.lease();
+		if request.initialize {
+			self
+				.ensure_no_repository_deinit_recovery()
+				.map_err(UpdateFailure::preflight)?;
+		} else {
+			self
+				.ensure_no_deinit_recovery()
+				.map_err(UpdateFailure::preflight)?;
+		}
+		let config_setup = if request.initialize {
+			None
+		} else {
+			Some(
+				self
+					.acquire_config_setup_lease()
+					.await
+					.map_err(UpdateFailure::preflight)?,
+			)
+		};
 
 		let initialized = if request.initialize {
 			self
-				.init(
+				.init_unlocked(
 					&InitRequest {
 						query: request.query.clone(),
 					},
 					configuration,
+					mutation_lease.clone(),
 				)
 				.await
 				.map_err(UpdateFailure::preflight)?
@@ -276,10 +363,12 @@ impl SubmoduleContext {
 					.map(|url| (outcome.path.clone(), url))
 			})
 			.collect();
-		let effective = configuration
-			.reload()
-			.await
-			.map_err(|source| UpdateFailure::after_init(&report, source))?;
+		let effective = update_effective_config(configuration, &report).await?;
+		if let Some(config_setup) = config_setup {
+			config_setup
+				.validate()
+				.map_err(|source| UpdateFailure::after_init(&report, source))?;
+		}
 		let mut plan = Vec::with_capacity(selected.len());
 		for path in selected {
 			let declaration = declarations
@@ -323,15 +412,13 @@ impl SubmoduleContext {
 				state,
 				recovering: false,
 				intent_identity: None,
+				module_config_lease: None,
 				pointers: pointers
 					.remove(&path)
 					.expect("preflight computed every selected module pointer"),
 			});
 		}
 
-		let lock = self
-			.acquire_update_lock()
-			.map_err(|source| UpdateFailure::after_init(&report, source))?;
 		lock
 			.validate()
 			.map_err(|source| UpdateFailure::after_init(&report, source))?;
@@ -368,6 +455,7 @@ impl SubmoduleContext {
 					request.reflog_committer.as_deref(),
 					configuration,
 					transfer,
+					&mutation_lease,
 				)
 				.await;
 			match update {
@@ -401,6 +489,7 @@ impl SubmoduleContext {
 		committer: Option<&str>,
 		configuration: &C,
 		transfer: &T,
+		mutation_lease: &crate::SubmoduleMutationLease,
 	) -> Result<UpdateOutcomeState, SubmoduleError> {
 		let mut intent_identity = entry.intent_identity;
 		let module_relative = Path::new("modules").join(&entry.declaration.name);
@@ -430,19 +519,45 @@ impl SubmoduleContext {
 		// Pin the mount before any transfer. The transfer can take an arbitrary amount of time, so
 		// this snapshot must not be used for publication until both its namespace identity and its
 		// marker/emptiness state have been revalidated.
-		let mount_before_transfer = self.inspect_module_mount(entry).await?;
+		let mount_before_transfer = self.inspect_module_mount(entry, configuration).await?;
 		if !existing {
 			let source = entry
 				.source_url
 				.as_ref()
 				.ok_or_else(|| SubmoduleError::Unregistered(entry.declaration.name.clone()))?;
-			intent_identity = Some(self.prepare_module(entry, source, transfer).await?);
+			intent_identity = Some(
+				self
+					.prepare_module(entry, source, transfer, mutation_lease.clone())
+					.await?,
+			);
 			cloned = true;
 		}
 		let completion_required = cloned || entry.recovering || mount_before_transfer.newly_attached;
 		let module_git_dir = self.layout.git_dir.join(&module_relative);
 		let (mut repository, module_directory) =
 			self.open_module_repository::<H>(&entry.declaration)?;
+		// A retained module is independently addressable as a repository. Serialize its config from
+		// the first read through attachment publication so a config command that already captured the
+		// detached image cannot overwrite `core.worktree` after update reports success. The parent
+		// guard is always acquired first; trying the module guard preserves that order without waiting
+		// on an inverse acquisition in another process.
+		let module_mutation_lease = match &entry.module_config_lease {
+			Some(lease) => {
+				if !lease
+					.covers_config_directory(&module_directory)
+					.map_err(|source| SubmoduleError::Io {
+						path: module_git_dir.clone(),
+						source,
+					})? {
+					return Err(SubmoduleError::InvalidRepository(
+						entry.declaration.name.clone(),
+					));
+				}
+				lease.clone()
+			}
+			None => try_acquire_submodule_config_mutation_lease(&module_directory, &module_git_dir)?,
+		};
+		let mutation_lease = mutation_lease.clone().combine(module_mutation_lease);
 		let hash_directory = module_directory
 			.try_clone()
 			.map_err(|source| SubmoduleError::Io {
@@ -498,13 +613,16 @@ impl SubmoduleContext {
 				.resolve_fetch_source_identity(&fetch_source)
 				.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
 			let fetched = transfer
-				.fetch_recorded(FetchRepository {
-					source: fetch_source,
-					git_dir: transfer_directory,
-					display_git_dir: module_git_dir.clone(),
-					hash_kind: crate::object_id::kind::<H>(),
-					recorded: SubmoduleObjectId::from_typed(entry.recorded),
-				})
+				.fetch_recorded(
+					FetchRepository {
+						source: fetch_source,
+						git_dir: transfer_directory,
+						display_git_dir: module_git_dir.clone(),
+						hash_kind: crate::object_id::kind::<H>(),
+						recorded: SubmoduleObjectId::from_typed(entry.recorded),
+					},
+					mutation_lease.clone(),
+				)
 				.await
 				.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
 			if fetched.resolved_source != resolved {
@@ -547,7 +665,7 @@ impl SubmoduleContext {
 			None
 		};
 		let mount = self
-			.revalidate_module_mount(entry, &mount_before_transfer)
+			.revalidate_module_mount(entry, &mount_before_transfer, configuration)
 			.await?;
 		let resolved_attachment_source = if mount.newly_attached && !cloned && !entry.recovering {
 			Some(resolved_existing_source.ok_or_else(|| {
@@ -565,7 +683,7 @@ impl SubmoduleContext {
 					&mount,
 					&module_directory,
 					false,
-					configuration,
+					(configuration, &mutation_lease),
 					resolved_attachment_source.as_deref(),
 				)
 				.await?;
@@ -598,7 +716,7 @@ impl SubmoduleContext {
 				&mount,
 				&module_directory,
 				cloned || entry.recovering,
-				configuration,
+				(configuration, &mutation_lease),
 				resolved_attachment_source.as_deref(),
 			)
 			.await?
@@ -670,6 +788,7 @@ impl SubmoduleContext {
 		entry: &Planned<H>,
 		source: &str,
 		transfer: &T,
+		mutation_lease: crate::SubmoduleMutationLease,
 	) -> Result<EntryIdentity, SubmoduleError> {
 		let request = PrepareSource {
 			source_url: source.to_owned(),
@@ -680,7 +799,7 @@ impl SubmoduleContext {
 			.resolve_source_identity(&request)
 			.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
 		let prepared = transfer
-			.prepare_source(request)
+			.prepare_source(request, mutation_lease)
 			.await
 			.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
 		if prepared.resolved_source != resolved_source {
@@ -1076,7 +1195,7 @@ impl SubmoduleContext {
 			self.clear_control_dir(Some(intent_identity))?;
 			return Ok(None);
 		}
-		let (source, resolved) = match source_context {
+		let (source, resolved, module_config_lease) = match source_context {
 			IntentSourceContext::Superproject => {
 				let source = entry.source_url.as_deref().ok_or_else(|| {
 					SubmoduleError::RecoveryRequired(format!(
@@ -1092,7 +1211,7 @@ impl SubmoduleContext {
 				let resolved = transfer
 					.resolve_source_identity(&request)
 					.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
-				(source.to_owned(), resolved)
+				(source.to_owned(), resolved, None)
 			}
 			IntentSourceContext::Module => {
 				if !target_exists || staged_exists {
@@ -1109,6 +1228,11 @@ impl SubmoduleContext {
 							path: module_git_dir.clone(),
 							source,
 						})?;
+				// Module-scoped recovery derives its durable source binding from the retained
+				// repository's own config. Serialize that first read and carry the same guard into
+				// update completion so a writer cannot replace the validated image in between.
+				let module_config_lease =
+					try_acquire_submodule_config_mutation_lease(&module_directory, &module_git_dir)?;
 				let config_directory =
 					module_directory
 						.try_clone()
@@ -1129,7 +1253,7 @@ impl SubmoduleContext {
 				let resolved = transfer
 					.resolve_fetch_source_identity(&fetch_source)
 					.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
-				(source, resolved)
+				(source, resolved, Some(module_config_lease))
 			}
 		};
 		if !intent_matches_source(&intent, source_context, &source, &resolved) {
@@ -1145,6 +1269,7 @@ impl SubmoduleContext {
 			)));
 		}
 		entry.intent_identity = Some(intent_identity);
+		entry.module_config_lease = module_config_lease;
 		if target_exists && !staged_exists {
 			entry.recovering = true;
 			return Ok(Some(recovery_index));
@@ -1312,7 +1437,7 @@ impl SubmoduleContext {
 		Ok((repository, directory))
 	}
 
-	fn module_pointers(
+	pub(crate) fn module_pointers(
 		&self,
 		declaration: &SubmoduleDeclaration,
 	) -> Result<ModulePointers, SubmoduleError> {
@@ -1328,10 +1453,11 @@ impl SubmoduleContext {
 		})
 	}
 
-	fn preflight_module_namespaces(
+	pub(crate) async fn preflight_module_namespaces<C: ConfigurationProvider>(
 		&self,
 		declaration: &SubmoduleDeclaration,
 		pointers: &ModulePointers,
+		configuration: &C,
 	) -> Result<(), SubmoduleError> {
 		let module_relative = Path::new("modules").join(&declaration.name);
 		validate_existing_directory_components(
@@ -1367,12 +1493,19 @@ impl SubmoduleContext {
 					path: mount.join(".git"),
 					source,
 				})?;
-				if current != pointers.marker.as_bytes()
-					&& !std::str::from_utf8(&current)
-						.ok()
-						.and_then(parse_marker_target)
-						.is_some_and(|target| self.marker_targets_expected(declaration, target))
+				let equivalent = if current == pointers.marker.as_bytes() {
+					true
+				} else if let Some(target) = std::str::from_utf8(&current)
+					.ok()
+					.and_then(parse_marker_target)
 				{
+					self
+						.marker_targets_expected(declaration, target, configuration)
+						.await?
+				} else {
+					false
+				};
+				if !equivalent {
 					return Err(SubmoduleError::ForeignMount(declaration.path.clone()));
 				}
 			}
@@ -1381,9 +1514,10 @@ impl SubmoduleContext {
 		Ok(())
 	}
 
-	async fn inspect_module_mount<H: HashAlgorithm>(
+	async fn inspect_module_mount<H: HashAlgorithm, C: ConfigurationProvider>(
 		&self,
 		entry: &Planned<H>,
+		configuration: &C,
 	) -> Result<MountPlan, SubmoduleError> {
 		let declaration = &entry.declaration;
 		let mount = self.worktree_root().join(&declaration.path);
@@ -1435,10 +1569,16 @@ impl SubmoduleContext {
 						return Err(SubmoduleError::ForeignMount(declaration.path.clone()));
 					}
 					if current != entry.pointers.marker.as_bytes() {
-						let equivalent = std::str::from_utf8(&current)
+						let equivalent = if let Some(target) = std::str::from_utf8(&current)
 							.ok()
 							.and_then(parse_marker_target)
-							.is_some_and(|target| self.marker_targets_expected(declaration, target));
+						{
+							self
+								.marker_targets_expected(declaration, target, configuration)
+								.await?
+						} else {
+							false
+						};
 						if !equivalent {
 							return Err(SubmoduleError::ForeignMount(declaration.path.clone()));
 						}
@@ -1462,12 +1602,13 @@ impl SubmoduleContext {
 		})
 	}
 
-	async fn revalidate_module_mount<H: HashAlgorithm>(
+	async fn revalidate_module_mount<H: HashAlgorithm, C: ConfigurationProvider>(
 		&self,
 		entry: &Planned<H>,
 		previous: &MountPlan,
+		configuration: &C,
 	) -> Result<MountPlan, SubmoduleError> {
-		let current = self.inspect_module_mount(entry).await?;
+		let current = self.inspect_module_mount(entry, configuration).await?;
 		let same_identity =
 			same_directory_identity(&previous.directory, &current.directory).map_err(|source| {
 				SubmoduleError::Io {
@@ -1622,9 +1763,10 @@ impl SubmoduleContext {
 		mount_plan: &MountPlan,
 		module_directory: &Dir,
 		intent_durable: bool,
-		configuration: &C,
+		configuration_and_lease: (&C, &crate::SubmoduleMutationLease),
 		resolved_source: Option<&str>,
 	) -> Result<Option<EntryIdentity>, SubmoduleError> {
+		let (configuration, mutation_lease) = configuration_and_lease;
 		let declaration = &entry.declaration;
 		let published_intent = if mount_plan.newly_attached && !intent_durable {
 			let resolved = resolved_source.ok_or_else(|| {
@@ -1640,7 +1782,9 @@ impl SubmoduleContext {
 		// Revalidate the complete marker/emptiness snapshot immediately before the only repository
 		// mutation in this publication step. A later marker race is still possible, so the config
 		// edit below is paired with a conditional rollback token.
-		self.revalidate_module_mount(entry, mount_plan).await?;
+		self
+			.revalidate_module_mount(entry, mount_plan, configuration)
+			.await?;
 		self.ensure_mount_identity(entry, mount_plan)?;
 		self.ensure_module_identity(entry, module_directory)?;
 		let module_path = self.layout.git_dir.join("modules").join(&declaration.name);
@@ -1658,16 +1802,28 @@ impl SubmoduleContext {
 				source,
 			})?;
 		let edit = configuration
-			.set_module_worktree(edit_directory, &config_path, &entry.pointers.core_worktree)
+			.set_module_worktree(
+				edit_directory,
+				&config_path,
+				&entry.pointers.core_worktree,
+				mutation_lease.clone(),
+			)
 			.await?;
 		let publication = async {
 			self.ensure_module_identity(entry, module_directory)?;
-			self.publish_mount_marker(entry, mount_plan).await
+			self
+				.publish_mount_marker(entry, mount_plan, configuration)
+				.await
 		}
 		.await;
 		if let Err(error) = publication {
 			if let Err(rollback) = configuration
-				.rollback_module_worktree(rollback_directory, &config_path, edit)
+				.rollback_module_worktree(
+					rollback_directory,
+					&config_path,
+					edit,
+					mutation_lease.clone(),
+				)
 				.await
 			{
 				return Err(SubmoduleError::RecoveryRequired(format!(
@@ -1679,13 +1835,16 @@ impl SubmoduleContext {
 		Ok(published_intent)
 	}
 
-	async fn publish_mount_marker<H: HashAlgorithm>(
+	async fn publish_mount_marker<H: HashAlgorithm, C: ConfigurationProvider>(
 		&self,
 		entry: &Planned<H>,
 		mount_plan: &MountPlan,
+		configuration: &C,
 	) -> Result<(), SubmoduleError> {
 		let declaration = &entry.declaration;
-		self.revalidate_module_mount(entry, mount_plan).await?;
+		self
+			.revalidate_module_mount(entry, mount_plan, configuration)
+			.await?;
 		match &mount_plan.marker {
 			MarkerSnapshot::Absent => publish_new_mount_marker(
 				&mount_plan.directory,
@@ -1740,7 +1899,11 @@ impl SubmoduleContext {
 		self.ensure_mount_directory(path, true)
 	}
 
-	fn ensure_mount_directory(&self, path: &str, require_empty: bool) -> Result<(), SubmoduleError> {
+	pub(crate) fn ensure_mount_directory(
+		&self,
+		path: &str,
+		require_empty: bool,
+	) -> Result<(), SubmoduleError> {
 		let current = ensure_directory_components(
 			&self.work,
 			Path::new(path),
@@ -1763,95 +1926,475 @@ impl SubmoduleContext {
 		Ok(())
 	}
 
-	fn acquire_update_lock(&self) -> Result<UpdateLockGuard, SubmoduleError> {
-		let path = self.layout.git_dir.join(UPDATE_LOCK);
-		#[cfg(unix)]
-		let directory_lock = {
-			let mut options = OpenOptions::new();
-			options.read(true);
-			let directory = self
-				.git
-				.open_with(".", &options)
-				.map_err(|source| SubmoduleError::Io {
-					path: self.layout.git_dir.clone(),
-					source,
-				})?
-				.into_std();
-			File::try_lock(&directory).map_err(|error| match error {
-				std::fs::TryLockError::WouldBlock => SubmoduleError::UpdateLocked,
-				std::fs::TryLockError::Error(source) => SubmoduleError::Io {
-					path: self.layout.git_dir.clone(),
-					source,
-				},
-			})?;
-			Some(directory)
-		};
-		#[cfg(not(unix))]
-		let directory_lock = None;
-		match self.git.symlink_metadata(UPDATE_LOCK) {
-			Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
-			Ok(_) => {
-				return Err(SubmoduleError::RecoveryRequired(
-					"submodule update lock is not a regular file".to_owned(),
-				));
-			}
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-			Err(source) => {
-				return Err(SubmoduleError::Io { path, source });
-			}
-		}
+	pub(crate) fn acquire_update_lock(&self) -> Result<UpdateLockGuard, SubmoduleError> {
+		acquire_update_lock(&self.git, &self.layout.git_dir)
+	}
+
+	pub(crate) fn acquire_config_update_lock(&self) -> Result<UpdateLockGuard, SubmoduleError> {
+		acquire_update_lock_with_common(
+			&self.git,
+			&self.layout.git_dir,
+			&self.common,
+			&self.layout.common_dir,
+		)
+	}
+}
+
+async fn update_effective_config<C: ConfigurationProvider>(
+	configuration: &C,
+	report: &UpdateReport,
+) -> Result<GitConfig, UpdateFailure> {
+	// The caller holds either the common config mutation lock (`--init`) or a fresh setup lease
+	// acquired after the per-worktree update lock (plain update). Rebuild the effective view from
+	// that serialized state so an intervening deinit cannot be undone from the command-setup image.
+	configuration
+		.reload()
+		.await
+		.map_err(|source| UpdateFailure::after_init(report, source))
+}
+
+pub(crate) fn acquire_update_lock(
+	git: &Dir,
+	git_dir: &Path,
+) -> Result<UpdateLockGuard, SubmoduleError> {
+	acquire_update_lock_inner(git, git_dir, false)
+}
+
+fn acquire_update_lock_inner(
+	git: &Dir,
+	git_dir: &Path,
+	wait: bool,
+) -> Result<UpdateLockGuard, SubmoduleError> {
+	let path = git_dir.join(UPDATE_LOCK);
+	#[cfg(unix)]
+	let directory_lock = {
 		let mut options = OpenOptions::new();
-		options.read(true).write(true).create(true);
-		options.follow(FollowSymlinks::No);
-		#[cfg(windows)]
-		{
-			use cap_std::fs::OpenOptionsExt as _;
-			use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-			// Omitting FILE_SHARE_DELETE keeps the selected entry attached to its name while
-			// this guard is alive.
-			options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-		}
-		let file = self
-			.git
-			.open_with(UPDATE_LOCK, &options)
+		options.read(true);
+		let directory = git
+			.open_with(".", &options)
 			.map_err(|source| SubmoduleError::Io {
-				path: path.clone(),
+				path: git_dir.to_owned(),
 				source,
-			})?;
-		let metadata = file.metadata().map_err(|source| SubmoduleError::Io {
-			path: path.clone(),
-			source,
-		})?;
-		if !metadata.is_file() || metadata.file_type().is_symlink() {
+			})?
+			.into_std();
+		lock_file(&directory, git_dir, wait)?;
+		Some(directory)
+	};
+	#[cfg(not(unix))]
+	let directory_lock = None;
+	match git.symlink_metadata(UPDATE_LOCK) {
+		Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+		Ok(_) => {
 			return Err(SubmoduleError::RecoveryRequired(
 				"submodule update lock is not a regular file".to_owned(),
 			));
 		}
-		let identity = file_identity(&file).map_err(|source| SubmoduleError::Io {
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+		Err(source) => {
+			return Err(SubmoduleError::Io { path, source });
+		}
+	}
+	let mut options = OpenOptions::new();
+	options.read(true).write(true).create(true);
+	options.follow(FollowSymlinks::No);
+	#[cfg(windows)]
+	{
+		use cap_std::fs::OpenOptionsExt as _;
+		use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+		// Omitting FILE_SHARE_DELETE keeps the selected entry attached to its name while
+		// this guard is alive.
+		options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+	}
+	let file = git
+		.open_with(UPDATE_LOCK, &options)
+		.map_err(|source| SubmoduleError::Io {
 			path: path.clone(),
 			source,
 		})?;
-		let named_lock = file.into_std();
-		File::try_lock(&named_lock).map_err(|error| match error {
+	let metadata = file.metadata().map_err(|source| SubmoduleError::Io {
+		path: path.clone(),
+		source,
+	})?;
+	if !metadata.is_file() || metadata.file_type().is_symlink() {
+		return Err(SubmoduleError::RecoveryRequired(
+			"submodule update lock is not a regular file".to_owned(),
+		));
+	}
+	let identity = file_identity(&file).map_err(|source| SubmoduleError::Io {
+		path: path.clone(),
+		source,
+	})?;
+	let named_lock = file.into_std();
+	lock_file(&named_lock, &path, wait)?;
+	let state = UpdateLockState {
+		directory: git.try_clone().map_err(|source| SubmoduleError::Io {
+			path: git_dir.to_owned(),
+			source,
+		})?,
+		identity,
+		display_path: path,
+		_directory_lock: directory_lock,
+		_named_lock: named_lock,
+		shared_directory: None,
+		shared_identity: None,
+		shared_config_directory_identity: None,
+		shared_display_path: None,
+		shared_config_guard: None,
+		_shared_named_lock: None,
+	};
+	let guard = UpdateLockGuard {
+		state: Arc::new(state),
+	};
+	guard.validate()?;
+	Ok(guard)
+}
+
+pub(crate) fn acquire_update_lock_with_common(
+	git: &Dir,
+	git_dir: &Path,
+	common: &Dir,
+	common_dir: &Path,
+) -> Result<UpdateLockGuard, SubmoduleError> {
+	acquire_update_lock_with_common_inner(git, git_dir, common, common_dir, false)
+}
+
+fn acquire_update_lock_with_common_inner(
+	git: &Dir,
+	git_dir: &Path,
+	common: &Dir,
+	common_dir: &Path,
+	wait: bool,
+) -> Result<UpdateLockGuard, SubmoduleError> {
+	let mut guard = acquire_update_lock_inner(git, git_dir, wait)?;
+	let config_directory_identity =
+		directory_identity(common).map_err(|source| SubmoduleError::Io {
+			path: common_dir.to_owned(),
+			source,
+		})?;
+	let (shared_directory, identity, path, shared_config_guard, named_lock) =
+		acquire_shared_config_mutation_lock(common, common_dir, wait)?;
+	let state = Arc::get_mut(&mut guard.state).expect("new update lock guard is uniquely owned");
+	state.shared_directory = Some(shared_directory);
+	state.shared_identity = Some(identity);
+	state.shared_config_directory_identity = Some(config_directory_identity);
+	state.shared_display_path = Some(path);
+	state.shared_config_guard = Some(shared_config_guard);
+	state._shared_named_lock = Some(named_lock);
+	guard.validate()?;
+	Ok(guard)
+}
+
+fn acquire_shared_config_mutation_lock(
+	common: &Dir,
+	common_dir: &Path,
+	wait: bool,
+) -> Result<(Dir, EntryIdentity, PathBuf, Arc<SharedConfigGuard>, File), SubmoduleError> {
+	let config_guard =
+		lock_shared_config_guard(common, common_dir, wait, SharedConfigAccess::Mutation)?;
+	let path = common_dir.join(SHARED_CONFIG_LOCK);
+	match common.symlink_metadata(SHARED_CONFIG_LOCK) {
+		Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+		Ok(_) => {
+			return Err(SubmoduleError::RecoveryRequired(
+				"shared submodule config lock is not a regular file".to_owned(),
+			));
+		}
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+		Err(source) => return Err(SubmoduleError::Io { path, source }),
+	}
+	let mut options = OpenOptions::new();
+	options.read(true).write(true).create(true);
+	options.follow(FollowSymlinks::No);
+	#[cfg(windows)]
+	{
+		use cap_std::fs::OpenOptionsExt as _;
+		use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+		options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+	}
+	let file = common
+		.open_with(SHARED_CONFIG_LOCK, &options)
+		.map_err(|source| SubmoduleError::Io {
+			path: path.clone(),
+			source,
+		})?;
+	let metadata = file.metadata().map_err(|source| SubmoduleError::Io {
+		path: path.clone(),
+		source,
+	})?;
+	if !metadata.is_file() || metadata.file_type().is_symlink() {
+		return Err(SubmoduleError::RecoveryRequired(
+			"shared submodule config lock is not a regular file".to_owned(),
+		));
+	}
+	let identity = file_identity(&file).map_err(|source| SubmoduleError::Io {
+		path: path.clone(),
+		source,
+	})?;
+	let named_lock = file.into_std();
+	lock_file(&named_lock, &path, wait)?;
+	let directory = common.try_clone().map_err(|source| SubmoduleError::Io {
+		path: common_dir.to_owned(),
+		source,
+	})?;
+	validate_lock_entry(
+		&directory,
+		SHARED_CONFIG_LOCK,
+		identity,
+		&path,
+		"shared submodule config lock entry changed while held",
+	)?;
+	Ok((directory, identity, path, config_guard, named_lock))
+}
+
+fn lock_file(file: &File, path: &Path, wait: bool) -> Result<(), SubmoduleError> {
+	if wait {
+		File::lock(file).map_err(|source| SubmoduleError::Io {
+			path: path.to_owned(),
+			source,
+		})
+	} else {
+		File::try_lock(file).map_err(|error| match error {
 			std::fs::TryLockError::WouldBlock => SubmoduleError::UpdateLocked,
 			std::fs::TryLockError::Error(source) => SubmoduleError::Io {
-				path: path.clone(),
+				path: path.to_owned(),
 				source,
 			},
-		})?;
-		let guard = UpdateLockGuard {
-			directory: self.git.try_clone().map_err(|source| SubmoduleError::Io {
-				path: self.layout.git_dir.clone(),
-				source,
-			})?,
-			identity,
-			display_path: path,
-			_directory_lock: directory_lock,
-			_named_lock: named_lock,
-		};
-		guard.validate()?;
-		Ok(guard)
+		})
 	}
+}
+
+/// Lock a repository-owned inode distinct from every per-worktree Git directory.
+///
+/// Unix needs a stable guard in addition to the replaceable named lock. The common refs directory
+/// is shared by every linked worktree but remains distinct for repositories that share only object
+/// storage, and it does not alias the main worktree's long-lived update guard. Opening it through the
+/// common capability follows the same supported layout as repository discovery, while the retained
+/// file handle pins the resolved directory inode for this operation.
+fn lock_shared_config_guard(
+	common: &Dir,
+	common_dir: &Path,
+	wait: bool,
+	access: SharedConfigAccess,
+) -> Result<Arc<SharedConfigGuard>, SubmoduleError> {
+	let path = common_dir.join("refs");
+	let metadata = common
+		.symlink_metadata("refs")
+		.map_err(|source| SubmoduleError::Io {
+			path: path.clone(),
+			source,
+		})?;
+	if !metadata.is_dir() && !metadata.file_type().is_symlink() {
+		return Err(SubmoduleError::RecoveryRequired(
+			"shared config guard is not a directory".to_owned(),
+		));
+	}
+	let entry_identity = EntryIdentity::from_metadata(&metadata);
+	let refs = common
+		.open_dir("refs")
+		.map_err(|source| SubmoduleError::Io {
+			path: path.clone(),
+			source,
+		})?;
+	let target_identity = directory_identity(&refs).map_err(|source| SubmoduleError::Io {
+		path: path.clone(),
+		source,
+	})?;
+	if gitana_fs_native::entry_identity(common, OsStr::new("refs")).map_err(|source| {
+		SubmoduleError::Io {
+			path: path.clone(),
+			source,
+		}
+	})? != entry_identity
+	{
+		return Err(SubmoduleError::RecoveryRequired(
+			"shared config guard changed while opening".to_owned(),
+		));
+	}
+	#[cfg(unix)]
+	let lock = {
+		let mut options = OpenOptions::new();
+		options.read(true);
+		let directory = refs
+			.open_with(".", &options)
+			.map_err(|source| SubmoduleError::Io {
+				path: path.clone(),
+				source,
+			})?
+			.into_std();
+		match access {
+			SharedConfigAccess::Setup => lock_file_shared(&directory, &path, wait)?,
+			SharedConfigAccess::Mutation => lock_file(&directory, &path, wait)?,
+		}
+		Some(directory)
+	};
+	#[cfg(windows)]
+	let lock = {
+		use std::time::Duration;
+
+		use cap_std::fs::OpenOptionsExt as _;
+		use windows_sys::Win32::Storage::FileSystem::{
+			DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+			FILE_SHARE_READ, FILE_SHARE_WRITE,
+		};
+
+		loop {
+			let mut options = OpenOptions::new();
+			let desired = FILE_READ_ATTRIBUTES
+				| FILE_LIST_DIRECTORY
+				| if matches!(access, SharedConfigAccess::Mutation) {
+					DELETE
+				} else {
+					0
+				};
+			let sharing = FILE_SHARE_READ | FILE_SHARE_WRITE;
+			options
+				.access_mode(desired)
+				.share_mode(sharing)
+				.custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+				.follow(FollowSymlinks::No);
+			match refs.open_with(".", &options) {
+				Ok(directory) => break Some(directory.into_std()),
+				Err(source) if windows_lock_contended(&source) && wait => {
+					std::thread::sleep(Duration::from_millis(1));
+				}
+				Err(source) if windows_lock_contended(&source) => {
+					return Err(SubmoduleError::UpdateLocked);
+				}
+				Err(source) => {
+					return Err(SubmoduleError::Io {
+						path: path.clone(),
+						source,
+					});
+				}
+			}
+		}
+	};
+	#[cfg(not(any(unix, windows)))]
+	let lock = {
+		let _ = (common, common_dir, wait, access);
+		None
+	};
+	let guard = Arc::new(SharedConfigGuard::new(
+		common.try_clone().map_err(|source| SubmoduleError::Io {
+			path: common_dir.to_owned(),
+			source,
+		})?,
+		refs,
+		entry_identity,
+		target_identity,
+		path,
+		lock,
+	));
+	guard.validate()?;
+	Ok(guard)
+}
+
+#[cfg(windows)]
+fn windows_lock_contended(error: &std::io::Error) -> bool {
+	matches!(error.raw_os_error(), Some(32) | Some(33))
+}
+
+#[cfg(unix)]
+fn lock_file_shared(file: &File, path: &Path, wait: bool) -> Result<(), SubmoduleError> {
+	if wait {
+		File::lock_shared(file).map_err(|source| SubmoduleError::Io {
+			path: path.to_owned(),
+			source,
+		})
+	} else {
+		File::try_lock_shared(file).map_err(|error| match error {
+			std::fs::TryLockError::WouldBlock => SubmoduleError::UpdateLocked,
+			std::fs::TryLockError::Error(source) => SubmoduleError::Io {
+				path: path.to_owned(),
+				source,
+			},
+		})
+	}
+}
+
+/// Acquire the common submodule config lock for a repository command's configuration setup reads.
+///
+/// This waits for an active mutation rather than exposing its temporary Windows config displacement.
+/// Because waiting is blocking, native frontends must invoke it from a blocking worker.
+pub fn acquire_submodule_config_setup_lease(
+	common: &Dir,
+	common_dir: &Path,
+) -> Result<crate::SubmoduleMutationLease, SubmoduleError> {
+	let directory_lock =
+		lock_shared_config_guard(common, common_dir, true, SharedConfigAccess::Setup)?;
+	let identity = directory_identity(common).map_err(|source| SubmoduleError::Io {
+		path: common_dir.to_owned(),
+		source,
+	})?;
+	Ok(crate::SubmoduleMutationLease::retain_config_directory(
+		Arc::clone(&directory_lock),
+		identity,
+		Some(directory_lock),
+	))
+}
+
+/// Try to acquire common-config serialization for a repository command's configuration reads.
+///
+/// This is the nonblocking counterpart to [`acquire_submodule_config_setup_lease`]. Callers that
+/// already retain an unrelated repository mutation lease use it to avoid introducing a
+/// cross-repository lock cycle; contention is reported as [`SubmoduleError::UpdateLocked`].
+pub fn try_acquire_submodule_config_setup_lease(
+	common: &Dir,
+	common_dir: &Path,
+) -> Result<crate::SubmoduleMutationLease, SubmoduleError> {
+	let directory_lock =
+		lock_shared_config_guard(common, common_dir, false, SharedConfigAccess::Setup)?;
+	let identity = directory_identity(common).map_err(|source| SubmoduleError::Io {
+		path: common_dir.to_owned(),
+		source,
+	})?;
+	Ok(crate::SubmoduleMutationLease::retain_config_directory(
+		Arc::clone(&directory_lock),
+		identity,
+		Some(directory_lock),
+	))
+}
+
+/// Acquire exclusive common-config serialization for a frontend-owned repository config mutation.
+///
+/// Unlike [`acquire_submodule_config_setup_lease`], this may create the repository-owned named lock
+/// and must therefore be used only by commands that are already authorized to mutate configuration.
+pub fn acquire_submodule_config_mutation_lease(
+	common: &Dir,
+	common_dir: &Path,
+) -> Result<crate::SubmoduleMutationLease, SubmoduleError> {
+	let identity = directory_identity(common).map_err(|source| SubmoduleError::Io {
+		path: common_dir.to_owned(),
+		source,
+	})?;
+	let retained = acquire_shared_config_mutation_lock(common, common_dir, true)?;
+	let guard = Arc::clone(&retained.3);
+	Ok(crate::SubmoduleMutationLease::retain_config_directory(
+		Arc::new(retained),
+		identity,
+		Some(guard),
+	))
+}
+
+/// Try to acquire exclusive config serialization without waiting.
+///
+/// Deinit uses this after acquiring the superproject guard so lock ordering stays stable and an
+/// already-running module config writer is reported before any deinit namespace is changed.
+pub(crate) fn try_acquire_submodule_config_mutation_lease(
+	common: &Dir,
+	common_dir: &Path,
+) -> Result<crate::SubmoduleMutationLease, SubmoduleError> {
+	let identity = directory_identity(common).map_err(|source| SubmoduleError::Io {
+		path: common_dir.to_owned(),
+		source,
+	})?;
+	let retained = acquire_shared_config_mutation_lock(common, common_dir, false)?;
+	let guard = Arc::clone(&retained.3);
+	Ok(crate::SubmoduleMutationLease::retain_config_directory(
+		Arc::new(retained),
+		identity,
+		Some(guard),
+	))
 }
 
 /// Publish a complete marker only if the final name is still absent.
@@ -2447,15 +2990,18 @@ mod tests {
 	#[cfg(not(windows))]
 	use super::slash_path;
 	use super::{
-		DirectoryNamespace, IntentSourceContext, MarkerSnapshot, Planned, StageIntent, UPDATE_LOCK,
+		DirectoryNamespace, IntentSourceContext, MarkerSnapshot, Planned, SHARED_CONFIG_LOCK,
+		StageIntent, UPDATE_LOCK, acquire_submodule_config_mutation_lease,
+		acquire_submodule_config_setup_lease, acquire_update_lock_with_common,
 		ensure_directory_components, intent_matches_reprepare, intent_matches_source,
 		intent_source_context, legacy_source_fingerprint, marker_identity, module_origin_url,
 		publish_new_mount_marker, publish_stage_intent, remove_staged_repository,
 		rename_directory_noreplace, source_fingerprint, sync_repository_publication_parents,
+		try_acquire_submodule_config_mutation_lease, update_effective_config,
 	};
 	use crate::{
-		ConfigViews, ConfigurationProvider, InitConfigResult, InitConfigUpdate, SubmoduleContext,
-		SubmoduleDeclaration, SubmoduleError,
+		ConfigViews, ConfigurationProvider, InitConfigResult, InitConfigUpdate, MarkerTargetResolver,
+		SubmoduleContext, SubmoduleDeclaration, SubmoduleError, UpdateReport,
 	};
 	use cap_std::{ambient_authority, fs::Dir};
 	use gitana_config::GitConfig;
@@ -2667,32 +3213,46 @@ mod tests {
 
 	#[tokio::test]
 	async fn mount_revalidation_rejects_content_marker_and_identity_changes() {
+		let configuration = MarkerRacingConfiguration::default();
 		let (temporary, context, entry) = mount_fixture("content");
-		let before = context.inspect_module_mount(&entry).await.unwrap();
+		let before = context
+			.inspect_module_mount(&entry, &configuration)
+			.await
+			.unwrap();
 		std::fs::write(
 			temporary.path().join("work/modules/one/file"),
 			b"concurrent",
 		)
 		.unwrap();
 		assert!(matches!(
-			context.revalidate_module_mount(&entry, &before).await,
+			context
+				.revalidate_module_mount(&entry, &before, &configuration)
+				.await,
 			Err(SubmoduleError::ForeignMount(path)) if path == "modules/one"
 		));
 
 		let (temporary, context, entry) = mount_fixture("marker");
-		let before = context.inspect_module_mount(&entry).await.unwrap();
+		let before = context
+			.inspect_module_mount(&entry, &configuration)
+			.await
+			.unwrap();
 		std::fs::write(
 			temporary.path().join("work/modules/one/.git"),
 			entry.pointers.marker.as_bytes(),
 		)
 		.unwrap();
 		assert!(matches!(
-			context.revalidate_module_mount(&entry, &before).await,
+			context
+				.revalidate_module_mount(&entry, &before, &configuration)
+				.await,
 			Err(SubmoduleError::ForeignMount(path)) if path == "modules/one"
 		));
 
 		let (temporary, context, entry) = mount_fixture("identity");
-		let before = context.inspect_module_mount(&entry).await.unwrap();
+		let before = context
+			.inspect_module_mount(&entry, &configuration)
+			.await
+			.unwrap();
 		std::fs::rename(
 			temporary.path().join("work/modules/one"),
 			temporary.path().join("work/modules/old"),
@@ -2700,18 +3260,25 @@ mod tests {
 		.unwrap();
 		std::fs::create_dir(temporary.path().join("work/modules/one")).unwrap();
 		assert!(matches!(
-			context.revalidate_module_mount(&entry, &before).await,
+			context
+				.revalidate_module_mount(&entry, &before, &configuration)
+				.await,
 			Err(SubmoduleError::ForeignMount(path)) if path == "modules/one"
 		));
 
 		let (temporary, context, entry) = mount_fixture("marker-identity");
 		let marker = temporary.path().join("work/modules/one/.git");
 		std::fs::write(&marker, entry.pointers.marker.as_bytes()).unwrap();
-		let before = context.inspect_module_mount(&entry).await.unwrap();
+		let before = context
+			.inspect_module_mount(&entry, &configuration)
+			.await
+			.unwrap();
 		std::fs::remove_file(&marker).unwrap();
 		std::fs::write(&marker, entry.pointers.marker.as_bytes()).unwrap();
 		assert!(matches!(
-			context.revalidate_module_mount(&entry, &before).await,
+			context
+				.revalidate_module_mount(&entry, &before, &configuration)
+				.await,
 			Err(SubmoduleError::ForeignMount(path)) if path == "modules/one"
 		));
 	}
@@ -2719,20 +3286,73 @@ mod tests {
 	#[tokio::test]
 	async fn conditional_marker_publish_preserves_a_concurrent_marker() {
 		let (temporary, context, entry) = mount_fixture("conditional-marker");
-		let before = context.inspect_module_mount(&entry).await.unwrap();
+		let configuration = MarkerRacingConfiguration::default();
+		let before = context
+			.inspect_module_mount(&entry, &configuration)
+			.await
+			.unwrap();
 		let marker = temporary.path().join("work/modules/one/.git");
 		std::fs::write(&marker, b"foreign marker\n").unwrap();
 
 		assert!(matches!(
-			context.publish_mount_marker(&entry, &before).await,
+			context
+				.publish_mount_marker(&entry, &before, &configuration)
+				.await,
 			Err(SubmoduleError::ForeignMount(path)) if path == "modules/one"
 		));
 		assert_eq!(std::fs::read(marker).unwrap(), b"foreign marker\n");
 	}
 
+	#[tokio::test]
+	async fn plain_update_reloads_registration_after_acquiring_serialization() {
+		let stale = GitConfig::parse("[submodule \"one\"]\n\turl = source\n\tactive = true\n").unwrap();
+		let current = GitConfig::new();
+		let configuration = MarkerRacingConfiguration {
+			effective: Some(current),
+			..Default::default()
+		};
+		let effective = update_effective_config(&configuration, &UpdateReport::default())
+			.await
+			.unwrap();
+
+		assert_eq!(
+			stale.get_string("submodule", Some("one"), "url"),
+			Some("source")
+		);
+		assert_eq!(effective.get_raw("submodule", Some("one"), "url"), None);
+	}
+
+	#[derive(Default)]
 	struct MarkerRacingConfiguration {
 		marker: PathBuf,
 		marker_bytes: Vec<u8>,
+		effective: Option<GitConfig>,
+	}
+
+	impl MarkerTargetResolver for MarkerRacingConfiguration {
+		async fn marker_target_matches(
+			&self,
+			mount_path: &Path,
+			target: &str,
+			expected_git_dir: Dir,
+		) -> Result<bool, SubmoduleError> {
+			let target = Path::new(target);
+			let resolved = if target.is_absolute() {
+				target.to_owned()
+			} else {
+				mount_path.join(target)
+			};
+			let Ok(actual) = Dir::open_ambient_dir(resolved, ambient_authority()) else {
+				return Ok(false);
+			};
+			Ok(matches!(
+				(
+					gitana_fs_native::directory_identity(&actual),
+					gitana_fs_native::directory_identity(&expected_git_dir),
+				),
+				(Ok(actual), Ok(expected)) if actual == expected
+			))
+		}
 	}
 
 	impl ConfigurationProvider for MarkerRacingConfiguration {
@@ -2741,12 +3361,16 @@ mod tests {
 		async fn apply_init(
 			&self,
 			_updates: &[InitConfigUpdate],
+			_lease: crate::SubmoduleMutationLease,
 		) -> Result<InitConfigResult, SubmoduleError> {
 			unreachable!()
 		}
 
 		async fn reload(&self) -> Result<GitConfig, SubmoduleError> {
-			unreachable!()
+			self
+				.effective
+				.clone()
+				.ok_or_else(|| SubmoduleError::Configuration("unexpected config reload".to_owned()))
 		}
 
 		async fn load_module_config(
@@ -2754,6 +3378,15 @@ mod tests {
 			_git_dir: Dir,
 			_display_path: &Path,
 		) -> Result<GitConfig, SubmoduleError> {
+			unreachable!()
+		}
+
+		async fn validate_module_config_inputs_outside_worktrees(
+			&self,
+			_git_dir: Dir,
+			_display_path: &Path,
+			_selected_worktrees: Vec<Dir>,
+		) -> Result<(), SubmoduleError> {
 			unreachable!()
 		}
 
@@ -2773,11 +3406,21 @@ mod tests {
 			unreachable!()
 		}
 
+		async fn load_module_excludes_at(
+			&self,
+			_config: &GitConfig,
+			_worktree: Dir,
+			_worktree_root: &Path,
+		) -> Result<Option<String>, SubmoduleError> {
+			unreachable!()
+		}
+
 		async fn set_module_worktree(
 			&self,
 			git_dir: Dir,
 			_display_path: &Path,
 			_worktree: &str,
+			_lease: crate::SubmoduleMutationLease,
 		) -> Result<Self::ModuleWorktreeEdit, SubmoduleError> {
 			let before = git_dir.read("config").unwrap();
 			let after = b"[core]\n\tworktree = ../../modules/one\n".to_vec();
@@ -2792,6 +3435,7 @@ mod tests {
 			git_dir: Dir,
 			_display_path: &Path,
 			edit: Self::ModuleWorktreeEdit,
+			_lease: crate::SubmoduleMutationLease,
 		) -> Result<(), SubmoduleError> {
 			if git_dir.read("config").unwrap() != edit.1 {
 				return Err(SubmoduleError::Configuration(
@@ -2800,6 +3444,138 @@ mod tests {
 			}
 			git_dir.write("config", &edit.0).unwrap();
 			Ok(())
+		}
+
+		async fn plan_module_deinit(
+			&self,
+			_git_dir: Dir,
+			_display_path: &Path,
+			_expected_worktree: &str,
+			_mounted_worktree: Option<Dir>,
+		) -> Result<crate::DeinitConfigTransition, SubmoduleError> {
+			unreachable!()
+		}
+
+		async fn validate_module_deinit_target_outside_worktree(
+			&self,
+			_git_dir: Dir,
+			_display_path: &Path,
+			_transition: &crate::DeinitConfigTransition,
+			_publication: Option<&crate::DeinitConfigPublication>,
+			_worktree: Dir,
+			_worktree_root: &Path,
+		) -> Result<(), SubmoduleError> {
+			unreachable!()
+		}
+
+		async fn reserve_module_deinit(
+			&self,
+			_git_dir: Dir,
+			_display_path: &Path,
+			_expected_worktree: &str,
+			_transition: &crate::DeinitConfigTransition,
+			_lease: crate::SubmoduleMutationLease,
+		) -> Result<Option<crate::DeinitConfigPublication>, SubmoduleError> {
+			unreachable!()
+		}
+
+		async fn prepare_module_deinit(
+			&self,
+			_git_dir: Dir,
+			_display_path: &Path,
+			_expected_worktree: &str,
+			_transition: &crate::DeinitConfigTransition,
+			_publication: &crate::DeinitConfigPublication,
+			_lease: crate::SubmoduleMutationLease,
+		) -> Result<(), SubmoduleError> {
+			unreachable!()
+		}
+
+		async fn restore_module_deinit_before_image(
+			&self,
+			_git_dir: Dir,
+			_display_path: &Path,
+			_transition: &crate::DeinitConfigTransition,
+			_publication: &crate::DeinitConfigPublication,
+			_lease: crate::SubmoduleMutationLease,
+		) -> Result<bool, SubmoduleError> {
+			unreachable!()
+		}
+
+		async fn module_deinit_before_image_requires_restore(
+			&self,
+			_git_dir: Dir,
+			_display_path: &Path,
+			_transition: &crate::DeinitConfigTransition,
+			_publication: &crate::DeinitConfigPublication,
+		) -> Result<bool, SubmoduleError> {
+			unreachable!()
+		}
+
+		async fn apply_module_deinit(
+			&self,
+			_git_dir: Dir,
+			_display_path: &Path,
+			_expected_worktree: &str,
+			_transition: &crate::DeinitConfigTransition,
+			_publication: Option<&crate::DeinitConfigPublication>,
+			_lease: crate::SubmoduleMutationLease,
+		) -> Result<bool, SubmoduleError> {
+			unreachable!()
+		}
+
+		async fn plan_superproject_deinit(
+			&self,
+			_name: &str,
+			_mounted_worktree: Option<Dir>,
+			_worktree_root: &Path,
+		) -> Result<crate::DeinitConfigTransition, SubmoduleError> {
+			unreachable!()
+		}
+
+		async fn reserve_superproject_deinit(
+			&self,
+			_transition: &crate::DeinitConfigTransition,
+			_lease: crate::SubmoduleMutationLease,
+		) -> Result<Option<crate::DeinitConfigPublication>, SubmoduleError> {
+			unreachable!()
+		}
+
+		async fn prepare_superproject_deinit(
+			&self,
+			_name: &str,
+			_transition: &crate::DeinitConfigTransition,
+			_publication: &crate::DeinitConfigPublication,
+			_lease: crate::SubmoduleMutationLease,
+		) -> Result<(), SubmoduleError> {
+			unreachable!()
+		}
+
+		async fn restore_superproject_deinit_before_image(
+			&self,
+			_transition: &crate::DeinitConfigTransition,
+			_publication: &crate::DeinitConfigPublication,
+			_lease: crate::SubmoduleMutationLease,
+		) -> Result<bool, SubmoduleError> {
+			unreachable!()
+		}
+
+		async fn superproject_deinit_before_image_requires_restore(
+			&self,
+			_transition: &crate::DeinitConfigTransition,
+			_publication: &crate::DeinitConfigPublication,
+		) -> Result<bool, SubmoduleError> {
+			unreachable!()
+		}
+
+		async fn apply_superproject_deinit(
+			&self,
+			_name: &str,
+			_transition: &crate::DeinitConfigTransition,
+			_publication: Option<&crate::DeinitConfigPublication>,
+			_lease: crate::SubmoduleMutationLease,
+		) -> Result<bool, SubmoduleError> {
+			unreachable!()
 		}
 	}
 
@@ -2812,12 +3588,18 @@ mod tests {
 		let module_directory = context
 			.open_git_subdir_nofollow(Path::new("modules/one"))
 			.unwrap();
-		let mount_plan = context.inspect_module_mount(&entry).await.unwrap();
 		let marker = temporary.path().join("work/modules/one/.git");
 		let configuration = MarkerRacingConfiguration {
 			marker: marker.clone(),
 			marker_bytes: b"foreign marker\n".to_vec(),
+			effective: None,
 		};
+		let mount_plan = context
+			.inspect_module_mount(&entry, &configuration)
+			.await
+			.unwrap();
+		let guard = context.acquire_update_lock().unwrap();
+		let mutation_lease = guard.lease();
 
 		assert!(matches!(
 			context
@@ -2826,7 +3608,7 @@ mod tests {
 					&mount_plan,
 					&module_directory,
 					true,
-					&configuration,
+					(&configuration, &mutation_lease),
 					None,
 				)
 				.await,
@@ -2850,15 +3632,21 @@ mod tests {
 			.unwrap();
 		let marker = temporary.path().join("work/modules/one/.git");
 		std::fs::write(&marker, entry.pointers.marker.as_bytes()).unwrap();
-		let mount_plan = context.inspect_module_mount(&entry).await.unwrap();
+		let configuration = MarkerRacingConfiguration {
+			marker: marker.clone(),
+			marker_bytes: entry.pointers.marker.as_bytes().to_vec(),
+			effective: None,
+		};
+		let mount_plan = context
+			.inspect_module_mount(&entry, &configuration)
+			.await
+			.unwrap();
 		let before_identity = match &mount_plan.marker {
 			MarkerSnapshot::File { identity, .. } => *identity,
 			MarkerSnapshot::Absent => panic!("fixture marker must exist"),
 		};
-		let configuration = MarkerRacingConfiguration {
-			marker: marker.clone(),
-			marker_bytes: entry.pointers.marker.as_bytes().to_vec(),
-		};
+		let guard = context.acquire_update_lock().unwrap();
+		let mutation_lease = guard.lease();
 
 		assert!(matches!(
 			context
@@ -2867,7 +3655,7 @@ mod tests {
 					&mount_plan,
 					&module_directory,
 					false,
-					&configuration,
+					(&configuration, &mutation_lease),
 					None,
 				)
 				.await,
@@ -3095,6 +3883,270 @@ mod tests {
 		replacement_guard.validate().unwrap();
 	}
 
+	#[cfg(any(unix, windows))]
+	#[test]
+	fn update_lock_lease_retains_serialization_after_the_guard_is_dropped() {
+		let (_temporary, context, _entry) = mount_fixture("leased-update-lock");
+		let guard = context.acquire_update_lock().unwrap();
+		let lease = guard.lease();
+		drop(guard);
+
+		assert!(matches!(
+			context.acquire_update_lock(),
+			Err(SubmoduleError::UpdateLocked)
+		));
+
+		drop(lease);
+		let replacement = context.acquire_update_lock().unwrap();
+		replacement.validate().unwrap();
+	}
+
+	#[cfg(any(unix, windows))]
+	#[test]
+	fn shared_config_lock_serializes_linked_worktrees_and_survives_guard_drop() {
+		let temporary = tempfile::tempdir().unwrap();
+		let common_path = temporary.path().join("common");
+		let first_path = common_path.join("worktrees/first");
+		let second_path = common_path.join("worktrees/second");
+		std::fs::create_dir_all(common_path.join("refs")).unwrap();
+		std::fs::create_dir_all(&first_path).unwrap();
+		std::fs::create_dir_all(&second_path).unwrap();
+		let common = Dir::open_ambient_dir(&common_path, ambient_authority()).unwrap();
+		let first = Dir::open_ambient_dir(&first_path, ambient_authority()).unwrap();
+		let second = Dir::open_ambient_dir(&second_path, ambient_authority()).unwrap();
+
+		let guard =
+			acquire_update_lock_with_common(&first, &first_path, &common, &common_path).unwrap();
+		let lease = guard.lease();
+		drop(guard);
+		assert!(matches!(
+			acquire_update_lock_with_common(&second, &second_path, &common, &common_path),
+			Err(SubmoduleError::UpdateLocked)
+		));
+		drop(lease);
+
+		let replacement =
+			acquire_update_lock_with_common(&second, &second_path, &common, &common_path).unwrap();
+		replacement.validate().unwrap();
+		assert!(
+			common
+				.symlink_metadata(SHARED_CONFIG_LOCK)
+				.unwrap()
+				.is_file()
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn shared_config_lease_rejects_a_replaced_visible_refs_guard() {
+		let temporary = tempfile::tempdir().unwrap();
+		let common_path = temporary.path().join("common");
+		std::fs::create_dir_all(common_path.join("refs")).unwrap();
+		let common = Dir::open_ambient_dir(&common_path, ambient_authority()).unwrap();
+		let lease = acquire_submodule_config_mutation_lease(&common, &common_path).unwrap();
+
+		std::fs::rename(common_path.join("refs"), common_path.join("refs-retained")).unwrap();
+		std::fs::create_dir(common_path.join("refs")).unwrap();
+
+		assert!(matches!(
+			lease.validate(),
+			Err(SubmoduleError::RecoveryRequired(message))
+				if message.contains("shared config guard changed")
+		));
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn shared_config_guard_rejects_a_retargeted_refs_symlink() {
+		use std::os::unix::fs::symlink;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let common_path = temporary.path().join("common");
+		std::fs::create_dir(&common_path).unwrap();
+		std::fs::create_dir(common_path.join("original-refs")).unwrap();
+		std::fs::create_dir(common_path.join("replacement-refs")).unwrap();
+		symlink("original-refs", common_path.join("refs")).unwrap();
+		let common = Dir::open_ambient_dir(&common_path, ambient_authority()).unwrap();
+		let lease = acquire_submodule_config_setup_lease(&common, &common_path).unwrap();
+
+		std::fs::remove_file(common_path.join("refs")).unwrap();
+		symlink("replacement-refs", common_path.join("refs")).unwrap();
+
+		assert!(matches!(
+			lease.validate(),
+			Err(SubmoduleError::RecoveryRequired(message))
+				if message.contains("shared config guard changed")
+		));
+	}
+
+	#[cfg(any(unix, windows))]
+	#[test]
+	fn command_setup_lease_waits_for_a_linked_worktree_config_mutation() {
+		use std::sync::mpsc::{RecvTimeoutError, channel};
+		use std::time::Duration;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let common_path = temporary.path().join("common");
+		let first_path = common_path.join("worktrees/first");
+		let second_path = common_path.join("worktrees/second");
+		std::fs::create_dir_all(common_path.join("refs")).unwrap();
+		std::fs::create_dir_all(&first_path).unwrap();
+		std::fs::create_dir_all(&second_path).unwrap();
+		let common = Dir::open_ambient_dir(&common_path, ambient_authority()).unwrap();
+		let first = Dir::open_ambient_dir(&first_path, ambient_authority()).unwrap();
+		let mutation =
+			acquire_update_lock_with_common(&first, &first_path, &common, &common_path).unwrap();
+
+		let (sender, receiver) = channel();
+		let thread_common_path = common_path.clone();
+		let waiter = std::thread::spawn(move || {
+			let common = Dir::open_ambient_dir(&thread_common_path, ambient_authority()).unwrap();
+			sender.send(()).unwrap();
+			acquire_submodule_config_setup_lease(&common, &thread_common_path).unwrap()
+		});
+		receiver.recv().unwrap();
+		assert!(matches!(
+			receiver.recv_timeout(Duration::from_millis(50)),
+			Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected)
+		));
+
+		drop(mutation);
+		let lease = waiter.join().unwrap();
+		assert!(matches!(
+			acquire_update_lock_with_common(&first, &first_path, &common, &common_path),
+			Err(SubmoduleError::UpdateLocked)
+		));
+		drop(lease);
+		acquire_update_lock_with_common(&first, &first_path, &common, &common_path).unwrap();
+	}
+
+	#[cfg(any(unix, windows))]
+	#[test]
+	fn setup_leases_are_shared_and_do_not_create_the_mutation_lock() {
+		use std::sync::mpsc::{RecvTimeoutError, channel};
+		use std::time::Duration;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let common_path = temporary.path().join("common");
+		std::fs::create_dir_all(common_path.join("refs")).unwrap();
+		let common = Dir::open_ambient_dir(&common_path, ambient_authority()).unwrap();
+
+		let first = acquire_submodule_config_setup_lease(&common, &common_path).unwrap();
+		let second = acquire_submodule_config_setup_lease(&common, &common_path).unwrap();
+		assert!(matches!(
+			common.symlink_metadata(SHARED_CONFIG_LOCK),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound
+		));
+
+		let mutation_common = common.try_clone().unwrap();
+		let mutation_path = common_path.clone();
+		let (started_sender, started_receiver) = channel();
+		let (acquired_sender, acquired_receiver) = channel();
+		let mutation = std::thread::spawn(move || {
+			started_sender.send(()).unwrap();
+			let lease =
+				acquire_submodule_config_mutation_lease(&mutation_common, &mutation_path).unwrap();
+			acquired_sender.send(()).unwrap();
+			lease
+		});
+		started_receiver.recv().unwrap();
+		assert!(matches!(
+			acquired_receiver.recv_timeout(Duration::from_millis(50)),
+			Err(RecvTimeoutError::Timeout)
+		));
+		drop(first);
+		assert!(matches!(
+			acquired_receiver.recv_timeout(Duration::from_millis(50)),
+			Err(RecvTimeoutError::Timeout)
+		));
+		drop(second);
+		acquired_receiver
+			.recv_timeout(Duration::from_secs(1))
+			.expect("mutation waits until every setup lease is released");
+		let mutation = mutation.join().unwrap();
+		assert!(
+			common
+				.symlink_metadata(SHARED_CONFIG_LOCK)
+				.unwrap()
+				.is_file()
+		);
+		drop(mutation);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn shared_object_store_does_not_alias_distinct_config_guards() {
+		use std::os::unix::fs::symlink;
+		use std::sync::mpsc::channel;
+		use std::time::Duration;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let shared_objects = temporary.path().join("objects");
+		let first_path = temporary.path().join("first.git");
+		let second_path = temporary.path().join("second.git");
+		std::fs::create_dir(&shared_objects).unwrap();
+		std::fs::create_dir(&first_path).unwrap();
+		std::fs::create_dir(&second_path).unwrap();
+		std::fs::create_dir(first_path.join("refs")).unwrap();
+		std::fs::create_dir(second_path.join("refs")).unwrap();
+		symlink(&shared_objects, first_path.join("objects")).unwrap();
+		symlink(&shared_objects, second_path.join("objects")).unwrap();
+
+		let first = Dir::open_ambient_dir(&first_path, ambient_authority()).unwrap();
+		let second = Dir::open_ambient_dir(&second_path, ambient_authority()).unwrap();
+		let first_mutation = try_acquire_submodule_config_mutation_lease(&first, &first_path).unwrap();
+		let second_mutation =
+			try_acquire_submodule_config_mutation_lease(&second, &second_path).unwrap();
+		drop(second_mutation);
+
+		let (acquired_sender, acquired_receiver) = channel();
+		let waiter_path = second_path.clone();
+		let waiter = std::thread::spawn(move || {
+			let second = Dir::open_ambient_dir(&waiter_path, ambient_authority()).unwrap();
+			let lease = acquire_submodule_config_setup_lease(&second, &waiter_path).unwrap();
+			acquired_sender.send(()).unwrap();
+			lease
+		});
+		let acquired = acquired_receiver.recv_timeout(Duration::from_secs(1));
+		drop(first_mutation);
+		drop(waiter.join().unwrap());
+		assert!(
+			acquired.is_ok(),
+			"an unrelated repository setup lease waited on the shared object store"
+		);
+	}
+
+	#[cfg(any(unix, windows))]
+	#[test]
+	fn setup_lock_does_not_alias_the_main_worktree_update_guard() {
+		use std::sync::mpsc::channel;
+		use std::time::Duration;
+
+		let (_temporary, context, _entry) = mount_fixture("shared-main-worktree-lock");
+		let update = context.acquire_update_lock().unwrap();
+		let (sender, receiver) = channel();
+		let common_path = context.layout.common_dir.clone();
+		let waiter = std::thread::spawn(move || {
+			let common = Dir::open_ambient_dir(&common_path, ambient_authority()).unwrap();
+			let lease = acquire_submodule_config_setup_lease(&common, &common_path).unwrap();
+			sender.send(()).unwrap();
+			lease
+		});
+
+		receiver
+			.recv_timeout(Duration::from_secs(1))
+			.expect("setup lease must not wait for a plain update");
+		assert!(matches!(
+			context.acquire_update_lock(),
+			Err(SubmoduleError::UpdateLocked)
+		));
+
+		drop(update);
+		drop(waiter.join().unwrap());
+		let config_update = context.acquire_config_update_lock().unwrap();
+		config_update.validate().unwrap();
+	}
+
 	#[cfg(windows)]
 	#[test]
 	fn update_lock_entry_cannot_be_detached_while_held() {
@@ -3135,7 +4187,8 @@ mod tests {
 		let worktree = temporary.path().join("work");
 		let git_dir = worktree.join(".git");
 		std::fs::create_dir_all(worktree.join("modules/one")).unwrap();
-		std::fs::create_dir(&git_dir).unwrap();
+		std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+		std::fs::create_dir_all(git_dir.join("refs")).unwrap();
 		let worktree = std::fs::canonicalize(worktree).unwrap();
 		let git_dir = std::fs::canonicalize(git_dir).unwrap();
 		let context = SubmoduleContext::new(
@@ -3167,6 +4220,7 @@ mod tests {
 			state: None,
 			recovering: false,
 			intent_identity: None,
+			module_config_lease: None,
 			pointers,
 		};
 		(temporary, context, entry)

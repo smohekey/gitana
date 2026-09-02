@@ -55,6 +55,10 @@ pub enum SubmoduleError {
 	UnrepresentablePointerPath(PathBuf),
 	#[error("submodule update is already running for this worktree")]
 	UpdateLocked,
+	#[error(
+		"submodule path '{0}' contains local modifications; use --force to deinitialize while retaining the checkout and its local changes"
+	)]
+	LocalModifications(String),
 	#[error("cannot update submodule '{name}' while {operation} is in progress")]
 	OperationInProgress {
 		name: String,
@@ -66,6 +70,8 @@ pub enum SubmoduleError {
 	Transfer(String),
 	#[error("pathspec '{0}' did not match any file known to git")]
 	PathspecNoMatch(String),
+	#[error("submodule deinit requires an explicit all selection or at least one pathspec")]
+	EmptyDeinitSelection,
 	#[error("unsafe submodule name '{0}'")]
 	UnsafeName(String),
 	#[error("unsafe submodule path '{0}'")]

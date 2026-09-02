@@ -5,6 +5,7 @@
 //! per-worktree files (`HEAD`, `index`, `commondir` → the shared `.git`, `gitdir` → the checkout's
 //! `.git` file) plus a checkout whose `.git` is a file pointing back at that admin directory.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,11 +19,35 @@ use gitana_linked_worktree::{
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 use gitana_porcelain::Identity;
 use gitana_repository::Repository;
+use gitana_submodule::SubmoduleMutationLease;
 
 use crate::Backend;
-use crate::dispatch::detect_algorithm;
+use crate::RepositoryLayoutIdentity;
+use crate::dispatch::detect_algorithm_at;
 use crate::identity::CliIdentity;
 use crate::repo;
+
+/// Await a linked-worktree operation while retaining shared-config serialization.
+///
+/// Taking the lease by value makes its lifetime part of the awaited operation instead of relying on
+/// an otherwise-unused local remaining in scope.
+async fn with_setup_lease<T>(
+	_setup: SubmoduleMutationLease,
+	operation: impl Future<Output = T>,
+) -> T {
+	operation.await
+}
+
+/// Acquire shared-config serialization and reject any worktree-owned deinit recovery before a
+/// linked-worktree namespace mutation can invalidate its sole administrative owner.
+async fn destructive_setup_lease(
+	layout: &repo::RepositoryLayout,
+	expected: RepositoryLayoutIdentity,
+) -> Result<SubmoduleMutationLease> {
+	let (setup, common, git, _) = repo::command_setup_lease(layout, expected).await?;
+	repo::ensure_no_pending_deinit_at(layout, &common, &git)?;
+	Ok(setup)
+}
 
 /// A `gta worktree` operation.
 pub enum Action {
@@ -122,6 +147,7 @@ async fn add(
 	detach: bool,
 ) -> Result<()> {
 	let found = repo::discover(cwd).await?;
+	let identity = repo::capture_repository_layout_identity(&found)?;
 	let common = &found.common_dir;
 	let target = absolute(cwd, path);
 
@@ -146,9 +172,11 @@ async fn add(
 	// explicit `CheckoutTarget` the library takes plus a `Label` for the "Preparing worktree" line. The
 	// env-aware committer (honouring `GIT_COMMITTER_*`, incl. `DATE`) is resolved here too, the same way
 	// clone/fetch/pull do — the library records it on every reflog line it writes.
-	let (checkout_target, label, committer) = match detect_algorithm(common)? {
+	let (setup, common_dir, git_dir, _) = repo::command_setup_lease(&found, identity).await?;
+	let (checkout_target, label, committer) = match detect_algorithm_at(&common_dir, common).await? {
 		HashKind::Sha1 => {
-			let repo = repo::open_generic::<Sha1>(&found.git_dir, common).await?;
+			let repo =
+				repo::open_generic_from_dirs::<Sha1>(common_dir, git_dir, &found.git_dir, common).await?;
 			let (target, label) = plan_checkout::<Sha1>(
 				&repo,
 				&target,
@@ -163,7 +191,8 @@ async fn add(
 			(target, label, committer)
 		}
 		HashKind::Sha256 => {
-			let repo = repo::open_generic::<Sha256>(&found.git_dir, common).await?;
+			let repo =
+				repo::open_generic_from_dirs::<Sha256>(common_dir, git_dir, &found.git_dir, common).await?;
 			let (target, label) = plan_checkout::<Sha256>(
 				&repo,
 				&target,
@@ -183,7 +212,9 @@ async fn add(
 	// `core.logAllRefUpdates` gating (git's full precedence stack), as `list` injects it; `committer` carries
 	// the env-aware identity, and `reflog_start` the user's start-point spelling for a new branch's reflog
 	// message (git records the token as named — `branch: Created from HEAD` — not the resolved hash).
-	let effective = crate::git_config::for_worktree(common, &found.git_dir).await?;
+	let (config_common, config_git, _) = repo::revalidate_repository_layout(&found, identity).await?;
+	let effective =
+		crate::git_config::for_worktree_at(config_common, config_git, common, &found.git_dir).await?;
 	let reflog_start = matches!(checkout_target, CheckoutTarget::NewBranch { .. })
 		.then(|| commit_ish.unwrap_or("HEAD").to_owned());
 	let request = CreateRequest {
@@ -193,7 +224,13 @@ async fn add(
 		committer: Some(committer),
 		reflog_start,
 	};
-	match gitana_linked_worktree::create(&request, Some(&effective)).await {
+	repo::revalidate_repository_layout(&found, identity).await?;
+	match with_setup_lease(
+		setup,
+		gitana_linked_worktree::create(&request, Some(&effective)),
+	)
+	.await
+	{
 		// Created, or already exactly present (idempotent) — emit git's "Preparing worktree …" line.
 		Ok(_) => {
 			report_add(&label, &checkout_target);
@@ -478,16 +515,21 @@ fn map_create_error(error: CreateError, path: &Path, target: &CheckoutTarget) ->
 
 async fn list(cwd: &Path, porcelain: bool) -> Result<()> {
 	let found = repo::discover(cwd).await?;
+	let identity = repo::capture_repository_layout_identity(&found)?;
+	let (setup, common, git, _) = repo::worktree_list_setup_lease(&found, identity).await?;
 	// Resolve the *invoking* worktree's effective config (git's full precedence stack) here, where the
 	// discovered layout still carries that worktree's git dir. The library honours the injected
 	// `core.ignorecase` for its listing order (git sorts linked worktrees by checkout path, case-folded
 	// when `core.ignorecase` is set — typical on macOS/Windows).
-	let effective = crate::git_config::for_worktree(&found.common_dir, &found.git_dir).await?;
+	let effective =
+		crate::git_config::for_worktree_at(common, git, &found.common_dir, &found.git_dir).await?;
 	// `core.ignorecase` is a startup `core.*` boolean: git validates every occurrence and aborts on any
 	// malformed value — even one shadowed by a higher-precedence source. The library trusts its injected
 	// config (validation is a property of a git process booting, not of a library answering a query), so
 	// keep git's abort here at the CLI edge, as `list` has always done.
 	effective.get_bool_validated("core", None, "ignorecase")?;
+	let (common, _, _) = repo::revalidate_repository_layout(&found, identity).await?;
+	let kind = detect_algorithm_at(&common, &found.common_dir).await?;
 
 	// Delegating to the library closes a symlink disclosure class the native collector inherited from git:
 	// git follows a symlinked `worktrees/` container, a symlinked admin leaf, and a symlinked `locked`
@@ -498,10 +540,10 @@ async fn list(cwd: &Path, porcelain: bool) -> Result<()> {
 		RepositoryId::at_common_dir(found.common_dir.clone())?,
 		effective,
 	);
-	let listing = gitana_linked_worktree::enumerate(&cx).await?;
+	repo::revalidate_repository_layout(&found, identity).await?;
+	let listing = with_setup_lease(setup, gitana_linked_worktree::enumerate(&cx)).await?;
 	// The library reports no object for an unborn HEAD; `kind` renders its all-zeros placeholder at the
 	// repository's hash width.
-	let kind = detect_algorithm(&found.common_dir)?;
 	let entries: Vec<WorktreeInfo> = listing
 		.entries
 		.into_iter()
@@ -668,6 +710,7 @@ fn render_porcelain(entries: &[WorktreeInfo]) -> String {
 
 async fn remove(cwd: &Path, path: &Path, force: u8) -> Result<()> {
 	let found = repo::discover(cwd).await?;
+	let identity = repo::capture_repository_layout_identity(&found)?;
 	let common = &found.common_dir;
 	// Resolve by git's rules (exact path, then a unique name/id suffix) — kept CLI-side (the DWIM the library
 	// does not do). The checkout may already be gone (deleted or moved) — git still cleans up such a stale
@@ -694,9 +737,11 @@ async fn remove(cwd: &Path, path: &Path, force: u8) -> Result<()> {
 		expected_branch: None,
 		policy: RemovePolicy::GitCompat { force },
 	};
+	let setup = destructive_setup_lease(&found, identity).await?;
+	repo::revalidate_repository_layout(&found, identity).await?;
 	use ProtectionReason as P;
 	use WorktreeClassification as C;
-	match gitana_linked_worktree::remove(&request).await {
+	match with_setup_lease(setup, gitana_linked_worktree::remove(&request)).await {
 		// Removed, or already gone (idempotent) — git prints nothing on a successful remove.
 		Ok(RemoveOutcome::Removed { .. } | RemoveOutcome::AlreadyAbsent { .. }) => Ok(()),
 		// A locked worktree needs a second `-f`; carry git's lock-reason message when one is recorded.
@@ -856,42 +901,53 @@ fn resolve_lockable(common: &Path, cwd: &Path, arg: &Path) -> Result<PathBuf> {
 /// (`-n`) reports without removing; each removal is reported to stderr when `dry_run` or `verbose`.
 async fn prune(cwd: &Path, dry_run: bool, verbose: bool, expire: Option<&str>) -> Result<()> {
 	let found = repo::discover(cwd).await?;
+	let identity = repo::capture_repository_layout_identity(&found)?;
 	let common = &found.common_dir;
 	// Default (no `--expire`): remove every stale worktree — git uses an effectively-infinite cutoff.
 	let cutoff = match expire {
 		Some(spec) => parse_expiry(spec)?,
 		None => u64::MAX,
 	};
-	let worktrees = common.join("worktrees");
-	let mut names: Vec<String> = match std::fs::read_dir(&worktrees) {
-		Ok(entries) => entries
-			.flatten()
-			.filter_map(|entry| entry.file_name().into_string().ok())
-			.collect(),
-		Err(_) => return Ok(()),
+	let setup = if dry_run {
+		let (setup, _, _, _) = repo::command_setup_lease(&found, identity).await?;
+		setup
+	} else {
+		destructive_setup_lease(&found, identity).await?
 	};
-	// A stable order keeps the (stderr) report deterministic; git walks readdir order.
-	names.sort();
-	for name in names {
-		let admin = worktrees.join(&name);
-		let Some(reason) = prune_reason(&admin, cutoff) else {
-			continue;
+	repo::revalidate_repository_layout(&found, identity).await?;
+	with_setup_lease(setup, async {
+		let worktrees = common.join("worktrees");
+		let mut names: Vec<String> = match std::fs::read_dir(&worktrees) {
+			Ok(entries) => entries
+				.flatten()
+				.filter_map(|entry| entry.file_name().into_string().ok())
+				.collect(),
+			Err(_) => return Ok(()),
 		};
-		if dry_run || verbose {
-			eprintln!("Removing worktrees/{name}: {reason}");
-		}
-		if !dry_run {
-			// A malformed entry that is a plain file (`not a valid directory`) must be unlinked, not
-			// `remove_dir_all`-ed — prune is the cleanup path for exactly such corrupt admin entries.
-			let removed = if admin.is_dir() {
-				std::fs::remove_dir_all(&admin)
-			} else {
-				std::fs::remove_file(&admin)
+		// A stable order keeps the (stderr) report deterministic; git walks readdir order.
+		names.sort();
+		for name in names {
+			let admin = worktrees.join(&name);
+			let Some(reason) = prune_reason(&admin, cutoff) else {
+				continue;
 			};
-			removed.map_err(|error| anyhow!("removing {}: {error}", admin.display()))?;
+			if dry_run || verbose {
+				eprintln!("Removing worktrees/{name}: {reason}");
+			}
+			if !dry_run {
+				// A malformed entry that is a plain file (`not a valid directory`) must be unlinked, not
+				// `remove_dir_all`-ed — prune is the cleanup path for exactly such corrupt admin entries.
+				let removed = if admin.is_dir() {
+					std::fs::remove_dir_all(&admin)
+				} else {
+					std::fs::remove_file(&admin)
+				};
+				removed.map_err(|error| anyhow!("removing {}: {error}", admin.display()))?;
+			}
 		}
-	}
-	Ok(())
+		Ok(())
+	})
+	.await
 }
 
 /// The reason to prune the admin directory `admin`, or `None` to keep it — git's
@@ -1033,6 +1089,7 @@ fn parse_relative_span(spec: &str) -> Option<u64> {
 /// moves *into* it under its own basename, otherwise `new_path` is the literal target.
 async fn move_worktree(cwd: &Path, worktree: &Path, new_path: &Path, force: u8) -> Result<()> {
 	let found = repo::discover(cwd).await?;
+	let identity = repo::capture_repository_layout_identity(&found)?;
 	let common = &found.common_dir;
 	let (admin, source) = match find_worktree(common, cwd, worktree) {
 		Some(WorktreeRef::Main { .. }) => bail!("'{}' is a main working tree", worktree.display()),
@@ -1098,8 +1155,10 @@ async fn move_worktree(cwd: &Path, worktree: &Path, new_path: &Path, force: u8) 
 		expected_branch: None,
 		force,
 	};
+	let setup = destructive_setup_lease(&found, identity).await?;
+	repo::revalidate_repository_layout(&found, identity).await?;
 	use WorktreeClassification as C;
-	match relocate(&request).await {
+	match with_setup_lease(setup, relocate(&request)).await {
 		// Moved — git prints nothing on a successful move.
 		Ok(RelocateOutcome::Relocated { .. }) => Ok(()),
 		// `from == to` (e.g. moving into the worktree's own parent, which DWIMs back to itself): the library
@@ -1536,4 +1595,29 @@ fn canonical(path: &Path) -> PathBuf {
 /// Compare two paths by their canonical form.
 fn canonical_eq(a: &Path, b: &Path) -> bool {
 	canonical(a) == canonical(b)
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
+
+	use gitana_submodule::SubmoduleMutationLease;
+
+	use super::with_setup_lease;
+
+	#[tokio::test]
+	async fn setup_lease_is_retained_until_the_linked_worktree_future_completes() {
+		let owner = Arc::new(());
+		let retained = Arc::downgrade(&owner);
+		let lease = SubmoduleMutationLease::retain(Arc::clone(&owner));
+		drop(owner);
+
+		with_setup_lease(lease, async {
+			tokio::task::yield_now().await;
+			assert!(retained.upgrade().is_some());
+		})
+		.await;
+
+		assert!(retained.upgrade().is_none());
+	}
 }

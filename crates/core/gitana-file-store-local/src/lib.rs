@@ -54,6 +54,9 @@ use tokio::sync::Mutex as AsyncMutex;
 mod worktree;
 pub use worktree::WorktreeFileStore;
 
+mod worker_keepalive_backend;
+use worker_keepalive_backend::WorkerKeepaliveBackend;
+
 // The working-tree filesystem capability: a directory-rooted `lstat`/read/readdir/write/symlink/…
 // surface richer than `FileStore`'s flat byte API, for `gitana-worktree`. The trait and its metadata
 // types are target-agnostic; the concrete impls are per-target, each containing its own metadata
@@ -135,6 +138,16 @@ impl LocalFileStore {
 			#[cfg(not(target_arch = "wasm32"))]
 			locks: Arc::new(Mutex::new(HashMap::new())),
 		}
+	}
+
+	/// Retain an opaque serialization owner in every blocking worker spawned by this store.
+	///
+	/// Native filesystem workers continue after their awaiting future is cancelled. Because each
+	/// worker captures the backend, wrapping it here keeps `keepalive` held until the last queued
+	/// operation has actually stopped touching the namespace.
+	pub fn with_worker_keepalive(mut self, keepalive: Arc<dyn Send + Sync>) -> Self {
+		self.backend = Arc::new(WorkerKeepaliveBackend::new(self.backend, keepalive));
+		self
 	}
 
 	/// Create the directory `path` (and any missing parents) inside the store —

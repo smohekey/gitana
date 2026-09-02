@@ -14,7 +14,9 @@ use gitana_remote::{
 use crate::dispatch;
 use crate::identity::CliIdentity;
 use crate::shallow::build_fetch_deepen;
-use crate::{CommandContext, git_config, repo, transport_for, url_rewrite};
+use crate::{
+	CommandContext, RepositoryLayoutIdentity, git_config, repo, transport_for, url_rewrite,
+};
 
 /// Fetch all branches from the origin into `refs/remotes/origin/*`. By default git's tag auto-follow
 /// also lands tags reachable from the fetched branches; `all_tags` (`--tags`) mirrors every advertised
@@ -44,8 +46,11 @@ pub async fn run(
 		shallow_exclude,
 	)?;
 	let found = repo::discover(cwd).await?;
+	let identity = repo::capture_repository_layout_identity(&found)?;
 	// The origin URL is `remote.origin.url` with `url.*.insteadOf` applied, read from the merged config.
-	let config = git_config::from_repo(&found.git_dir, &found.common_dir).await?;
+	let (setup, common, git, _) = repo::command_setup_lease(&found, identity).await?;
+	let config = git_config::for_worktree_at(common, git, &found.common_dir, &found.git_dir).await?;
+	drop(setup);
 	let url = url_rewrite::resolve_fetch_url(&config, "origin")?;
 	let remote = RemoteUrl::parse(&url)?;
 	if let Some(command) = CommandContext::current() {
@@ -80,11 +85,14 @@ pub async fn run(
 			fetch_dispatch(
 				&mut fetcher,
 				&found,
+				identity,
 				&body,
-				&display,
-				tags,
-				&deepen,
-				unshallow,
+				FetchOptions {
+					url: &display,
+					tags,
+					deepen: &deepen,
+					unshallow,
+				},
 			)
 			.await
 		}
@@ -96,53 +104,91 @@ pub async fn run(
 			fetch_dispatch(
 				&mut fetcher,
 				&found,
+				identity,
 				&body,
-				&display,
-				tags,
-				&deepen,
-				unshallow,
+				FetchOptions {
+					url: &display,
+					tags,
+					deepen: &deepen,
+					unshallow,
+				},
 			)
 			.await
 		}
 		RemoteUrl::Local(path) => {
 			let source = local_path(&askpass_cwd, &path);
 			let source_layout = repo::inspect_root(&source).await?;
-			match dispatch::detect_algorithm(&source_layout.common_dir)? {
+			let source_identity = repo::capture_repository_layout_identity(&source_layout)?;
+			let (source_setup, common, git) =
+				repo::revalidated_local_source_setup(&source_layout, source_identity, None).await?;
+			match dispatch::detect_algorithm_at(&common, &source_layout.common_dir).await? {
 				HashKind::Sha1 => {
-					let source =
-						repo::open_generic::<Sha1>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let second_common = common.try_clone()?;
+					let second_git = git.try_clone()?;
+					let source = repo::open_generic_from_dirs::<Sha1>(
+						common,
+						git,
+						&source_layout.git_dir,
+						&source_layout.common_dir,
+					)
+					.await?;
 					let connection = LocalConnection::open(source).await?;
 					let body = connection.advertisement().to_vec();
-					let source =
-						repo::open_generic::<Sha1>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let source = repo::open_generic_from_dirs::<Sha1>(
+						second_common,
+						second_git,
+						&source_layout.git_dir,
+						&source_layout.common_dir,
+					)
+					.await?;
+					drop(source_setup);
 					let mut fetcher = LocalPackFetcher::new(source);
 					fetch_dispatch(
 						&mut fetcher,
 						&found,
+						identity,
 						&body,
-						&display,
-						tags,
-						&deepen,
-						unshallow,
+						FetchOptions {
+							url: &display,
+							tags,
+							deepen: &deepen,
+							unshallow,
+						},
 					)
 					.await
 				}
 				HashKind::Sha256 => {
-					let source =
-						repo::open_generic::<Sha256>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let second_common = common.try_clone()?;
+					let second_git = git.try_clone()?;
+					let source = repo::open_generic_from_dirs::<Sha256>(
+						common,
+						git,
+						&source_layout.git_dir,
+						&source_layout.common_dir,
+					)
+					.await?;
 					let connection = LocalConnection::open(source).await?;
 					let body = connection.advertisement().to_vec();
-					let source =
-						repo::open_generic::<Sha256>(&source_layout.git_dir, &source_layout.common_dir).await?;
+					let source = repo::open_generic_from_dirs::<Sha256>(
+						second_common,
+						second_git,
+						&source_layout.git_dir,
+						&source_layout.common_dir,
+					)
+					.await?;
+					drop(source_setup);
 					let mut fetcher = LocalPackFetcher::new(source);
 					fetch_dispatch(
 						&mut fetcher,
 						&found,
+						identity,
 						&body,
-						&display,
-						tags,
-						&deepen,
-						unshallow,
+						FetchOptions {
+							url: &display,
+							tags,
+							deepen: &deepen,
+							unshallow,
+						},
 					)
 					.await
 				}
@@ -160,37 +206,51 @@ fn local_path(cwd: &Path, path: &str) -> std::path::PathBuf {
 	}
 }
 
+struct FetchOptions<'a> {
+	url: &'a str,
+	tags: TagFetch,
+	deepen: &'a Deepen,
+	unshallow: bool,
+}
+
 /// Negotiate the object format from the advertisement, then run the per-hash fetch over `fetcher`.
 async fn fetch_dispatch(
 	fetcher: &mut impl PackFetcher,
 	found: &repo::RepositoryLayout,
+	identity: RepositoryLayoutIdentity,
 	body: &[u8],
-	url: &str,
-	tags: TagFetch,
-	deepen: &Deepen,
-	unshallow: bool,
+	options: FetchOptions<'_>,
 ) -> Result<()> {
-	let local = dispatch::detect_algorithm(&found.common_dir)?;
+	let (setup, common, _, _) = repo::command_setup_lease(found, identity).await?;
+	let local = dispatch::detect_algorithm_at(&common, &found.common_dir).await?;
+	drop(setup);
 	transport::ensure_same_format(local, transport::negotiated_kind(body)?)?;
 	match local {
-		HashKind::Sha1 => fetch_into::<Sha1>(fetcher, found, body, url, tags, deepen, unshallow).await,
-		HashKind::Sha256 => {
-			fetch_into::<Sha256>(fetcher, found, body, url, tags, deepen, unshallow).await
-		}
+		HashKind::Sha1 => fetch_into::<Sha1>(fetcher, found, identity, body, options).await,
+		HashKind::Sha256 => fetch_into::<Sha256>(fetcher, found, identity, body, options).await,
 	}
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn fetch_into<H: HashAlgorithm>(
 	fetcher: &mut impl PackFetcher,
 	found: &repo::RepositoryLayout,
+	identity: RepositoryLayoutIdentity,
 	body: &[u8],
-	url: &str,
-	tags: TagFetch,
-	deepen: &Deepen,
-	unshallow: bool,
+	options: FetchOptions<'_>,
 ) -> Result<()> {
-	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir).await?;
+	let FetchOptions {
+		url,
+		tags,
+		deepen,
+		unshallow,
+	} = options;
+	let (setup, common, git, _) = repo::command_setup_lease(found, identity).await?;
+	let repository =
+		repo::open_generic_from_dirs::<H>(common, git, &found.git_dir, &found.common_dir).await?;
+	// Preserve repository identity across the deliberately absent Windows publication window. The
+	// porcelain receives this local-config snapshot so serialization need not cover the transfer.
+	let bare = repo::repository_bare_snapshot(&repository).await?;
+	drop(setup);
 	// `--unshallow` only makes sense on a shallow repository; git rejects it on a complete one rather
 	// than pointlessly refetch the whole history.
 	if unshallow && repository.read_shallow().await?.is_empty() {
@@ -198,7 +258,7 @@ async fn fetch_into<H: HashAlgorithm>(
 	}
 	// Every branch checked out in a worktree (this one and any linked one) so the porcelain can refuse a
 	// refspec mapping onto it, naming the worktree's path as git does.
-	let checkouts = repo::branch_checkouts(&found.common_dir)
+	let checkouts = repo::branch_checkouts(&found.common_dir, bare)
 		.into_iter()
 		.map(|(branch, path)| (branch, path.display().to_string()))
 		.collect::<Vec<_>>();
@@ -207,9 +267,10 @@ async fn fetch_into<H: HashAlgorithm>(
 	// if set, else `fetch` (a plain `gta fetch` names no remote, exactly like `git fetch`).
 	let committer = CliIdentity::new(&repository).committer_or_default().await?;
 	let action = crate::identity::reflog_action("fetch");
-	let outcome = gitana_porcelain::fetch(
+	let outcome = gitana_porcelain::fetch_with_bare(
 		fetcher,
 		&repository,
+		bare,
 		body,
 		false,
 		tags,

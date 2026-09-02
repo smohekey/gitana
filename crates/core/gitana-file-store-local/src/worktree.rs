@@ -62,6 +62,19 @@ impl WorktreeFileStore {
 		)
 	}
 
+	/// A native split store whose detached filesystem workers retain `keepalive` until completion.
+	#[cfg(not(target_arch = "wasm32"))]
+	pub fn new_with_worker_keepalive(
+		common: Dir,
+		worktree: Dir,
+		keepalive: Arc<dyn Send + Sync>,
+	) -> Self {
+		Self::from_stores(
+			LocalFileStore::from_dir(common).with_worker_keepalive(Arc::clone(&keepalive)),
+			LocalFileStore::from_dir(worktree).with_worker_keepalive(keepalive),
+		)
+	}
+
 	/// The shared **common** store — where `config`, `objects`, and shared refs live (for an ordinary
 	/// repository it is the single store; for a linked worktree it is the main `.git`). git resolves the
 	/// repository config and its relative `[include]` targets against this directory, so a consumer that

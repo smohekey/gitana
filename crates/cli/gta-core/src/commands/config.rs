@@ -74,44 +74,42 @@ pub async fn run(
 	if !scoped_keyed_read {
 		git_config::ensure_count_valid()?;
 	}
+	let is_write = !args.list && write_op(&args)?.is_some();
 
 	// `--global` / `--system` never need a repository (git config --global works anywhere); `--local`
 	// always does; and the unscoped default reads from the full stack but writes to the repository.
 	match scope {
 		Some(ConfigScope::Global) => run_ambient(ConfigScope::Global, args).await,
 		Some(ConfigScope::System) => run_ambient(ConfigScope::System, args).await,
-		Some(ConfigScope::Local) => {
-			dispatch::on_repo(
-				cwd,
-				ConfigCmd {
-					local_only: true,
-					args,
-				},
-			)
-			.await
-		}
-		None => run_unscoped(cwd, args).await,
+		Some(ConfigScope::Local) => run_repository(cwd, args, true, is_write).await,
+		None => run_unscoped(cwd, args, is_write).await,
 	}
 }
 
 /// The unscoped default. A read resolves across the full precedence stack; outside a repository it
 /// still resolves from the ambient (global + system) stack, as git does. A write always targets the
 /// repository-local file, so it requires a repository.
-async fn run_unscoped(cwd: &Path, args: ConfigArgs) -> Result<()> {
-	let is_write = !args.list && write_op(&args)?.is_some();
+async fn run_unscoped(cwd: &Path, args: ConfigArgs, is_write: bool) -> Result<()> {
 	// A read genuinely outside a repository (`try_discover` → `None`) falls back to the ambient stack;
 	// a *malformed* repository is an error (propagated by `?`), not a fall-through — matching git.
 	if !is_write && crate::repo::try_discover(cwd).await?.is_none() {
 		return emit_reads(&git_config::from_ambient().await?, &args);
 	}
-	dispatch::on_repo(
-		cwd,
-		ConfigCmd {
-			local_only: false,
-			args,
-		},
-	)
-	.await
+	run_repository(cwd, args, false, is_write).await
+}
+
+async fn run_repository(
+	cwd: &Path,
+	args: ConfigArgs,
+	local_only: bool,
+	is_write: bool,
+) -> Result<()> {
+	let command = ConfigCmd { local_only, args };
+	if is_write {
+		dispatch::on_repo_config_mutation(cwd, command).await
+	} else {
+		dispatch::on_repo_config_read(cwd, command).await
+	}
 }
 
 /// The parsed `gta config` flags shared by the repository and ambient (global/system) paths.

@@ -21,7 +21,7 @@ use crate::dispatch::{self, RepoCommand};
 use crate::identity::CliIdentity;
 use crate::repo;
 use crate::signer::{self, CliSigner};
-use crate::{git_config, transport_for, url_rewrite};
+use crate::{RepositoryLayoutIdentity, git_config, transport_for, url_rewrite};
 
 /// A `trust` sub-command.
 pub enum Action {
@@ -81,10 +81,13 @@ pub async fn run(cwd: &Path, action: Action) -> Result<()> {
 /// verifying it as a forward-only candidate over the local root — then print the resulting root.
 async fn sync(cwd: &Path, expect: Option<String>) -> Result<()> {
 	let found = repo::discover(cwd).await?;
+	let identity = repo::capture_repository_layout_identity(&found)?;
 	// The origin URL is `remote.origin.url` with `url.*.insteadOf` applied, read from the merged config.
 	// (`trust sync` both fetches and pushes the trust ref over this one origin; it uses fetch-direction
 	// `insteadOf` rather than `pushInsteadOf`, which would only differ under a push-specific rewrite.)
-	let config = git_config::from_repo(&found.git_dir, &found.common_dir).await?;
+	let (setup, common, git, _) = repo::command_setup_lease(&found, identity).await?;
+	let config = git_config::for_worktree_at(common, git, &found.common_dir, &found.git_dir).await?;
+	drop(setup);
 	// `trust sync` transacts over Smart HTTP only (the trust-ref fetch+push composite is HTTP-bound); an
 	// SSH origin is rejected here (`Origin::parse`) rather than silently mis-handled.
 	let origin = Origin::parse(&url_rewrite::resolve_fetch_url(&config, "origin")?)?;
@@ -96,12 +99,14 @@ async fn sync(cwd: &Path, expect: Option<String>) -> Result<()> {
 	let http = transport_for(config, &origin, askpass_cwd)?;
 	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
 
-	let local = dispatch::detect_algorithm(&found.common_dir)?;
+	let (setup, common, _, _) = repo::command_setup_lease(&found, identity).await?;
+	let local = dispatch::detect_algorithm_at(&common, &found.common_dir).await?;
+	drop(setup);
 	transport::ensure_same_format(local, transport::negotiated_kind(&body)?)?;
 
 	match local {
-		HashKind::Sha1 => sync_into::<Sha1>(&http, &origin, &found, &body, expect).await,
-		HashKind::Sha256 => sync_into::<Sha256>(&http, &origin, &found, &body, expect).await,
+		HashKind::Sha1 => sync_into::<Sha1>(&http, &origin, &found, identity, &body, expect).await,
+		HashKind::Sha256 => sync_into::<Sha256>(&http, &origin, &found, identity, &body, expect).await,
 	}
 }
 
@@ -109,10 +114,14 @@ async fn sync_into<H: HashAlgorithm>(
 	http: &impl HttpTransport,
 	origin: &Origin,
 	found: &repo::RepositoryLayout,
+	identity: RepositoryLayoutIdentity,
 	body: &[u8],
 	expect: Option<String>,
 ) -> Result<()> {
-	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir).await?;
+	let (setup, common, git, _) = repo::command_setup_lease(found, identity).await?;
+	let repository =
+		repo::open_generic_from_dirs::<H>(common, git, &found.git_dir, &found.common_dir).await?;
+	drop(setup);
 	let identity = CliIdentity::new(&repository);
 	// On a first-use bootstrap, `trust_sync` asks whether to adopt the unseen root; the fast-forward
 	// path never calls this. `--expect` pins the anchor for a non-interactive decision; otherwise a

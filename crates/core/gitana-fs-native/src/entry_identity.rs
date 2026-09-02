@@ -10,6 +10,16 @@ pub struct EntryIdentity {
 }
 
 impl EntryIdentity {
+	/// Rebuild an identity previously recorded in a durable transaction journal.
+	pub const fn from_parts(device: u64, inode: u64) -> Self {
+		Self { device, inode }
+	}
+
+	/// Return the stable platform identity fields for durable recording.
+	pub const fn parts(self) -> (u64, u64) {
+		(self.device, self.inode)
+	}
+
 	/// Capture identity from metadata obtained without following the final entry.
 	pub fn from_metadata(metadata: &Metadata) -> Self {
 		Self {

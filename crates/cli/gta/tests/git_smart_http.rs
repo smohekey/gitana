@@ -1764,3 +1764,56 @@ async fn bare_repo_fetches_into_its_branch_namespace() {
 		root.to_hex()
 	);
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bare_repo_with_an_external_config_symlink_fetches_into_its_branch_namespace() {
+	use std::os::unix::fs::symlink;
+
+	let srv = TempDir::new().unwrap();
+	let git_dir = srv.path().join("srv.git");
+	let root = init_server(&git_dir, "f.txt", b"1\n").await;
+	let url = serve(git_dir.clone()).await;
+
+	let client = srv.path().join("client.git");
+	std::fs::create_dir_all(&client).unwrap();
+	let crepo = open(&client);
+	crepo.init().await.unwrap();
+	std::fs::create_dir_all(client.join("objects/pack")).unwrap();
+	std::fs::create_dir_all(client.join("refs/heads")).unwrap();
+	let mut cfg = crepo.read_config().await.unwrap();
+	cfg.set("core", None, "bare", "true").unwrap();
+	cfg.set("remote", Some("origin"), "url", &url).unwrap();
+	cfg
+		.set(
+			"remote",
+			Some("origin"),
+			"fetch",
+			"+refs/heads/*:refs/heads/*",
+		)
+		.unwrap();
+	crepo.write_config(&cfg).await.unwrap();
+
+	let external_config = srv.path().join("external-client-config");
+	std::fs::rename(client.join("config"), &external_config).unwrap();
+	symlink(&external_config, client.join("config")).unwrap();
+	let c = client.to_str().unwrap();
+
+	ok(
+		&gta(&["-C", c, "fetch"]).await,
+		"bare fetch through external config symlink",
+	);
+	assert_eq!(
+		stdout(
+			&gta(&["-C", c, "rev-parse", "refs/heads/main"]).await,
+			"rev-parse bare symlinked-config main",
+		),
+		root.to_hex()
+	);
+	assert!(
+		std::fs::symlink_metadata(client.join("config"))
+			.unwrap()
+			.file_type()
+			.is_symlink()
+	);
+}

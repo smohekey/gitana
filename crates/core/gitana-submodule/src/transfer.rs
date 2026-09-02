@@ -4,7 +4,7 @@ use cap_std::fs::Dir;
 use gitana_config::GitConfig;
 use gitana_object::HashKind;
 
-use crate::SubmoduleObjectId;
+use crate::{SubmoduleMutationLease, SubmoduleObjectId};
 
 /// A request to validate and retain a source before publishing any staging namespace.
 #[derive(Clone)]
@@ -69,6 +69,7 @@ pub trait RepositoryTransfer {
 	async fn prepare_source(
 		&self,
 		request: PrepareSource,
+		lease: SubmoduleMutationLease,
 	) -> Result<PreparedTransfer<Self::PreparedSource>, Self::Error>;
 
 	async fn populate_prepared(
@@ -77,5 +78,9 @@ pub trait RepositoryTransfer {
 		request: PrepareRepository,
 	) -> Result<(), Self::Error>;
 
-	async fn fetch_recorded(&self, request: FetchRepository) -> Result<FetchedTransfer, Self::Error>;
+	async fn fetch_recorded(
+		&self,
+		request: FetchRepository,
+		lease: SubmoduleMutationLease,
+	) -> Result<FetchedTransfer, Self::Error>;
 }

@@ -66,7 +66,7 @@ mod native {
 		linked_admin_dirs, main_worktree_path, resolve_ref_terminal, worktree_path_of,
 	};
 	use crate::repo_id::{
-		detect_kind, open_store_raw, reject_unsupported_repository_format,
+		detect_kind_at, open_store_raw, reject_unsupported_repository_format,
 		validate_repository_structure,
 	};
 	use crate::{LinkedWorktreeError, WorktreeContext};
@@ -79,13 +79,11 @@ mod native {
 		let common = cx.repo().common_dir();
 		reject_unsupported_repository_format(common)?;
 		validate_repository_structure(common)?;
-		// The initial store only detects the object format (shared state) — anchor it on the stable
-		// `common_dir`, not the identity's `git_dir` (which, discovered inside a linked worktree, names that
-		// checkout's admin and fails to open once the checkout is pruned). Each worktree's HEAD is then
-		// resolved through a store scoped to *that* worktree's git dir (see `head_facts`).
-		let store = open_store_raw(common, common)?;
+		// Object format is shared state. Read it through the common config's supported ambient symlink
+		// path; the CLI has already serialized and capability-validated that namespace. Each worktree's
+		// HEAD is then resolved through a store scoped to that worktree's Git directory.
 		let effective = cx.effective_config();
-		match detect_kind(&store).await? {
+		match detect_kind_at(common)? {
 			HashKind::Sha1 => enumerate_generic::<Sha1>(common, effective).await,
 			HashKind::Sha256 => enumerate_generic::<Sha256>(common, effective).await,
 		}

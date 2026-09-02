@@ -1,13 +1,13 @@
 //! One-level submodule consumer operations over the dedicated `gitana-submodule` state machine.
 
+use std::future::Future;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
-use cap_std::{ambient_authority, fs::Dir};
 use gitana_submodule::{
-	ConfigViews, ConfigurationProvider, InitNotice, InitRequest, SubmoduleContext, SubmoduleQuery,
-	UpdateOutcomeState, UpdateRequest,
+	ConfigViews, ConfigurationProvider, DeinitRequest, DeinitSelection, InitNotice, InitRequest,
+	SubmoduleContext, SubmoduleMutationLease, SubmoduleQuery, UpdateOutcomeState, UpdateRequest,
 };
 
 use crate::submodule_configuration::WorktreeConfiguration;
@@ -15,9 +15,31 @@ use crate::submodule_transfer::SubmoduleTransfer;
 use crate::{CommandContext, git_config, repo};
 
 pub enum Action {
-	Status { paths: Vec<String> },
-	Init { paths: Vec<String> },
-	Update { init: bool, paths: Vec<String> },
+	Status {
+		paths: Vec<String>,
+	},
+	Init {
+		paths: Vec<String>,
+	},
+	Update {
+		init: bool,
+		paths: Vec<String>,
+	},
+	Deinit {
+		force: bool,
+		all: bool,
+		paths: Vec<String>,
+	},
+}
+
+/// Await status while retaining shared-config serialization through every module config read.
+///
+/// Taking the lease by value makes the lifetime explicit even though status itself does not use it.
+async fn with_setup_lease<T>(
+	_setup: SubmoduleMutationLease,
+	operation: impl Future<Output = T>,
+) -> T {
+	operation.await
 }
 
 pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result<()> {
@@ -27,9 +49,9 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 		.as_ref()
 		.ok_or_else(|| anyhow!("submodule operations require a working tree"))?
 		.clone();
-	let common = open_dir(&layout.common_dir)?;
-	let git = open_dir(&layout.git_dir)?;
-	let work = open_dir(&worktree_root)?;
+	let identity = repo::capture_worktree_layout_identity(&layout)?;
+	let (setup, common, git, work) = repo::command_setup_lease(&layout, identity).await?;
+	let work = work.ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?;
 	let configuration = WorktreeConfiguration::new(
 		common
 			.try_clone()
@@ -54,19 +76,24 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 
 	match action {
 		Action::Status { paths } => {
-			for status in context
-				.status(&SubmoduleQuery::paths(paths), &configuration)
-				.await?
-			{
-				println!(
-					"{}{} {}",
-					status.state.sigil(),
-					status.oid,
-					render_relative(&prefix, &status.path)
-				);
-			}
+			with_setup_lease(setup, async {
+				for status in context
+					.status(&SubmoduleQuery::paths(paths), &configuration)
+					.await?
+				{
+					println!(
+						"{}{} {}",
+						status.state.sigil(),
+						status.oid,
+						render_relative(&prefix, &status.path)
+					);
+				}
+				Ok::<(), anyhow::Error>(())
+			})
+			.await?;
 		}
 		Action::Init { paths } => {
+			drop(setup);
 			let report = context
 				.init(
 					&InitRequest {
@@ -87,6 +114,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 			}
 		}
 		Action::Update { init, paths } => {
+			drop(setup);
 			// A new module starts with the ambient system/global/command stack. The superproject's
 			// repository-local layers drive source rewriting and authorization, but they are not the
 			// module repository's own effective configuration.
@@ -106,13 +134,41 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 				}
 			}
 		}
+		Action::Deinit { force, all, paths } => {
+			drop(setup);
+			let request = DeinitRequest {
+				selection: if all {
+					DeinitSelection::All
+				} else {
+					DeinitSelection::Paths(paths)
+				},
+				force,
+			};
+			match context.deinit(&request, &configuration).await {
+				Ok(report) => render_deinit(&prefix, &report),
+				Err(failure) => {
+					render_deinit(&prefix, &failure.completed);
+					return Err(failure.into());
+				}
+			}
+		}
 	}
 	Ok(())
 }
 
-fn open_dir(path: &Path) -> Result<Dir> {
-	Dir::open_ambient_dir(path, ambient_authority())
-		.map_err(|error| anyhow!("opening {}: {error}", path.display()))
+fn render_deinit(prefix: &str, report: &gitana_submodule::DeinitReport) {
+	for outcome in &report.outcomes {
+		let path = render_relative(prefix, &outcome.path);
+		if outcome.cleared {
+			println!("Cleared directory '{path}'");
+		}
+		if outcome.unregistered {
+			eprintln!(
+				"Submodule '{}' unregistered for path '{path}'",
+				outcome.name
+			);
+		}
+	}
 }
 
 fn render_update(prefix: &str, report: &gitana_submodule::UpdateReport) {
@@ -182,7 +238,27 @@ fn committer(config: &gitana_config::GitConfig) -> String {
 
 #[cfg(test)]
 mod tests {
-	use super::render_relative;
+	use std::sync::Arc;
+
+	use gitana_submodule::SubmoduleMutationLease;
+
+	use super::{render_relative, with_setup_lease};
+
+	#[tokio::test]
+	async fn setup_lease_is_retained_until_status_completes() {
+		let owner = Arc::new(());
+		let retained = Arc::downgrade(&owner);
+		let lease = SubmoduleMutationLease::retain(Arc::clone(&owner));
+		drop(owner);
+
+		with_setup_lease(lease, async {
+			tokio::task::yield_now().await;
+			assert!(retained.upgrade().is_some());
+		})
+		.await;
+
+		assert!(retained.upgrade().is_none());
+	}
 
 	#[test]
 	fn paths_are_rendered_from_the_invocation_prefix() {

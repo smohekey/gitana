@@ -23,7 +23,13 @@ pub enum Action {
 
 /// Manage the repository's configured remotes — the `[remote "<name>"]` sections of `.git/config`.
 pub async fn run(cwd: &Path, action: Action) -> Result<()> {
-	dispatch::on_repo(cwd, RemoteCmd { action }).await
+	let is_write = !matches!(&action, Action::List { .. });
+	let command = RemoteCmd { action };
+	if is_write {
+		dispatch::on_repo_config_mutation(cwd, command).await
+	} else {
+		dispatch::on_repo_config_read(cwd, command).await
+	}
 }
 
 struct RemoteCmd {

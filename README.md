@@ -94,7 +94,7 @@ Major gaps:
 - `gta rebase <upstream> [--onto <newbase>]` replays the branch's commits onto a
   new base (linear histories only), with `--continue` / `--skip` / `--abort`.
   Non-interactive: no `-i`, autosquash, or `--rebase-merges`.
-- `gta submodule status` / `init` / `update` implement one-level consumer operations. Nested
+- `gta submodule status` / `init` / `update` / `deinit` implement one-level consumer operations. Nested
   recursion, clone-time recursion, and the `merge`, `rebase`, or custom-command update strategies
   are not yet supported.
 - There is no interactive rebase, stash, blame, bisect, or hook support.
@@ -186,8 +186,8 @@ Implemented command groups:
   or the main worktree. `move`/`remove` refuse a worktree holding an initialized submodule, and
   `worktree.useRelativePaths` pointers are preserved across a move/repair. The result is byte-for-byte
   git's layout, so stock git reads and operates in a gta-created worktree.
-- Submodules: `submodule status`, `submodule init`, and `submodule update [--init]` for one level of
-  tracked consumer modules.
+- Submodules: `submodule status`, `submodule init`, `submodule update [--init]`, and
+	`submodule deinit [-f|--force] (--all | <path>...)` for one level of tracked consumer modules.
 - Repository setup: `config`, scoped like git — `--local` (the repository `.git/config`, the default
   for writes), `--global` (`$GIT_CONFIG_GLOBAL`, else `~/.gitconfig` / the XDG file), and `--system`
   (`$GIT_CONFIG_SYSTEM`, else `/etc/gitconfig`). An unscoped read resolves across git's whole
@@ -269,7 +269,8 @@ Implemented command groups:
 - `crates/core/gitana-worktree`: Git index, worktree scanning, status, add,
   checkout, and diff support.
 - `crates/core/gitana-submodule`: One-level submodule declaration, status, initialization, update,
-  and crash-recovery state machines over injected configuration and transport capabilities.
+	deinitialization, and crash-recovery state machines over injected configuration and transport
+	capabilities.
 - `crates/core/gitana-config`: Git config parser.
 - `crates/core/gitana-diff`: Myers line diff and diff3 three-way line merge.
 - `crates/core/gitana-git-http`: Transport-agnostic Smart HTTP protocol helpers.

@@ -15,6 +15,7 @@ mod http_headers;
 mod identity;
 mod prompt;
 mod repo;
+mod repository_layout_identity;
 mod shallow;
 mod signer;
 mod ssh;
@@ -30,6 +31,7 @@ pub use git_config::{validate_command_config, with_command_config, with_command_
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
 pub use gitana_worktree::LsFilesOptions;
 pub use prompt::with_terminal_prompts_disabled;
+pub(crate) use repository_layout_identity::RepositoryLayoutIdentity;
 
 /// The local file-store backend every command operates over: a [`WorktreeFileStore`], which routes
 /// git's per-worktree files and shared files to the right directory so commands work the same in

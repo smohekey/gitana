@@ -16,7 +16,7 @@ use gitana_remote::{
 };
 use gitana_repository::Repository;
 
-use crate::{CommandContext, git_config, transport_for, url_rewrite};
+use crate::{CommandContext, RepositoryLayoutIdentity, git_config, transport_for, url_rewrite};
 
 use crate::dispatch;
 use crate::repo;
@@ -67,9 +67,12 @@ pub async fn run(
 	}
 
 	let found = repo::discover(cwd).await?;
+	let identity = repo::capture_repository_layout_identity(&found)?;
 	// git's push-URL selection: `remote.origin.pushurl` (with `insteadOf`) if set, else
 	// `remote.origin.url` with `pushInsteadOf` (falling back to `insteadOf`) — over the merged config.
-	let config = git_config::from_repo(&found.git_dir, &found.common_dir).await?;
+	let (setup, common, git, _) = repo::command_setup_lease(&found, identity).await?;
+	let config = git_config::for_worktree_at(common, git, &found.common_dir, &found.git_dir).await?;
+	drop(setup);
 	let url = url_rewrite::resolve_push_url(&config, "origin")?;
 	let remote = RemoteUrl::parse(&url)?;
 	if let Some(command) = CommandContext::current() {
@@ -107,6 +110,7 @@ pub async fn run(
 			push_dispatch(
 				&mut connection,
 				&found,
+				identity,
 				&body,
 				&display,
 				specs,
@@ -127,6 +131,7 @@ pub async fn run(
 			push_dispatch(
 				&mut connection,
 				&found,
+				identity,
 				&body,
 				&display,
 				specs,
@@ -148,6 +153,7 @@ pub async fn run(
 async fn push_dispatch(
 	connection: &mut impl Connection,
 	found: &repo::RepositoryLayout,
+	identity: RepositoryLayoutIdentity,
 	body: &[u8],
 	url: &str,
 	specs: Vec<PushRefspec>,
@@ -158,13 +164,16 @@ async fn push_dispatch(
 	tags: PushTags,
 	cwd: &Path,
 ) -> Result<()> {
-	let local = dispatch::detect_algorithm(&found.common_dir)?;
+	let (setup, common, _, _) = repo::command_setup_lease(found, identity).await?;
+	let local = dispatch::detect_algorithm_at(&common, &found.common_dir).await?;
+	drop(setup);
 	transport::ensure_same_format(local, transport::negotiated_kind(body)?)?;
 	match local {
 		HashKind::Sha1 => {
 			push_into::<Sha1>(
 				connection,
 				found,
+				identity,
 				body,
 				url,
 				specs,
@@ -181,6 +190,7 @@ async fn push_dispatch(
 			push_into::<Sha256>(
 				connection,
 				found,
+				identity,
 				body,
 				url,
 				specs,
@@ -200,6 +210,7 @@ async fn push_dispatch(
 async fn push_into<H: HashAlgorithm>(
 	connection: &mut impl Connection,
 	found: &repo::RepositoryLayout,
+	identity: RepositoryLayoutIdentity,
 	body: &[u8],
 	url: &str,
 	refspecs: Vec<PushRefspec>,
@@ -210,7 +221,22 @@ async fn push_into<H: HashAlgorithm>(
 	tags: PushTags,
 	cwd: &Path,
 ) -> Result<()> {
-	let repository = repo::open_generic::<H>(&found.git_dir, &found.common_dir).await?;
+	let (setup, common, git, _) = repo::command_setup_lease(found, identity).await?;
+	let repository = if signed {
+		repo::open_generic_from_dirs_with_worker_lease::<H>(
+			common,
+			git,
+			&found.git_dir,
+			&found.common_dir,
+			setup.clone(),
+		)
+		.await?
+	} else {
+		repo::open_generic_from_dirs::<H>(common, git, &found.git_dir, &found.common_dir).await?
+	};
+	if !signed {
+		drop(setup);
+	}
 	// A signed push certificate is signed like `commit -S`: the format follows `gpg.format` (unset →
 	// OpenPGP, git's default), and the key is resolved lazily so a "server does not accept signed
 	// pushes" error is not masked by a missing signing key. The certificate's pushee is the push URL.
@@ -257,6 +283,19 @@ async fn push_into<H: HashAlgorithm>(
 /// The pusher identity for a certificate: `Name <email> <unix-ts> +0000`. Always stamped with the
 /// push time, so unlike a commit it ignores any `GIT_AUTHOR_DATE`.
 async fn pusher_ident<H: HashAlgorithm>(repo: &Repository<Backend, H>) -> Result<String> {
+	pusher_ident_with_overrides(
+		repo,
+		std::env::var("GIT_AUTHOR_NAME").ok(),
+		std::env::var("GIT_AUTHOR_EMAIL").ok(),
+	)
+	.await
+}
+
+async fn pusher_ident_with_overrides<H: HashAlgorithm>(
+	repo: &Repository<Backend, H>,
+	name: Option<String>,
+	email: Option<String>,
+) -> Result<String> {
 	let config = repo.read_config().await.ok();
 	let secs = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -264,9 +303,51 @@ async fn pusher_ident<H: HashAlgorithm>(repo: &Repository<Backend, H>) -> Result
 		.unwrap_or(0);
 	gitana_identity::signature(
 		"AUTHOR",
-		std::env::var("GIT_AUTHOR_NAME").ok(),
-		std::env::var("GIT_AUTHOR_EMAIL").ok(),
+		name,
+		email,
 		config.as_ref(),
 		&format!("{secs} +0000"),
 	)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+	use gitana_object::Sha1;
+
+	use super::pusher_ident_with_overrides;
+	use crate::repo;
+
+	#[tokio::test]
+	async fn pusher_identity_uses_the_retained_repository_after_path_replacement() {
+		let temporary = tempfile::tempdir().unwrap();
+		let visible = temporary.path().join("repository.git");
+		let retained = temporary.path().join("retained.git");
+		std::fs::create_dir_all(visible.join("objects")).unwrap();
+		std::fs::create_dir_all(visible.join("refs")).unwrap();
+		std::fs::write(visible.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		std::fs::write(
+			visible.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\tbare = true\n[user]\n\tname = Original\n\temail = original@example.com\n",
+		)
+		.unwrap();
+		let repository = repo::open_generic::<Sha1>(&visible, &visible)
+			.await
+			.unwrap();
+
+		std::fs::rename(&visible, &retained).unwrap();
+		std::fs::create_dir_all(visible.join("objects")).unwrap();
+		std::fs::create_dir_all(visible.join("refs")).unwrap();
+		std::fs::write(visible.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		std::fs::write(
+			visible.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\tbare = true\n[user]\n\tname = Replacement\n\temail = replacement@example.com\n",
+		)
+		.unwrap();
+
+		let identity = pusher_ident_with_overrides(&repository, None, None)
+			.await
+			.unwrap();
+		assert!(identity.starts_with("Original <original@example.com> "));
+		assert!(!identity.contains("Replacement"));
+	}
 }

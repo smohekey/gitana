@@ -29,6 +29,7 @@ cap-fs-ext.workspace = true
 cap-std.workspace = true
 caseless.workspace = true
 gitana-fs-native.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 unicode-normalization.workspace = true
 
 [target.'cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "redox", target_os = "tvos", target_os = "visionos", target_os = "watchos"))'.dependencies]
@@ -39,4 +40,4 @@ windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros"] }

@@ -719,6 +719,7 @@ mod tests {
 		assert!(server.specs.contains_key("hash-object"));
 		assert!(server.specs.contains_key("worktree_add"));
 		assert!(server.specs.contains_key("submodule_status"));
+		assert!(server.specs.contains_key("submodule_deinit"));
 		assert!(server.specs.contains_key("remote_set_url"));
 		assert!(server.specs.contains_key("add"));
 		assert!(!server.specs.contains_key("status_2"));
@@ -737,6 +738,16 @@ mod tests {
 				"update",
 				"--init"
 			]
+		);
+		let deinit = server.specs.get("submodule_deinit").unwrap();
+		let arguments = serde_json::from_value(serde_json::json!({
+			"force": true,
+			"paths": ["modules/one"]
+		}))
+		.unwrap();
+		assert_eq!(
+			build_argv(deinit, &arguments),
+			["submodule", "deinit", "--force", "--path=modules/one"]
 		);
 	}
 

@@ -81,6 +81,12 @@ pub fn rename_noreplace_if_identity(
 ) -> Result<()> {
 	use crate::entry_identity;
 	use rustix::fs::{RenameFlags, renameat_with};
+	if entry_identity(source, source_name)? != expected_source {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::AlreadyExists,
+			"publication source changed before atomic no-replace rename",
+		));
+	}
 
 	renameat_with(
 		source,
@@ -238,6 +244,14 @@ pub fn replace_if_identities(
 ) -> Result<()> {
 	use crate::entry_identity;
 	use rustix::fs::{RenameFlags, renameat_with};
+	if entry_identity(directory, prepared)? != expected_prepared
+		|| entry_identity(directory, target)? != expected_target
+	{
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::AlreadyExists,
+			"publication source or target changed before atomic replacement",
+		));
+	}
 
 	renameat_with(
 		directory,
