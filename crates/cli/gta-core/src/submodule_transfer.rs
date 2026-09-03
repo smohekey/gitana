@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use cap_std::fs::Dir;
@@ -17,7 +19,7 @@ use gitana_remote::{
 use gitana_repository::{Repository, detect_hash_kind};
 use gitana_submodule::{
 	FetchRepository, FetchSource, FetchedTransfer, PrepareRepository, PrepareSource,
-	PreparedTransfer, RepositoryTransfer, SubmoduleObjectId,
+	PreparedTransfer, RepositoryTransfer, SubmoduleObjectId, resolve_relative_url,
 };
 
 use crate::{
@@ -43,7 +45,9 @@ enum PreparedTransport {
 }
 
 pub(crate) struct PreparedSubmoduleSource {
-	source_url: String,
+	secret_urls: Vec<String>,
+	module_path: String,
+	descendant_url_base: Option<String>,
 	persist_url: String,
 	transport: PreparedTransport,
 }
@@ -59,6 +63,8 @@ pub(crate) struct SubmoduleTransfer<'a> {
 	command: &'a CommandContext,
 	worktree_root: &'a Path,
 	module_base: GitConfig,
+	credential_url_base: Option<String>,
+	descendant_url_bases: Mutex<HashMap<String, String>>,
 }
 
 impl<'a> SubmoduleTransfer<'a> {
@@ -66,12 +72,75 @@ impl<'a> SubmoduleTransfer<'a> {
 		command: &'a CommandContext,
 		worktree_root: &'a Path,
 		module_base: GitConfig,
+		credential_url_base: Option<String>,
 	) -> Self {
 		Self {
 			command,
 			worktree_root,
 			module_base,
+			credential_url_base,
+			descendant_url_bases: Mutex::new(HashMap::new()),
 		}
+	}
+
+	/// Remove the private credential-bearing bases prepared for successfully populated children.
+	/// The recursive command consumes these before dropping the level transfer; they are never added
+	/// to a core report or durable recovery record.
+	pub(crate) fn take_descendant_url_bases(&self) -> Result<HashMap<String, String>> {
+		let mut bases = self
+			.descendant_url_bases
+			.lock()
+			.map_err(|_| anyhow!("submodule descendant URL state is unavailable"))?;
+		Ok(std::mem::take(&mut *bases))
+	}
+
+	fn private_relative_source_url(&self, request: &PrepareSource) -> Option<String> {
+		let base = self.credential_url_base.as_deref()?;
+		let declared = request.declared_url.as_deref()?;
+		if !declared.starts_with("./") && !declared.starts_with("../") {
+			return None;
+		}
+		resolve_relative_url(base, declared).ok()
+	}
+
+	fn transfer_secrets(&self, request: &PrepareSource, private_source: Option<&str>) -> Vec<String> {
+		let mut secrets = vec![request.source_url.clone()];
+		if let Some(base) = &self.credential_url_base {
+			secrets.push(base.clone());
+		}
+		if let Some(private_source) = private_source {
+			secrets.push(private_source.to_owned());
+		}
+		secrets
+	}
+
+	fn resolve_prepare_source(
+		&self,
+		request: &PrepareSource,
+		private_source: Option<&str>,
+	) -> Result<ResolvedSubmoduleSource> {
+		let configured =
+			Self::resolve_source(&request.config, self.worktree_root, &request.source_url)?;
+		if gitana_remote::redact_password(&configured.rewritten) != configured.rewritten {
+			return Ok(configured);
+		}
+		let Some(private_source) = private_source else {
+			return Ok(configured);
+		};
+		let safe_private_source = gitana_remote::redact_password(private_source);
+		let candidate =
+			Self::resolve_source(&request.config, self.worktree_root, &safe_private_source)?;
+		if gitana_remote::redact_password(&candidate.rewritten)
+			!= gitana_remote::redact_password(&configured.rewritten)
+		{
+			// An effective per-module URL override remains authoritative. A relative declaration is
+			// not permission to copy the clone credential onto a different rewritten endpoint.
+			return Ok(configured);
+		}
+		let Some(rewritten) = inherit_http_userinfo(private_source, &candidate.rewritten) else {
+			return Ok(configured);
+		};
+		Self::resolve_rewritten_source(self.worktree_root, rewritten)
 	}
 
 	fn resolve_source(
@@ -80,6 +149,10 @@ impl<'a> SubmoduleTransfer<'a> {
 		source_url: &str,
 	) -> Result<ResolvedSubmoduleSource> {
 		let rewritten = url_rewrite::rewrite_fetch_url(config, source_url)?;
+		Self::resolve_rewritten_source(base, rewritten)
+	}
+
+	fn resolve_rewritten_source(base: &Path, rewritten: String) -> Result<ResolvedSubmoduleSource> {
 		let remote = RemoteUrl::parse(&rewritten)?;
 		let identity = match &remote {
 			RemoteUrl::Local(path) => {
@@ -98,10 +171,6 @@ impl<'a> SubmoduleTransfer<'a> {
 		})
 	}
 
-	fn resolve_source_inner(&self, request: &PrepareSource) -> Result<ResolvedSubmoduleSource> {
-		Self::resolve_source(&request.config, self.worktree_root, &request.source_url)
-	}
-
 	fn resolve_fetch_source_inner(&self, source: &FetchSource) -> Result<ResolvedSubmoduleSource> {
 		Self::resolve_source(&source.config, &source.worktree_dir, &source.source_url)
 	}
@@ -109,6 +178,8 @@ impl<'a> SubmoduleTransfer<'a> {
 	async fn prepare_source_inner(
 		&self,
 		request: PrepareSource,
+		resolved: ResolvedSubmoduleSource,
+		secret_urls: Vec<String>,
 		lease: gitana_submodule::SubmoduleMutationLease,
 	) -> Result<PreparedTransfer<PreparedSubmoduleSource>> {
 		let config = &request.config;
@@ -116,7 +187,7 @@ impl<'a> SubmoduleTransfer<'a> {
 			rewritten,
 			remote,
 			identity,
-		} = self.resolve_source_inner(&request)?;
+		} = resolved;
 		self
 			.command
 			.authorize(config, &remote, ProtocolContext::Recursive)?;
@@ -126,6 +197,7 @@ impl<'a> SubmoduleTransfer<'a> {
 		// repository unusable on its next update. Keep the effective network endpoint while stripping
 		// any password introduced by either the declaration or the rewrite rule.
 		let network_persist_url = gitana_remote::redact_password(&rewritten);
+		let descendant_url_base = (network_persist_url != rewritten).then_some(rewritten.clone());
 
 		let (persist_url, transport) = match remote {
 			RemoteUrl::Http(origin) => {
@@ -183,7 +255,9 @@ impl<'a> SubmoduleTransfer<'a> {
 		};
 		Ok(PreparedTransfer {
 			source: PreparedSubmoduleSource {
-				source_url: request.source_url,
+				secret_urls,
+				module_path: request.module_path,
+				descendant_url_base,
 				persist_url,
 				transport,
 			},
@@ -214,6 +288,8 @@ impl<'a> SubmoduleTransfer<'a> {
 		let recorded = typed_oid::<H>(&request.recorded)?;
 		let repository = create_repository::<H>(request.git_dir, self.module_base.clone()).await?;
 		let PreparedSubmoduleSource {
+			module_path,
+			descendant_url_base,
 			persist_url,
 			transport,
 			..
@@ -281,6 +357,13 @@ impl<'a> SubmoduleTransfer<'a> {
 					fetch_object(&mut fetcher, &repository, recorded).await?;
 				}
 			}
+		}
+		if let Some(base) = descendant_url_base {
+			self
+				.descendant_url_bases
+				.lock()
+				.map_err(|_| anyhow!("submodule descendant URL state is unavailable"))?
+				.insert(module_path, base);
 		}
 		Ok(())
 	}
@@ -400,11 +483,12 @@ impl RepositoryTransfer for SubmoduleTransfer<'_> {
 	type PreparedSource = PreparedSubmoduleSource;
 
 	fn resolve_source_identity(&self, request: &PrepareSource) -> Result<String, Self::Error> {
-		let secret = request.source_url.clone();
+		let private_source = self.private_relative_source_url(request);
+		let secrets = self.transfer_secrets(request, private_source.as_deref());
 		self
-			.resolve_source_inner(request)
+			.resolve_prepare_source(request, private_source.as_deref())
 			.map(|source| source.identity)
-			.map_err(|error| TransferError::new(error, [secret]))
+			.map_err(|error| TransferError::new(error, secrets))
 	}
 
 	fn resolve_fetch_source_identity(&self, source: &FetchSource) -> Result<String, Self::Error> {
@@ -420,11 +504,16 @@ impl RepositoryTransfer for SubmoduleTransfer<'_> {
 		request: PrepareSource,
 		lease: gitana_submodule::SubmoduleMutationLease,
 	) -> Result<PreparedTransfer<Self::PreparedSource>, Self::Error> {
-		let secret = request.source_url.clone();
+		let private_source = self.private_relative_source_url(&request);
+		let mut secrets = self.transfer_secrets(&request, private_source.as_deref());
+		let resolved = self
+			.resolve_prepare_source(&request, private_source.as_deref())
+			.map_err(|error| TransferError::new(error, secrets.clone()))?;
+		secrets.push(resolved.rewritten.clone());
 		self
-			.prepare_source_inner(request, lease)
+			.prepare_source_inner(request, resolved, secrets.clone(), lease)
 			.await
-			.map_err(|error| TransferError::new(error, [secret]))
+			.map_err(|error| TransferError::new(error, secrets))
 	}
 
 	async fn populate_prepared(
@@ -432,13 +521,13 @@ impl RepositoryTransfer for SubmoduleTransfer<'_> {
 		source: Self::PreparedSource,
 		request: PrepareRepository,
 	) -> Result<(), Self::Error> {
-		let secret = source.source_url.clone();
+		let secrets = source.secret_urls.clone();
 		let display = request.display_git_dir.clone();
 		self
 			.populate_prepared_inner(source, request)
 			.await
 			.with_context(|| format!("populating staged repository {}", display.display()))
-			.map_err(|error| TransferError::new(error, [secret]))
+			.map_err(|error| TransferError::new(error, secrets))
 	}
 
 	async fn fetch_recorded(
@@ -454,6 +543,25 @@ impl RepositoryTransfer for SubmoduleTransfer<'_> {
 			.with_context(|| format!("updating module repository {}", display.display()))
 			.map_err(|error| TransferError::new(error, [secret]))
 	}
+}
+
+fn inherit_http_userinfo(private_source: &str, rewritten: &str) -> Option<String> {
+	let RemoteUrl::Http(private) = RemoteUrl::parse(private_source).ok()? else {
+		return None;
+	};
+	let RemoteUrl::Http(target) = RemoteUrl::parse(rewritten).ok()? else {
+		return None;
+	};
+	let username = private.username?;
+	let password = private.password?;
+	let (scheme, rest) = target.url.split_once("://")?;
+	let inherited = format!(
+		"{scheme}://{}:{}@{rest}",
+		gitana_remote::percent_encode_userinfo(&username),
+		gitana_remote::percent_encode_userinfo(&password)
+	);
+	(gitana_remote::redact_password(&inherited) == gitana_remote::redact_password(rewritten))
+		.then_some(inherited)
 }
 
 #[derive(Debug)]
@@ -590,6 +698,80 @@ mod tests {
 	use gitana_file_store::FileStore;
 
 	use super::*;
+
+	#[test]
+	fn relative_clone_source_inherits_only_after_rewritten_endpoints_match() {
+		let temporary = tempfile::tempdir().unwrap();
+		let command = CommandContext::from_env(temporary.path().to_owned(), Vec::new());
+		let transfer = SubmoduleTransfer::new(
+			&command,
+			temporary.path(),
+			GitConfig::parse("").unwrap(),
+			Some("https://alice:secret@example.invalid/team/root".to_owned()),
+		);
+		let matching = PrepareSource {
+			module_path: "modules/child".to_owned(),
+			declared_url: Some("../child".to_owned()),
+			source_url: "https://alice@example.invalid/team/child".to_owned(),
+			persist_url: "https://alice@example.invalid/team/child".to_owned(),
+			hash_kind: HashKind::Sha256,
+			config: GitConfig::parse("").unwrap(),
+		};
+		let private_source = transfer.private_relative_source_url(&matching);
+		assert_eq!(
+			transfer
+				.resolve_prepare_source(&matching, private_source.as_deref())
+				.unwrap()
+				.rewritten,
+			"https://alice:secret@example.invalid/team/child"
+		);
+
+		let overridden = PrepareSource {
+			source_url: "https://other.invalid/child".to_owned(),
+			..matching.clone()
+		};
+		let private_source = transfer.private_relative_source_url(&overridden);
+		assert_eq!(
+			transfer
+				.resolve_prepare_source(&overridden, private_source.as_deref())
+				.unwrap()
+				.rewritten,
+			"https://other.invalid/child",
+			"an effective URL override must not inherit the clone credential"
+		);
+
+		let rewritten = PrepareSource {
+			config: GitConfig::parse(
+				"[url \"https://alice@example.invalid/mirror/\"]\n\tinsteadOf = https://alice@example.invalid/team/\n",
+			)
+			.unwrap(),
+			..matching
+		};
+		let private_source = transfer.private_relative_source_url(&rewritten);
+		assert_eq!(
+			transfer
+				.resolve_prepare_source(&rewritten, private_source.as_deref())
+				.unwrap()
+				.rewritten,
+			"https://alice:secret@example.invalid/mirror/child",
+			"the safe URL must be rewritten before the private userinfo is restored"
+		);
+	}
+
+	#[test]
+	fn transfer_errors_redact_every_private_url_form() {
+		let base = "https://alice:root-secret@example.invalid/team/root".to_owned();
+		let child = "https://alice:child-secret@example.invalid/team/child".to_owned();
+		let error = TransferError::new(
+			anyhow!("using {base} selected {child}"),
+			[base.clone(), child.clone()],
+		);
+		let rendered = error.to_string();
+		assert!(!rendered.contains("root-secret"));
+		assert!(!rendered.contains("child-secret"));
+		assert!(rendered.contains("https://alice@example.invalid/team/root"));
+		assert!(rendered.contains("https://alice@example.invalid/team/child"));
+	}
 
 	#[test]
 	fn fetch_source_identity_uses_the_module_config_and_worktree_base() {

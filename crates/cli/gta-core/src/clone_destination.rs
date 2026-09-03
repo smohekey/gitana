@@ -10,6 +10,8 @@ use gitana_fs_native::{
 	EntryIdentity, directory_identity, entry_identity, remove_dir_if_identity, rename_noreplace,
 };
 
+use crate::RepositoryLayoutIdentity;
+
 static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_PRIVATE_NAMES: u32 = 4096;
 
@@ -100,6 +102,7 @@ impl CloneDestination {
 	}
 
 	/// Publish a completed staged clone in place of the unchanged empty reservation.
+	#[cfg(test)]
 	pub(crate) fn commit(mut self) -> std::io::Result<()> {
 		let Some(attempt) = self.attempt.as_mut() else {
 			return Ok(());
@@ -107,6 +110,24 @@ impl CloneDestination {
 		publish(attempt)?;
 		self.attempt = None;
 		Ok(())
+	}
+
+	/// Publish a completed ordinary worktree clone and return the exact directory identities that
+	/// were moved into the requested namespace. The proof is captured through retained capabilities
+	/// before publication, so a replacement at the destination cannot become the repository used by
+	/// a post-clone operation.
+	pub(crate) fn commit_repository(
+		mut self,
+	) -> std::io::Result<(PathBuf, RepositoryLayoutIdentity)> {
+		let attempt = self
+			.attempt
+			.as_mut()
+			.ok_or_else(|| invalid_data("clone destination was not started"))?;
+		let identity = staged_repository_identity(attempt)?;
+		let published_root = attempt.parent_path.join(&attempt.target_name);
+		publish(attempt)?;
+		self.attempt = None;
+		Ok((published_root, identity))
 	}
 
 	pub(crate) fn cleanup_after_failure(&mut self) -> std::io::Result<()> {
@@ -117,6 +138,33 @@ impl CloneDestination {
 		self.attempt = None;
 		Ok(())
 	}
+}
+
+fn staged_repository_identity(attempt: &CloneAttempt) -> std::io::Result<RepositoryLayoutIdentity> {
+	let staging = attempt
+		.staging
+		.as_ref()
+		.ok_or_else(|| invalid_data("clone staging directory is no longer available"))?;
+	let worktree = if attempt.reservation_owned {
+		staging
+	} else {
+		attempt
+			.reservation
+			.as_ref()
+			.ok_or_else(|| invalid_data("clone reservation is no longer available"))?
+	};
+	let git = staging.open_dir_nofollow(".git")?;
+	let git_identity = directory_identity(&git)?;
+	if entry_identity(staging, OsStr::new(".git"))? != git_identity {
+		return Err(invalid_data(
+			"clone Git directory identity changed before publication",
+		));
+	}
+	Ok(RepositoryLayoutIdentity {
+		worktree: Some(directory_identity(worktree)?),
+		git: git_identity,
+		common: git_identity,
+	})
 }
 
 impl Drop for CloneDestination {

@@ -106,12 +106,12 @@ impl SubmoduleContext {
 		let planned = match self.hash_kind {
 			HashKind::Sha1 => {
 				self
-					.init_typed::<Sha1, C>(request, configuration, &effective, None)
+					.init_typed::<Sha1, C>(request, configuration, &effective, false, None)
 					.await?
 			}
 			HashKind::Sha256 => {
 				self
-					.init_typed::<Sha256, C>(request, configuration, &effective, None)
+					.init_typed::<Sha256, C>(request, configuration, &effective, false, None)
 					.await?
 			}
 		};
@@ -124,7 +124,7 @@ impl SubmoduleContext {
 		lock.validate()?;
 		self.ensure_no_repository_deinit_recovery()?;
 		let report = self
-			.init_unlocked(request, configuration, lock.lease())
+			.init_unlocked(request, configuration, false, lock.lease())
 			.await?;
 		lock.validate()?;
 		Ok(report)
@@ -134,18 +134,31 @@ impl SubmoduleContext {
 		&self,
 		request: &InitRequest,
 		configuration: &C,
+		initialize_only_active: bool,
 		lease: crate::SubmoduleMutationLease,
 	) -> Result<InitReport, SubmoduleError> {
 		let effective = configuration.reload().await?;
 		let report = match self.hash_kind {
 			HashKind::Sha1 => {
 				self
-					.init_typed::<Sha1, C>(request, configuration, &effective, Some(lease))
+					.init_typed::<Sha1, C>(
+						request,
+						configuration,
+						&effective,
+						initialize_only_active,
+						Some(lease),
+					)
 					.await?
 			}
 			HashKind::Sha256 => {
 				self
-					.init_typed::<Sha256, C>(request, configuration, &effective, Some(lease))
+					.init_typed::<Sha256, C>(
+						request,
+						configuration,
+						&effective,
+						initialize_only_active,
+						Some(lease),
+					)
 					.await?
 			}
 		};
@@ -210,6 +223,7 @@ impl SubmoduleContext {
 		request: &InitRequest,
 		configuration: &C,
 		effective: &gitana_config::GitConfig,
+		initialize_only_active: bool,
 		lease: Option<crate::SubmoduleMutationLease>,
 	) -> Result<Option<InitReport>, SubmoduleError> {
 		struct Planned {
@@ -239,7 +253,11 @@ impl SubmoduleContext {
 			if let Some(strategy) = declaration.update.as_deref() {
 				validate_update_strategy(&declaration.name, strategy)?;
 			}
-			let activate = !is_active(effective, &declaration.name, &declaration.path)?;
+			let active = is_active(effective, &declaration.name, &declaration.path)?;
+			if initialize_only_active && !active {
+				continue;
+			}
+			let activate = !active;
 			let (safe_url, credential_url) =
 				match effective.get_raw("submodule", Some(&declaration.name), "url") {
 					Some(Some(_)) => (None, None),
@@ -320,6 +338,7 @@ impl SubmoduleContext {
 			configuration
 				.apply_init(
 					&updates,
+					false,
 					lease.expect("non-empty initialization updates require a mutation lease"),
 				)
 				.await?

@@ -166,6 +166,7 @@ impl ConfigurationProvider for WorktreeConfiguration {
 	async fn apply_init(
 		&self,
 		updates: &[InitConfigUpdate],
+		persist_all_active: bool,
 		lease: SubmoduleMutationLease,
 	) -> Result<InitConfigResult, SubmoduleError> {
 		lease.validate()?;
@@ -188,6 +189,9 @@ impl ConfigurationProvider for WorktreeConfiguration {
 					while !release.load(Ordering::SeqCst) {
 						std::thread::yield_now();
 					}
+				}
+				if persist_all_active {
+					config.set("submodule", None, "active", ".")?;
 				}
 				let mut registered_urls = Vec::new();
 				for update in updates {
@@ -1967,6 +1971,7 @@ mod tests {
 				&UpdateRequest {
 					query: Default::default(),
 					initialize: false,
+					initialize_only_active: false,
 					reflog_committer: None,
 				},
 				&configuration,
@@ -2057,6 +2062,7 @@ mod tests {
 				&UpdateRequest {
 					query: Default::default(),
 					initialize: false,
+					initialize_only_active: false,
 					reflog_committer: None,
 				},
 				&configuration,
@@ -2381,6 +2387,7 @@ mod tests {
 					url_if_absent: Some("../source".to_owned()),
 					update_if_absent: Some("checkout".to_owned()),
 				}],
+				false,
 				mutation_lease(),
 			)
 			.await
@@ -2393,6 +2400,30 @@ mod tests {
 		let replacement_config = std::fs::read_to_string(original.join("config")).unwrap();
 		assert!(replacement_config.contains("[foreign]"));
 		assert!(!replacement_config.contains("[submodule \"one\"]"));
+	}
+
+	#[tokio::test]
+	async fn initialization_persists_all_active_without_module_updates() {
+		let temporary = tempfile::tempdir().unwrap();
+		let common_path = temporary.path().join("common");
+		std::fs::create_dir(&common_path).unwrap();
+		std::fs::write(
+			common_path.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n",
+		)
+		.unwrap();
+		let common = Dir::open_ambient_dir(&common_path, ambient_authority()).unwrap();
+		let git = common.try_clone().unwrap();
+		let configuration = WorktreeConfiguration::new(common, git, &common_path, &common_path);
+
+		let result = configuration
+			.apply_init(&[], true, mutation_lease())
+			.await
+			.unwrap();
+
+		assert_eq!(result, InitConfigResult::default());
+		let config = configuration.reload().await.unwrap();
+		assert_eq!(config.get_raw("submodule", None, "active"), Some(Some(".")));
 	}
 
 	#[tokio::test]

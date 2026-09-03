@@ -1,6 +1,6 @@
 //! Submodule consumer operations over the dedicated `gitana-submodule` state machine.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -79,8 +79,13 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 				identity,
 				&prefix,
 				command,
-				*init,
-				SubmoduleQuery::paths(paths.clone()),
+				UpdateRequest {
+					query: SubmoduleQuery::paths(paths.clone()),
+					initialize: *init,
+					initialize_only_active: false,
+					reflog_committer: None,
+				},
+				None,
 			))
 			.await;
 		}
@@ -169,10 +174,11 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 			// repository-local layers drive source rewriting and authorization, but they are not the
 			// module repository's own effective configuration.
 			let module_base = git_config::from_ambient().await?;
-			let transfer = SubmoduleTransfer::new(command, &worktree_root, module_base);
+			let transfer = SubmoduleTransfer::new(command, &worktree_root, module_base, None);
 			let request = UpdateRequest {
 				query: SubmoduleQuery::paths(paths),
 				initialize: init,
+				initialize_only_active: false,
 				reflog_committer: Some(committer(&superproject)),
 			};
 			match Box::pin(context.update(&request, &configuration, &transfer)).await {
@@ -286,9 +292,15 @@ async fn recursive_update(
 	root_identity: RepositoryLayoutIdentity,
 	prefix: &str,
 	command: &CommandContext,
-	initialize: bool,
-	query: SubmoduleQuery,
+	request: UpdateRequest,
+	credential_url_base: Option<String>,
 ) -> Result<()> {
+	let UpdateRequest {
+		query,
+		initialize,
+		initialize_only_active,
+		..
+	} = request;
 	let root = root_layout
 		.worktree_root
 		.as_ref()
@@ -323,6 +335,8 @@ async fn recursive_update(
 		prefix.to_owned(),
 		String::new(),
 		query,
+		initialize_only_active,
+		credential_url_base,
 	)]);
 	while let Some((
 		level_root,
@@ -331,18 +345,21 @@ async fn recursive_update(
 		query_prefix,
 		level_prefix,
 		query,
+		initialize_only_active,
+		credential_url_base,
 	)) = pending.pop_front()
 	{
-		let (layout, report) = Box::pin(update_level(
+		let (layout, report, mut descendant_url_bases) = Box::pin(update_level(
 			&level_root,
 			expected_git_dir.as_deref(),
 			discovered_root,
 			(&query_prefix, prefix, &level_prefix),
 			command,
-			module_base.clone(),
+			(module_base.clone(), credential_url_base),
 			UpdateRequest {
 				query,
 				initialize,
+				initialize_only_active,
 				reflog_committer: None,
 			},
 		))
@@ -361,11 +378,48 @@ async fn recursive_update(
 					String::new(),
 					join_submodule_path(&level_prefix, &outcome.path),
 					SubmoduleQuery::all(),
+					false,
+					descendant_url_bases.remove(&outcome.path),
 				));
 			}
 		}
 	}
 	Ok(())
+}
+
+/// Persist Git's all-submodules activation and then initialize every submodule in a newly published
+/// clone while retaining the exact repository identity established by clone publication.
+pub(crate) async fn update_published_clone(
+	root_layout: repo::RepositoryLayout,
+	root_identity: RepositoryLayoutIdentity,
+	command: &CommandContext,
+	credential_url_base: Option<String>,
+) -> Result<()> {
+	let (lease, common, git, _) = Box::pin(repo::command_config_mutation_lease(
+		&root_layout,
+		root_identity,
+	))
+	.await?;
+	repo::ensure_no_pending_deinit_at(&root_layout, &common, &git)?;
+	let configuration =
+		WorktreeConfiguration::new(common, git, &root_layout.common_dir, &root_layout.git_dir);
+	configuration.apply_init(&[], true, lease).await?;
+	repo::revalidate_repository_layout(&root_layout, root_identity).await?;
+
+	recursive_update(
+		root_layout,
+		root_identity,
+		"",
+		command,
+		UpdateRequest {
+			query: SubmoduleQuery::all(),
+			initialize: true,
+			initialize_only_active: true,
+			reflog_committer: None,
+		},
+		credential_url_base,
+	)
+	.await
 }
 
 async fn initialized_subtree(
@@ -514,7 +568,7 @@ async fn resume_update_level(
 		String::new(),
 		hash_kind,
 	)?;
-	let transfer = SubmoduleTransfer::new(command, root, module_base);
+	let transfer = SubmoduleTransfer::new(command, root, module_base, None);
 	match Box::pin(context.resume_pending_update(
 		&configuration,
 		&transfer,
@@ -538,10 +592,15 @@ async fn update_level(
 	discovered_root: Option<(repo::RepositoryLayout, RepositoryLayoutIdentity)>,
 	scope: (&str, &str, &str),
 	command: &CommandContext,
-	module_base: gitana_config::GitConfig,
+	transfer_state: (gitana_config::GitConfig, Option<String>),
 	mut request: UpdateRequest,
-) -> Result<(repo::RepositoryLayout, UpdateReport)> {
+) -> Result<(
+	repo::RepositoryLayout,
+	UpdateReport,
+	HashMap<String, String>,
+)> {
 	let (query_prefix, prefix, level_prefix) = scope;
+	let (module_base, credential_url_base) = transfer_state;
 	let (layout, setup, common, git, work, configuration, superproject, hash_kind) =
 		Box::pin(open_level(root, expected_git_dir, discovered_root)).await?;
 	repo::ensure_no_pending_deinit_at(&layout, &common, &git)?;
@@ -557,11 +616,12 @@ async fn update_level(
 		hash_kind,
 	)?;
 	request.reflog_committer = Some(committer(&superproject));
-	let transfer = SubmoduleTransfer::new(command, root, module_base);
+	let transfer = SubmoduleTransfer::new(command, root, module_base, credential_url_base);
 	match Box::pin(context.update(&request, &configuration, &transfer)).await {
 		Ok(report) => {
+			let descendant_url_bases = transfer.take_descendant_url_bases()?;
 			render_update_at(prefix, level_prefix, &report);
-			Ok((returned_layout, report))
+			Ok((returned_layout, report, descendant_url_bases))
 		}
 		Err(failure) => {
 			render_update_at(prefix, level_prefix, &failure.completed);

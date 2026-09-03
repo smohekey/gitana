@@ -479,6 +479,9 @@ enum Command {
 		/// Initialise cone sparse-checkout (root files only); narrow with `gta sparse-checkout set`.
 		#[arg(long)]
 		sparse: bool,
+		/// Initialize and recursively update every submodule after publishing the root clone.
+		#[arg(long = "recurse-submodules", visible_alias = "recursive")]
+		recurse_submodules: bool,
 	},
 	/// Download new objects from the origin and update remote-tracking refs.
 	Fetch {
@@ -1066,7 +1069,20 @@ impl Cli {
 					shallow_since,
 					shallow_exclude,
 					sparse,
-				} => commands::clone::run(url, path, depth, shallow_since, shallow_exclude, sparse).await,
+					recurse_submodules,
+				} => {
+					commands::clone::run(
+						&command_context,
+						url,
+						path,
+						depth,
+						shallow_since,
+						shallow_exclude,
+						sparse,
+						recurse_submodules,
+					)
+					.await
+				}
 				Command::Fetch {
 					tags,
 					no_tags,

@@ -5,9 +5,11 @@
 Gitana implements the consumer commands `submodule status`, `submodule init`, `submodule update`,
 and `submodule deinit`. `status --recursive` and `update --recursive` explicitly recurse into nested
 submodules; omitted flags remain one-level operations, and root pathspecs select only the first
-level before every eligible descendant is considered. Clone-time recursion and the `merge`,
-`rebase`, and custom-command update strategies remain unsupported. Unsupported strategies are
-rejected before initialization or filesystem mutation; `none` is an explicit skip.
+level before every eligible descendant is considered. `clone --recurse-submodules` (also spelled
+`--recursive`) publishes the root clone and then performs an initializing recursive update over all
+of its submodules. The `merge`, `rebase`, and custom-command update strategies remain unsupported.
+Unsupported strategies are rejected before initialization or module filesystem mutation; `none` is
+an explicit skip.
 
 Recursive status renders a depth-first pre-order and enters only initialized, non-conflicted module
 worktrees. Recursive update first scans the currently initialized selected subtree and resumes
@@ -32,6 +34,23 @@ before a parent would mutate that module repository. A durable recovery path is 
 as a top-relative literal, independent of the caller's pathspec prefix or any wildcard and magic
 characters in the recorded name. An empty update control directory with no staged repository is
 retired directly under the per-worktree update lock and never converted into an all-module update.
+
+Clone recursion has a deliberate root-publication boundary. Clone captures the worktree and `.git`
+directory identities through the private destination capabilities before publication, then passes
+that proof into recursive update. Before materialization, the root persists `submodule.active=.`
+through the serialized repository-local config transaction, including when HEAD contains no
+gitlinks. Root initialization then omits modules that remain inactive under the freshly reloaded
+effective configuration: it does not read or validate their URL, register, activate, transfer, or
+descend through them.
+Descendants of successful active roots retain normal per-module activation. The updater reopens and
+validates the visible root before reading or mutating it, so replacing the clone destination cannot
+redirect recursion into another repository. Once the root is published it is caller-owned: a submodule
+failure returns an error but retains the valid root clone, activation setting, completed module
+prefix, and any durable update intent for a later `submodule update --init --recursive` retry.
+Failures before root publication retain the ordinary clone cleanup contract. This first form is
+boolean and always selects every top-level module; clone-time pathspecs, jobs, shallow-submodule
+propagation, and remote-branch submodule updates are not supported. A shallow root clone does not
+implicitly make its submodules shallow.
 
 The implementation is split at an authority boundary. `gitana-submodule` owns declaration parsing,
 selection, state transitions, validation, reports, and recovery. It receives already-opened
@@ -126,7 +145,15 @@ lossily rewritten to replacement characters.
 Command-line `-c` configuration is invocation-owned and overlays system, global, and repository
 configuration without entering persistent config. A password embedded in a URL is never persisted
 or included in structured/debug output. `update --init` may retain the original credential-bearing
-URL only in private process memory for that invocation.
+URL only in private process memory for that invocation. Recursive clone likewise retains its
+credential-bearing root URL only for the post-publication update in that process. A relative child
+may inherit that private base only when both its redacted resolution and the source selected from
+serialized configuration resolve through `insteadOf` to the same password-free endpoint. The
+private userinfo is applied only after that single rewrite, so it cannot suppress lexical rule
+matching; a per-module override that selects another final endpoint remains authoritative. After a successful
+network preparation, the full rewritten endpoint becomes only that child's private base for resolving
+its relative descendants. Neither base enters configuration, reports, logs, or durable recovery, so
+a later retry must acquire credentials normally.
 
 The superproject's effective configuration drives declaration URL rewriting, recursive transport
 authorization, credentials, and connection setup. A newly staged module repository starts instead

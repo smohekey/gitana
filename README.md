@@ -95,8 +95,11 @@ Major gaps:
   new base (linear histories only), with `--continue` / `--skip` / `--abort`.
   Non-interactive: no `-i`, autosquash, or `--rebase-merges`.
 - `gta submodule status [--recursive]` / `init` / `update [--init] [--recursive]` / `deinit`
-  implement consumer operations. Recursion is explicit for status and update; clone-time recursion
-  and the `merge`, `rebase`, or custom-command update strategies are not yet supported.
+  implement consumer operations. `gta clone --recurse-submodules` (alias `--recursive`) publishes
+  the root clone, records Git's root-level `submodule.active=.`, and then initializes every active
+  nested module, retaining that root for an explicit retry if a child fails. Clone-time
+  pathspec/jobs/shallow/remote variants and the `merge`, `rebase`, or custom-command update
+  strategies are not yet supported.
 - There is no interactive rebase, stash, blame, bisect, or hook support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
@@ -190,7 +193,8 @@ Implemented command groups:
 	`submodule update [--init] [--recursive]`, and
 	`submodule deinit [-f|--force] (--all | <path>...)`. Root pathspecs select top-level modules;
 	recursive status is depth-first and recursive update completes each repository-local batch before
-	entering successful child worktrees.
+	entering successful child worktrees. `clone --recurse-submodules` (`--recursive`) composes the
+	initializing recursive update after the root clone has been published.
 - Repository setup: `config`, scoped like git — `--local` (the repository `.git/config`, the default
   for writes), `--global` (`$GIT_CONFIG_GLOBAL`, else `~/.gitconfig` / the XDG file), and `--system`
   (`$GIT_CONFIG_SYSTEM`, else `/etc/gitconfig`). An unscoped read resolves across git's whole

@@ -520,6 +520,31 @@ pub async fn serve_git_http_backend(project_root: PathBuf) -> String {
 	format!("http://{addr}")
 }
 
+/// Serve multiple repositories through `git http-backend`, requiring the same HTTP Basic
+/// credential for every repository path. This exercises relative submodule URLs on one authority.
+pub async fn serve_git_http_backend_basic_auth(
+	project_root: PathBuf,
+	user: &str,
+	pass: &str,
+) -> String {
+	let expected = format!(
+		"Basic {}",
+		base64_encode(format!("{user}:{pass}").as_bytes())
+	);
+	let app = Router::new()
+		.fallback(git_http_backend_cgi)
+		.layer(axum::middleware::from_fn(move |req, next| {
+			basic_auth_gate(Some(expected.clone()), req, next)
+		}))
+		.with_state(project_root);
+	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+	let addr = listener.local_addr().expect("addr");
+	tokio::spawn(async move {
+		axum::serve(listener, app).await.expect("serve");
+	});
+	format!("http://{addr}")
+}
+
 /// Bridge one HTTP request to `git http-backend`: set the CGI environment from the request, pipe the
 /// body to its stdin, and translate its CGI response (headers, blank line, body) back to HTTP.
 async fn git_http_backend_cgi(

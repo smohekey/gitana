@@ -12,6 +12,421 @@ use gitana_submodule::acquire_submodule_config_mutation_lease;
 use sha2::{Digest, Sha256};
 
 #[test]
+fn clone_recurse_submodules_materializes_nested_modules_after_root_publication() {
+	let root = unique_tmp("clone-recurse-submodules");
+	let leaf = root.join("leaf");
+	let middle = root.join("middle");
+	let superproject = root.join("super");
+	let consumer = root.join("consumer");
+	for repository in [&leaf, &middle, &superproject] {
+		std::fs::create_dir_all(repository).unwrap();
+		init_repository(repository, None);
+		std::fs::write(
+			repository.join("file.txt"),
+			repository.display().to_string(),
+		)
+		.unwrap();
+		git_ok(repository, &["add", "file.txt"]);
+		commit(repository, "root");
+	}
+	git_allow(&middle, &["submodule", "add", "../leaf", "child"]);
+	commit(&middle, "add child");
+	git_allow(
+		&superproject,
+		&["submodule", "add", "../middle", "modules/a"],
+	);
+	git_allow(&superproject, &["submodule", "add", "../leaf", "modules/b"]);
+	commit(&superproject, "add modules");
+	let middle_oid = git(&middle, &["rev-parse", "HEAD"]).trim().to_owned();
+	let leaf_oid = git(&leaf, &["rev-parse", "HEAD"]).trim().to_owned();
+
+	let clone = gta(
+		&root,
+		true,
+		&[
+			"clone",
+			"--recurse-submodules",
+			superproject.to_str().unwrap(),
+			consumer.to_str().unwrap(),
+		],
+	);
+	assert_success(&clone, "clone --recurse-submodules");
+	assert_eq!(
+		git(
+			&consumer,
+			&["config", "--local", "--get-all", "submodule.active"]
+		),
+		".\n"
+	);
+	let root_config = std::fs::read_to_string(git_path(&consumer, "config")).unwrap();
+	assert!(
+		!root_config.contains("active = true"),
+		"the root-wide activation must not create redundant per-module keys"
+	);
+	let output = stdout(&clone);
+	let cloned = output.find("Cloned '").expect("root clone outcome");
+	let middle = output
+		.find("Submodule path 'modules/a'")
+		.expect("middle submodule outcome");
+	let sibling = output
+		.find("Submodule path 'modules/b'")
+		.expect("sibling submodule outcome");
+	let child = output
+		.find("Submodule path 'modules/a/child'")
+		.expect("nested submodule outcome");
+	assert!(
+		cloned < middle && middle < sibling && sibling < child,
+		"root publication and repository-local batches must retain their order: {output}"
+	);
+	assert_eq!(
+		git(&consumer.join("modules/a"), &["rev-parse", "HEAD"]).trim(),
+		middle_oid
+	);
+	assert_eq!(
+		git(&consumer.join("modules/a/child"), &["rev-parse", "HEAD"]).trim(),
+		leaf_oid
+	);
+	let middle_config =
+		std::fs::read_to_string(git_path(&consumer.join("modules/a"), "config")).unwrap();
+	assert!(
+		middle_config.contains("active = true"),
+		"descendants must retain normal per-module activation"
+	);
+	assert_eq!(
+		stdout(&gta(
+			&consumer,
+			false,
+			&["submodule", "status", "--recursive"]
+		)),
+		format!(" {middle_oid} modules/a\n {leaf_oid} modules/a/child\n {leaf_oid} modules/b\n")
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clone_recurse_submodules_carries_url_credentials_through_relative_children() {
+	if !support::git_http_backend_available() {
+		eprintln!("skipping: git http-backend not available");
+		return;
+	}
+	let root = unique_tmp("clone-recurse-submodules-auth");
+	let leaf = root.join("leaf");
+	let middle = root.join("rewritten-middle");
+	let superproject = root.join("super");
+	let consumer = root.join("consumer");
+	for repository in [&leaf, &middle, &superproject] {
+		std::fs::create_dir_all(repository).unwrap();
+		init_repository(repository, None);
+		std::fs::write(
+			repository.join("file.txt"),
+			repository.display().to_string(),
+		)
+		.unwrap();
+		git_ok(repository, &["add", "file.txt"]);
+		commit(repository, "root");
+	}
+	git_allow(&middle, &["submodule", "add", "../leaf", "child"]);
+	commit(&middle, "add child");
+	git_allow(
+		&superproject,
+		&["submodule", "add", "../rewritten-middle", "parent"],
+	);
+	git_ok(
+		&superproject,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.parent.url",
+			"../middle",
+		],
+	);
+	commit(&superproject, "add parent");
+	let middle_oid = git(&middle, &["rev-parse", "HEAD"]).trim().to_owned();
+	let leaf_oid = git(&leaf, &["rev-parse", "HEAD"]).trim().to_owned();
+	let base = support::serve_git_http_backend_basic_auth(root.clone(), "alice", "s3cr3t").await;
+	let authenticated = format!(
+		"http://alice:s3cr3t@{}/super",
+		base.trim_start_matches("http://")
+	);
+	let safe_middle = format!("http://alice@{}/middle", base.trim_start_matches("http://"));
+	let rewritten_middle = format!(
+		"http://alice@{}/rewritten-middle",
+		base.trim_start_matches("http://")
+	);
+	let global = root.join("clone.config");
+	std::fs::write(
+		&global,
+		format!("[url \"{rewritten_middle}\"]\n\tinsteadOf = {safe_middle}\n"),
+	)
+	.unwrap();
+
+	let clone = gta_with_environment(
+		&root,
+		&[
+			"clone",
+			"--recurse-submodules",
+			&authenticated,
+			consumer.to_str().unwrap(),
+		],
+		&[
+			("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+			("GIT_CONFIG_SYSTEM", "/dev/null"),
+			("GIT_TERMINAL_PROMPT", "0"),
+		],
+	);
+	assert_success(&clone, "authenticated recursive clone");
+	assert_eq!(
+		git(&consumer.join("parent"), &["rev-parse", "HEAD"]).trim(),
+		middle_oid
+	);
+	assert_eq!(
+		git(&consumer.join("parent/child"), &["rev-parse", "HEAD"]).trim(),
+		leaf_oid
+	);
+	assert_eq!(
+		git(
+			&consumer.join("parent"),
+			&["config", "--get", "remote.origin.url"]
+		)
+		.trim(),
+		rewritten_middle,
+		"the module must persist the rewritten endpoint without its password"
+	);
+	for config in [
+		git_path(&consumer, "config"),
+		git_path(&consumer.join("parent"), "config"),
+		git_path(&consumer.join("parent/child"), "config"),
+	] {
+		let text = std::fs::read_to_string(&config).unwrap();
+		assert!(
+			!text.contains("s3cr3t"),
+			"the recursive credential leaked into {}: {text}",
+			config.display()
+		);
+	}
+	for reflog in [
+		git_path(&consumer, "logs/HEAD"),
+		git_path(&consumer.join("parent"), "logs/HEAD"),
+		git_path(&consumer.join("parent/child"), "logs/HEAD"),
+	] {
+		let text = std::fs::read_to_string(&reflog).unwrap();
+		assert!(
+			!text.contains("s3cr3t"),
+			"the recursive credential leaked into {}: {text}",
+			reflog.display()
+		);
+	}
+	assert!(!stdout(&clone).contains("s3cr3t"));
+	assert!(!stderr(&clone).contains("s3cr3t"));
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn clone_recurse_submodules_preserves_root_inactivity() {
+	let root = unique_tmp("clone-recurse-submodules-inactive");
+	let leaf = root.join("leaf");
+	let middle = root.join("middle");
+	let superproject = root.join("super");
+	for repository in [&leaf, &middle, &superproject] {
+		std::fs::create_dir_all(repository).unwrap();
+		init_repository(repository, None);
+		std::fs::write(
+			repository.join("file.txt"),
+			repository.display().to_string(),
+		)
+		.unwrap();
+		git_ok(repository, &["add", "file.txt"]);
+		commit(repository, "root");
+	}
+	git_allow(&middle, &["submodule", "add", "../leaf", "child"]);
+	commit(&middle, "add child");
+	git_allow(&superproject, &["submodule", "add", "../middle", "parent"]);
+	git_allow(&superproject, &["submodule", "add", "../leaf", "active"]);
+	commit(&superproject, "add modules");
+
+	for (name, inactive) in [
+		("named", "submodule.parent.active=false"),
+		("pathspec", "submodule.active=:(exclude)parent"),
+	] {
+		let consumer = root.join(format!("consumer-{name}"));
+		let clone = gta_with_configs(
+			&root,
+			&["protocol.file.allow=always", inactive],
+			&[
+				"clone",
+				"--recurse-submodules",
+				superproject.to_str().unwrap(),
+				consumer.to_str().unwrap(),
+			],
+		);
+		assert_success(&clone, "active-aware recursive clone");
+		assert!(consumer.join("active/.git").is_file());
+		assert!(!consumer.join("parent/.git").exists());
+		assert!(!consumer.join("parent/child/.git").exists());
+		let config = std::fs::read_to_string(git_path(&consumer, "config")).unwrap();
+		assert!(config.contains("active = ."));
+		assert!(config.contains("[submodule \"active\"]"));
+		assert!(
+			!config.contains("[submodule \"parent\"]"),
+			"inactive root module must not be registered: {config}"
+		);
+		assert!(
+			!config.contains("active = true"),
+			"root-wide activation must not be replaced by per-module activation: {config}"
+		);
+	}
+
+	let global = root.join("inactive.config");
+	std::fs::write(
+		&global,
+		"[protocol \"file\"]\n\tallow = always\n[submodule \"parent\"]\n\tactive = false\n\turl\n",
+	)
+	.unwrap();
+	let consumer = root.join("consumer-valueless-url");
+	let clone = gta_with_environment(
+		&root,
+		&[
+			"clone",
+			"--recurse-submodules",
+			superproject.to_str().unwrap(),
+			consumer.to_str().unwrap(),
+		],
+		&[
+			("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+			("GIT_CONFIG_SYSTEM", "/dev/null"),
+		],
+	);
+	assert_success(&clone, "inactive module with a valueless URL");
+	assert!(consumer.join("active/.git").is_file());
+	assert!(!consumer.join("parent/.git").exists());
+	assert!(!consumer.join("parent/child/.git").exists());
+	let config = std::fs::read_to_string(git_path(&consumer, "config")).unwrap();
+	assert!(config.contains("active = ."));
+	assert!(config.contains("[submodule \"active\"]"));
+	assert!(!config.contains("[submodule \"parent\"]"));
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn clone_recursive_alias_is_opt_in() {
+	let fixture = Fixture::new("clone-recursive-alias");
+	let recursive = fixture.root.join("recursive");
+	let plain = fixture.root.join("plain");
+	let no_modules = fixture.root.join("no-modules");
+	std::fs::create_dir(&recursive).unwrap();
+	let recursive_clone = gta(
+		&fixture.root,
+		true,
+		&[
+			"clone",
+			"--recursive",
+			fixture.superproject.to_str().unwrap(),
+			recursive.to_str().unwrap(),
+		],
+	);
+	assert_success(&recursive_clone, "clone --recursive");
+	assert_eq!(
+		std::fs::read_to_string(recursive.join("modules/one/file.txt")).unwrap(),
+		"old\n"
+	);
+
+	let plain_clone = gta(
+		&fixture.root,
+		true,
+		&[
+			"clone",
+			fixture.superproject.to_str().unwrap(),
+			plain.to_str().unwrap(),
+		],
+	);
+	assert_success(&plain_clone, "plain clone");
+	assert!(
+		!plain.join("modules/one/.git").exists(),
+		"clone recursion must remain opt in"
+	);
+	let plain_config = std::fs::read_to_string(git_path(&plain, "config")).unwrap();
+	assert!(!plain_config.contains("active = ."));
+
+	let no_modules_clone = gta(
+		&fixture.root,
+		true,
+		&[
+			"clone",
+			"--recurse-submodules",
+			fixture.source.to_str().unwrap(),
+			no_modules.to_str().unwrap(),
+		],
+	);
+	assert_success(
+		&no_modules_clone,
+		"recursive clone without submodule declarations",
+	);
+	assert_eq!(
+		std::fs::read_to_string(no_modules.join("file.txt")).unwrap(),
+		"old\n"
+	);
+	assert_eq!(
+		git(
+			&no_modules,
+			&["config", "--local", "--get-all", "submodule.active"]
+		),
+		".\n"
+	);
+}
+
+#[test]
+fn clone_recursion_failure_retains_the_root_for_retry() {
+	let fixture = Fixture::new("clone-recursion-retry");
+	let consumer = fixture.root.join("retry-consumer");
+	let clone = gta(
+		&fixture.root,
+		false,
+		&[
+			"clone",
+			"--recurse-submodules",
+			fixture.superproject.to_str().unwrap(),
+			consumer.to_str().unwrap(),
+		],
+	);
+	assert!(
+		!clone.status.success(),
+		"recursive file transport must fail closed"
+	);
+	assert!(
+		stdout(&clone).starts_with("Cloned '"),
+		"root publication must be reported before recursion: {}",
+		stdout(&clone)
+	);
+	assert!(
+		consumer.join(".git").is_dir(),
+		"the root clone must be retained"
+	);
+	assert_eq!(
+		git(&consumer, &["rev-parse", "HEAD"]),
+		git(&fixture.superproject, &["rev-parse", "HEAD"])
+	);
+	assert_eq!(
+		git(
+			&consumer,
+			&["config", "--local", "--get-all", "submodule.active"]
+		),
+		".\n"
+	);
+
+	let retry = gta(
+		&consumer,
+		true,
+		&["submodule", "update", "--init", "--recursive"],
+	);
+	assert_success(&retry, "retry retained clone submodules");
+	assert_eq!(
+		std::fs::read_to_string(consumer.join("modules/one/file.txt")).unwrap(),
+		"old\n"
+	);
+}
+
+#[test]
 fn update_init_materializes_the_recorded_commit_in_a_detached_worktree() {
 	let fixture = Fixture::new("fresh");
 

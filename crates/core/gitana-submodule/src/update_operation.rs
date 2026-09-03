@@ -280,6 +280,7 @@ impl SubmoduleContext {
 		let request = UpdateRequest {
 			query,
 			initialize: false,
+			initialize_only_active: false,
 			reflog_committer,
 		};
 		let report = match self.hash_kind {
@@ -440,6 +441,7 @@ impl SubmoduleContext {
 						query: request.query.clone(),
 					},
 					configuration,
+					request.initialize_only_active,
 					mutation_lease.clone(),
 				)
 				.await
@@ -475,6 +477,29 @@ impl SubmoduleContext {
 				.expect("preflight established every mapping")
 				.clone();
 			let recorded = index.entry(&path).expect("selected stage-zero gitlink").oid;
+			let active = is_active(&effective, &declaration.name, &declaration.path)
+				.map_err(|source| UpdateFailure::after_init(&report, source))?;
+			let strategy = configured_update_strategy(&effective, &declaration.name)
+				.map_err(|source| UpdateFailure::after_init(&report, source))?
+				.or_else(|| declaration.update.clone())
+				.unwrap_or_else(|| "checkout".to_owned());
+			validate_update_strategy(&declaration.name, &strategy)
+				.map_err(|source| UpdateFailure::after_init(&report, source))?;
+			if request.initialize_only_active && !active {
+				plan.push(Planned {
+					declaration,
+					recorded,
+					source_url: None,
+					state: Some(UpdateOutcomeState::SkippedInactive),
+					recovering: false,
+					intent_identity: None,
+					module_config_lease: None,
+					pointers: pointers
+						.remove(&path)
+						.expect("preflight computed every selected module pointer"),
+				});
+				continue;
+			}
 			let configured_url = effective.get_raw("submodule", Some(&declaration.name), "url");
 			let source_url = match configured_url {
 				Some(Some(url)) => Some(url.to_owned()),
@@ -487,14 +512,6 @@ impl SubmoduleContext {
 				None => None,
 			};
 			let source_url = credential_urls.get(&path).cloned().or(source_url);
-			let active = is_active(&effective, &declaration.name, &declaration.path)
-				.map_err(|source| UpdateFailure::after_init(&report, source))?;
-			let strategy = configured_update_strategy(&effective, &declaration.name)
-				.map_err(|source| UpdateFailure::after_init(&report, source))?
-				.or_else(|| declaration.update.clone())
-				.unwrap_or_else(|| "checkout".to_owned());
-			validate_update_strategy(&declaration.name, &strategy)
-				.map_err(|source| UpdateFailure::after_init(&report, source))?;
 			let state = if source_url.is_none() {
 				Some(UpdateOutcomeState::SkippedUnregistered)
 			} else if !active {
@@ -912,6 +929,8 @@ impl SubmoduleContext {
 		mutation_lease: crate::SubmoduleMutationLease,
 	) -> Result<EntryIdentity, SubmoduleError> {
 		let request = PrepareSource {
+			module_path: entry.declaration.path.clone(),
+			declared_url: entry.declaration.url.clone(),
 			source_url: source.to_owned(),
 			persist_url: gitana_remote::redact_password(source),
 			hash_kind: crate::object_id::kind::<H>(),
@@ -1327,6 +1346,8 @@ impl SubmoduleContext {
 					))
 				})?;
 				let request = PrepareSource {
+					module_path: entry.declaration.path.clone(),
+					declared_url: entry.declaration.url.clone(),
 					source_url: source.to_owned(),
 					persist_url: gitana_remote::redact_password(source),
 					hash_kind: crate::object_id::kind::<H>(),
@@ -3503,6 +3524,7 @@ mod tests {
 		async fn apply_init(
 			&self,
 			_updates: &[InitConfigUpdate],
+			_persist_all_active: bool,
 			_lease: crate::SubmoduleMutationLease,
 		) -> Result<InitConfigResult, SubmoduleError> {
 			unreachable!()

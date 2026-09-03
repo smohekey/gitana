@@ -37,9 +37,12 @@ pub trait ConfigurationProvider: MarkerTargetResolver {
 	#[cfg(not(target_arch = "wasm32"))]
 	type ModuleWorktreeEdit: Send;
 
+	/// Atomically apply repository-local initialization updates. When `persist_all_active` is true,
+	/// the same transaction also records Git's root-level `submodule.active=.` clone setting.
 	async fn apply_init(
 		&self,
 		updates: &[InitConfigUpdate],
+		persist_all_active: bool,
 		lease: SubmoduleMutationLease,
 	) -> Result<InitConfigResult, SubmoduleError>;
 

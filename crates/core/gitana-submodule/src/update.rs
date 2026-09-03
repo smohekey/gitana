@@ -7,6 +7,10 @@ use crate::{InitReport, SubmoduleError, SubmoduleObjectId, SubmoduleQuery};
 pub struct UpdateRequest {
 	pub query: SubmoduleQuery,
 	pub initialize: bool,
+	/// Initialize only modules that are already active in the serialized effective configuration.
+	/// Recursive clone enables this for its root level so command/global exclusions are not
+	/// overwritten by ordinary per-module activation.
+	pub initialize_only_active: bool,
 	/// Reflog committer line supplied by the frontend; `None` disables module HEAD reflogs.
 	pub reflog_committer: Option<String>,
 }

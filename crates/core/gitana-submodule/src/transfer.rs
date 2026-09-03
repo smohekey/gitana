@@ -9,6 +9,11 @@ use crate::{SubmoduleMutationLease, SubmoduleObjectId};
 /// A request to validate and retain a source before publishing any staging namespace.
 #[derive(Clone)]
 pub struct PrepareSource {
+	/// Level-local submodule path used to return private descendant transport state to the frontend.
+	pub module_path: String,
+	/// Original `.gitmodules` URL, when present. The frontend uses a relative declaration to carry
+	/// invocation-owned credentials forward without changing the serialized source selected by core.
+	pub declared_url: Option<String>,
 	pub source_url: String,
 	pub persist_url: String,
 	pub hash_kind: HashKind,

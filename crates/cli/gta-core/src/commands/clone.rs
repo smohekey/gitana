@@ -20,13 +20,16 @@ use crate::{CloneDestination, CommandContext, git_config, repo, transport_for, u
 ///
 /// `depth` / `shallow_since` / `shallow_exclude` request a shallow clone (git's `--depth`,
 /// `--shallow-since`, `--shallow-exclude`): a truncated history recorded in `.git/shallow`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
+	command: &CommandContext,
 	url: String,
 	dir: Option<PathBuf>,
 	depth: Option<u32>,
 	shallow_since: Option<String>,
 	shallow_exclude: Vec<String>,
 	sparse: bool,
+	recurse_submodules: bool,
 ) -> Result<()> {
 	// Fail fast on a bad `--shallow-since` before any network round-trip.
 	let deepen = build_deepen(depth, shallow_since.as_deref(), shallow_exclude)?;
@@ -44,13 +47,11 @@ pub async fn run(
 	let config = git_config::from_ambient().await?;
 	let rewritten_url = url_rewrite::rewrite_fetch_url(&config, &url)?;
 	let remote = RemoteUrl::parse(&rewritten_url)?;
-	if let Some(command) = CommandContext::current() {
-		command.authorize(
-			&config,
-			&remote,
-			gitana_remote::ProtocolContext::UserInitiated,
-		)?;
-	}
+	command.authorize(
+		&config,
+		&remote,
+		gitana_remote::ProtocolContext::UserInitiated,
+	)?;
 	let target_argument = dir.unwrap_or_else(|| default_directory_path(&url, &naming_cwd));
 	// `-C` changes the effective working directory for the whole command. Resolve both an explicit
 	// relative destination and the inferred directory there before any no-follow classification or
@@ -237,10 +238,21 @@ pub async fn run(
 		}
 		return Err(error);
 	}
-	destination.commit()?;
+	let (published_root, published_identity) = destination.commit_repository()?;
 
 	// Report the userinfo-stripped URL — a password in the clone URL must not reach stdout / CI logs.
 	println!("Cloned '{}' into '{}'", reflog_url, target.display());
+	if recurse_submodules {
+		let layout = repo::inspect_root(&published_root).await?;
+		let credential_url_base = (transport::redact_password(&url) != url).then_some(url);
+		super::submodule::update_published_clone(
+			layout,
+			published_identity,
+			command,
+			credential_url_base,
+		)
+		.await?;
+	}
 	Ok(())
 }
 
@@ -507,6 +519,41 @@ mod tests {
 		assert_eq!(
 			default_directory_path(r"C:\source\repository\.git", cwd),
 			PathBuf::from("repository")
+		);
+	}
+
+	#[tokio::test]
+	async fn recursive_handoff_rejects_a_replaced_published_root() {
+		let temporary = tempfile::tempdir().unwrap();
+		let target = temporary.path().join("target");
+		let retained = temporary.path().join("retained");
+		let mut destination = CloneDestination::new(&target, false);
+		let staging = destination.start().unwrap();
+		std::fs::create_dir_all(staging.join(".git/refs")).unwrap();
+		let (published_root, identity) = destination.commit_repository().unwrap();
+
+		std::fs::rename(&published_root, &retained).unwrap();
+		std::fs::create_dir_all(published_root.join(".git/refs")).unwrap();
+		let layout = repo::inspect_root(&published_root).await.unwrap();
+		let command = CommandContext::from_env(temporary.path().to_owned(), Vec::new());
+		let error =
+			crate::commands::submodule::update_published_clone(layout, identity, &command, None)
+				.await
+				.unwrap_err();
+
+		assert!(
+			error
+				.to_string()
+				.contains("changed while waiting for repository setup"),
+			"unexpected replacement error: {error:#}"
+		);
+		assert!(
+			published_root.join(".git/refs").is_dir(),
+			"the replacement repository must remain untouched"
+		);
+		assert!(
+			retained.join(".git/refs").is_dir(),
+			"the published clone must remain recoverable at its displaced name"
 		);
 	}
 }
