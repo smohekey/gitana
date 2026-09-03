@@ -504,6 +504,12 @@ impl SubmoduleContext {
 		}
 		let module_lease =
 			crate::update_operation::try_acquire_submodule_config_mutation_lease(&module, &module_path)?;
+		if crate::repository_has_pending_update(&module, &module_path)? {
+			return Err(SubmoduleError::RecoveryRequired(format!(
+				"pending submodule update recovery in module '{}' must be completed before deinitializing its parent",
+				intent.name
+			)));
+		}
 		let module_layout = RepositoryLayout {
 			worktree_root: intent
 				.mount_identity
@@ -644,6 +650,12 @@ impl SubmoduleContext {
 						&module_path,
 					)
 					.map_err(&preflight)?;
+					if crate::repository_has_pending_update(&directory, &module_path).map_err(&preflight)? {
+						return Err(preflight(SubmoduleError::RecoveryRequired(format!(
+							"pending submodule update recovery in module '{}' must be completed before deinitializing its parent",
+							declaration.name
+						))));
+					}
 					let module_layout = RepositoryLayout {
 						worktree_root: mounted.then(|| self.worktree_root().join(&declaration.path)),
 						git_dir: module_path.clone(),

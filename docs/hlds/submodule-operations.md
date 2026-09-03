@@ -2,11 +2,36 @@
 
 ## Scope
 
-Gitana implements the one-level consumer commands `submodule status`, `submodule init`,
-`submodule update`, and `submodule deinit`. The first release deliberately does not recurse into
-nested submodules and does not implement clone-time recursion or the `merge`, `rebase`, or
-custom-command update strategies. Unsupported strategies are rejected before initialization or
-filesystem mutation; `none` is an explicit skip.
+Gitana implements the consumer commands `submodule status`, `submodule init`, `submodule update`,
+and `submodule deinit`. `status --recursive` and `update --recursive` explicitly recurse into nested
+submodules; omitted flags remain one-level operations, and root pathspecs select only the first
+level before every eligible descendant is considered. Clone-time recursion and the `merge`,
+`rebase`, and custom-command update strategies remain unsupported. Unsupported strategies are
+rejected before initialization or filesystem mutation; `none` is an explicit skip.
+
+Recursive status renders a depth-first pre-order and enters only initialized, non-conflicted module
+worktrees. Recursive update first scans the currently initialized selected subtree and resumes
+pending update journals deepest-first; any pending nested deinit fails closed. When the root owns a
+durable update intent outside the caller's pathspecs, the original query and the owner's
+top-relative literal query are evaluated independently and their status results are deduplicated for
+this recovery scan. This preserves exclusion-only pathspec semantics while ensuring descendant
+recovery completes before the root intent, without broadening the subsequent requested update. An
+empty recorded owner path is malformed and fails recovery before a pathspec is constructed or any
+recursive level is scanned.
+Normal updates then complete a whole repository-local selection before
+releasing every lease and entering successful children in level order. `Cloned`, `CheckedOut`, and
+`AlreadyCurrent` parents are eligible;
+unregistered, inactive, and `none`-strategy parents stop descent. This batch-first ordering is an
+intentional safety difference from Git's sibling/descendant interleaving: no parent repository lock
+is retained across a child operation. The root layout and its worktree, per-worktree Git-directory,
+and common-directory identities are captured before ambient configuration or setup-lock waits and
+revalidated on every recovery and update pass; a replacement root is never adopted as a fresh
+recursive level. Each child is exact-root discovered and identity-revalidated after setup
+serialization, and the core rejects a nested update journal that appears after the recovery scan but
+before a parent would mutate that module repository. A durable recovery path is always interpreted
+as a top-relative literal, independent of the caller's pathspec prefix or any wildcard and magic
+characters in the recorded name. An empty update control directory with no staged repository is
+retired directly under the per-worktree update lock and never converted into an all-module update.
 
 The implementation is split at an authority boundary. `gitana-submodule` owns declaration parsing,
 selection, state transitions, validation, reports, and recovery. It receives already-opened
@@ -27,10 +52,16 @@ Each worktree owns its module repositories at:
 ```
 
 This rule applies unchanged to a main checkout and to a linked worktree. A module mount contains the
-usual `.git` text file pointing to that exact repository. Names and paths are compared through a
-lowercased Unicode canonical-decomposition key, so normalization-equivalent filesystem aliases are
-rejected portably before mutation. Parent components, existing mount markers, and directory types
-are validated without following symlink components. An existing marker is accepted only if opening
+usual `.git` text file pointing to that exact repository. Recursive entry requires the requested and
+discovered worktree roots to identify the same directory, and requires both the discovered
+per-worktree Git directory and its resolved common directory to identify the expected module
+repository. A foreign `commondir` redirect is rejected before identity capture, setup locking, or
+configuration access, while native-equivalent spellings and aliases to the same directory remain
+valid within the fixed layout. Names and paths are compared through a lowercased Unicode
+canonical-decomposition key, so
+normalization-equivalent filesystem aliases are rejected portably before mutation. Parent
+components, existing mount markers, and directory types are validated without following symlink
+components. An existing marker is accepted only if opening
 its original, unnormalized target reaches the same directory identity as the expected per-worktree
 repository. The original target is reopened after that comparison and its visible resolution must
 still identify the retained repository. This accepts genuine native aliases while preventing either
@@ -105,7 +136,10 @@ configuration as though those layers belonged to the module.
 After `update --init` changes repository-local configuration, the state machine asks the native
 frontend to rebuild the complete effective configuration stack. URL, activation, and strategy
 decisions use that refreshed stack; raw local values never bypass worktree or command-scope
-overrides. The same native authority owns the atomic local-config transaction: it follows a
+overrides. Initial repository preparation receives that exact post-lock effective snapshot in its
+`PrepareSource`; endpoint rewriting, authorization, credentials, and transport construction cannot
+reuse a frontend configuration image captured before update acquired serialization. The same native
+authority owns the atomic local-config transaction: it follows a
 symlinked config to its target, then opens each explicitly resolved directory component without
 following links and verifies the opened directory plus its still-visible name against the identity
 captured before the open, so a concurrent directory or symlink replacement cannot redirect the edit. It locks and
@@ -145,6 +179,10 @@ the stable serialization guard remains held. Every detached config mutation work
 cloned lease on that guard, including init edits, attachment edits and rollback, and deinit
 reservation, preparation, restoration, and publication. Dropping the awaiting operation therefore
 cannot admit another init, update, or deinit until its last blocking config worker has finished.
+Pending update resumption acquires this guard before reading the durable owner and carries the same
+guard through preflight, recovery, transfer, checkout, and intent retirement. If no journal remains
+when the guard is acquired, resumption is a no-op; another compliant updater cannot clear the intent
+between owner selection and the recovered update.
 Reports retain initialization effects and module outcomes in actual completion order if a later
 module fails.
 
@@ -170,9 +208,10 @@ before validating or planning that module config. It retains those module guards
 publications and intent retirement. Detached module-config workers receive one lease combining the
 superproject and module guards, so cancellation cannot admit a writer on either side of the
 transition. While holding each module guard, parent deinit also rejects pending or malformed nested
-deinit recovery owned by that module repository. A parent transition therefore cannot replace the
-module config inode pinned by a crashed nested transaction. Contention or nested recovery fails
-preflight without moving a mount or publishing an intent.
+update or deinit recovery owned by that module repository. A parent checkout containing a recoverable
+child journal therefore cannot be retired, and a parent transition cannot replace the module config
+inode pinned by a crashed nested transaction. The same checks precede active parent-deinit recovery.
+Contention or nested recovery fails preflight without moving a mount or publishing an intent.
 Update follows the same parent-before-module order for every published module repository: after
 opening the retained module and before reading its hash or effective config, it tries that module's
 config-mutation guard. The combined parent and module lease is retained through fetch, attachment,

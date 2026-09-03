@@ -94,9 +94,9 @@ Major gaps:
 - `gta rebase <upstream> [--onto <newbase>]` replays the branch's commits onto a
   new base (linear histories only), with `--continue` / `--skip` / `--abort`.
   Non-interactive: no `-i`, autosquash, or `--rebase-merges`.
-- `gta submodule status` / `init` / `update` / `deinit` implement one-level consumer operations. Nested
-  recursion, clone-time recursion, and the `merge`, `rebase`, or custom-command update strategies
-  are not yet supported.
+- `gta submodule status [--recursive]` / `init` / `update [--init] [--recursive]` / `deinit`
+  implement consumer operations. Recursion is explicit for status and update; clone-time recursion
+  and the `merge`, `rebase`, or custom-command update strategies are not yet supported.
 - There is no interactive rebase, stash, blame, bisect, or hook support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
@@ -186,8 +186,11 @@ Implemented command groups:
   or the main worktree. `move`/`remove` refuse a worktree holding an initialized submodule, and
   `worktree.useRelativePaths` pointers are preserved across a move/repair. The result is byte-for-byte
   git's layout, so stock git reads and operates in a gta-created worktree.
-- Submodules: `submodule status`, `submodule init`, `submodule update [--init]`, and
-	`submodule deinit [-f|--force] (--all | <path>...)` for one level of tracked consumer modules.
+- Submodules: `submodule status [--recursive]`, `submodule init`,
+	`submodule update [--init] [--recursive]`, and
+	`submodule deinit [-f|--force] (--all | <path>...)`. Root pathspecs select top-level modules;
+	recursive status is depth-first and recursive update completes each repository-local batch before
+	entering successful child worktrees.
 - Repository setup: `config`, scoped like git — `--local` (the repository `.git/config`, the default
   for writes), `--global` (`$GIT_CONFIG_GLOBAL`, else `~/.gitconfig` / the XDG file), and `--system`
   (`$GIT_CONFIG_SYSTEM`, else `/etc/gitconfig`). An unscoped read resolves across git's whole

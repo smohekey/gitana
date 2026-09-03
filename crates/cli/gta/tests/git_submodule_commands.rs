@@ -61,6 +61,501 @@ fn update_init_materializes_the_recorded_commit_in_a_detached_worktree() {
 	assert_mount_points_at_per_worktree_repository(&fixture.consumer);
 }
 
+#[test]
+fn recursive_status_and_update_traverse_nested_modules_with_explicit_level_order() {
+	let root = unique_tmp("recursive-status-update");
+	let leaf = root.join("leaf");
+	let middle = root.join("middle");
+	let superproject = root.join("super");
+	let consumer = root.join("consumer");
+	for repository in [&leaf, &middle, &superproject] {
+		std::fs::create_dir_all(repository).unwrap();
+		init_repository(repository, None);
+		std::fs::write(
+			repository.join("file.txt"),
+			repository.display().to_string(),
+		)
+		.unwrap();
+		git_ok(repository, &["add", "file.txt"]);
+		commit(repository, "root");
+	}
+	git_allow(&middle, &["submodule", "add", "../leaf", "child"]);
+	commit(&middle, "add child");
+	git_allow(
+		&superproject,
+		&["submodule", "add", "../middle", "modules/a"],
+	);
+	git_allow(&superproject, &["submodule", "add", "../leaf", "modules/b"]);
+	commit(&superproject, "add modules");
+	let clone = Command::new("git")
+		.args(["clone", "-q", "--no-recurse-submodules"])
+		.arg(&superproject)
+		.arg(&consumer)
+		.output()
+		.unwrap();
+	assert_success(&clone, "clone recursive fixture");
+	let middle_oid = git(&middle, &["rev-parse", "HEAD"]).trim().to_owned();
+	let leaf_oid = git(&leaf, &["rev-parse", "HEAD"]).trim().to_owned();
+
+	let initial = gta(&consumer, false, &["submodule", "status", "--recursive"]);
+	assert_success(&initial, "recursive status before initialization");
+	assert_eq!(
+		stdout(&initial),
+		format!("-{middle_oid} modules/a\n-{leaf_oid} modules/b\n")
+	);
+
+	let update = gta(
+		&consumer,
+		true,
+		&["submodule", "update", "--init", "--recursive"],
+	);
+	assert_success(&update, "recursive update --init");
+	assert_eq!(
+		stdout(&update),
+		format!(
+			"Submodule path 'modules/a': checked out '{middle_oid}'\nSubmodule path 'modules/b': checked out '{leaf_oid}'\nSubmodule path 'modules/a/child': checked out '{leaf_oid}'\n"
+		),
+		"the whole root batch must complete before entering its child"
+	);
+
+	let status = gta(&consumer, false, &["submodule", "status", "--recursive"]);
+	assert_success(&status, "recursive status after update");
+	assert_eq!(
+		stdout(&status),
+		format!(" {middle_oid} modules/a\n {leaf_oid} modules/a/child\n {leaf_oid} modules/b\n"),
+		"status must render depth-first"
+	);
+	let module = consumer.join("modules/a");
+	let intermediate = consumer.join("modules/a-case-rename");
+	let recased = consumer.join("modules/A");
+	std::fs::rename(&module, &intermediate).unwrap();
+	std::fs::rename(&intermediate, &recased).unwrap();
+	if module.exists() {
+		let status = gta(
+			&consumer,
+			false,
+			&["submodule", "status", "--recursive", "modules/a"],
+		);
+		assert_success(
+			&status,
+			"recursive status with a native-equivalent mount spelling",
+		);
+		let update = gta(
+			&consumer,
+			true,
+			&["submodule", "update", "--recursive", "modules/a"],
+		);
+		assert_success(
+			&update,
+			"recursive update with a native-equivalent mount spelling",
+		);
+	}
+	std::fs::rename(&recased, &intermediate).unwrap();
+	std::fs::rename(&intermediate, &module).unwrap();
+	let child_source = git(
+		&consumer.join("modules/a/child"),
+		&["config", "--get", "remote.origin.url"],
+	)
+	.trim()
+	.to_owned();
+	let unrelated_recovery = write_v4_recovery_intent_at(
+		&consumer.join("modules/a"),
+		"child",
+		"child",
+		&leaf_oid,
+		&child_source,
+		"module",
+	);
+	let empty_owner = write_v4_recovery_intent_at(
+		&consumer,
+		"empty",
+		"",
+		&middle_oid,
+		"https://example.invalid/empty",
+		"module",
+	);
+	let refused = gta(
+		&consumer,
+		true,
+		&["submodule", "update", "--recursive", "modules/b"],
+	);
+	assert!(!refused.status.success());
+	assert!(
+		stderr(&refused).contains("staging intent has an empty path"),
+		"unexpected error: {}",
+		stderr(&refused)
+	);
+	assert!(
+		unrelated_recovery.exists(),
+		"an empty root owner must not recover an unrelated descendant journal"
+	);
+	assert!(
+		empty_owner.exists(),
+		"the malformed root journal must remain available for diagnosis"
+	);
+	std::fs::remove_dir_all(empty_owner).unwrap();
+	std::fs::remove_dir_all(unrelated_recovery).unwrap();
+
+	let nested_update = git_path(&consumer.join("modules/a"), "gitana-submodule-update");
+	std::fs::create_dir_all(&nested_update).unwrap();
+	let parent_update = gta(&consumer, true, &["submodule", "update", "modules/a"]);
+	assert!(!parent_update.status.success());
+	assert!(
+		stderr(&parent_update).contains("pending nested submodule update recovery"),
+		"unexpected error: {}",
+		stderr(&parent_update)
+	);
+	let recovery = gta(&consumer, true, &["submodule", "update", "--recursive"]);
+	assert_success(&recovery, "deepest-first nested update recovery");
+	assert!(!nested_update.exists());
+
+	let nested_deinit = git_path(&consumer.join("modules/a"), "gitana-submodule-deinit");
+	std::fs::create_dir_all(&nested_deinit).unwrap();
+	let parent_update = gta(&consumer, true, &["submodule", "update", "modules/a"]);
+	assert!(!parent_update.status.success());
+	assert!(
+		stderr(&parent_update).contains("pending nested submodule deinit recovery"),
+		"unexpected error: {}",
+		stderr(&parent_update)
+	);
+	let refused = gta(&consumer, true, &["submodule", "update", "--recursive"]);
+	assert!(!refused.status.success());
+	assert!(
+		stderr(&refused).contains("pending submodule deinit"),
+		"unexpected error: {}",
+		stderr(&refused)
+	);
+	std::fs::remove_dir(&nested_deinit).unwrap();
+
+	let nested_update = write_v4_recovery_intent_at(
+		&consumer.join("modules/a"),
+		"child",
+		"child",
+		&leaf_oid,
+		&child_source,
+		"module",
+	);
+	let super_config = consumer.join(".git/config");
+	let super_before = std::fs::read(&super_config).unwrap();
+	let module_config = git_path(&consumer.join("modules/a"), "config");
+	let module_before = std::fs::read(&module_config).unwrap();
+	let refused = gta(&consumer, false, &["submodule", "deinit", "modules/a"]);
+	assert!(!refused.status.success());
+	assert!(
+		stderr(&refused).contains("pending submodule update recovery in module 'modules/a'"),
+		"unexpected error: {}",
+		stderr(&refused)
+	);
+	assert!(consumer.join("modules/a/file.txt").is_file());
+	assert_eq!(std::fs::read(&super_config).unwrap(), super_before);
+	assert_eq!(std::fs::read(&module_config).unwrap(), module_before);
+	assert!(
+		!git_path(&consumer, "gitana-submodule-deinit").exists(),
+		"parent deinit must fail before publishing an intent"
+	);
+
+	let parent_source = git(
+		&consumer.join("modules/a"),
+		&["config", "--get", "remote.origin.url"],
+	)
+	.trim()
+	.to_owned();
+	let root_update = write_v4_recovery_intent_at(
+		&consumer,
+		"modules/a",
+		"modules/a",
+		&middle_oid,
+		&parent_source,
+		"module",
+	);
+	let recovered = gta(
+		&consumer,
+		true,
+		&["submodule", "update", "--recursive", "modules/b"],
+	);
+	assert_success(
+		&recovered,
+		"recover the unselected root owner and its child deepest-first",
+	);
+	assert!(
+		!nested_update.exists(),
+		"the child journal beneath the root owner must be recovered"
+	);
+	assert!(
+		!root_update.exists(),
+		"the root owner's journal must be recovered"
+	);
+
+	let nested_update = write_v4_recovery_intent_at(
+		&consumer.join("modules/a"),
+		"child",
+		"child",
+		&leaf_oid,
+		&child_source,
+		"module",
+	);
+	let sibling_source = git(
+		&consumer.join("modules/b"),
+		&["config", "--get", "remote.origin.url"],
+	)
+	.trim()
+	.to_owned();
+	let root_update = write_v4_recovery_intent_at(
+		&consumer,
+		"modules/b",
+		"modules/b",
+		&leaf_oid,
+		&sibling_source,
+		"module",
+	);
+	let recovered = gta(
+		&consumer,
+		true,
+		&[
+			"submodule",
+			"update",
+			"--recursive",
+			":(exclude)not-present",
+		],
+	);
+	assert_success(
+		&recovered,
+		"preserve exclusion-only selection while scanning a distinct recovery owner",
+	);
+	assert!(
+		!nested_update.exists(),
+		"exclusion-only recovery must retain the originally selected subtree"
+	);
+	assert!(
+		!root_update.exists(),
+		"the distinct root owner must also recover"
+	);
+	let deinit = gta(
+		&consumer,
+		false,
+		&["submodule", "deinit", "--force", "modules/a"],
+	);
+	assert_success(&deinit, "deinit after nested update recovery");
+
+	let no_init = root.join("consumer-no-init");
+	let clone = Command::new("git")
+		.args(["clone", "-q", "--no-recurse-submodules"])
+		.arg(&superproject)
+		.arg(&no_init)
+		.output()
+		.unwrap();
+	assert_success(&clone, "clone no-init recursive fixture");
+	let update = gta(&no_init, true, &["submodule", "update", "--recursive"]);
+	assert_success(&update, "recursive update without init");
+	assert_eq!(stdout(&update), "");
+	assert!(!no_init.join("modules/a/.git").exists());
+
+	let selected = root.join("consumer-selected");
+	let clone = Command::new("git")
+		.args(["clone", "-q", "--no-recurse-submodules"])
+		.arg(&superproject)
+		.arg(&selected)
+		.output()
+		.unwrap();
+	assert_success(&clone, "clone selected recursive fixture");
+	let update = gta(
+		&selected.join("modules"),
+		true,
+		&["submodule", "update", "--init", "--recursive", "a"],
+	);
+	assert_success(&update, "path-selected recursive update");
+	assert_eq!(
+		stdout(&update),
+		format!(
+			"Submodule path 'a': checked out '{middle_oid}'\nSubmodule path 'a/child': checked out '{leaf_oid}'\n"
+		)
+	);
+	assert!(!selected.join("modules/b/.git").exists());
+	let initialized = gta(&selected, false, &["submodule", "init", "modules/b"]);
+	assert_success(&initialized, "register the unselected sibling");
+	let empty_control = git_path(&selected, "gitana-submodule-update");
+	std::fs::create_dir_all(&empty_control).unwrap();
+	let recovered = gta(
+		&selected,
+		true,
+		&["submodule", "update", "--init", "--recursive", "modules/a"],
+	);
+	assert_success(&recovered, "retire an empty update control");
+	assert!(
+		!selected.join("modules/b/.git").exists(),
+		"empty-control recovery must not broaden the requested root selection"
+	);
+	assert!(
+		!empty_control.exists(),
+		"empty-control recovery must retire the orphaned namespace"
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recursive_update_rejects_a_child_common_directory_redirect_before_config_mutation() {
+	let root = unique_tmp("recursive-child-commondir");
+	let leaf = root.join("leaf");
+	let middle = root.join("middle");
+	let superproject = root.join("super");
+	let consumer = root.join("consumer");
+	let foreign = root.join("foreign.git");
+	for repository in [&leaf, &middle, &superproject] {
+		std::fs::create_dir_all(repository).unwrap();
+		init_repository(repository, None);
+		std::fs::write(repository.join("file.txt"), b"content\n").unwrap();
+		git_ok(repository, &["add", "file.txt"]);
+		commit(repository, "root");
+	}
+	git_allow(
+		&middle,
+		&["submodule", "add", "--name", "child", "../leaf", "child"],
+	);
+	commit(&middle, "add child");
+	git_allow(
+		&superproject,
+		&[
+			"submodule",
+			"add",
+			"--name",
+			"parent",
+			"../middle",
+			"parent",
+		],
+	);
+	commit(&superproject, "add parent");
+	let clone = Command::new("git")
+		.args(["clone", "-q", "--no-recurse-submodules"])
+		.arg(&superproject)
+		.arg(&consumer)
+		.output()
+		.unwrap();
+	assert_success(&clone, "clone redirected-child fixture");
+	let parent = gta(
+		&consumer,
+		true,
+		&["submodule", "update", "--init", "parent"],
+	);
+	assert_success(&parent, "initialize parent only");
+
+	let initialized = Command::new("git")
+		.args(["init", "--bare", "-q"])
+		.arg(&foreign)
+		.output()
+		.unwrap();
+	assert_success(&initialized, "initialize unrelated bare repository");
+	let module_git_dir = git_path(&consumer, "modules/parent");
+	std::fs::write(
+		module_git_dir.join("commondir"),
+		format!("{}\n", foreign.display()),
+	)
+	.unwrap();
+	let foreign_config = std::fs::read(foreign.join("config")).unwrap();
+
+	let update = gta(
+		&consumer,
+		true,
+		&["submodule", "update", "--init", "--recursive", "parent"],
+	);
+	assert!(!update.status.success());
+	assert!(
+		stderr(&update).contains("submodule repository attachment changed"),
+		"unexpected error: {}",
+		stderr(&update)
+	);
+	assert_eq!(
+		std::fs::read(foreign.join("config")).unwrap(),
+		foreign_config,
+		"recursive entry must reject the redirect before mutating unrelated config"
+	);
+	assert!(
+		!consumer.join("parent/child/.git").exists(),
+		"recursive update must not initialize the redirected child"
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recursive_recovery_treats_the_recorded_owner_as_a_literal_path() {
+	let root = unique_tmp("recursive-literal-recovery");
+	let source = root.join("source");
+	let superproject = root.join("super");
+	let consumer = root.join("consumer");
+	for repository in [&source, &superproject] {
+		std::fs::create_dir_all(repository).unwrap();
+		init_repository(repository, None);
+		std::fs::write(repository.join("file.txt"), b"content\n").unwrap();
+		git_ok(repository, &["add", "file.txt"]);
+		commit(repository, "root");
+	}
+	for (name, path) in [
+		("bracket", "a[bc]"),
+		("sibling", "ab"),
+		("target", "target"),
+	] {
+		git_allow(
+			&superproject,
+			&["submodule", "add", "--name", name, "../source", path],
+		);
+	}
+	commit(&superproject, "add literal recovery modules");
+	let clone = Command::new("git")
+		.args(["clone", "-q", "--no-recurse-submodules"])
+		.arg(&superproject)
+		.arg(&consumer)
+		.output()
+		.unwrap();
+	assert_success(&clone, "clone literal recovery fixture");
+	let recorded = git(&source, &["rev-parse", "HEAD"]).trim().to_owned();
+	assert_success(
+		&gta(&consumer, false, &["submodule", "init"]),
+		"register every literal recovery module",
+	);
+	assert_success(
+		&gta(
+			&consumer,
+			true,
+			&["submodule", "update", ":(top,literal)a[bc]"],
+		),
+		"materialize the literal recovery owner",
+	);
+	let source_url = git(
+		&consumer.join("a[bc]"),
+		&["config", "--get", "remote.origin.url"],
+	)
+	.trim()
+	.to_owned();
+	let control = write_v4_recovery_intent_at(
+		&consumer,
+		"bracket",
+		"a[bc]",
+		&recorded,
+		&source_url,
+		"module",
+	);
+
+	let recovered = gta(
+		&consumer,
+		true,
+		&["submodule", "update", "--recursive", "target"],
+	);
+	assert_success(
+		&recovered,
+		"recover a literal owner before the requested module",
+	);
+	assert!(consumer.join("a[bc]/.git").is_file());
+	assert!(consumer.join("target/.git").is_file());
+	assert!(
+		!consumer.join("ab/.git").exists(),
+		"the recorded 'a[bc]' owner must not select its glob-matching sibling"
+	);
+	assert!(
+		!control.exists(),
+		"the exact owner's recovery must complete"
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(any(unix, windows))]
 #[test]
 fn submodule_status_waits_for_each_module_config_publication() {
@@ -6711,7 +7206,25 @@ fn write_v4_recovery_intent(
 	resolved_source: &str,
 	source_context: &str,
 ) -> PathBuf {
-	let control = git_path(&fixture.consumer, "gitana-submodule-update");
+	write_v4_recovery_intent_at(
+		&fixture.consumer,
+		name,
+		path,
+		recorded,
+		resolved_source,
+		source_context,
+	)
+}
+
+fn write_v4_recovery_intent_at(
+	repository: &Path,
+	name: &str,
+	path: &str,
+	recorded: &str,
+	resolved_source: &str,
+	source_context: &str,
+) -> PathBuf {
+	let control = git_path(repository, "gitana-submodule-update");
 	std::fs::create_dir_all(&control).unwrap();
 	let fingerprint = Sha256::digest(gitana_remote::redact_password(resolved_source).as_bytes());
 	let fingerprint = fingerprint

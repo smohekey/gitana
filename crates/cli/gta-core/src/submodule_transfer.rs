@@ -58,7 +58,6 @@ struct ResolvedSubmoduleSource {
 pub(crate) struct SubmoduleTransfer<'a> {
 	command: &'a CommandContext,
 	worktree_root: &'a Path,
-	superproject: GitConfig,
 	module_base: GitConfig,
 }
 
@@ -66,13 +65,11 @@ impl<'a> SubmoduleTransfer<'a> {
 	pub(crate) fn new(
 		command: &'a CommandContext,
 		worktree_root: &'a Path,
-		superproject: GitConfig,
 		module_base: GitConfig,
 	) -> Self {
 		Self {
 			command,
 			worktree_root,
-			superproject,
 			module_base,
 		}
 	}
@@ -102,7 +99,7 @@ impl<'a> SubmoduleTransfer<'a> {
 	}
 
 	fn resolve_source_inner(&self, request: &PrepareSource) -> Result<ResolvedSubmoduleSource> {
-		Self::resolve_source(&self.superproject, self.worktree_root, &request.source_url)
+		Self::resolve_source(&request.config, self.worktree_root, &request.source_url)
 	}
 
 	fn resolve_fetch_source_inner(&self, source: &FetchSource) -> Result<ResolvedSubmoduleSource> {
@@ -114,7 +111,7 @@ impl<'a> SubmoduleTransfer<'a> {
 		request: PrepareSource,
 		lease: gitana_submodule::SubmoduleMutationLease,
 	) -> Result<PreparedTransfer<PreparedSubmoduleSource>> {
-		let config = &self.superproject;
+		let config = &request.config;
 		let ResolvedSubmoduleSource {
 			rewritten,
 			remote,

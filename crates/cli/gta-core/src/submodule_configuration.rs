@@ -1570,7 +1570,7 @@ mod tests {
 	};
 	use gitana_worktree::{Index, IndexEntry, Stat};
 	use std::os::unix::fs::symlink;
-	use std::sync::Arc;
+	use std::sync::{Arc, atomic::AtomicUsize};
 
 	use super::*;
 
@@ -1614,6 +1614,62 @@ mod tests {
 			_lease: SubmoduleMutationLease,
 		) -> Result<FetchedTransfer, Self::Error> {
 			panic!("an unregistered module must not fetch a repository")
+		}
+	}
+
+	struct SerializedConfigTransfer {
+		expected: &'static str,
+		observations: Arc<AtomicUsize>,
+	}
+
+	impl SerializedConfigTransfer {
+		fn observe(&self, request: &PrepareSource) {
+			assert_eq!(
+				request.config.get_string("snapshot", None, "value"),
+				Some(self.expected)
+			);
+			self.observations.fetch_add(1, Ordering::SeqCst);
+		}
+	}
+
+	impl RepositoryTransfer for SerializedConfigTransfer {
+		type Error = std::io::Error;
+		type PreparedSource = ();
+
+		fn resolve_source_identity(&self, request: &PrepareSource) -> Result<String, Self::Error> {
+			self.observe(request);
+			Ok(request.source_url.clone())
+		}
+
+		fn resolve_fetch_source_identity(&self, _source: &FetchSource) -> Result<String, Self::Error> {
+			panic!("a missing module must not resolve an existing-repository source")
+		}
+
+		async fn prepare_source(
+			&self,
+			request: PrepareSource,
+			_lease: SubmoduleMutationLease,
+		) -> Result<PreparedTransfer<Self::PreparedSource>, Self::Error> {
+			self.observe(&request);
+			Err(std::io::Error::other(
+				"stop after observing serialized configuration",
+			))
+		}
+
+		async fn populate_prepared(
+			&self,
+			_source: Self::PreparedSource,
+			_request: PrepareRepository,
+		) -> Result<(), Self::Error> {
+			panic!("the test transfer stops before repository population")
+		}
+
+		async fn fetch_recorded(
+			&self,
+			_request: FetchRepository,
+			_lease: SubmoduleMutationLease,
+		) -> Result<FetchedTransfer, Self::Error> {
+			panic!("a missing module must not fetch an existing repository")
 		}
 	}
 
@@ -1926,6 +1982,95 @@ mod tests {
 		);
 		assert!(!worktree.join("modules/one").exists());
 		assert!(!git_dir.join("modules/one").exists());
+	}
+
+	#[tokio::test]
+	async fn initial_transfer_uses_the_serialized_post_lock_config_snapshot() {
+		let temporary = tempfile::tempdir().unwrap();
+		let worktree = temporary.path().join("work");
+		let git_dir = worktree.join(".git");
+		std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+		std::fs::create_dir(git_dir.join("refs")).unwrap();
+		std::fs::write(
+			worktree.join(".gitmodules"),
+			"[submodule \"one\"]\n\tpath = modules/one\n\turl = https://example.invalid/one\n",
+		)
+		.unwrap();
+		let mut index = Index::<Sha1>::new();
+		index.upsert(IndexEntry {
+			stat: Stat::default(),
+			mode: 0o160000,
+			oid: ObjectId::from_hex(&"1".repeat(40)).unwrap(),
+			stage: 0,
+			assume_valid: false,
+			skip_worktree: false,
+			intent_to_add: false,
+			path: "modules/one".to_owned(),
+		});
+		std::fs::write(git_dir.join("index"), index.write_v4()).unwrap();
+		std::fs::write(
+			git_dir.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\
+			 [snapshot]\n\tvalue = stale\n\
+			 [submodule \"one\"]\n\tactive = true\n\turl = https://example.invalid/one\n",
+		)
+		.unwrap();
+
+		let common = Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap();
+		let git = common.try_clone().unwrap();
+		let configuration = WorktreeConfiguration::new(
+			common.try_clone().unwrap(),
+			git.try_clone().unwrap(),
+			&git_dir,
+			&git_dir,
+		);
+		let stale = configuration.reload().await.unwrap();
+		let context = SubmoduleContext::new(
+			RepositoryLayout {
+				worktree_root: Some(worktree.clone()),
+				git_dir: git_dir.clone(),
+				common_dir: git_dir.clone(),
+			},
+			common,
+			git,
+			Dir::open_ambient_dir(&worktree, ambient_authority()).unwrap(),
+			ConfigViews::new(stale),
+			String::new(),
+			HashKind::Sha1,
+		)
+		.unwrap();
+
+		std::fs::write(
+			git_dir.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\
+			 [snapshot]\n\tvalue = fresh\n\
+			 [submodule \"one\"]\n\tactive = true\n\turl = https://example.invalid/one\n",
+		)
+		.unwrap();
+		let observations = Arc::new(AtomicUsize::new(0));
+		let transfer = SerializedConfigTransfer {
+			expected: "fresh",
+			observations: observations.clone(),
+		};
+		let error = context
+			.update(
+				&UpdateRequest {
+					query: Default::default(),
+					initialize: false,
+					reflog_committer: None,
+				},
+				&configuration,
+				&transfer,
+			)
+			.await
+			.unwrap_err();
+
+		assert!(
+			error
+				.to_string()
+				.contains("stop after observing serialized configuration")
+		);
+		assert_eq!(observations.load(Ordering::SeqCst), 2);
 	}
 
 	#[tokio::test]

@@ -71,5 +71,5 @@ pub use update::{UpdateFailure, UpdateOutcome, UpdateOutcomeState, UpdateReport,
 #[cfg(not(target_arch = "wasm32"))]
 pub use update_operation::{
 	acquire_submodule_config_mutation_lease, acquire_submodule_config_setup_lease,
-	try_acquire_submodule_config_setup_lease,
+	repository_has_pending_update, try_acquire_submodule_config_setup_lease,
 };

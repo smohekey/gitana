@@ -518,6 +518,9 @@ enum Command {
 enum SubmoduleAction {
 	/// Show the recorded and checked-out state of tracked submodules.
 	Status {
+		/// Recurse into initialized submodules.
+		#[arg(long)]
+		recursive: bool,
 		#[arg(value_name = "path")]
 		paths: Vec<String>,
 	},
@@ -530,6 +533,9 @@ enum SubmoduleAction {
 	Update {
 		#[arg(long)]
 		init: bool,
+		/// Recursively update initialized descendants (and initialize them with `--init`).
+		#[arg(long)]
+		recursive: bool,
 		#[arg(value_name = "path")]
 		paths: Vec<String>,
 	},
@@ -1062,9 +1068,17 @@ impl Cli {
 fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 	use commands::submodule::Action;
 	match action {
-		SubmoduleAction::Status { paths } => Action::Status { paths },
+		SubmoduleAction::Status { recursive, paths } => Action::Status { recursive, paths },
 		SubmoduleAction::Init { paths } => Action::Init { paths },
-		SubmoduleAction::Update { init, paths } => Action::Update { init, paths },
+		SubmoduleAction::Update {
+			init,
+			recursive,
+			paths,
+		} => Action::Update {
+			init,
+			recursive,
+			paths,
+		},
 		SubmoduleAction::Deinit { force, all, paths } => Action::Deinit { force, all, paths },
 	}
 }

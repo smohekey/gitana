@@ -243,15 +243,110 @@ impl SubmoduleContext {
 		match self.hash_kind {
 			HashKind::Sha1 => {
 				self
-					.update_typed::<Sha1, C, T>(request, configuration, transfer)
+					.update_typed::<Sha1, C, T>(request, configuration, transfer, None)
 					.await
 			}
 			HashKind::Sha256 => {
 				self
-					.update_typed::<Sha256, C, T>(request, configuration, transfer)
+					.update_typed::<Sha256, C, T>(request, configuration, transfer, None)
 					.await
 			}
 		}
+	}
+
+	/// Resume this worktree's pending update transaction, if one exists.
+	///
+	/// The durable intent selects the recovery owner independently of a recursive caller's current
+	/// path query. An empty control directory is retired directly under the update lock so recovery
+	/// never broadens the caller's selection merely to reach the ordinary update state machine.
+	pub async fn resume_pending_update<C: ConfigurationProvider, T: RepositoryTransfer>(
+		&self,
+		configuration: &C,
+		transfer: &T,
+		reflog_committer: Option<String>,
+	) -> Result<Option<UpdateReport>, UpdateFailure> {
+		self
+			.ensure_no_repository_deinit_recovery()
+			.map_err(UpdateFailure::preflight)?;
+		let lock = self
+			.acquire_update_lock()
+			.map_err(UpdateFailure::preflight)?;
+		let Some(query) = self
+			.pending_update_query_locked(&lock)
+			.map_err(UpdateFailure::preflight)?
+		else {
+			return Ok(None);
+		};
+		let request = UpdateRequest {
+			query,
+			initialize: false,
+			reflog_committer,
+		};
+		let report = match self.hash_kind {
+			HashKind::Sha1 => {
+				self
+					.update_typed::<Sha1, C, T>(&request, configuration, transfer, Some(lock))
+					.await
+			}
+			HashKind::Sha256 => {
+				self
+					.update_typed::<Sha256, C, T>(&request, configuration, transfer, Some(lock))
+					.await
+			}
+		}?;
+		Ok(Some(report))
+	}
+
+	/// Return the literal owner selection for this repository's pending update, if one exists.
+	///
+	/// An empty control directory is retired under the update lock. Callers can therefore use this
+	/// operation to construct a recovery traversal without broadening it to every module.
+	pub fn pending_update_query(&self) -> Result<Option<crate::SubmoduleQuery>, SubmoduleError> {
+		if !repository_has_pending_update(&self.git, &self.layout.git_dir)? {
+			return Ok(None);
+		}
+		let lock = self.acquire_update_lock()?;
+		self.pending_update_query_locked(&lock)
+	}
+
+	fn pending_update_query_locked(
+		&self,
+		lock: &UpdateLockGuard,
+	) -> Result<Option<crate::SubmoduleQuery>, SubmoduleError> {
+		lock.validate()?;
+		self.ensure_no_repository_deinit_recovery()?;
+		if !repository_has_pending_update(&self.git, &self.layout.git_dir)? {
+			return Ok(None);
+		}
+		let control = self
+			.open_git_subdir_nofollow(Path::new(CONTROL_DIR))
+			.map_err(|source| SubmoduleError::Io {
+				path: self.layout.git_dir.join(CONTROL_DIR),
+				source,
+			})?;
+		let Some((intent, _)) = read_stage_intent(&control, &self.layout.git_dir.join(INTENT_FILE))?
+		else {
+			if safe_directory_exists(
+				&control,
+				Path::new(STAGED_REPOSITORY_NAME),
+				&self.layout.git_dir.join(STAGED_REPOSITORY),
+			)? {
+				return Err(SubmoduleError::RecoveryRequired(
+					"staged repository exists without an intent".to_owned(),
+				));
+			}
+			self.clear_control_dir(None)?;
+			lock.validate()?;
+			return Ok(None);
+		};
+		if intent.path.is_empty() {
+			return Err(SubmoduleError::RecoveryRequired(
+				"staging intent has an empty path".to_owned(),
+			));
+		}
+		let query = crate::SubmoduleQuery::top_literal(&intent.path);
+		lock.validate()?;
+		Ok(Some(query))
 	}
 
 	async fn update_typed<H: HashAlgorithm, C: ConfigurationProvider, T: RepositoryTransfer>(
@@ -259,6 +354,7 @@ impl SubmoduleContext {
 		request: &UpdateRequest,
 		configuration: &C,
 		transfer: &T,
+		retained_lock: Option<UpdateLockGuard>,
 	) -> Result<UpdateReport, UpdateFailure> {
 		let worktree = self.worktree::<H>().map_err(UpdateFailure::preflight)?;
 		let index = worktree
@@ -292,11 +388,6 @@ impl SubmoduleContext {
 			if let Some(strategy) = declaration.update.as_deref() {
 				validate_update_strategy(&declaration.name, strategy).map_err(UpdateFailure::preflight)?;
 			}
-			let strategy = configured_update_strategy(&self.configs.superproject, &declaration.name)
-				.map_err(UpdateFailure::preflight)?
-				.or_else(|| declaration.update.clone())
-				.unwrap_or_else(|| "checkout".to_owned());
-			validate_update_strategy(&declaration.name, &strategy).map_err(UpdateFailure::preflight)?;
 			let module_pointers = self
 				.module_pointers(declaration)
 				.map_err(UpdateFailure::preflight)?;
@@ -306,12 +397,20 @@ impl SubmoduleContext {
 				.map_err(UpdateFailure::preflight)?;
 			pointers.insert(path.clone(), module_pointers);
 		}
-		let lock = if request.initialize {
-			self.acquire_config_update_lock()
+		let lock = if let Some(lock) = retained_lock {
+			debug_assert!(
+				!request.initialize,
+				"recovery retains the plain update guard"
+			);
+			lock
 		} else {
-			self.acquire_update_lock()
-		}
-		.map_err(UpdateFailure::preflight)?;
+			if request.initialize {
+				self.acquire_config_update_lock()
+			} else {
+				self.acquire_update_lock()
+			}
+			.map_err(UpdateFailure::preflight)?
+		};
 		lock.validate().map_err(UpdateFailure::preflight)?;
 		let mutation_lease = lock.lease();
 		if request.initialize {
@@ -423,7 +522,7 @@ impl SubmoduleContext {
 			.validate()
 			.map_err(|source| UpdateFailure::after_init(&report, source))?;
 		let recovery_index = self
-			.recover_stage(&mut plan, configuration, transfer)
+			.recover_stage(&mut plan, &effective, configuration, transfer)
 			.await
 			.map_err(|source| UpdateFailure::after_init(&report, source))?;
 		lock
@@ -453,6 +552,7 @@ impl SubmoduleContext {
 				.update_one(
 					&entry,
 					request.reflog_committer.as_deref(),
+					&effective,
 					configuration,
 					transfer,
 					&mutation_lease,
@@ -487,6 +587,7 @@ impl SubmoduleContext {
 		&self,
 		entry: &Planned<H>,
 		committer: Option<&str>,
+		effective: &GitConfig,
 		configuration: &C,
 		transfer: &T,
 		mutation_lease: &crate::SubmoduleMutationLease,
@@ -527,7 +628,7 @@ impl SubmoduleContext {
 				.ok_or_else(|| SubmoduleError::Unregistered(entry.declaration.name.clone()))?;
 			intent_identity = Some(
 				self
-					.prepare_module(entry, source, transfer, mutation_lease.clone())
+					.prepare_module(entry, source, effective, transfer, mutation_lease.clone())
 					.await?,
 			);
 			cloned = true;
@@ -557,6 +658,25 @@ impl SubmoduleContext {
 			}
 			None => try_acquire_submodule_config_mutation_lease(&module_directory, &module_git_dir)?,
 		};
+		if repository_has_pending_update(&module_directory, &module_git_dir)? {
+			return Err(SubmoduleError::RecoveryRequired(format!(
+				"pending nested submodule update recovery in '{}' must be completed before updating its parent",
+				entry.declaration.path
+			)));
+		}
+		let module_layout = gitana_repository_layout::RepositoryLayout {
+			worktree_root: mount_before_transfer
+				.mounted
+				.then(|| self.worktree_root().join(&entry.declaration.path)),
+			git_dir: module_git_dir.clone(),
+			common_dir: module_git_dir.clone(),
+		};
+		if crate::repository_has_pending_deinit(&module_directory, &module_directory, &module_layout)? {
+			return Err(SubmoduleError::RecoveryRequired(format!(
+				"pending nested submodule deinit recovery in '{}' must be completed before updating its parent",
+				entry.declaration.path
+			)));
+		}
 		let mutation_lease = mutation_lease.clone().combine(module_mutation_lease);
 		let hash_directory = module_directory
 			.try_clone()
@@ -787,6 +907,7 @@ impl SubmoduleContext {
 		&self,
 		entry: &Planned<H>,
 		source: &str,
+		effective: &GitConfig,
 		transfer: &T,
 		mutation_lease: crate::SubmoduleMutationLease,
 	) -> Result<EntryIdentity, SubmoduleError> {
@@ -794,6 +915,7 @@ impl SubmoduleContext {
 			source_url: source.to_owned(),
 			persist_url: gitana_remote::redact_password(source),
 			hash_kind: crate::object_id::kind::<H>(),
+			config: effective.clone(),
 		};
 		let resolved_source = transfer
 			.resolve_source_identity(&request)
@@ -1117,6 +1239,7 @@ impl SubmoduleContext {
 	async fn recover_stage<H: HashAlgorithm, C: ConfigurationProvider, T: RepositoryTransfer>(
 		&self,
 		plan: &mut [Planned<H>],
+		effective: &GitConfig,
 		configuration: &C,
 		transfer: &T,
 	) -> Result<Option<usize>, SubmoduleError> {
@@ -1207,6 +1330,7 @@ impl SubmoduleContext {
 					source_url: source.to_owned(),
 					persist_url: gitana_remote::redact_password(source),
 					hash_kind: crate::object_id::kind::<H>(),
+					config: effective.clone(),
 				};
 				let resolved = transfer
 					.resolve_source_identity(&request)
@@ -2830,6 +2954,22 @@ fn safe_directory_exists(
 	}
 }
 
+/// Return whether a repository owns an update control directory, rejecting malformed namespaces.
+pub fn repository_has_pending_update(git: &Dir, git_dir: &Path) -> Result<bool, SubmoduleError> {
+	match git.symlink_metadata(CONTROL_DIR) {
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+		Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(true),
+		Ok(_) => Err(SubmoduleError::RecoveryRequired(format!(
+			"submodule update control path in '{}' is not a directory",
+			git_dir.display()
+		))),
+		Err(source) => Err(SubmoduleError::Io {
+			path: git_dir.join(CONTROL_DIR),
+			source,
+		}),
+	}
+}
+
 fn read_stage_intent(
 	control: &Dir,
 	display: &Path,
@@ -2989,15 +3129,17 @@ async fn operation_in_progress<F: FileStore, H: HashAlgorithm>(
 mod tests {
 	#[cfg(not(windows))]
 	use super::slash_path;
+	#[cfg(unix)]
+	use super::try_acquire_submodule_config_mutation_lease;
 	use super::{
-		DirectoryNamespace, IntentSourceContext, MarkerSnapshot, Planned, SHARED_CONFIG_LOCK,
-		StageIntent, UPDATE_LOCK, acquire_submodule_config_mutation_lease,
+		CONTROL_DIR, DirectoryNamespace, INTENT_NAME, IntentSourceContext, MarkerSnapshot, Planned,
+		SHARED_CONFIG_LOCK, StageIntent, UPDATE_LOCK, acquire_submodule_config_mutation_lease,
 		acquire_submodule_config_setup_lease, acquire_update_lock_with_common,
 		ensure_directory_components, intent_matches_reprepare, intent_matches_source,
 		intent_source_context, legacy_source_fingerprint, marker_identity, module_origin_url,
 		publish_new_mount_marker, publish_stage_intent, remove_staged_repository,
 		rename_directory_noreplace, source_fingerprint, sync_repository_publication_parents,
-		try_acquire_submodule_config_mutation_lease, update_effective_config,
+		update_effective_config,
 	};
 	use crate::{
 		ConfigViews, ConfigurationProvider, InitConfigResult, InitConfigUpdate, MarkerTargetResolver,
@@ -3881,6 +4023,54 @@ mod tests {
 		drop(first_guard);
 		let replacement_guard = second.acquire_update_lock().unwrap();
 		replacement_guard.validate().unwrap();
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn pending_recovery_query_is_read_under_the_retained_update_guard() {
+		let (_temporary, context, _entry) = mount_fixture("retained-recovery-lock");
+		let second = reopen_context(&context);
+		context.git.create_dir(CONTROL_DIR).unwrap();
+		let control = context.git.open_dir(CONTROL_DIR).unwrap();
+		control
+			.write(
+				INTENT_NAME,
+				serde_json::to_vec(&intent(4, source_fingerprint("source"))).unwrap(),
+			)
+			.unwrap();
+
+		let lock = context.acquire_update_lock().unwrap();
+		let query = context
+			.pending_update_query_locked(&lock)
+			.unwrap()
+			.expect("the durable owner is selected");
+		assert_eq!(query.pathspecs, vec![":(top,literal)modules/one"]);
+		assert!(matches!(
+			second.acquire_update_lock(),
+			Err(SubmoduleError::UpdateLocked)
+		));
+		lock.validate().unwrap();
+	}
+
+	#[test]
+	fn pending_recovery_query_rejects_an_empty_recorded_path() {
+		let (_temporary, context, _entry) = mount_fixture("empty-recovery-path");
+		context.git.create_dir(CONTROL_DIR).unwrap();
+		let control = context.git.open_dir(CONTROL_DIR).unwrap();
+		let mut empty = intent(4, source_fingerprint("source"));
+		empty.path.clear();
+		control
+			.write(INTENT_NAME, serde_json::to_vec(&empty).unwrap())
+			.unwrap();
+
+		let lock = context.acquire_update_lock().unwrap();
+		assert!(matches!(
+			context.pending_update_query_locked(&lock),
+			Err(SubmoduleError::RecoveryRequired(message))
+				if message.contains("staging intent has an empty path")
+		));
+		assert!(control.symlink_metadata(INTENT_NAME).is_ok());
+		lock.validate().unwrap();
 	}
 
 	#[cfg(any(unix, windows))]

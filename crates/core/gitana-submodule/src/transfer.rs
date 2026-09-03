@@ -12,6 +12,8 @@ pub struct PrepareSource {
 	pub source_url: String,
 	pub persist_url: String,
 	pub hash_kind: HashKind,
+	/// Serialized effective superproject configuration used for rewriting and authorization.
+	pub config: GitConfig,
 }
 
 /// A retained transfer source together with the credential-safe endpoint identity selected for it.
