@@ -479,9 +479,16 @@ enum Command {
 		/// Initialise cone sparse-checkout (root files only); narrow with `gta sparse-checkout set`.
 		#[arg(long)]
 		sparse: bool,
-		/// Initialize and recursively update every submodule after publishing the root clone.
-		#[arg(long = "recurse-submodules", visible_alias = "recursive")]
-		recurse_submodules: bool,
+		/// Initialize matching submodules recursively after publishing the root clone.
+		#[arg(
+			long = "recurse-submodules",
+			visible_alias = "recursive",
+			value_name = "pathspec",
+			num_args = 0..=1,
+			default_missing_value = ".",
+			require_equals = true
+		)]
+		recurse_submodules: Vec<String>,
 	},
 	/// Download new objects from the origin and update remote-tracking refs.
 	Fetch {

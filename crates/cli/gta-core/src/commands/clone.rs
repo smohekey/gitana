@@ -29,7 +29,7 @@ pub async fn run(
 	shallow_since: Option<String>,
 	shallow_exclude: Vec<String>,
 	sparse: bool,
-	recurse_submodules: bool,
+	recurse_submodules: Vec<String>,
 ) -> Result<()> {
 	// Fail fast on a bad `--shallow-since` before any network round-trip.
 	let deepen = build_deepen(depth, shallow_since.as_deref(), shallow_exclude)?;
@@ -242,13 +242,14 @@ pub async fn run(
 
 	// Report the userinfo-stripped URL — a password in the clone URL must not reach stdout / CI logs.
 	println!("Cloned '{}' into '{}'", reflog_url, target.display());
-	if recurse_submodules {
+	if !recurse_submodules.is_empty() {
 		let layout = repo::inspect_root(&published_root).await?;
 		let credential_url_base = (transport::redact_password(&url) != url).then_some(url);
 		super::submodule::update_published_clone(
 			layout,
 			published_identity,
 			command,
+			recurse_submodules,
 			credential_url_base,
 		)
 		.await?;
@@ -536,10 +537,15 @@ mod tests {
 		std::fs::create_dir_all(published_root.join(".git/refs")).unwrap();
 		let layout = repo::inspect_root(&published_root).await.unwrap();
 		let command = CommandContext::from_env(temporary.path().to_owned(), Vec::new());
-		let error =
-			crate::commands::submodule::update_published_clone(layout, identity, &command, None)
-				.await
-				.unwrap_err();
+		let error = crate::commands::submodule::update_published_clone(
+			layout,
+			identity,
+			&command,
+			vec![".".to_owned()],
+			None,
+		)
+		.await
+		.unwrap_err();
 
 		assert!(
 			error

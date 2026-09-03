@@ -5,11 +5,20 @@
 Gitana implements the consumer commands `submodule status`, `submodule init`, `submodule update`,
 and `submodule deinit`. `status --recursive` and `update --recursive` explicitly recurse into nested
 submodules; omitted flags remain one-level operations, and root pathspecs select only the first
-level before every eligible descendant is considered. `clone --recurse-submodules` (also spelled
-`--recursive`) publishes the root clone and then performs an initializing recursive update over all
-of its submodules. The `merge`, `rebase`, and custom-command update strategies remain unsupported.
+level before every eligible descendant is considered. `clone --recurse-submodules[=<pathspec>]`
+(also spelled `--recursive[=<pathspec>]`) publishes the root clone and then performs an initializing
+recursive update over the selected submodules. The `merge`, `rebase`, and custom-command update
+strategies remain unsupported.
 Unsupported strategies are rejected before initialization or module filesystem mutation; `none` is
 an explicit skip.
+
+An implicit, no-path `submodule init` or `submodule update --init` follows root
+`submodule.active` pathspecs when they are configured; without those root selectors it retains Git's
+default of considering every gitlink. An explicit path remains an override and may initialize a module
+outside the active set. Because a gitlink represents a directory, literal directory-form selectors
+such as `modules/a/`, `modules/a/.`, and their exclusion forms match the gitlink itself. A
+directory-only wildcard such as `modules/*/` or `:(glob)modules/*/` does not match a gitlink, in
+accordance with Git's pathspec behavior.
 
 Recursive status renders a depth-first pre-order and enters only initialized, non-conflicted module
 worktrees. Recursive update first scans the currently initialized selected subtree and resumes
@@ -37,20 +46,27 @@ retired directly under the per-worktree update lock and never converted into an 
 
 Clone recursion has a deliberate root-publication boundary. Clone captures the worktree and `.git`
 directory identities through the private destination capabilities before publication, then passes
-that proof into recursive update. Before materialization, the root persists `submodule.active=.`
-through the serialized repository-local config transaction, including when HEAD contains no
-gitlinks. Root initialization then omits modules that remain inactive under the freshly reloaded
-effective configuration: it does not read or validate their URL, register, activate, transfer, or
-descend through them.
+that proof into recursive update. Before materialization, the root persists every requested
+`submodule.active` pathspec, in command order, through the serialized repository-local config
+transaction, including when none matches a gitlink in HEAD. A flag without a value records `.`;
+repeated values are independent selectors, and exclusion-only sets retain normal pathspec semantics.
+Unlike ordinary submodule commands, an unmatched positive clone selector is a successful no-op.
+The requested values are validated independently, while root candidates are selected from the
+freshly reloaded effective `submodule.active` set across every configuration layer. Consequently,
+pre-existing system, global, and command-scope positive selectors remain additive instead of being
+intersected with the clone command's locally persisted values. Root initialization omits modules
+that remain inactive under that complete configuration: it does not read or validate their URL,
+register, activate, transfer, or descend through them.
 Descendants of successful active roots retain normal per-module activation. The updater reopens and
 validates the visible root before reading or mutating it, so replacing the clone destination cannot
 redirect recursion into another repository. Once the root is published it is caller-owned: a submodule
-failure returns an error but retains the valid root clone, activation setting, completed module
-prefix, and any durable update intent for a later `submodule update --init --recursive` retry.
-Failures before root publication retain the ordinary clone cleanup contract. This first form is
-boolean and always selects every top-level module; clone-time pathspecs, jobs, shallow-submodule
-propagation, and remote-branch submodule updates are not supported. A shallow root clone does not
-implicitly make its submodules shallow.
+failure returns an error but retains the valid root clone, activation settings, completed module
+prefix, and any durable update intent for a later `submodule update --init --recursive` retry. That
+no-path retry reloads and applies the persisted root activation selectors, so it cannot register or
+materialize a sibling excluded by the original clone request.
+Failures before root publication retain the ordinary clone cleanup contract. Clone-time jobs,
+shallow-submodule propagation, and remote-branch submodule updates are not supported. A shallow root
+clone does not implicitly make its submodules shallow.
 
 The implementation is split at an authority boundary. `gitana-submodule` owns declaration parsing,
 selection, state transitions, validation, reports, and recovery. It receives already-opened

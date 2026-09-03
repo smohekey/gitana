@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256 as Sha256Digest};
 
 use crate::context::{
-	declarations_by_path, is_active, parse_marker_target, validate_update_strategy,
+	declarations_by_path, is_active, parse_marker_target, should_initialize_only_active,
+	validate_update_strategy,
 };
 use crate::{
 	ConfigurationProvider, FetchRepository, FetchSource, InitRequest, PrepareRepository,
@@ -470,6 +471,8 @@ impl SubmoduleContext {
 				.validate()
 				.map_err(|source| UpdateFailure::after_init(&report, source))?;
 		}
+		let initialize_only_active =
+			should_initialize_only_active(&request.query, &effective, request.initialize_only_active);
 		let mut plan = Vec::with_capacity(selected.len());
 		for path in selected {
 			let declaration = declarations
@@ -485,7 +488,7 @@ impl SubmoduleContext {
 				.unwrap_or_else(|| "checkout".to_owned());
 			validate_update_strategy(&declaration.name, &strategy)
 				.map_err(|source| UpdateFailure::after_init(&report, source))?;
-			if request.initialize_only_active && !active {
+			if initialize_only_active && !active {
 				plan.push(Planned {
 					declaration,
 					recorded,
@@ -3524,7 +3527,7 @@ mod tests {
 		async fn apply_init(
 			&self,
 			_updates: &[InitConfigUpdate],
-			_persist_all_active: bool,
+			_active_pathspecs: &[String],
 			_lease: crate::SubmoduleMutationLease,
 		) -> Result<InitConfigResult, SubmoduleError> {
 			unreachable!()

@@ -166,7 +166,7 @@ impl ConfigurationProvider for WorktreeConfiguration {
 	async fn apply_init(
 		&self,
 		updates: &[InitConfigUpdate],
-		persist_all_active: bool,
+		active_pathspecs: &[String],
 		lease: SubmoduleMutationLease,
 	) -> Result<InitConfigResult, SubmoduleError> {
 		lease.validate()?;
@@ -175,6 +175,7 @@ impl ConfigurationProvider for WorktreeConfiguration {
 			SubmoduleError::Configuration(format!("opening {}: {error}", self.common_dir.display()))
 		})?;
 		let updates = updates.to_vec();
+		let active_pathspecs = active_pathspecs.to_vec();
 		#[cfg(test)]
 		let apply_init_pause = self.apply_init_pause.clone();
 		gitana_config_native::edit_file_at_guarded(
@@ -190,8 +191,11 @@ impl ConfigurationProvider for WorktreeConfiguration {
 						std::thread::yield_now();
 					}
 				}
-				if persist_all_active {
-					config.set("submodule", None, "active", ".")?;
+				if !active_pathspecs.is_empty() {
+					config.unset("submodule", None, "active");
+					for pathspec in active_pathspecs {
+						config.add("submodule", None, "active", Some(&pathspec));
+					}
 				}
 				let mut registered_urls = Vec::new();
 				for update in updates {
@@ -2387,7 +2391,7 @@ mod tests {
 					url_if_absent: Some("../source".to_owned()),
 					update_if_absent: Some("checkout".to_owned()),
 				}],
-				false,
+				&[],
 				mutation_lease(),
 			)
 			.await
@@ -2403,7 +2407,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn initialization_persists_all_active_without_module_updates() {
+	async fn initialization_persists_ordered_active_pathspecs_without_module_updates() {
 		let temporary = tempfile::tempdir().unwrap();
 		let common_path = temporary.path().join("common");
 		std::fs::create_dir(&common_path).unwrap();
@@ -2417,13 +2421,20 @@ mod tests {
 		let configuration = WorktreeConfiguration::new(common, git, &common_path, &common_path);
 
 		let result = configuration
-			.apply_init(&[], true, mutation_lease())
+			.apply_init(
+				&[],
+				&["modules/a".to_owned(), ":(exclude)modules/b".to_owned()],
+				mutation_lease(),
+			)
 			.await
 			.unwrap();
 
 		assert_eq!(result, InitConfigResult::default());
 		let config = configuration.reload().await.unwrap();
-		assert_eq!(config.get_raw("submodule", None, "active"), Some(Some(".")));
+		assert_eq!(
+			config.get_all_raw("submodule", None, "active"),
+			vec![Some("modules/a"), Some(":(exclude)modules/b")]
+		);
 	}
 
 	#[tokio::test]

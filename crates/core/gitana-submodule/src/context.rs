@@ -103,15 +103,28 @@ impl SubmoduleContext {
 		let setup = self.acquire_config_setup_lease().await?;
 		self.ensure_no_repository_deinit_recovery()?;
 		let effective = configuration.reload().await?;
+		let initialize_only_active = should_initialize_only_active(&request.query, &effective, false);
 		let planned = match self.hash_kind {
 			HashKind::Sha1 => {
 				self
-					.init_typed::<Sha1, C>(request, configuration, &effective, false, None)
+					.init_typed::<Sha1, C>(
+						request,
+						configuration,
+						&effective,
+						initialize_only_active,
+						None,
+					)
 					.await?
 			}
 			HashKind::Sha256 => {
 				self
-					.init_typed::<Sha256, C>(request, configuration, &effective, false, None)
+					.init_typed::<Sha256, C>(
+						request,
+						configuration,
+						&effective,
+						initialize_only_active,
+						None,
+					)
 					.await?
 			}
 		};
@@ -138,6 +151,8 @@ impl SubmoduleContext {
 		lease: crate::SubmoduleMutationLease,
 	) -> Result<InitReport, SubmoduleError> {
 		let effective = configuration.reload().await?;
+		let initialize_only_active =
+			should_initialize_only_active(&request.query, &effective, initialize_only_active);
 		let report = match self.hash_kind {
 			HashKind::Sha1 => {
 				self
@@ -338,7 +353,7 @@ impl SubmoduleContext {
 			configuration
 				.apply_init(
 					&updates,
-					false,
+					&[],
 					lease.expect("non-empty initialization updates require a mutation lease"),
 				)
 				.await?
@@ -392,17 +407,22 @@ impl SubmoduleContext {
 		let specs: Vec<&str> = query.pathspecs.iter().map(String::as_str).collect();
 		let set = PathspecSet::parse(&specs, &self.prefix)?;
 		if let Some(prior_path) = prior_path {
-			set.matches(prior_path);
+			set.matches_directory(prior_path);
 		}
 		let mut selected = Vec::new();
 		let mut seen = HashSet::new();
 		for entry in &index.entries {
-			let matched = set.matches(&entry.path);
+			let matched = if entry.mode == 0o160000 {
+				set.matches_directory(&entry.path)
+			} else {
+				set.matches(&entry.path)
+			};
 			if matched && entry.mode == 0o160000 && seen.insert(entry.path.clone()) {
 				selected.push(entry.path.clone());
 			}
 		}
-		if !query.pathspecs.is_empty()
+		if !query.allow_unmatched
+			&& !query.pathspecs.is_empty()
 			&& let Some(unmatched) = set.unmatched()
 		{
 			return Err(SubmoduleError::PathspecNoMatch(unmatched.to_owned()));
@@ -781,7 +801,7 @@ pub(crate) fn is_active(
 			values
 				.push(pattern.ok_or_else(|| SubmoduleError::MissingValue("submodule.active".to_owned()))?);
 		}
-		return Ok(PathspecSet::parse(&values, "")?.matches(path));
+		return Ok(PathspecSet::parse(&values, "")?.matches_directory(path));
 	}
 	match config.get_raw("submodule", Some(name), "url") {
 		Some(Some(_)) => Ok(true),
@@ -790,6 +810,15 @@ pub(crate) fn is_active(
 		))),
 		None => Ok(false),
 	}
+}
+
+pub(crate) fn should_initialize_only_active(
+	query: &SubmoduleQuery,
+	config: &gitana_config::GitConfig,
+	forced: bool,
+) -> bool {
+	forced
+		|| (query.pathspecs.is_empty() && !config.get_all_raw("submodule", None, "active").is_empty())
 }
 
 pub(crate) fn validate_path(path: &str) -> Result<(), SubmoduleError> {
@@ -884,6 +913,44 @@ mod tests {
 		);
 		assert_eq!(parse_marker_target("gitdir: \n"), None);
 		assert_eq!(parse_marker_target("gitdir:../../modules/one\n"), None);
+	}
+
+	#[test]
+	fn submodule_activation_matches_gitlinks_as_directories() {
+		for pattern in ["modules/one/", "modules/one/."] {
+			let config =
+				gitana_config::GitConfig::parse(&format!("[submodule]\n\tactive = {pattern}\n")).unwrap();
+			assert!(is_active(&config, "one", "modules/one").unwrap());
+			assert!(!is_active(&config, "two", "modules/two").unwrap());
+		}
+
+		let config =
+			gitana_config::GitConfig::parse("[submodule]\n\tactive = :(exclude)modules/two/\n").unwrap();
+		assert!(is_active(&config, "one", "modules/one").unwrap());
+		assert!(!is_active(&config, "two", "modules/two").unwrap());
+	}
+
+	#[test]
+	fn implicit_initialization_filters_only_when_root_activation_exists() {
+		let all = SubmoduleQuery::all();
+		let explicit = SubmoduleQuery::paths(vec!["modules/two".to_owned()]);
+		let no_activation =
+			gitana_config::GitConfig::parse("[submodule \"one\"]\n\tactive = false\n").unwrap();
+		assert!(!should_initialize_only_active(&all, &no_activation, false));
+
+		let root_activation =
+			gitana_config::GitConfig::parse("[submodule]\n\tactive = modules/one\n").unwrap();
+		assert!(should_initialize_only_active(&all, &root_activation, false));
+		assert!(!should_initialize_only_active(
+			&explicit,
+			&root_activation,
+			false
+		));
+		assert!(should_initialize_only_active(
+			&explicit,
+			&root_activation,
+			true
+		));
 	}
 
 	#[test]

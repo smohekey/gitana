@@ -387,12 +387,13 @@ async fn recursive_update(
 	Ok(())
 }
 
-/// Persist Git's all-submodules activation and then initialize every submodule in a newly published
-/// clone while retaining the exact repository identity established by clone publication.
+/// Persist Git's ordered clone activation pathspecs and then initialize matching submodules in a
+/// newly published clone while retaining the exact repository identity established by publication.
 pub(crate) async fn update_published_clone(
 	root_layout: repo::RepositoryLayout,
 	root_identity: RepositoryLayoutIdentity,
 	command: &CommandContext,
+	active_pathspecs: Vec<String>,
 	credential_url_base: Option<String>,
 ) -> Result<()> {
 	let (lease, common, git, _) = Box::pin(repo::command_config_mutation_lease(
@@ -403,8 +404,11 @@ pub(crate) async fn update_published_clone(
 	repo::ensure_no_pending_deinit_at(&root_layout, &common, &git)?;
 	let configuration =
 		WorktreeConfiguration::new(common, git, &root_layout.common_dir, &root_layout.git_dir);
-	configuration.apply_init(&[], true, lease).await?;
+	configuration
+		.apply_init(&[], &active_pathspecs, lease)
+		.await?;
 	repo::revalidate_repository_layout(&root_layout, root_identity).await?;
+	SubmoduleQuery::paths_allow_unmatched(active_pathspecs).validate_pathspecs("")?;
 
 	recursive_update(
 		root_layout,

@@ -103,6 +103,263 @@ fn clone_recurse_submodules_materializes_nested_modules_after_root_publication()
 	std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn clone_recurse_submodules_honors_root_pathspecs() {
+	let root = unique_tmp("clone-recurse-submodules-pathspecs");
+	let leaf = root.join("leaf");
+	let middle = root.join("middle");
+	let superproject = root.join("super");
+	for repository in [&leaf, &middle, &superproject] {
+		std::fs::create_dir_all(repository).unwrap();
+		init_repository(repository, None);
+		std::fs::write(
+			repository.join("file.txt"),
+			repository.display().to_string(),
+		)
+		.unwrap();
+		git_ok(repository, &["add", "file.txt"]);
+		commit(repository, "root");
+	}
+	git_allow(&middle, &["submodule", "add", "../leaf", "child"]);
+	commit(&middle, "add child");
+	git_allow(
+		&superproject,
+		&["submodule", "add", "../middle", "modules/a"],
+	);
+	git_allow(&superproject, &["submodule", "add", "../leaf", "modules/b"]);
+	commit(&superproject, "add modules");
+
+	let selected = root.join("selected");
+	let clone = gta(
+		&root,
+		true,
+		&[
+			"clone",
+			"--recurse-submodules=modules/a",
+			superproject.to_str().unwrap(),
+			selected.to_str().unwrap(),
+		],
+	);
+	assert_success(&clone, "clone with one recursive pathspec");
+	assert!(selected.join("modules/a/.git").is_file());
+	assert!(selected.join("modules/a/child/.git").is_file());
+	assert!(!selected.join("modules/b/.git").exists());
+	assert_eq!(
+		git(
+			&selected,
+			&["config", "--local", "--get-all", "submodule.active"]
+		),
+		"modules/a\n"
+	);
+	for (tag, selector) in [
+		("selected-directory", "modules/a/"),
+		("selected-directory-dot", "modules/a/."),
+	] {
+		let directory_selected = root.join(tag);
+		let clone = gta(
+			&root,
+			true,
+			&[
+				"clone",
+				&format!("--recurse-submodules={selector}"),
+				superproject.to_str().unwrap(),
+				directory_selected.to_str().unwrap(),
+			],
+		);
+		assert_success(&clone, "clone with a directory-form pathspec");
+		assert!(directory_selected.join("modules/a/.git").is_file());
+		assert!(directory_selected.join("modules/a/child/.git").is_file());
+		assert!(!directory_selected.join("modules/b/.git").exists());
+		assert_eq!(
+			git(
+				&directory_selected,
+				&["config", "--local", "--get-all", "submodule.active"]
+			),
+			format!("{selector}\n")
+		);
+	}
+
+	let layered = root.join("layered");
+	let clone = gta_with_configs(
+		&root,
+		&["protocol.file.allow=always", "submodule.active=modules/b"],
+		&[
+			"clone",
+			"--recurse-submodules=modules/a",
+			superproject.to_str().unwrap(),
+			layered.to_str().unwrap(),
+		],
+	);
+	assert_success(&clone, "clone with layered recursive pathspecs");
+	assert!(layered.join("modules/a/.git").is_file());
+	assert!(layered.join("modules/b/.git").is_file());
+	assert_eq!(
+		git(
+			&layered,
+			&["config", "--local", "--get-all", "submodule.active"]
+		),
+		"modules/a\n",
+		"only the command-line selector is persisted locally"
+	);
+
+	for (tag, selector) in [
+		("wildcard-directory", "modules/*/"),
+		("wildcard-directory-magic", ":(glob)modules/*/"),
+	] {
+		let wildcard = root.join(tag);
+		let clone = gta(
+			&root,
+			true,
+			&[
+				"clone",
+				&format!("--recurse-submodules={selector}"),
+				superproject.to_str().unwrap(),
+				wildcard.to_str().unwrap(),
+			],
+		);
+		assert_success(&clone, "clone with a wildcard directory pathspec");
+		assert!(!wildcard.join("modules/a/.git").exists());
+		assert!(!wildcard.join("modules/b/.git").exists());
+	}
+
+	let wildcard = root.join("wildcard");
+	let clone = gta(
+		&root,
+		true,
+		&[
+			"clone",
+			"--recurse-submodules=modules/*",
+			superproject.to_str().unwrap(),
+			wildcard.to_str().unwrap(),
+		],
+	);
+	assert_success(&clone, "clone with a wildcard pathspec");
+	assert!(wildcard.join("modules/a/.git").is_file());
+	assert!(wildcard.join("modules/a/child/.git").is_file());
+	assert!(wildcard.join("modules/b/.git").is_file());
+
+	let wildcard_excluded = root.join("wildcard-excluded");
+	let clone = gta(
+		&root,
+		true,
+		&[
+			"clone",
+			"--recurse-submodules=:(exclude,glob)modules/*/",
+			superproject.to_str().unwrap(),
+			wildcard_excluded.to_str().unwrap(),
+		],
+	);
+	assert_success(&clone, "clone with a wildcard directory exclusion");
+	assert!(wildcard_excluded.join("modules/a/.git").is_file());
+	assert!(wildcard_excluded.join("modules/a/child/.git").is_file());
+	assert!(wildcard_excluded.join("modules/b/.git").is_file());
+
+	let repeated = root.join("repeated");
+	let clone = gta(
+		&root,
+		true,
+		&[
+			"clone",
+			"--recurse-submodules=modules/a",
+			"--recursive=modules/b",
+			superproject.to_str().unwrap(),
+			repeated.to_str().unwrap(),
+		],
+	);
+	assert_success(&clone, "clone with repeated recursive pathspecs");
+	assert!(repeated.join("modules/a/.git").is_file());
+	assert!(repeated.join("modules/a/child/.git").is_file());
+	assert!(repeated.join("modules/b/.git").is_file());
+	assert_eq!(
+		git(
+			&repeated,
+			&["config", "--local", "--get-all", "submodule.active"]
+		),
+		"modules/a\nmodules/b\n"
+	);
+
+	let excluded = root.join("excluded");
+	let clone = gta(
+		&root,
+		true,
+		&[
+			"clone",
+			"--recurse-submodules=:(exclude)modules/b/",
+			superproject.to_str().unwrap(),
+			excluded.to_str().unwrap(),
+		],
+	);
+	assert_success(&clone, "clone with an exclusion-only recursive pathspec");
+	assert!(excluded.join("modules/a/.git").is_file());
+	assert!(excluded.join("modules/a/child/.git").is_file());
+	assert!(!excluded.join("modules/b/.git").exists());
+	assert_eq!(
+		git(
+			&excluded,
+			&["config", "--local", "--get-all", "submodule.active"]
+		),
+		":(exclude)modules/b/\n"
+	);
+
+	let unmatched = root.join("unmatched");
+	let clone = gta(
+		&root,
+		true,
+		&[
+			"clone",
+			"--recurse-submodules=missing",
+			superproject.to_str().unwrap(),
+			unmatched.to_str().unwrap(),
+		],
+	);
+	assert_success(&clone, "clone with an unmatched recursive pathspec");
+	assert!(!unmatched.join("modules/a/.git").exists());
+	assert!(!unmatched.join("modules/b/.git").exists());
+	assert_eq!(
+		git(
+			&unmatched,
+			&["config", "--local", "--get-all", "submodule.active"]
+		),
+		"missing\n"
+	);
+	let strict = gta(&unmatched, true, &["submodule", "update", "missing"]);
+	assert!(!strict.status.success());
+	assert!(
+		stderr(&strict).contains("pathspec 'missing' did not match any file known to git"),
+		"ordinary update pathspecs must remain strict: {}",
+		stderr(&strict)
+	);
+
+	let invalid = root.join("invalid");
+	let clone = gta(
+		&root,
+		true,
+		&[
+			"clone",
+			"--recurse-submodules=",
+			superproject.to_str().unwrap(),
+			invalid.to_str().unwrap(),
+		],
+	);
+	assert!(
+		!clone.status.success(),
+		"an empty pathspec must be rejected"
+	);
+	assert!(
+		invalid.join(".git").is_dir(),
+		"pathspec validation happens after root publication"
+	);
+	assert_eq!(
+		git(
+			&invalid,
+			&["config", "--local", "--get-all", "submodule.active"]
+		),
+		"\n"
+	);
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clone_recurse_submodules_carries_url_credentials_through_relative_children() {
 	if !support::git_http_backend_available() {
@@ -378,13 +635,25 @@ fn clone_recursive_alias_is_opt_in() {
 #[test]
 fn clone_recursion_failure_retains_the_root_for_retry() {
 	let fixture = Fixture::new("clone-recursion-retry");
+	git_allow(
+		&fixture.superproject,
+		&[
+			"submodule",
+			"add",
+			"--name",
+			"two",
+			"../source",
+			"modules/two",
+		],
+	);
+	commit(&fixture.superproject, "add unselected submodule");
 	let consumer = fixture.root.join("retry-consumer");
 	let clone = gta(
 		&fixture.root,
 		false,
 		&[
 			"clone",
-			"--recurse-submodules",
+			"--recurse-submodules=modules/one",
 			fixture.superproject.to_str().unwrap(),
 			consumer.to_str().unwrap(),
 		],
@@ -411,7 +680,7 @@ fn clone_recursion_failure_retains_the_root_for_retry() {
 			&consumer,
 			&["config", "--local", "--get-all", "submodule.active"]
 		),
-		".\n"
+		"modules/one\n"
 	);
 
 	let retry = gta(
@@ -423,6 +692,16 @@ fn clone_recursion_failure_retains_the_root_for_retry() {
 	assert_eq!(
 		std::fs::read_to_string(consumer.join("modules/one/file.txt")).unwrap(),
 		"old\n"
+	);
+	assert!(
+		!consumer.join("modules/two/.git").exists(),
+		"retry must not materialize a module outside the persisted clone selector"
+	);
+	assert!(
+		!std::fs::read_to_string(git_path(&consumer, "config"))
+			.unwrap()
+			.contains("[submodule \"two\"]"),
+		"retry must not register a module outside the persisted clone selector"
 	);
 }
 
@@ -474,6 +753,35 @@ fn update_init_materializes_the_recorded_commit_in_a_detached_worktree() {
 		format!(" {} modules/one\n", fixture.old)
 	);
 	assert_mount_points_at_per_worktree_repository(&fixture.consumer);
+}
+
+#[test]
+fn implicit_init_honors_root_activation_while_explicit_paths_override_it() {
+	let fixture = Fixture::new("init-active-pathspec");
+	add_second_module_mapping(&fixture);
+	git_ok(
+		&fixture.consumer,
+		&["config", "submodule.active", "modules/one"],
+	);
+
+	let init = gta(&fixture.consumer, true, &["submodule", "init"]);
+	assert_success(&init, "implicit init with a root activation pathspec");
+	let config = std::fs::read_to_string(git_path(&fixture.consumer, "config")).unwrap();
+	assert!(config.contains("[submodule \"one\"]"));
+	assert!(!config.contains("[submodule \"two\"]"));
+
+	let update = gta(&fixture.consumer, true, &["submodule", "update", "--init"]);
+	assert_success(&update, "implicit update with a root activation pathspec");
+	assert!(fixture.consumer.join("modules/one/.git").is_file());
+	assert!(!fixture.consumer.join("modules/two/.git").exists());
+
+	let explicit = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--init", "modules/two"],
+	);
+	assert_success(&explicit, "explicit update outside the active pathspec");
+	assert!(fixture.consumer.join("modules/two/.git").is_file());
 }
 
 #[test]

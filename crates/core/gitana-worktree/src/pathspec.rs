@@ -303,6 +303,19 @@ impl Pathspec {
 	/// glob that merely matches a directory does **not** pull in its contents (git only expands a literal
 	/// leading directory), so no directory-prefix rule is applied to a glob.
 	pub(crate) fn matches(&self, path: &str) -> bool {
+		self.matches_entry(path, false)
+	}
+
+	/// Whether this pathspec matches a directory entry at the worktree-relative `path`.
+	///
+	/// Unlike [`matches`](Self::matches), an exact match satisfies a trailing slash or final `.`
+	/// requirement. Submodule gitlinks use this because Git presents them to pathspecs as directories
+	/// even though the index stores them as mode `160000` entries.
+	fn matches_directory(&self, path: &str) -> bool {
+		self.matches_entry(path, true)
+	}
+
+	fn matches_entry(&self, path: &str, is_directory: bool) -> bool {
 		if self.normalized.is_empty() {
 			// The whole tree (`.`, bare `:` / `:/`) — or, for a magic path that only *resolved* to the root
 			// (`:/.`), nothing at all.
@@ -315,7 +328,7 @@ impl Pathspec {
 		// the literally-named directory it spells: `a?` matches the real directory `a?/`'s contents even
 		// though the 2-char glob cannot full-match a longer path, and only its literal pass fails on a
 		// dangling backslash (`?\` selects just `?\`) — both probed vs git 2.50.1.
-		let exact = !self.dir_only && bytes_eq(p, n, self.icase);
+		let exact = (!self.dir_only || is_directory) && bytes_eq(p, n, self.icase);
 		let under = p.len() > n.len() && p[n.len()] == b'/' && bytes_eq(&p[..n.len()], n, self.icase);
 		if self.wildcard {
 			// A directory-only glob (`src*/`) matches no file entry — git requires the glob to name a
@@ -390,14 +403,40 @@ impl PathspecSet {
 	/// Whether `path` is selected by the set (matches a positive — or there are none — and no negative).
 	/// Records the positives that matched, for [`unmatched`](Self::unmatched).
 	pub fn matches(&self, path: &str) -> bool {
+		self.matches_entry(path, false)
+	}
+
+	/// Whether a directory at `path` is selected by the set.
+	///
+	/// This applies the same positive, negative, and unmatched tracking as [`matches`](Self::matches),
+	/// but allows an exact literal directory-only pathspec to match the directory entry itself.
+	/// Directory-only wildcards retain Git's ordinary no-match behavior for a gitlink. Consumers
+	/// representing submodule gitlinks as directories use this without changing index-file matching.
+	pub fn matches_directory(&self, path: &str) -> bool {
+		self.matches_entry(path, true)
+	}
+
+	fn matches_entry(&self, path: &str, is_directory: bool) -> bool {
 		let mut positive_hit = self.positive.is_empty();
 		for (_, pathspec, matched) in &self.positive {
-			if pathspec.matches(path) {
+			let matches = if is_directory {
+				pathspec.matches_directory(path)
+			} else {
+				pathspec.matches(path)
+			};
+			if matches {
 				matched.store(true, std::sync::atomic::Ordering::Relaxed);
 				positive_hit = true;
 			}
 		}
-		positive_hit && !self.is_excluded(path)
+		positive_hit
+			&& !self.negative.iter().any(|negative| {
+				if is_directory {
+					negative.matches_directory(path)
+				} else {
+					negative.matches(path)
+				}
+			})
 	}
 
 	/// The original text of the first positive pathspec that matched nothing (git's "did not match any
@@ -595,6 +634,41 @@ mod tests {
 		let p = ps("a.txt/"); // trailing slash
 		assert!(!p.matches("a.txt")); // a file cannot satisfy a dir-only spec
 		assert!(p.matches("a.txt/inner")); // matches as a directory
+	}
+
+	#[test]
+	fn set_matches_directory_entries_without_changing_file_semantics() {
+		for spec in ["modules/a/", "modules/a/."] {
+			let set = PathspecSet::parse(&[spec], "").unwrap();
+			assert!(!set.matches("modules/a"), "{spec} must not match a file");
+			assert_eq!(set.unmatched(), Some(spec));
+			assert!(
+				set.matches_directory("modules/a"),
+				"{spec} must match a directory"
+			);
+			assert!(set.unmatched().is_none());
+		}
+		let wildcard = PathspecSet::parse(&["modules/*"], "").unwrap();
+		assert!(wildcard.matches_directory("modules/a"));
+		for spec in ["modules/*/", ":(glob)modules/*/"] {
+			let set = PathspecSet::parse(&[spec], "").unwrap();
+			assert!(
+				!set.matches_directory("modules/a"),
+				"{spec} must not match a gitlink"
+			);
+			assert_eq!(set.unmatched(), Some(spec));
+		}
+
+		let excluded = PathspecSet::parse(&[":(exclude)modules/b/"], "").unwrap();
+		assert!(excluded.matches_directory("modules/a"));
+		assert!(!excluded.matches_directory("modules/b"));
+		assert!(
+			excluded.matches("modules/b"),
+			"a directory-only exclusion must not exclude a regular file"
+		);
+		let wildcard_excluded = PathspecSet::parse(&[":(exclude,glob)modules/*/"], "").unwrap();
+		assert!(wildcard_excluded.matches_directory("modules/a"));
+		assert!(wildcard_excluded.matches_directory("modules/b"));
 	}
 
 	#[test]
