@@ -94,16 +94,22 @@ Major gaps:
 - `gta rebase <upstream> [--onto <newbase>]` replays the branch's commits onto a
   new base (linear histories only), with `--continue` / `--skip` / `--abort`.
   Non-interactive: no `-i`, autosquash, or `--rebase-merges`.
-- `gta submodule status [--recursive]` / `init` / `update [--init] [--recursive]` / `deinit`
+- `gta submodule status [--recursive]` / `init` / `update [--init] [--recursive] [--depth N]` / `deinit`
   implement consumer operations. `gta clone --recurse-submodules[=<pathspec>]` (alias
   `--recursive[=<pathspec>]`) publishes the root clone, records the requested root-level
   `submodule.active` values (`.` for the bare flag), and then initializes every selected active
   nested module, retaining that root for an explicit no-path retry if a child fails. The retry honors
   the effective activation set across all config layers. Literal directory-form selectors match
   submodule gitlinks as directories; directory-only wildcard selectors retain Git's no-match
-  behavior for gitlinks.
-  Clone-time jobs, shallow/remote variants, and the `merge`, `rebase`, or custom-command update
-  strategies are not yet supported.
+  behavior for gitlinks. `clone --recurse-submodules --shallow-submodules` requests depth one for
+  every selected module and descendant; `submodule update --depth N` applies an absolute positive
+  depth to both new and existing module repositories. As with top-level clone, initial native-local
+  cloning ignores depth while `file://` sources honor it; later fetches into existing modules honor
+  depth for both forms. A failed shallow recursive clone is faithfully continued with
+  `gta submodule update --init --recursive --depth 1`; omitting the explicit depth may complete
+  remaining modules with full history. Clone-time jobs, recommended-shallow controls,
+  shallow since/exclude propagation, remote-branch updates, and the `merge`, `rebase`, or
+  custom-command update strategies are not yet supported.
 - There is no interactive rebase, stash, blame, bisect, or hook support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
@@ -194,12 +200,14 @@ Implemented command groups:
   `worktree.useRelativePaths` pointers are preserved across a move/repair. The result is byte-for-byte
   git's layout, so stock git reads and operates in a gta-created worktree.
 - Submodules: `submodule status [--recursive]`, `submodule init`,
-	`submodule update [--init] [--recursive]`, and
+	`submodule update [--init] [--recursive] [--depth N]`, and
 	`submodule deinit [-f|--force] (--all | <path>...)`. Root pathspecs select top-level modules;
 	recursive status is depth-first and recursive update completes each repository-local batch before
 	entering successful child worktrees. `clone --recurse-submodules[=<pathspec>]`
 	(`--recursive[=<pathspec>]`) composes the initializing recursive update after the root clone has
 	been published; repeated pathspecs select top-level modules and the bare flag selects all of them.
+	Add `--shallow-submodules` for depth-one module history; a root `clone --depth N` alone does not
+	change submodule depth.
 - Repository setup: `config`, scoped like git — `--local` (the repository `.git/config`, the default
   for writes), `--global` (`$GIT_CONFIG_GLOBAL`, else `~/.gitconfig` / the XDG file), and `--system`
   (`$GIT_CONFIG_SYSTEM`, else `/etc/gitconfig`). An unscoped read resolves across git's whole

@@ -1574,7 +1574,7 @@ mod tests {
 	use gitana_submodule::{
 		ConfigViews, FetchRepository, FetchSource, FetchedTransfer, InitRequest, PrepareRepository,
 		PrepareSource, PreparedTransfer, RepositoryTransfer, SubmoduleContext, SubmoduleMutationLease,
-		UpdateOutcomeState, UpdateRequest,
+		SubmoduleObjectId, UpdateOutcomeState, UpdateRequest,
 	};
 	use gitana_worktree::{Index, IndexEntry, Stat};
 	use std::os::unix::fs::symlink;
@@ -1612,7 +1612,7 @@ mod tests {
 			&self,
 			_source: Self::PreparedSource,
 			_request: PrepareRepository,
-		) -> Result<(), Self::Error> {
+		) -> Result<Vec<SubmoduleObjectId>, Self::Error> {
 			panic!("an unregistered module must not populate a repository")
 		}
 
@@ -1668,7 +1668,7 @@ mod tests {
 			&self,
 			_source: Self::PreparedSource,
 			_request: PrepareRepository,
-		) -> Result<(), Self::Error> {
+		) -> Result<Vec<SubmoduleObjectId>, Self::Error> {
 			panic!("the test transfer stops before repository population")
 		}
 
@@ -1975,6 +1975,7 @@ mod tests {
 				&UpdateRequest {
 					query: Default::default(),
 					initialize: false,
+					depth: None,
 					initialize_only_active: false,
 					reflog_committer: None,
 				},
@@ -2066,6 +2067,7 @@ mod tests {
 				&UpdateRequest {
 					query: Default::default(),
 					initialize: false,
+					depth: None,
 					initialize_only_active: false,
 					reflog_committer: None,
 				},

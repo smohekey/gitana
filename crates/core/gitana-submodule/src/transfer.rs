@@ -41,6 +41,8 @@ pub struct FetchSource {
 /// The credential-safe endpoint identity used by a completed existing-repository fetch.
 pub struct FetchedTransfer {
 	pub resolved_source: String,
+	/// Object-graph roots requested while fetching the repository.
+	pub fetched_roots: Vec<SubmoduleObjectId>,
 }
 
 /// A request to populate a repository-only clone through an already-open staging directory.
@@ -49,6 +51,7 @@ pub struct PrepareRepository {
 	pub display_git_dir: PathBuf,
 	pub hash_kind: HashKind,
 	pub recorded: SubmoduleObjectId,
+	pub depth: Option<u32>,
 }
 
 /// A request to fetch a recorded commit into an existing module repository.
@@ -58,6 +61,7 @@ pub struct FetchRepository {
 	pub display_git_dir: PathBuf,
 	pub hash_kind: HashKind,
 	pub recorded: SubmoduleObjectId,
+	pub depth: Option<u32>,
 }
 
 /// Transport capability injected into the submodule state machine by a native frontend.
@@ -79,11 +83,14 @@ pub trait RepositoryTransfer {
 		lease: SubmoduleMutationLease,
 	) -> Result<PreparedTransfer<Self::PreparedSource>, Self::Error>;
 
+	/// Populate the retained staging repository and return every object-graph root requested from
+	/// the source. The state machine combines these with the recorded commit in one durability
+	/// barrier before publishing the repository.
 	async fn populate_prepared(
 		&self,
 		source: Self::PreparedSource,
 		request: PrepareRepository,
-	) -> Result<(), Self::Error>;
+	) -> Result<Vec<SubmoduleObjectId>, Self::Error>;
 
 	async fn fetch_recorded(
 		&self,

@@ -28,6 +28,7 @@ pub enum Action {
 	},
 	Update {
 		init: bool,
+		depth: Option<u32>,
 		recursive: bool,
 		paths: Vec<String>,
 	},
@@ -49,6 +50,9 @@ async fn with_setup_lease<T>(
 }
 
 pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result<()> {
+	if matches!(&action, Action::Update { depth: Some(0), .. }) {
+		return Err(anyhow!("--depth must be a positive number of commits"));
+	}
 	let (layout, prefix) = repo::discover_worktree_with_prefix(cwd).await?;
 	let worktree_root = layout
 		.worktree_root
@@ -71,6 +75,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 		}
 		Action::Update {
 			init,
+			depth,
 			recursive: true,
 			paths,
 		} => {
@@ -82,6 +87,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 				UpdateRequest {
 					query: SubmoduleQuery::paths(paths.clone()),
 					initialize: *init,
+					depth: *depth,
 					initialize_only_active: false,
 					reflog_committer: None,
 				},
@@ -166,6 +172,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 		}
 		Action::Update {
 			init,
+			depth,
 			recursive: false,
 			paths,
 		} => {
@@ -178,6 +185,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 			let request = UpdateRequest {
 				query: SubmoduleQuery::paths(paths),
 				initialize: init,
+				depth,
 				initialize_only_active: false,
 				reflog_committer: Some(committer(&superproject)),
 			};
@@ -298,6 +306,7 @@ async fn recursive_update(
 	let UpdateRequest {
 		query,
 		initialize,
+		depth,
 		initialize_only_active,
 		..
 	} = request;
@@ -323,7 +332,7 @@ async fn recursive_update(
 			prefix,
 			&level_prefix,
 			command,
-			module_base.clone(),
+			(module_base.clone(), depth),
 		))
 		.await?;
 	}
@@ -337,6 +346,7 @@ async fn recursive_update(
 		query,
 		initialize_only_active,
 		credential_url_base,
+		depth,
 	)]);
 	while let Some((
 		level_root,
@@ -347,6 +357,7 @@ async fn recursive_update(
 		query,
 		initialize_only_active,
 		credential_url_base,
+		depth,
 	)) = pending.pop_front()
 	{
 		let (layout, report, mut descendant_url_bases) = Box::pin(update_level(
@@ -359,6 +370,7 @@ async fn recursive_update(
 			UpdateRequest {
 				query,
 				initialize,
+				depth,
 				initialize_only_active,
 				reflog_committer: None,
 			},
@@ -380,6 +392,7 @@ async fn recursive_update(
 					SubmoduleQuery::all(),
 					false,
 					descendant_url_bases.remove(&outcome.path),
+					depth,
 				));
 			}
 		}
@@ -395,6 +408,7 @@ pub(crate) async fn update_published_clone(
 	command: &CommandContext,
 	active_pathspecs: Vec<String>,
 	credential_url_base: Option<String>,
+	depth: Option<u32>,
 ) -> Result<()> {
 	let (lease, common, git, _) = Box::pin(repo::command_config_mutation_lease(
 		&root_layout,
@@ -418,6 +432,7 @@ pub(crate) async fn update_published_clone(
 		UpdateRequest {
 			query: SubmoduleQuery::all(),
 			initialize: true,
+			depth,
 			initialize_only_active: true,
 			reflog_committer: None,
 		},
@@ -557,8 +572,9 @@ async fn resume_update_level(
 	prefix: &str,
 	level_prefix: &str,
 	command: &CommandContext,
-	module_base: gitana_config::GitConfig,
+	recovery_state: (gitana_config::GitConfig, Option<u32>),
 ) -> Result<()> {
+	let (module_base, depth) = recovery_state;
 	let (layout, setup, common, git, work, configuration, superproject, hash_kind) =
 		Box::pin(open_level(root, expected_git_dir, discovered_root)).await?;
 	repo::ensure_no_pending_deinit_at(&layout, &common, &git)?;
@@ -577,6 +593,7 @@ async fn resume_update_level(
 		&configuration,
 		&transfer,
 		Some(committer(&superproject)),
+		depth,
 	))
 	.await
 	{

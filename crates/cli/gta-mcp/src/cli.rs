@@ -489,6 +489,9 @@ enum Command {
 			require_equals = true
 		)]
 		recurse_submodules: Vec<String>,
+		/// Clone selected submodules and descendants with history truncated to one commit.
+		#[arg(long)]
+		shallow_submodules: bool,
 	},
 	/// Download new objects from the origin and update remote-tracking refs.
 	Fetch {
@@ -597,6 +600,9 @@ enum SubmoduleAction {
 	Update {
 		#[arg(long)]
 		init: bool,
+		/// Limit fetched submodule history to this many commits from each requested tip.
+		#[arg(long, value_name = "depth")]
+		depth: Option<u32>,
 		/// Recursively update initialized descendants (and initialize them with `--init`).
 		#[arg(long)]
 		recursive: bool,
@@ -1077,6 +1083,7 @@ impl Cli {
 					shallow_exclude,
 					sparse,
 					recurse_submodules,
+					shallow_submodules,
 				} => {
 					commands::clone::run(
 						&command_context,
@@ -1087,6 +1094,7 @@ impl Cli {
 						shallow_exclude,
 						sparse,
 						recurse_submodules,
+						shallow_submodules,
 					)
 					.await
 				}
@@ -1169,10 +1177,12 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 		SubmoduleAction::Init { paths } => Action::Init { paths },
 		SubmoduleAction::Update {
 			init,
+			depth,
 			recursive,
 			paths,
 		} => Action::Update {
 			init,
+			depth,
 			recursive,
 			paths,
 		},

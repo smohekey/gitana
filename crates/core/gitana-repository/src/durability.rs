@@ -73,10 +73,26 @@ where
 		root: ObjectId<H>,
 		durable_frontiers: &[ObjectId<H>],
 	) -> Result<(), RepositoryError> {
+		self
+			.durability_barrier_object_graphs(std::slice::from_ref(&root), durable_frontiers)
+			.await
+	}
+
+	/// Flush every object reachable from `roots` beyond the supplied durable frontiers in one
+	/// barrier, without requiring refs to name the roots yet.
+	///
+	/// The union is essential for shallow transfers: `.git/shallow` describes every transferred
+	/// boundary and must not become durable before the loose objects or pack/index pairs supplying
+	/// any requested root. Physical provenance for the complete union is re-read after the barrier.
+	pub async fn durability_barrier_object_graphs(
+		&self,
+		roots: &[ObjectId<H>],
+		durable_frontiers: &[ObjectId<H>],
+	) -> Result<(), RepositoryError> {
 		let frontiers: HashSet<_> = durable_frontiers.iter().copied().collect();
 		let mut last_provenance_error = None;
 		for _ in 0..STABILITY_ATTEMPTS {
-			let reachability = match self.reachability_snapshot(root, &frontiers).await {
+			let reachability = match self.reachability_snapshot(roots, &frontiers).await {
 				Ok(snapshot) => {
 					last_provenance_error = None;
 					snapshot
@@ -95,7 +111,7 @@ where
 				.durability_barrier(&targets)
 				.await
 			{
-				let after = match self.reachability_snapshot(root, &frontiers).await {
+				let after = match self.reachability_snapshot(roots, &frontiers).await {
 					Ok(snapshot) => snapshot,
 					Err(error) if is_provenance_movement(&error) => {
 						last_provenance_error = Some(error);
@@ -109,7 +125,7 @@ where
 				continue;
 			}
 
-			let after = match self.reachability_snapshot(root, &frontiers).await {
+			let after = match self.reachability_snapshot(roots, &frontiers).await {
 				Ok(snapshot) => snapshot,
 				Err(error) if is_provenance_movement(&error) => {
 					last_provenance_error = Some(error);
@@ -125,7 +141,10 @@ where
 		match last_provenance_error {
 			Some(error) => Err(error),
 			None => Err(RepositoryError::DurabilityUnstable {
-				name: format!("object graph {root}"),
+				name: match roots {
+					[root] => format!("object graph {root}"),
+					_ => format!("{} object graph roots", roots.len()),
+				},
 			}),
 		}
 	}
@@ -149,7 +168,10 @@ where
 		let mut last_provenance_error = None;
 		for _ in 0..STABILITY_ATTEMPTS {
 			self.require_ref(name, Some(expected)).await?;
-			let reachability = match self.reachability_snapshot(expected, &frontiers).await {
+			let reachability = match self
+				.reachability_snapshot(std::slice::from_ref(&expected), &frontiers)
+				.await
+			{
 				Ok(snapshot) => {
 					last_provenance_error = None;
 					snapshot
@@ -170,7 +192,10 @@ where
 				.await
 			{
 				self.require_ref(name, Some(expected)).await?;
-				let after = match self.reachability_snapshot(expected, &frontiers).await {
+				let after = match self
+					.reachability_snapshot(std::slice::from_ref(&expected), &frontiers)
+					.await
+				{
 					Ok(snapshot) => snapshot,
 					Err(error) if is_provenance_movement(&error) => {
 						last_provenance_error = Some(error);
@@ -186,7 +211,10 @@ where
 			}
 
 			self.require_ref(name, Some(expected)).await?;
-			let after = match self.reachability_snapshot(expected, &frontiers).await {
+			let after = match self
+				.reachability_snapshot(std::slice::from_ref(&expected), &frontiers)
+				.await
+			{
 				Ok(snapshot) => snapshot,
 				Err(error) if is_provenance_movement(&error) => {
 					last_provenance_error = Some(error);
@@ -250,14 +278,14 @@ where
 
 	async fn reachability_snapshot(
 		&self,
-		root: ObjectId<H>,
+		roots: &[ObjectId<H>],
 		frontiers: &HashSet<ObjectId<H>>,
 	) -> Result<ReachabilitySnapshot<H>, RepositoryError> {
 		let shallow: HashSet<_> = self.read_shallow().await?.into_iter().collect();
 		let shallow_file = self.objects().file_store().exists("shallow").await?;
 		let mut objects = HashMap::new();
 		let mut seen = HashSet::new();
-		let mut pending = vec![root];
+		let mut pending = roots.to_vec();
 		let mut reader = self.objects().read_session();
 
 		while let Some(id) = pending.pop() {
@@ -768,6 +796,92 @@ mod tests {
 		for durable in [baseline, baseline_tree, baseline_blob] {
 			assert!(!files.contains(loose_object_path(&durable).as_str()));
 		}
+	}
+
+	#[tokio::test]
+	async fn object_graph_barrier_flushes_every_root_before_the_shared_shallow_file() {
+		let (files, barriers) = RecordingFileStore::new();
+		let repo = Repository::<_, Sha256>::new(ObjectStore::new(files));
+		repo.init().await.unwrap();
+		let packed_commit = |value: &[u8], message: &str| {
+			let blob_data = value.to_vec();
+			let blob = ObjectId::<Sha256>::compute(ObjectKind::Blob, &blob_data);
+			let tree_data = encode_tree(&[TreeEntry {
+				mode: "100644".to_owned(),
+				name: "value".to_owned(),
+				id: blob,
+			}]);
+			let tree = ObjectId::<Sha256>::compute(ObjectKind::Tree, &tree_data);
+			let commit_data = encode_commit(&Commit {
+				tree,
+				parents: Vec::new(),
+				author: "A <a@b> 1 +0000".to_owned(),
+				committer: "A <a@b> 1 +0000".to_owned(),
+				signature: None,
+				extra_headers: Vec::new(),
+				message: message.to_owned(),
+			});
+			let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, &commit_data);
+			(
+				tip,
+				vec![
+					PackedObject {
+						id: blob,
+						kind: ObjectKind::Blob,
+						data: blob_data,
+					},
+					PackedObject {
+						id: tree,
+						kind: ObjectKind::Tree,
+						data: tree_data,
+					},
+					PackedObject {
+						id: tip,
+						kind: ObjectKind::Commit,
+						data: commit_data,
+					},
+				],
+			)
+		};
+		let (first, first_pack) = packed_commit(b"first", "first");
+		let (second, second_pack) = packed_commit(b"second", "second");
+		repo
+			.objects()
+			.write_pack(encode_pack(&first_pack))
+			.await
+			.unwrap();
+		repo
+			.objects()
+			.write_pack(encode_pack(&second_pack))
+			.await
+			.unwrap();
+		repo.write_shallow(&[first, second]).await.unwrap();
+
+		repo
+			.durability_barrier_object_graphs(&[first, second], &[])
+			.await
+			.unwrap();
+
+		let calls = barriers.lock().unwrap();
+		assert_eq!(calls.len(), 1, "all roots must cross one barrier");
+		let files: Vec<_> = calls[0]
+			.iter()
+			.filter_map(|target| match target {
+				DurabilityTarget::File(path) => Some(path.as_str()),
+				DurabilityTarget::Directory(_) | DurabilityTarget::Tree(_) => None,
+			})
+			.collect();
+		assert!(files.contains(&"shallow"));
+		assert_eq!(
+			files.iter().filter(|path| path.ends_with(".pack")).count(),
+			2,
+			"each independently fetched pack must be durable"
+		);
+		assert_eq!(
+			files.iter().filter(|path| path.ends_with(".idx")).count(),
+			2,
+			"each independently fetched pack index must be durable"
+		);
 	}
 
 	#[tokio::test]

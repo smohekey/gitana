@@ -33,6 +33,8 @@ pub enum TagFetch {
 
 /// The outcome of a [`fetch`]: the tracking refs it advanced, and any it declined to.
 pub struct FetchOutcome<H: HashAlgorithm> {
+	/// Object-graph roots requested from the remote during this fetch.
+	pub fetched_roots: Vec<ObjectId<H>>,
 	/// Tracking refs advanced (`(ref name, new oid)`).
 	pub updated: Vec<(String, ObjectId<H>)>,
 	/// Tracking refs left unchanged because the update was not a fast-forward and the matching refspec
@@ -216,7 +218,7 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 	// A shallow fetch asks for reachable annotated tags (`include-tag`) so tags pointing into the fetched
 	// history arrive — unless `--no-tags` disabled tag fetching entirely, which git also omits it for.
 	let include_tag = !deepen.is_empty() && tags != TagFetch::None;
-	download(
+	let fetched_roots = download(
 		fetcher,
 		repo,
 		&advertised,
@@ -406,6 +408,7 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 	}
 
 	Ok(FetchOutcome {
+		fetched_roots,
 		updated,
 		rejected,
 		pruned,
@@ -619,12 +622,38 @@ pub async fn fetch_object<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	oid: ObjectId<H>,
 ) -> Result<()> {
+	fetch_object_inner(fetcher, repo, oid, &Deepen::default()).await
+}
+
+/// Fetch the closure rooted at an exact object id with an absolute history-depth request.
+///
+/// `advertisement` supplies the server capability proof for the requested deepening. Callers use
+/// this after their normal shallow fetch when the recorded submodule commit is no longer reachable
+/// from an advertised ref; the exact commit becomes an additional shallow boundary.
+pub async fn fetch_object_with_deepen<F: FileStore, H: HashAlgorithm>(
+	fetcher: &mut impl PackFetcher,
+	repo: &Repository<F, H>,
+	advertisement: &[u8],
+	oid: ObjectId<H>,
+	deepen: &Deepen,
+) -> Result<()> {
+	let advertised = parse_advertisement::<H>(advertisement)?;
+	ensure_deepen_supported(&advertised, deepen)?;
+	fetch_object_inner(fetcher, repo, oid, deepen).await
+}
+
+async fn fetch_object_inner<F: FileStore, H: HashAlgorithm>(
+	fetcher: &mut impl PackFetcher,
+	repo: &Repository<F, H>,
+	oid: ObjectId<H>,
+	deepen: &Deepen,
+) -> Result<()> {
 	if repo.objects().exists_object(&oid).await? {
 		return Ok(());
 	}
 	let haves = gitana_remote::local_haves(repo).await?;
 	fetcher
-		.fetch_pack(repo, &[oid], &haves, &Deepen::default(), false)
+		.fetch_pack(repo, &[oid], &haves, deepen, false)
 		.await?;
 	if !repo.objects().exists_object(&oid).await? {
 		bail!("remote did not provide requested object {oid}");
@@ -690,7 +719,7 @@ pub async fn prepare_clone<F: FileStore, H: HashAlgorithm>(
 	// these roots and wants every advertised ref. A shallow clone requests reachable tags (`include-tag`)
 	// so tags pointing into the fetched history are preserved.
 	let roots = shallow_wants(&advertised);
-	download_clone(
+	let fetched_roots = download_clone(
 		connection,
 		repo,
 		&advertised,
@@ -758,7 +787,10 @@ pub async fn prepare_clone<F: FileStore, H: HashAlgorithm>(
 
 	// Return the prepared HEAD so the caller can populate its chosen working tree.
 	let head = repo.refs().resolve_head().await?;
-	Ok(PreparedClone { head })
+	Ok(PreparedClone {
+		head,
+		fetched_roots,
+	})
 }
 
 async fn clone_default_branch<F: FileStore, H: HashAlgorithm>(
@@ -812,7 +844,7 @@ async fn download_clone<F: FileStore, H: HashAlgorithm>(
 	deepen: &Deepen,
 	deepen_roots: &[ObjectId<H>],
 	include_tag: bool,
-) -> Result<()> {
+) -> Result<Vec<ObjectId<H>>> {
 	ensure_deepen_supported(advertised, deepen)?;
 	let wants = if deepen.is_empty() {
 		gitana_remote::advertised_oids(advertised)
@@ -822,7 +854,8 @@ async fn download_clone<F: FileStore, H: HashAlgorithm>(
 		wants.dedup();
 		wants
 	};
-	gitana_remote::download_clone_pack(connection, repo, &wants, deepen, include_tag).await
+	gitana_remote::download_clone_pack(connection, repo, &wants, deepen, include_tag).await?;
+	Ok(wants)
 }
 
 /// Download the objects reachable from the advertised tips that `haves` do not already cover, writing
@@ -842,7 +875,7 @@ async fn download<F: FileStore, H: HashAlgorithm>(
 	deepen: &Deepen,
 	deepen_roots: &[ObjectId<H>],
 	include_tag: bool,
-) -> Result<()> {
+) -> Result<Vec<ObjectId<H>>> {
 	ensure_deepen_supported(advertised, deepen)?;
 	let wants = if deepen.is_empty() {
 		gitana_remote::advertised_oids(advertised)
@@ -855,7 +888,7 @@ async fn download<F: FileStore, H: HashAlgorithm>(
 	fetcher
 		.fetch_pack(repo, &wants, haves, deepen, include_tag)
 		.await?;
-	Ok(())
+	Ok(wants)
 }
 
 /// Fail a shallow request the server cannot honor: if the advertisement lacks the matching capability

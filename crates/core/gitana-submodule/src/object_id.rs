@@ -9,13 +9,22 @@ pub struct SubmoduleObjectId {
 
 impl SubmoduleObjectId {
 	#[cfg(not(target_arch = "wasm32"))]
-	pub(crate) fn from_typed<H: gitana_object::HashAlgorithm>(
-		oid: gitana_object::ObjectId<H>,
-	) -> Self {
+	/// Construct a runtime-tagged object id from a typed Git object id.
+	pub fn from_typed<H: gitana_object::HashAlgorithm>(oid: gitana_object::ObjectId<H>) -> Self {
 		Self {
 			kind: kind::<H>(),
 			hex: oid.to_hex(),
 		}
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	pub(crate) fn to_typed<H: gitana_object::HashAlgorithm>(
+		&self,
+	) -> Option<gitana_object::ObjectId<H>> {
+		if self.kind != kind::<H>() {
+			return None;
+		}
+		gitana_object::ObjectId::from_hex(&self.hex).ok()
 	}
 
 	#[cfg(not(target_arch = "wasm32"))]

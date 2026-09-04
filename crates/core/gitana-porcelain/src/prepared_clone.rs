@@ -4,4 +4,6 @@ use gitana_object::{HashAlgorithm, ObjectId};
 pub struct PreparedClone<H: HashAlgorithm> {
 	/// The commit resolved through the prepared repository's `HEAD`, if the remote is not empty.
 	pub head: Option<ObjectId<H>>,
+	/// Object-graph roots requested while populating the repository.
+	pub fetched_roots: Vec<ObjectId<H>>,
 }

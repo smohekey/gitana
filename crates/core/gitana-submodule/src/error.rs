@@ -55,6 +55,8 @@ pub enum SubmoduleError {
 	UnrepresentablePointerPath(PathBuf),
 	#[error("submodule update is already running for this worktree")]
 	UpdateLocked,
+	#[error("submodule update depth must be a positive number of commits")]
+	InvalidDepth,
 	#[error(
 		"submodule path '{0}' contains local modifications; use --force to deinitialize while retaining the checkout and its local changes"
 	)]

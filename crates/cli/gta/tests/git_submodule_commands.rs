@@ -12,6 +12,159 @@ use gitana_submodule::acquire_submodule_config_mutation_lease;
 use sha2::{Digest, Sha256};
 
 #[test]
+fn shallow_recursive_clone_and_update_bound_each_recorded_commit() {
+	let root = unique_tmp("shallow-recursive-submodules");
+	let leaf = root.join("leaf");
+	let middle = root.join("middle");
+	let superproject = root.join("super");
+	for repository in [&leaf, &middle, &superproject] {
+		std::fs::create_dir_all(repository).unwrap();
+		init_repository(repository, None);
+		std::fs::write(repository.join("file.txt"), b"old\n").unwrap();
+		git_ok(repository, &["add", "file.txt"]);
+		commit(repository, "old");
+	}
+	let leaf_recorded = git(&leaf, &["rev-parse", "HEAD"]).trim().to_owned();
+	git_allow(&middle, &["submodule", "add", "../leaf", "child"]);
+	git_ok(
+		&middle,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.child.url",
+			&format!("file://{}", leaf.display()),
+		],
+	);
+	git_ok(&middle, &["add", ".gitmodules"]);
+	commit(&middle, "add child");
+	let middle_recorded = git(&middle, &["rev-parse", "HEAD"]).trim().to_owned();
+	std::fs::write(leaf.join("file.txt"), b"new\n").unwrap();
+	git_ok(&leaf, &["add", "file.txt"]);
+	commit(&leaf, "advance leaf branch");
+
+	git_allow(
+		&superproject,
+		&["submodule", "add", "../middle", "modules/middle"],
+	);
+	git_ok(
+		&superproject,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.modules/middle.url",
+			&format!("file://{}", middle.display()),
+		],
+	);
+	git_ok(&superproject, &["add", ".gitmodules"]);
+	commit(&superproject, "add middle");
+	std::fs::write(middle.join("file.txt"), b"new\n").unwrap();
+	git_ok(&middle, &["add", "file.txt"]);
+	commit(&middle, "advance middle branch");
+
+	let cloned = root.join("cloned");
+	let clone = gta(
+		&root,
+		true,
+		&[
+			"clone",
+			"--recurse-submodules",
+			"--shallow-submodules",
+			superproject.to_str().unwrap(),
+			cloned.to_str().unwrap(),
+		],
+	);
+	assert_success(&clone, "shallow recursive clone");
+	let cloned_middle = cloned.join("modules/middle");
+	let cloned_leaf = cloned_middle.join("child");
+	assert_eq!(
+		git(&cloned_middle, &["rev-parse", "HEAD"]).trim(),
+		middle_recorded
+	);
+	assert_eq!(
+		git(&cloned_leaf, &["rev-parse", "HEAD"]).trim(),
+		leaf_recorded
+	);
+	assert_shallow_one(&cloned_middle);
+	assert_shallow_one(&cloned_leaf);
+
+	let updated = root.join("updated");
+	assert_success(
+		&gta(
+			&root,
+			false,
+			&[
+				"clone",
+				superproject.to_str().unwrap(),
+				updated.to_str().unwrap(),
+			],
+		),
+		"clone root before recursive shallow update",
+	);
+	assert_success(
+		&gta(
+			&updated,
+			true,
+			&[
+				"submodule",
+				"update",
+				"--init",
+				"--recursive",
+				"--depth",
+				"1",
+			],
+		),
+		"recursive update at depth one",
+	);
+	assert_shallow_one(&updated.join("modules/middle"));
+	assert_shallow_one(&updated.join("modules/middle/child"));
+
+	let ordinary = root.join("ordinary");
+	assert_success(
+		&gta(
+			&root,
+			true,
+			&[
+				"clone",
+				"--depth",
+				"1",
+				"--recurse-submodules",
+				&format!("file://{}", superproject.display()),
+				ordinary.to_str().unwrap(),
+			],
+		),
+		"shallow root clone without shallow submodules",
+	);
+	assert_eq!(
+		git(
+			&ordinary.join("modules/middle"),
+			&["rev-parse", "--is-shallow-repository"]
+		)
+		.trim(),
+		"false",
+		"a shallow root must not imply shallow modules"
+	);
+
+	let no_recursion = root.join("no-recursion");
+	assert_success(
+		&gta(
+			&root,
+			false,
+			&[
+				"clone",
+				"--shallow-submodules",
+				superproject.to_str().unwrap(),
+				no_recursion.to_str().unwrap(),
+			],
+		),
+		"shallow-submodules without recursion",
+	);
+	assert!(!no_recursion.join("modules/middle/.git").exists());
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn clone_recurse_submodules_materializes_nested_modules_after_root_publication() {
 	let root = unique_tmp("clone-recurse-submodules");
 	let leaf = root.join("leaf");
@@ -635,6 +788,7 @@ fn clone_recursive_alias_is_opt_in() {
 #[test]
 fn clone_recursion_failure_retains_the_root_for_retry() {
 	let fixture = Fixture::new("clone-recursion-retry");
+	fixture.commit_source("new\n", "advance source past recorded gitlink");
 	git_allow(
 		&fixture.superproject,
 		&[
@@ -647,6 +801,21 @@ fn clone_recursion_failure_retains_the_root_for_retry() {
 		],
 	);
 	commit(&fixture.superproject, "add unselected submodule");
+	let file_url = format!("file://{}", fixture.source.display());
+	for name in ["one", "two"] {
+		git_ok(
+			&fixture.superproject,
+			&[
+				"config",
+				"-f",
+				".gitmodules",
+				&format!("submodule.{name}.url"),
+				&file_url,
+			],
+		);
+	}
+	git_ok(&fixture.superproject, &["add", ".gitmodules"]);
+	commit(&fixture.superproject, "use file URLs for shallow retry");
 	let consumer = fixture.root.join("retry-consumer");
 	let clone = gta(
 		&fixture.root,
@@ -654,6 +823,7 @@ fn clone_recursion_failure_retains_the_root_for_retry() {
 		&[
 			"clone",
 			"--recurse-submodules=modules/one",
+			"--shallow-submodules",
 			fixture.superproject.to_str().unwrap(),
 			consumer.to_str().unwrap(),
 		],
@@ -686,13 +856,21 @@ fn clone_recursion_failure_retains_the_root_for_retry() {
 	let retry = gta(
 		&consumer,
 		true,
-		&["submodule", "update", "--init", "--recursive"],
+		&[
+			"submodule",
+			"update",
+			"--init",
+			"--recursive",
+			"--depth",
+			"1",
+		],
 	);
 	assert_success(&retry, "retry retained clone submodules");
 	assert_eq!(
 		std::fs::read_to_string(consumer.join("modules/one/file.txt")).unwrap(),
 		"old\n"
 	);
+	assert_shallow_one(&consumer.join("modules/one"));
 	assert!(
 		!consumer.join("modules/two/.git").exists(),
 		"retry must not materialize a module outside the persisted clone selector"
@@ -753,6 +931,131 @@ fn update_init_materializes_the_recorded_commit_in_a_detached_worktree() {
 		format!(" {} modules/one\n", fixture.old)
 	);
 	assert_mount_points_at_per_worktree_repository(&fixture.consumer);
+}
+
+#[test]
+fn submodule_update_depth_honors_file_urls_and_updates_existing_repositories() {
+	let shallow = Fixture::new("submodule-update-file-depth");
+	let advertised = shallow.commit_source("new\n", "advance source past recorded gitlink");
+	git_ok(
+		&shallow.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.url",
+			&format!("file://{}", shallow.source.display()),
+		],
+	);
+	let update = gta(
+		&shallow.consumer,
+		true,
+		&["submodule", "update", "--init", "--depth", "1"],
+	);
+	assert_success(&update, "new file-URL module at depth one");
+	let module = shallow.consumer.join("modules/one");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), shallow.old);
+	assert_shallow_one(&module);
+	assert_eq!(
+		git(&module, &["cat-file", "-t", &advertised]).trim(),
+		"commit",
+		"the advertised tip fetched separately from the recorded commit must remain available"
+	);
+	assert_eq!(
+		git(&module, &["rev-list", "--count", &advertised]).trim(),
+		"1",
+		"the advertised tip must retain its shallow boundary"
+	);
+
+	let local = Fixture::new("submodule-update-local-depth");
+	local.commit_source("new\n", "advance raw local source");
+	assert_success(
+		&gta(
+			&local.consumer,
+			true,
+			&["submodule", "update", "--init", "--depth", "1"],
+		),
+		"raw local module with ignored depth",
+	);
+	assert_eq!(
+		git(
+			&local.consumer.join("modules/one"),
+			&["rev-parse", "--is-shallow-repository"]
+		)
+		.trim(),
+		"false"
+	);
+	let local_recorded = local.commit_source("later\n", "new recorded raw local commit");
+	local.record_superproject_commit(&local_recorded, "advance raw local gitlink");
+	git_ok(&local.consumer, &["fetch", "origin"]);
+	git_ok(&local.consumer, &["reset", "--hard", "origin/main"]);
+	assert_success(
+		&gta(
+			&local.consumer,
+			true,
+			&["submodule", "update", "--depth", "1"],
+		),
+		"existing raw local module at depth one",
+	);
+	let local_module = local.consumer.join("modules/one");
+	assert_eq!(
+		git(&local_module, &["rev-parse", "HEAD"]).trim(),
+		local_recorded
+	);
+	assert_shallow_one(&local_module);
+
+	let existing = Fixture::new("submodule-update-existing-depth");
+	let file_url = format!("file://{}", existing.source.display());
+	git_ok(
+		&existing.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.url",
+			&file_url,
+		],
+	);
+	assert_success(
+		&gta(&existing.consumer, true, &["submodule", "update", "--init"]),
+		"initial full module update",
+	);
+	let new = existing.commit_source("new\n", "new recorded source commit");
+	existing.record_superproject_commit(&new, "advance gitlink");
+	git_ok(&existing.consumer, &["fetch", "origin"]);
+	git_ok(&existing.consumer, &["reset", "--hard", "origin/main"]);
+	assert_success(
+		&gta(
+			&existing.consumer,
+			true,
+			&["submodule", "update", "--depth", "1"],
+		),
+		"existing module update at depth one",
+	);
+	let existing_module = existing.consumer.join("modules/one");
+	assert_eq!(git(&existing_module, &["rev-parse", "HEAD"]).trim(), new);
+	assert_shallow_one(&existing_module);
+}
+
+#[test]
+fn submodule_update_rejects_zero_depth_before_mutation() {
+	let fixture = Fixture::new("submodule-update-zero-depth");
+	let config = git_path(&fixture.consumer, "config");
+	let before = std::fs::read(&config).unwrap();
+	let update = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--init", "--depth", "0"],
+	);
+	assert!(!update.status.success(), "zero depth must be rejected");
+	assert!(
+		stderr(&update).contains("--depth must be a positive number of commits"),
+		"unexpected error: {}",
+		stderr(&update)
+	);
+	assert_eq!(std::fs::read(&config).unwrap(), before);
+	assert!(!fixture.consumer.join("modules/one/.git").exists());
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-update").exists());
 }
 
 #[test]
@@ -4609,9 +4912,14 @@ async fn rewritten_http_module_origin_is_credential_safe_and_reusable() {
 	let rewrite_key = format!("url.{rewritten}.insteadOf");
 	git_ok(&fixture.consumer, &["config", &rewrite_key, alias]);
 
-	let initial = gta(&fixture.consumer, false, &["submodule", "update", "--init"]);
+	let initial = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "update", "--init", "--depth", "1"],
+	);
 	assert_success(&initial, "initial rewritten HTTP submodule update");
 	let module = fixture.consumer.join("modules/one");
+	assert_shallow_one(&module);
 	assert_eq!(
 		git(&module, &["config", "--get", "remote.origin.url"]).trim(),
 		persisted,
@@ -5586,7 +5894,11 @@ fn an_existing_unborn_module_is_refused_without_changing_local_state() {
 	let config_before = std::fs::read(module_git_dir.join("config")).unwrap();
 	let marker_before = std::fs::read(module.join(".git")).unwrap();
 
-	let update = gta(&fixture.consumer, true, &["submodule", "update"]);
+	let update = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--depth", "1"],
+	);
 	assert!(!update.status.success(), "unborn existing module must fail");
 	assert!(
 		stderr(&update).contains("because its HEAD is unborn"),
@@ -5920,7 +6232,11 @@ fn ssh_exact_object_fallback_reopens_the_completed_fetch_session() {
 	);
 	std::fs::write(&sessions, b"").unwrap();
 
-	let update = gta_with_environment(&fixture.consumer, &["submodule", "update"], &environment);
+	let update = gta_with_environment(
+		&fixture.consumer,
+		&["submodule", "update", "--depth", "1"],
+		&environment,
+	);
 	assert_success(&update, "SSH exact-object fallback");
 	assert_eq!(
 		std::fs::read_to_string(&sessions).unwrap().lines().count(),
@@ -5928,6 +6244,7 @@ fn ssh_exact_object_fallback_reopens_the_completed_fetch_session() {
 		"normal fetch and exact-object fallback must use separate SSH sessions"
 	);
 	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), hidden);
+	assert_shallow_one(&module);
 	assert_eq!(
 		std::fs::read_to_string(module.join("file.txt")).unwrap(),
 		"hidden over ssh\n"
@@ -5937,14 +6254,34 @@ fn ssh_exact_object_fallback_reopens_the_completed_fetch_session() {
 #[test]
 fn an_existing_current_module_still_fetches_advertised_refs() {
 	let fixture = Fixture::new("existing-advertised-fetch");
-	assert_success(
-		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
-		"initial update",
+	fixture.commit_source("first advertised\n", "first advertised commit");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.url",
+			&format!("file://{}", fixture.source.display()),
+		],
 	);
-	let next = fixture.commit_source("advertised\n", "advertised commit");
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--init", "--depth", "1"],
+		),
+		"initial shallow update",
+	);
 	let module = fixture.consumer.join("modules/one");
+	assert_shallow_one(&module);
+	let next = fixture.commit_source("second advertised\n", "second advertised commit");
 
-	let update = gta(&fixture.consumer, true, &["submodule", "update"]);
+	let update = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--depth", "1"],
+	);
 	assert_success(&update, "advertised fetch for current module");
 	assert_eq!(
 		git(&module, &["rev-parse", "refs/remotes/origin/main"]).trim(),
@@ -5954,6 +6291,12 @@ fn an_existing_current_module_still_fetches_advertised_refs() {
 		git(&module, &["rev-parse", "HEAD"]).trim(),
 		fixture.old,
 		"fetching advertised refs must not move beyond the recorded gitlink"
+	);
+	assert_shallow_one(&module);
+	assert_eq!(
+		git(&module, &["rev-list", "--count", &next]).trim(),
+		"1",
+		"the separately fetched advertised tip must retain its shallow boundary"
 	);
 }
 
@@ -7083,8 +7426,23 @@ fn update_dispatches_sha256_superprojects_and_modules() {
 	}
 	let fixture = Fixture::new_with_format("sha256", Some("sha256"));
 	assert_eq!(fixture.old.len(), 64);
-	let update = gta(&fixture.consumer, true, &["submodule", "update", "--init"]);
-	assert_success(&update, "SHA-256 update");
+	fixture.commit_source("new\n", "advance SHA-256 source");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.url",
+			&format!("file://{}", fixture.source.display()),
+		],
+	);
+	let update = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--init", "--depth", "1"],
+	);
+	assert_success(&update, "shallow SHA-256 update");
 	assert_eq!(
 		git(
 			&fixture.consumer.join("modules/one"),
@@ -7093,6 +7451,7 @@ fn update_dispatches_sha256_superprojects_and_modules() {
 		.trim(),
 		fixture.old
 	);
+	assert_shallow_one(&fixture.consumer.join("modules/one"));
 	assert_eq!(
 		stdout(&gta(&fixture.consumer, false, &["submodule", "status"])),
 		format!(" {} modules/one\n", fixture.old)
@@ -8029,6 +8388,21 @@ fn git_path(repository: &Path, path: &str) -> PathBuf {
 	} else {
 		repository.join(rendered)
 	}
+}
+
+fn assert_shallow_one(repository: &Path) {
+	assert_eq!(
+		git(repository, &["rev-parse", "--is-shallow-repository"]).trim(),
+		"true",
+		"{} must be shallow",
+		repository.display()
+	);
+	assert_eq!(
+		git(repository, &["rev-list", "--count", "HEAD"]).trim(),
+		"1",
+		"{} must retain only the checked-out commit's shallow history",
+		repository.display()
+	);
 }
 
 fn gta(repository: &Path, allow_file: bool, args: &[&str]) -> Output {

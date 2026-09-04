@@ -60,6 +60,7 @@ struct Planned<H: HashAlgorithm> {
 	recovering: bool,
 	intent_identity: Option<EntryIdentity>,
 	module_config_lease: Option<crate::SubmoduleMutationLease>,
+	depth: Option<u32>,
 	pointers: ModulePointers,
 }
 
@@ -265,7 +266,11 @@ impl SubmoduleContext {
 		configuration: &C,
 		transfer: &T,
 		reflog_committer: Option<String>,
+		depth: Option<u32>,
 	) -> Result<Option<UpdateReport>, UpdateFailure> {
+		if depth == Some(0) {
+			return Err(UpdateFailure::preflight(SubmoduleError::InvalidDepth));
+		}
 		self
 			.ensure_no_repository_deinit_recovery()
 			.map_err(UpdateFailure::preflight)?;
@@ -281,6 +286,7 @@ impl SubmoduleContext {
 		let request = UpdateRequest {
 			query,
 			initialize: false,
+			depth,
 			initialize_only_active: false,
 			reflog_committer,
 		};
@@ -358,6 +364,9 @@ impl SubmoduleContext {
 		transfer: &T,
 		retained_lock: Option<UpdateLockGuard>,
 	) -> Result<UpdateReport, UpdateFailure> {
+		if request.depth == Some(0) {
+			return Err(UpdateFailure::preflight(SubmoduleError::InvalidDepth));
+		}
 		let worktree = self.worktree::<H>().map_err(UpdateFailure::preflight)?;
 		let index = worktree
 			.load_index()
@@ -497,6 +506,7 @@ impl SubmoduleContext {
 					recovering: false,
 					intent_identity: None,
 					module_config_lease: None,
+					depth: request.depth,
 					pointers: pointers
 						.remove(&path)
 						.expect("preflight computed every selected module pointer"),
@@ -532,6 +542,7 @@ impl SubmoduleContext {
 				recovering: false,
 				intent_identity: None,
 				module_config_lease: None,
+				depth: request.depth,
 				pointers: pointers
 					.remove(&path)
 					.expect("preflight computed every selected module pointer"),
@@ -735,6 +746,7 @@ impl SubmoduleContext {
 		// local state even if the original source has disappeared. Ordinary existing repositories keep
 		// Git's fetch-first update behavior, including retained repositories without a recovery intent.
 		let mut resolved_existing_source = None;
+		let mut fetched_roots = Vec::new();
 		if existing && !entry.recovering {
 			let source = module_origin_url(&config, &entry.declaration.name)?;
 			let transfer_directory =
@@ -760,6 +772,7 @@ impl SubmoduleContext {
 						display_git_dir: module_git_dir.clone(),
 						hash_kind: crate::object_id::kind::<H>(),
 						recorded: SubmoduleObjectId::from_typed(entry.recorded),
+						depth: entry.depth,
 					},
 					mutation_lease.clone(),
 				)
@@ -771,11 +784,18 @@ impl SubmoduleContext {
 				));
 			}
 			resolved_existing_source = Some(fetched.resolved_source);
+			fetched_roots = fetched.fetched_roots;
 		}
 		if !repository.objects().exists_object(&entry.recorded).await? {
 			return Err(SubmoduleError::InvalidRepository(
 				entry.declaration.name.clone(),
 			));
+		}
+		if entry.depth.is_some() && existing && !entry.recovering {
+			let roots = durability_roots(entry.recorded, fetched_roots)?;
+			repository
+				.durability_barrier_object_graphs(&roots, &[])
+				.await?;
 		}
 		let target_tree = repository.commit_tree(entry.recorded).await?;
 		let head_lock = repository.refs().lock_head().await?;
@@ -976,7 +996,7 @@ impl SubmoduleContext {
 				path: self.layout.git_dir.join(STAGED_REPOSITORY),
 				source,
 			})?;
-		transfer
+		let fetched_roots = transfer
 			.populate_prepared(
 				prepared.source,
 				PrepareRepository {
@@ -984,12 +1004,19 @@ impl SubmoduleContext {
 					display_git_dir: self.layout.git_dir.join(STAGED_REPOSITORY),
 					hash_kind: crate::object_id::kind::<H>(),
 					recorded: SubmoduleObjectId::from_typed(entry.recorded),
+					depth: entry.depth,
 				},
 			)
 			.await
 			.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
+		let durability_roots = durability_roots(entry.recorded, fetched_roots)?;
 		self
-			.verify_staged::<H>(entry.recorded, &entry.declaration.name, &stage_directory)
+			.verify_staged::<H>(
+				entry.recorded,
+				&durability_roots,
+				&entry.declaration.name,
+				&stage_directory,
+			)
 			.await?;
 		let target = Path::new("modules").join(&entry.declaration.name);
 		let target_parent = self.ensure_git_parent_directories(&target)?;
@@ -1219,6 +1246,7 @@ impl SubmoduleContext {
 	async fn verify_staged<H: HashAlgorithm>(
 		&self,
 		recorded: ObjectId<H>,
+		fetched_roots: &[ObjectId<H>],
 		name: &str,
 		directory: &Dir,
 	) -> Result<(), SubmoduleError> {
@@ -1238,7 +1266,7 @@ impl SubmoduleContext {
 		// that namespace publication; a failed barrier leaves the durable intent and private stage in
 		// place for the normal recovery path.
 		repository
-			.durability_barrier_object_graph(recorded, &[])
+			.durability_barrier_object_graphs(fetched_roots, &[])
 			.await?;
 		repository.durability_barrier_initialized().await?;
 		self.ensure_staged_identity(name, directory)?;
@@ -2879,6 +2907,25 @@ fn module_origin_url(
 		.ok_or_else(|| SubmoduleError::MissingModuleOrigin(module.to_owned()))
 }
 
+fn durability_roots<H: HashAlgorithm>(
+	recorded: ObjectId<H>,
+	fetched: Vec<SubmoduleObjectId>,
+) -> Result<Vec<ObjectId<H>>, SubmoduleError> {
+	let mut roots = Vec::with_capacity(fetched.len() + 1);
+	roots.push(recorded);
+	for root in fetched {
+		let root = root.to_typed::<H>().ok_or_else(|| {
+			SubmoduleError::Transfer(
+				"submodule transfer returned a fetched root for the wrong hash algorithm".to_owned(),
+			)
+		})?;
+		if !roots.contains(&root) {
+			roots.push(root);
+		}
+	}
+	Ok(roots)
+}
+
 fn outcome<H: HashAlgorithm>(entry: &Planned<H>, state: UpdateOutcomeState) -> UpdateOutcome {
 	UpdateOutcome {
 		name: entry.declaration.name.clone(),
@@ -4436,6 +4483,7 @@ mod tests {
 			recovering: false,
 			intent_identity: None,
 			module_config_lease: None,
+			depth: None,
 			pointers,
 		};
 		(temporary, context, entry)

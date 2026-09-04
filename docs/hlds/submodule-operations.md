@@ -64,9 +64,23 @@ failure returns an error but retains the valid root clone, activation settings, 
 prefix, and any durable update intent for a later `submodule update --init --recursive` retry. That
 no-path retry reloads and applies the persisted root activation selectors, so it cannot register or
 materialize a sibling excluded by the original clone request.
-Failures before root publication retain the ordinary clone cleanup contract. Clone-time jobs,
-shallow-submodule propagation, and remote-branch submodule updates are not supported. A shallow root
-clone does not implicitly make its submodules shallow.
+`clone --recurse-submodules --shallow-submodules` supplies an absolute depth of one to every selected
+module and successful descendant. `submodule update --depth N` accepts only a positive depth and
+applies it to newly prepared and existing module repositories, including the exact recorded-commit
+fallback when that commit is older than the advertised branch tip. Recursive recovery carries the
+current invocation's depth, but depth is intentionally not part of the durable source/target intent:
+it changes local storage completeness rather than the semantic commit being recovered. Therefore a
+failed shallow clone is faithfully continued with `submodule update --init --recursive --depth 1`;
+a retry without the explicit depth may complete remaining repositories with full history. HTTP, SSH,
+and `file://` sources honor the request. Initial native-local cloning ignores depth like top-level
+clone, while later fetches into an existing native-local module honor it. Every advertised tip and
+exact recorded-commit fallback requested by a shallow transfer crosses one combined object-graph
+durability barrier with the complete shallow boundary before checkout/publication reports success.
+A shallow root clone does not implicitly make its submodules shallow, and
+`--shallow-submodules` without recursion has no effect. Clone-time jobs, `.gitmodules` recommended
+shallow values, `--[no-]recommend-shallow`, shallow since/exclude propagation, explicit
+`--no-shallow-submodules`, and remote-branch submodule updates remain unsupported.
+Failures before root publication retain the ordinary clone cleanup contract.
 
 The implementation is split at an authority boundary. `gitana-submodule` owns declaration parsing,
 selection, state transitions, validation, reports, and recovery. It receives already-opened
