@@ -161,6 +161,66 @@ fn shallow_recursive_clone_and_update_bound_each_recorded_commit() {
 		"shallow-submodules without recursion",
 	);
 	assert!(!no_recursion.join("modules/middle/.git").exists());
+
+	set_module_shallow(&middle, "child", "true");
+	git_ok(&middle, &["add", ".gitmodules"]);
+	commit(&middle, "recommend shallow child clones");
+	let middle_tip = git(&middle, &["rev-parse", "HEAD"]);
+	git_allow(&superproject.join("modules/middle"), &["fetch", "origin"]);
+	git_ok(
+		&superproject.join("modules/middle"),
+		&["checkout", "-q", middle_tip.trim()],
+	);
+	set_module_shallow(&superproject, "modules/middle", "true");
+	git_ok(&superproject, &["add", ".gitmodules", "modules/middle"]);
+	commit(&superproject, "recommend shallow recursive modules");
+
+	let recommended = root.join("recommended");
+	assert_success(
+		&gta(
+			&root,
+			true,
+			&[
+				"clone",
+				"--recurse-submodules",
+				superproject.to_str().unwrap(),
+				recommended.to_str().unwrap(),
+			],
+		),
+		"recursive clone with per-module shallow recommendations",
+	);
+	assert_shallow_one(&recommended.join("modules/middle"));
+	assert_shallow_one(&recommended.join("modules/middle/child"));
+
+	let recommendations_ignored = root.join("recommendations-ignored");
+	assert_success(
+		&gta(
+			&root,
+			false,
+			&[
+				"clone",
+				superproject.to_str().unwrap(),
+				recommendations_ignored.to_str().unwrap(),
+			],
+		),
+		"clone before ignoring recursive shallow recommendations",
+	);
+	assert_success(
+		&gta(
+			&recommendations_ignored,
+			true,
+			&[
+				"submodule",
+				"update",
+				"--init",
+				"--recursive",
+				"--no-recommend-shallow",
+			],
+		),
+		"recursive update ignoring per-module shallow recommendations",
+	);
+	assert_not_shallow(&recommendations_ignored.join("modules/middle"));
+	assert_not_shallow(&recommendations_ignored.join("modules/middle/child"));
 	std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -1038,6 +1098,151 @@ fn submodule_update_depth_honors_file_urls_and_updates_existing_repositories() {
 }
 
 #[test]
+fn recommended_shallow_only_applies_when_creating_module_repositories() {
+	let ignored = Fixture::new("submodule-recommended-shallow-ignored");
+	ignored.commit_source("new\n", "advance source before full module clone");
+	configure_module_shallow(&ignored.consumer, "one", &ignored.source, "true");
+	assert_success(
+		&gta(
+			&ignored.consumer,
+			true,
+			&[
+				"submodule",
+				"update",
+				"--init",
+				"--recommend-shallow",
+				"--no-recommend-shallow",
+			],
+		),
+		"last no-recommend-shallow disables the recommendation",
+	);
+	let ignored_module = ignored.consumer.join("modules/one");
+	assert_not_shallow(&ignored_module);
+
+	let recorded = ignored.commit_source("later\n", "advance existing module source");
+	ignored.record_superproject_commit(&recorded, "advance existing module gitlink");
+	git_ok(&ignored.consumer, &["fetch", "origin"]);
+	git_ok(&ignored.consumer, &["reset", "--hard", "origin/main"]);
+	configure_module_shallow(&ignored.consumer, "one", &ignored.source, "true");
+	assert_success(
+		&gta(&ignored.consumer, true, &["submodule", "update"]),
+		"a recommendation does not truncate an existing repository",
+	);
+	assert_eq!(
+		git(&ignored_module, &["rev-parse", "HEAD"]).trim(),
+		recorded
+	);
+	assert_not_shallow(&ignored_module);
+
+	let recommended = Fixture::new("submodule-recommended-shallow-enabled");
+	recommended.commit_source("new\n", "advance recommended source");
+	configure_module_shallow(&recommended.consumer, "one", &recommended.source, "true");
+	assert_success(
+		&gta(
+			&recommended.consumer,
+			true,
+			&[
+				"submodule",
+				"update",
+				"--init",
+				"--no-recommend-shallow",
+				"--recommend-shallow",
+			],
+		),
+		"last recommend-shallow enables the recommendation",
+	);
+	assert_shallow_one(&recommended.consumer.join("modules/one"));
+
+	let explicit = Fixture::new("submodule-recommended-shallow-explicit-depth");
+	explicit.commit_source("new\n", "advance explicitly shallow source");
+	configure_module_shallow(&explicit.consumer, "one", &explicit.source, "false");
+	assert_success(
+		&gta(
+			&explicit.consumer,
+			true,
+			&[
+				"submodule",
+				"update",
+				"--init",
+				"--no-recommend-shallow",
+				"--depth",
+				"1",
+			],
+		),
+		"explicit depth overrides disabled and false recommendations",
+	);
+	assert_shallow_one(&explicit.consumer.join("modules/one"));
+}
+
+#[test]
+fn clone_shallow_submodule_negation_preserves_per_module_recommendations() {
+	let fixture = Fixture::new("clone-shallow-submodule-negation");
+	fixture.commit_source("new\n", "advance clone recommendation source");
+	configure_module_shallow(&fixture.superproject, "one", &fixture.source, "false");
+	git_ok(&fixture.superproject, &["add", ".gitmodules"]);
+	commit(
+		&fixture.superproject,
+		"disable module shallow recommendation",
+	);
+
+	let disabled = fixture.root.join("clone-shallow-disabled");
+	assert_success(
+		&gta(
+			&fixture.root,
+			true,
+			&[
+				"clone",
+				"--recurse-submodules",
+				"--shallow-submodules",
+				"--no-shallow-submodules",
+				fixture.superproject.to_str().unwrap(),
+				disabled.to_str().unwrap(),
+			],
+		),
+		"last no-shallow-submodules cancels the global shallow force",
+	);
+	assert_not_shallow(&disabled.join("modules/one"));
+
+	let enabled = fixture.root.join("clone-shallow-enabled");
+	assert_success(
+		&gta(
+			&fixture.root,
+			true,
+			&[
+				"clone",
+				"--recurse-submodules",
+				"--no-shallow-submodules",
+				"--shallow-submodules",
+				fixture.superproject.to_str().unwrap(),
+				enabled.to_str().unwrap(),
+			],
+		),
+		"last shallow-submodules enables the global shallow force",
+	);
+	assert_shallow_one(&enabled.join("modules/one"));
+
+	set_module_shallow(&fixture.superproject, "one", "true");
+	git_ok(&fixture.superproject, &["add", ".gitmodules"]);
+	commit(&fixture.superproject, "recommend shallow module clones");
+	let recommended = fixture.root.join("clone-shallow-recommended");
+	assert_success(
+		&gta(
+			&fixture.root,
+			true,
+			&[
+				"clone",
+				"--recurse-submodules",
+				"--no-shallow-submodules",
+				fixture.superproject.to_str().unwrap(),
+				recommended.to_str().unwrap(),
+			],
+		),
+		"no-shallow-submodules retains the per-module recommendation",
+	);
+	assert_shallow_one(&recommended.join("modules/one"));
+}
+
+#[test]
 fn submodule_update_rejects_zero_depth_before_mutation() {
 	let fixture = Fixture::new("submodule-update-zero-depth");
 	let config = git_path(&fixture.consumer, "config");
@@ -1056,6 +1261,45 @@ fn submodule_update_rejects_zero_depth_before_mutation() {
 	assert_eq!(std::fs::read(&config).unwrap(), before);
 	assert!(!fixture.consumer.join("modules/one/.git").exists());
 	assert!(!git_path(&fixture.consumer, "gitana-submodule-update").exists());
+}
+
+#[test]
+fn malformed_shallow_recommendation_fails_before_initialization() {
+	let fixture = Fixture::new("submodule-invalid-shallow-recommendation");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"--add",
+			"submodule.unselected.shallow",
+			"invalid",
+		],
+	);
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"--add",
+			"submodule.unselected.shallow",
+			"false",
+		],
+	);
+	let config = git_path(&fixture.consumer, "config");
+	let before = std::fs::read(&config).unwrap();
+	let update = gta(&fixture.consumer, true, &["submodule", "update", "--init"]);
+	assert!(!update.status.success(), "malformed boolean must fail");
+	assert!(
+		stderr(&update).contains("not a boolean"),
+		"unexpected error: {}",
+		stderr(&update)
+	);
+	assert_eq!(std::fs::read(config).unwrap(), before);
+	assert!(!fixture.consumer.join("modules/one/.git").exists());
+	assert!(!git_path(&fixture.consumer, "modules/one").exists());
 }
 
 #[test]
@@ -8216,6 +8460,21 @@ impl Drop for Fixture {
 	}
 }
 
+fn configure_module_shallow(repository: &Path, name: &str, source: &Path, shallow: &str) {
+	let url_key = format!("submodule.{name}.url");
+	let source = format!("file://{}", source.display());
+	git_ok(
+		repository,
+		&["config", "-f", ".gitmodules", &url_key, &source],
+	);
+	set_module_shallow(repository, name, shallow);
+}
+
+fn set_module_shallow(repository: &Path, name: &str, shallow: &str) {
+	let key = format!("submodule.{name}.shallow");
+	git_ok(repository, &["config", "-f", ".gitmodules", &key, shallow]);
+}
+
 fn add_second_module_mapping(fixture: &Fixture) {
 	git_ok(
 		&fixture.consumer,
@@ -8401,6 +8660,15 @@ fn assert_shallow_one(repository: &Path) {
 		git(repository, &["rev-list", "--count", "HEAD"]).trim(),
 		"1",
 		"{} must retain only the checked-out commit's shallow history",
+		repository.display()
+	);
+}
+
+fn assert_not_shallow(repository: &Path) {
+	assert_eq!(
+		git(repository, &["rev-parse", "--is-shallow-repository"]).trim(),
+		"false",
+		"{} must retain complete history",
 		repository.display()
 	);
 }

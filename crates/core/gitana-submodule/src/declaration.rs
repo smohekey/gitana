@@ -10,6 +10,8 @@ pub struct SubmoduleDeclaration {
 	pub url: Option<String>,
 	pub branch: Option<String>,
 	pub update: Option<String>,
+	/// Recommended shallow-clone policy from `.gitmodules`.
+	pub shallow: Option<bool>,
 }
 
 impl SubmoduleDeclaration {
@@ -21,6 +23,7 @@ impl SubmoduleDeclaration {
 			let url = field(&config, name, "url", true)?;
 			let branch = field(&config, name, "branch", false)?;
 			let update = field(&config, name, "update", false)?;
+			let shallow = config.get_bool_validated("submodule", Some(name), "shallow")?;
 			let Some(path) = path else {
 				continue;
 			};
@@ -30,6 +33,7 @@ impl SubmoduleDeclaration {
 				url,
 				branch,
 				update,
+				shallow,
 			});
 		}
 		Ok(declarations)
@@ -78,5 +82,26 @@ mod tests {
 			SubmoduleDeclaration::parse_all("[submodule \"a\"]\n\tpath = a\n\turl\n\turl = good\n")
 				.unwrap_err();
 		assert!(error.to_string().contains("missing value"));
+	}
+
+	#[test]
+	fn parses_shallow_with_gits_boolean_grammar() {
+		let declarations = SubmoduleDeclaration::parse_all(
+			"[submodule \"true\"]\n\tpath = true\n\tshallow\n\
+			 [submodule \"false\"]\n\tpath = false\n\tshallow = off\n",
+		)
+		.unwrap();
+		assert_eq!(declarations[0].shallow, Some(true));
+		assert_eq!(declarations[1].shallow, Some(false));
+	}
+
+	#[test]
+	fn validates_every_shallow_occurrence() {
+		let error = SubmoduleDeclaration::parse_all(
+			"[submodule \"a\"]\n\tpath = a\n\tshallow = true\n\
+			 [submodule \"unselected\"]\n\tshallow = invalid\n\tshallow = false\n",
+		)
+		.unwrap_err();
+		assert!(error.to_string().contains("not a boolean"));
 	}
 }

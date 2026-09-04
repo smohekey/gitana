@@ -490,8 +490,11 @@ enum Command {
 		)]
 		recurse_submodules: Vec<String>,
 		/// Clone selected submodules and descendants with history truncated to one commit.
-		#[arg(long)]
+		#[arg(long, overrides_with = "no_shallow_submodules")]
 		shallow_submodules: bool,
+		/// Do not force every cloned submodule to be shallow; per-module recommendations still apply.
+		#[arg(long, overrides_with = "shallow_submodules")]
+		no_shallow_submodules: bool,
 	},
 	/// Download new objects from the origin and update remote-tracking refs.
 	Fetch {
@@ -603,6 +606,12 @@ enum SubmoduleAction {
 		/// Limit fetched submodule history to this many commits from each requested tip.
 		#[arg(long, value_name = "depth")]
 		depth: Option<u32>,
+		/// Honor `.gitmodules` shallow recommendations when creating module repositories.
+		#[arg(long, overrides_with = "no_recommend_shallow")]
+		recommend_shallow: bool,
+		/// Ignore `.gitmodules` shallow recommendations.
+		#[arg(long, overrides_with = "recommend_shallow")]
+		no_recommend_shallow: bool,
 		/// Recursively update initialized descendants (and initialize them with `--init`).
 		#[arg(long)]
 		recursive: bool,
@@ -1084,7 +1093,9 @@ impl Cli {
 					sparse,
 					recurse_submodules,
 					shallow_submodules,
+					no_shallow_submodules,
 				} => {
+					let shallow_submodules = shallow_submodules && !no_shallow_submodules;
 					commands::clone::run(
 						&command_context,
 						url,
@@ -1178,11 +1189,14 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 		SubmoduleAction::Update {
 			init,
 			depth,
+			recommend_shallow,
+			no_recommend_shallow,
 			recursive,
 			paths,
 		} => Action::Update {
 			init,
 			depth,
+			recommend_shallow: recommend_shallow || !no_recommend_shallow,
 			recursive,
 			paths,
 		},
@@ -1297,5 +1311,77 @@ fn remote_action(verbose: bool, action: Option<RemoteAction>) -> commands::remot
 		Some(RemoteAction::Remove { name }) => Action::Remove { name },
 		Some(RemoteAction::Rename { old, new }) => Action::Rename { old, new },
 		Some(RemoteAction::SetUrl { name, url }) => Action::SetUrl { name, url },
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn clone_is_forced_shallow(arguments: &[&str]) -> bool {
+		let cli = Cli::try_parse_from(arguments).unwrap();
+		let Command::Clone {
+			shallow_submodules,
+			no_shallow_submodules,
+			..
+		} = cli.command
+		else {
+			panic!("expected clone command");
+		};
+		shallow_submodules && !no_shallow_submodules
+	}
+
+	fn update_recommends_shallow(arguments: &[&str]) -> bool {
+		let cli = Cli::try_parse_from(arguments).unwrap();
+		let Command::Submodule {
+			action: SubmoduleAction::Update { .. },
+		} = &cli.command
+		else {
+			panic!("expected submodule update command");
+		};
+		let Command::Submodule { action } = cli.command else {
+			unreachable!();
+		};
+		let commands::submodule::Action::Update {
+			recommend_shallow, ..
+		} = submodule_action(action)
+		else {
+			unreachable!();
+		};
+		recommend_shallow
+	}
+
+	#[test]
+	fn shallow_policy_negations_follow_the_last_occurrence() {
+		assert!(!clone_is_forced_shallow(&[
+			"gta-mcp",
+			"clone",
+			"--url",
+			"source",
+			"--shallow-submodules",
+			"--no-shallow-submodules",
+		]));
+		assert!(clone_is_forced_shallow(&[
+			"gta-mcp",
+			"clone",
+			"--url",
+			"source",
+			"--no-shallow-submodules",
+			"--shallow-submodules",
+		]));
+		assert!(!update_recommends_shallow(&[
+			"gta-mcp",
+			"submodule",
+			"update",
+			"--recommend-shallow",
+			"--no-recommend-shallow",
+		]));
+		assert!(update_recommends_shallow(&[
+			"gta-mcp",
+			"submodule",
+			"update",
+			"--no-recommend-shallow",
+			"--recommend-shallow",
+		]));
 	}
 }

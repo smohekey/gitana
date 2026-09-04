@@ -1195,6 +1195,7 @@ impl SubmoduleContext {
 						url: None,
 						branch: None,
 						update: None,
+						shallow: None,
 					},
 					module,
 					configuration,
@@ -1800,6 +1801,7 @@ impl SubmoduleContext {
 			url: None,
 			branch: None,
 			update: None,
+			shallow: None,
 		};
 		let marker = if at_public_path {
 			self
@@ -2285,6 +2287,7 @@ impl SubmoduleContext {
 				url: None,
 				branch: None,
 				update: None,
+				shallow: None,
 			},
 			&directory,
 		)?;
@@ -2424,6 +2427,7 @@ impl SubmoduleContext {
 			url: None,
 			update: None,
 			branch: None,
+			shallow: None,
 		};
 		self
 			.ensure_module_repository_valid::<H, C>(&declaration, module, configuration)
@@ -2573,6 +2577,7 @@ impl SubmoduleContext {
 			url: None,
 			branch: None,
 			update: None,
+			shallow: None,
 		};
 		let expected_marker = intent.mount_marker.as_ref().ok_or_else(|| {
 			SubmoduleError::RecoveryRequired("mounted deinit intent has no exact mount marker".to_owned())
@@ -4137,6 +4142,7 @@ mod tests {
 			url: None,
 			branch: None,
 			update: None,
+			shallow: None,
 		};
 		(temporary, context, declaration)
 	}

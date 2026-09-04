@@ -68,18 +68,31 @@ materialize a sibling excluded by the original clone request.
 module and successful descendant. `submodule update --depth N` accepts only a positive depth and
 applies it to newly prepared and existing module repositories, including the exact recorded-commit
 fallback when that commit is older than the advertised branch tip. Recursive recovery carries the
-current invocation's depth, but depth is intentionally not part of the durable source/target intent:
-it changes local storage completeness rather than the semantic commit being recovered. Therefore a
-failed shallow clone is faithfully continued with `submodule update --init --recursive --depth 1`;
-a retry without the explicit depth may complete remaining repositories with full history. HTTP, SSH,
-and `file://` sources honor the request. Initial native-local cloning ignores depth like top-level
-clone, while later fetches into an existing native-local module honor it. Every advertised tip and
-exact recorded-commit fallback requested by a shallow transfer crosses one combined object-graph
-durability barrier with the complete shallow boundary before checkout/publication reports success.
-A shallow root clone does not implicitly make its submodules shallow, and
-`--shallow-submodules` without recursion has no effect. Clone-time jobs, `.gitmodules` recommended
-shallow values, `--[no-]recommend-shallow`, shallow since/exclude propagation, explicit
-`--no-shallow-submodules`, and remote-branch submodule updates remain unsupported.
+current invocation's depth and shallow-recommendation policy, but neither is part of the durable
+source/target intent: they change local storage completeness rather than the semantic commit being
+recovered. Therefore a failed shallow clone is faithfully continued with
+`submodule update --init --recursive --depth 1`; a retry without the explicit depth may complete
+remaining repositories with full history.
+
+By default, a true `.gitmodules` `submodule.<name>.shallow` value recommends depth one when the module
+repository is first created. Git's full boolean grammar is accepted, a valueless variable means true,
+and every occurrence across every declaration is validated during structural preflight. A malformed
+value therefore fails before initialization even when a later value wins or the declaration is not
+selected. `submodule update --no-recommend-shallow` disables these recommendations for the invocation;
+`--recommend-shallow` re-enables them, repeated positive and negative forms follow last-occurrence
+ordering, and the choice propagates recursively. An explicit `--depth N` always wins. Recommendations
+never truncate or depth-limit a fetch into an existing or retained module repository. The setting is
+read only from `.gitmodules`; a same-named repository-local value does not override it.
+
+HTTP, SSH, and `file://` sources honor effective depths. Initial native-local cloning ignores depth
+like top-level clone, while later explicitly depth-limited fetches into an existing native-local module
+honor it. Every advertised tip and exact recorded-commit fallback requested by a shallow transfer
+crosses one combined object-graph durability barrier with the complete shallow boundary before
+checkout/publication reports success. A shallow root clone does not implicitly make its submodules
+shallow, and `--shallow-submodules` without recursion has no effect. Clone
+`--no-shallow-submodules` cancels the global depth-one force but continues to honor true per-module
+recommendations; repeated positive and negative forms follow last-occurrence ordering. Clone-time
+jobs, shallow since/exclude propagation, and remote-branch submodule updates remain unsupported.
 Failures before root publication retain the ordinary clone cleanup contract.
 
 The implementation is split at an authority boundary. `gitana-submodule` owns declaration parsing,

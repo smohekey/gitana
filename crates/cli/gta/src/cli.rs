@@ -436,8 +436,11 @@ enum Command {
 		)]
 		recurse_submodules: Vec<String>,
 		/// Clone selected submodules and descendants with history truncated to one commit.
-		#[arg(long)]
+		#[arg(long, overrides_with = "no_shallow_submodules")]
 		shallow_submodules: bool,
+		/// Do not force every cloned submodule to be shallow; per-module recommendations still apply.
+		#[arg(long, overrides_with = "shallow_submodules")]
+		no_shallow_submodules: bool,
 	},
 	/// Download new objects from the origin and update remote-tracking refs.
 	Fetch {
@@ -549,6 +552,12 @@ enum SubmoduleAction {
 		/// Limit fetched submodule history to this many commits from each requested tip.
 		#[arg(long, value_name = "depth")]
 		depth: Option<u32>,
+		/// Honor `.gitmodules` shallow recommendations when creating module repositories.
+		#[arg(long, overrides_with = "no_recommend_shallow")]
+		recommend_shallow: bool,
+		/// Ignore `.gitmodules` shallow recommendations.
+		#[arg(long, overrides_with = "recommend_shallow")]
+		no_recommend_shallow: bool,
 		/// Recursively update initialized descendants (and initialize them with `--init`).
 		#[arg(long)]
 		recursive: bool,
@@ -1017,7 +1026,9 @@ impl Cli {
 					sparse,
 					recurse_submodules,
 					shallow_submodules,
+					no_shallow_submodules,
 				} => {
+					let shallow_submodules = shallow_submodules && !no_shallow_submodules;
 					commands::clone::run(
 						&command_context,
 						url,
@@ -1104,11 +1115,14 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 		SubmoduleAction::Update {
 			init,
 			depth,
+			recommend_shallow,
+			no_recommend_shallow,
 			recursive,
 			paths,
 		} => Action::Update {
 			init,
 			depth,
+			recommend_shallow: recommend_shallow || !no_recommend_shallow,
 			recursive,
 			paths,
 		},

@@ -29,6 +29,7 @@ pub enum Action {
 	Update {
 		init: bool,
 		depth: Option<u32>,
+		recommend_shallow: bool,
 		recursive: bool,
 		paths: Vec<String>,
 	},
@@ -76,6 +77,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 		Action::Update {
 			init,
 			depth,
+			recommend_shallow,
 			recursive: true,
 			paths,
 		} => {
@@ -88,6 +90,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 					query: SubmoduleQuery::paths(paths.clone()),
 					initialize: *init,
 					depth: *depth,
+					recommend_shallow: *recommend_shallow,
 					initialize_only_active: false,
 					reflog_committer: None,
 				},
@@ -173,6 +176,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 		Action::Update {
 			init,
 			depth,
+			recommend_shallow,
 			recursive: false,
 			paths,
 		} => {
@@ -186,6 +190,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 				query: SubmoduleQuery::paths(paths),
 				initialize: init,
 				depth,
+				recommend_shallow,
 				initialize_only_active: false,
 				reflog_committer: Some(committer(&superproject)),
 			};
@@ -307,6 +312,7 @@ async fn recursive_update(
 		query,
 		initialize,
 		depth,
+		recommend_shallow,
 		initialize_only_active,
 		..
 	} = request;
@@ -332,7 +338,7 @@ async fn recursive_update(
 			prefix,
 			&level_prefix,
 			command,
-			(module_base.clone(), depth),
+			(module_base.clone(), depth, recommend_shallow),
 		))
 		.await?;
 	}
@@ -347,6 +353,7 @@ async fn recursive_update(
 		initialize_only_active,
 		credential_url_base,
 		depth,
+		recommend_shallow,
 	)]);
 	while let Some((
 		level_root,
@@ -358,6 +365,7 @@ async fn recursive_update(
 		initialize_only_active,
 		credential_url_base,
 		depth,
+		recommend_shallow,
 	)) = pending.pop_front()
 	{
 		let (layout, report, mut descendant_url_bases) = Box::pin(update_level(
@@ -371,6 +379,7 @@ async fn recursive_update(
 				query,
 				initialize,
 				depth,
+				recommend_shallow,
 				initialize_only_active,
 				reflog_committer: None,
 			},
@@ -393,6 +402,7 @@ async fn recursive_update(
 					false,
 					descendant_url_bases.remove(&outcome.path),
 					depth,
+					recommend_shallow,
 				));
 			}
 		}
@@ -433,6 +443,7 @@ pub(crate) async fn update_published_clone(
 			query: SubmoduleQuery::all(),
 			initialize: true,
 			depth,
+			recommend_shallow: true,
 			initialize_only_active: true,
 			reflog_committer: None,
 		},
@@ -572,9 +583,9 @@ async fn resume_update_level(
 	prefix: &str,
 	level_prefix: &str,
 	command: &CommandContext,
-	recovery_state: (gitana_config::GitConfig, Option<u32>),
+	recovery_state: (gitana_config::GitConfig, Option<u32>, bool),
 ) -> Result<()> {
-	let (module_base, depth) = recovery_state;
+	let (module_base, depth, recommend_shallow) = recovery_state;
 	let (layout, setup, common, git, work, configuration, superproject, hash_kind) =
 		Box::pin(open_level(root, expected_git_dir, discovered_root)).await?;
 	repo::ensure_no_pending_deinit_at(&layout, &common, &git)?;
@@ -594,6 +605,7 @@ async fn resume_update_level(
 		&transfer,
 		Some(committer(&superproject)),
 		depth,
+		recommend_shallow,
 	))
 	.await
 	{

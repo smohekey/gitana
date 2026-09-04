@@ -60,8 +60,20 @@ struct Planned<H: HashAlgorithm> {
 	recovering: bool,
 	intent_identity: Option<EntryIdentity>,
 	module_config_lease: Option<crate::SubmoduleMutationLease>,
+	/// Explicit depth applied to both new repositories and existing fetches.
 	depth: Option<u32>,
+	/// Effective depth for initial repository creation, including `.gitmodules` recommendations.
+	clone_depth: Option<u32>,
 	pointers: ModulePointers,
+}
+
+fn recommended_clone_depth(
+	request: &UpdateRequest,
+	declaration: &SubmoduleDeclaration,
+) -> Option<u32> {
+	request
+		.depth
+		.or_else(|| (request.recommend_shallow && declaration.shallow == Some(true)).then_some(1))
 }
 
 #[derive(Clone, Copy)]
@@ -267,6 +279,7 @@ impl SubmoduleContext {
 		transfer: &T,
 		reflog_committer: Option<String>,
 		depth: Option<u32>,
+		recommend_shallow: bool,
 	) -> Result<Option<UpdateReport>, UpdateFailure> {
 		if depth == Some(0) {
 			return Err(UpdateFailure::preflight(SubmoduleError::InvalidDepth));
@@ -287,6 +300,7 @@ impl SubmoduleContext {
 			query,
 			initialize: false,
 			depth,
+			recommend_shallow,
 			initialize_only_active: false,
 			reflog_committer,
 		};
@@ -498,6 +512,7 @@ impl SubmoduleContext {
 			validate_update_strategy(&declaration.name, &strategy)
 				.map_err(|source| UpdateFailure::after_init(&report, source))?;
 			if initialize_only_active && !active {
+				let clone_depth = recommended_clone_depth(request, &declaration);
 				plan.push(Planned {
 					declaration,
 					recorded,
@@ -507,6 +522,7 @@ impl SubmoduleContext {
 					intent_identity: None,
 					module_config_lease: None,
 					depth: request.depth,
+					clone_depth,
 					pointers: pointers
 						.remove(&path)
 						.expect("preflight computed every selected module pointer"),
@@ -534,6 +550,7 @@ impl SubmoduleContext {
 			} else {
 				None
 			};
+			let clone_depth = recommended_clone_depth(request, &declaration);
 			plan.push(Planned {
 				declaration,
 				recorded,
@@ -543,6 +560,7 @@ impl SubmoduleContext {
 				intent_identity: None,
 				module_config_lease: None,
 				depth: request.depth,
+				clone_depth,
 				pointers: pointers
 					.remove(&path)
 					.expect("preflight computed every selected module pointer"),
@@ -1004,7 +1022,7 @@ impl SubmoduleContext {
 					display_git_dir: self.layout.git_dir.join(STAGED_REPOSITORY),
 					hash_kind: crate::object_id::kind::<H>(),
 					recorded: SubmoduleObjectId::from_typed(entry.recorded),
-					depth: entry.depth,
+					depth: entry.clone_depth,
 				},
 			)
 			.await
@@ -3208,13 +3226,13 @@ mod tests {
 		acquire_submodule_config_setup_lease, acquire_update_lock_with_common,
 		ensure_directory_components, intent_matches_reprepare, intent_matches_source,
 		intent_source_context, legacy_source_fingerprint, marker_identity, module_origin_url,
-		publish_new_mount_marker, publish_stage_intent, remove_staged_repository,
-		rename_directory_noreplace, source_fingerprint, sync_repository_publication_parents,
-		update_effective_config,
+		publish_new_mount_marker, publish_stage_intent, recommended_clone_depth,
+		remove_staged_repository, rename_directory_noreplace, source_fingerprint,
+		sync_repository_publication_parents, update_effective_config,
 	};
 	use crate::{
 		ConfigViews, ConfigurationProvider, InitConfigResult, InitConfigUpdate, MarkerTargetResolver,
-		SubmoduleContext, SubmoduleDeclaration, SubmoduleError, UpdateReport,
+		SubmoduleContext, SubmoduleDeclaration, SubmoduleError, UpdateReport, UpdateRequest,
 	};
 	use cap_std::{ambient_authority, fs::Dir};
 	use gitana_config::GitConfig;
@@ -4473,6 +4491,7 @@ mod tests {
 			url: Some("source".to_owned()),
 			branch: None,
 			update: None,
+			shallow: None,
 		};
 		let pointers = context.module_pointers(&declaration).unwrap();
 		let entry = Planned {
@@ -4484,8 +4503,34 @@ mod tests {
 			intent_identity: None,
 			module_config_lease: None,
 			depth: None,
+			clone_depth: None,
 			pointers,
 		};
 		(temporary, context, entry)
+	}
+
+	#[test]
+	fn recommended_depth_only_changes_initial_clone_depth() {
+		let mut declaration = SubmoduleDeclaration {
+			name: "one".to_owned(),
+			path: "modules/one".to_owned(),
+			url: Some("source".to_owned()),
+			branch: None,
+			update: None,
+			shallow: Some(true),
+		};
+		let mut request = UpdateRequest::default();
+		assert_eq!(recommended_clone_depth(&request, &declaration), Some(1));
+
+		request.recommend_shallow = false;
+		assert_eq!(recommended_clone_depth(&request, &declaration), None);
+
+		request.depth = Some(3);
+		assert_eq!(recommended_clone_depth(&request, &declaration), Some(3));
+
+		request.depth = None;
+		request.recommend_shallow = true;
+		declaration.shallow = Some(false);
+		assert_eq!(recommended_clone_depth(&request, &declaration), None);
 	}
 }
