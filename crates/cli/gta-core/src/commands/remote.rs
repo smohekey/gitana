@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 use gitana_object::HashAlgorithm;
+use gitana_remote::validate_remote_name;
 use gitana_repository::Repository;
 
 use crate::dispatch::{self, RepoCommand};
@@ -97,7 +98,7 @@ async fn list<H: HashAlgorithm>(repo: &Repository<Backend, H>, verbose: bool) ->
 }
 
 async fn add<H: HashAlgorithm>(repo: &Repository<Backend, H>, name: &str, url: &str) -> Result<()> {
-	validate_name(name)?;
+	validate_remote_name(name)?;
 	let mut config = repo.read_config().await?;
 	if config.subsections("remote").contains(&name) {
 		bail!("remote '{name}' already exists");
@@ -168,7 +169,7 @@ async fn rename<H: HashAlgorithm>(
 	old: &str,
 	new: &str,
 ) -> Result<()> {
-	validate_name(new)?;
+	validate_remote_name(new)?;
 	let mut config = repo.read_config().await?;
 	let remotes = config.subsections("remote");
 	if !remotes.contains(&old) {
@@ -227,31 +228,5 @@ async fn rename<H: HashAlgorithm>(
 		.refs()
 		.rename_prefix(&old_tracking, &new_tracking)
 		.await?;
-	Ok(())
-}
-
-/// Reject a remote name that would produce an invalid `refs/remotes/<name>/*` refspec, applying
-/// git's refname rules to the `<name>` path segments. `<name>` is always a *middle* segment (the
-/// branch is the last), so the whole-refname-only rules (a trailing `.`, the single `@`) do not
-/// apply — git accepts remotes like `@` and `foo.`. A bad name would otherwise silently write config
-/// that stock `git fetch`/`git remote -v` then rejects.
-fn validate_name(name: &str) -> Result<()> {
-	// Anywhere in the name: no `..` or `@{`, and no ASCII control, space, or refname-special /
-	// config-breaking byte.
-	let anywhere_bad = name.contains("..")
-		|| name.contains("@{")
-		|| name.chars().any(|c| {
-			// git's refname-invalid bytes. A `"` is allowed: it is valid in a refname and the config
-			// writer escapes it in the `[remote "…"]` subsection header.
-			c.is_whitespace() || c.is_control() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
-		});
-	// Each `/`-separated segment (empty catches a leading/trailing/double slash) must be a valid
-	// refname component: non-empty, not starting with `.`, not ending with `.lock`.
-	let segment_bad = name
-		.split('/')
-		.any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"));
-	if name.is_empty() || anywhere_bad || segment_bad {
-		bail!("invalid remote name: '{name}'");
-	}
 	Ok(())
 }

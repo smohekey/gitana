@@ -106,6 +106,12 @@ struct PrefixSnapshot {
 	packed_refs: Vec<String>,
 }
 
+#[derive(PartialEq, Eq)]
+struct SymbolicRefResolution {
+	chain: Vec<String>,
+	terminal: String,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 struct OwnedRefOp<H: HashAlgorithm> {
 	name: String,
@@ -357,6 +363,53 @@ where
 		self.follow_symref(name).await
 	}
 
+	/// Resolve a direct or symbolic ref only when the initially requested loose name has the exact
+	/// spelling supplied by the caller. Packed refs are already matched byte-for-byte. This prevents a
+	/// case-insensitive filesystem from satisfying `refs/remotes/origin/HEAD` with an unrelated legal
+	/// tracking ref such as `refs/remotes/origin/head`.
+	pub async fn resolve_symbolic_exact(
+		&self,
+		name: &str,
+	) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let files = self.files.shared_handle();
+			let effective = self.effective.cloned();
+			let name = name.to_owned();
+			match tokio::spawn(async move {
+				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+				store.resolve_symbolic_exact_inline(&name).await
+			})
+			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		self.resolve_symbolic_exact_inline(name).await
+	}
+
+	async fn resolve_symbolic_exact_inline(
+		&self,
+		name: &str,
+	) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		let acquired = self
+			.lock_all(&[name.to_owned(), PACKED_REFS.to_owned()])
+			.await
+			.map_err(|(_, error)| error)?;
+		let result = async {
+			if self.ref_name_resolves_through_alias(name).await? {
+				return Ok(None);
+			}
+			self.follow_symref(name).await
+		}
+		.await;
+		self.release_locks(acquired).await;
+		result
+	}
+
 	/// Compare-and-set a ref. `expected == None` requires the ref to be absent; otherwise the current
 	/// value must equal `expected`. A ref present only in `packed-refs` counts as its packed value —
 	/// updating it writes the loose file, which shadows the packed entry from then on (as git does).
@@ -380,6 +433,179 @@ where
 			.transact(std::slice::from_ref(&op))
 			.await
 			.map_err(|(_, error)| error)
+	}
+
+	/// Compare-and-set a ref while following any symbolic chain at `name`, matching Git's default
+	/// `update-ref` behavior. Every symbolic hop, the terminal ref, and `packed-refs` remain locked
+	/// while the chain is revalidated and the terminal value is published, so a concurrent retarget
+	/// cannot redirect or detach the update. The symbolic ref itself is preserved. When reflogging is
+	/// enabled, every followed symbolic ref receives the same resolved old/new entry as Git; the
+	/// terminal ref keeps the ordinary direct-update and split-HEAD logging rules.
+	pub async fn update_ref_following_symbolic(
+		&self,
+		name: &str,
+		new: ObjectId<H>,
+		expected: Option<ObjectId<H>>,
+		reflog: ReflogIntent<'_>,
+	) -> Result<(), RepositoryError> {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let files = self.files.shared_handle();
+			let effective = self.effective.cloned();
+			let name = name.to_owned();
+			let reflog = OwnedReflogIntent::from(reflog);
+			match tokio::spawn(async move {
+				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+				store
+					.update_ref_following_symbolic_inline(&name, new, expected, reflog.borrow())
+					.await
+			})
+			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		self
+			.update_ref_following_symbolic_inline(name, new, expected, reflog)
+			.await
+	}
+
+	async fn update_ref_following_symbolic_inline(
+		&self,
+		name: &str,
+		new: ObjectId<H>,
+		expected: Option<ObjectId<H>>,
+		reflog: ReflogIntent<'_>,
+	) -> Result<(), RepositoryError> {
+		let policy = self.reflog_policy().await?;
+		let planned = self.symbolic_ref_resolution(name).await?;
+		let head_target = self.read_symbolic("HEAD").await?;
+		let cascade = planned.terminal.starts_with("refs/heads/")
+			&& head_target.as_deref() == Some(planned.terminal.as_str());
+		let mut lock_names = planned.chain.clone();
+		if cascade {
+			lock_names.push("HEAD".to_owned());
+		}
+		if planned.terminal.starts_with("refs/") {
+			lock_names.push(PACKED_REFS.to_owned());
+		}
+		let acquired = self
+			.lock_all(&lock_names)
+			.await
+			.map_err(|(_, error)| error)?;
+		let result = async {
+			let observed = self.symbolic_ref_resolution(name).await?;
+			if observed.chain != planned.chain || observed.terminal != planned.terminal {
+				return Err(RepositoryError::RefMoved {
+					name: name.to_owned(),
+				});
+			}
+			let symbolic_hops = observed
+				.chain
+				.iter()
+				.take(observed.chain.len().saturating_sub(1))
+				.cloned()
+				.collect::<Vec<_>>();
+			let op = RefOp {
+				name: observed.terminal,
+				expected,
+				new: Some(new),
+				reflog,
+			};
+			let cascades = self
+				.confirm_cascades(std::slice::from_ref(&op), vec![cascade])
+				.await
+				.map_err(|(_, error)| error)?;
+			let olds = self
+				.validate_locked(std::slice::from_ref(&op), &cascades, policy)
+				.await
+				.map_err(|(_, error)| error)?;
+			// Git logs the requested symbolic name and every intermediate hop, even for a no-op;
+			// the terminal direct ref retains the ordinary rule that suppresses a no-op entry. When
+			// `HEAD` is itself a followed hop, the terminal branch's split-HEAD cascade owns that one
+			// log entry, so exclude it here rather than appending it twice.
+			let mut logged_hops = Vec::new();
+			if matches!(reflog, ReflogIntent::Log { .. }) {
+				for hop in symbolic_hops {
+					if cascades[0] && hop == "HEAD" {
+						continue;
+					}
+					if self.should_log(&hop, policy).await? {
+						if self.path_write_blocked(&format!("logs/{hop}")).await? {
+							return Err(RepositoryError::InvalidRef(format!(
+								"{name}: reflog path {hop} blocked by an existing file or directory"
+							)));
+						}
+						logged_hops.push(hop);
+					}
+				}
+			}
+			if let ReflogIntent::Log { committer, message } = reflog {
+				for hop in logged_hops {
+					self
+						.append_reflog(&hop, olds[0], Some(new), committer, message)
+						.await?;
+				}
+			}
+			self
+				.commit_validated(std::slice::from_ref(&op), &olds, &cascades, policy)
+				.await
+				.map_err(|(_, error)| error)
+		}
+		.await;
+		self.release_locks(acquired).await;
+		result
+	}
+
+	async fn symbolic_ref_resolution(
+		&self,
+		name: &str,
+	) -> Result<SymbolicRefResolution, RepositoryError> {
+		let mut current = name.to_owned();
+		let mut chain = Vec::new();
+		for _ in 0..MAX_SYMREF_DEPTH {
+			if chain.contains(&current) {
+				return Err(RepositoryError::InvalidRef(format!(
+					"{name}: symbolic ref cycle"
+				)));
+			}
+			chain.push(current.clone());
+			match self.files.read_path(&current).await {
+				Ok(bytes) => {
+					let text = std::str::from_utf8(&bytes)
+						.map_err(|_| RepositoryError::InvalidRef(current.clone()))?
+						.trim();
+					if let Some(target) = text.strip_prefix("ref:") {
+						let target = target.trim();
+						if !is_valid_refname(target) {
+							return Err(RepositoryError::InvalidRef(format!(
+								"{current}: invalid symbolic target {target}"
+							)));
+						}
+						current = target.to_owned();
+					} else {
+						return Ok(SymbolicRefResolution {
+							chain,
+							terminal: current.clone(),
+						});
+					}
+				}
+				Err(FileStoreError::NotFound) => {
+					self.resolve_packed(&current).await?;
+					return Ok(SymbolicRefResolution {
+						chain,
+						terminal: current.clone(),
+					});
+				}
+				Err(other) => return Err(other.into()),
+			}
+		}
+		Err(RepositoryError::InvalidRef(format!(
+			"{name}: symbolic ref chain is too deep"
+		)))
 	}
 
 	/// Delete a ref, requiring its current resolved value to equal `expected` (CAS).
@@ -736,19 +962,18 @@ where
 	/// intermediate directory, e.g. a stray `logs/refs/heads/foo` file under `logs/refs/heads/foo/bar`).
 	///
 	/// A transaction preflights this for a move's ref path and its reflog path, so a validated commit
-	/// cannot fail on such a conflict. `is_dir` catches the directory case (including empty dirs);
-	/// `read_path` catches a file ancestor — it reads back `Ok` only for a file (a directory or absent
-	/// path errors, with a backend-varying kind, so we key on `Ok`).
+	/// cannot fail on such a conflict. `read_path` catches a file ancestor — it reads back `Ok` only
+	/// for a file (a directory or absent path errors, with a backend-varying kind, so we key on `Ok`).
+	/// Ancestors are checked before `is_dir`, because native metadata on the target can report
+	/// `NotADirectory` when an ancestor is the blocker. `is_dir` then catches the target-directory case
+	/// (including empty directories).
 	async fn path_write_blocked(&self, target: &str) -> Result<bool, RepositoryError> {
-		if self.files.is_dir(target).await? {
-			return Ok(true);
-		}
 		for (index, _) in target.match_indices('/') {
 			if self.files.read_path(&target[..index]).await.is_ok() {
 				return Ok(true);
 			}
 		}
-		Ok(false)
+		self.files.is_dir(target).await.map_err(Into::into)
 	}
 
 	/// Acquire every `<name>.lock` in `names`, sorted and deduped so concurrent transactions take
@@ -1492,6 +1717,166 @@ where
 		self.set_symbolic_inline(name, target, reflog).await
 	}
 
+	/// Publish a non-essential direct or symbolic ref when its namespace can safely represent it.
+	///
+	/// Unlike the ordinary ref-moving APIs, a directory/file conflict, malformed loose occupant, or
+	/// filesystem-equivalent differently spelled occupant at the exact name is an expected omission and
+	/// returns `false` without changing it. Other failures remain errors. The publication is unlogged and
+	/// holds the ref and packed-ref locks across its final validation and write, making the decision atomic
+	/// with other ref operations.
+	pub async fn publish_optional_ref(
+		&self,
+		name: &str,
+		state: HeadState<H>,
+	) -> Result<bool, RepositoryError> {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let files = self.files.shared_handle();
+			let effective = self.effective.cloned();
+			let name = name.to_owned();
+			match tokio::spawn(async move {
+				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+				store.publish_optional_ref_inline(&name, &state).await
+			})
+			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		self.publish_optional_ref_inline(name, &state).await
+	}
+
+	async fn publish_optional_ref_inline(
+		&self,
+		name: &str,
+		state: &HeadState<H>,
+	) -> Result<bool, RepositoryError> {
+		// A loose ancestor ref prevents the target lock's parent directory from being created. Detect
+		// that namespace shape before locking so an optional ref remains optional rather than turning a
+		// completed fetch into an error.
+		if self.path_write_blocked(name).await? {
+			return Ok(false);
+		}
+		let acquired = match self
+			.lock_all(&[name.to_owned(), PACKED_REFS.to_owned()])
+			.await
+		{
+			Ok(acquired) => acquired,
+			Err((failed, error)) => {
+				// An ancestor may have become a loose ref after the preflight. Confirm that concrete
+				// namespace conflict before translating the target-lock error; unrelated storage and
+				// contention failures remain fatal.
+				if failed == name && self.path_write_blocked(name).await? {
+					return Ok(false);
+				}
+				return Err(error);
+			}
+		};
+		let result = self.publish_optional_ref_locked(name, state).await;
+		let HeldRefLocks { names, locks } = acquired;
+		drop(locks);
+		for name in &names {
+			self.prune_empty_dirs(name).await;
+		}
+		result
+	}
+
+	async fn publish_optional_ref_locked(
+		&self,
+		name: &str,
+		state: &HeadState<H>,
+	) -> Result<bool, RepositoryError> {
+		let packed_refs = self.read_opt(PACKED_REFS).await?;
+		if self
+			.ref_path_write_blocked(name, packed_refs.as_deref())
+			.await?
+		{
+			return Ok(false);
+		}
+		if let Some(packed_refs) = packed_refs.as_deref()
+			&& self
+				.packed_ref_name_resolves_through_alias(name, packed_refs)
+				.await?
+		{
+			return Ok(false);
+		}
+		if self.ref_name_resolves_through_alias(name).await? {
+			return Ok(false);
+		}
+		match self.files.read_path(name).await {
+			Ok(bytes) => match HeadState::<H>::parse(&bytes) {
+				Ok(HeadState::Symbolic(target)) if !is_valid_refname(&target) => return Ok(false),
+				Ok(_) => {}
+				Err(_) => return Ok(false),
+			},
+			Err(FileStoreError::NotFound) => {
+				// Validate a packed exact occupant before shadowing it with the optional loose ref.
+				self.resolve_packed(name).await?;
+			}
+			Err(other) => return Err(other.into()),
+		}
+		self
+			.files
+			.write_path_replace(name, state.render().as_bytes())
+			.await?;
+		Ok(true)
+	}
+
+	/// Whether `name` resolves to a loose entry whose directory spelling differs from the requested
+	/// name. This catches case and normalization aliases on filesystems that identify those spellings,
+	/// while permitting both refs on a filesystem where they are genuinely distinct. The caller holds
+	/// the ref lock, whose differently spelled aliases resolve to the same lock on such filesystems.
+	async fn ref_name_resolves_through_alias(&self, name: &str) -> Result<bool, RepositoryError> {
+		let Some((parent, _)) = name.rsplit_once('/') else {
+			return Ok(false);
+		};
+		let prefix = format!("{parent}/");
+		let entries = self.files.list_prefix(&prefix).await?;
+		if entries.iter().any(|entry| entry == name) {
+			return Ok(false);
+		}
+		Ok(self.files.exists(name).await?)
+	}
+
+	/// Whether a packed ref occupies `name`, an ancestor, or a descendant through a different
+	/// spelling that the native filesystem resolves to the same namespace. The caller holds
+	/// `<name>.lock` and `packed-refs.lock`; spelling the held lock through each packed candidate lets
+	/// the filesystem decide case and normalization equivalence without imposing global folding rules.
+	async fn packed_ref_name_resolves_through_alias(
+		&self,
+		name: &str,
+		packed_refs: &[u8],
+	) -> Result<bool, RepositoryError> {
+		let target_parts = name.split('/').collect::<Vec<_>>();
+		for line in packed_refs.split(|byte| *byte == b'\n') {
+			let line = line.strip_suffix(b"\r").unwrap_or(line);
+			if line.starts_with(b"#") || line.starts_with(b"^") || line.is_empty() {
+				continue;
+			}
+			let Some((_, packed_name)) = split_packed_ref(line) else {
+				continue;
+			};
+			let Ok(packed_name) = std::str::from_utf8(packed_name) else {
+				continue;
+			};
+			if packed_name == name || !is_valid_refname(packed_name) {
+				continue;
+			}
+			let packed_parts = packed_name.split('/').collect::<Vec<_>>();
+			let shared_depth = target_parts.len().min(packed_parts.len());
+			let mut probe_parts = packed_parts[..shared_depth].to_vec();
+			probe_parts.extend_from_slice(&target_parts[shared_depth..]);
+			let probe = format!("{}.lock", probe_parts.join("/"));
+			if self.files.exists(&probe).await? {
+				return Ok(true);
+			}
+		}
+		Ok(false)
+	}
+
 	async fn set_symbolic_inline(
 		&self,
 		name: &str,
@@ -1835,6 +2220,29 @@ fn parse_oid<H: HashAlgorithm>(name: &str, bytes: &[u8]) -> Result<ObjectId<H>, 
 	ObjectId::from_hex(text).map_err(|_| RepositoryError::InvalidRef(format!("{name}: {text}")))
 }
 
+/// Whether a name obeys Git's refname rules, including valid one-level symbolic-ref targets.
+fn is_valid_refname(name: &str) -> bool {
+	if name.is_empty() || name == "@" {
+		return false;
+	}
+	if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
+		return false;
+	}
+	if name.contains("..") || name.contains("@{") || name.ends_with('.') {
+		return false;
+	}
+	if name.bytes().any(|byte| {
+		byte < 0x20
+			|| byte == 0x7f
+			|| matches!(byte, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+	}) {
+		return false;
+	}
+	name
+		.split('/')
+		.all(|component| !component.starts_with('.') && !component.ends_with(".lock"))
+}
+
 fn split_packed_ref(line: &[u8]) -> Option<(&[u8], &[u8])> {
 	let separator = line.iter().position(|byte| *byte == b' ')?;
 	Some((&line[..separator], &line[separator + 1..]))
@@ -1922,7 +2330,7 @@ mod tests {
 	#[cfg(not(target_arch = "wasm32"))]
 	use crate::GatedFileStore;
 
-	use super::{PACKED_REFS, RefStore, ReflogIntent};
+	use super::{HeadState, PACKED_REFS, RefStore, ReflogIntent};
 
 	#[cfg(not(target_arch = "wasm32"))]
 	async fn let_retained_mutation_reach_a_held_lock() {
@@ -2041,6 +2449,266 @@ mod tests {
 		assert_eq!(
 			store.resolve("refs/tags/topic/child").await.unwrap(),
 			Some(child)
+		);
+	}
+
+	#[tokio::test]
+	async fn optional_ref_publication_writes_direct_and_symbolic_states() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let first = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"first");
+		let second = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"second");
+		files
+			.write_path_if_absent("refs/remotes/origin/main", format!("{first}\n").as_bytes())
+			.await
+			.unwrap();
+
+		assert!(
+			store
+				.publish_optional_ref(
+					"refs/remotes/origin/HEAD",
+					HeadState::Symbolic("refs/remotes/origin/main".to_owned()),
+				)
+				.await
+				.unwrap()
+		);
+		assert_eq!(
+			store
+				.resolve_symbolic("refs/remotes/origin/HEAD")
+				.await
+				.unwrap(),
+			Some(first)
+		);
+		assert!(
+			store
+				.publish_optional_ref("refs/remotes/origin/HEAD", HeadState::Detached(second),)
+				.await
+				.unwrap()
+		);
+		assert_eq!(
+			store
+				.resolve_symbolic("refs/remotes/origin/HEAD")
+				.await
+				.unwrap(),
+			Some(second)
+		);
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn optional_ref_publication_preserves_a_filesystem_equivalent_spelling() {
+		use gitana_file_store_local::LocalFileStore;
+
+		let tmp =
+			std::env::temp_dir().join(format!("gitana-optional-ref-alias-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(&tmp).unwrap();
+		let files = LocalFileStore::from_dir(
+			cap_std::fs::Dir::open_ambient_dir(&tmp, cap_std::ambient_authority()).unwrap(),
+		);
+		let store: RefStore<'_, LocalFileStore, Sha256> = RefStore::new(&files);
+		let branch = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"branch");
+		let convenience = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"convenience");
+		store
+			.update_ref("refs/remotes/origin/head", branch, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		if !tmp.join("refs/remotes/origin/HEAD").exists() {
+			let _ = std::fs::remove_dir_all(&tmp);
+			return;
+		}
+		assert_eq!(
+			store
+				.resolve_symbolic_exact("refs/remotes/origin/HEAD")
+				.await
+				.unwrap(),
+			None,
+			"an aliased tracking branch must not satisfy the exact convenience-ref name"
+		);
+		assert_eq!(
+			store
+				.resolve_symbolic_exact("refs/remotes/origin/head")
+				.await
+				.unwrap(),
+			Some(branch)
+		);
+		assert!(
+			!store
+				.publish_optional_ref("refs/remotes/origin/HEAD", HeadState::Detached(convenience),)
+				.await
+				.unwrap()
+		);
+		assert_eq!(
+			store
+				.resolve_symbolic("refs/remotes/origin/head")
+				.await
+				.unwrap(),
+			Some(branch)
+		);
+		let _ = std::fs::remove_dir_all(&tmp);
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn optional_ref_publication_preserves_a_loose_ancestor() {
+		use gitana_file_store_local::LocalFileStore;
+
+		let tmp = std::env::temp_dir().join(format!(
+			"gitana-optional-ref-loose-ancestor-{}",
+			std::process::id()
+		));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(tmp.join("refs/remotes")).unwrap();
+		let ancestor = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"ancestor");
+		std::fs::write(tmp.join("refs/remotes/origin"), format!("{ancestor}\n")).unwrap();
+		let files = LocalFileStore::from_dir(
+			cap_std::fs::Dir::open_ambient_dir(&tmp, cap_std::ambient_authority()).unwrap(),
+		);
+		let store: RefStore<'_, LocalFileStore, Sha256> = RefStore::new(&files);
+		let proposed = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"proposed");
+
+		assert!(
+			!store
+				.publish_optional_ref("refs/remotes/origin/HEAD", HeadState::Detached(proposed),)
+				.await
+				.unwrap()
+		);
+		assert_eq!(
+			store.resolve("refs/remotes/origin").await.unwrap(),
+			Some(ancestor)
+		);
+		assert!(!tmp.join("refs/remotes/origin/HEAD.lock").exists());
+		let _ = std::fs::remove_dir_all(&tmp);
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn optional_ref_publication_preserves_filesystem_equivalent_packed_namespaces() {
+		use gitana_file_store_local::LocalFileStore;
+
+		let tmp = std::env::temp_dir().join(format!(
+			"gitana-optional-packed-ref-alias-{}",
+			std::process::id()
+		));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(&tmp).unwrap();
+		std::fs::write(tmp.join("case-probe"), b"").unwrap();
+		if !tmp.join("CASE-PROBE").exists() {
+			let _ = std::fs::remove_dir_all(&tmp);
+			return;
+		}
+
+		for (index, (packed_name, requested)) in [
+			("refs/remotes/origin/head", "refs/remotes/origin/HEAD"),
+			("refs/remotes/origin/head/child", "refs/remotes/origin/HEAD"),
+			("refs/remotes/origin/head", "refs/remotes/origin/HEAD/child"),
+		]
+		.into_iter()
+		.enumerate()
+		{
+			let case = tmp.join(index.to_string());
+			std::fs::create_dir_all(&case).unwrap();
+			let files = LocalFileStore::from_dir(
+				cap_std::fs::Dir::open_ambient_dir(&case, cap_std::ambient_authority()).unwrap(),
+			);
+			let packed = ObjectId::<Sha256>::compute(ObjectKind::Commit, packed_name.as_bytes());
+			let proposed = ObjectId::<Sha256>::compute(ObjectKind::Commit, requested.as_bytes());
+			files
+				.write_path_if_absent(PACKED_REFS, format!("{packed} {packed_name}\n").as_bytes())
+				.await
+				.unwrap();
+			let store: RefStore<'_, LocalFileStore, Sha256> = RefStore::new(&files);
+
+			assert!(
+				!store
+					.publish_optional_ref(requested, HeadState::Detached(proposed))
+					.await
+					.unwrap(),
+				"{packed_name} must preserve its filesystem-equivalent namespace from {requested}"
+			);
+			assert_eq!(store.resolve(packed_name).await.unwrap(), Some(packed));
+		}
+		let _ = std::fs::remove_dir_all(&tmp);
+	}
+
+	#[tokio::test]
+	async fn optional_ref_publication_keeps_case_distinct_packed_names_distinct() {
+		let files = MemoryFileStore::new();
+		let packed = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"packed");
+		let proposed = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"proposed");
+		files
+			.write_path_if_absent(
+				PACKED_REFS,
+				format!("{packed} refs/remotes/origin/head\n").as_bytes(),
+			)
+			.await
+			.unwrap();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+
+		assert!(
+			store
+				.publish_optional_ref("refs/remotes/origin/HEAD", HeadState::Detached(proposed),)
+				.await
+				.unwrap()
+		);
+		assert_eq!(
+			store.resolve("refs/remotes/origin/head").await.unwrap(),
+			Some(packed)
+		);
+		assert_eq!(
+			store.resolve("refs/remotes/origin/HEAD").await.unwrap(),
+			Some(proposed)
+		);
+	}
+
+	#[tokio::test]
+	async fn optional_ref_publication_preserves_blocked_and_malformed_occupants() {
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"target");
+
+		for bytes in [b"not a ref\n".as_slice(), b"ref: bad ref\n".as_slice()] {
+			let malformed = MemoryFileStore::new();
+			malformed
+				.write_path_if_absent("refs/remotes/origin/HEAD", bytes)
+				.await
+				.unwrap();
+			let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&malformed);
+			assert!(
+				!store
+					.publish_optional_ref("refs/remotes/origin/HEAD", HeadState::Detached(target),)
+					.await
+					.unwrap()
+			);
+			assert_eq!(
+				malformed
+					.read_path("refs/remotes/origin/HEAD")
+					.await
+					.unwrap(),
+				bytes
+			);
+		}
+
+		let blocked = MemoryFileStore::new();
+		blocked
+			.write_path_if_absent(
+				"refs/remotes/origin/HEAD/topic",
+				format!("{target}\n").as_bytes(),
+			)
+			.await
+			.unwrap();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&blocked);
+		assert!(
+			!store
+				.publish_optional_ref("refs/remotes/origin/HEAD", HeadState::Detached(target),)
+				.await
+				.unwrap()
+		);
+		assert_eq!(
+			blocked
+				.read_path("refs/remotes/origin/HEAD/topic")
+				.await
+				.unwrap(),
+			format!("{target}\n").as_bytes()
 		);
 	}
 
@@ -2601,6 +3269,214 @@ mod tests {
 
 		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
 		assert_eq!(store.resolve_head().await.expect("resolve head"), Some(tip));
+	}
+
+	#[tokio::test]
+	async fn update_ref_following_symbolic_logs_every_hop_and_preserves_the_chain() {
+		let files = MemoryFileStore::new();
+		let old = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"old");
+		let new = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"new");
+		let committer = "A U Thor <a@example.com> 1700000000 +0000";
+		files
+			.write_path_if_absent("refs/remotes/origin/main", format!("{old}\n").as_bytes())
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent(
+				"refs/remotes/origin/alias",
+				b"ref: refs/remotes/origin/main\n",
+			)
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent(
+				"refs/remotes/origin/HEAD",
+				b"ref: refs/remotes/origin/alias\n",
+			)
+			.await
+			.unwrap();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+
+		store
+			.update_ref_following_symbolic(
+				"refs/remotes/origin/HEAD",
+				new,
+				Some(old),
+				ReflogIntent::Log {
+					committer,
+					message: "fetch: fast-forward",
+				},
+			)
+			.await
+			.expect("update the symbolic destination's referent");
+
+		assert_eq!(
+			store
+				.read_symbolic("refs/remotes/origin/HEAD")
+				.await
+				.unwrap()
+				.as_deref(),
+			Some("refs/remotes/origin/alias")
+		);
+		assert_eq!(
+			store
+				.read_symbolic("refs/remotes/origin/alias")
+				.await
+				.unwrap()
+				.as_deref(),
+			Some("refs/remotes/origin/main")
+		);
+		assert_eq!(
+			store.resolve("refs/remotes/origin/main").await.unwrap(),
+			Some(new)
+		);
+		assert_eq!(
+			store
+				.resolve_symbolic("refs/remotes/origin/HEAD")
+				.await
+				.unwrap(),
+			Some(new)
+		);
+		let moved = format!("{old} {new} {committer}\tfetch: fast-forward\n");
+		for name in ["HEAD", "alias", "main"] {
+			assert_eq!(
+				files
+					.read_path(&format!("logs/refs/remotes/origin/{name}"))
+					.await
+					.unwrap(),
+				moved.as_bytes(),
+				"the real move must log {name}"
+			);
+		}
+
+		store
+			.update_ref_following_symbolic(
+				"refs/remotes/origin/HEAD",
+				new,
+				Some(new),
+				ReflogIntent::Log {
+					committer,
+					message: "fetch: no-op",
+				},
+			)
+			.await
+			.expect("log a no-op through the symbolic chain");
+		let no_op = format!("{new} {new} {committer}\tfetch: no-op\n");
+		for name in ["HEAD", "alias"] {
+			assert_eq!(
+				files
+					.read_path(&format!("logs/refs/remotes/origin/{name}"))
+					.await
+					.unwrap(),
+				format!("{moved}{no_op}").as_bytes(),
+				"the symbolic no-op must log {name}"
+			);
+		}
+		assert_eq!(
+			files
+				.read_path("logs/refs/remotes/origin/main")
+				.await
+				.unwrap(),
+			moved.as_bytes(),
+			"the terminal direct ref must not log a no-op"
+		);
+	}
+
+	#[tokio::test]
+	async fn update_ref_following_head_logs_the_head_cascade_once() {
+		let files = MemoryFileStore::new();
+		let old = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"old");
+		let new = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"new");
+		let committer = "A U Thor <a@example.com> 1700000000 +0000";
+		files
+			.write_path_if_absent("HEAD", b"ref: refs/heads/main\n")
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent("refs/heads/main", format!("{old}\n").as_bytes())
+			.await
+			.unwrap();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+
+		store
+			.update_ref_following_symbolic(
+				"HEAD",
+				new,
+				Some(old),
+				ReflogIntent::Log {
+					committer,
+					message: "reset: moving to target",
+				},
+			)
+			.await
+			.unwrap();
+
+		let line = format!("{old} {new} {committer}\treset: moving to target\n");
+		for name in ["HEAD", "refs/heads/main"] {
+			assert_eq!(
+				files.read_path(&format!("logs/{name}")).await.unwrap(),
+				line.as_bytes(),
+				"{name} must receive exactly one entry"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn update_ref_following_symbolic_preflights_every_hop_reflog() {
+		let files = MemoryFileStore::new();
+		let old = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"old");
+		let new = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"new");
+		files
+			.write_path_if_absent("refs/remotes/origin/main", format!("{old}\n").as_bytes())
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent(
+				"refs/remotes/origin/alias",
+				b"ref: refs/remotes/origin/main\n",
+			)
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent(
+				"refs/remotes/origin/HEAD",
+				b"ref: refs/remotes/origin/alias\n",
+			)
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent("logs/refs/remotes/origin/alias/blocker", b"occupied")
+			.await
+			.unwrap();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+
+		let error = store
+			.update_ref_following_symbolic(
+				"refs/remotes/origin/HEAD",
+				new,
+				Some(old),
+				ReflogIntent::Log {
+					committer: "A U Thor <a@example.com> 1700000000 +0000",
+					message: "fetch: fast-forward",
+				},
+			)
+			.await
+			.expect_err("a blocked hop reflog must reject before publication");
+		assert!(
+			error
+				.to_string()
+				.contains("reflog path refs/remotes/origin/alias blocked")
+		);
+		assert_eq!(
+			store.resolve("refs/remotes/origin/main").await.unwrap(),
+			Some(old)
+		);
+		assert_eq!(
+			files.read_path("refs/remotes/origin/HEAD").await.unwrap(),
+			b"ref: refs/remotes/origin/alias\n"
+		);
+		assert!(!files.exists("logs/refs/remotes/origin/HEAD").await.unwrap());
+		assert!(!files.exists("logs/refs/remotes/origin/main").await.unwrap());
 	}
 
 	#[tokio::test]

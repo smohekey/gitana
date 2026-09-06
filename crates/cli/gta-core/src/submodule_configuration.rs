@@ -1616,7 +1616,7 @@ mod tests {
 			panic!("an unregistered module must not populate a repository")
 		}
 
-		async fn fetch_recorded(
+		async fn fetch_target(
 			&self,
 			_request: FetchRepository,
 			_lease: SubmoduleMutationLease,
@@ -1672,7 +1672,7 @@ mod tests {
 			panic!("the test transfer stops before repository population")
 		}
 
-		async fn fetch_recorded(
+		async fn fetch_target(
 			&self,
 			_request: FetchRepository,
 			_lease: SubmoduleMutationLease,
@@ -1977,6 +1977,8 @@ mod tests {
 					initialize: false,
 					depth: None,
 					recommend_shallow: true,
+					remote: false,
+					fetch: true,
 					initialize_only_active: false,
 					reflog_committer: None,
 				},
@@ -2070,6 +2072,8 @@ mod tests {
 					initialize: false,
 					depth: None,
 					recommend_shallow: true,
+					remote: false,
+					fetch: true,
 					initialize_only_active: false,
 					reflog_committer: None,
 				},

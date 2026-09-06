@@ -10,16 +10,17 @@ use gitana_file_store_local::LocalFileStore;
 use gitana_git_http::Deepen;
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
-use gitana_porcelain::{TagFetch, fetch, fetch_object_with_deepen, prepare_clone};
+use gitana_porcelain::{TagFetch, fetch_from_remote, fetch_object_with_deepen, prepare_clone};
 use gitana_remote::{
 	AuthTransport, Connection, HttpConnection, HttpPackFetcher, LocalConnection, LocalPackFetcher,
 	Origin, PackFetcher, ProtocolContext, RemoteUrl, ReqwestTransport, SshCommand, SshConnection,
 	SshPackFetcher, SshRemote,
 };
-use gitana_repository::{Repository, detect_hash_kind};
+use gitana_repository::{HeadState, Repository, detect_hash_kind};
 use gitana_submodule::{
 	FetchRepository, FetchSource, FetchedTransfer, PrepareRepository, PrepareSource,
-	PreparedTransfer, RepositoryTransfer, SubmoduleObjectId, resolve_relative_url,
+	PreparedTransfer, RepositoryTransfer, SubmoduleObjectId, SubmoduleUpdateTarget,
+	resolve_relative_url,
 };
 
 use crate::{
@@ -183,6 +184,7 @@ impl<'a> SubmoduleTransfer<'a> {
 		secret_urls: Vec<String>,
 		lease: gitana_submodule::SubmoduleMutationLease,
 	) -> Result<PreparedTransfer<PreparedSubmoduleSource>> {
+		ensure_initial_target_is_representable(&request.target)?;
 		let config = &request.config;
 		let ResolvedSubmoduleSource {
 			rewritten,
@@ -256,6 +258,8 @@ impl<'a> SubmoduleTransfer<'a> {
 				(persist_url, PreparedTransport::Local { files })
 			}
 		};
+		let selected_target =
+			select_prepared_target(request.hash_kind, &transport, &request.target).await?;
 		Ok(PreparedTransfer {
 			source: PreparedSubmoduleSource {
 				secret_urls,
@@ -266,6 +270,7 @@ impl<'a> SubmoduleTransfer<'a> {
 				transport,
 			},
 			resolved_source: identity,
+			selected_target,
 		})
 	}
 
@@ -289,7 +294,8 @@ impl<'a> SubmoduleTransfer<'a> {
 		source: PreparedSubmoduleSource,
 		request: PrepareRepository,
 	) -> Result<Vec<SubmoduleObjectId>> {
-		let recorded = typed_oid::<H>(&request.recorded)?;
+		let target = typed_oid::<H>(&request.target)?;
+		let remote_head_fallback = request.record_remote_head.then_some(target);
 		let repository = create_repository::<H>(request.git_dir, self.module_base.clone()).await?;
 		let PreparedSubmoduleSource {
 			module_path,
@@ -301,7 +307,7 @@ impl<'a> SubmoduleTransfer<'a> {
 		} = source;
 		let deepen = absolute_depth(honors_clone_depth.then_some(request.depth).flatten());
 
-		let fetched_roots = match transport {
+		let (fetched_roots, remote_head_published) = match transport {
 			PreparedTransport::Http {
 				origin,
 				transport,
@@ -315,15 +321,16 @@ impl<'a> SubmoduleTransfer<'a> {
 				);
 				let prepared =
 					prepare_clone(&mut connection, &repository, &deepen, None, &persist_url).await?;
+				let remote_head_published = prepared.remote_head_published;
 				let mut fetched_roots = prepared.fetched_roots;
-				if !repository.objects().exists_object(&recorded).await? {
+				if !repository.objects().exists_object(&target).await? {
 					let advertisement = connection.advertisement().to_vec();
 					let mut fetcher = HttpPackFetcher::new(&transport, &origin);
-					fetch_object_with_deepen(&mut fetcher, &repository, &advertisement, recorded, &deepen)
+					fetch_object_with_deepen(&mut fetcher, &repository, &advertisement, target, &deepen)
 						.await?;
-					fetched_roots.push(recorded);
+					fetched_roots.push(target);
 				}
-				fetched_roots
+				(fetched_roots, remote_head_published)
 			}
 			PreparedTransport::Ssh {
 				remote,
@@ -332,37 +339,56 @@ impl<'a> SubmoduleTransfer<'a> {
 			} => {
 				let prepared =
 					prepare_clone(&mut connection, &repository, &deepen, None, &persist_url).await?;
+				let remote_head_published = prepared.remote_head_published;
 				let mut fetched_roots = prepared.fetched_roots;
-				if !repository.objects().exists_object(&recorded).await? {
+				if !repository.objects().exists_object(&target).await? {
 					let connection =
 						SshConnection::open(&remote, "git-upload-pack", &command, self.command.cwd()).await?;
 					let advertisement = connection.advertisement().to_vec();
 					let mut fetcher = SshPackFetcher::new(connection);
-					fetch_object_with_deepen(&mut fetcher, &repository, &advertisement, recorded, &deepen)
+					fetch_object_with_deepen(&mut fetcher, &repository, &advertisement, target, &deepen)
 						.await?;
-					fetched_roots.push(recorded);
+					fetched_roots.push(target);
 				}
-				fetched_roots
+				(fetched_roots, remote_head_published)
 			}
 			PreparedTransport::Local { files } => {
 				let source: Repository<_, H> = Repository::new(ObjectStore::new(files.shared_handle()));
 				let mut connection = LocalConnection::open(source).await?;
 				let prepared =
 					prepare_clone(&mut connection, &repository, &deepen, None, &persist_url).await?;
+				let remote_head_published = prepared.remote_head_published;
 				let mut fetched_roots = prepared.fetched_roots;
-				if !repository.objects().exists_object(&recorded).await? {
+				if !repository.objects().exists_object(&target).await? {
 					let source: Repository<_, H> = Repository::new(ObjectStore::new(files.shared_handle()));
 					let connection = LocalConnection::open(source).await?;
 					let advertisement = connection.advertisement().to_vec();
 					let source: Repository<_, H> = Repository::new(ObjectStore::new(files.shared_handle()));
 					let mut fetcher = LocalPackFetcher::new(source);
-					fetch_object_with_deepen(&mut fetcher, &repository, &advertisement, recorded, &deepen)
+					fetch_object_with_deepen(&mut fetcher, &repository, &advertisement, target, &deepen)
 						.await?;
-					fetched_roots.push(recorded);
+					fetched_roots.push(target);
 				}
-				fetched_roots
+				(fetched_roots, remote_head_published)
 			}
 		};
+		if let Some(remote_head) = remote_head_fallback {
+			let prepared_head_matches = if remote_head_published {
+				repository
+					.refs()
+					.resolve_symbolic("refs/remotes/origin/HEAD")
+					.await?
+					== Some(remote_head)
+			} else {
+				false
+			};
+			if !prepared_head_matches {
+				repository
+					.refs()
+					.publish_optional_ref("refs/remotes/origin/HEAD", HeadState::Detached(remote_head))
+					.await?;
+			}
+		}
 		if let Some(base) = descendant_url_base {
 			self
 				.descendant_url_bases
@@ -397,26 +423,27 @@ impl<'a> SubmoduleTransfer<'a> {
 		let FetchRepository {
 			source,
 			git_dir,
-			recorded,
+			target,
 			depth,
 			..
 		} = request;
 		let FetchSource {
+			remote: remote_name,
 			source_url,
 			worktree_dir,
 			config,
 		} = source;
+		ensure_fetch_refspec_selects_target(&config, &remote_name, &target)?;
 		let repository = repository_from_dir::<H>(git_dir, config.clone());
 		let ResolvedSubmoduleSource {
 			remote, identity, ..
 		} = Self::resolve_source(&config, &worktree_dir, &source_url)?;
 		let deepen = absolute_depth(depth);
+		let repair_remote_head = matches!(&target, SubmoduleUpdateTarget::RemoteHead);
 		self
 			.command
 			.authorize(&config, &remote, ProtocolContext::Recursive)?;
-		let recorded = typed_oid::<H>(&recorded)?;
-
-		let fetched_roots = match remote {
+		let (fetched_roots, selected_target) = match remote {
 			RemoteUrl::Http(origin) => {
 				let http = transport_for(config, &origin, self.command.cwd().to_path_buf())?;
 				let advertisement =
@@ -425,12 +452,27 @@ impl<'a> SubmoduleTransfer<'a> {
 					kind::<H>(),
 					gitana_remote::negotiated_kind(&advertisement)?,
 				)?;
+				let target = select_target::<H>(&advertisement, &target)?;
 				let mut fetcher = HttpPackFetcher::new(&http, &origin);
-				normal_then_exact(&mut fetcher, &repository, &advertisement, recorded, &deepen).await?
+				(
+					normal_then_exact(
+						&mut fetcher,
+						&repository,
+						&advertisement,
+						target,
+						&remote_name,
+						&deepen,
+						repair_remote_head,
+					)
+					.await?,
+					target,
+				)
 			}
 			RemoteUrl::Ssh(remote) => {
 				let command = ssh::resolve_ssh_command(&config)?;
+				let advertisement;
 				let mut fetched_roots;
+				let selected_target;
 				{
 					let connection =
 						SshConnection::open(&remote, "git-upload-pack", &command, self.command.cwd()).await?;
@@ -438,11 +480,20 @@ impl<'a> SubmoduleTransfer<'a> {
 						kind::<H>(),
 						gitana_remote::negotiated_kind(connection.advertisement())?,
 					)?;
-					let advertisement = connection.advertisement().to_vec();
+					advertisement = connection.advertisement().to_vec();
 					let mut fetcher = SshPackFetcher::new(connection);
-					fetched_roots = normal_fetch(&mut fetcher, &repository, &advertisement, &deepen).await?;
+					let target = select_target::<H>(&advertisement, &target)?;
+					fetched_roots = normal_fetch(
+						&mut fetcher,
+						&repository,
+						&advertisement,
+						&remote_name,
+						&deepen,
+					)
+					.await?;
+					selected_target = target;
 				}
-				if !repository.objects().exists_object(&recorded).await? {
+				if !repository.objects().exists_object(&selected_target).await? {
 					let connection =
 						SshConnection::open(&remote, "git-upload-pack", &command, self.command.cwd()).await?;
 					gitana_remote::ensure_same_format(
@@ -451,11 +502,25 @@ impl<'a> SubmoduleTransfer<'a> {
 					)?;
 					let advertisement = connection.advertisement().to_vec();
 					let mut fetcher = SshPackFetcher::new(connection);
-					fetch_object_with_deepen(&mut fetcher, &repository, &advertisement, recorded, &deepen)
-						.await?;
-					fetched_roots.push(recorded);
+					fetch_object_with_deepen(
+						&mut fetcher,
+						&repository,
+						&advertisement,
+						selected_target,
+						&deepen,
+					)
+					.await?;
+					fetched_roots.push(selected_target);
 				}
-				fetched_roots
+				if repair_remote_head {
+					gitana_porcelain::repair_remote_head_from_advertisement(
+						&repository,
+						&remote_name,
+						&advertisement,
+					)
+					.await?;
+				}
+				(fetched_roots, selected_target)
 			}
 			RemoteUrl::Local(path) => {
 				let source_path = resolve_local_path(&worktree_dir, &path);
@@ -477,6 +542,7 @@ impl<'a> SubmoduleTransfer<'a> {
 				.await?;
 				let connection = LocalConnection::open(source).await?;
 				let advertisement = connection.advertisement().to_vec();
+				let target = select_target::<H>(&advertisement, &target)?;
 				let source = repo::open_generic_from_dirs::<H>(
 					second_common,
 					second_git,
@@ -486,11 +552,24 @@ impl<'a> SubmoduleTransfer<'a> {
 				.await?;
 				drop(source_setup);
 				let mut fetcher = LocalPackFetcher::new(source);
-				normal_then_exact(&mut fetcher, &repository, &advertisement, recorded, &deepen).await?
+				(
+					normal_then_exact(
+						&mut fetcher,
+						&repository,
+						&advertisement,
+						target,
+						&remote_name,
+						&deepen,
+						repair_remote_head,
+					)
+					.await?,
+					target,
+				)
 			}
 		};
 		Ok(FetchedTransfer {
 			resolved_source: identity,
+			selected_target: SubmoduleObjectId::from_typed(selected_target),
 			fetched_roots: fetched_roots
 				.into_iter()
 				.map(SubmoduleObjectId::from_typed)
@@ -551,7 +630,7 @@ impl RepositoryTransfer for SubmoduleTransfer<'_> {
 			.map_err(|error| TransferError::new(error, secrets))
 	}
 
-	async fn fetch_recorded(
+	async fn fetch_target(
 		&self,
 		request: FetchRepository,
 		lease: gitana_submodule::SubmoduleMutationLease,
@@ -606,21 +685,137 @@ impl std::fmt::Display for TransferError {
 
 impl std::error::Error for TransferError {}
 
+async fn select_prepared_target(
+	kind: HashKind,
+	transport: &PreparedTransport,
+	target: &SubmoduleUpdateTarget,
+) -> Result<SubmoduleObjectId> {
+	let advertisement = match transport {
+		PreparedTransport::Http { advertisement, .. } => advertisement.clone(),
+		PreparedTransport::Ssh { connection, .. } => connection.advertisement().to_vec(),
+		PreparedTransport::Local { files } => match kind {
+			HashKind::Sha1 => {
+				let source: Repository<_, Sha1> = Repository::new(ObjectStore::new(files.shared_handle()));
+				LocalConnection::open(source)
+					.await?
+					.advertisement()
+					.to_vec()
+			}
+			HashKind::Sha256 => {
+				let source: Repository<_, Sha256> =
+					Repository::new(ObjectStore::new(files.shared_handle()));
+				LocalConnection::open(source)
+					.await?
+					.advertisement()
+					.to_vec()
+			}
+		},
+	};
+	match kind {
+		HashKind::Sha1 => {
+			select_target::<Sha1>(&advertisement, target).map(SubmoduleObjectId::from_typed)
+		}
+		HashKind::Sha256 => {
+			select_target::<Sha256>(&advertisement, target).map(SubmoduleObjectId::from_typed)
+		}
+	}
+}
+
+fn select_target<H: HashAlgorithm>(
+	advertisement: &[u8],
+	target: &SubmoduleUpdateTarget,
+) -> Result<ObjectId<H>> {
+	match target {
+		SubmoduleUpdateTarget::Gitlink(oid) => typed_oid::<H>(oid),
+		SubmoduleUpdateTarget::RemoteHead => {
+			let advertised = gitana_git_http::parse_advertisement::<H>(advertisement)?;
+			advertised
+				.head_oid()
+				.ok_or_else(|| anyhow!("remote does not advertise HEAD"))
+		}
+		SubmoduleUpdateTarget::RemoteBranch(branch) => {
+			let advertised = gitana_git_http::parse_advertisement::<H>(advertisement)?;
+			let name = format!("refs/heads/{branch}");
+			advertised
+				.oid_of(&name)
+				.ok_or_else(|| anyhow!("remote does not advertise branch '{branch}'"))
+		}
+	}
+}
+
+fn ensure_fetch_refspec_selects_target(
+	config: &GitConfig,
+	remote: &str,
+	target: &SubmoduleUpdateTarget,
+) -> Result<()> {
+	let SubmoduleUpdateTarget::RemoteBranch(branch) = target else {
+		return Ok(());
+	};
+	let source = format!("refs/heads/{branch}");
+	let remote_head = format!("refs/remotes/{remote}/HEAD");
+	let destination = gitana_remote::effective_fetch_destination(config, remote, &source)?;
+	if destination.is_none()
+		&& gitana_remote::effective_fetch_refspecs(config, remote)?
+			.iter()
+			.any(|spec| {
+				spec.exact_source().is_none()
+					&& spec.destination(&source).as_deref() == Some(remote_head.as_str())
+			})
+	{
+		bail!("remote '{remote}' branch '{branch}' maps to reserved remote HEAD ref '{remote_head}'");
+	}
+	let Some(destination) = destination else {
+		bail!("remote '{remote}' fetch refspecs do not select branch '{branch}'");
+	};
+	ensure_target_destination_is_not_remote_head(remote, branch, &destination, &remote_head)?;
+	Ok(())
+}
+
+fn ensure_initial_target_is_representable(target: &SubmoduleUpdateTarget) -> Result<()> {
+	let SubmoduleUpdateTarget::RemoteBranch(branch) = target else {
+		return Ok(());
+	};
+	let source = format!("refs/heads/{branch}");
+	let destination = gitana_remote::Refspec::parse(gitana_remote::ORIGIN_FETCH_REFSPEC)?
+		.destination(&source)
+		.expect("the default origin refspec maps every branch");
+	let remote_head = "refs/remotes/origin/HEAD";
+	ensure_target_destination_is_not_remote_head("origin", branch, &destination, remote_head)
+}
+
+fn ensure_target_destination_is_not_remote_head(
+	remote: &str,
+	branch: &str,
+	destination: &str,
+	remote_head: &str,
+) -> Result<()> {
+	if destination == remote_head {
+		bail!("remote '{remote}' branch '{branch}' maps to reserved remote HEAD ref '{remote_head}'");
+	}
+	Ok(())
+}
+
 async fn normal_then_exact<F, H>(
 	fetcher: &mut impl PackFetcher,
 	repository: &gitana_repository::Repository<F, H>,
 	advertisement: &[u8],
-	recorded: ObjectId<H>,
+	target: ObjectId<H>,
+	remote: &str,
 	deepen: &Deepen,
+	repair_remote_head: bool,
 ) -> Result<Vec<ObjectId<H>>>
 where
 	F: gitana_file_store::FileStore,
 	H: HashAlgorithm,
 {
-	let mut fetched_roots = normal_fetch(fetcher, repository, advertisement, deepen).await?;
-	if !repository.objects().exists_object(&recorded).await? {
-		fetch_object_with_deepen(fetcher, repository, advertisement, recorded, deepen).await?;
-		fetched_roots.push(recorded);
+	let mut fetched_roots = normal_fetch(fetcher, repository, advertisement, remote, deepen).await?;
+	if !repository.objects().exists_object(&target).await? {
+		fetch_object_with_deepen(fetcher, repository, advertisement, target, deepen).await?;
+		fetched_roots.push(target);
+	}
+	if repair_remote_head {
+		gitana_porcelain::repair_remote_head_from_advertisement(repository, remote, advertisement)
+			.await?;
 	}
 	Ok(fetched_roots)
 }
@@ -629,15 +824,17 @@ async fn normal_fetch<F, H>(
 	fetcher: &mut impl PackFetcher,
 	repository: &gitana_repository::Repository<F, H>,
 	advertisement: &[u8],
+	remote: &str,
 	deepen: &Deepen,
 ) -> Result<Vec<ObjectId<H>>>
 where
 	F: gitana_file_store::FileStore,
 	H: HashAlgorithm,
 {
-	let outcome = fetch(
+	let outcome = fetch_from_remote(
 		fetcher,
 		repository,
+		remote,
 		advertisement,
 		false,
 		TagFetch::Auto,
@@ -647,6 +844,9 @@ where
 		None,
 	)
 	.await?;
+	if !outcome.rejected.is_empty() {
+		bail!("some remote-tracking refs were not updated (non-fast-forward)");
+	}
 	Ok(outcome.fetched_roots)
 }
 
@@ -723,6 +923,34 @@ fn repository_from_dir<H: HashAlgorithm>(
 	repository
 }
 
+#[cfg(test)]
+mod target_tests {
+	use gitana_object::{ObjectKind, write_flush, write_pkt};
+
+	use super::*;
+
+	#[test]
+	fn hidden_head_uses_its_advertised_symbolic_target() {
+		let oid = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"head");
+		let mut advertisement = Vec::new();
+		write_pkt(
+			&mut advertisement,
+			format!(
+				"{} refs/heads/main\0symref=HEAD:refs/heads/main object-format=sha256\n",
+				oid.to_hex()
+			)
+			.as_bytes(),
+		)
+		.unwrap();
+		write_flush(&mut advertisement);
+
+		assert_eq!(
+			select_target::<Sha256>(&advertisement, &SubmoduleUpdateTarget::RemoteHead).unwrap(),
+			oid
+		);
+	}
+}
+
 #[cfg(all(test, unix))]
 mod tests {
 	use cap_std::ambient_authority;
@@ -746,6 +974,7 @@ mod tests {
 			source_url: "https://alice@example.invalid/team/child".to_owned(),
 			persist_url: "https://alice@example.invalid/team/child".to_owned(),
 			hash_kind: HashKind::Sha256,
+			target: SubmoduleUpdateTarget::RemoteHead,
 			config: GitConfig::parse("").unwrap(),
 		};
 		let private_source = transfer.private_relative_source_url(&matching);

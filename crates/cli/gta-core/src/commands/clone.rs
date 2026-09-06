@@ -31,6 +31,7 @@ pub async fn run(
 	sparse: bool,
 	recurse_submodules: Vec<String>,
 	shallow_submodules: bool,
+	remote_submodules: bool,
 ) -> Result<()> {
 	// Fail fast on a bad `--shallow-since` before any network round-trip.
 	let deepen = build_deepen(depth, shallow_since.as_deref(), shallow_exclude)?;
@@ -253,6 +254,7 @@ pub async fn run(
 			recurse_submodules,
 			credential_url_base,
 			shallow_submodules.then_some(1),
+			remote_submodules,
 		)
 		.await?;
 	}
@@ -546,6 +548,7 @@ mod tests {
 			vec![".".to_owned()],
 			None,
 			None,
+			false,
 		)
 		.await
 		.unwrap_err();

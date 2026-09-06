@@ -11,7 +11,10 @@ use gitana_git_http::{
 	build_receive_pack_request, parse_advertisement, parse_report_status,
 };
 use gitana_object::{HashAlgorithm, ObjectId};
-use gitana_remote::{Connection, PackFetcher, PushRefspec, Refspec};
+use gitana_remote::{
+	Connection, PackFetcher, PushRefspec, Refspec, effective_fetch_destination,
+	effective_fetch_refspecs, validate_remote_name,
+};
 use gitana_repository::{HeadState, ReflogIntent, Repository};
 use gitana_worktree::WorkTree;
 
@@ -44,6 +47,14 @@ pub struct FetchOutcome<H: HashAlgorithm> {
 	/// advertises any ref mapping onto them — their upstream branch was deleted. Empty when `prune` is
 	/// false. Judging reachability after a prune is what makes a stale tracking ref safe to trust.
 	pub pruned: Vec<String>,
+}
+
+struct PlannedTrackingUpdate<H: HashAlgorithm> {
+	new: ObjectId<H>,
+	tracking: String,
+	source: String,
+	force: bool,
+	expected: Option<ObjectId<H>>,
 }
 
 /// The reflog identity for a [`fetch`]'s tracking-ref updates: the committer line and the action
@@ -111,6 +122,35 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 	checkouts: &[(String, String)],
 	reflog: Option<FetchReflog<'_>>,
 ) -> Result<FetchOutcome<H>> {
+	fetch_from_remote(
+		fetcher,
+		repo,
+		"origin",
+		advertisement,
+		update_head_ok,
+		tags,
+		prune,
+		deepen,
+		checkouts,
+		reflog,
+	)
+	.await
+}
+
+/// Fetch using the named remote's URL-independent configuration.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_from_remote<F: FileStore, H: HashAlgorithm>(
+	fetcher: &mut impl PackFetcher,
+	repo: &Repository<F, H>,
+	remote: &str,
+	advertisement: &[u8],
+	update_head_ok: bool,
+	tags: TagFetch,
+	prune: bool,
+	deepen: &Deepen,
+	checkouts: &[(String, String)],
+	reflog: Option<FetchReflog<'_>>,
+) -> Result<FetchOutcome<H>> {
 	// `core.bare` is repository identity, so consult only the local config. Frontends that must
 	// serialize this read with another config publisher use `fetch_with_bare` instead.
 	let bare = repo
@@ -119,10 +159,11 @@ pub async fn fetch<F: FileStore, H: HashAlgorithm>(
 		.ok()
 		.and_then(|local| local.get_bool("core", None, "bare").ok().flatten())
 		.unwrap_or(false);
-	fetch_with_bare(
+	fetch_with_bare_from_remote(
 		fetcher,
 		repo,
 		bare,
+		remote,
 		advertisement,
 		update_head_ok,
 		tags,
@@ -151,24 +192,56 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 	checkouts: &[(String, String)],
 	reflog: Option<FetchReflog<'_>>,
 ) -> Result<FetchOutcome<H>> {
+	fetch_with_bare_from_remote(
+		fetcher,
+		repo,
+		bare,
+		"origin",
+		advertisement,
+		update_head_ok,
+		tags,
+		prune,
+		deepen,
+		checkouts,
+		reflog,
+	)
+	.await
+}
+
+/// Fetch using the named remote's configuration and a caller-supplied `core.bare` snapshot.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_with_bare_from_remote<F: FileStore, H: HashAlgorithm>(
+	fetcher: &mut impl PackFetcher,
+	repo: &Repository<F, H>,
+	bare: bool,
+	remote: &str,
+	advertisement: &[u8],
+	update_head_ok: bool,
+	tags: TagFetch,
+	prune: bool,
+	deepen: &Deepen,
+	checkouts: &[(String, String)],
+	reflog: Option<FetchReflog<'_>>,
+) -> Result<FetchOutcome<H>> {
+	validate_remote_name(remote)?;
 	let advertised = parse_advertisement::<H>(advertisement)?;
 	let haves = gitana_remote::local_haves(repo).await?;
 
-	// `remote.origin.*` follows git's merged precedence, so a globally-configured `tagOpt`/refspec is
+	// `remote.<name>.*` follows git's merged precedence, so a globally-configured `tagOpt`/refspec is
 	// honoured (the frontend installs the effective config; a bare engine falls back to local).
 	let config = repo.effective_config().await?;
 	// Resolve the effective tag mode: an explicit CLI `--tags` / `--no-tags` (`All` / `None`) wins;
-	// otherwise the default (`Auto`) honors git's `remote.origin.tagOpt` config (`--tags` / `--no-tags`,
+	// otherwise the default (`Auto`) honors git's `remote.<name>.tagOpt` config (`--tags` / `--no-tags`,
 	// set e.g. by `git clone --no-tags`), and only then falls back to auto-follow.
 	let tags = match tags {
-		TagFetch::Auto => match config.get_string("remote", Some("origin"), "tagopt") {
+		TagFetch::Auto => match config.get_string("remote", Some(remote), "tagopt") {
 			Some("--tags") => TagFetch::All,
 			Some("--no-tags") => TagFetch::None,
 			_ => TagFetch::Auto,
 		},
 		explicit => explicit,
 	};
-	let mut refspecs = parse_fetch_refspecs(&config)?;
+	let mut refspecs = effective_fetch_refspecs(&config, remote)?;
 	// `--tags` mirrors every advertised tag into the same-named local ref, in addition to the
 	// configured refspecs. It is not forced (git does not clobber an existing tag pointing elsewhere
 	// without `--force`), so a tag that would move to an unrelated object is reported as rejected.
@@ -195,6 +268,7 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 	// fetched objects — the plan loop below re-derives the tracking updates once the pack is in hand.
 	validate_fetch_selection(
 		&advertised,
+		remote,
 		&positive,
 		&negative,
 		checked_out.as_deref(),
@@ -212,7 +286,11 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 		.refs
 		.iter()
 		.filter(|(name, _)| !negative.iter().any(|spec| spec.excludes(name)))
-		.filter(|(name, _)| positive.iter().any(|spec| spec.matches_source(name)))
+		.filter(|(name, _)| {
+			positive
+				.iter()
+				.any(|spec| fetch_refspec_selects_source(spec, remote, name))
+		})
 		.map(|(_, oid)| *oid)
 		.collect();
 	// A shallow fetch asks for reachable annotated tags (`include-tag`) so tags pointing into the fetched
@@ -233,10 +311,11 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 	// its destination (git applies them all), deduped so one source→destination pair acts once. Two
 	// *different* sources mapping to the same destination is a config error git aborts on, so detect
 	// it before writing anything.
-	// Each entry is `(new oid, destination tracking ref, advertised source ref, forced)`. The source ref
-	// is kept so the reflog can word a create by the *source* namespace (git's `storing head` vs
-	// `storing tag`), matching git.
-	let mut plan: Vec<(ObjectId<H>, String, String, bool)> = Vec::new();
+	// The source ref is kept so the reflog can word a create by the *source* namespace (git's `storing
+	// head` vs `storing tag`), matching git. Resolve every expected value before the first publication:
+	// distinct symbolic destinations can share one terminal ref, and the second update must retain the
+	// same pre-fetch CAS expectation rather than accepting the first update as its new baseline.
+	let mut plan = Vec::new();
 	let mut claimed: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
 	let mut rejected = Vec::new();
 	for (name, oid) in &advertised.refs {
@@ -244,7 +323,7 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 			continue;
 		}
 		for spec in &positive {
-			let Some(tracking) = spec.destination(name) else {
+			let Some(tracking) = spec.fetch_destination(remote, name) else {
 				continue;
 			};
 			// Conflict detection covers every destination, including the checked-out branch: two
@@ -258,6 +337,7 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 					claimed.insert(tracking.clone(), name.as_str());
 				}
 			}
+			let current = repo.refs().resolve_symbolic_exact(&tracking).await?;
 			if checked_out.as_deref() == Some(tracking.as_str()) {
 				if !update_head_ok {
 					bail!("refusing to fetch into branch '{tracking}' checked out in the work tree");
@@ -266,7 +346,6 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 				// fast-forward. A non-fast-forward onto the current branch is refused (git would
 				// force-reset it under a `+` refspec, discarding local commits — we decline to do that
 				// silently); a non-forced refspec would have git reject it too.
-				let current = repo.refs().resolve(&tracking).await?;
 				if current != Some(*oid)
 					&& let Some(current) = current
 					&& !repo.is_ancestor(current, *oid).await?
@@ -275,13 +354,25 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 				}
 				continue;
 			}
-			plan.push((*oid, tracking, name.clone(), spec.force));
+			plan.push(PlannedTrackingUpdate {
+				new: *oid,
+				tracking,
+				source: name.clone(),
+				force: spec.force,
+				expected: current,
+			});
 		}
 	}
 
 	let mut updated = Vec::new();
-	for (oid, tracking, source, force) in plan {
-		let current = repo.refs().resolve(&tracking).await?;
+	for PlannedTrackingUpdate {
+		new: oid,
+		tracking,
+		source,
+		force,
+		expected: current,
+	} in plan
+	{
 		if current == Some(oid) {
 			continue;
 		}
@@ -358,7 +449,7 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 		};
 		repo
 			.refs()
-			.update_ref(&tracking, oid, current, intent)
+			.update_ref_following_symbolic(&tracking, oid, current, intent)
 			.await?;
 		updated.push((tracking, oid));
 	}
@@ -370,6 +461,7 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 		auto_follow_tags(
 			repo,
 			&advertised,
+			remote,
 			&positive,
 			&negative,
 			&reflog,
@@ -385,13 +477,15 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 	// nothing.
 	let mut pruned = Vec::new();
 	if prune {
+		let remote_head = format!("refs/remotes/{remote}/HEAD");
 		let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 		for spec in &positive {
 			let Some(prefix) = spec.destination_glob_prefix() else {
 				continue;
 			};
 			for (tracking, _) in repo.refs().list(prefix).await? {
-				if claimed.contains_key(tracking.as_str())
+				if tracking == remote_head
+					|| claimed.contains_key(tracking.as_str())
 					|| !spec.covers_destination(&tracking)
 					|| !seen.insert(tracking.clone())
 				{
@@ -415,6 +509,16 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 	})
 }
 
+fn fetch_refspec_selects_source(spec: &Refspec, remote: &str, source: &str) -> bool {
+	if !spec.matches_source(source) {
+		return false;
+	}
+	if spec.destination(source).is_none() {
+		return true;
+	}
+	spec.fetch_destination(remote, source).is_some()
+}
+
 /// The fetch's fatal, structural errors — checked before any download so a fetch that fails persists no
 /// state (neither objects nor a `.git/shallow` boundary): an exact refspec source the remote does not
 /// advertise (git's `couldn't find remote ref …`), two different sources mapping onto one tracking ref,
@@ -423,6 +527,7 @@ pub async fn fetch_with_bare<F: FileStore, H: HashAlgorithm>(
 /// them per object once the pack is in hand.
 fn validate_fetch_selection<H: HashAlgorithm>(
 	advertised: &Advertised<H>,
+	remote: &str,
 	positive: &[&Refspec],
 	negative: &[&Refspec],
 	checked_out: Option<&str>,
@@ -442,7 +547,7 @@ fn validate_fetch_selection<H: HashAlgorithm>(
 			continue;
 		}
 		for spec in positive {
-			let Some(tracking) = spec.destination(name) else {
+			let Some(tracking) = spec.fetch_destination(remote, name) else {
 				continue;
 			};
 			if let Some(&other) = claimed.get(tracking.as_str())
@@ -485,6 +590,7 @@ fn validate_fetch_selection<H: HashAlgorithm>(
 async fn auto_follow_tags<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	advertised: &Advertised<H>,
+	remote: &str,
 	positive: &[&Refspec],
 	negative: &[&Refspec],
 	reflog: &Option<FetchReflog<'_>>,
@@ -515,7 +621,11 @@ async fn auto_follow_tags<F: FileStore, H: HashAlgorithm>(
 		.iter()
 		.filter(|(name, _)| !name.starts_with("refs/tags/"))
 		.filter(|(name, _)| !negative.iter().any(|spec| spec.excludes(name)))
-		.filter(|(name, _)| positive.iter().any(|spec| spec.destination(name).is_some()))
+		.filter(|(name, _)| {
+			positive
+				.iter()
+				.any(|spec| spec.fetch_destination(remote, name).is_some())
+		})
 		.map(|(_, oid)| *oid)
 		.collect();
 	let closure = crate::prune::reachable_from(repo, roots).await?;
@@ -564,13 +674,57 @@ async fn peel_tag_target<F: FileStore, H: HashAlgorithm>(
 	}
 }
 
-/// The parsed `remote.origin.fetch` refspecs, or the default when the remote has no `fetch` line.
-fn parse_fetch_refspecs(config: &gitana_config::GitConfig) -> Result<Vec<Refspec>> {
-	let configured = config.get_all("remote", Some("origin"), "fetch");
-	if configured.is_empty() {
-		return Ok(vec![Refspec::parse(gitana_remote::ORIGIN_FETCH_REFSPEC)?]);
+/// Reconstruct the named remote's conventional `HEAD` ref from a fetch advertisement.
+///
+/// When the server advertises a symbolic HEAD and its mapped tracking ref contains the advertised
+/// object, the local remote HEAD follows it symbolically. A detached HEAD, an omitted symref
+/// capability, or an unmapped target is recorded directly instead. Callers invoke this only after
+/// fetch and exact-object fallback have made the selected object available. The ref is optional: an
+/// unrepresentable or malformed destination is preserved while the fetched branch refs remain
+/// authoritative.
+pub async fn repair_remote_head_from_advertisement<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	remote: &str,
+	advertisement: &[u8],
+) -> Result<()> {
+	validate_remote_name(remote)?;
+	let advertised = parse_advertisement::<H>(advertisement)?;
+	let Some(head) = advertised.head_oid() else {
+		return Ok(());
+	};
+	if !repo.objects().exists_object(&head).await? {
+		return Ok(());
 	}
-	configured.iter().map(|spec| Refspec::parse(spec)).collect()
+	let remote_head = format!("refs/remotes/{remote}/HEAD");
+	let config = repo.effective_config().await?;
+	let refspecs = effective_fetch_refspecs(&config, remote)?;
+	let exact_mapping_owns_remote_head = refspecs.iter().any(|spec| {
+		let Some(source) = spec.exact_source() else {
+			return false;
+		};
+		!refspecs.iter().any(|candidate| candidate.excludes(source))
+			&& spec.fetch_destination(remote, source).as_deref() == Some(remote_head.as_str())
+	});
+	if exact_mapping_owns_remote_head {
+		return Ok(());
+	}
+	let state = if let Some(source) = advertised.head_target.as_deref() {
+		let tracking = effective_fetch_destination(&config, remote, source)?;
+		match tracking {
+			Some(tracking) if tracking == remote_head => HeadState::Detached(head),
+			Some(tracking) if repo.refs().resolve_symbolic(&tracking).await? == Some(head) => {
+				HeadState::Symbolic(tracking)
+			}
+			_ => HeadState::Detached(head),
+		}
+	} else {
+		HeadState::Detached(head)
+	};
+	repo
+		.refs()
+		.publish_optional_ref(&remote_head, state)
+		.await?;
+	Ok(())
 }
 
 /// The upstream tip `pull` should merge for local `branch`, read from the advertisement (the merge
@@ -590,7 +744,7 @@ pub async fn pull_upstream<F: FileStore, H: HashAlgorithm>(
 	branch: &str,
 ) -> Result<Option<ObjectId<H>>> {
 	let config = repo.effective_config().await?;
-	let refspecs = parse_fetch_refspecs(&config)?;
+	let refspecs = effective_fetch_refspecs(&config, "origin")?;
 	let advertised = parse_advertisement::<H>(advertisement)?;
 	let excluded = |name: &str| refspecs.iter().any(|spec| spec.excludes(name));
 	let maps_onto_branch = |name: &str| {
@@ -715,9 +869,10 @@ pub async fn prepare_clone<F: FileStore, H: HashAlgorithm>(
 	repo.init().await?;
 
 	let advertised = parse_advertisement::<H>(connection.advertisement())?;
-	// A shallow clone deepens from the branch tips and `HEAD` (see `shallow_wants`); a full clone ignores
-	// these roots and wants every advertised ref. A shallow clone requests reachable tags (`include-tag`)
-	// so tags pointing into the fetched history are preserved.
+	// A shallow clone deepens from the branch tips and `HEAD` (see `shallow_wants`); a full clone wants
+	// the refs it will publish plus `HEAD`. Filtering source-side tracking refs before negotiation avoids
+	// downloading history that the clone deliberately leaves unreachable. A shallow clone requests
+	// reachable tags (`include-tag`) so tags pointing into the fetched history are preserved.
 	let roots = shallow_wants(&advertised);
 	let fetched_roots = download_clone(
 		connection,
@@ -765,13 +920,16 @@ pub async fn prepare_clone<F: FileStore, H: HashAlgorithm>(
 	// object. A full clone holds the whole closure, so nothing is skipped there.
 	let shallow = !deepen.is_empty();
 	for (name, oid) in &advertised.refs {
-		if name.starts_with("refs/") {
+		// A clone owns its `refs/remotes/origin` namespace. Source-side tracking refs describe the
+		// source's remotes, not this clone's origin, and importing them can also create directory/file
+		// conflicts with the tracking refs synthesized from advertised branches below.
+		if clone_imports_ref(name) {
 			if shallow && !repo.objects().exists_object(oid).await? {
 				continue;
 			}
 			// Only the checked-out branch (HEAD's target) carries clone's reflog — writing it cascades the
-			// entry into `logs/HEAD`. The other refs gta recreates here stand in for git's remote-tracking
-			// refs, which git leaves unlogged, so they pass Skip.
+			// entry into `logs/HEAD`. The other imported refs and the tracking refs created below are
+			// unlogged, so they pass Skip.
 			let intent = match (&head_state, &clone_reflog) {
 				(HeadState::Symbolic(target), Some((c, msg))) if name == target => ReflogIntent::Log {
 					committer: c,
@@ -782,6 +940,41 @@ pub async fn prepare_clone<F: FileStore, H: HashAlgorithm>(
 			repo.refs().update_ref(name, *oid, None, intent).await?;
 		}
 	}
+	// Make this clone's tracking refs describe the source's branch tips.
+	for (branch, oid) in advertised.branches() {
+		if branch == "refs/heads/HEAD" {
+			continue;
+		}
+		let branch = branch
+			.strip_prefix("refs/heads/")
+			.expect("Advertised::branches returns only branch refs");
+		let tracking = format!("refs/remotes/origin/{branch}");
+		let expected = repo.refs().resolve_symbolic(&tracking).await?;
+		if expected != Some(oid) {
+			repo
+				.refs()
+				.update_ref(&tracking, oid, expected, ReflogIntent::Skip)
+				.await?;
+		}
+	}
+	let mut remote_head_published = false;
+	if let HeadState::Symbolic(branch) = &head_state
+		&& let Some(branch) = branch.strip_prefix("refs/heads/")
+		&& let Some(head) = advertised.oid_of(&format!("refs/heads/{branch}"))
+		&& !advertised
+			.branches()
+			.any(|(name, _)| name.starts_with("refs/heads/HEAD/"))
+	{
+		let tracking = format!("refs/remotes/origin/{branch}");
+		if tracking != "refs/remotes/origin/HEAD"
+			&& repo.refs().resolve_symbolic(&tracking).await? == Some(head)
+		{
+			remote_head_published = repo
+				.refs()
+				.publish_optional_ref("refs/remotes/origin/HEAD", HeadState::Symbolic(tracking))
+				.await?;
+		}
+	}
 	// Persist the remote (the caller-resolved URL, scheme-agnostic) through the file store.
 	gitana_remote::save_remote_origin(repo.objects().file_store(), persist_url).await?;
 
@@ -790,7 +983,12 @@ pub async fn prepare_clone<F: FileStore, H: HashAlgorithm>(
 	Ok(PreparedClone {
 		head,
 		fetched_roots,
+		remote_head_published,
 	})
+}
+
+fn clone_imports_ref(name: &str) -> bool {
+	name.starts_with("refs/") && name != "refs/remotes" && !name.starts_with("refs/remotes/")
 }
 
 async fn clone_default_branch<F: FileStore, H: HashAlgorithm>(
@@ -809,9 +1007,14 @@ fn infer_clone_head<H: HashAlgorithm>(
 	default_branch: &str,
 ) -> HeadState<H> {
 	if let Some(target) = &advertised.head_target {
-		return HeadState::Symbolic(target.clone());
+		if clone_imports_ref(target) {
+			return HeadState::Symbolic(target.clone());
+		}
+		if let Some(head) = advertised.head_oid() {
+			return HeadState::Detached(head);
+		}
 	}
-	let Some(head) = advertised.oid_of("HEAD") else {
+	let Some(head) = advertised.head_oid() else {
 		return HeadState::Symbolic(format!("refs/heads/{default_branch}"));
 	};
 	let configured = format!("refs/heads/{default_branch}");
@@ -835,8 +1038,8 @@ fn infer_clone_head<H: HashAlgorithm>(
 
 /// Download a **clone**'s objects over a [`Connection`] (the single-round counterpart of [`download`],
 /// which negotiates `have`s for an incremental fetch over the stateless-HTTP path). A full clone wants
-/// every advertised ref; a shallow one deepens from `deepen_roots`. `include_tag` requests reachable
-/// annotated tags for a shallow clone.
+/// the advertised refs it will publish plus `HEAD`; a shallow one deepens from `deepen_roots`.
+/// `include_tag` requests reachable annotated tags for a shallow clone.
 async fn download_clone<F: FileStore, H: HashAlgorithm>(
 	connection: &mut impl Connection,
 	repo: &Repository<F, H>,
@@ -847,7 +1050,7 @@ async fn download_clone<F: FileStore, H: HashAlgorithm>(
 ) -> Result<Vec<ObjectId<H>>> {
 	ensure_deepen_supported(advertised, deepen)?;
 	let wants = if deepen.is_empty() {
-		gitana_remote::advertised_oids(advertised)
+		full_clone_wants(advertised)
 	} else {
 		let mut wants = deepen_roots.to_vec();
 		wants.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -856,6 +1059,24 @@ async fn download_clone<F: FileStore, H: HashAlgorithm>(
 	};
 	gitana_remote::download_clone_pack(connection, repo, &wants, deepen, include_tag).await?;
 	Ok(wants)
+}
+
+/// A full clone requests exactly the roots whose refs it can retain, plus `HEAD` for a detached or
+/// filtered symbolic target. Source-side remote-tracking refs are not part of the destination clone's
+/// namespace, so their otherwise-unreachable history must not be transferred either.
+fn full_clone_wants<H: HashAlgorithm>(advertised: &Advertised<H>) -> Vec<ObjectId<H>> {
+	let mut oids: Vec<ObjectId<H>> = advertised
+		.refs
+		.iter()
+		.filter(|(name, _)| clone_imports_ref(name))
+		.map(|(_, oid)| *oid)
+		.collect();
+	if let Some(head) = advertised.head_oid() {
+		oids.push(head);
+	}
+	oids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+	oids.dedup();
+	oids
 }
 
 /// Download the objects reachable from the advertised tips that `haves` do not already cover, writing
@@ -931,9 +1152,12 @@ fn shallow_wants<H: HashAlgorithm>(advertised: &Advertised<H>) -> Vec<ObjectId<H
 	let mut oids: Vec<ObjectId<H>> = advertised
 		.refs
 		.iter()
-		.filter(|(name, _)| name == "HEAD" || name.starts_with("refs/heads/"))
+		.filter(|(name, _)| name.starts_with("refs/heads/"))
 		.map(|(_, oid)| *oid)
 		.collect();
+	if let Some(head) = advertised.head_oid() {
+		oids.push(head);
+	}
 	oids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 	oids.dedup();
 	oids
@@ -1469,6 +1693,113 @@ mod tests {
 	use super::*;
 	use crate::test_support::{TestIdentity, TestSigner, fixture, open_dir, stage};
 
+	#[test]
+	fn named_remote_fetch_refspecs_use_the_named_namespace() {
+		let config = gitana_config::GitConfig::parse("").unwrap();
+		let fallback = effective_fetch_refspecs(&config, "backup").unwrap();
+		assert_eq!(
+			fallback[0].destination("refs/heads/main").as_deref(),
+			Some("refs/remotes/backup/main")
+		);
+		let configured = gitana_config::GitConfig::parse(
+			"[remote \"backup\"]\n\tfetch = +refs/heads/main:refs/custom/main\n",
+		)
+		.unwrap();
+		assert_eq!(
+			effective_fetch_refspecs(&configured, "backup").unwrap()[0]
+				.destination("refs/heads/main")
+				.as_deref(),
+			Some("refs/custom/main")
+		);
+	}
+
+	#[test]
+	fn wildcard_fetch_reserves_the_remote_head_convenience_ref() {
+		let wildcard = Refspec::parse("+refs/heads/*:refs/remotes/origin/*").unwrap();
+		assert_eq!(
+			wildcard.fetch_destination("origin", "refs/heads/HEAD"),
+			None
+		);
+		assert!(!fetch_refspec_selects_source(
+			&wildcard,
+			"origin",
+			"refs/heads/HEAD"
+		));
+
+		let exact = Refspec::parse("refs/heads/HEAD:refs/custom/branch-head").unwrap();
+		assert_eq!(
+			exact
+				.fetch_destination("origin", "refs/heads/HEAD")
+				.as_deref(),
+			Some("refs/custom/branch-head")
+		);
+		assert!(fetch_refspec_selects_source(
+			&exact,
+			"origin",
+			"refs/heads/HEAD"
+		));
+
+		let nested = Refspec::parse("+refs/heads/team/*:refs/remotes/origin/*").unwrap();
+		assert_eq!(
+			nested.fetch_destination("origin", "refs/heads/team/HEAD"),
+			None
+		);
+		assert!(!fetch_refspec_selects_source(
+			&nested,
+			"origin",
+			"refs/heads/team/HEAD"
+		));
+
+		let exact_nested = Refspec::parse("refs/heads/team/HEAD:refs/custom/team-head").unwrap();
+		assert_eq!(
+			exact_nested
+				.fetch_destination("origin", "refs/heads/team/HEAD")
+				.as_deref(),
+			Some("refs/custom/team-head")
+		);
+		assert!(fetch_refspec_selects_source(
+			&exact_nested,
+			"origin",
+			"refs/heads/team/HEAD"
+		));
+	}
+
+	#[test]
+	fn full_clone_wants_only_published_refs_and_head() {
+		let head = ObjectId::<Sha256>::from_hex(&"1".repeat(64)).unwrap();
+		let branch = ObjectId::<Sha256>::from_hex(&"2".repeat(64)).unwrap();
+		let tag = ObjectId::<Sha256>::from_hex(&"3".repeat(64)).unwrap();
+		let source_tracking = ObjectId::<Sha256>::from_hex(&"4".repeat(64)).unwrap();
+		let advertised = Advertised {
+			refs: vec![
+				("HEAD".to_owned(), head),
+				("refs/heads/main".to_owned(), branch),
+				("refs/tags/v1".to_owned(), tag),
+				("refs/remotes/upstream/hidden".to_owned(), source_tracking),
+			],
+			..Default::default()
+		};
+
+		assert_eq!(full_clone_wants(&advertised), vec![head, branch, tag]);
+	}
+
+	#[test]
+	fn clone_wants_retain_a_hidden_filtered_symbolic_head_target() {
+		let head = ObjectId::<Sha256>::from_hex(&"1".repeat(64)).unwrap();
+		let advertised = Advertised {
+			refs: vec![("refs/remotes/upstream/main".to_owned(), head)],
+			head_target: Some("refs/remotes/upstream/main".to_owned()),
+			..Default::default()
+		};
+
+		assert_eq!(full_clone_wants(&advertised), vec![head]);
+		assert_eq!(shallow_wants(&advertised), vec![head]);
+		assert_eq!(
+			infer_clone_head(&advertised, "main"),
+			HeadState::Detached(head)
+		);
+	}
+
 	struct NoopFetcher;
 
 	impl PackFetcher for NoopFetcher {
@@ -1557,6 +1888,377 @@ mod tests {
 		.unwrap();
 	}
 
+	#[tokio::test]
+	async fn remote_head_repair_preserves_an_exact_fetch_destination() {
+		let (_directory, worktree) = fixture().await;
+		let blob = worktree.repository().write_blob(b"main\n").await.unwrap();
+		let mut index = Index::new();
+		stage(&mut index, "main.txt", blob);
+		worktree.save_index(&index).await.unwrap();
+		crate::commit(&worktree, "main", &TestIdentity::default())
+			.await
+			.unwrap();
+		let other =
+			crate::test_support::loose_commit(worktree.repository(), Vec::new(), "other.txt", b"other\n")
+				.await;
+		worktree
+			.repository()
+			.refs()
+			.update_ref("refs/heads/other", other, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		let advertisement = advertise(
+			worktree.repository(),
+			Service::UploadPack,
+			ProtocolVersion::V0,
+			None,
+		)
+		.await
+		.unwrap();
+		let mut config = worktree.repository().read_config().await.unwrap();
+		config
+			.set(
+				"remote",
+				Some("origin"),
+				"fetch",
+				"+refs/heads/other:refs/remotes/origin/HEAD",
+			)
+			.unwrap();
+		worktree.repository().write_config(&config).await.unwrap();
+
+		fetch_with_bare(
+			&mut NoopFetcher,
+			worktree.repository(),
+			false,
+			&advertisement,
+			false,
+			TagFetch::Auto,
+			false,
+			&Deepen::default(),
+			&[],
+			None,
+		)
+		.await
+		.unwrap();
+		repair_remote_head_from_advertisement(worktree.repository(), "origin", &advertisement)
+			.await
+			.unwrap();
+
+		assert_eq!(
+			worktree
+				.repository()
+				.refs()
+				.resolve("refs/remotes/origin/HEAD")
+				.await
+				.unwrap(),
+			Some(other)
+		);
+		assert_eq!(
+			worktree
+				.repository()
+				.refs()
+				.read_symbolic("refs/remotes/origin/HEAD")
+				.await
+				.unwrap(),
+			None,
+			"the explicit fetch destination must remain a direct ref"
+		);
+	}
+
+	#[tokio::test]
+	async fn remote_head_repair_ignores_an_excluded_exact_fetch_destination() {
+		let (_directory, worktree) = fixture().await;
+		let blob = worktree.repository().write_blob(b"main\n").await.unwrap();
+		let mut index = Index::new();
+		stage(&mut index, "main.txt", blob);
+		worktree.save_index(&index).await.unwrap();
+		crate::commit(&worktree, "main", &TestIdentity::default())
+			.await
+			.unwrap();
+		let main = worktree
+			.repository()
+			.refs()
+			.resolve_head()
+			.await
+			.unwrap()
+			.unwrap();
+		let advertisement = advertise(
+			worktree.repository(),
+			Service::UploadPack,
+			ProtocolVersion::V0,
+			None,
+		)
+		.await
+		.unwrap();
+		let mut config = worktree.repository().read_config().await.unwrap();
+		config
+			.set(
+				"remote",
+				Some("origin"),
+				"fetch",
+				"+refs/heads/main:refs/remotes/origin/HEAD",
+			)
+			.unwrap();
+		config.add("remote", Some("origin"), "fetch", Some("^refs/heads/main"));
+		worktree.repository().write_config(&config).await.unwrap();
+
+		fetch_with_bare(
+			&mut NoopFetcher,
+			worktree.repository(),
+			false,
+			&advertisement,
+			false,
+			TagFetch::Auto,
+			false,
+			&Deepen::default(),
+			&[],
+			None,
+		)
+		.await
+		.unwrap();
+		repair_remote_head_from_advertisement(worktree.repository(), "origin", &advertisement)
+			.await
+			.unwrap();
+
+		assert_eq!(
+			worktree
+				.repository()
+				.refs()
+				.resolve("refs/remotes/origin/HEAD")
+				.await
+				.unwrap(),
+			Some(main)
+		);
+		assert_eq!(
+			worktree
+				.repository()
+				.refs()
+				.read_symbolic("refs/remotes/origin/HEAD")
+				.await
+				.unwrap(),
+			None,
+			"the excluded mapping must not suppress the direct convenience ref"
+		);
+	}
+
+	#[tokio::test]
+	async fn exact_fetch_destination_follows_an_existing_remote_head_symref() {
+		let (_directory, worktree) = fixture().await;
+		let blob = worktree.repository().write_blob(b"main\n").await.unwrap();
+		let mut index = Index::new();
+		stage(&mut index, "main.txt", blob);
+		worktree.save_index(&index).await.unwrap();
+		crate::commit(&worktree, "main", &TestIdentity::default())
+			.await
+			.unwrap();
+		let main = worktree
+			.repository()
+			.refs()
+			.resolve_head()
+			.await
+			.unwrap()
+			.unwrap();
+		let other =
+			crate::test_support::loose_commit(worktree.repository(), Vec::new(), "other.txt", b"other\n")
+				.await;
+		worktree
+			.repository()
+			.refs()
+			.update_ref("refs/heads/other", other, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		worktree
+			.repository()
+			.refs()
+			.update_ref("refs/remotes/origin/main", main, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		worktree
+			.repository()
+			.refs()
+			.set_symbolic(
+				"refs/remotes/origin/HEAD",
+				"refs/remotes/origin/main",
+				ReflogIntent::Skip,
+			)
+			.await
+			.unwrap();
+		let advertisement = advertise(
+			worktree.repository(),
+			Service::UploadPack,
+			ProtocolVersion::V0,
+			None,
+		)
+		.await
+		.unwrap();
+		let mut config = worktree.repository().read_config().await.unwrap();
+		config
+			.set(
+				"remote",
+				Some("origin"),
+				"fetch",
+				"+refs/heads/other:refs/remotes/origin/HEAD",
+			)
+			.unwrap();
+		worktree.repository().write_config(&config).await.unwrap();
+
+		fetch_with_bare(
+			&mut NoopFetcher,
+			worktree.repository(),
+			false,
+			&advertisement,
+			false,
+			TagFetch::Auto,
+			false,
+			&Deepen::default(),
+			&[],
+			None,
+		)
+		.await
+		.unwrap();
+		repair_remote_head_from_advertisement(worktree.repository(), "origin", &advertisement)
+			.await
+			.unwrap();
+
+		assert_eq!(
+			worktree
+				.repository()
+				.refs()
+				.read_symbolic("refs/remotes/origin/HEAD")
+				.await
+				.unwrap()
+				.as_deref(),
+			Some("refs/remotes/origin/main")
+		);
+		assert_eq!(
+			worktree
+				.repository()
+				.refs()
+				.resolve("refs/remotes/origin/main")
+				.await
+				.unwrap(),
+			Some(other),
+			"the exact fetch mapping must update the symref's referent"
+		);
+	}
+
+	#[tokio::test]
+	async fn symbolic_destination_aliases_retain_their_shared_prepublication_expectation() {
+		let (_directory, worktree) = fixture().await;
+		let blob = worktree
+			.repository()
+			.write_blob(b"initial\n")
+			.await
+			.unwrap();
+		let mut index = Index::new();
+		stage(&mut index, "initial.txt", blob);
+		worktree.save_index(&index).await.unwrap();
+		crate::commit(&worktree, "initial", &TestIdentity::default())
+			.await
+			.unwrap();
+		let initial = worktree
+			.repository()
+			.refs()
+			.resolve_head()
+			.await
+			.unwrap()
+			.unwrap();
+		let first =
+			crate::test_support::loose_commit(worktree.repository(), Vec::new(), "first.txt", b"first\n")
+				.await;
+		let second = crate::test_support::loose_commit(
+			worktree.repository(),
+			Vec::new(),
+			"second.txt",
+			b"second\n",
+		)
+		.await;
+		for (name, oid) in [
+			("refs/heads/a-first", first),
+			("refs/heads/z-second", second),
+		] {
+			worktree
+				.repository()
+				.refs()
+				.update_ref(name, oid, None, ReflogIntent::Skip)
+				.await
+				.unwrap();
+		}
+		worktree
+			.repository()
+			.refs()
+			.update_ref(
+				"refs/remotes/origin/terminal",
+				initial,
+				None,
+				ReflogIntent::Skip,
+			)
+			.await
+			.unwrap();
+		for alias in ["refs/remotes/origin/a", "refs/remotes/origin/z"] {
+			worktree
+				.repository()
+				.refs()
+				.set_symbolic(alias, "refs/remotes/origin/terminal", ReflogIntent::Skip)
+				.await
+				.unwrap();
+		}
+		let advertisement = advertise(
+			worktree.repository(),
+			Service::UploadPack,
+			ProtocolVersion::V0,
+			None,
+		)
+		.await
+		.unwrap();
+		let mut config = worktree.repository().read_config().await.unwrap();
+		config
+			.set(
+				"remote",
+				Some("origin"),
+				"fetch",
+				"+refs/heads/a-first:refs/remotes/origin/a",
+			)
+			.unwrap();
+		config.add(
+			"remote",
+			Some("origin"),
+			"fetch",
+			Some("+refs/heads/z-second:refs/remotes/origin/z"),
+		);
+		worktree.repository().write_config(&config).await.unwrap();
+
+		let result = fetch_with_bare(
+			&mut NoopFetcher,
+			worktree.repository(),
+			false,
+			&advertisement,
+			false,
+			TagFetch::Auto,
+			false,
+			&Deepen::default(),
+			&[],
+			None,
+		)
+		.await;
+		let error = match result {
+			Ok(_) => panic!("symbolic aliases to one terminal must not both update"),
+			Err(error) => error,
+		};
+
+		assert!(error.to_string().contains("moved"));
+		assert_eq!(
+			worktree
+				.repository()
+				.refs()
+				.resolve("refs/remotes/origin/terminal")
+				.await
+				.unwrap(),
+			Some(first),
+			"the later alias must not adopt the first update as its expected value"
+		);
+	}
+
 	#[test]
 	fn clone_head_without_symref_infers_a_matching_branch() {
 		use gitana_object::Sha256;
@@ -1605,6 +2307,25 @@ mod tests {
 				("HEAD".to_owned(), head),
 				("refs/heads/main".to_owned(), branch),
 			],
+			..Default::default()
+		};
+		assert_eq!(
+			infer_clone_head(&advertised, "main"),
+			HeadState::Detached(head)
+		);
+	}
+
+	#[test]
+	fn clone_head_detaches_when_its_symbolic_target_is_not_imported() {
+		use gitana_object::Sha256;
+
+		let head = ObjectId::<Sha256>::from_hex(&"5".repeat(64)).unwrap();
+		let advertised = Advertised {
+			refs: vec![
+				("HEAD".to_owned(), head),
+				("refs/remotes/upstream/main".to_owned(), head),
+			],
+			head_target: Some("refs/remotes/upstream/main".to_owned()),
 			..Default::default()
 		};
 		assert_eq!(

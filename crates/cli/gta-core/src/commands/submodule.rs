@@ -30,6 +30,8 @@ pub enum Action {
 		init: bool,
 		depth: Option<u32>,
 		recommend_shallow: bool,
+		remote: bool,
+		fetch: bool,
 		recursive: bool,
 		paths: Vec<String>,
 	},
@@ -78,6 +80,8 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 			init,
 			depth,
 			recommend_shallow,
+			remote,
+			fetch,
 			recursive: true,
 			paths,
 		} => {
@@ -91,6 +95,8 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 					initialize: *init,
 					depth: *depth,
 					recommend_shallow: *recommend_shallow,
+					remote: *remote,
+					fetch: *fetch,
 					initialize_only_active: false,
 					reflog_committer: None,
 				},
@@ -177,6 +183,8 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 			init,
 			depth,
 			recommend_shallow,
+			remote,
+			fetch,
 			recursive: false,
 			paths,
 		} => {
@@ -191,6 +199,8 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 				initialize: init,
 				depth,
 				recommend_shallow,
+				remote,
+				fetch,
 				initialize_only_active: false,
 				reflog_committer: Some(committer(&superproject)),
 			};
@@ -313,6 +323,8 @@ async fn recursive_update(
 		initialize,
 		depth,
 		recommend_shallow,
+		remote,
+		fetch,
 		initialize_only_active,
 		..
 	} = request;
@@ -330,17 +342,21 @@ async fn recursive_update(
 		root_proof.clone(),
 	))
 	.await?;
+	let mut recovered_levels = HashMap::new();
 	for (level_root, expected_git_dir, discovered_root, level_prefix) in recovery_levels {
-		Box::pin(resume_update_level(
+		if let Some(recovered) = Box::pin(resume_update_level(
 			&level_root,
 			expected_git_dir.as_deref(),
 			discovered_root,
 			prefix,
 			&level_prefix,
 			command,
-			(module_base.clone(), depth, recommend_shallow),
+			(module_base.clone(), depth, recommend_shallow, remote, fetch),
 		))
-		.await?;
+		.await?
+		{
+			recovered_levels.insert(level_prefix, recovered);
+		}
 	}
 
 	let mut pending = VecDeque::from([(
@@ -354,6 +370,8 @@ async fn recursive_update(
 		credential_url_base,
 		depth,
 		recommend_shallow,
+		remote,
+		fetch,
 	)]);
 	while let Some((
 		level_root,
@@ -361,13 +379,23 @@ async fn recursive_update(
 		discovered_root,
 		query_prefix,
 		level_prefix,
-		query,
+		mut query,
 		initialize_only_active,
 		credential_url_base,
 		depth,
 		recommend_shallow,
+		remote,
+		fetch,
 	)) = pending.pop_front()
 	{
+		let recovered = recovered_levels.remove(&level_prefix);
+		if let Some((report, _)) = &recovered {
+			for outcome in &report.outcomes {
+				query
+					.pathspecs
+					.push(format!(":(top,literal,exclude){}", outcome.path));
+			}
+		}
 		let (layout, report, mut descendant_url_bases) = Box::pin(update_level(
 			&level_root,
 			expected_git_dir.as_deref(),
@@ -380,12 +408,23 @@ async fn recursive_update(
 				initialize,
 				depth,
 				recommend_shallow,
+				remote,
+				fetch,
 				initialize_only_active,
 				reflog_committer: None,
 			},
 		))
 		.await?;
-		for outcome in report.outcomes {
+		let mut traversal_outcomes = report.outcomes;
+		if let Some((recovered, recovered_url_bases)) = recovered {
+			for (path, url) in recovered_url_bases {
+				descendant_url_bases.entry(path).or_insert(url);
+			}
+			traversal_outcomes.extend(recovered.outcomes);
+		}
+		traversal_outcomes.sort_by(|left, right| left.path.cmp(&right.path));
+		traversal_outcomes.dedup_by(|left, right| left.path == right.path);
+		for outcome in traversal_outcomes {
 			if matches!(
 				outcome.state,
 				UpdateOutcomeState::Cloned
@@ -403,6 +442,8 @@ async fn recursive_update(
 					descendant_url_bases.remove(&outcome.path),
 					depth,
 					recommend_shallow,
+					remote,
+					fetch,
 				));
 			}
 		}
@@ -419,6 +460,7 @@ pub(crate) async fn update_published_clone(
 	active_pathspecs: Vec<String>,
 	credential_url_base: Option<String>,
 	depth: Option<u32>,
+	remote: bool,
 ) -> Result<()> {
 	let (lease, common, git, _) = Box::pin(repo::command_config_mutation_lease(
 		&root_layout,
@@ -444,6 +486,8 @@ pub(crate) async fn update_published_clone(
 			initialize: true,
 			depth,
 			recommend_shallow: true,
+			remote,
+			fetch: true,
 			initialize_only_active: true,
 			reflog_committer: None,
 		},
@@ -583,9 +627,9 @@ async fn resume_update_level(
 	prefix: &str,
 	level_prefix: &str,
 	command: &CommandContext,
-	recovery_state: (gitana_config::GitConfig, Option<u32>, bool),
-) -> Result<()> {
-	let (module_base, depth, recommend_shallow) = recovery_state;
+	recovery_state: (gitana_config::GitConfig, Option<u32>, bool, bool, bool),
+) -> Result<Option<(UpdateReport, HashMap<String, String>)>> {
+	let (module_base, depth, recommend_shallow, remote, fetch) = recovery_state;
 	let (layout, setup, common, git, work, configuration, superproject, hash_kind) =
 		Box::pin(open_level(root, expected_git_dir, discovered_root)).await?;
 	repo::ensure_no_pending_deinit_at(&layout, &common, &git)?;
@@ -606,17 +650,22 @@ async fn resume_update_level(
 		Some(committer(&superproject)),
 		depth,
 		recommend_shallow,
+		remote,
+		fetch,
 	))
 	.await
 	{
-		Ok(Some(report)) => render_update_at(prefix, level_prefix, &report),
-		Ok(None) => {}
+		Ok(Some(report)) => {
+			render_update_at(prefix, level_prefix, &report);
+			let descendant_url_bases = transfer.take_descendant_url_bases()?;
+			Ok(Some((report, descendant_url_bases)))
+		}
+		Ok(None) => Ok(None),
 		Err(failure) => {
 			render_update_at(prefix, level_prefix, &failure.completed);
-			return Err(failure.into());
+			Err(failure.into())
 		}
 	}
-	Ok(())
 }
 
 async fn update_level(
@@ -792,7 +841,10 @@ fn render_update_at(prefix: &str, level_prefix: &str, report: &gitana_submodule:
 			UpdateOutcomeState::Cloned | UpdateOutcomeState::CheckedOut => println!(
 				"Submodule path '{}': checked out '{}'",
 				render_nested_relative(prefix, level_prefix, &outcome.path),
-				outcome.recorded
+				outcome
+					.target
+					.as_ref()
+					.expect("completed updates always report their selected target")
 			),
 			UpdateOutcomeState::SkippedByStrategy => eprintln!(
 				"Skipping submodule '{}'",

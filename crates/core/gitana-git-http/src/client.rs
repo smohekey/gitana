@@ -48,6 +48,19 @@ impl<H: HashAlgorithm> Advertised<H> {
 			.map(|(_, oid)| *oid)
 	}
 
+	/// The remote's advertised `HEAD` object. An explicit `HEAD` pseudo-ref is authoritative; when a
+	/// server hides that pseudo-ref but retains `symref=HEAD:<ref>`, the advertised symbolic target
+	/// supplies the object instead. An unborn or otherwise unadvertised symbolic target resolves to
+	/// `None`.
+	pub fn head_oid(&self) -> Option<ObjectId<H>> {
+		self.oid_of("HEAD").or_else(|| {
+			self
+				.head_target
+				.as_deref()
+				.and_then(|target| self.oid_of(target))
+		})
+	}
+
 	/// Whether the server advertised the bare capability token `cap` (e.g. `"shallow"`).
 	pub fn supports(&self, cap: &str) -> bool {
 		self.capabilities.iter().any(|token| token == cap)
@@ -560,6 +573,31 @@ mod tests {
 		assert_eq!(adv.head_target.as_deref(), Some("refs/heads/main"));
 		assert_eq!(adv.branches().count(), 1);
 		assert!(adv.oid_of("refs/heads/main").is_some());
+	}
+
+	#[test]
+	fn advertised_head_falls_back_to_an_advertised_symref_target() {
+		let oid = ObjectId::<Sha256>::compute(gitana_object::ObjectKind::Commit, b"c");
+		let mut body = Vec::new();
+		write_pkt(&mut body, b"# service=git-upload-pack\n").unwrap();
+		write_flush(&mut body);
+		write_pkt(
+			&mut body,
+			format!(
+				"{} refs/heads/main\0symref=HEAD:refs/heads/main object-format=sha256\n",
+				oid.to_hex()
+			)
+			.as_bytes(),
+		)
+		.unwrap();
+		write_flush(&mut body);
+
+		let mut advertised = parse_advertisement::<Sha256>(&body).expect("parse");
+		assert_eq!(advertised.oid_of("HEAD"), None);
+		assert_eq!(advertised.head_oid(), Some(oid));
+
+		advertised.head_target = Some("refs/heads/unborn".to_owned());
+		assert_eq!(advertised.head_oid(), None);
 	}
 
 	#[test]

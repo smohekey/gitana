@@ -33,8 +33,9 @@ pub use prune::{gc, prune};
 pub use rebase::{RebaseOutcome, abort_rebase, continue_rebase, rebase, skip_rebase};
 pub use remote::{
 	CloneReflog, FetchOutcome, FetchReflog, PushOutcome, PushResult, PushTags, TagFetch, clone,
-	fetch, fetch_object, fetch_object_with_deepen, fetch_with_bare, prepare_clone, pull_upstream,
-	push, push_signed,
+	fetch, fetch_from_remote, fetch_object, fetch_object_with_deepen, fetch_with_bare,
+	fetch_with_bare_from_remote, prepare_clone, pull_upstream, push, push_signed,
+	repair_remote_head_from_advertisement,
 };
 pub use revert::{RevertOutcome, abort_revert, continue_revert, revert};
 pub use tag::{tag, tag_signed};

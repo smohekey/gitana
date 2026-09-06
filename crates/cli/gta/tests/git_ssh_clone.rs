@@ -10,7 +10,7 @@ mod support;
 
 use std::path::Path;
 
-use support::{git, git_supports_sha256, gta_env, gta_ok, unique_tmp};
+use support::{git, git_supports_sha256, git_try, gta_env, gta_ok, unique_tmp};
 
 /// Write a fake `ssh` that ignores its options/host and runs the remote git command locally. gitana
 /// invokes `GIT_SSH_COMMAND` as `sh -c '<cmd> "$@"' ssh [-p port] <host> "git-upload-pack '<path>'"`,
@@ -168,6 +168,12 @@ async fn clone_over_ssh_handles_an_empty_repository() {
 			.trim(),
 		"ref: refs/heads/main",
 	);
+	let remote_head = git_try(&target, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"]);
+	assert!(
+		!remote_head.status.success(),
+		"an empty source must not create a dangling origin/HEAD"
+	);
+	git(&target, &["fsck", "--full"]);
 	// The server did not hang up unexpectedly (the terminating flush was sent).
 	assert!(
 		!String::from_utf8_lossy(&out.stderr).contains("hung up"),

@@ -5345,6 +5345,255 @@ fn top_level_local_clone_and_pull_use_the_in_process_transport() {
 }
 
 #[test]
+fn local_clone_does_not_import_the_sources_remote_tracking_namespace() {
+	let fixture = Fixture::new("clone-source-tracking-ref-conflict");
+	let source_tip = git(&fixture.source, &["rev-parse", "HEAD"])
+		.trim()
+		.to_owned();
+	let tree = git(&fixture.source, &["rev-parse", "HEAD^{tree}"])
+		.trim()
+		.to_owned();
+	let tracking_only = git(
+		&fixture.source,
+		&[
+			"-c",
+			"user.name=Test",
+			"-c",
+			"user.email=test@example.com",
+			"commit-tree",
+			&tree,
+			"-m",
+			"tracking-only",
+		],
+	)
+	.trim()
+	.to_owned();
+	git_ok(
+		&fixture.source,
+		&["update-ref", "refs/remotes/origin/main/child", &source_tip],
+	);
+	git_ok(
+		&fixture.source,
+		&["update-ref", "refs/remotes/upstream/hidden", &tracking_only],
+	);
+	let clone = fixture.root.join("tracking-ref-clone");
+
+	let cloned = gta(
+		&fixture.root,
+		true,
+		&[
+			"clone",
+			fixture.source.to_str().unwrap(),
+			clone.to_str().unwrap(),
+		],
+	);
+	assert_success(&cloned, "clone with a conflicting source tracking ref");
+	assert_eq!(
+		git(&clone, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+		source_tip
+	);
+	assert_eq!(
+		git(&clone, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+		"refs/remotes/origin/main"
+	);
+	let imported = Command::new("git")
+		.arg("-C")
+		.arg(&clone)
+		.args([
+			"show-ref",
+			"--verify",
+			"--quiet",
+			"refs/remotes/origin/main/child",
+		])
+		.status()
+		.expect("inspect imported tracking ref");
+	assert!(
+		!imported.success(),
+		"the source repository's tracking refs must not be imported"
+	);
+	let tracking_commit = format!("{tracking_only}^{{commit}}");
+	let tracking_object = Command::new("git")
+		.arg("-C")
+		.arg(&clone)
+		.args(["cat-file", "-e", &tracking_commit])
+		.output()
+		.expect("inspect source-tracking-only object");
+	assert!(
+		!tracking_object.status.success(),
+		"history reachable only from a filtered source tracking ref must not be downloaded"
+	);
+}
+
+#[test]
+fn fetch_reserves_remote_head_for_every_wildcard_mapping() {
+	let fixture = Fixture::new("fetch-custom-wildcard-reserved-head");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(
+		&module,
+		&[
+			"config",
+			"--replace-all",
+			"remote.origin.fetch",
+			"+refs/heads/team/*:refs/remotes/origin/*",
+		],
+	);
+	git_ok(
+		&fixture.source,
+		&["update-ref", "refs/heads/team/HEAD", &fixture.old],
+	);
+
+	assert_success(
+		&gta(&module, true, &["fetch"]),
+		"fetch through a wildcard mapping onto remote HEAD",
+	);
+	assert_eq!(
+		git(&module, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+		"refs/remotes/origin/main",
+		"the wildcard mapping must preserve a symbolic convenience ref"
+	);
+
+	git_ok(
+		&module,
+		&["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+	);
+	git_ok(
+		&module,
+		&["update-ref", "refs/remotes/origin/HEAD", &fixture.old],
+	);
+	let advanced = fixture.commit_source("team head\n", "advance team HEAD");
+	git_ok(
+		&fixture.source,
+		&["update-ref", "refs/heads/team/HEAD", &advanced],
+	);
+	assert_success(
+		&gta(&module, true, &["fetch"]),
+		"fetch while a direct remote HEAD occupies the reserved destination",
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/remotes/origin/HEAD"]).trim(),
+		fixture.old,
+		"the wildcard mapping must preserve a direct convenience ref"
+	);
+}
+
+#[test]
+fn local_clone_reserves_origin_head_from_a_branch_named_head() {
+	let fixture = Fixture::new("clone-literal-head-branch");
+	git_ok(
+		&fixture.source,
+		&["update-ref", "refs/heads/HEAD", &fixture.old],
+	);
+	let clone = fixture.root.join("literal-head-clone");
+
+	let cloned = gta(
+		&fixture.root,
+		true,
+		&[
+			"clone",
+			fixture.source.to_str().unwrap(),
+			clone.to_str().unwrap(),
+		],
+	);
+	assert_success(&cloned, "clone with a literal HEAD branch");
+	assert_eq!(
+		git(&clone, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+		"refs/remotes/origin/main",
+		"the wildcard branch import must not overwrite the convenience ref"
+	);
+}
+
+#[test]
+fn local_clone_detaches_when_the_source_head_targets_a_filtered_tracking_ref() {
+	let fixture = Fixture::new("clone-filtered-head-target");
+	git_ok(
+		&fixture.source,
+		&["update-ref", "refs/remotes/upstream/main", &fixture.old],
+	);
+	git_ok(
+		&fixture.source,
+		&["symbolic-ref", "HEAD", "refs/remotes/upstream/main"],
+	);
+	let clone = fixture.root.join("filtered-head-clone");
+
+	let cloned = gta(
+		&fixture.root,
+		true,
+		&[
+			"clone",
+			fixture.source.to_str().unwrap(),
+			clone.to_str().unwrap(),
+		],
+	);
+	assert_success(&cloned, "clone whose source HEAD target is filtered");
+	assert_eq!(git(&clone, &["rev-parse", "HEAD"]).trim(), fixture.old);
+	let symbolic = Command::new("git")
+		.arg("-C")
+		.arg(&clone)
+		.args(["symbolic-ref", "-q", "HEAD"])
+		.output()
+		.expect("inspect cloned HEAD");
+	assert!(
+		!symbolic.status.success(),
+		"the cloned HEAD must be detached"
+	);
+	assert_eq!(
+		std::fs::read_to_string(clone.join("file.txt")).unwrap(),
+		"old\n"
+	);
+	let imported = Command::new("git")
+		.arg("-C")
+		.arg(&clone)
+		.args([
+			"show-ref",
+			"--verify",
+			"--quiet",
+			"refs/remotes/upstream/main",
+		])
+		.status()
+		.expect("inspect filtered source tracking ref");
+	assert!(!imported.success());
+}
+
+#[test]
+fn local_clone_omits_origin_head_when_a_tracking_descendant_blocks_it() {
+	let fixture = Fixture::new("clone-origin-head-descendant");
+	git_ok(
+		&fixture.source,
+		&["update-ref", "refs/heads/HEAD/foo", &fixture.old],
+	);
+	let clone = fixture.root.join("head-descendant-clone");
+
+	let cloned = gta(
+		&fixture.root,
+		true,
+		&[
+			"clone",
+			fixture.source.to_str().unwrap(),
+			clone.to_str().unwrap(),
+		],
+	);
+	assert_success(&cloned, "clone with an origin/HEAD descendant");
+	assert_eq!(
+		git(&clone, &["rev-parse", "refs/remotes/origin/HEAD/foo"]).trim(),
+		fixture.old
+	);
+	let convenience = Command::new("git")
+		.arg("-C")
+		.arg(&clone)
+		.args(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+		.output()
+		.expect("inspect origin HEAD convenience ref");
+	assert!(
+		!convenience.status.success(),
+		"the unrepresentable convenience ref must be omitted"
+	);
+}
+
+#[test]
 fn omitted_local_clone_destination_preserves_dot_path_semantics() {
 	let fixture = Fixture::new("omitted-local-clone-destination");
 	let dot_clone = assert_cmd::Command::cargo_bin("gta")
@@ -6545,6 +6794,1226 @@ fn an_existing_current_module_still_fetches_advertised_refs() {
 }
 
 #[test]
+fn initial_remote_update_records_a_detached_head_for_no_fetch() {
+	let fixture = Fixture::new("initial-remote-detached-head");
+	git_ok(&fixture.source, &["checkout", "--detach", "-q"]);
+	let detached = fixture.commit_source("initial detached\n", "initial detached HEAD");
+
+	let update = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--init", "--remote"],
+	);
+	assert_success(&update, "initial update from a detached remote HEAD");
+	let module = fixture.consumer.join("modules/one");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), detached);
+	let symbolic = Command::new("git")
+		.arg("-C")
+		.arg(&module)
+		.args(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+		.output()
+		.expect("inspect initial remote HEAD");
+	assert!(
+		!symbolic.status.success(),
+		"a detached initial selection must publish a direct remote HEAD"
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/remotes/origin/HEAD"]).trim(),
+		detached
+	);
+
+	git_ok(&module, &["checkout", "--detach", "-q", &fixture.old]);
+	git_ok(
+		&fixture.consumer,
+		&["config", "--unset-all", "submodule.one.url"],
+	);
+	git_ok(&module, &["config", "--unset-all", "remote.origin.url"]);
+	let local = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--remote", "--no-fetch"],
+	);
+	assert_success(&local, "reuse the initial direct remote HEAD");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), detached);
+}
+
+#[test]
+fn initial_remote_update_preserves_a_case_aliased_tracking_branch() {
+	let fixture = Fixture::new("initial-remote-case-aliased-head");
+	if !directory_is_case_insensitive(&fixture.consumer) {
+		return;
+	}
+	git_ok(
+		&fixture.source,
+		&["update-ref", "refs/heads/head", &fixture.old],
+	);
+	let default_tip = fixture.commit_source("new default\n", "advance default branch");
+
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--init", "--remote"],
+		),
+		"initial remote update with a case-aliased tracking branch",
+	);
+	let module = fixture.consumer.join("modules/one");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), default_tip);
+	let symbolic = Command::new("git")
+		.arg("-C")
+		.arg(&module)
+		.args(["symbolic-ref", "-q", "refs/remotes/origin/head"])
+		.output()
+		.expect("inspect case-aliased tracking branch");
+	assert!(
+		!symbolic.status.success(),
+		"the tracking branch must remain direct rather than becoming the convenience symref"
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/remotes/origin/head"]).trim(),
+		fixture.old
+	);
+	let no_fetch = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--remote", "--no-fetch"],
+	);
+	assert!(
+		!no_fetch.status.success(),
+		"a case-aliased branch must not satisfy the exact remote HEAD lookup"
+	);
+	assert!(
+		stderr(&no_fetch).contains("refs/remotes/origin/HEAD"),
+		"unexpected missing-target error: {}",
+		stderr(&no_fetch)
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "HEAD"]).trim(),
+		default_tip,
+		"the rejected alias must not move module HEAD"
+	);
+
+	assert_success(
+		&gta(&module, true, &["fetch"]),
+		"fetch with a case-aliased tracking branch",
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/remotes/origin/head"]).trim(),
+		fixture.old
+	);
+}
+
+#[test]
+fn fetch_rejects_a_tracking_branch_aliased_to_remote_head_by_case() {
+	let fixture = Fixture::new("fetch-case-aliased-remote-head");
+	if !directory_is_case_insensitive(&fixture.consumer) {
+		return;
+	}
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--init", "--remote"],
+		),
+		"initial remote update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	assert_eq!(
+		git(&module, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+		"refs/remotes/origin/main"
+	);
+
+	let aliased_tip = fixture.commit_source("case alias\n", "create case-aliased branch tip");
+	git_ok(
+		&fixture.source,
+		&["update-ref", "refs/heads/head", &aliased_tip],
+	);
+	git_ok(&fixture.source, &["reset", "--hard", &fixture.old]);
+
+	let fetch = gta(&module, true, &["fetch"]);
+	assert!(
+		!fetch.status.success(),
+		"a differently spelled tracking destination must not update through origin/HEAD"
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+		fixture.old,
+		"the aliased branch must not move the remote HEAD terminal"
+	);
+	assert_eq!(
+		git(&module, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+		"refs/remotes/origin/main"
+	);
+}
+
+#[test]
+fn initial_remote_update_rejects_a_branch_named_head_before_repository_creation() {
+	let fixture = Fixture::new("initial-remote-literal-head");
+	git_ok(
+		&fixture.source,
+		&["update-ref", "refs/heads/HEAD", &fixture.old],
+	);
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.branch",
+			"HEAD",
+		],
+	);
+
+	let update = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--init", "--remote"],
+	);
+	assert!(
+		!update.status.success(),
+		"reserved branch unexpectedly succeeded"
+	);
+	assert!(
+		stderr(&update).contains("reserved remote HEAD ref"),
+		"unexpected error: {}",
+		stderr(&update)
+	);
+	assert!(
+		!git_path(&fixture.consumer, "modules/one").exists(),
+		"target validation must precede module repository creation"
+	);
+	assert!(
+		!git_path(&fixture.consumer, "gitana-submodule-update").exists(),
+		"target validation must precede intent publication"
+	);
+}
+
+#[test]
+fn remote_update_selects_the_branch_tip_and_no_fetch_uses_local_tracking_state() {
+	let fixture = Fixture::new("remote-submodule-update");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	let first = fixture.commit_source("remote first\n", "advance remote once");
+	let update = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--remote"],
+	);
+	assert_success(&update, "remote branch update");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), first);
+	assert_eq!(
+		git(&fixture.consumer, &["rev-parse", "HEAD:modules/one"]).trim(),
+		fixture.old,
+		"remote selection must not change the superproject gitlink"
+	);
+
+	let second = fixture.commit_source("remote second\n", "advance remote twice");
+	let stale = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--remote", "--no-fetch"],
+	);
+	assert_success(&stale, "no-fetch remote update from stale tracking state");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), first);
+
+	git_allow(&module, &["fetch", "origin"]);
+	git_ok(
+		&fixture.consumer,
+		&["config", "--unset-all", "submodule.one.url"],
+	);
+	git_ok(&module, &["config", "--unset-all", "remote.origin.url"]);
+	let local = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--remote", "--no-fetch"],
+	);
+	assert_success(&local, "URL-free no-fetch remote update");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), second);
+
+	let recorded = gta(&fixture.consumer, true, &["submodule", "update", "-N"]);
+	assert_success(&recorded, "URL-free no-fetch gitlink update");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), fixture.old);
+}
+
+#[test]
+fn remote_update_repairs_remote_head_for_a_later_no_fetch_update() {
+	let fixture = Fixture::new("remote-submodule-repair-head");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(
+		&module,
+		&["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+	);
+	let current = fixture.commit_source("remote head repaired\n", "advance remote head");
+
+	let fetched = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--remote"],
+	);
+	assert_success(&fetched, "remote update repairs its HEAD symref");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), current);
+	assert_eq!(
+		git(&module, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+		"refs/remotes/origin/main"
+	);
+
+	git_ok(
+		&fixture.consumer,
+		&["config", "--unset-all", "submodule.one.url"],
+	);
+	git_ok(&module, &["config", "--unset-all", "remote.origin.url"]);
+	let local = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--remote", "--no-fetch"],
+	);
+	assert_success(&local, "use the repaired remote HEAD without transport");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), current);
+}
+
+#[test]
+fn no_fetch_remote_branch_uses_the_configured_tracking_destination() {
+	let fixture = Fixture::new("remote-submodule-custom-tracking");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.branch",
+			"main",
+		],
+	);
+	git_ok(
+		&module,
+		&[
+			"config",
+			"--replace-all",
+			"remote.origin.fetch",
+			"+refs/heads/main:refs/custom/upstream-main",
+		],
+	);
+	let current = fixture.commit_source("custom tracking\n", "advance custom tracking");
+
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"remote update through a custom tracking destination",
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/custom/upstream-main"]).trim(),
+		current
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+		fixture.old,
+		"the conventional tracking ref remains deliberately stale"
+	);
+
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote", "--no-fetch"],
+		),
+		"no-fetch update through a custom tracking destination",
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "HEAD"]).trim(),
+		current,
+		"no-fetch must not select the stale conventional ref"
+	);
+}
+
+#[test]
+fn no_fetch_remote_branches_require_exact_ref_spelling() {
+	let fixture = Fixture::new("no-fetch-exact-remote-branch");
+	if !directory_is_case_insensitive(&fixture.consumer) {
+		return;
+	}
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(
+		&module,
+		&["update-ref", "refs/remotes/origin/feature", &fixture.old],
+	);
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.branch",
+			"Feature",
+		],
+	);
+
+	let named = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--remote", "--no-fetch"],
+	);
+	assert!(
+		!named.status.success(),
+		"a case alias must not satisfy a named remote branch"
+	);
+	assert!(
+		stderr(&named).contains("refs/remotes/origin/Feature"),
+		"unexpected named-remote error: {}",
+		stderr(&named)
+	);
+
+	git_ok(&module, &["checkout", "-q", "-b", "holder"]);
+	git_ok(&module, &["update-ref", "refs/heads/feature", &fixture.old]);
+	git_ok(&module, &["config", "branch.holder.remote", "."]);
+	let local = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--remote", "--no-fetch"],
+	);
+	assert!(
+		!local.status.success(),
+		"a case alias must not satisfy a local dot-remote branch"
+	);
+	assert!(
+		stderr(&local).contains("refs/heads/Feature"),
+		"unexpected dot-remote error: {}",
+		stderr(&local)
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), fixture.old);
+}
+
+#[test]
+fn remote_update_rejects_the_reserved_remote_head_destination() {
+	let fixture = Fixture::new("remote-submodule-reserved-head");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	let default_tip = fixture.commit_source("new default\n", "advance default branch");
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"update the default branch and remote HEAD",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), default_tip);
+	assert_eq!(
+		git(&module, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+		"refs/remotes/origin/main"
+	);
+	git_ok(
+		&fixture.source,
+		&["update-ref", "refs/heads/HEAD", &fixture.old],
+	);
+	let fetched = gta(&module, true, &["fetch"]);
+	assert_success(
+		&fetched,
+		"ordinary fetch with a literal HEAD branch and a convenience ref",
+	);
+	assert_eq!(
+		git(&module, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+		"refs/remotes/origin/main",
+		"wildcard fetch must preserve the remote HEAD convenience ref"
+	);
+	git_ok(
+		&fixture.source,
+		&["symbolic-ref", "HEAD", "refs/heads/HEAD"],
+	);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"select an advertised remote HEAD whose target occupies the reserved mapping",
+	);
+	let symbolic = Command::new("git")
+		.arg("-C")
+		.arg(&module)
+		.args(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+		.output()
+		.expect("inspect direct remote HEAD");
+	assert!(
+		!symbolic.status.success(),
+		"an ambiguous advertised target must be recorded directly"
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/remotes/origin/HEAD"]).trim(),
+		fixture.old
+	);
+	git_ok(
+		&fixture.source,
+		&["symbolic-ref", "HEAD", "refs/heads/main"],
+	);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"restore the ordinary remote HEAD convenience ref",
+	);
+	assert_eq!(
+		git(&module, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+		"refs/remotes/origin/main"
+	);
+	git_ok(&module, &["checkout", "--detach", "-q", &fixture.old]);
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.branch",
+			"HEAD",
+		],
+	);
+
+	for arguments in [
+		&["submodule", "update", "--remote", "--no-fetch"][..],
+		&["submodule", "update", "--remote"][..],
+	] {
+		let update = gta(&fixture.consumer, true, arguments);
+		assert!(
+			!update.status.success(),
+			"remote update unexpectedly accepted the reserved destination: stdout={} stderr={}",
+			String::from_utf8_lossy(&update.stdout),
+			String::from_utf8_lossy(&update.stderr)
+		);
+		assert!(
+			String::from_utf8_lossy(&update.stderr).contains("reserved remote HEAD ref"),
+			"remote update did not explain the reserved destination: {}",
+			String::from_utf8_lossy(&update.stderr)
+		);
+		assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), fixture.old);
+		assert_eq!(
+			git(&module, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+			"refs/remotes/origin/main"
+		);
+		assert_eq!(
+			git(&module, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+			default_tip
+		);
+	}
+
+	git_ok(
+		&module,
+		&[
+			"config",
+			"--add",
+			"remote.origin.fetch",
+			"+refs/heads/HEAD:refs/custom/branch-head",
+		],
+	);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"fetch a literal HEAD branch through a custom destination",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), fixture.old);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/custom/branch-head"]).trim(),
+		fixture.old
+	);
+
+	git_ok(&module, &["checkout", "--detach", "-q", &default_tip]);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote", "--no-fetch"],
+		),
+		"reuse a literal HEAD branch from its custom destination",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), fixture.old);
+
+	git_ok(
+		&fixture.source,
+		&["symbolic-ref", "HEAD", "refs/heads/HEAD"],
+	);
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"--unset-all",
+			"submodule.one.branch",
+		],
+	);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"repair remote HEAD through the later exact destination",
+	);
+	assert_eq!(
+		git(&module, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+		"refs/custom/branch-head"
+	);
+
+	git_ok(&module, &["checkout", "--detach", "-q", &default_tip]);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote", "--no-fetch"],
+		),
+		"reuse the repaired remote HEAD through the exact destination",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), fixture.old);
+}
+
+#[test]
+fn remote_update_refuses_a_branch_not_selected_by_fetch_refspecs() {
+	let fixture = Fixture::new("remote-submodule-unselected-branch");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.branch",
+			"main",
+		],
+	);
+	let current = fixture.commit_source("unselected branch\n", "advance unselected branch");
+
+	for (refspec, description) in [
+		("^refs/heads/main", "excluded branch"),
+		(
+			"+refs/heads/topic:refs/remotes/origin/topic",
+			"unmapped branch",
+		),
+	] {
+		git_ok(
+			&module,
+			&["config", "--replace-all", "remote.origin.fetch", refspec],
+		);
+		let update = gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		);
+		assert!(
+			!update.status.success(),
+			"remote update unexpectedly accepted {description}: stdout={} stderr={}",
+			String::from_utf8_lossy(&update.stdout),
+			String::from_utf8_lossy(&update.stderr)
+		);
+		assert_eq!(
+			git(&module, &["rev-parse", "HEAD"]).trim(),
+			fixture.old,
+			"a rejected {description} must not move the module"
+		);
+		assert_eq!(
+			git(&module, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+			fixture.old,
+			"a rejected {description} must not move its tracking ref"
+		);
+	}
+	assert_ne!(current, fixture.old);
+}
+
+#[test]
+fn remote_update_records_a_detached_advertised_head_for_no_fetch() {
+	let fixture = Fixture::new("remote-submodule-detached-head");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(&fixture.source, &["checkout", "--detach", "-q"]);
+	let detached = fixture.commit_source("detached remote\n", "detached remote HEAD");
+
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"remote update from a detached advertised HEAD",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), detached);
+	let symbolic = Command::new("git")
+		.arg("-C")
+		.arg(&module)
+		.args(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+		.output()
+		.expect("inspect detached remote HEAD");
+	assert!(
+		!symbolic.status.success(),
+		"a detached advertisement must publish a direct remote HEAD"
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/remotes/origin/HEAD"]).trim(),
+		detached
+	);
+
+	git_ok(&module, &["checkout", "--detach", "-q", &fixture.old]);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote", "--no-fetch"],
+		),
+		"no-fetch update from the direct remote HEAD",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), detached);
+}
+
+#[test]
+fn remote_update_preserves_unrepresentable_remote_head_occupants() {
+	let fixture = Fixture::new("remote-submodule-blocked-head");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	let remote_head = git_path(&fixture.consumer, "modules/one").join("refs/remotes/origin/HEAD");
+	git_ok(
+		&module,
+		&["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+	);
+	std::fs::create_dir(&remote_head).unwrap();
+	let first = fixture.commit_source("blocked head one\n", "advance past empty directory");
+
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"remote update with an empty remote HEAD directory",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), first);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+		first
+	);
+	assert!(
+		remote_head.is_dir(),
+		"the optional ref conflict is preserved"
+	);
+
+	std::fs::remove_dir(&remote_head).unwrap();
+	std::fs::write(&remote_head, b"ref: bad ref\n").unwrap();
+	let second = fixture.commit_source("blocked head two\n", "advance past malformed occupant");
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"remote update with a malformed symbolic remote HEAD occupant",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), second);
+	assert_eq!(std::fs::read(&remote_head).unwrap(), b"ref: bad ref\n");
+}
+
+#[test]
+fn remote_update_accepts_a_remote_name_ending_in_a_dot() {
+	let fixture = Fixture::new("remote-name-trailing-dot");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(&module, &["switch", "-c", "topic"]);
+	git_ok(
+		&module,
+		&["remote", "add", "backup.", fixture.source.to_str().unwrap()],
+	);
+	git_ok(&module, &["config", "branch.topic.remote", "backup."]);
+	let current = fixture.commit_source("trailing dot remote\n", "advance trailing dot remote");
+
+	let update = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--remote"],
+	);
+	assert_success(&update, "remote update through backup.");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), current);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/remotes/backup./main"]).trim(),
+		current
+	);
+}
+
+#[test]
+fn remote_update_rejects_dot_prefixed_branch_components_before_checkout() {
+	let fixture = Fixture::new("remote-branch-dot-component");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+
+	for branch in [".topic", "foo/.topic"] {
+		git_ok(
+			&fixture.consumer,
+			&[
+				"config",
+				"-f",
+				".gitmodules",
+				"submodule.one.branch",
+				branch,
+			],
+		);
+		let update = gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		);
+		assert!(
+			!update.status.success(),
+			"remote update unexpectedly accepted {branch}: stdout={} stderr={}",
+			stdout(&update),
+			stderr(&update)
+		);
+		assert!(stderr(&update).contains("invalid submodule branch"));
+		assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), fixture.old);
+	}
+}
+
+#[test]
+fn remote_update_rejects_a_non_fast_forward_before_checkout() {
+	let fixture = Fixture::new("remote-submodule-rejected-rewind");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	let advanced = fixture.commit_source("advanced\n", "advance remote");
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"advance module from the remote branch",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), advanced);
+
+	git_ok(
+		&module,
+		&[
+			"config",
+			"--replace-all",
+			"remote.origin.fetch",
+			"refs/heads/*:refs/remotes/origin/*",
+		],
+	);
+	git_ok(&fixture.source, &["reset", "--hard", &fixture.old]);
+	let rejected = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--remote"],
+	);
+	assert!(
+		!rejected.status.success(),
+		"a rejected tracking-ref rewind must fail the update"
+	);
+	assert!(
+		stderr(&rejected).contains("some remote-tracking refs were not updated (non-fast-forward)"),
+		"unexpected rejection error: {}",
+		stderr(&rejected)
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "HEAD"]).trim(),
+		advanced,
+		"a rejected remote target must not be checked out"
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+		advanced,
+		"the rejected tracking ref must retain its old value"
+	);
+	assert_eq!(
+		std::fs::read_to_string(module.join("file.txt")).unwrap(),
+		"advanced\n"
+	);
+}
+
+#[test]
+fn remote_update_honors_branch_configuration_and_dot_requires_a_branch() {
+	let fixture = Fixture::new("remote-submodule-branch");
+	let dev = fixture.commit_source("development\n", "development tip");
+	git_ok(&fixture.source, &["branch", "dev", &dev]);
+	git_ok(&fixture.source, &["reset", "--hard", &fixture.old]);
+	git_ok(
+		&fixture.consumer,
+		&["config", "-f", ".gitmodules", "submodule.one.branch", "dev"],
+	);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--init", "--remote"],
+		),
+		"configured remote branch update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), dev);
+	git_ok(
+		&fixture.consumer,
+		&["config", "submodule.one.branch", "main"],
+	);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"superproject-local branch override",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), fixture.old);
+
+	git_ok(&fixture.consumer, &["config", "submodule.one.branch", "."]);
+	git_ok(&fixture.consumer, &["checkout", "--detach", "-q"]);
+	let detached = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--remote"],
+	);
+	assert!(!detached.status.success());
+	assert!(
+		stderr(&detached).contains("superproject HEAD is detached"),
+		"unexpected detached-branch error: {}",
+		stderr(&detached)
+	);
+}
+
+#[test]
+fn remote_update_uses_the_current_module_branch_remote_and_supports_dot() {
+	let fixture = Fixture::new("remote-submodule-selected-remote");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(&module, &["checkout", "-q", "-b", "selected"]);
+	git_ok(
+		&module,
+		&["remote", "add", "backup", fixture.source.to_str().unwrap()],
+	);
+	git_ok(&module, &["config", "branch.selected.remote", "backup"]);
+	let remote_tip = fixture.commit_source("backup remote\n", "advance backup");
+	git_ok(&module, &["config", "remote.origin.url", "missing-origin"]);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"named module remote update",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), remote_tip);
+
+	git_ok(&module, &["checkout", "-q", "-B", "local"]);
+	std::fs::write(module.join("file.txt"), b"module-local\n").unwrap();
+	git_ok(&module, &["add", "file.txt"]);
+	commit(&module, "module-local target");
+	let local_tip = git(&module, &["rev-parse", "HEAD"]).trim().to_owned();
+	git_ok(&module, &["config", "branch.local.remote", "."]);
+	git_ok(
+		&fixture.consumer,
+		&["config", "submodule.one.branch", "local"],
+	);
+	git_ok(
+		&fixture.consumer,
+		&["config", "--unset-all", "submodule.one.url"],
+	);
+	git_ok(&module, &["config", "--unset-all", "remote.origin.url"]);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"dot module remote update",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), local_tip);
+
+	git_ok(&module, &["config", "branch.local.remote", "backup"]);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"missing registration still skips a named module remote",
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "HEAD"]).trim(),
+		local_tip,
+		"the named remote must remain skipped without registration"
+	);
+}
+
+#[test]
+fn recursive_clone_remote_submodules_selects_remote_tips_and_last_flag_wins() {
+	let fixture = Fixture::new("clone-remote-submodules");
+	let tip = fixture.commit_source("remote clone tip\n", "advance before clone");
+	for (name, flags, expected) in [
+		("remote", vec!["--remote-submodules"], tip.as_str()),
+		(
+			"remote-last",
+			vec!["--no-remote-submodules", "--remote-submodules"],
+			tip.as_str(),
+		),
+		(
+			"recorded-last",
+			vec!["--remote-submodules", "--no-remote-submodules"],
+			fixture.old.as_str(),
+		),
+	] {
+		let destination = fixture.root.join(name);
+		let mut arguments = vec!["clone", "--recurse-submodules"];
+		arguments.extend(flags);
+		arguments.push(fixture.superproject.to_str().unwrap());
+		arguments.push(destination.to_str().unwrap());
+		let clone = gta(&fixture.root, true, &arguments);
+		assert_success(&clone, "recursive clone remote-submodules policy");
+		assert_eq!(
+			git(&destination.join("modules/one"), &["rev-parse", "HEAD"]).trim(),
+			expected
+		);
+	}
+}
+
+#[test]
+fn recursive_remote_update_propagates_target_and_fetch_policy() {
+	let root = unique_tmp("recursive-remote-update");
+	let leaf = root.join("leaf");
+	let parent = root.join("parent");
+	let superproject = root.join("super");
+	for repository in [&leaf, &parent, &superproject] {
+		std::fs::create_dir_all(repository).unwrap();
+		init_repository(repository, None);
+		std::fs::write(repository.join("file.txt"), b"recorded\n").unwrap();
+		git_ok(repository, &["add", "file.txt"]);
+		commit(repository, "recorded");
+	}
+	git_allow(&parent, &["submodule", "add", "../leaf", "child"]);
+	commit(&parent, "add child");
+	git_allow(
+		&superproject,
+		&["submodule", "add", "../parent", "modules/parent"],
+	);
+	commit(&superproject, "add parent");
+	std::fs::write(leaf.join("file.txt"), b"leaf tip\n").unwrap();
+	git_ok(&leaf, &["add", "file.txt"]);
+	commit(&leaf, "advance leaf");
+	let leaf_tip = git(&leaf, &["rev-parse", "HEAD"]).trim().to_owned();
+	std::fs::write(parent.join("file.txt"), b"parent tip\n").unwrap();
+	git_ok(&parent, &["add", "file.txt"]);
+	commit(&parent, "advance parent");
+	let parent_tip = git(&parent, &["rev-parse", "HEAD"]).trim().to_owned();
+	let consumer = root.join("consumer");
+	assert_success(
+		&gta(
+			&root,
+			false,
+			&[
+				"clone",
+				superproject.to_str().unwrap(),
+				consumer.to_str().unwrap(),
+			],
+		),
+		"clone root",
+	);
+	assert_success(
+		&gta(
+			&consumer,
+			true,
+			&["submodule", "update", "--init", "--recursive", "--remote"],
+		),
+		"recursive remote update",
+	);
+	assert_eq!(
+		git(&consumer.join("modules/parent"), &["rev-parse", "HEAD"]).trim(),
+		parent_tip
+	);
+	assert_eq!(
+		git(
+			&consumer.join("modules/parent/child"),
+			&["rev-parse", "HEAD"]
+		)
+		.trim(),
+		leaf_tip
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recursive_remote_recovery_does_not_rerun_the_recovered_owner() {
+	let root = unique_tmp("recursive-remote-recovery");
+	let leaf = root.join("leaf");
+	let parent = root.join("parent");
+	let superproject = root.join("super");
+	for repository in [&leaf, &parent, &superproject] {
+		std::fs::create_dir_all(repository).unwrap();
+		init_repository(repository, None);
+		std::fs::write(repository.join("file.txt"), b"recorded\n").unwrap();
+		git_ok(repository, &["add", "file.txt"]);
+		commit(repository, "recorded");
+	}
+	git_allow(&parent, &["submodule", "add", "../leaf", "child"]);
+	commit(&parent, "add child");
+	let recorded_parent = git(&parent, &["rev-parse", "HEAD"]).trim().to_owned();
+	git_allow(
+		&superproject,
+		&["submodule", "add", "../parent", "modules/parent"],
+	);
+	commit(&superproject, "add parent");
+	let consumer = root.join("consumer");
+	assert_success(
+		&gta(
+			&root,
+			false,
+			&[
+				"clone",
+				superproject.to_str().unwrap(),
+				consumer.to_str().unwrap(),
+			],
+		),
+		"clone root",
+	);
+	assert_success(
+		&gta(
+			&consumer,
+			true,
+			&["submodule", "update", "--init", "--recursive"],
+		),
+		"initialize nested modules",
+	);
+
+	std::fs::write(parent.join("file.txt"), b"pinned parent\n").unwrap();
+	git_ok(&parent, &["add", "file.txt"]);
+	commit(&parent, "pinned parent");
+	let pinned_parent = git(&parent, &["rev-parse", "HEAD"]).trim().to_owned();
+	assert_success(
+		&gta(
+			&consumer,
+			true,
+			&["submodule", "update", "--remote", "modules/parent"],
+		),
+		"fetch the pinned parent",
+	);
+	let mounted_parent = consumer.join("modules/parent");
+	let module_origin = git(&mounted_parent, &["config", "--get", "remote.origin.url"])
+		.trim()
+		.to_owned();
+	assert_success(
+		&gta(
+			&consumer,
+			false,
+			&["submodule", "deinit", "-f", "modules/parent"],
+		),
+		"retain the parent before recovery",
+	);
+	assert_success(
+		&gta(&consumer, false, &["submodule", "init", "modules/parent"]),
+		"restore the registration owned by the interrupted update",
+	);
+	let control = write_v5_recovery_intent(
+		&consumer,
+		"modules/parent",
+		"modules/parent",
+		&recorded_parent,
+		&pinned_parent,
+		&module_origin,
+		"module",
+		Some("origin"),
+		true,
+	);
+
+	std::fs::write(parent.join("file.txt"), b"later parent\n").unwrap();
+	git_ok(&parent, &["add", "file.txt"]);
+	commit(&parent, "later parent");
+	let later_parent = git(&parent, &["rev-parse", "HEAD"]).trim().to_owned();
+	std::fs::write(leaf.join("file.txt"), b"later leaf\n").unwrap();
+	git_ok(&leaf, &["add", "file.txt"]);
+	commit(&leaf, "later leaf");
+	let later_leaf = git(&leaf, &["rev-parse", "HEAD"]).trim().to_owned();
+
+	let recovered = gta(
+		&consumer,
+		true,
+		&["submodule", "update", "--init", "--recursive", "--remote"],
+	);
+	assert_success(&recovered, "recover once and continue recursive descent");
+	assert_eq!(
+		stdout(&recovered)
+			.matches("Submodule path 'modules/parent':")
+			.count(),
+		1,
+		"the recovered owner must not be checked out again in the normal pass"
+	);
+	assert_eq!(
+		git(&mounted_parent, &["rev-parse", "HEAD"]).trim(),
+		pinned_parent
+	);
+	assert_ne!(
+		git(&mounted_parent, &["rev-parse", "HEAD"]).trim(),
+		later_parent
+	);
+	assert_eq!(
+		git(&mounted_parent.join("child"), &["rev-parse", "HEAD"]).trim(),
+		later_leaf,
+		"a recovered owner must still contribute its recursive descendants"
+	);
+	assert!(!control.exists());
+
+	assert_success(
+		&gta(
+			&consumer,
+			true,
+			&["submodule", "update", "--remote", "modules/parent"],
+		),
+		"advance the parent in a later invocation",
+	);
+	assert_eq!(
+		git(&mounted_parent, &["rev-parse", "HEAD"]).trim(),
+		later_parent
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn an_existing_current_module_reports_an_unavailable_origin() {
 	let fixture = Fixture::new("existing-fetch-failure");
 	assert_success(
@@ -7228,6 +8697,80 @@ fn module_scoped_recovery_rejects_a_changed_module_origin() {
 	assert!(control.join("intent.json").is_file());
 }
 
+#[test]
+fn abandoned_legacy_recovery_uses_the_current_gitlink() {
+	let fixture = Fixture::new("abandoned-legacy-current-gitlink");
+	assert_success(
+		&gta(&fixture.consumer, false, &["submodule", "init"]),
+		"register module",
+	);
+	let source_url = git(&fixture.consumer, &["config", "--get", "submodule.one.url"])
+		.trim()
+		.to_owned();
+	let current = fixture.commit_source("current gitlink\n", "current gitlink");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{current},modules/one"),
+		],
+	);
+	let control = write_v2_recovery_intent(&fixture, "one", "modules/one", &fixture.old, &source_url);
+
+	let update = gta(&fixture.consumer, true, &["submodule", "update", "--init"]);
+	assert_success(&update, "restart after abandoning an empty legacy intent");
+	assert_eq!(
+		git(
+			&fixture.consumer.join("modules/one"),
+			&["rev-parse", "HEAD"]
+		)
+		.trim(),
+		current
+	);
+	assert!(!control.exists());
+}
+
+#[test]
+fn abandoned_legacy_recovery_reselects_the_current_remote_head() {
+	let fixture = Fixture::new("abandoned-legacy-current-remote-head");
+	assert_success(
+		&gta(&fixture.consumer, false, &["submodule", "init"]),
+		"register module",
+	);
+	let source_url = git(&fixture.consumer, &["config", "--get", "submodule.one.url"])
+		.trim()
+		.to_owned();
+	let control = write_v4_recovery_intent(
+		&fixture,
+		"one",
+		"modules/one",
+		&fixture.old,
+		&source_url,
+		"superproject",
+	);
+	let current = fixture.commit_source("current remote head\n", "current remote head");
+
+	let update = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--init", "--remote"],
+	);
+	assert_success(
+		&update,
+		"reselect remote HEAD after abandoning legacy intent",
+	);
+	assert_eq!(
+		git(
+			&fixture.consumer.join("modules/one"),
+			&["rev-parse", "HEAD"]
+		)
+		.trim(),
+		current
+	);
+	assert!(!control.exists());
+}
+
 #[cfg(any(unix, windows))]
 #[test]
 fn module_scoped_recovery_locks_config_before_source_validation() {
@@ -7294,8 +8837,14 @@ fn published_repository_recovery_finishes_without_its_remote() {
 	let control = write_v3_recovery_intent(&fixture, "one", "modules/one", &fixture.old, &source_url);
 	let unavailable = fixture.root.join("source-offline");
 	std::fs::rename(&fixture.source, &unavailable).unwrap();
+	git_ok(&fixture.consumer, &["config", "submodule.one.branch", "."]);
+	git_ok(&fixture.consumer, &["checkout", "--detach", "-q"]);
 
-	let recovered = gta(&fixture.consumer, true, &["submodule", "update", "--init"]);
+	let recovered = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--init", "--remote"],
+	);
 	assert_success(
 		&recovered,
 		"recover published repository without its remote",
@@ -7319,6 +8868,135 @@ fn published_repository_recovery_finishes_without_its_remote() {
 }
 
 #[test]
+fn v5_remote_recovery_finishes_the_recorded_target_before_advancing_again() {
+	let fixture = Fixture::new("remote-v5-recovery");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let first = fixture.commit_source("first remote target\n", "first remote target");
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"fetch first remote target",
+	);
+	let module = fixture.consumer.join("modules/one");
+	let module_origin = git(&module, &["config", "--get", "remote.origin.url"])
+		.trim()
+		.to_owned();
+	git_ok(
+		&fixture.consumer,
+		&["submodule", "deinit", "-f", "modules/one"],
+	);
+	let control = write_v5_recovery_intent(
+		&fixture.consumer,
+		"one",
+		"modules/one",
+		&fixture.old,
+		&first,
+		&module_origin,
+		"module",
+		Some("origin"),
+		true,
+	);
+	let second = fixture.commit_source("second remote target\n", "second remote target");
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--init", "--remote"],
+		),
+		"resume exact remote target",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), first);
+	assert!(!control.exists());
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"advance after exact recovery",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), second);
+}
+
+#[test]
+fn unpublished_v5_remote_recovery_reprepares_the_exact_selected_target() {
+	let fixture = Fixture::new("remote-v5-unpublished-recovery");
+	assert_success(
+		&gta(&fixture.consumer, false, &["submodule", "init"]),
+		"register module",
+	);
+	let first = fixture.commit_source("first selected target\n", "first selected target");
+	let source = git(&fixture.consumer, &["config", "--get", "submodule.one.url"])
+		.trim()
+		.to_owned();
+	let control = write_v5_recovery_intent(
+		&fixture.consumer,
+		"one",
+		"modules/one",
+		&fixture.old,
+		&first,
+		&source,
+		"superproject",
+		None,
+		true,
+	);
+	let second = fixture.commit_source("second selected target\n", "second selected target");
+	git_ok(&fixture.consumer, &["config", "submodule.one.branch", "."]);
+	git_ok(&fixture.consumer, &["checkout", "--detach", "-q"]);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote"],
+		),
+		"reprepare exact selected target",
+	);
+	let module = fixture.consumer.join("modules/one");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), first);
+	assert_ne!(git(&module, &["rev-parse", "HEAD"]).trim(), second);
+	let symbolic = Command::new("git")
+		.arg("-C")
+		.arg(&module)
+		.args(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+		.output()
+		.expect("inspect recovered remote HEAD");
+	assert!(
+		!symbolic.status.success(),
+		"v5 recovery must retain the original remote-HEAD publication policy"
+	);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/remotes/origin/HEAD"]).trim(),
+		first
+	);
+	assert!(!control.exists());
+
+	git_ok(
+		&fixture.consumer,
+		&["config", "--unset-all", "submodule.one.branch"],
+	);
+	git_ok(
+		&fixture.consumer,
+		&["config", "--unset-all", "submodule.one.url"],
+	);
+	git_ok(&module, &["config", "--unset-all", "remote.origin.url"]);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			true,
+			&["submodule", "update", "--remote", "--no-fetch"],
+		),
+		"reuse the recovered direct remote HEAD",
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), first);
+}
+
+#[test]
 fn unpublished_v1_recovery_is_upgraded_and_reprepared() {
 	let fixture = Fixture::new("unpublished-v1-recovery");
 	assert_success(
@@ -7336,8 +9014,14 @@ fn unpublished_v1_recovery_is_upgraded_and_reprepared() {
 	let module_git_dir = git_path(&fixture.consumer, "modules/one");
 	let control = write_v1_recovery_intent(&fixture, "one", "modules/one", &fixture.old, &source_url);
 	std::fs::rename(&module_git_dir, control.join("repository")).unwrap();
+	git_ok(&fixture.consumer, &["config", "submodule.one.branch", "."]);
+	git_ok(&fixture.consumer, &["checkout", "--detach", "-q"]);
 
-	let recovered = gta(&fixture.consumer, true, &["submodule", "update", "--init"]);
+	let recovered = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--init", "--remote"],
+	);
 	assert_success(&recovered, "upgrade and retry unpublished v1 recovery");
 	assert_eq!(
 		std::fs::read_to_string(fixture.consumer.join("modules/one/file.txt")).unwrap(),
@@ -8582,6 +10266,36 @@ fn write_v4_recovery_intent_at(
 	control
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_v5_recovery_intent(
+	repository: &Path,
+	name: &str,
+	path: &str,
+	gitlink: &str,
+	target: &str,
+	resolved_source: &str,
+	source_context: &str,
+	remote: Option<&str>,
+	record_remote_head: bool,
+) -> PathBuf {
+	let control = git_path(repository, "gitana-submodule-update");
+	std::fs::create_dir_all(&control).unwrap();
+	let fingerprint = Sha256::digest(gitana_remote::redact_password(resolved_source).as_bytes());
+	let fingerprint = fingerprint
+		.iter()
+		.map(|byte| format!("{byte:02x}"))
+		.collect::<String>();
+	let remote = remote.map_or_else(String::new, |remote| format!(",\"remote\":\"{remote}\""));
+	std::fs::write(
+		control.join("intent.json"),
+		format!(
+			"{{\"version\":5,\"name\":\"{name}\",\"path\":\"{path}\",\"gitlink\":\"{gitlink}\",\"target\":\"{target}\",\"source_fingerprint\":\"{fingerprint}\",\"source_context\":\"{source_context}\",\"record_remote_head\":{record_remote_head}{remote}}}"
+		),
+	)
+	.unwrap();
+	control
+}
+
 fn write_v1_recovery_intent(
 	fixture: &Fixture,
 	name: &str,
@@ -8798,6 +10512,16 @@ fn unique_tmp(tag: &str) -> PathBuf {
 	let _ = std::fs::remove_dir_all(&path);
 	std::fs::create_dir_all(&path).unwrap();
 	path
+}
+
+fn directory_is_case_insensitive(directory: &Path) -> bool {
+	let probe = directory.join(".gitana-case-probe");
+	let _ = std::fs::remove_dir_all(&probe);
+	std::fs::create_dir(&probe).unwrap();
+	std::fs::write(probe.join("CaseProbe"), b"probe").unwrap();
+	let insensitive = probe.join("caseprobe").exists();
+	let _ = std::fs::remove_dir_all(probe);
+	insensitive
 }
 
 fn git_supports_sha256() -> bool {

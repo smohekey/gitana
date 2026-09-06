@@ -7,6 +7,9 @@
 //! negative refspec `^<pattern>` excludes any advertised ref its pattern matches.
 
 use anyhow::{Result, bail};
+use gitana_config::GitConfig;
+
+use crate::validate_remote_name;
 
 /// Expand an unqualified fetch destination to a local branch, as git does (`foo` → `refs/heads/foo`);
 /// a `refs/`-rooted destination is already fully qualified.
@@ -181,6 +184,15 @@ impl Refspec {
 		dst.starts_with("refs/").then_some(dst)
 	}
 
+	/// The local ref this refspec updates during a fetch, after reserving the named remote's
+	/// conventional `HEAD` ref. A wildcard mapping onto `refs/remotes/<remote>/HEAD` is omitted so it
+	/// cannot collide with the convenience ref; an exact source remains an explicit mapping.
+	pub fn fetch_destination(&self, remote: &str, name: &str) -> Option<String> {
+		let destination = self.destination(name)?;
+		let remote_head = format!("refs/remotes/{remote}/HEAD");
+		(self.exact_source().is_some() || destination != remote_head).then_some(destination)
+	}
+
 	/// Whether this is a negative refspec whose pattern matches `name` (so `name` is excluded).
 	pub fn excludes(&self, name: &str) -> bool {
 		self.negative && self.src.match_capture(name).is_some()
@@ -227,6 +239,40 @@ impl Refspec {
 	}
 }
 
+/// The effective fetch refspecs for `remote`, including Git's conventional fallback when the remote
+/// has no configured `fetch` value.
+pub fn effective_fetch_refspecs(config: &GitConfig, remote: &str) -> Result<Vec<Refspec>> {
+	validate_remote_name(remote)?;
+	let configured = config.get_all("remote", Some(remote), "fetch");
+	if configured.is_empty() {
+		return Ok(vec![Refspec::parse(&format!(
+			"+refs/heads/*:refs/remotes/{remote}/*"
+		))?]);
+	}
+	configured.iter().map(|spec| Refspec::parse(spec)).collect()
+}
+
+/// The first local destination selected for `source` by a remote's effective fetch refspecs.
+///
+/// Negative refspecs override every positive mapping. `None` therefore means that the source is
+/// excluded, no positive refspec selects it, every matching wildcard maps onto the reserved remote
+/// `HEAD`, or the selected refspec has no destination.
+pub fn effective_fetch_destination(
+	config: &GitConfig,
+	remote: &str,
+	source: &str,
+) -> Result<Option<String>> {
+	let refspecs = effective_fetch_refspecs(config, remote)?;
+	if refspecs.iter().any(|spec| spec.excludes(source)) {
+		return Ok(None);
+	}
+	Ok(
+		refspecs
+			.iter()
+			.find_map(|spec| spec.fetch_destination(remote, source)),
+	)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -247,6 +293,74 @@ mod tests {
 		);
 		// A non-branch ref does not match.
 		assert_eq!(spec.destination("refs/tags/v1"), None);
+	}
+
+	#[test]
+	fn effective_refspecs_use_the_named_remote_and_preserve_configured_order() {
+		let fallback = effective_fetch_refspecs(&GitConfig::parse("").unwrap(), "backup").unwrap();
+		assert_eq!(
+			fallback[0].destination("refs/heads/main").as_deref(),
+			Some("refs/remotes/backup/main")
+		);
+
+		let configured = GitConfig::parse(
+			"[remote \"backup\"]\n\tfetch = ^refs/heads/private\n\tfetch = +refs/heads/main:refs/custom/main\n",
+		)
+		.unwrap();
+		let refspecs = effective_fetch_refspecs(&configured, "backup").unwrap();
+		assert!(refspecs[0].excludes("refs/heads/private"));
+		assert_eq!(
+			refspecs[1].destination("refs/heads/main").as_deref(),
+			Some("refs/custom/main")
+		);
+		assert_eq!(
+			effective_fetch_destination(&configured, "backup", "refs/heads/main")
+				.unwrap()
+				.as_deref(),
+			Some("refs/custom/main")
+		);
+		assert_eq!(
+			effective_fetch_destination(&configured, "backup", "refs/heads/private").unwrap(),
+			None
+		);
+	}
+
+	#[test]
+	fn effective_destination_skips_reserved_wildcards_for_later_exact_mappings() {
+		let configured = GitConfig::parse(
+			"[remote \"origin\"]\n\
+			 \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+			 \tfetch = refs/heads/HEAD:refs/custom/branch-head\n",
+		)
+		.unwrap();
+		assert_eq!(
+			effective_fetch_destination(&configured, "origin", "refs/heads/HEAD")
+				.unwrap()
+				.as_deref(),
+			Some("refs/custom/branch-head")
+		);
+
+		let wildcard_only = GitConfig::parse(
+			"[remote \"origin\"]\n\
+			 \tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+		)
+		.unwrap();
+		assert_eq!(
+			effective_fetch_destination(&wildcard_only, "origin", "refs/heads/HEAD").unwrap(),
+			None
+		);
+
+		let excluded = GitConfig::parse(
+			"[remote \"origin\"]\n\
+			 \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+			 \tfetch = refs/heads/HEAD:refs/custom/branch-head\n\
+			 \tfetch = ^refs/heads/HEAD\n",
+		)
+		.unwrap();
+		assert_eq!(
+			effective_fetch_destination(&excluded, "origin", "refs/heads/HEAD").unwrap(),
+			None
+		);
 	}
 
 	#[test]

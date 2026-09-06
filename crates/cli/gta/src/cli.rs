@@ -441,6 +441,12 @@ enum Command {
 		/// Do not force every cloned submodule to be shallow; per-module recommendations still apply.
 		#[arg(long, overrides_with = "shallow_submodules")]
 		no_shallow_submodules: bool,
+		/// Use each selected submodule's remote-tracking branch during recursive materialization.
+		#[arg(long, overrides_with = "no_remote_submodules")]
+		remote_submodules: bool,
+		/// Use the recorded gitlink commits during recursive materialization.
+		#[arg(long, overrides_with = "remote_submodules")]
+		no_remote_submodules: bool,
 	},
 	/// Download new objects from the origin and update remote-tracking refs.
 	Fetch {
@@ -558,6 +564,12 @@ enum SubmoduleAction {
 		/// Ignore `.gitmodules` shallow recommendations.
 		#[arg(long, overrides_with = "recommend_shallow")]
 		no_recommend_shallow: bool,
+		/// Update to the tip of each module's configured remote branch.
+		#[arg(long)]
+		remote: bool,
+		/// Do not fetch; use only locally available objects and remote-tracking refs.
+		#[arg(short = 'N', long)]
+		no_fetch: bool,
 		/// Recursively update initialized descendants (and initialize them with `--init`).
 		#[arg(long)]
 		recursive: bool,
@@ -1027,8 +1039,11 @@ impl Cli {
 					recurse_submodules,
 					shallow_submodules,
 					no_shallow_submodules,
+					remote_submodules,
+					no_remote_submodules,
 				} => {
 					let shallow_submodules = shallow_submodules && !no_shallow_submodules;
+					let remote_submodules = remote_submodules && !no_remote_submodules;
 					commands::clone::run(
 						&command_context,
 						url,
@@ -1039,6 +1054,7 @@ impl Cli {
 						sparse,
 						recurse_submodules,
 						shallow_submodules,
+						remote_submodules,
 					)
 					.await
 				}
@@ -1117,12 +1133,16 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 			depth,
 			recommend_shallow,
 			no_recommend_shallow,
+			remote,
+			no_fetch,
 			recursive,
 			paths,
 		} => Action::Update {
 			init,
 			depth,
 			recommend_shallow: recommend_shallow || !no_recommend_shallow,
+			remote,
+			fetch: !no_fetch,
 			recursive,
 			paths,
 		},

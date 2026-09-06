@@ -17,7 +17,7 @@ use gitana_fs_native::{
 };
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
-use gitana_repository::{ReflogIntent, Repository, detect_hash_kind};
+use gitana_repository::{HeadState, ReflogIntent, Repository, detect_hash_kind};
 use gitana_worktree::WorkTree;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256 as Sha256Digest};
@@ -29,8 +29,8 @@ use crate::context::{
 use crate::{
 	ConfigurationProvider, FetchRepository, FetchSource, InitRequest, PrepareRepository,
 	PrepareSource, RepositoryTransfer, SharedConfigGuard, SubmoduleContext, SubmoduleDeclaration,
-	SubmoduleError, SubmoduleObjectId, UpdateFailure, UpdateOutcome, UpdateOutcomeState,
-	UpdateReport, UpdateRequest,
+	SubmoduleError, SubmoduleObjectId, SubmoduleUpdateTarget, UpdateFailure, UpdateOutcome,
+	UpdateOutcomeState, UpdateReport, UpdateRequest,
 };
 
 const CONTROL_DIR: &str = "gitana-submodule-update";
@@ -54,7 +54,15 @@ enum SharedConfigAccess {
 
 struct Planned<H: HashAlgorithm> {
 	declaration: SubmoduleDeclaration,
+	/// Commit recorded by the superproject gitlink, retained for status/reporting.
 	recorded: ObjectId<H>,
+	target: SubmoduleUpdateTarget,
+	/// Exact durable target selected by a prior interrupted invocation.
+	recovery_target: Option<ObjectId<H>>,
+	/// Whether successful population must retain the selected remote HEAD for no-fetch reuse.
+	record_remote_head: bool,
+	/// Full symbolic superproject branch captured for `branch = .`.
+	superproject_branch: Option<String>,
 	source_url: Option<String>,
 	state: Option<UpdateOutcomeState>,
 	recovering: bool,
@@ -62,9 +70,18 @@ struct Planned<H: HashAlgorithm> {
 	module_config_lease: Option<crate::SubmoduleMutationLease>,
 	/// Explicit depth applied to both new repositories and existing fetches.
 	depth: Option<u32>,
+	fetch: bool,
 	/// Effective depth for initial repository creation, including `.gitmodules` recommendations.
 	clone_depth: Option<u32>,
 	pointers: ModulePointers,
+}
+
+struct ExactRecoveryHint<H: HashAlgorithm> {
+	name: String,
+	path: String,
+	target: ObjectId<H>,
+	source_context: IntentSourceContext,
+	record_remote_head: bool,
 }
 
 fn recommended_clone_depth(
@@ -130,6 +147,7 @@ struct MountPlan {
 enum IntentSourceContext {
 	Superproject,
 	Module,
+	ModuleLocal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,10 +155,23 @@ struct StageIntent {
 	version: u32,
 	name: String,
 	path: String,
+	#[serde(default, skip_serializing_if = "String::is_empty")]
 	recorded: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	gitlink: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	target: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	remote: Option<String>,
 	source_fingerprint: String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	source_context: Option<IntentSourceContext>,
+	#[serde(default, skip_serializing_if = "is_false")]
+	record_remote_head: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+	!*value
 }
 
 struct ConditionalFileCleanup {
@@ -273,6 +304,7 @@ impl SubmoduleContext {
 	/// The durable intent selects the recovery owner independently of a recursive caller's current
 	/// path query. An empty control directory is retired directly under the update lock so recovery
 	/// never broadens the caller's selection merely to reach the ordinary update state machine.
+	#[allow(clippy::too_many_arguments)]
 	pub async fn resume_pending_update<C: ConfigurationProvider, T: RepositoryTransfer>(
 		&self,
 		configuration: &C,
@@ -280,6 +312,8 @@ impl SubmoduleContext {
 		reflog_committer: Option<String>,
 		depth: Option<u32>,
 		recommend_shallow: bool,
+		remote: bool,
+		fetch: bool,
 	) -> Result<Option<UpdateReport>, UpdateFailure> {
 		if depth == Some(0) {
 			return Err(UpdateFailure::preflight(SubmoduleError::InvalidDepth));
@@ -301,6 +335,8 @@ impl SubmoduleContext {
 			initialize: false,
 			depth,
 			recommend_shallow,
+			remote,
+			fetch,
 			initialize_only_active: false,
 			reflog_committer,
 		};
@@ -369,6 +405,70 @@ impl SubmoduleContext {
 		let query = crate::SubmoduleQuery::top_literal(&intent.path);
 		lock.validate()?;
 		Ok(Some(query))
+	}
+
+	fn exact_recovery_hint<H: HashAlgorithm>(
+		&self,
+		declarations: &HashMap<String, SubmoduleDeclaration>,
+	) -> Result<Option<ExactRecoveryHint<H>>, SubmoduleError> {
+		if !repository_has_pending_update(&self.git, &self.layout.git_dir)? {
+			return Ok(None);
+		}
+		let control = self
+			.open_git_subdir_nofollow(Path::new(CONTROL_DIR))
+			.map_err(|source| SubmoduleError::Io {
+				path: self.layout.git_dir.join(CONTROL_DIR),
+				source,
+			})?;
+		let Some((intent, _)) = read_stage_intent(&control, &self.layout.git_dir.join(INTENT_FILE))?
+		else {
+			return Ok(None);
+		};
+		let source_context = intent_source_context(&intent).ok_or_else(|| {
+			let message = if matches!(intent.version, 1..=5) {
+				format!(
+					"staging intent version {} has an invalid source context",
+					intent.version
+				)
+			} else {
+				format!("unsupported staging intent version {}", intent.version)
+			};
+			SubmoduleError::RecoveryRequired(message)
+		})?;
+		let declaration = declarations
+			.get(&intent.path)
+			.filter(|declaration| declaration.name == intent.name)
+			.ok_or_else(|| {
+				SubmoduleError::RecoveryRequired(format!("unfinished staging for '{}'", intent.name))
+			})?;
+		let module = Path::new("modules").join(&declaration.name);
+		let published = safe_directory_exists(&self.git, &module, &self.layout.git_dir.join(&module))?;
+		let staged = safe_directory_exists(
+			&control,
+			Path::new(STAGED_REPOSITORY_NAME),
+			&self.layout.git_dir.join(STAGED_REPOSITORY),
+		)?;
+		if intent.version < 5 && !published && !staged {
+			return Ok(None);
+		}
+		let target = intent_target(&intent)
+			.ok_or_else(|| {
+				SubmoduleError::RecoveryRequired("staging intent has no selected target".to_owned())
+			})
+			.and_then(|target| {
+				ObjectId::from_hex(target).map_err(|_| {
+					SubmoduleError::RecoveryRequired(
+						"staging intent has an invalid selected target".to_owned(),
+					)
+				})
+			})?;
+		Ok(Some(ExactRecoveryHint {
+			name: intent.name,
+			path: intent.path,
+			target,
+			source_context,
+			record_remote_head: intent.version == 5 && intent.record_remote_head,
+		}))
 	}
 
 	async fn update_typed<H: HashAlgorithm, C: ConfigurationProvider, T: RepositoryTransfer>(
@@ -494,6 +594,9 @@ impl SubmoduleContext {
 				.validate()
 				.map_err(|source| UpdateFailure::after_init(&report, source))?;
 		}
+		let exact_recovery = self
+			.exact_recovery_hint::<H>(&declarations)
+			.map_err(|source| UpdateFailure::after_init(&report, source))?;
 		let initialize_only_active =
 			should_initialize_only_active(&request.query, &effective, request.initialize_only_active);
 		let mut plan = Vec::with_capacity(selected.len());
@@ -503,25 +606,42 @@ impl SubmoduleContext {
 				.expect("preflight established every mapping")
 				.clone();
 			let recorded = index.entry(&path).expect("selected stage-zero gitlink").oid;
-			let active = is_active(&effective, &declaration.name, &declaration.path)
-				.map_err(|source| UpdateFailure::after_init(&report, source))?;
-			let strategy = configured_update_strategy(&effective, &declaration.name)
-				.map_err(|source| UpdateFailure::after_init(&report, source))?
-				.or_else(|| declaration.update.clone())
-				.unwrap_or_else(|| "checkout".to_owned());
-			validate_update_strategy(&declaration.name, &strategy)
-				.map_err(|source| UpdateFailure::after_init(&report, source))?;
-			if initialize_only_active && !active {
+			let recovery = exact_recovery
+				.as_ref()
+				.filter(|recovery| recovery.name == declaration.name && recovery.path == declaration.path);
+			let active = if recovery.is_some() {
+				true
+			} else {
+				is_active(&effective, &declaration.name, &declaration.path)
+					.map_err(|source| UpdateFailure::after_init(&report, source))?
+			};
+			let strategy = if recovery.is_some() {
+				"checkout".to_owned()
+			} else {
+				let strategy = configured_update_strategy(&effective, &declaration.name)
+					.map_err(|source| UpdateFailure::after_init(&report, source))?
+					.or_else(|| declaration.update.clone())
+					.unwrap_or_else(|| "checkout".to_owned());
+				validate_update_strategy(&declaration.name, &strategy)
+					.map_err(|source| UpdateFailure::after_init(&report, source))?;
+				strategy
+			};
+			if recovery.is_none() && initialize_only_active && !active {
 				let clone_depth = recommended_clone_depth(request, &declaration);
 				plan.push(Planned {
 					declaration,
 					recorded,
+					target: SubmoduleUpdateTarget::Gitlink(SubmoduleObjectId::from_typed(recorded)),
+					recovery_target: None,
+					record_remote_head: false,
+					superproject_branch: None,
 					source_url: None,
 					state: Some(UpdateOutcomeState::SkippedInactive),
 					recovering: false,
 					intent_identity: None,
 					module_config_lease: None,
 					depth: request.depth,
+					fetch: request.fetch,
 					clone_depth,
 					pointers: pointers
 						.remove(&path)
@@ -529,7 +649,13 @@ impl SubmoduleContext {
 				});
 				continue;
 			}
-			let configured_url = effective.get_raw("submodule", Some(&declaration.name), "url");
+			let configured_url = if recovery
+				.is_some_and(|recovery| recovery.source_context != IntentSourceContext::Superproject)
+			{
+				None
+			} else {
+				effective.get_raw("submodule", Some(&declaration.name), "url")
+			};
 			let source_url = match configured_url {
 				Some(Some(url)) => Some(url.to_owned()),
 				Some(None) => {
@@ -541,7 +667,30 @@ impl SubmoduleContext {
 				None => None,
 			};
 			let source_url = credential_urls.get(&path).cloned().or(source_url);
-			let state = if source_url.is_none() {
+			let module_relative = Path::new("modules").join(&declaration.name);
+			let retained_repository = self
+				.git
+				.symlink_metadata(&module_relative)
+				.is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+			let (registration_remote, module_config_lease) = if recovery.is_none()
+				&& request.remote
+				&& request.fetch
+				&& source_url.is_none()
+				&& retained_repository
+			{
+				let (remote, lease) = self
+					.retained_module_remote::<H, C>(&declaration, configuration)
+					.await
+					.map_err(|source| UpdateFailure::after_init(&report, source))?;
+				(Some(remote), Some(lease))
+			} else {
+				(None, None)
+			};
+			let state = if recovery.is_some() {
+				None
+			} else if source_url.is_none()
+				&& ((request.fetch && registration_remote.as_deref() != Some(".")) || !retained_repository)
+			{
 				Some(UpdateOutcomeState::SkippedUnregistered)
 			} else if !active {
 				Some(UpdateOutcomeState::SkippedInactive)
@@ -550,16 +699,49 @@ impl SubmoduleContext {
 			} else {
 				None
 			};
+			let (target, recovery_target, superproject_branch) = if let Some(recovery) = recovery {
+				(
+					SubmoduleUpdateTarget::Gitlink(SubmoduleObjectId::from_typed(recovery.target)),
+					Some(recovery.target),
+					None,
+				)
+			} else if state.is_none() {
+				configured_update_target(
+					request,
+					&effective,
+					&declaration,
+					recorded,
+					worktree.repository(),
+				)
+				.await
+				.map(|(target, branch)| (target, None, branch))
+				.map_err(|source| UpdateFailure::after_init(&report, source))?
+			} else {
+				(
+					SubmoduleUpdateTarget::Gitlink(SubmoduleObjectId::from_typed(recorded)),
+					None,
+					None,
+				)
+			};
 			let clone_depth = recommended_clone_depth(request, &declaration);
+			let record_remote_head = recovery.map_or_else(
+				|| matches!(&target, SubmoduleUpdateTarget::RemoteHead),
+				|recovery| recovery.record_remote_head,
+			);
 			plan.push(Planned {
 				declaration,
 				recorded,
+				target,
+				recovery_target,
+				record_remote_head,
+				superproject_branch,
 				source_url,
 				state,
 				recovering: false,
 				intent_identity: None,
-				module_config_lease: None,
+				module_config_lease,
 				depth: request.depth,
+				fetch: request.fetch,
 				clone_depth,
 				pointers: pointers
 					.remove(&path)
@@ -593,7 +775,7 @@ impl SubmoduleContext {
 				source,
 			})?;
 			if let Some(state) = entry.state {
-				report.outcomes.push(outcome(&entry, state));
+				report.outcomes.push(outcome(&entry, state, None));
 				continue;
 			}
 			let module = entry.declaration.name.clone();
@@ -608,8 +790,8 @@ impl SubmoduleContext {
 				)
 				.await;
 			match update {
-				Ok(state) => {
-					report.outcomes.push(outcome(&entry, state));
+				Ok((state, target)) => {
+					report.outcomes.push(outcome(&entry, state, Some(target)));
 					lock.validate().map_err(|source| UpdateFailure {
 						completed: report.clone(),
 						module: Some(module),
@@ -640,8 +822,9 @@ impl SubmoduleContext {
 		configuration: &C,
 		transfer: &T,
 		mutation_lease: &crate::SubmoduleMutationLease,
-	) -> Result<UpdateOutcomeState, SubmoduleError> {
+	) -> Result<(UpdateOutcomeState, ObjectId<H>), SubmoduleError> {
 		let mut intent_identity = entry.intent_identity;
+		let mut selected_target = entry.recovery_target;
 		let module_relative = Path::new("modules").join(&entry.declaration.name);
 		let existing = match self.git.symlink_metadata(&module_relative) {
 			Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
@@ -675,11 +858,11 @@ impl SubmoduleContext {
 				.source_url
 				.as_ref()
 				.ok_or_else(|| SubmoduleError::Unregistered(entry.declaration.name.clone()))?;
-			intent_identity = Some(
-				self
-					.prepare_module(entry, source, effective, transfer, mutation_lease.clone())
-					.await?,
-			);
+			let prepared = self
+				.prepare_module(entry, source, effective, transfer, mutation_lease.clone())
+				.await?;
+			intent_identity = Some(prepared.0);
+			selected_target = Some(prepared.1);
 			cloned = true;
 		}
 		let completion_required = cloned || entry.recovering || mount_before_transfer.newly_attached;
@@ -759,63 +942,85 @@ impl SubmoduleContext {
 		// effective view on the repository before any checkout or HEAD publication so ref policy (for
 		// example `core.logAllRefUpdates`) observes the invocation's actual configuration.
 		repository.set_effective_config(config.clone());
-		// A published repository accepted by `recover_stage` already has a durable recorded object
+		// A published repository accepted by `recover_stage` already has a durable selected object
 		// graph and is source-bound by its matching intent. Recovery must therefore finish from that
 		// local state even if the original source has disappeared. Ordinary existing repositories keep
 		// Git's fetch-first update behavior, including retained repositories without a recovery intent.
 		let mut resolved_existing_source = None;
+		let mut existing_remote = None;
 		let mut fetched_roots = Vec::new();
 		if existing && !entry.recovering {
-			let source = module_origin_url(&config, &entry.declaration.name)?;
-			let transfer_directory =
-				module_directory
-					.try_clone()
-					.map_err(|source| SubmoduleError::Io {
-						path: module_git_dir.clone(),
-						source,
-					})?;
-			let fetch_source = FetchSource {
-				source_url: source,
-				worktree_dir: self.worktree_root().join(&entry.declaration.path),
-				config: config.clone(),
+			let remote = if matches!(entry.target, SubmoduleUpdateTarget::Gitlink(_)) {
+				"origin".to_owned()
+			} else {
+				module_update_remote(&repository, &config).await?
 			};
-			let resolved = transfer
-				.resolve_fetch_source_identity(&fetch_source)
-				.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
-			let fetched = transfer
-				.fetch_recorded(
-					FetchRepository {
-						source: fetch_source,
-						git_dir: transfer_directory,
-						display_git_dir: module_git_dir.clone(),
-						hash_kind: crate::object_id::kind::<H>(),
-						recorded: SubmoduleObjectId::from_typed(entry.recorded),
-						depth: entry.depth,
-					},
-					mutation_lease.clone(),
-				)
-				.await
-				.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
-			if fetched.resolved_source != resolved {
-				return Err(SubmoduleError::Transfer(
-					"submodule transfer source changed during fetch".to_owned(),
+			existing_remote = Some(remote.clone());
+			if entry.fetch && remote != "." {
+				let source = module_remote_url(&config, &entry.declaration.name, &remote)?;
+				let transfer_directory =
+					module_directory
+						.try_clone()
+						.map_err(|source| SubmoduleError::Io {
+							path: module_git_dir.clone(),
+							source,
+						})?;
+				let fetch_source = FetchSource {
+					remote: remote.clone(),
+					source_url: source,
+					worktree_dir: self.worktree_root().join(&entry.declaration.path),
+					config: config.clone(),
+				};
+				let resolved = transfer
+					.resolve_fetch_source_identity(&fetch_source)
+					.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
+				let fetched = transfer
+					.fetch_target(
+						FetchRepository {
+							source: fetch_source,
+							git_dir: transfer_directory,
+							display_git_dir: module_git_dir.clone(),
+							hash_kind: crate::object_id::kind::<H>(),
+							target: entry.target.clone(),
+							depth: entry.depth,
+						},
+						mutation_lease.clone(),
+					)
+					.await
+					.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
+				if fetched.resolved_source != resolved {
+					return Err(SubmoduleError::Transfer(
+						"submodule transfer source changed during fetch".to_owned(),
+					));
+				}
+				selected_target = Some(typed_update_oid::<H>(&fetched.selected_target)?);
+				resolved_existing_source = Some((fetched.resolved_source, IntentSourceContext::Module));
+				fetched_roots = fetched.fetched_roots;
+			} else {
+				selected_target = Some(
+					resolve_local_update_target(&repository, &entry.target, &remote, &entry.declaration.name)
+						.await?,
+				);
+				resolved_existing_source = Some((
+					local_source_identity(&remote, selected_target.unwrap()),
+					IntentSourceContext::ModuleLocal,
 				));
 			}
-			resolved_existing_source = Some(fetched.resolved_source);
-			fetched_roots = fetched.fetched_roots;
 		}
-		if !repository.objects().exists_object(&entry.recorded).await? {
+		let selected_target = selected_target.unwrap_or(entry.recorded);
+		self.ensure_superproject_branch(entry).await?;
+		if !repository.objects().exists_object(&selected_target).await? {
 			return Err(SubmoduleError::InvalidRepository(
 				entry.declaration.name.clone(),
 			));
 		}
 		if entry.depth.is_some() && existing && !entry.recovering {
-			let roots = durability_roots(entry.recorded, fetched_roots)?;
+			let roots = durability_roots(selected_target, fetched_roots)?;
 			repository
 				.durability_barrier_object_graphs(&roots, &[])
 				.await?;
 		}
-		let target_tree = repository.commit_tree(entry.recorded).await?;
+		let target_tree = repository.commit_tree(selected_target).await?;
 		let head_lock = repository.refs().lock_head().await?;
 		let current = repository.refs().resolve_head().await?;
 		if !completion_required && mount_before_transfer.mounted && current.is_none() {
@@ -824,7 +1029,7 @@ impl SubmoduleContext {
 				entry.declaration.name.clone(),
 			));
 		}
-		let needs_checkout = completion_required || current != Some(entry.recorded);
+		let needs_checkout = completion_required || current != Some(selected_target);
 		if existing
 			&& needs_checkout
 			&& let Some(operation) = operation_in_progress(&repository).await?
@@ -845,6 +1050,7 @@ impl SubmoduleContext {
 		let mount = self
 			.revalidate_module_mount(entry, &mount_before_transfer, configuration)
 			.await?;
+		self.ensure_superproject_branch(entry).await?;
 		let resolved_attachment_source = if mount.newly_attached && !cloned && !entry.recovering {
 			Some(resolved_existing_source.ok_or_else(|| {
 				SubmoduleError::RecoveryRequired(
@@ -854,15 +1060,19 @@ impl SubmoduleContext {
 		} else {
 			None
 		};
-		if !completion_required && mount.mounted && current == Some(entry.recorded) {
+		if !completion_required && mount.mounted && current == Some(selected_target) {
 			let published_intent = self
 				.publish_module_mount(
 					entry,
 					&mount,
 					&module_directory,
+					selected_target,
 					false,
 					(configuration, &mutation_lease),
-					resolved_attachment_source.as_deref(),
+					resolved_attachment_source
+						.as_ref()
+						.map(|(source, context)| (source.as_str(), *context)),
+					existing_remote.as_deref(),
 				)
 				.await?;
 			debug_assert!(published_intent.is_none());
@@ -870,12 +1080,12 @@ impl SubmoduleContext {
 			self.ensure_mount_identity(entry, &mount)?;
 			self.ensure_mount_marker(entry, &mount)?;
 			drop(head_lock);
-			return Ok(UpdateOutcomeState::AlreadyCurrent);
+			return Ok((UpdateOutcomeState::AlreadyCurrent, selected_target));
 		}
 		let message = format!(
 			"checkout: moving from {} to {}",
 			current.map_or_else(|| "unborn".to_owned(), |oid| oid.to_hex()),
-			entry.recorded
+			selected_target
 		);
 		let reflog = match committer {
 			Some(committer) => ReflogIntent::Log {
@@ -887,15 +1097,19 @@ impl SubmoduleContext {
 		// Validate HEAD and its reflog under the retained HEAD.lock before publishing the mount or
 		// changing the index/worktree. A deterministic publication failure must leave an existing
 		// module at the old commit rather than reporting an error after checkout has already landed.
-		let prepared_head = head_lock.prepare_detached(entry.recorded, reflog).await?;
+		let prepared_head = head_lock.prepare_detached(selected_target, reflog).await?;
 		if let Some(published_intent) = self
 			.publish_module_mount(
 				entry,
 				&mount,
 				&module_directory,
+				selected_target,
 				cloned || entry.recovering,
 				(configuration, &mutation_lease),
-				resolved_attachment_source.as_deref(),
+				resolved_attachment_source
+					.as_ref()
+					.map(|(source, context)| (source.as_str(), *context)),
+				existing_remote.as_deref(),
 			)
 			.await?
 		{
@@ -954,11 +1168,14 @@ impl SubmoduleContext {
 			})?;
 			self.clear_control_dir(Some(expected))?;
 		}
-		Ok(if cloned {
-			UpdateOutcomeState::Cloned
-		} else {
-			UpdateOutcomeState::CheckedOut
-		})
+		Ok((
+			if cloned {
+				UpdateOutcomeState::Cloned
+			} else {
+				UpdateOutcomeState::CheckedOut
+			},
+			selected_target,
+		))
 	}
 
 	async fn prepare_module<H: HashAlgorithm, T: RepositoryTransfer>(
@@ -968,13 +1185,14 @@ impl SubmoduleContext {
 		effective: &GitConfig,
 		transfer: &T,
 		mutation_lease: crate::SubmoduleMutationLease,
-	) -> Result<EntryIdentity, SubmoduleError> {
+	) -> Result<(EntryIdentity, ObjectId<H>), SubmoduleError> {
 		let request = PrepareSource {
 			module_path: entry.declaration.path.clone(),
 			declared_url: entry.declaration.url.clone(),
 			source_url: source.to_owned(),
 			persist_url: gitana_remote::redact_password(source),
 			hash_kind: crate::object_id::kind::<H>(),
+			target: entry.target.clone(),
 			config: effective.clone(),
 		};
 		let resolved_source = transfer
@@ -989,10 +1207,13 @@ impl SubmoduleContext {
 				"submodule transfer source changed during preparation".to_owned(),
 			));
 		}
+		let target = typed_update_oid::<H>(&prepared.selected_target)?;
 		let intent = stage_intent(
 			entry,
+			target,
 			&prepared.resolved_source,
 			IntentSourceContext::Superproject,
+			None,
 		);
 		let intent_identity = self.prepare_control_dir(&intent)?;
 		self
@@ -1021,24 +1242,25 @@ impl SubmoduleContext {
 					git_dir: transfer_directory,
 					display_git_dir: self.layout.git_dir.join(STAGED_REPOSITORY),
 					hash_kind: crate::object_id::kind::<H>(),
-					recorded: SubmoduleObjectId::from_typed(entry.recorded),
+					target: SubmoduleObjectId::from_typed(target),
+					record_remote_head: entry.record_remote_head,
 					depth: entry.clone_depth,
 				},
 			)
 			.await
 			.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
-		let durability_roots = durability_roots(entry.recorded, fetched_roots)?;
+		let durability_roots = durability_roots(target, fetched_roots)?;
 		self
 			.verify_staged::<H>(
-				entry.recorded,
+				target,
 				&durability_roots,
 				&entry.declaration.name,
 				&stage_directory,
 			)
 			.await?;
-		let target = Path::new("modules").join(&entry.declaration.name);
-		let target_parent = self.ensure_git_parent_directories(&target)?;
-		let target_name = target
+		let module_target = Path::new("modules").join(&entry.declaration.name);
+		let target_parent = self.ensure_git_parent_directories(&module_target)?;
+		let target_name = module_target
 			.file_name()
 			.expect("validated module target has a final component");
 		let control = self
@@ -1061,7 +1283,7 @@ impl SubmoduleContext {
 			}
 			Err(source) => {
 				return Err(SubmoduleError::Io {
-					path: self.layout.git_dir.join(&target),
+					path: self.layout.git_dir.join(&module_target),
 					source,
 				});
 			}
@@ -1069,12 +1291,12 @@ impl SubmoduleContext {
 		let published = target_parent
 			.open_dir_nofollow(target_name)
 			.map_err(|source| SubmoduleError::Io {
-				path: self.layout.git_dir.join(&target),
+				path: self.layout.git_dir.join(&module_target),
 				source,
 			})?;
 		if !same_directory_identity(&stage_directory, &published).map_err(|source| {
 			SubmoduleError::Io {
-				path: self.layout.git_dir.join(&target),
+				path: self.layout.git_dir.join(&module_target),
 				source,
 			}
 		})? {
@@ -1082,8 +1304,8 @@ impl SubmoduleContext {
 				entry.declaration.name.clone(),
 			));
 		}
-		sync_repository_publication_parents(&target, |parent| self.sync_git_directory(parent))?;
-		Ok(intent_identity)
+		sync_repository_publication_parents(&module_target, |parent| self.sync_git_directory(parent))?;
+		Ok((intent_identity, target))
 	}
 
 	fn prepare_control_dir(&self, intent: &StageIntent) -> Result<EntryIdentity, SubmoduleError> {
@@ -1350,7 +1572,7 @@ impl SubmoduleContext {
 				}
 			};
 		let source_context = intent_source_context(&intent).ok_or_else(|| {
-			let message = if matches!(intent.version, 1..=4) {
+			let message = if matches!(intent.version, 1..=5) {
 				format!(
 					"staging intent version {} has an invalid source context",
 					intent.version
@@ -1361,9 +1583,7 @@ impl SubmoduleContext {
 			SubmoduleError::RecoveryRequired(message)
 		})?;
 		let Some(recovery_index) = plan.iter().position(|entry| {
-			entry.declaration.name == intent.name
-				&& entry.declaration.path == intent.path
-				&& entry.recorded.to_hex() == intent.recorded
+			entry.declaration.name == intent.name && entry.declaration.path == intent.path
 		}) else {
 			return Err(SubmoduleError::RecoveryRequired(format!(
 				"unfinished staging for '{}'",
@@ -1379,13 +1599,29 @@ impl SubmoduleContext {
 			Path::new(STAGED_REPOSITORY),
 			&self.layout.git_dir.join(STAGED_REPOSITORY),
 		)?;
-		// An intent with no repository name owns no durable content and is safe to abandon. Once either
-		// name exists, its resolved endpoint identity remains binding and recovery must not silently
-		// reuse the repository after an `insteadOf` rule selects a different source.
-		if !target_exists && !staged_exists {
+		// A legacy intent with no repository name owns no durable content. Retire it before copying its
+		// recorded object into the current plan: this invocation must retain its fresh gitlink or remote
+		// target when it starts again from scratch.
+		if !target_exists && !staged_exists && intent.version < 5 {
 			self.clear_control_dir(Some(intent_identity))?;
 			return Ok(None);
 		}
+		let gitlink_hex = intent_gitlink(&intent).ok_or_else(|| {
+			SubmoduleError::RecoveryRequired("staging intent has no recorded gitlink".to_owned())
+		})?;
+		entry.recorded = ObjectId::<H>::from_hex(gitlink_hex).map_err(|_| {
+			SubmoduleError::RecoveryRequired("staging intent has an invalid recorded gitlink".to_owned())
+		})?;
+		let target_hex = intent_target(&intent).ok_or_else(|| {
+			SubmoduleError::RecoveryRequired("staging intent has no selected target".to_owned())
+		})?;
+		let selected_target = ObjectId::<H>::from_hex(target_hex).map_err(|_| {
+			SubmoduleError::RecoveryRequired("staging intent has an invalid selected target".to_owned())
+		})?;
+		entry.recovery_target = Some(selected_target);
+		entry.target = SubmoduleUpdateTarget::Gitlink(SubmoduleObjectId::from_typed(selected_target));
+		// Once either repository name exists, its resolved endpoint identity remains binding and recovery
+		// must not silently reuse the repository after an `insteadOf` rule selects a different source.
 		let (source, resolved, module_config_lease) = match source_context {
 			IntentSourceContext::Superproject => {
 				let source = entry.source_url.as_deref().ok_or_else(|| {
@@ -1400,6 +1636,7 @@ impl SubmoduleContext {
 					source_url: source.to_owned(),
 					persist_url: gitana_remote::redact_password(source),
 					hash_kind: crate::object_id::kind::<H>(),
+					target: SubmoduleUpdateTarget::Gitlink(SubmoduleObjectId::from_typed(selected_target)),
 					config: effective.clone(),
 				};
 				let resolved = transfer
@@ -1438,8 +1675,10 @@ impl SubmoduleContext {
 					.load_module_config(config_directory, &module_git_dir)
 					.await?;
 				self.ensure_module_identity(entry, &module_directory)?;
-				let source = module_origin_url(&config, &entry.declaration.name)?;
+				let remote = intent.remote.as_deref().unwrap_or("origin");
+				let source = module_remote_url(&config, &entry.declaration.name, remote)?;
 				let fetch_source = FetchSource {
+					remote: remote.to_owned(),
 					source_url: source.clone(),
 					worktree_dir: self.worktree_root().join(&entry.declaration.path),
 					config,
@@ -1448,6 +1687,27 @@ impl SubmoduleContext {
 					.resolve_fetch_source_identity(&fetch_source)
 					.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
 				(source, resolved, Some(module_config_lease))
+			}
+			IntentSourceContext::ModuleLocal => {
+				if !target_exists || staged_exists {
+					return Err(SubmoduleError::RecoveryRequired(format!(
+						"module-local staging requires one published repository for '{}'",
+						intent.name
+					)));
+				}
+				let module_git_dir = self.layout.git_dir.join(&target);
+				let module_directory =
+					self
+						.open_git_subdir_nofollow(&target)
+						.map_err(|source| SubmoduleError::Io {
+							path: module_git_dir.clone(),
+							source,
+						})?;
+				let lease =
+					try_acquire_submodule_config_mutation_lease(&module_directory, &module_git_dir)?;
+				let remote = intent.remote.as_deref().unwrap_or("origin");
+				let resolved = local_source_identity(remote, selected_target);
+				(resolved.clone(), resolved, Some(lease))
 			}
 		};
 		if !intent_matches_source(&intent, source_context, &source, &resolved) {
@@ -1629,6 +1889,52 @@ impl SubmoduleContext {
 			})?);
 		let repository = Repository::new(ObjectStore::new(files));
 		Ok((repository, directory))
+	}
+
+	async fn retained_module_remote<H: HashAlgorithm, C: ConfigurationProvider>(
+		&self,
+		declaration: &SubmoduleDeclaration,
+		configuration: &C,
+	) -> Result<(String, crate::SubmoduleMutationLease), SubmoduleError> {
+		let module_git_dir = self.layout.git_dir.join("modules").join(&declaration.name);
+		let (repository, module_directory) = self.open_module_repository::<H>(declaration)?;
+		let lease = try_acquire_submodule_config_mutation_lease(&module_directory, &module_git_dir)?;
+		let hash_directory = module_directory
+			.try_clone()
+			.map_err(|source| SubmoduleError::Io {
+				path: module_git_dir.clone(),
+				source,
+			})?;
+		if configuration
+			.module_hash_kind(hash_directory, &module_git_dir)
+			.await?
+			!= crate::object_id::kind::<H>()
+		{
+			return Err(SubmoduleError::InvalidRepository(declaration.name.clone()));
+		}
+		let config_directory = module_directory
+			.try_clone()
+			.map_err(|source| SubmoduleError::Io {
+				path: module_git_dir.clone(),
+				source,
+			})?;
+		let config = configuration
+			.load_module_config(config_directory, &module_git_dir)
+			.await?;
+		let relative = Path::new("modules").join(&declaration.name);
+		let current = self
+			.open_git_subdir_nofollow(&relative)
+			.map_err(|_| SubmoduleError::InvalidRepository(declaration.name.clone()))?;
+		if !same_directory_identity(&module_directory, &current).map_err(|source| {
+			SubmoduleError::Io {
+				path: module_git_dir,
+				source,
+			}
+		})? {
+			return Err(SubmoduleError::InvalidRepository(declaration.name.clone()));
+		}
+		let remote = module_update_remote(&repository, &config).await?;
+		Ok((remote, lease))
 	}
 
 	pub(crate) fn module_pointers(
@@ -1951,24 +2257,33 @@ impl SubmoduleContext {
 		Ok(())
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	async fn publish_module_mount<H: HashAlgorithm, C: ConfigurationProvider>(
 		&self,
 		entry: &Planned<H>,
 		mount_plan: &MountPlan,
 		module_directory: &Dir,
+		selected_target: ObjectId<H>,
 		intent_durable: bool,
 		configuration_and_lease: (&C, &crate::SubmoduleMutationLease),
-		resolved_source: Option<&str>,
+		resolved_source: Option<(&str, IntentSourceContext)>,
+		remote: Option<&str>,
 	) -> Result<Option<EntryIdentity>, SubmoduleError> {
 		let (configuration, mutation_lease) = configuration_and_lease;
 		let declaration = &entry.declaration;
 		let published_intent = if mount_plan.newly_attached && !intent_durable {
-			let resolved = resolved_source.ok_or_else(|| {
+			let (resolved, context) = resolved_source.ok_or_else(|| {
 				SubmoduleError::RecoveryRequired(
 					"new mount publication requires a resolved source identity".to_owned(),
 				)
 			})?;
-			Some(self.prepare_control_dir(&stage_intent(entry, resolved, IntentSourceContext::Module))?)
+			Some(self.prepare_control_dir(&stage_intent(
+				entry,
+				selected_target,
+				resolved,
+				context,
+				remote,
+			))?)
 		} else {
 			None
 		};
@@ -2085,6 +2400,24 @@ impl SubmoduleContext {
 			return Err(SubmoduleError::InvalidRepository(
 				entry.declaration.name.clone(),
 			));
+		}
+		Ok(())
+	}
+
+	async fn ensure_superproject_branch<H: HashAlgorithm>(
+		&self,
+		entry: &Planned<H>,
+	) -> Result<(), SubmoduleError> {
+		let Some(expected) = entry.superproject_branch.as_deref() else {
+			return Ok(());
+		};
+		let repository = self.worktree::<H>()?;
+		if repository.repository().refs().read_head().await? != HeadState::Symbolic(expected.to_owned())
+		{
+			return Err(SubmoduleError::RecoveryRequired(format!(
+				"superproject branch changed while selecting remote target for '{}'",
+				entry.declaration.name
+			)));
 		}
 		Ok(())
 	}
@@ -2916,6 +3249,76 @@ fn configured_update_strategy(
 	}
 }
 
+async fn configured_update_target<F: FileStore, H: HashAlgorithm>(
+	request: &UpdateRequest,
+	config: &GitConfig,
+	declaration: &SubmoduleDeclaration,
+	recorded: ObjectId<H>,
+	repository: &Repository<F, H>,
+) -> Result<(SubmoduleUpdateTarget, Option<String>), SubmoduleError> {
+	if !request.remote {
+		return Ok((
+			SubmoduleUpdateTarget::Gitlink(SubmoduleObjectId::from_typed(recorded)),
+			None,
+		));
+	}
+	let configured = match config.get_raw("submodule", Some(&declaration.name), "branch") {
+		Some(Some(branch)) if !branch.is_empty() => Some(branch.to_owned()),
+		Some(_) => {
+			return Err(SubmoduleError::MissingValue(format!(
+				"submodule.{}.branch",
+				declaration.name
+			)));
+		}
+		None => declaration.branch.clone(),
+	};
+	let Some(branch) = configured else {
+		return Ok((SubmoduleUpdateTarget::RemoteHead, None));
+	};
+	if branch != "." {
+		validate_ref_fragment(&branch, "submodule branch")?;
+		return Ok((SubmoduleUpdateTarget::RemoteBranch(branch), None));
+	}
+	let HeadState::Symbolic(symbolic) = repository.refs().read_head().await? else {
+		return Err(SubmoduleError::DetachedSuperproject(
+			declaration.name.clone(),
+		));
+	};
+	let branch = symbolic
+		.strip_prefix("refs/heads/")
+		.ok_or_else(|| SubmoduleError::DetachedSuperproject(declaration.name.clone()))?;
+	validate_ref_fragment(branch, "superproject branch")?;
+	Ok((
+		SubmoduleUpdateTarget::RemoteBranch(branch.to_owned()),
+		Some(symbolic),
+	))
+}
+
+fn validate_ref_fragment(value: &str, kind: &str) -> Result<(), SubmoduleError> {
+	let invalid = value.is_empty()
+		|| value.starts_with('/')
+		|| value.ends_with('/')
+		|| value.ends_with('.')
+		|| value.contains("..")
+		|| value.contains("@{")
+		|| value.contains("//")
+		|| value
+			.split('/')
+			.any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+		|| value.bytes().any(|byte| {
+			byte <= b' '
+				|| byte == 0x7f
+				|| matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+		});
+	if invalid {
+		return Err(SubmoduleError::Transfer(format!(
+			"invalid {kind} '{value}'"
+		)));
+	}
+	Ok(())
+}
+
+#[cfg(test)]
 fn module_origin_url(
 	config: &gitana_config::GitConfig,
 	module: &str,
@@ -2923,6 +3326,122 @@ fn module_origin_url(
 	crate::remote_url::first_fetch_url(config, "origin")?
 		.map(str::to_owned)
 		.ok_or_else(|| SubmoduleError::MissingModuleOrigin(module.to_owned()))
+}
+
+async fn module_update_remote<F: FileStore, H: HashAlgorithm>(
+	repository: &Repository<F, H>,
+	config: &GitConfig,
+) -> Result<String, SubmoduleError> {
+	let HeadState::Symbolic(head) = repository.refs().read_head().await? else {
+		return Ok("origin".to_owned());
+	};
+	let Some(branch) = head.strip_prefix("refs/heads/") else {
+		return Ok("origin".to_owned());
+	};
+	let remote = match config.get_raw("branch", Some(branch), "remote") {
+		Some(Some(remote)) if !remote.is_empty() => remote.to_owned(),
+		Some(_) => {
+			return Err(SubmoduleError::MissingValue(format!(
+				"branch.{branch}.remote"
+			)));
+		}
+		None => "origin".to_owned(),
+	};
+	if remote != "." {
+		gitana_remote::validate_remote_name(&remote)
+			.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
+	}
+	Ok(remote)
+}
+
+fn module_remote_url(
+	config: &GitConfig,
+	module: &str,
+	remote: &str,
+) -> Result<String, SubmoduleError> {
+	if remote == "." {
+		return Ok(".".to_owned());
+	}
+	crate::remote_url::first_fetch_url(config, remote)?
+		.map(str::to_owned)
+		.ok_or_else(|| SubmoduleError::MissingModuleRemote {
+			name: module.to_owned(),
+			remote: remote.to_owned(),
+		})
+}
+
+async fn resolve_local_update_target<F: FileStore, H: HashAlgorithm>(
+	repository: &Repository<F, H>,
+	target: &SubmoduleUpdateTarget,
+	remote: &str,
+	module: &str,
+) -> Result<ObjectId<H>, SubmoduleError> {
+	let (name, oid) = match target {
+		SubmoduleUpdateTarget::Gitlink(oid) => {
+			return typed_update_oid::<H>(oid);
+		}
+		SubmoduleUpdateTarget::RemoteHead if remote == "." => {
+			("HEAD".to_owned(), repository.refs().resolve_head().await?)
+		}
+		SubmoduleUpdateTarget::RemoteHead => {
+			let name = format!("refs/remotes/{remote}/HEAD");
+			let oid = repository.refs().resolve_symbolic_exact(&name).await?;
+			(name, oid)
+		}
+		SubmoduleUpdateTarget::RemoteBranch(branch) if remote == "." => {
+			let name = format!("refs/heads/{branch}");
+			let oid = repository.refs().resolve_symbolic_exact(&name).await?;
+			(name, oid)
+		}
+		SubmoduleUpdateTarget::RemoteBranch(branch) => {
+			let source = format!("refs/heads/{branch}");
+			let config = repository.effective_config().await?;
+			let name = gitana_remote::effective_fetch_destination(&config, remote, &source)
+				.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
+			let remote_head = format!("refs/remotes/{remote}/HEAD");
+			if name.is_none()
+				&& gitana_remote::effective_fetch_refspecs(&config, remote)
+					.map_err(|error| SubmoduleError::Transfer(error.to_string()))?
+					.iter()
+					.any(|spec| {
+						spec.exact_source().is_none()
+							&& spec.destination(&source).as_deref() == Some(remote_head.as_str())
+					}) {
+				return Err(SubmoduleError::Transfer(format!(
+					"remote '{remote}' branch '{branch}' maps to reserved remote HEAD ref '{remote_head}'"
+				)));
+			}
+			let name = name.ok_or_else(|| SubmoduleError::MissingUpdateTarget {
+				name: module.to_owned(),
+				target: source,
+			})?;
+			if name == remote_head {
+				return Err(SubmoduleError::Transfer(format!(
+					"remote '{remote}' branch '{branch}' maps to reserved remote HEAD ref '{remote_head}'"
+				)));
+			}
+			let oid = repository.refs().resolve_symbolic_exact(&name).await?;
+			(name, oid)
+		}
+	};
+	oid.ok_or_else(|| SubmoduleError::MissingUpdateTarget {
+		name: module.to_owned(),
+		target: name,
+	})
+}
+
+fn typed_update_oid<H: HashAlgorithm>(
+	oid: &SubmoduleObjectId,
+) -> Result<ObjectId<H>, SubmoduleError> {
+	oid.to_typed::<H>().ok_or_else(|| {
+		SubmoduleError::Transfer(
+			"submodule transfer returned a target for the wrong hash algorithm".to_owned(),
+		)
+	})
+}
+
+fn local_source_identity<H: HashAlgorithm>(remote: &str, target: ObjectId<H>) -> String {
+	format!("local-state:{remote}:{}", target.to_hex())
 }
 
 fn durability_roots<H: HashAlgorithm>(
@@ -2944,11 +3463,16 @@ fn durability_roots<H: HashAlgorithm>(
 	Ok(roots)
 }
 
-fn outcome<H: HashAlgorithm>(entry: &Planned<H>, state: UpdateOutcomeState) -> UpdateOutcome {
+fn outcome<H: HashAlgorithm>(
+	entry: &Planned<H>,
+	state: UpdateOutcomeState,
+	target: Option<ObjectId<H>>,
+) -> UpdateOutcome {
 	UpdateOutcome {
 		name: entry.declaration.name.clone(),
 		path: entry.declaration.path.clone(),
 		recorded: SubmoduleObjectId::from_typed(entry.recorded),
+		target: target.map(SubmoduleObjectId::from_typed),
 		state,
 	}
 }
@@ -2967,33 +3491,48 @@ fn legacy_source_fingerprint(source: &str) -> String {
 
 fn stage_intent<H: HashAlgorithm>(
 	entry: &Planned<H>,
+	target: ObjectId<H>,
 	source: &str,
 	source_context: IntentSourceContext,
+	remote: Option<&str>,
 ) -> StageIntent {
 	StageIntent {
-		version: 4,
+		version: 5,
 		name: entry.declaration.name.clone(),
 		path: entry.declaration.path.clone(),
-		recorded: entry.recorded.to_hex(),
+		recorded: String::new(),
+		gitlink: Some(entry.recorded.to_hex()),
+		target: Some(target.to_hex()),
+		remote: remote.map(str::to_owned),
 		source_fingerprint: source_fingerprint(source),
 		source_context: Some(source_context),
+		record_remote_head: entry.record_remote_head,
 	}
 }
 
 fn intent_matches_reprepare(previous: &StageIntent, current: &StageIntent) -> bool {
 	intent_source_context(previous) == Some(IntentSourceContext::Superproject)
-		&& current.version == 4
+		&& current.version == 5
 		&& current.source_context == Some(IntentSourceContext::Superproject)
 		&& previous.name == current.name
 		&& previous.path == current.path
-		&& previous.recorded == current.recorded
+		&& intent_gitlink(previous) == intent_gitlink(current)
+		&& intent_target(previous) == intent_target(current)
+		&& previous.remote == current.remote
+		&& previous.record_remote_head == current.record_remote_head
 		&& previous.source_fingerprint == current.source_fingerprint
 }
 
 fn intent_source_context(intent: &StageIntent) -> Option<IntentSourceContext> {
 	match intent.version {
 		1..=3 if intent.source_context.is_none() => Some(IntentSourceContext::Superproject),
-		4 => intent.source_context,
+		4 => match intent.source_context {
+			Some(IntentSourceContext::Superproject | IntentSourceContext::Module) => {
+				intent.source_context
+			}
+			_ => None,
+		},
+		5 => intent.source_context,
 		_ => None,
 	}
 }
@@ -3006,7 +3545,7 @@ fn intent_matches_source(
 ) -> bool {
 	let resolved = source_fingerprint(resolved);
 	match intent.version {
-		4 => intent.source_context == Some(source_context) && resolved == intent.source_fingerprint,
+		4 | 5 => intent.source_context == Some(source_context) && resolved == intent.source_fingerprint,
 		3 if source_context == IntentSourceContext::Superproject && intent.source_context.is_none() => {
 			resolved == intent.source_fingerprint
 		}
@@ -3021,6 +3560,22 @@ fn intent_matches_source(
 				&& legacy == intent.source_fingerprint
 		}
 		_ => false,
+	}
+}
+
+fn intent_gitlink(intent: &StageIntent) -> Option<&str> {
+	match intent.version {
+		1..=4 if !intent.recorded.is_empty() => Some(&intent.recorded),
+		5 => intent.gitlink.as_deref(),
+		_ => None,
+	}
+}
+
+fn intent_target(intent: &StageIntent) -> Option<&str> {
+	match intent.version {
+		1..=4 if !intent.recorded.is_empty() => Some(&intent.recorded),
+		5 => intent.target.as_deref(),
+		_ => None,
 	}
 }
 
@@ -3224,11 +3779,11 @@ mod tests {
 		CONTROL_DIR, DirectoryNamespace, INTENT_NAME, IntentSourceContext, MarkerSnapshot, Planned,
 		SHARED_CONFIG_LOCK, StageIntent, UPDATE_LOCK, acquire_submodule_config_mutation_lease,
 		acquire_submodule_config_setup_lease, acquire_update_lock_with_common,
-		ensure_directory_components, intent_matches_reprepare, intent_matches_source,
-		intent_source_context, legacy_source_fingerprint, marker_identity, module_origin_url,
-		publish_new_mount_marker, publish_stage_intent, recommended_clone_depth,
-		remove_staged_repository, rename_directory_noreplace, source_fingerprint,
-		sync_repository_publication_parents, update_effective_config,
+		ensure_directory_components, intent_gitlink, intent_matches_reprepare, intent_matches_source,
+		intent_source_context, intent_target, legacy_source_fingerprint, marker_identity,
+		module_origin_url, publish_new_mount_marker, publish_stage_intent, recommended_clone_depth,
+		remove_staged_repository, rename_directory_noreplace, source_fingerprint, stage_intent,
+		sync_repository_publication_parents, update_effective_config, validate_ref_fragment,
 	};
 	use crate::{
 		ConfigViews, ConfigurationProvider, InitConfigResult, InitConfigUpdate, MarkerTargetResolver,
@@ -3245,9 +3800,17 @@ mod tests {
 			version,
 			name: "one".to_owned(),
 			path: "modules/one".to_owned(),
-			recorded: "00".to_owned(),
+			recorded: if version < 5 {
+				"00".to_owned()
+			} else {
+				String::new()
+			},
+			gitlink: (version == 5).then(|| "00".to_owned()),
+			target: (version == 5).then(|| "00".to_owned()),
+			remote: None,
 			source_fingerprint,
-			source_context: (version == 4).then_some(IntentSourceContext::Superproject),
+			source_context: matches!(version, 4 | 5).then_some(IntentSourceContext::Superproject),
+			record_remote_head: false,
 		}
 	}
 
@@ -3264,6 +3827,16 @@ mod tests {
 			"ssh://alice:different@host/repository",
 			"ssh://alice@host/repository",
 		));
+	}
+
+	#[test]
+	fn remote_branch_components_must_not_start_with_a_dot() {
+		for branch in [".topic", "foo/.topic"] {
+			assert!(validate_ref_fragment(branch, "submodule branch").is_err());
+		}
+		for branch in ["topic.v1", "foo/topic.bar"] {
+			assert!(validate_ref_fragment(branch, "submodule branch").is_ok());
+		}
 	}
 
 	#[test]
@@ -3344,10 +3917,10 @@ mod tests {
 	}
 
 	#[test]
-	fn legacy_recovery_reprepare_matches_semantic_identity_and_upgrades_to_v4() {
+	fn legacy_recovery_reprepare_matches_semantic_identity_and_upgrades_to_v5() {
 		let fingerprint = source_fingerprint("https://host/repository");
 		let legacy = intent(1, fingerprint.clone());
-		let current = intent(4, fingerprint);
+		let current = intent(5, fingerprint);
 		assert!(intent_matches_reprepare(&legacy, &current));
 
 		let mut wrong_path = legacy.clone();
@@ -3357,9 +3930,24 @@ mod tests {
 		module.source_context = Some(IntentSourceContext::Module);
 		assert!(!intent_matches_reprepare(&module, &current));
 		assert!(!intent_matches_reprepare(
-			&intent(5, current.source_fingerprint.clone()),
+			&intent(6, current.source_fingerprint.clone()),
 			&current
 		));
+	}
+
+	#[test]
+	fn v5_recovery_keeps_gitlink_and_selected_target_distinct() {
+		let mut current = intent(5, source_fingerprint("https://host/repository"));
+		current.gitlink = Some("11".repeat(32));
+		current.target = Some("22".repeat(32));
+		assert_eq!(intent_gitlink(&current), current.gitlink.as_deref());
+		assert_eq!(intent_target(&current), current.target.as_deref());
+
+		let mut changed = current.clone();
+		changed.target = Some("33".repeat(32));
+		assert!(!intent_matches_reprepare(&current, &changed));
+		let legacy = intent(4, current.source_fingerprint.clone());
+		assert_eq!(intent_gitlink(&legacy), intent_target(&legacy));
 	}
 
 	#[test]
@@ -3386,6 +3974,36 @@ mod tests {
 		let mut missing = superproject;
 		missing.source_context = None;
 		assert_eq!(intent_source_context(&missing), None);
+
+		let mut local = intent(4, source_fingerprint(endpoint));
+		local.source_context = Some(IntentSourceContext::ModuleLocal);
+		assert_eq!(intent_source_context(&local), None);
+		local.version = 5;
+		assert_eq!(
+			intent_source_context(&local),
+			Some(IntentSourceContext::ModuleLocal)
+		);
+	}
+
+	#[test]
+	fn stage_intent_does_not_infer_context_from_the_source_spelling() {
+		let (_temporary, _context, entry) = mount_fixture("explicit-source-context");
+		let remote = stage_intent(
+			&entry,
+			entry.recorded,
+			"local-state:origin:attacker-controlled",
+			IntentSourceContext::Module,
+			Some("origin"),
+		);
+		assert_eq!(remote.source_context, Some(IntentSourceContext::Module));
+		let local = stage_intent(
+			&entry,
+			entry.recorded,
+			"ordinary-looking-source",
+			IntentSourceContext::ModuleLocal,
+			Some("origin"),
+		);
+		assert_eq!(local.source_context, Some(IntentSourceContext::ModuleLocal));
 	}
 
 	#[test]
@@ -3839,8 +4457,10 @@ mod tests {
 					&entry,
 					&mount_plan,
 					&module_directory,
+					entry.recorded,
 					true,
 					(&configuration, &mutation_lease),
+					None,
 					None,
 				)
 				.await,
@@ -3886,8 +4506,10 @@ mod tests {
 					&entry,
 					&mount_plan,
 					&module_directory,
+					entry.recorded,
 					false,
 					(&configuration, &mutation_lease),
+					None,
 					None,
 				)
 				.await,
@@ -4494,15 +5116,21 @@ mod tests {
 			shallow: None,
 		};
 		let pointers = context.module_pointers(&declaration).unwrap();
+		let recorded = ObjectId::from_hex(&"0".repeat(64)).unwrap();
 		let entry = Planned {
 			declaration,
-			recorded: ObjectId::from_hex(&"0".repeat(64)).unwrap(),
+			recorded,
+			target: crate::SubmoduleUpdateTarget::Gitlink(crate::SubmoduleObjectId::from_typed(recorded)),
+			recovery_target: None,
+			record_remote_head: false,
+			superproject_branch: None,
 			source_url: Some("source".to_owned()),
 			state: None,
 			recovering: false,
 			intent_identity: None,
 			module_config_lease: None,
 			depth: None,
+			fetch: true,
 			clone_depth: None,
 			pointers,
 		};

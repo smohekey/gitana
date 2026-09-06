@@ -27,6 +27,7 @@ mod pack_stream;
 mod protocol_policy;
 mod push_refspec;
 mod refspec;
+mod remote_name;
 mod remote_url;
 #[cfg(feature = "reqwest-transport")]
 mod reqwest_transport;
@@ -57,7 +58,8 @@ pub use pack_fetcher::PackFetcher;
 pub use pack_stream::PackStream;
 pub use protocol_policy::{ProtocolContext, ProtocolFromUser, ProtocolPolicy};
 pub use push_refspec::PushRefspec;
-pub use refspec::Refspec;
+pub use refspec::{Refspec, effective_fetch_destination, effective_fetch_refspecs};
+pub use remote_name::validate_remote_name;
 pub use remote_url::RemoteUrl;
 #[cfg(feature = "reqwest-transport")]
 pub use reqwest_transport::ReqwestTransport;

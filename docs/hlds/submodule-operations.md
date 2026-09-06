@@ -92,8 +92,85 @@ checkout/publication reports success. A shallow root clone does not implicitly m
 shallow, and `--shallow-submodules` without recursion has no effect. Clone
 `--no-shallow-submodules` cancels the global depth-one force but continues to honor true per-module
 recommendations; repeated positive and negative forms follow last-occurrence ordering. Clone-time
-jobs, shallow since/exclude propagation, and remote-branch submodule updates remain unsupported.
+jobs and shallow since/exclude propagation remain unsupported.
 Failures before root publication retain the ordinary clone cleanup contract.
+
+`submodule update --remote` separates the superproject gitlink from the commit selected for checkout.
+The effective superproject-local `submodule.<name>.branch` overrides `.gitmodules`; an absent value
+selects the module remote's advertised HEAD, a named value selects that branch, and `.` substitutes
+the current superproject branch after refusing a detached HEAD. The symbolic superproject HEAD is
+revalidated after transfer and immediately before publication. For an existing module, the remote is
+the current module branch's effective `branch.<name>.remote`, defaulting to `origin`; the local `.`
+remote selects the module's own refs without transport. Named remotes use their own URL, tag policy,
+and fetch refspecs. A hidden `HEAD` pseudo-ref still selects the OID of its advertised symbolic target;
+an explicit advertised `HEAD` remains authoritative when both are present. Checkout remains detached,
+and merge, rebase, custom-command, and `set-branch` forms remain out of scope.
+
+A rejected non-fast-forward remote-tracking update fails the submodule update before checkout. Any
+objects and unrelated refs already fetched may remain, but the module HEAD and worktree are not
+published at the rejected target. Clone constructs its destination `origin` tracking namespace from
+the source's advertised branch tips and does not import the source repository's own `refs/remotes`
+namespace. Full clone also excludes those source tracking tips from negotiation, so history reachable
+only from refs the clone will discard is not downloaded. If the advertised symbolic HEAD points into
+that filtered namespace, clone still requests its advertised object and checks it out with a detached
+HEAD. Every wildcard import reserves `refs/remotes/origin/HEAD` for the convenience ref, regardless of
+which source spelling produces that destination; an explicit exact refspec may still map a source to a
+non-reserved destination. A reserved wildcard mapping does not shadow a later usable exact mapping in
+the configured refspec order. Fetch, shallow-root selection, tag auto-follow, and prune use the same rule,
+and prune never removes the convenience ref merely because no ordinary branch maps onto it. The
+`origin/HEAD` convenience symref is omitted when a legal
+tracking ref below `origin/HEAD/` makes the loose namespace unrepresentable; that conflict does not
+invalidate the clone or its actual branch tracking refs. It is likewise omitted when another tracking
+ref has a filesystem-equivalent spelling, such as `origin/head` on a case-insensitive filesystem;
+this check covers loose and packed names at the target and their ancestor or descendant namespaces.
+The advertised tracking branch takes precedence over the convenience ref.
+Clone requests the resolved advertised HEAD object even when the pseudo-ref is hidden and the symbolic
+target belongs to the filtered source tracking namespace; that source ref remains unpublished and the
+clone checks out the retained object detached. This applies to both full and shallow acquisition.
+
+After an accepted fetched-ref update and any exact-object fallback for remote-HEAD submodule mode,
+update reconstructs the named remote's `refs/remotes/<remote>/HEAD` from the advertisement and
+effective fetch refspecs. It is symbolic when a mapped tracking target contains the advertised
+object, and otherwise records the advertised HEAD object directly (including detached HEAD or an
+omitted symref capability). An advertised symbolic target that itself maps onto the reserved remote
+HEAD destination is likewise stored directly, because no separate tracking ref can represent it.
+An exact, non-excluded fetch refspec whose destination is `refs/remotes/<remote>/HEAD` owns that ref
+and suppresses convenience-ref repair, preserving the value written by the configured mapping; a
+matching negative refspec removes that ownership. As with Git's default ref updates, an exact
+destination that is already symbolic remains symbolic: the fetch resolves every destination before
+the first publication, then locks and revalidates each complete chain and advances its terminal
+referent with the captured pre-publication value as its CAS expectation. Distinct symbolic
+destinations that alias one terminal therefore cannot silently apply successive sources: the first
+accepted update remains, and the later conflicting update fails. A logged update appends the same
+resolved old/new entry to every followed symbolic ref and to the terminal ref; a no-op still logs the
+symbolic hops but retains the ordinary rule that suppresses the terminal direct-ref entry. All
+applicable reflog paths are preflighted under the chain locks before publication, and a symbolic hop
+that is also the split-HEAD subject receives only one entry.
+Initial `--init --remote` population applies the same direct fallback after exact-object acquisition
+when clone could not publish a normal symbolic convenience ref. This repairs repositories created before clone published the convenience
+ref and prevents a later `--remote --no-fetch` from selecting stale state. The optional publication
+preserves an empty-directory, malformed-file, loose-ancestor-ref, or descendant-ref conflict and
+leaves the fetched branch refs authoritative rather than failing after fetch. Remote names are validated as the middle
+components of this namespace, so names such as `backup.` remain valid even though a complete refname
+cannot end in a dot. Configured remote branch names follow Git refname component rules: in particular,
+an individual component may contain a dot but cannot begin with one.
+
+`-N`/`--no-fetch` applies to ordinary gitlink and remote updates. Existing repositories perform no
+authorization, URL lookup, or transport I/O: gitlink mode uses the recorded object already present,
+named remote branches resolve their source through the effective `remote.<name>.fetch` refspecs,
+remote-HEAD mode uses the exactly spelled repaired direct or symbolic convenience ref, and remote `.`
+uses the module's local ref. A retained module whose current branch selects remote `.` likewise needs
+no registered superproject URL for an ordinary fetching update; a missing registration still skips a
+named remote. Negative refspecs exclude the source, and an unmapped source has no implicit
+conventional fallback. Named local and remote-tracking branches require exact ref spelling, so a
+filesystem-equivalent case or normalization alias is treated as missing. A named branch whose effective destination is the reserved
+`refs/remotes/<remote>/HEAD` convenience ref is rejected; a literal branch named `HEAD` therefore
+requires a custom, non-reserved tracking destination. A missing local object or ref fails before
+mount, index, worktree, or HEAD publication. Both remote and fetch policy propagate to every
+recursive level.
+`clone --remote-submodules` applies remote selection only to the post-publication recursive update;
+`--no-remote-submodules` cancels it,
+last occurrence wins, and either flag without recursion has no effect.
 
 The implementation is split at an authority boundary. `gitana-submodule` owns declaration parsing,
 selection, state transitions, validation, reports, and recovery. It receives already-opened
@@ -150,7 +227,7 @@ completion intent is cleared. A foreign mount is rejected before `core.worktree`
 retained repository from
 `submodule deinit` is reusable, but its attachment first writes a durable completion intent and is
 forced through checkout even when the retained repository's `HEAD` already equals the
-superproject's recorded commit. An already completed same-commit mount remains untouched, preserving
+selected target. An already completed same-commit mount remains untouched, preserving
 user worktree deletions like Git.
 
 The mount directory is identity-pinned before any module transfer and reopened without following
@@ -310,7 +387,8 @@ dry-run pruning remain serialized read-only operations.
 
 A new module repository is acquired without a worktree in the fixed private staging directory
 `gitana-submodule-update/repository`. A versioned JSON intent records the module name, path, recorded
-object ID, a credential-free source fingerprint, and, in version 4, its source context. A new
+gitlink object ID, selected checkout target, a credential-free source fingerprint, and source
+context. Version 5 separates gitlink and target and records the selected module remote when needed. A new
 repository is `superproject`-scoped to the declaration endpoint; attachment of a retained repository
 is `module`-scoped to the effective module origin that was fetched. Both contexts fingerprint the
 selected endpoint after `insteadOf` rewriting and password removal, so rewrite changes and transport
@@ -329,9 +407,9 @@ symlink cannot make the recorded origin disagree with the repository that suppli
 Existing
 module fetches likewise use the already-open module directory and its effective configuration;
 ambient paths remain only diagnostic and relative-URL inputs. The prepared repository must use the
-superproject's hash format and contain the recorded commit before an atomic no-replace rename
+superproject's hash format and contain the selected target before an atomic no-replace rename
 publishes it at `modules/<name>`. A raced final entry is preserved and leaves the private stage
-recoverable. Before that rename, the recorded object graph (including its
+recoverable. Before that rename, the selected object graph (including its
 pack index when packed) and the repository's current initialization metadata are flushed. Creating
 the recovery directory is made durable by flushing both the intent directory and its per-worktree
 git-directory parent before publication begins. After the repository rename, both its destination
@@ -340,9 +418,11 @@ module parent and the source recovery directory are flushed before mount publica
 The intent remains durable until the mount checkout and detached `HEAD` publication both succeed.
 On retry:
 
-- an intent with neither a staged nor a published repository is durably cleared and prepared from
-  the current source, allowing correction of a URL rewrite, parse, or authorization failure that
-  happened before repository creation;
+- a legacy intent with neither a staged nor a published repository is durably cleared before its old
+  object is applied to the new plan, then prepared from the current gitlink or freshly selected remote
+  target and source; this allows correction of a target, URL rewrite, parse, or authorization failure
+  that happened before repository creation; a version 5 intent instead retains and reprepares its
+  already-selected exact target;
 - an unpublished staged repository with a matching intent is discarded and prepared again;
 - a published repository with a matching intent is reopened and forced through checkout/HEAD
   completion without contacting its transport; its already-durable recorded object graph is
@@ -357,26 +437,45 @@ replacement is preserved and reported as recovery-required. After the active nam
 exact recovery directory is retired under a private name rather than recursively deleting its Unix
 quarantines; the ordinary `gitana-submodule-update` name is absent for the next operation.
 
-Versions 1 through 3 remain readable with their original superproject-scoped interpretation.
-Version 1 and 2 intents remain readable only when their legacy fingerprint agrees with both the raw
+Versions 1 through 4 remain readable with their original recorded-object interpretation: their one
+object ID supplies both the gitlink and exact recovery target. Versions 1 through 3 retain their
+original superproject-scoped interpretation. Version 1 and 2 intents remain readable only when their
+legacy fingerprint agrees with both the raw
 configured source and the currently resolved endpoint. This preserves direct-source recovery while
 failing closed for a legacy alias whose selected rewrite cannot be proven. When an accepted legacy
 intent must reprepare an unpublished repository, its semantic identity is matched against the new
-version 4 superproject intent and atomically upgraded before transfer; the serialized version alone
+version 5 superproject intent and atomically upgraded before transfer; the serialized version alone
 cannot leave a supported recovery state permanently blocked. A version 4 module-scoped intent is
 valid only for a published retained repository. Recovery loads that pinned repository's effective
 configuration and resolves its module origin from the module worktree base; a changed module origin
 fails closed, while an unrelated superproject URL change cannot rebind or block the retained source.
 
+For a version 5 remote update, target selection completes before intent publication. Recovery always
+uses that exact target even if the configured branch or remote HEAD advances. This guarantee covers
+only the in-flight module; modules not yet started by a failed recursive invocation require a retry
+that repeats `--remote`. A recursive retry does not run the recovered owner through its normal remote
+pass again in the same invocation, but it does descend through the recovered checkout so unfinished
+children still receive the requested recursive policy. The intent also records whether the exact target was selected as remote HEAD,
+so interrupted initial population accepts a newly prepared symbolic convenience ref only when it
+resolves to the pinned target, and otherwise records the pinned target directly for a later no-fetch
+retry. Older version 1 through 4 intents become exact before current remote-policy
+validation only when their staged or published repository still exists; an empty legacy intent is
+abandoned and the current invocation reselects normally. Version 4 accepts only its historical
+superproject and module source contexts; the URL-free module-local context is version 5 only. A
+module-local no-fetch attachment uses a URL-free source context derived
+from its selected remote and exact target, so recovery never invents a transport dependency.
+The caller records this context explicitly; source text is opaque and cannot select the local
+recovery policy by imitating its diagnostic spelling.
+
 Outside published-repository recovery, existing repositories perform a normal advertised-ref fetch
-first. If the recorded commit is still absent, the frontend requests that exact object ID without
+first. If the selected commit is still absent, the frontend requests that exact object ID without
 changing refs. Checkout uses a three-way worktree update for an existing module, preserving dirty
 files and leaving `HEAD` unchanged when a conflict prevents the move. Before changing the index or
 worktree, update retains `HEAD.lock` while preparing the detached-HEAD publication: it validates the
 HEAD namespace, effective reflog policy, and reflog destination and snapshots the old value and
 prospective reflog. The prepared capability
 is consumed only after checkout, so a deterministic HEAD/reflog rejection cannot leave the files at
-the recorded commit while `HEAD` still names the old commit. Merge, cherry-pick, revert, and rebase
+the selected target while `HEAD` still names the old commit. Merge, cherry-pick, revert, and rebase
 state also block a move.
 An ordinary mounted repository with an unborn or missing `HEAD` has no valid three-way base and is
 refused without changing its config, marker, index, worktree, or `HEAD`; forced checkout remains
@@ -711,7 +810,7 @@ client's offered-have closure already reaches a source boundary without crossing
 the source still stops its pack walk there but does not tell that client to persist a shallow marker.
 An exact-object want is subject to the same rule: a commit retained below the source boundary is
 rejected unless another advertised ref exposes it within the source's visible history. Complete
-non-shallow sources retain the exact-object fallback for unadvertised recorded commits. Only boundary
+non-shallow sources retain the exact-object fallback for unadvertised selected commits. Only boundary
 commits reachable from the requested wants are advertised to the client. In protocol v0 the boundary
 constrains readiness and pack construction without completing negotiation: ordinary rounds without
 `done` still return `multi_ack_detailed` acknowledgements and never a pack.

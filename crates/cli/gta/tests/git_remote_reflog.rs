@@ -377,6 +377,130 @@ async fn fetch_reflog_matches_git() {
 	);
 }
 
+/// An exact fetch destination that is already symbolic remains symbolic, while the requested ref,
+/// every intermediate alias, and the terminal ref all receive Git's fetch reflog entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_symbolic_fetch_destination_reflogs_match_git() {
+	if skip() {
+		return;
+	}
+	let root = tmp("symbolic-fetch-reflog");
+	build_bare(&root);
+	let base = serve_git_http_backend(root.clone()).await;
+	let repo_url = format!("{base}/repo.git");
+
+	let git_co = root.join("git-clone");
+	let gta_co = root.join("gta-clone");
+	ok(
+		&git_client(
+			vec![
+				"clone".into(),
+				"-q".into(),
+				repo_url.clone(),
+				git_co.to_str().unwrap().into(),
+			],
+			vec![],
+		)
+		.await,
+		"git clone",
+	);
+	ok(
+		&gta_client(
+			vec!["clone".into(), repo_url, gta_co.to_str().unwrap().into()],
+			vec![],
+		)
+		.await,
+		"gta clone",
+	);
+	ok(
+		&gta_client(
+			vec!["-C".into(), gta_co.to_str().unwrap().into(), "fetch".into()],
+			vec![],
+		)
+		.await,
+		"gta initial fetch",
+	);
+
+	let refspec = "+refs/heads/main:refs/remotes/origin/HEAD";
+	for checkout in [&git_co, &gta_co] {
+		git(checkout, &["config", "--unset-all", "remote.origin.fetch"]);
+		git(
+			checkout,
+			&["config", "--add", "remote.origin.fetch", refspec],
+		);
+		git(
+			checkout,
+			&[
+				"symbolic-ref",
+				"refs/remotes/origin/alias",
+				"refs/remotes/origin/main",
+			],
+		);
+		git(
+			checkout,
+			&[
+				"symbolic-ref",
+				"refs/remotes/origin/HEAD",
+				"refs/remotes/origin/alias",
+			],
+		);
+	}
+
+	let work = root.join("work");
+	std::fs::write(work.join("a.txt"), b"hello\nsecond\n").unwrap();
+	git(&work, &["commit", "-qam", "second"]);
+	git(
+		&work,
+		&[
+			"push",
+			"-q",
+			root.join("repo.git").to_str().unwrap(),
+			"main",
+		],
+	);
+
+	ok(
+		&git_client(
+			vec!["-C".into(), git_co.to_str().unwrap().into(), "fetch".into()],
+			vec![],
+		)
+		.await,
+		"git symbolic fetch",
+	);
+	ok(
+		&gta_client(
+			vec!["-C".into(), gta_co.to_str().unwrap().into(), "fetch".into()],
+			vec![],
+		)
+		.await,
+		"gta symbolic fetch",
+	);
+
+	let git_dir = git_co.join(".git");
+	let gta_dir = gta_co.join(".git");
+	for name in [
+		"refs/remotes/origin/HEAD",
+		"refs/remotes/origin/alias",
+		"refs/remotes/origin/main",
+	] {
+		assert_eq!(
+			last_line(&gta_dir, name),
+			last_line(&git_dir, name),
+			"{name} symbolic fetch reflog"
+		);
+	}
+	for (name, target) in [
+		("HEAD", "refs/remotes/origin/alias"),
+		("alias", "refs/remotes/origin/main"),
+	] {
+		assert_eq!(
+			std::fs::read_to_string(gta_dir.join("refs/remotes/origin").join(name)).unwrap(),
+			format!("ref: {target}\n"),
+			"the {name} symbolic ref must be preserved"
+		);
+	}
+}
+
 /// A refspec that maps tags into a *logged*, non-`refs/tags/*` namespace
 /// (`refs/tags/*:refs/remotes/origin/tags/*`, deliberately *unforced*) reflogs each update, and the
 /// status word is git's, classified from the object: a blob-backed tag (no commit history) is

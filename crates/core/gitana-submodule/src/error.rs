@@ -51,6 +51,12 @@ pub enum SubmoduleError {
 	UnbornModuleHead(String),
 	#[error("existing submodule '{0}' has no remote.origin.url")]
 	MissingModuleOrigin(String),
+	#[error("submodule '{name}' has no URL for remote '{remote}'")]
+	MissingModuleRemote { name: String, remote: String },
+	#[error("submodule '{name}' has no locally available target for '{target}'")]
+	MissingUpdateTarget { name: String, target: String },
+	#[error("submodule '{0}' uses branch='.' but the superproject HEAD is detached")]
+	DetachedSuperproject(String),
 	#[error("submodule pointer path '{}' is not representable as UTF-8", .0.display())]
 	UnrepresentablePointerPath(PathBuf),
 	#[error("submodule update is already running for this worktree")]

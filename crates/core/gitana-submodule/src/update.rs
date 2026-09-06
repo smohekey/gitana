@@ -11,6 +11,10 @@ pub struct UpdateRequest {
 	pub depth: Option<u32>,
 	/// Honor `.gitmodules` shallow recommendations when creating module repositories.
 	pub recommend_shallow: bool,
+	/// Select the tip of each module's configured remote branch instead of the gitlink commit.
+	pub remote: bool,
+	/// Permit network fetches. When false, target selection uses only existing local objects and refs.
+	pub fetch: bool,
 	/// Force initialization to modules that are already active in the serialized effective
 	/// configuration. Recursive clone enables this for an explicit root selector so command/global
 	/// exclusions are not overwritten by ordinary per-module activation. A no-path initialization
@@ -27,6 +31,8 @@ impl Default for UpdateRequest {
 			initialize: false,
 			depth: None,
 			recommend_shallow: true,
+			remote: false,
+			fetch: true,
 			initialize_only_active: false,
 			reflog_committer: None,
 		}
@@ -50,6 +56,8 @@ pub struct UpdateOutcome {
 	pub name: String,
 	pub path: String,
 	pub recorded: SubmoduleObjectId,
+	/// The commit selected for checkout. Skipped modules have no selected target.
+	pub target: Option<SubmoduleObjectId>,
 	pub state: UpdateOutcomeState,
 }
 

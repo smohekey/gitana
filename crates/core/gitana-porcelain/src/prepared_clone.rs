@@ -6,4 +6,6 @@ pub struct PreparedClone<H: HashAlgorithm> {
 	pub head: Option<ObjectId<H>>,
 	/// Object-graph roots requested while populating the repository.
 	pub fetched_roots: Vec<ObjectId<H>>,
+	/// Whether clone published the `origin/HEAD` convenience ref.
+	pub remote_head_published: bool,
 }

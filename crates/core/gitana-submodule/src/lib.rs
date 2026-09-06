@@ -31,6 +31,8 @@ mod transfer;
 mod update;
 #[cfg(not(target_arch = "wasm32"))]
 mod update_operation;
+#[cfg(not(target_arch = "wasm32"))]
+mod update_target;
 
 pub(crate) use self::config_identity::ConfigIdentity;
 pub use self::deinit::{
@@ -73,3 +75,5 @@ pub use update_operation::{
 	acquire_submodule_config_mutation_lease, acquire_submodule_config_setup_lease,
 	repository_has_pending_update, try_acquire_submodule_config_setup_lease,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use update_target::SubmoduleUpdateTarget;
