@@ -3271,6 +3271,22 @@ fn pending_deinit_recovery_blocks_mutations_but_not_status() {
 	);
 	assert!(stderr(&update).contains("must be completed with 'gta submodule deinit'"));
 
+	let modules_before = std::fs::read(fixture.consumer.join(".gitmodules")).unwrap();
+	let set_branch = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "set-branch", "--branch=main", "modules/one"],
+	);
+	assert!(
+		!set_branch.status.success(),
+		"set-branch must not bypass deinit recovery"
+	);
+	assert!(stderr(&set_branch).contains("must be completed with 'gta submodule deinit'"));
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".gitmodules")).unwrap(),
+		modules_before
+	);
+
 	let status = gta(&fixture.consumer, false, &["submodule", "status"]);
 	assert_success(&status, "read-only status during recovery");
 	assert_eq!(stdout(&status), format!("-{} modules/one\n", fixture.old));
@@ -10056,6 +10072,152 @@ fn update_init_rejects_a_non_utf8_pointer_before_any_mutation() {
 	assert!(!git_dir.join("modules/one").exists());
 	assert!(!git_dir.join("gitana-submodule-update").exists());
 	assert!(!fixture.consumer.join("modules/one/.git").exists());
+}
+
+#[test]
+fn set_branch_edits_an_exact_root_mapping_without_a_gitlink_or_staging() {
+	let root = unique_tmp("set-branch-exact");
+	init_repository(&root, None);
+	let modules = root.join(".gitmodules");
+	std::fs::write(
+		&modules,
+		"# preserved\n[submodule \"one\"]\n\tpath = modules/one\n\turl = ../source\n\tbranch = old # keep\n",
+	)
+	.unwrap();
+	let nested = root.join("nested");
+	std::fs::create_dir(&nested).unwrap();
+
+	let set = gta(
+		&nested,
+		false,
+		&[
+			"submodule",
+			"set-branch",
+			"-b",
+			"bad..name",
+			"--",
+			"modules/one",
+		],
+	);
+	assert_success(&set, "set branch from a subdirectory");
+	assert!(stdout(&set).is_empty());
+	assert!(stderr(&set).is_empty());
+	let text = std::fs::read_to_string(&modules).unwrap();
+	assert!(text.starts_with("# preserved\n"));
+	assert!(text.contains("branch = bad..name # keep"));
+	assert!(git(&root, &["diff", "--cached", "--name-only"]).is_empty());
+
+	let before_wrong_path = std::fs::read(&modules).unwrap();
+	let wrong_path = gta(
+		&nested,
+		false,
+		&["submodule", "set-branch", "--branch=main", "./modules/one"],
+	);
+	assert!(!wrong_path.status.success());
+	assert_eq!(std::fs::read(&modules).unwrap(), before_wrong_path);
+
+	let empty = gta(
+		&root,
+		false,
+		&["submodule", "set-branch", "--branch=", "modules/one"],
+	);
+	assert_success(&empty, "record an empty branch verbatim");
+	let configured = Command::new("git")
+		.args(["config", "-f"])
+		.arg(&modules)
+		.args(["--get", "submodule.one.branch"])
+		.output()
+		.unwrap();
+	assert!(configured.status.success());
+	assert_eq!(configured.stdout, b"\n");
+
+	let clear = gta(
+		&root,
+		false,
+		&["submodule", "set-branch", "-d", "modules/one"],
+	);
+	assert_success(&clear, "clear branch");
+	let before_noop = std::fs::read(&modules).unwrap();
+	#[cfg(unix)]
+	let before_noop_inode = {
+		use std::os::unix::fs::MetadataExt as _;
+		std::fs::metadata(&modules).unwrap().ino()
+	};
+	let already_default = gta(
+		&root,
+		false,
+		&["submodule", "set-branch", "--default", "modules/one"],
+	);
+	assert_eq!(already_default.status.code(), Some(1));
+	assert!(stdout(&already_default).is_empty());
+	assert!(stderr(&already_default).is_empty());
+	assert_eq!(std::fs::read(&modules).unwrap(), before_noop);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt as _;
+		assert_eq!(
+			std::fs::metadata(&modules).unwrap().ino(),
+			before_noop_inode
+		);
+	}
+
+	std::fs::write(
+		&modules,
+		"[submodule \"one\"]\n\tpath = modules/one\n\tbranch = main\n\tbranch = next\n",
+	)
+	.unwrap();
+	let before_multiple = std::fs::read(&modules).unwrap();
+	let multiple = gta(
+		&root,
+		false,
+		&["submodule", "set-branch", "--branch=other", "modules/one"],
+	);
+	assert!(!multiple.status.success());
+	assert_eq!(std::fs::read(&modules).unwrap(), before_multiple);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn set_branch_preserves_a_symlinked_gitmodules_file() {
+	use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+	let root = unique_tmp("set-branch-symlink");
+	init_repository(&root, None);
+	let metadata = root.join("metadata");
+	std::fs::create_dir(&metadata).unwrap();
+	let target = metadata.join("modules-config");
+	std::fs::write(
+		&target,
+		"[submodule \"one\"]\n\tpath = modules/one\n\turl = ../source\n",
+	)
+	.unwrap();
+	std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+	symlink("metadata/modules-config", root.join(".gitmodules")).unwrap();
+
+	let set = gta(
+		&root,
+		false,
+		&["submodule", "set-branch", "--branch", ".", "modules/one"],
+	);
+	assert_success(&set, "set branch through symlinked .gitmodules");
+	assert!(
+		std::fs::symlink_metadata(root.join(".gitmodules"))
+			.unwrap()
+			.file_type()
+			.is_symlink()
+	);
+	assert_eq!(
+		std::fs::read_link(root.join(".gitmodules")).unwrap(),
+		PathBuf::from("metadata/modules-config")
+	);
+	assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o640);
+	assert!(
+		std::fs::read_to_string(target)
+			.unwrap()
+			.contains("branch = .")
+	);
+	std::fs::remove_dir_all(root).unwrap();
 }
 
 struct Fixture {

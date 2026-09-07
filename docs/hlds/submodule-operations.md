@@ -3,7 +3,8 @@
 ## Scope
 
 Gitana implements the consumer commands `submodule status`, `submodule init`, `submodule update`,
-and `submodule deinit`. `status --recursive` and `update --recursive` explicitly recurse into nested
+`submodule deinit`, and `submodule set-branch`. `status --recursive` and `update --recursive`
+explicitly recurse into nested
 submodules; omitted flags remain one-level operations, and root pathspecs select only the first
 level before every eligible descendant is considered. `clone --recurse-submodules[=<pathspec>]`
 (also spelled `--recursive[=<pathspec>]`) publishes the root clone and then performs an initializing
@@ -104,7 +105,22 @@ the current module branch's effective `branch.<name>.remote`, defaulting to `ori
 remote selects the module's own refs without transport. Named remotes use their own URL, tag policy,
 and fetch refspecs. A hidden `HEAD` pseudo-ref still selects the OID of its advertised symbolic target;
 an explicit advertised `HEAD` remains authoritative when both are present. Checkout remains detached,
-and merge, rebase, custom-command, and `set-branch` forms remain out of scope.
+and merge, rebase, and custom-command forms remain out of scope.
+
+`submodule set-branch (-b|--branch <branch> | -d|--default) <path>` edits the declaration selected
+by an exact repository-root `.gitmodules` path. The path is not a pathspec and is not resolved from
+the caller's current directory; no index gitlink or initialized module repository is required. The
+declaration scan retains Gitana's fail-closed unsafe-name, unsafe-path, duplicate-path, and portable
+filesystem-alias checks. A branch value is recorded verbatim, including `.`, an empty value, or text
+that is not a valid ref name; `update --remote` remains the boundary that interprets and validates
+that policy. Multiple existing branch values are rejected without changing the file. `--default`
+removes the sole branch value, and when no value exists it returns Git's silent non-zero result.
+
+The edit is made through the symlink-aware native config transaction while holding the repository's
+recovery-aware config mutation lease. It therefore preserves the `.gitmodules` symlink and target
+mode, comments and unrelated text, retains serialization through a cancelled blocking worker, and
+publishes the replacement with the same identity and durability checks as other configuration
+writes. Pending deinit recovery rejects the mutation. The command does not stage `.gitmodules`.
 
 A rejected non-fast-forward remote-tracking update fails the submodule update before checkout. Any
 objects and unrelated refs already fetched may remain, but the module HEAD and worktree are not

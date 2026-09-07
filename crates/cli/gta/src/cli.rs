@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use gta_core::commands;
 
 /// Parse the command line and run the requested command.
@@ -592,6 +592,25 @@ enum SubmoduleAction {
 		)]
 		paths: Vec<String>,
 	},
+	/// Set or clear a submodule's remote-tracking branch in `.gitmodules`.
+	SetBranch {
+		#[command(flatten)]
+		mode: SetBranchMode,
+		/// Exact repository-root submodule path.
+		#[arg(value_name = "path")]
+		path: String,
+	},
+}
+
+#[derive(Args)]
+#[group(id = "set_branch_mode", required = true, multiple = false)]
+struct SetBranchMode {
+	/// Track this branch. The value is recorded verbatim for update-time validation.
+	#[arg(short = 'b', long, value_name = "branch")]
+	branch: Option<String>,
+	/// Remove the configured branch and use the remote's default branch.
+	#[arg(short = 'd', long)]
+	default: bool,
 }
 
 /// A `sparse-checkout` sub-command.
@@ -1147,6 +1166,10 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 			paths,
 		},
 		SubmoduleAction::Deinit { force, all, paths } => Action::Deinit { force, all, paths },
+		SubmoduleAction::SetBranch {
+			mode: SetBranchMode { branch, default: _ },
+			path,
+		} => Action::SetBranch { branch, path },
 	}
 }
 

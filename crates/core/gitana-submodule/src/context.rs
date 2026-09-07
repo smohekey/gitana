@@ -1,9 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
-use caseless::Caseless;
 use gitana_file_store_local::{CapWorkDir, LocalFileStore, WorkDirFs, WorktreeFileStore};
 use gitana_fs_native::{EntryIdentity, directory_identity};
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
@@ -11,12 +10,12 @@ use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
 use gitana_repository_layout::RepositoryLayout;
 use gitana_worktree::{PathspecSet, WorkTree};
-use unicode_normalization::UnicodeNormalization;
 
 use crate::{
 	ConfigViews, ConfigurationProvider, InitConfigResult, InitConfigUpdate, InitNotice, InitOutcome,
 	InitReport, InitRequest, MarkerTargetResolver, SubmoduleDeclaration, SubmoduleError,
-	SubmoduleObjectId, SubmoduleQuery, SubmoduleStatus, SubmoduleStatusState, resolve_relative_url,
+	SubmoduleObjectId, SubmoduleQuery, SubmoduleStatus, SubmoduleStatusState, declarations_by_path,
+	resolve_relative_url, validate_name, validate_path,
 };
 
 /// An explicit, capability-scoped superproject context.
@@ -717,64 +716,6 @@ pub(crate) fn parse_marker_target(marker: &str) -> Option<&str> {
 	(!target.is_empty()).then_some(target)
 }
 
-pub(crate) fn declarations_by_path(
-	declarations: Vec<SubmoduleDeclaration>,
-) -> Result<HashMap<String, SubmoduleDeclaration>, SubmoduleError> {
-	let mut by_path = HashMap::with_capacity(declarations.len());
-	let mut names: HashSet<String> = HashSet::new();
-	let mut paths: HashSet<String> = HashSet::new();
-	for declaration in declarations {
-		validate_name(&declaration.name)?;
-		validate_path(&declaration.path)?;
-		let path = declaration.path.clone();
-		if by_path.contains_key(&path) {
-			return Err(SubmoduleError::DuplicateMapping(path));
-		}
-		let name_key = filesystem_key(&declaration.name);
-		let path_key = filesystem_key(&declaration.path);
-		if names
-			.iter()
-			.any(|name| component_prefix_collision(name, &name_key))
-			|| paths
-				.iter()
-				.any(|path| component_prefix_collision(path, &path_key))
-		{
-			return Err(SubmoduleError::AmbiguousDeclaration(declaration.path));
-		}
-		names.insert(name_key);
-		paths.insert(path_key);
-		by_path.insert(path, declaration);
-	}
-	Ok(by_path)
-}
-
-/// A portable comparison key for path namespaces. Full Unicode case folding catches filesystem
-/// aliases that lowercasing alone misses (for example normal and final Greek sigma), while the NFD
-/// passes also collapse canonically equivalent spellings used by case-insensitive macOS filesystems.
-/// Reject these aliases even when the current filesystem is sensitive so a declaration cannot be
-/// moved to a less-sensitive filesystem and cross-wire module repositories.
-fn filesystem_key(value: &str) -> String {
-	value.chars().nfd().default_case_fold().nfd().collect()
-}
-
-fn component_prefix_collision(left: &str, right: &str) -> bool {
-	left == right
-		|| right
-			.strip_prefix(left)
-			.is_some_and(|remainder| remainder.starts_with('/'))
-		|| left
-			.strip_prefix(right)
-			.is_some_and(|remainder| remainder.starts_with('/'))
-}
-
-pub(crate) fn validate_name(name: &str) -> Result<(), SubmoduleError> {
-	if safe_relative(name) {
-		Ok(())
-	} else {
-		Err(SubmoduleError::UnsafeName(name.to_owned()))
-	}
-}
-
 pub(crate) fn validate_update_strategy(name: &str, strategy: &str) -> Result<(), SubmoduleError> {
 	if matches!(strategy, "checkout" | "none") {
 		Ok(())
@@ -821,85 +762,9 @@ pub(crate) fn should_initialize_only_active(
 		|| (query.pathspecs.is_empty() && !config.get_all_raw("submodule", None, "active").is_empty())
 }
 
-pub(crate) fn validate_path(path: &str) -> Result<(), SubmoduleError> {
-	if safe_relative(path) {
-		Ok(())
-	} else {
-		Err(SubmoduleError::UnsafePath(path.to_owned()))
-	}
-}
-
-fn safe_relative(value: &str) -> bool {
-	if value.is_empty() || value.starts_with('/') {
-		return false;
-	}
-	if cfg!(windows) && (value.contains('\\') || value.contains(':')) {
-		return false;
-	}
-	value.split('/').all(|component| {
-		!component.is_empty()
-			&& !matches!(component, "." | "..")
-			&& !is_ntfs_dot_git_alias(component)
-			&& !component.chars().any(char::is_control)
-	})
-}
-
-/// Match Git's `core.protectNTFS` spellings for the repository metadata directory. NTFS strips
-/// trailing spaces and dots, exposes `.git` as the 8.3 short name `git~1`, and treats a colon as an
-/// alternate-data-stream separator. Reject these aliases portably so a declaration cannot become
-/// unsafe merely by moving the repository to Windows.
-fn is_ntfs_dot_git_alias(component: &str) -> bool {
-	let bytes = component.as_bytes();
-	let remainder = if bytes
-		.get(..4)
-		.is_some_and(|prefix| prefix.eq_ignore_ascii_case(b".git"))
-	{
-		&bytes[4..]
-	} else if bytes
-		.get(..5)
-		.is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"git~1"))
-	{
-		&bytes[5..]
-	} else {
-		return false;
-	};
-
-	for byte in remainder {
-		if *byte == b':' {
-			return true;
-		}
-		if !matches!(*byte, b' ' | b'.') {
-			return false;
-		}
-	}
-	true
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn rejects_traversal_and_git_components() {
-		for value in [
-			"",
-			"../x",
-			"a/../x",
-			".git",
-			"a/.GIT/x",
-			"a//b",
-			".git ",
-			"a/.GiT.../x",
-			"git~1",
-			"a/GIT~1./x",
-			"a/.git  :stream/x",
-		] {
-			assert!(!safe_relative(value), "{value:?}");
-		}
-		for value in ["git~2", ".gitx", "a/agit~1/b", "a/.git x/b"] {
-			assert!(safe_relative(value), "{value:?}");
-		}
-	}
 
 	#[test]
 	fn marker_parser_removes_only_line_terminators() {

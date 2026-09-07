@@ -65,6 +65,7 @@ fn mcp_stdio_advertises_gta_tools() {
 		"worktree_add",
 		"submodule_status",
 		"submodule_deinit",
+		"submodule_set_branch",
 		"remote_set_url",
 	] {
 		assert!(
@@ -93,6 +94,23 @@ fn mcp_stdio_advertises_gta_tools() {
 		worktree_remove["inputSchema"]["properties"]["force"]["maximum"],
 		255
 	);
+	let set_branch = tools
+		.iter()
+		.find(|candidate| candidate["name"] == "submodule_set_branch")
+		.expect("submodule_set_branch tool");
+	let choices = set_branch["inputSchema"]["allOf"][0]["oneOf"]
+		.as_array()
+		.expect("set-branch exclusive choice schema");
+	assert_eq!(choices.len(), 2);
+	assert!(
+		choices
+			.iter()
+			.any(|choice| choice["required"] == serde_json::json!(["branch"]))
+	);
+	assert!(choices.iter().any(|choice| {
+		choice["required"] == serde_json::json!(["default"])
+			&& choice["properties"]["default"]["const"] == true
+	}));
 
 	let resources = reply(3)["result"]["resources"]
 		.as_array()

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use gta_core::commands;
 
 /// Drive one parsed command to completion on a fresh current-thread runtime.
@@ -642,6 +642,25 @@ enum SubmoduleAction {
 		#[arg(long = "path", conflicts_with = "all", required_unless_present = "all")]
 		paths: Vec<String>,
 	},
+	/// Set or clear a submodule's remote-tracking branch in `.gitmodules`.
+	SetBranch {
+		#[command(flatten)]
+		mode: SetBranchMode,
+		/// Exact repository-root submodule path.
+		#[arg(long = "path")]
+		path: String,
+	},
+}
+
+#[derive(Args)]
+#[group(id = "set_branch_mode", required = true, multiple = false)]
+struct SetBranchMode {
+	/// Track this branch. The value is recorded verbatim for update-time validation.
+	#[arg(short = 'b', long, value_name = "branch")]
+	branch: Option<String>,
+	/// Remove the configured branch and use the remote's default branch.
+	#[arg(short = 'd', long)]
+	default: bool,
 }
 
 /// A `sparse-checkout` sub-command.
@@ -1221,6 +1240,10 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 			paths,
 		},
 		SubmoduleAction::Deinit { force, all, paths } => Action::Deinit { force, all, paths },
+		SubmoduleAction::SetBranch {
+			mode: SetBranchMode { branch, default: _ },
+			path,
+		} => Action::SetBranch { branch, path },
 	}
 }
 
@@ -1403,5 +1426,61 @@ mod tests {
 			"--no-recommend-shallow",
 			"--recommend-shallow",
 		]));
+	}
+
+	#[test]
+	fn set_branch_maps_named_arguments_to_the_shared_action() {
+		let cli = Cli::try_parse_from([
+			"gta-mcp",
+			"submodule",
+			"set-branch",
+			"--branch=bad..name",
+			"--path=modules/one",
+		])
+		.unwrap();
+		let Command::Submodule { action } = cli.command else {
+			panic!("expected submodule command");
+		};
+		assert!(matches!(
+			submodule_action(action),
+			commands::submodule::Action::SetBranch {
+				branch: Some(branch),
+				path,
+			} if branch == "bad..name" && path == "modules/one"
+		));
+
+		let cli = Cli::try_parse_from([
+			"gta-mcp",
+			"submodule",
+			"set-branch",
+			"--default",
+			"--path=modules/one",
+		])
+		.unwrap();
+		let Command::Submodule { action } = cli.command else {
+			panic!("expected submodule command");
+		};
+		assert!(matches!(
+			submodule_action(action),
+			commands::submodule::Action::SetBranch {
+				branch: None,
+				path,
+			} if path == "modules/one"
+		));
+
+		assert!(
+			Cli::try_parse_from([
+				"gta-mcp",
+				"submodule",
+				"set-branch",
+				"--branch=main",
+				"--default",
+				"--path=modules/one",
+			])
+			.is_err()
+		);
+		assert!(
+			Cli::try_parse_from(["gta-mcp", "submodule", "set-branch", "--path=modules/one",]).is_err()
+		);
 	}
 }

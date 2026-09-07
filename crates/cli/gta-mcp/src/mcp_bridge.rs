@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use clap::CommandFactory;
-use clap_mcp::{ClapArg, ClapMcpConfig, ClapMcpSchemaMetadata, ClapSchema};
+use clap_mcp::{ClapArg, ClapArgGroup, ClapMcpConfig, ClapMcpSchemaMetadata, ClapSchema};
 use rmcp::model::{
 	CallToolRequestParams, CallToolResult, Content, Implementation, ListResourcesResult,
 	ListToolsResult, PaginatedRequestParams, RawResource, ReadResourceRequestParams,
@@ -32,6 +32,7 @@ const MAX_COUNT_ARGUMENT: u64 = u8::MAX as u64;
 struct ToolSpec {
 	path: Vec<String>,
 	args: Vec<ClapArg>,
+	arg_groups: Vec<ClapArgGroup>,
 	prefix_count: usize,
 }
 
@@ -83,6 +84,7 @@ impl GtaMcpServer {
 			.filter(|tool| specs.contains_key(tool.name.as_ref()))
 			.collect();
 		constrain_count_schemas(&mut tools, &specs);
+		constrain_required_exclusive_group_schemas(&mut tools, &specs);
 		Ok(Self {
 			tools: Arc::new(tools),
 			specs: Arc::new(specs),
@@ -368,6 +370,7 @@ fn collect_specs(
 					ToolSpec {
 						path: path[1..].to_vec(),
 						args: args.clone(),
+						arg_groups: schema.arg_groups.clone(),
 						prefix_count,
 					},
 				)
@@ -450,6 +453,36 @@ fn validate_arguments(
 		};
 		validate_argument(tool, arg, value)?;
 	}
+	validate_required_exclusive_groups(spec, arguments, tool)?;
+	Ok(())
+}
+
+fn validate_required_exclusive_groups(
+	spec: &ToolSpec,
+	arguments: &Map<String, Value>,
+	tool: &str,
+) -> Result<(), McpError> {
+	for group in spec
+		.arg_groups
+		.iter()
+		.filter(|group| group.required && !group.multiple)
+	{
+		let active = group
+			.args
+			.iter()
+			.filter_map(|id| spec.args.iter().find(|argument| argument.id == *id))
+			.filter(|argument| argument_is_active(argument, arguments.get(&argument.id)))
+			.count();
+		if active != 1 {
+			return Err(McpError::invalid_params(
+				format!(
+					"tool '{tool}' requires exactly one of arguments {}",
+					group.args.join(", ")
+				),
+				None,
+			));
+		}
+	}
 	Ok(())
 }
 
@@ -518,6 +551,79 @@ fn constrain_count_schemas(tools: &mut [Tool], specs: &HashMap<String, ToolSpec>
 	}
 }
 
+fn constrain_required_exclusive_group_schemas(
+	tools: &mut [Tool],
+	specs: &HashMap<String, ToolSpec>,
+) {
+	for tool in tools {
+		let Some(spec) = specs.get(tool.name.as_ref()) else {
+			continue;
+		};
+		let constraints: Vec<Value> = spec
+			.arg_groups
+			.iter()
+			.filter(|group| group.required && !group.multiple)
+			.filter_map(|group| {
+				let choices: Vec<Value> = group
+					.args
+					.iter()
+					.filter_map(|id| spec.args.iter().find(|argument| argument.id == *id))
+					.map(required_active_argument_schema)
+					.collect();
+				(!choices.is_empty()).then(|| {
+					let mut constraint = Map::new();
+					constraint.insert("oneOf".to_owned(), Value::Array(choices));
+					Value::Object(constraint)
+				})
+			})
+			.collect();
+		if constraints.is_empty() {
+			continue;
+		}
+		let schema = Arc::make_mut(&mut tool.input_schema);
+		let all_of = schema
+			.entry("allOf".to_owned())
+			.or_insert_with(|| Value::Array(Vec::new()));
+		let Some(all_of) = all_of.as_array_mut() else {
+			continue;
+		};
+		all_of.extend(constraints);
+	}
+}
+
+fn required_active_argument_schema(argument: &ClapArg) -> Value {
+	let mut schema = Map::new();
+	schema.insert(
+		"required".to_owned(),
+		Value::Array(vec![Value::String(argument.id.clone())]),
+	);
+	let mut property = Map::new();
+	match argument.action.as_deref().unwrap_or("Set") {
+		"SetTrue" => {
+			property.insert("const".to_owned(), Value::Bool(true));
+		}
+		"SetFalse" => {
+			property.insert("const".to_owned(), Value::Bool(false));
+		}
+		"Count" => {
+			property.insert("minimum".to_owned(), Value::from(1));
+		}
+		"Append" => {
+			property.insert("minItems".to_owned(), Value::from(1));
+		}
+		_ if argument_is_array(argument) => {
+			property.insert("minItems".to_owned(), Value::from(1));
+		}
+		_ => {}
+	}
+	if !property.is_empty() {
+		let mut properties = Map::new();
+		properties.insert(argument.id.clone(), Value::Object(property));
+		schema.insert("properties".to_owned(), Value::Object(properties));
+	}
+	Value::Object(schema)
+}
+
 fn validate_string_array(
 	tool: &str,
 	arg: &ClapArg,
@@ -578,6 +684,21 @@ fn argument_is_array(arg: &ClapArg) -> bool {
 		.num_args
 		.as_deref()
 		.is_some_and(|range| range.contains("..") && !range.contains("=1"))
+}
+
+fn argument_is_active(arg: &ClapArg, value: Option<&Value>) -> bool {
+	match arg.action.as_deref().unwrap_or("Set") {
+		"SetTrue" => value.and_then(Value::as_bool) == Some(true),
+		"SetFalse" => value.and_then(Value::as_bool) == Some(false),
+		"Count" => value.and_then(Value::as_u64).is_some_and(|count| count > 0),
+		"Append" => value
+			.and_then(Value::as_array)
+			.is_some_and(|values| !values.is_empty()),
+		_ if argument_is_array(arg) => value
+			.and_then(Value::as_array)
+			.is_some_and(|values| !values.is_empty()),
+		_ => value.is_some(),
+	}
 }
 
 fn argument_range(range: &str) -> Option<(usize, Option<usize>)> {
@@ -720,6 +841,7 @@ mod tests {
 		assert!(server.specs.contains_key("worktree_add"));
 		assert!(server.specs.contains_key("submodule_status"));
 		assert!(server.specs.contains_key("submodule_deinit"));
+		assert!(server.specs.contains_key("submodule_set_branch"));
 		assert!(server.specs.contains_key("remote_set_url"));
 		assert!(server.specs.contains_key("add"));
 		assert!(!server.specs.contains_key("status_2"));
@@ -748,6 +870,21 @@ mod tests {
 		assert_eq!(
 			build_argv(deinit, &arguments),
 			["submodule", "deinit", "--force", "--path=modules/one"]
+		);
+		let set_branch = server.specs.get("submodule_set_branch").unwrap();
+		let arguments = serde_json::from_value(serde_json::json!({
+			"branch": "bad..name",
+			"path": "modules/one"
+		}))
+		.unwrap();
+		assert_eq!(
+			build_argv(set_branch, &arguments),
+			[
+				"submodule",
+				"set-branch",
+				"--branch=bad..name",
+				"--path=modules/one"
+			]
 		);
 	}
 
@@ -793,6 +930,61 @@ mod tests {
 
 		let cat_file = server.specs.get("cat-file").unwrap();
 		assert!(validate_arguments(cat_file, &Map::new(), "cat-file").is_err());
+	}
+
+	#[test]
+	fn required_exclusive_groups_are_enforced_by_schema_and_runtime() {
+		let server = GtaMcpServer::new().expect("server schema");
+		let spec = server.specs.get("submodule_set_branch").unwrap();
+		assert!(spec.arg_groups.iter().any(|group| {
+			group.required && !group.multiple && group.args == ["branch".to_owned(), "default".to_owned()]
+		}));
+
+		for arguments in [
+			serde_json::json!({ "branch": "main", "path": "modules/one" }),
+			serde_json::json!({ "default": true, "path": "modules/one" }),
+			serde_json::json!({
+				"branch": "main",
+				"default": false,
+				"path": "modules/one"
+			}),
+		] {
+			let arguments = serde_json::from_value(arguments).unwrap();
+			validate_arguments(spec, &arguments, "submodule_set_branch").unwrap();
+		}
+		for arguments in [
+			serde_json::json!({ "path": "modules/one" }),
+			serde_json::json!({ "default": false, "path": "modules/one" }),
+			serde_json::json!({
+				"branch": "main",
+				"default": true,
+				"path": "modules/one"
+			}),
+		] {
+			let arguments = serde_json::from_value(arguments).unwrap();
+			assert!(validate_arguments(spec, &arguments, "submodule_set_branch").is_err());
+		}
+
+		let tool = server
+			.tools
+			.iter()
+			.find(|tool| tool.name.as_ref() == "submodule_set_branch")
+			.unwrap();
+		let all_of = tool.input_schema["allOf"].as_array().unwrap();
+		let choices = all_of
+			.iter()
+			.find_map(|constraint| constraint["oneOf"].as_array())
+			.unwrap();
+		assert_eq!(choices.len(), 2);
+		assert!(
+			choices
+				.iter()
+				.any(|choice| { choice["required"] == serde_json::json!(["branch"]) })
+		);
+		assert!(choices.iter().any(|choice| {
+			choice["required"] == serde_json::json!(["default"])
+				&& choice["properties"]["default"]["const"] == true
+		}));
 	}
 
 	#[test]

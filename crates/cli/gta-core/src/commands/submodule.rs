@@ -10,13 +10,13 @@ use cap_std::{ambient_authority, fs::Dir};
 use gitana_fs_native::{EntryIdentity, directory_identity};
 use gitana_submodule::{
 	ConfigViews, ConfigurationProvider, DeinitRequest, DeinitSelection, InitNotice, InitRequest,
-	SubmoduleContext, SubmoduleError, SubmoduleMutationLease, SubmoduleQuery, SubmoduleStatus,
-	SubmoduleStatusState, UpdateOutcomeState, UpdateReport, UpdateRequest,
+	SetBranchOutcome, SubmoduleContext, SubmoduleError, SubmoduleMutationLease, SubmoduleQuery,
+	SubmoduleStatus, SubmoduleStatusState, UpdateOutcomeState, UpdateReport, UpdateRequest,
 };
 
 use crate::submodule_configuration::WorktreeConfiguration;
 use crate::submodule_transfer::SubmoduleTransfer;
-use crate::{CommandContext, RepositoryLayoutIdentity, git_config, repo};
+use crate::{CommandContext, RepositoryLayoutIdentity, SilentExit, git_config, repo};
 
 pub enum Action {
 	Status {
@@ -39,6 +39,10 @@ pub enum Action {
 		force: bool,
 		all: bool,
 		paths: Vec<String>,
+	},
+	SetBranch {
+		branch: Option<String>,
+		path: String,
 	},
 }
 
@@ -63,6 +67,9 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 		.ok_or_else(|| anyhow!("submodule operations require a working tree"))?
 		.clone();
 	let identity = repo::capture_worktree_layout_identity(&layout)?;
+	if let Action::SetBranch { branch, path } = action {
+		return run_set_branch(&layout, identity, branch, path).await;
+	}
 	match &action {
 		Action::Status {
 			recursive: true,
@@ -112,6 +119,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 			recursive: false, ..
 		}
 		| Action::Deinit { .. } => {}
+		Action::SetBranch { .. } => unreachable!("set-branch returns before opening the root context"),
 	}
 	let (setup, common, git, work) = repo::command_setup_lease(&layout, identity).await?;
 	let work = work.ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?;
@@ -236,7 +244,41 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 		| Action::Update {
 			recursive: true, ..
 		} => unreachable!("recursive actions return before opening the root context"),
+		Action::SetBranch { .. } => unreachable!("set-branch returns before opening the root context"),
 	}
+	Ok(())
+}
+
+async fn run_set_branch(
+	layout: &repo::RepositoryLayout,
+	identity: RepositoryLayoutIdentity,
+	branch: Option<String>,
+	path: String,
+) -> Result<()> {
+	let (lease, common, git, work) = repo::command_config_mutation_lease(layout, identity).await?;
+	repo::ensure_no_pending_deinit_at(layout, &common, &git)?;
+	let work = work.ok_or_else(|| anyhow!("submodule operations require a working tree"))?;
+	let display_path = layout
+		.worktree_root
+		.as_ref()
+		.expect("set-branch requires a worktree")
+		.join(".gitmodules");
+	gitana_config_native::edit_file_at_guarded(
+		work,
+		Path::new(".gitmodules"),
+		&display_path,
+		lease,
+		move |config| match gitana_submodule::set_branch(config, &path, branch.as_deref())? {
+			SetBranchOutcome::Applied => Ok(()),
+			SetBranchOutcome::AlreadyDefault => Err(
+				SilentExit {
+					reason: "submodule branch is already at its default",
+				}
+				.into(),
+			),
+		},
+	)
+	.await?;
 	Ok(())
 }
 

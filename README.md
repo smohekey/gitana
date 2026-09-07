@@ -95,7 +95,8 @@ Major gaps:
   new base (linear histories only), with `--continue` / `--skip` / `--abort`.
   Non-interactive: no `-i`, autosquash, or `--rebase-merges`.
 - `gta submodule status [--recursive]` / `init` /
-  `update [--init] [--recursive] [--remote] [-N|--no-fetch] [--depth N]` / `deinit`
+  `update [--init] [--recursive] [--remote] [-N|--no-fetch] [--depth N]` / `deinit` /
+  `set-branch (-b|--branch <branch> | -d|--default) <path>`
   implement consumer operations. `gta clone --recurse-submodules[=<pathspec>]` (alias
   `--recursive[=<pathspec>]`) publishes the root clone, records the requested root-level
   `submodule.active` values (`.` for the bare flag), and then initializes every selected active
@@ -113,8 +114,8 @@ Major gaps:
   per-module branch (or the selected remote's HEAD), while `--no-fetch` confines selection to local
   objects and tracking refs; both policies propagate recursively. Recursive clone accepts
   `--[no-]remote-submodules`, with the last occurrence winning. Clone-time jobs, shallow
-  since/exclude propagation, `set-branch`, and the `merge`, `rebase`, or custom-command update
-  strategies are not yet supported.
+  since/exclude propagation and the `merge`, `rebase`, or custom-command update strategies are not
+  yet supported.
 - There is no interactive rebase, stash, blame, bisect, or hook support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
@@ -206,7 +207,9 @@ Implemented command groups:
   git's layout, so stock git reads and operates in a gta-created worktree.
 - Submodules: `submodule status [--recursive]`, `submodule init`,
 	`submodule update [--init] [--recursive] [--remote] [-N|--no-fetch] [--depth N]`, and
-	`submodule deinit [-f|--force] (--all | <path>...)`. Root pathspecs select top-level modules;
+	`submodule deinit [-f|--force] (--all | <path>...)`, plus
+	`submodule set-branch (-b|--branch <branch> | -d|--default) <path>`. Root pathspecs select
+	top-level modules;
 	recursive status is depth-first and recursive update completes each repository-local batch before
 	entering successful child worktrees. `clone --recurse-submodules[=<pathspec>]`
 	(`--recursive[=<pathspec>]`) composes the initializing recursive update after the root clone has

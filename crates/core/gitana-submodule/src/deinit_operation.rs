@@ -21,12 +21,11 @@ use gitana_repository_layout::RepositoryLayout;
 use gitana_worktree::WorkTree;
 use serde::{Deserialize, Serialize};
 
-use crate::context::{declarations_by_path, validate_name, validate_path};
 use crate::{
 	ConfigurationProvider, DeinitConfigPublication, DeinitConfigTransition, DeinitFailure,
 	DeinitMountMarker, DeinitOutcome, DeinitReport, DeinitRequest, DeinitSelection, DurableIdentity,
 	MarkerTargetResolver, SubmoduleContext, SubmoduleDeclaration, SubmoduleError,
-	SubmoduleMutationLease,
+	SubmoduleMutationLease, declarations_by_path, validate_name, validate_path,
 };
 
 const CONTROL_DIR: &str = "gitana-submodule-deinit";

@@ -22,6 +22,8 @@ mod query;
 mod relative_url;
 #[cfg(not(target_arch = "wasm32"))]
 mod remote_url;
+mod set_branch;
+mod set_branch_outcome;
 #[cfg(not(target_arch = "wasm32"))]
 mod shared_config_guard;
 mod status;
@@ -35,6 +37,10 @@ mod update_operation;
 mod update_target;
 
 pub(crate) use self::config_identity::ConfigIdentity;
+pub use self::declaration::SubmoduleDeclaration;
+pub(crate) use self::declaration::mappings_by_path;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use self::declaration::{declarations_by_path, validate_name, validate_path};
 pub use self::deinit::{
 	DeinitFailure, DeinitOutcome, DeinitReport, DeinitRequest, DeinitSelection,
 };
@@ -51,7 +57,6 @@ pub use config_views::ConfigViews;
 pub use configuration_provider::{ConfigurationProvider, InitConfigResult, InitConfigUpdate};
 #[cfg(not(target_arch = "wasm32"))]
 pub use context::SubmoduleContext;
-pub use declaration::SubmoduleDeclaration;
 pub use deinit_config_publication::DeinitConfigPublication;
 pub use deinit_config_target::DeinitConfigTarget;
 pub use deinit_worktree_attachment::DeinitWorktreeAttachment;
@@ -60,6 +65,8 @@ pub use init::{InitNotice, InitOutcome, InitReport, InitRequest};
 pub use object_id::SubmoduleObjectId;
 pub use query::SubmoduleQuery;
 pub use relative_url::{RelativeUrlError, resolve_relative_url};
+pub use set_branch::set_branch;
+pub use set_branch_outcome::SetBranchOutcome;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use shared_config_guard::SharedConfigGuard;
 pub use status::{SubmoduleStatus, SubmoduleStatusState};

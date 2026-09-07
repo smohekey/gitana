@@ -1,4 +1,8 @@
+use std::collections::{HashMap, HashSet};
+
+use caseless::Caseless;
 use gitana_config::GitConfig;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::SubmoduleError;
 
@@ -38,6 +42,143 @@ impl SubmoduleDeclaration {
 		}
 		Ok(declarations)
 	}
+}
+
+pub(crate) fn mappings_by_path(
+	config: &GitConfig,
+) -> Result<HashMap<String, String>, SubmoduleError> {
+	let mut by_path = HashMap::new();
+	let mut names: HashSet<String> = HashSet::new();
+	let mut paths: HashSet<String> = HashSet::new();
+	for name in config.subsections("submodule") {
+		let Some(path) = field(config, name, "path", true)? else {
+			continue;
+		};
+		validate_name(name)?;
+		validate_path(&path)?;
+		if by_path.contains_key(&path) {
+			return Err(SubmoduleError::DuplicateMapping(path));
+		}
+		let name_key = filesystem_key(name);
+		let path_key = filesystem_key(&path);
+		if names
+			.iter()
+			.any(|known| component_prefix_collision(known, &name_key))
+			|| paths
+				.iter()
+				.any(|known| component_prefix_collision(known, &path_key))
+		{
+			return Err(SubmoduleError::AmbiguousDeclaration(path));
+		}
+		names.insert(name_key);
+		paths.insert(path_key);
+		by_path.insert(path, name.to_owned());
+	}
+	Ok(by_path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn declarations_by_path(
+	declarations: Vec<SubmoduleDeclaration>,
+) -> Result<HashMap<String, SubmoduleDeclaration>, SubmoduleError> {
+	let mut by_path = HashMap::with_capacity(declarations.len());
+	let mut names: HashSet<String> = HashSet::new();
+	let mut paths: HashSet<String> = HashSet::new();
+	for declaration in declarations {
+		validate_name(&declaration.name)?;
+		validate_path(&declaration.path)?;
+		let path = declaration.path.clone();
+		if by_path.contains_key(&path) {
+			return Err(SubmoduleError::DuplicateMapping(path));
+		}
+		let name_key = filesystem_key(&declaration.name);
+		let path_key = filesystem_key(&declaration.path);
+		if names
+			.iter()
+			.any(|name| component_prefix_collision(name, &name_key))
+			|| paths
+				.iter()
+				.any(|path| component_prefix_collision(path, &path_key))
+		{
+			return Err(SubmoduleError::AmbiguousDeclaration(declaration.path));
+		}
+		names.insert(name_key);
+		paths.insert(path_key);
+		by_path.insert(path, declaration);
+	}
+	Ok(by_path)
+}
+
+fn filesystem_key(value: &str) -> String {
+	value.chars().nfd().default_case_fold().nfd().collect()
+}
+
+fn component_prefix_collision(left: &str, right: &str) -> bool {
+	left == right
+		|| right
+			.strip_prefix(left)
+			.is_some_and(|remainder| remainder.starts_with('/'))
+		|| left
+			.strip_prefix(right)
+			.is_some_and(|remainder| remainder.starts_with('/'))
+}
+
+pub(crate) fn validate_name(name: &str) -> Result<(), SubmoduleError> {
+	if safe_relative(name) {
+		Ok(())
+	} else {
+		Err(SubmoduleError::UnsafeName(name.to_owned()))
+	}
+}
+
+pub(crate) fn validate_path(path: &str) -> Result<(), SubmoduleError> {
+	if safe_relative(path) {
+		Ok(())
+	} else {
+		Err(SubmoduleError::UnsafePath(path.to_owned()))
+	}
+}
+
+fn safe_relative(value: &str) -> bool {
+	if value.is_empty() || value.starts_with('/') {
+		return false;
+	}
+	if cfg!(windows) && (value.contains('\\') || value.contains(':')) {
+		return false;
+	}
+	value.split('/').all(|component| {
+		!component.is_empty()
+			&& !matches!(component, "." | "..")
+			&& !is_ntfs_dot_git_alias(component)
+			&& !component.chars().any(char::is_control)
+	})
+}
+
+fn is_ntfs_dot_git_alias(component: &str) -> bool {
+	let bytes = component.as_bytes();
+	let remainder = if bytes
+		.get(..4)
+		.is_some_and(|prefix| prefix.eq_ignore_ascii_case(b".git"))
+	{
+		&bytes[4..]
+	} else if bytes
+		.get(..5)
+		.is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"git~1"))
+	{
+		&bytes[5..]
+	} else {
+		return false;
+	};
+
+	for byte in remainder {
+		if *byte == b':' {
+			return true;
+		}
+		if !matches!(*byte, b' ' | b'.') {
+			return false;
+		}
+	}
+	true
 }
 
 fn field(
@@ -103,5 +244,27 @@ mod tests {
 		)
 		.unwrap_err();
 		assert!(error.to_string().contains("not a boolean"));
+	}
+
+	#[test]
+	fn rejects_traversal_and_git_components() {
+		for value in [
+			"",
+			"../x",
+			"a/../x",
+			".git",
+			"a/.GIT/x",
+			"a//b",
+			".git ",
+			"a/.GiT.../x",
+			"git~1",
+			"a/GIT~1./x",
+			"a/.git  :stream/x",
+		] {
+			assert!(!safe_relative(value), "{value:?}");
+		}
+		for value in ["git~2", ".gitx", "a/agit~1/b", "a/.git x/b"] {
+			assert!(safe_relative(value), "{value:?}");
+		}
 	}
 }

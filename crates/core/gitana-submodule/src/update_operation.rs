@@ -23,14 +23,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256 as Sha256Digest};
 
 use crate::context::{
-	declarations_by_path, is_active, parse_marker_target, should_initialize_only_active,
-	validate_update_strategy,
+	is_active, parse_marker_target, should_initialize_only_active, validate_update_strategy,
 };
 use crate::{
 	ConfigurationProvider, FetchRepository, FetchSource, InitRequest, PrepareRepository,
 	PrepareSource, RepositoryTransfer, SharedConfigGuard, SubmoduleContext, SubmoduleDeclaration,
 	SubmoduleError, SubmoduleObjectId, SubmoduleUpdateTarget, UpdateFailure, UpdateOutcome,
-	UpdateOutcomeState, UpdateReport, UpdateRequest,
+	UpdateOutcomeState, UpdateReport, UpdateRequest, declarations_by_path,
 };
 
 const CONTROL_DIR: &str = "gitana-submodule-update";
