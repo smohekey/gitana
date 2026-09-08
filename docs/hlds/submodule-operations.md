@@ -3,7 +3,7 @@
 ## Scope
 
 Gitana implements the consumer commands `submodule status`, `submodule init`, `submodule update`,
-`submodule deinit`, and `submodule set-branch`. `status --recursive` and `update --recursive`
+`submodule deinit`, `submodule set-branch`, and `submodule set-url`. `status --recursive` and `update --recursive`
 explicitly recurse into nested
 submodules; omitted flags remain one-level operations, and root pathspecs select only the first
 level before every eligible descendant is considered. `clone --recurse-submodules[=<pathspec>]`
@@ -121,6 +121,43 @@ recovery-aware config mutation lease. It therefore preserves the `.gitmodules` s
 mode, comments and unrelated text, retains serialization through a cancelled blocking worker, and
 publishes the replacement with the same identity and durability checks as other configuration
 writes. Pending deinit recovery rejects the mutation. The command does not stage `.gitmodules`.
+
+`submodule set-url <path> <newurl>` selects one declaration by the same exact repository-root path.
+It always records the URL verbatim in `.gitmodules`. If the module is registered, it also resolves a
+relative URL against the authoritative superproject remote and writes the redacted result to the
+repository-local `submodule.<name>.url`. If the worktree is initialized, it updates the URL of the
+module remote selected by its current branch, defaulting to `origin` for a detached HEAD. An
+unregistered declaration is otherwise silent; a registered declaration prints Git's synchronization
+notice. Empty URLs are valid. A URL containing a password is rejected before planning because
+Gitana does not persist credentials. Multiple values at any URL key are likewise rejected before the
+first config publication. A synchronized repository or module URL must be owned solely by the
+writable base `config`; an occurrence from a system, global, included, worktree-local, or command
+overlay is rejected before intent publication even when it has the same value. The command does not
+require an index gitlink and does not stage `.gitmodules`.
+
+The three possible config edits form one durable, roll-forward transaction. The coordinator records
+the identity and symlink-resolution chain of `.gitmodules`, the shared config, and the initialized
+module config, rejects aliases between those targets, reserves and fsyncs every private after-image,
+then marks the transaction ready before publishing any participant. Recovery abandons only a
+pre-ready transaction; once ready, it resumes each publication in journaled order and never rolls a
+completed participant back. An initialized module receives a durable participant claim before the
+coordinator intent is published. The claim is first written and synced under a private staging name,
+then atomically published and directory-synced, so its public name is always either absent or a
+complete recovery record. Direct configuration writers, nested submodule operations, parent
+update, and parent deinit reject that claim until the coordinator completes, so cancellation or a
+process crash cannot admit a stale module-config writer. A pre-intent orphan claim is self-identifying
+and is retired by a later set-url invocation from the same pinned coordinator and module. Every
+parent set-url, update, or deinit that can replace an initialized module's shared config also holds
+that module's common config lock while enumerating its current and linked-worktree administrative
+directories; a coordinator intent in any owner blocks the parent mutation. Every prepared image,
+claim, journal update, and retirement is identity-conditioned and directory-synced;
+Windows predecessor and absent-config publication states use the same recovery ordering as deinit.
+Before retirement, completion replays every participant idempotently to revalidate the published
+target identities, fingerprints, module repository, mount marker, and visible mount. Completion also
+reloads each effective configuration to prove that no surviving overlay can supersede or precede the
+published URL. It then retires the coordinator before its participant claim; a crash between those
+steps leaves a blocking, self-identifying orphan claim that the owning coordinator can safely retire
+on retry.
 
 A rejected non-fast-forward remote-tracking update fails the submodule update before checkout. Any
 objects and unrelated refs already fetched may remain, but the module HEAD and worktree are not
@@ -650,8 +687,9 @@ an opaque clone of that lease: every queued blocking CAS or replacement worker c
 so cancelling the CLI or MCP future cannot release common-config serialization before an already
 queued namespace publication finishes. Before a repository-local config write begins, the command
 enumerates the current and linked-worktree administrative directories while still holding that
-common lock and rejects any pending or malformed deinit recovery state. A durable pre-publication
-intent therefore keeps exclusive authority over its recorded config inode. Serialized config reads,
+common lock and rejects any pending or malformed deinit or set-url recovery state. A durable
+coordinator intent and an initialized module's set-url participant claim therefore keep exclusive
+authority over every recorded config inode. Serialized config reads,
 remote listing, and sparse reapply remain available because they cannot replace that inode. After
 winning its per-worktree update lock, a plain `submodule update` takes a fresh shared setup lease and
 reloads the effective configuration before deciding registration, activity, URL, or strategy. A

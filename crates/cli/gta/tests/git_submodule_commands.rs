@@ -2090,6 +2090,47 @@ fn deinit_refuses_a_module_repository_with_pending_nested_recovery() {
 	assert_success(&retry, "deinit after nested recovery is cleared");
 }
 
+#[test]
+fn deinit_refuses_current_set_url_recovery_before_mutation() {
+	let fixture = Fixture::new("deinit-current-set-url-recovery");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let control = git_path(&fixture.consumer, "gitana-submodule-set-url");
+	std::fs::create_dir(&control).unwrap();
+	let declaration = std::fs::read(fixture.consumer.join(".gitmodules")).unwrap();
+	let super_config = std::fs::read(fixture.consumer.join(".git/config")).unwrap();
+	let module_config_path = git_path(&fixture.consumer, "modules/one").join("config");
+	let module_config = std::fs::read(&module_config_path).unwrap();
+
+	let refused = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "deinit", "modules/one"],
+	);
+	assert!(
+		!refused.status.success(),
+		"set-url recovery must block deinit"
+	);
+	assert!(
+		stderr(&refused).contains("pending submodule set-url"),
+		"unexpected recovery error: {}",
+		stderr(&refused)
+	);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".gitmodules")).unwrap(),
+		declaration
+	);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".git/config")).unwrap(),
+		super_config
+	);
+	assert_eq!(std::fs::read(module_config_path).unwrap(), module_config);
+	assert!(fixture.consumer.join("modules/one/file.txt").is_file());
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
+}
+
 #[cfg(any(unix, windows))]
 #[test]
 fn update_refuses_a_busy_retained_module_config_before_attachment() {
@@ -10220,6 +10261,600 @@ fn set_branch_preserves_a_symlinked_gitmodules_file() {
 	std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn set_url_updates_the_declaration_and_registered_config_without_a_gitlink() {
+	let root = unique_tmp("set-url-uninitialized");
+	init_repository(&root, None);
+	std::fs::write(
+		root.join(".gitmodules"),
+		"# preserved\n[submodule \"one\"]\n\tpath = modules/one\n\turl = ../old\n",
+	)
+	.unwrap();
+
+	let unregistered = gta(
+		&root,
+		false,
+		&["submodule", "set-url", "modules/one", "../new"],
+	);
+	assert_success(&unregistered, "set URL for an unregistered declaration");
+	assert!(stdout(&unregistered).is_empty());
+	assert!(stderr(&unregistered).is_empty());
+	assert_eq!(
+		git(
+			&root,
+			&["config", "-f", ".gitmodules", "--get", "submodule.one.url"]
+		),
+		"../new\n"
+	);
+	assert!(
+		!std::fs::read_to_string(root.join(".git/config"))
+			.unwrap()
+			.contains("[submodule \"one\"]")
+	);
+
+	git_ok(&root, &["config", "submodule.one.url", "old"]);
+	let registered = gta(
+		&root,
+		false,
+		&["submodule", "set-url", "modules/one", "../later"],
+	);
+	assert_success(&registered, "synchronize a registered declaration");
+	assert_eq!(
+		stdout(&registered),
+		"Synchronizing submodule url for 'modules/one'\n"
+	);
+	assert_eq!(
+		git(
+			&root,
+			&["config", "-f", ".gitmodules", "--get", "submodule.one.url"]
+		),
+		"../later\n"
+	);
+	let expected = root.parent().unwrap().canonicalize().unwrap().join("later");
+	assert_eq!(
+		git(&root, &["config", "--get", "submodule.one.url"]),
+		format!("{}\n", expected.display())
+	);
+	assert!(git(&root, &["diff", "--cached", "--name-only"]).is_empty());
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn set_url_synchronizes_the_initialized_modules_selected_remote() {
+	let fixture = Fixture::new("set-url-initialized");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initialize module",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(&module, &["switch", "-q", "-c", "topic"]);
+	git_ok(&module, &["config", "branch.topic.remote", "upstream"]);
+	git_ok(&module, &["remote", "add", "upstream", "old"]);
+	let new_url = fixture.root.join("replacement");
+	let update = gta(
+		&fixture.consumer,
+		false,
+		&[
+			"submodule",
+			"set-url",
+			"modules/one",
+			new_url.to_str().unwrap(),
+		],
+	);
+	assert_success(&update, "set URL for initialized module");
+	assert_eq!(
+		stdout(&update),
+		"Synchronizing submodule url for 'modules/one'\n"
+	);
+	for (repository, key) in [
+		(&fixture.consumer, "submodule.one.url"),
+		(&module, "remote.upstream.url"),
+	] {
+		assert_eq!(
+			git(repository, &["config", "--get", key]),
+			format!("{}\n", new_url.display())
+		);
+	}
+	assert_eq!(
+		git(
+			&fixture.consumer,
+			&["config", "-f", ".gitmodules", "--get", "submodule.one.url"]
+		),
+		format!("{}\n", new_url.display())
+	);
+	assert_ne!(
+		git(&module, &["config", "--get", "remote.origin.url"]),
+		format!("{}\n", new_url.display())
+	);
+	assert!(
+		!fixture
+			.consumer
+			.join(".git/gitana-submodule-set-url")
+			.exists()
+	);
+	assert!(
+		!fixture
+			.consumer
+			.join(".git/modules/one/gitana-submodule-set-url.claim")
+			.exists()
+	);
+	git_ok(
+		&module,
+		&["config", "--add", "remote.upstream.url", "duplicate"],
+	);
+	let declaration_before = std::fs::read(fixture.consumer.join(".gitmodules")).unwrap();
+	let registration_before = git(
+		&fixture.consumer,
+		&["config", "--get-all", "submodule.one.url"],
+	);
+	let duplicate_remote = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "set-url", "modules/one", "after-duplicate"],
+	);
+	assert!(!duplicate_remote.status.success());
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".gitmodules")).unwrap(),
+		declaration_before
+	);
+	assert_eq!(
+		git(
+			&fixture.consumer,
+			&["config", "--get-all", "submodule.one.url"]
+		),
+		registration_before
+	);
+	assert_eq!(
+		git(&module, &["config", "--get-all", "remote.upstream.url"]),
+		format!("{}\nduplicate\n", new_url.display())
+	);
+	assert!(
+		!fixture
+			.consumer
+			.join(".git/gitana-submodule-set-url")
+			.exists()
+	);
+	assert!(
+		!fixture
+			.consumer
+			.join(".git/modules/one/gitana-submodule-set-url.claim")
+			.exists()
+	);
+	let claim = fixture
+		.consumer
+		.join(".git/modules/one/gitana-submodule-set-url.claim");
+	std::fs::write(&claim, "{}").unwrap();
+	let blocked = gta(&module, false, &["config", "participant.changed", "true"]);
+	assert!(!blocked.status.success());
+	assert!(stderr(&blocked).contains("pending submodule set-url"));
+	let nested = gta(
+		&module,
+		false,
+		&["submodule", "set-url", "nested", "replacement"],
+	);
+	assert!(!nested.status.success());
+	assert!(stderr(&nested).contains("parent submodule set-url"));
+	assert!(
+		!std::fs::read_to_string(fixture.consumer.join(".git/modules/one/config"))
+			.unwrap()
+			.contains("[participant]")
+	);
+	std::fs::remove_file(claim).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn set_url_retires_an_owned_orphan_claim_after_registration_is_removed() {
+	let fixture = Fixture::new("set-url-orphan-unregistered");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initialize module",
+	);
+	let module = fixture.consumer.join("modules/one");
+	let claim = write_owned_set_url_orphan_claim(&fixture);
+	git_ok(
+		&fixture.consumer,
+		&["config", "--remove-section", "submodule.one"],
+	);
+
+	let retry = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "set-url", "modules/one", "next"],
+	);
+	assert_success(&retry, "retry set-url after registration removal");
+	assert!(!claim.exists(), "the owned orphan claim must be retired");
+	assert_success(
+		&gta(&module, false, &["config", "orphan.cleared", "true"]),
+		"mutate module config after orphan retirement",
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn set_url_retires_an_owned_orphan_claim_after_the_mount_is_detached() {
+	let fixture = Fixture::new("set-url-orphan-detached");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initialize module",
+	);
+	let module = fixture.consumer.join("modules/one");
+	let module_config = git_path(&fixture.consumer, "modules/one/config");
+	let module_before = std::fs::read(&module_config).unwrap();
+	let claim = write_owned_set_url_orphan_claim(&fixture);
+	std::fs::remove_file(module.join(".git")).unwrap();
+
+	let retry = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "set-url", "modules/one", "next"],
+	);
+	assert_success(&retry, "retry set-url after mount detachment");
+	assert!(!claim.exists(), "the owned orphan claim must be retired");
+	assert_eq!(
+		std::fs::read(module_config).unwrap(),
+		module_before,
+		"a detached module config must not be synchronized"
+	);
+}
+
+#[test]
+fn parent_module_config_mutations_reject_linked_worktree_set_url_recovery() {
+	let fixture = Fixture::new("set-url-linked-module-recovery");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initialize module",
+	);
+	let module = fixture.consumer.join("modules/one");
+	let linked = fixture.root.join("module-linked");
+	git_ok(
+		&module,
+		&["worktree", "add", "--detach", linked.to_str().unwrap()],
+	);
+	let linked_control = git_path(&linked, "gitana-submodule-set-url");
+	std::fs::create_dir(&linked_control).unwrap();
+
+	let declaration_before = std::fs::read(fixture.consumer.join(".gitmodules")).unwrap();
+	let super_config_path = fixture.consumer.join(".git/config");
+	let super_before = std::fs::read(&super_config_path).unwrap();
+	let module_config_path = git_path(&fixture.consumer, "modules/one/config");
+	let module_before = std::fs::read(&module_config_path).unwrap();
+
+	for (operation, result) in [
+		(
+			"set-url",
+			gta(
+				&fixture.consumer,
+				false,
+				&["submodule", "set-url", "modules/one", "../next"],
+			),
+		),
+		(
+			"update",
+			gta(
+				&fixture.consumer,
+				false,
+				&["submodule", "update", "modules/one"],
+			),
+		),
+		(
+			"deinit",
+			gta(
+				&fixture.consumer,
+				false,
+				&["submodule", "deinit", "modules/one"],
+			),
+		),
+	] {
+		assert!(!result.status.success(), "parent {operation} must fail");
+		assert!(
+			stderr(&result).contains("set-url recovery"),
+			"unexpected parent {operation} error: {}",
+			stderr(&result)
+		);
+	}
+
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".gitmodules")).unwrap(),
+		declaration_before
+	);
+	assert_eq!(std::fs::read(super_config_path).unwrap(), super_before);
+	assert_eq!(std::fs::read(module_config_path).unwrap(), module_before);
+	assert!(module.join(".git").is_file());
+	assert!(module.join("file.txt").is_file());
+	assert!(linked_control.is_dir());
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-set-url").exists());
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-update").exists());
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
+}
+
+#[test]
+fn set_url_rejects_duplicate_or_password_bearing_values_before_mutation() {
+	let root = unique_tmp("set-url-invalid");
+	init_repository(&root, None);
+	let modules = root.join(".gitmodules");
+	std::fs::write(
+		&modules,
+		"[submodule \"one\"]\n\tpath = modules/one\n\turl = first\n\turl = second\n",
+	)
+	.unwrap();
+	let before = std::fs::read(&modules).unwrap();
+	let duplicate = gta(
+		&root,
+		false,
+		&["submodule", "set-url", "modules/one", "next"],
+	);
+	assert!(!duplicate.status.success());
+	assert_eq!(std::fs::read(&modules).unwrap(), before);
+
+	std::fs::write(
+		&modules,
+		"[submodule \"one\"]\n\tpath = modules/one\n\turl = first\n",
+	)
+	.unwrap();
+	git_ok(
+		&root,
+		&["config", "--add", "submodule.one.url", "local-one"],
+	);
+	git_ok(
+		&root,
+		&["config", "--add", "submodule.one.url", "local-two"],
+	);
+	let before = std::fs::read(&modules).unwrap();
+	let duplicate_registration = gta(
+		&root,
+		false,
+		&["submodule", "set-url", "modules/one", "next"],
+	);
+	assert!(!duplicate_registration.status.success());
+	assert_eq!(std::fs::read(&modules).unwrap(), before);
+	assert_eq!(
+		git(&root, &["config", "--get-all", "submodule.one.url"]),
+		"local-one\nlocal-two\n"
+	);
+	git_ok(&root, &["config", "--remove-section", "submodule.one"]);
+
+	let before = std::fs::read(&modules).unwrap();
+	let password = gta(
+		&root,
+		false,
+		&[
+			"submodule",
+			"set-url",
+			"modules/one",
+			"https://user:secret@example.invalid/repo",
+		],
+	);
+	assert!(!password.status.success());
+	assert!(stderr(&password).contains("containing a password"));
+	assert_eq!(std::fs::read(&modules).unwrap(), before);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn set_url_rejects_a_worktree_local_registration_overlay_before_mutation() {
+	let root = unique_tmp("set-url-worktree-overlay");
+	init_repository(&root, None);
+	std::fs::write(
+		root.join(".gitmodules"),
+		"[submodule \"one\"]\n\tpath = modules/one\n\turl = old\n",
+	)
+	.unwrap();
+	git_ok(&root, &["config", "extensions.worktreeConfig", "true"]);
+	let worktree_config = root.join(".git/config.worktree");
+	std::fs::write(
+		&worktree_config,
+		"[submodule \"one\"]\n\turl = worktree-old\n",
+	)
+	.unwrap();
+	let declaration_before = std::fs::read(root.join(".gitmodules")).unwrap();
+	let config_before = std::fs::read(root.join(".git/config")).unwrap();
+	let worktree_before = std::fs::read(&worktree_config).unwrap();
+
+	let set = gta(
+		&root,
+		false,
+		&["submodule", "set-url", "modules/one", "next"],
+	);
+	assert!(!set.status.success());
+	assert!(
+		stderr(&set).contains("defined outside the writable base config"),
+		"{}",
+		stderr(&set)
+	);
+	assert_eq!(
+		std::fs::read(root.join(".gitmodules")).unwrap(),
+		declaration_before
+	);
+	assert_eq!(
+		std::fs::read(root.join(".git/config")).unwrap(),
+		config_before
+	);
+	assert_eq!(std::fs::read(worktree_config).unwrap(), worktree_before);
+	assert!(!root.join(".git/gitana-submodule-set-url").exists());
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn set_url_rejects_an_included_module_remote_overlay_before_mutation() {
+	let fixture = Fixture::new("set-url-module-include-overlay");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initialize module",
+	);
+	let module = fixture.consumer.join("modules/one");
+	let module_config = git_path(&fixture.consumer, "modules/one/config");
+	git_ok(&module, &["config", "--unset-all", "remote.origin.url"]);
+	let included = fixture.root.join("module-remote.inc");
+	std::fs::write(&included, "[remote \"origin\"]\n\turl = included-old\n").unwrap();
+	git_ok(
+		&module,
+		&["config", "include.path", included.to_str().unwrap()],
+	);
+	let declaration_before = std::fs::read(fixture.consumer.join(".gitmodules")).unwrap();
+	let config_before = std::fs::read(fixture.consumer.join(".git/config")).unwrap();
+	let module_before = std::fs::read(&module_config).unwrap();
+	let included_before = std::fs::read(&included).unwrap();
+
+	let set = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "set-url", "modules/one", "next"],
+	);
+	assert!(!set.status.success());
+	assert!(stderr(&set).contains("defined outside the writable base config"));
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".gitmodules")).unwrap(),
+		declaration_before
+	);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".git/config")).unwrap(),
+		config_before
+	);
+	assert_eq!(std::fs::read(module_config).unwrap(), module_before);
+	assert_eq!(std::fs::read(included).unwrap(), included_before);
+	assert!(
+		!fixture
+			.consumer
+			.join(".git/gitana-submodule-set-url")
+			.exists()
+	);
+	assert!(
+		!fixture
+			.consumer
+			.join(".git/modules/one/gitana-submodule-set-url.claim")
+			.exists()
+	);
+}
+
+#[test]
+fn set_url_rejects_a_global_module_remote_overlay_before_mutation() {
+	let fixture = Fixture::new("set-url-module-global-overlay");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initialize module",
+	);
+	let module_config = git_path(&fixture.consumer, "modules/one/config");
+	let global = fixture.root.join("global-config");
+	std::fs::write(&global, "[remote \"origin\"]\n\turl = global-old\n").unwrap();
+	let declaration_before = std::fs::read(fixture.consumer.join(".gitmodules")).unwrap();
+	let config_before = std::fs::read(fixture.consumer.join(".git/config")).unwrap();
+	let module_before = std::fs::read(&module_config).unwrap();
+	let global_before = std::fs::read(&global).unwrap();
+
+	let set = gta_with_environment(
+		&fixture.consumer,
+		&["submodule", "set-url", "modules/one", "next"],
+		&[
+			("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+			("GIT_CONFIG_NOSYSTEM", "1"),
+		],
+	);
+	assert!(!set.status.success());
+	assert!(stderr(&set).contains("defined outside the writable base config"));
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".gitmodules")).unwrap(),
+		declaration_before
+	);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".git/config")).unwrap(),
+		config_before
+	);
+	assert_eq!(std::fs::read(module_config).unwrap(), module_before);
+	assert_eq!(std::fs::read(global).unwrap(), global_before);
+	assert!(
+		!fixture
+			.consumer
+			.join(".git/gitana-submodule-set-url")
+			.exists()
+	);
+	assert!(
+		!fixture
+			.consumer
+			.join(".git/modules/one/gitana-submodule-set-url.claim")
+			.exists()
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn set_url_preserves_a_symlinked_gitmodules_file_and_accepts_an_empty_url() {
+	use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+	let root = unique_tmp("set-url-symlink");
+	init_repository(&root, None);
+	let metadata = root.join("metadata");
+	std::fs::create_dir(&metadata).unwrap();
+	let target = metadata.join("modules-config");
+	std::fs::write(
+		&target,
+		"# preserved\n[submodule \"one\"]\n\tpath = modules/one\n\turl = ../source\n",
+	)
+	.unwrap();
+	std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+	symlink("metadata/modules-config", root.join(".gitmodules")).unwrap();
+
+	let set = gta(&root, false, &["submodule", "set-url", "modules/one", ""]);
+	assert_success(&set, "set empty URL through symlinked .gitmodules");
+	assert!(stdout(&set).is_empty());
+	assert!(stderr(&set).is_empty());
+	assert!(
+		std::fs::symlink_metadata(root.join(".gitmodules"))
+			.unwrap()
+			.file_type()
+			.is_symlink()
+	);
+	assert_eq!(
+		std::fs::read_link(root.join(".gitmodules")).unwrap(),
+		PathBuf::from("metadata/modules-config")
+	);
+	assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o640);
+	assert_eq!(
+		git(
+			&root,
+			&["config", "-f", ".gitmodules", "--get", "submodule.one.url"]
+		),
+		"\n"
+	);
+	assert!(
+		std::fs::read_to_string(target)
+			.unwrap()
+			.starts_with("# preserved\n")
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn set_url_rejects_aliased_declaration_and_registration_targets_before_mutation() {
+	use std::os::unix::fs::symlink;
+
+	let root = unique_tmp("set-url-config-alias");
+	init_repository(&root, None);
+	let config = root.join(".git/config");
+	let mut bytes = std::fs::read_to_string(&config).unwrap();
+	bytes.push_str("[submodule \"one\"]\n\tpath = modules/one\n\turl = ../source\n");
+	std::fs::write(&config, bytes).unwrap();
+	symlink(".git/config", root.join(".gitmodules")).unwrap();
+	let before = std::fs::read(&config).unwrap();
+
+	let set = gta(
+		&root,
+		false,
+		&["submodule", "set-url", "modules/one", "../next"],
+	);
+	assert!(!set.status.success());
+	assert!(stderr(&set).contains("resolve to the same file"));
+	assert_eq!(std::fs::read(&config).unwrap(), before);
+	assert!(
+		std::fs::symlink_metadata(root.join(".gitmodules"))
+			.unwrap()
+			.file_type()
+			.is_symlink()
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
 struct Fixture {
 	root: PathBuf,
 	source: PathBuf,
@@ -10523,6 +11158,32 @@ fn git_path(repository: &Path, path: &str) -> PathBuf {
 	} else {
 		repository.join(rendered)
 	}
+}
+
+#[cfg(unix)]
+fn write_owned_set_url_orphan_claim(fixture: &Fixture) -> PathBuf {
+	use std::os::unix::fs::MetadataExt as _;
+
+	let owner = std::fs::metadata(fixture.consumer.join(".git")).unwrap();
+	let module = git_path(&fixture.consumer, "modules/one");
+	let module_metadata = std::fs::metadata(&module).unwrap();
+	let claim = module.join("gitana-submodule-set-url.claim");
+	let body = serde_json::json!({
+		"version": 1,
+		"transaction": "orphaned-before-intent",
+		"owner_identity": {
+			"device": owner.dev(),
+			"inode": owner.ino(),
+		},
+		"module_identity": {
+			"device": module_metadata.dev(),
+			"inode": module_metadata.ino(),
+		},
+		"name": "one",
+		"path": "modules/one",
+	});
+	std::fs::write(&claim, serde_json::to_vec(&body).unwrap()).unwrap();
+	claim
 }
 
 fn assert_shallow_one(repository: &Path) {

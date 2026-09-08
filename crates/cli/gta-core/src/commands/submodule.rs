@@ -10,8 +10,9 @@ use cap_std::{ambient_authority, fs::Dir};
 use gitana_fs_native::{EntryIdentity, directory_identity};
 use gitana_submodule::{
 	ConfigViews, ConfigurationProvider, DeinitRequest, DeinitSelection, InitNotice, InitRequest,
-	SetBranchOutcome, SubmoduleContext, SubmoduleError, SubmoduleMutationLease, SubmoduleQuery,
-	SubmoduleStatus, SubmoduleStatusState, UpdateOutcomeState, UpdateReport, UpdateRequest,
+	SetBranchOutcome, SetUrlRequest, SubmoduleContext, SubmoduleError, SubmoduleMutationLease,
+	SubmoduleQuery, SubmoduleStatus, SubmoduleStatusState, UpdateOutcomeState, UpdateReport,
+	UpdateRequest,
 };
 
 use crate::submodule_configuration::WorktreeConfiguration;
@@ -43,6 +44,10 @@ pub enum Action {
 	SetBranch {
 		branch: Option<String>,
 		path: String,
+	},
+	SetUrl {
+		path: String,
+		url: String,
 	},
 }
 
@@ -120,6 +125,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 		}
 		| Action::Deinit { .. } => {}
 		Action::SetBranch { .. } => unreachable!("set-branch returns before opening the root context"),
+		Action::SetUrl { .. } => {}
 	}
 	let (setup, common, git, work) = repo::command_setup_lease(&layout, identity).await?;
 	let work = work.ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?;
@@ -236,6 +242,21 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 					render_deinit(&prefix, &failure.completed);
 					return Err(failure.into());
 				}
+			}
+		}
+		Action::SetUrl { path, url } => {
+			drop(setup);
+			let report = context
+				.set_url(&SetUrlRequest { path, url }, &configuration)
+				.await?;
+			for notice in &report.notices {
+				render_init_notice(notice);
+			}
+			if report.registration_synced {
+				println!(
+					"Synchronizing submodule url for '{}'",
+					render_relative(&prefix, &report.path)
+				);
 			}
 		}
 		Action::Status {
@@ -913,11 +934,15 @@ fn join_submodule_path(prefix: &str, path: &str) -> String {
 
 fn render_init_notices(report: &gitana_submodule::InitReport) {
 	for notice in &report.notices {
-		match notice {
-			InitNotice::AuthoritativeSuperproject { missing_key } => eprintln!(
-				"warning: could not look up configuration '{missing_key}'. Assuming this repository is its own authoritative upstream."
-			),
-		}
+		render_init_notice(notice);
+	}
+}
+
+fn render_init_notice(notice: &InitNotice) {
+	match notice {
+		InitNotice::AuthoritativeSuperproject { missing_key } => eprintln!(
+			"warning: could not look up configuration '{missing_key}'. Assuming this repository is its own authoritative upstream."
+		),
 	}
 }
 

@@ -842,6 +842,7 @@ mod tests {
 		assert!(server.specs.contains_key("submodule_status"));
 		assert!(server.specs.contains_key("submodule_deinit"));
 		assert!(server.specs.contains_key("submodule_set_branch"));
+		assert!(server.specs.contains_key("submodule_set_url"));
 		assert!(server.specs.contains_key("remote_set_url"));
 		assert!(server.specs.contains_key("add"));
 		assert!(!server.specs.contains_key("status_2"));
@@ -886,6 +887,36 @@ mod tests {
 				"--path=modules/one"
 			]
 		);
+		let set_url = server.specs.get("submodule_set_url").unwrap();
+		for arguments in [
+			serde_json::json!({ "path": "modules/one" }),
+			serde_json::json!({ "url": "../new" }),
+		] {
+			let arguments = serde_json::from_value(arguments).unwrap();
+			assert!(validate_arguments(set_url, &arguments, "submodule_set_url").is_err());
+		}
+		let arguments = serde_json::from_value(serde_json::json!({
+			"url": "../new",
+			"path": "modules/one"
+		}))
+		.unwrap();
+		assert_eq!(
+			build_argv(set_url, &arguments),
+			[
+				"submodule",
+				"set-url",
+				"--path=modules/one",
+				"--new-url=../new"
+			]
+		);
+		let tool = server
+			.tools
+			.iter()
+			.find(|tool| tool.name.as_ref() == "submodule_set_url")
+			.unwrap();
+		let required = tool.input_schema["required"].as_array().unwrap();
+		assert!(required.contains(&serde_json::json!("path")));
+		assert!(required.contains(&serde_json::json!("url")));
 	}
 
 	#[test]

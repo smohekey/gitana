@@ -600,6 +600,15 @@ enum SubmoduleAction {
 		#[arg(value_name = "path")]
 		path: String,
 	},
+	/// Set a submodule URL in `.gitmodules` and synchronize registered configuration.
+	SetUrl {
+		/// Exact repository-root submodule path.
+		#[arg(value_name = "path")]
+		path: String,
+		/// New submodule URL.
+		#[arg(value_name = "newurl")]
+		url: String,
+	},
 }
 
 #[derive(Args)]
@@ -1170,6 +1179,7 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 			mode: SetBranchMode { branch, default: _ },
 			path,
 		} => Action::SetBranch { branch, path },
+		SubmoduleAction::SetUrl { path, url } => Action::SetUrl { path, url },
 	}
 }
 

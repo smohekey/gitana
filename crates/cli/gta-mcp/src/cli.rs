@@ -650,6 +650,15 @@ enum SubmoduleAction {
 		#[arg(long = "path")]
 		path: String,
 	},
+	/// Set a submodule URL in `.gitmodules` and synchronize registered configuration.
+	SetUrl {
+		/// Exact repository-root submodule path.
+		#[arg(long = "path")]
+		path: String,
+		/// New submodule URL.
+		#[arg(long = "new-url")]
+		url: String,
+	},
 }
 
 #[derive(Args)]
@@ -1244,6 +1253,7 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 			mode: SetBranchMode { branch, default: _ },
 			path,
 		} => Action::SetBranch { branch, path },
+		SubmoduleAction::SetUrl { path, url } => Action::SetUrl { path, url },
 	}
 }
 
@@ -1482,5 +1492,25 @@ mod tests {
 		assert!(
 			Cli::try_parse_from(["gta-mcp", "submodule", "set-branch", "--path=modules/one",]).is_err()
 		);
+	}
+
+	#[test]
+	fn set_url_maps_named_arguments_to_the_shared_action() {
+		let cli = Cli::try_parse_from([
+			"gta-mcp",
+			"submodule",
+			"set-url",
+			"--path=modules/one",
+			"--new-url=../new",
+		])
+		.unwrap();
+		let Command::Submodule { action } = cli.command else {
+			panic!("expected submodule command");
+		};
+		assert!(matches!(
+			submodule_action(action),
+			commands::submodule::Action::SetUrl { path, url }
+				if path == "modules/one" && url == "../new"
+		));
 	}
 }

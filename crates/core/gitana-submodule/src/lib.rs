@@ -24,6 +24,17 @@ mod relative_url;
 mod remote_url;
 mod set_branch;
 mod set_branch_outcome;
+mod set_url;
+#[cfg(not(target_arch = "wasm32"))]
+mod set_url_config_path;
+#[cfg(not(target_arch = "wasm32"))]
+mod set_url_configuration_provider;
+#[cfg(not(target_arch = "wasm32"))]
+mod set_url_operation;
+mod set_url_report;
+mod set_url_request;
+#[cfg(not(target_arch = "wasm32"))]
+mod set_url_value;
 #[cfg(not(target_arch = "wasm32"))]
 mod shared_config_guard;
 mod status;
@@ -67,6 +78,22 @@ pub use query::SubmoduleQuery;
 pub use relative_url::{RelativeUrlError, resolve_relative_url};
 pub use set_branch::set_branch;
 pub use set_branch_outcome::SetBranchOutcome;
+pub use set_url::set_url;
+#[cfg(not(target_arch = "wasm32"))]
+pub use set_url_config_path::SetUrlConfigPath;
+#[cfg(not(target_arch = "wasm32"))]
+pub use set_url_configuration_provider::SetUrlConfigurationProvider;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use set_url_operation::repository_has_pending_set_url_recovery;
+#[cfg(not(target_arch = "wasm32"))]
+pub use set_url_operation::{
+	pending_set_url_configs_require_restore, repository_has_pending_set_url,
+	repository_has_set_url_participant_claim, restore_pending_set_url_configs,
+};
+pub use set_url_report::SetUrlReport;
+pub use set_url_request::SetUrlRequest;
+#[cfg(not(target_arch = "wasm32"))]
+pub use set_url_value::SetUrlValue;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use shared_config_guard::SharedConfigGuard;
 pub use status::{SubmoduleStatus, SubmoduleStatusState};
@@ -77,6 +104,11 @@ pub use transfer::{
 	PreparedTransfer, RepositoryTransfer,
 };
 pub use update::{UpdateFailure, UpdateOutcome, UpdateOutcomeState, UpdateReport, UpdateRequest};
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use update_operation::{
+	UpdateLockGuard, acquire_update_lock_with_common, module_update_remote,
+	try_acquire_submodule_config_mutation_lease,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use update_operation::{
 	acquire_submodule_config_mutation_lease, acquire_submodule_config_setup_lease,

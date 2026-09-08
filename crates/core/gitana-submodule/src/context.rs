@@ -29,9 +29,9 @@ pub struct SubmoduleContext {
 	pub(crate) hash_kind: HashKind,
 }
 
-struct RelativeUrlBase {
-	url: String,
-	missing_remote_key: Option<String>,
+pub(crate) struct RelativeUrlBase {
+	pub(crate) url: String,
+	pub(crate) missing_remote_key: Option<String>,
 }
 
 impl SubmoduleContext {
@@ -429,7 +429,7 @@ impl SubmoduleContext {
 		Ok(selected)
 	}
 
-	async fn branch_remote_base<H: HashAlgorithm>(
+	pub(crate) async fn branch_remote_base<H: HashAlgorithm>(
 		&self,
 		worktree: &WorkTree<WorktreeFileStore, CapWorkDir, H>,
 		effective: &gitana_config::GitConfig,
@@ -546,7 +546,7 @@ impl SubmoduleContext {
 		Ok(head)
 	}
 
-	fn reopen_module_directory(
+	pub(crate) fn reopen_module_directory(
 		&self,
 		declaration: &SubmoduleDeclaration,
 		relative: &Path,

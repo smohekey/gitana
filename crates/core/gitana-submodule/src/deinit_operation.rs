@@ -285,7 +285,17 @@ fn push_recovery_git_dir(
 	Ok(())
 }
 
-fn ensure_no_deinit_recovery_at(git: &Dir, git_dir: &Path) -> Result<(), SubmoduleError> {
+fn ensure_no_set_url_recovery_at(git: &Dir, git_dir: &Path) -> Result<(), SubmoduleError> {
+	if crate::repository_has_pending_set_url(git, git_dir)? {
+		return Err(SubmoduleError::RecoveryRequired(format!(
+			"a pending submodule set-url in '{}' must be retried from its owning superproject",
+			git_dir.display()
+		)));
+	}
+	Ok(())
+}
+
+fn ensure_no_deinit_intent_at(git: &Dir, git_dir: &Path) -> Result<(), SubmoduleError> {
 	match git.symlink_metadata(CONTROL_DIR) {
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
 		Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
@@ -303,6 +313,11 @@ fn ensure_no_deinit_recovery_at(git: &Dir, git_dir: &Path) -> Result<(), Submodu
 			source,
 		}),
 	}
+}
+
+fn ensure_no_deinit_recovery_at(git: &Dir, git_dir: &Path) -> Result<(), SubmoduleError> {
+	ensure_no_set_url_recovery_at(git, git_dir)?;
+	ensure_no_deinit_intent_at(git, git_dir)
 }
 
 /// Restore config before-images needed to load a repository with a pending deinit intent.
@@ -514,11 +529,17 @@ impl SubmoduleContext {
 				.mount_identity
 				.map(|_| self.worktree_root().join(&intent.path)),
 			git_dir: module_path.clone(),
-			common_dir: module_path,
+			common_dir: module_path.clone(),
 		};
 		if repository_has_pending_deinit(&module, &module, &module_layout)? {
 			return Err(SubmoduleError::RecoveryRequired(format!(
 				"pending submodule deinit recovery in module '{}' must be completed before deinitializing its parent",
+				intent.name
+			)));
+		}
+		if crate::repository_has_pending_set_url_recovery(&module, &module, &module_layout)? {
+			return Err(SubmoduleError::RecoveryRequired(format!(
+				"pending submodule set-url recovery in module '{}' must be completed before deinitializing its parent",
 				intent.name
 			)));
 		}
@@ -665,6 +686,14 @@ impl SubmoduleContext {
 					{
 						return Err(preflight(SubmoduleError::RecoveryRequired(format!(
 							"pending submodule deinit recovery in module '{}' must be completed before deinitializing its parent",
+							declaration.name
+						))));
+					}
+					if crate::repository_has_pending_set_url_recovery(&directory, &directory, &module_layout)
+						.map_err(&preflight)?
+					{
+						return Err(preflight(SubmoduleError::RecoveryRequired(format!(
+							"pending submodule set-url recovery in module '{}' must be completed before deinitializing its parent",
 							declaration.name
 						))));
 					}
@@ -2299,7 +2328,7 @@ impl SubmoduleContext {
 		Ok(())
 	}
 
-	async fn capture_owned_mount<R: MarkerTargetResolver>(
+	pub(crate) async fn capture_owned_mount<R: MarkerTargetResolver>(
 		&self,
 		declaration: &SubmoduleDeclaration,
 		parent: &Dir,
@@ -2326,7 +2355,7 @@ impl SubmoduleContext {
 		Ok((directory, identity, marker))
 	}
 
-	async fn revalidate_owned_mount<R: MarkerTargetResolver>(
+	pub(crate) async fn revalidate_owned_mount<R: MarkerTargetResolver>(
 		&self,
 		declaration: &SubmoduleDeclaration,
 		parent: &Dir,
@@ -2498,7 +2527,7 @@ impl SubmoduleContext {
 		Ok(())
 	}
 
-	async fn ensure_module_repository_valid<H: HashAlgorithm, C: ConfigurationProvider>(
+	pub(crate) async fn ensure_module_repository_valid<H: HashAlgorithm, C: ConfigurationProvider>(
 		&self,
 		declaration: &SubmoduleDeclaration,
 		module: &Dir,
@@ -2520,7 +2549,10 @@ impl SubmoduleContext {
 		Ok(())
 	}
 
-	fn mount_is_attached(&self, declaration: &SubmoduleDeclaration) -> Result<bool, SubmoduleError> {
+	pub(crate) fn mount_is_attached(
+		&self,
+		declaration: &SubmoduleDeclaration,
+	) -> Result<bool, SubmoduleError> {
 		let Some(directory) = self.existing_mount_directory_nofollow(&declaration.path)? else {
 			return Ok(false);
 		};
@@ -2590,7 +2622,10 @@ impl SubmoduleContext {
 		Ok(())
 	}
 
-	fn mount_parent(&self, path: &str) -> Result<(Dir, OsString, PathBuf), SubmoduleError> {
+	pub(crate) fn mount_parent(
+		&self,
+		path: &str,
+	) -> Result<(Dir, OsString, PathBuf), SubmoduleError> {
 		let path = Path::new(path);
 		let target = path
 			.file_name()
@@ -2789,14 +2824,15 @@ impl SubmoduleContext {
 				path: git_dir.clone(),
 				source,
 			})?;
+			ensure_no_set_url_recovery_at(&git, &git_dir)?;
 			if identity != current {
-				ensure_no_deinit_recovery_at(&git, &git_dir)?;
+				ensure_no_deinit_intent_at(&git, &git_dir)?;
 			}
 		}
 		Ok(())
 	}
 
-	fn ensure_no_update_recovery(&self) -> Result<(), SubmoduleError> {
+	pub(crate) fn ensure_no_update_recovery(&self) -> Result<(), SubmoduleError> {
 		match self.git.symlink_metadata(UPDATE_CONTROL_DIR) {
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
 			Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {

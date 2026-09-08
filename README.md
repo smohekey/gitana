@@ -96,7 +96,8 @@ Major gaps:
   Non-interactive: no `-i`, autosquash, or `--rebase-merges`.
 - `gta submodule status [--recursive]` / `init` /
   `update [--init] [--recursive] [--remote] [-N|--no-fetch] [--depth N]` / `deinit` /
-  `set-branch (-b|--branch <branch> | -d|--default) <path>`
+  `set-branch (-b|--branch <branch> | -d|--default) <path>` /
+  `set-url <path> <newurl>`
   implement consumer operations. `gta clone --recurse-submodules[=<pathspec>]` (alias
   `--recursive[=<pathspec>]`) publishes the root clone, records the requested root-level
   `submodule.active` values (`.` for the bare flag), and then initializes every selected active
@@ -208,7 +209,8 @@ Implemented command groups:
 - Submodules: `submodule status [--recursive]`, `submodule init`,
 	`submodule update [--init] [--recursive] [--remote] [-N|--no-fetch] [--depth N]`, and
 	`submodule deinit [-f|--force] (--all | <path>...)`, plus
-	`submodule set-branch (-b|--branch <branch> | -d|--default) <path>`. Root pathspecs select
+	`submodule set-branch (-b|--branch <branch> | -d|--default) <path>` and
+	`submodule set-url <path> <newurl>`. Root pathspecs select
 	top-level modules;
 	recursive status is depth-first and recursive update completes each repository-local batch before
 	entering successful child worktrees. `clone --recurse-submodules[=<pathspec>]`
@@ -298,7 +300,7 @@ Implemented command groups:
 - `crates/core/gitana-worktree`: Git index, worktree scanning, status, add,
   checkout, and diff support.
 - `crates/core/gitana-submodule`: One-level submodule declaration, status, initialization, update,
-	deinitialization, and crash-recovery state machines over injected configuration and transport
+	URL synchronization, deinitialization, and crash-recovery state machines over injected configuration and transport
 	capabilities.
 - `crates/core/gitana-config`: Git config parser.
 - `crates/core/gitana-diff`: Myers line diff and diff3 three-way line merge.

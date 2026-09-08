@@ -19,8 +19,10 @@ use gitana_repository::Repository;
 use gitana_submodule::{
 	SubmoduleError, SubmoduleMutationLease, acquire_submodule_config_mutation_lease,
 	acquire_submodule_config_setup_lease, deinit_recovery_git_dirs,
-	pending_deinit_configs_require_restore, repository_has_pending_deinit,
-	restore_pending_deinit_configs, try_acquire_submodule_config_setup_lease,
+	pending_deinit_configs_require_restore, pending_set_url_configs_require_restore,
+	repository_has_pending_deinit, repository_has_pending_set_url,
+	repository_has_set_url_participant_claim, restore_pending_deinit_configs,
+	restore_pending_set_url_configs, try_acquire_submodule_config_setup_lease,
 };
 
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
@@ -74,12 +76,12 @@ pub(crate) async fn command_setup_lease(
 	loop {
 		let lease = acquire_setup_lease_once(layout).await?;
 		let (common, git, worktree) = revalidate_repository_layout(layout, expected).await?;
-		if !pending_configs_require_restore_at(layout, &common, &git).await? {
+		if !pending_configs_require_restore_at(layout, &common, &git, worktree.as_ref()).await? {
 			lease.validate()?;
 			return Ok((lease, common, git, worktree));
 		}
 		drop(lease);
-		match restore_command_setup(layout, common, git).await {
+		match restore_command_setup(layout, common, git, worktree).await {
 			Ok(()) => recovery_backoff = SETUP_RECOVERY_BACKOFF_INITIAL,
 			Err(error) if matches!(error.downcast_ref(), Some(SubmoduleError::UpdateLocked)) => {
 				backoff_after_setup_recovery_lock(&mut recovery_backoff).await;
@@ -213,12 +215,12 @@ pub(crate) async fn command_config_mutation_lease(
 		.map_err(|error| anyhow!("waiting for repository config mutation lock: {error}"))??;
 
 		let (common, git, worktree) = revalidate_repository_layout(layout, expected).await?;
-		if !pending_configs_require_restore_at(layout, &common, &git).await? {
+		if !pending_configs_require_restore_at(layout, &common, &git, worktree.as_ref()).await? {
 			lease.validate()?;
 			return Ok((lease, common, git, worktree));
 		}
 		drop(lease);
-		match restore_command_setup(layout, common, git).await {
+		match restore_command_setup(layout, common, git, worktree).await {
 			Ok(()) => recovery_backoff = SETUP_RECOVERY_BACKOFF_INITIAL,
 			Err(error) if matches!(error.downcast_ref(), Some(SubmoduleError::UpdateLocked)) => {
 				backoff_after_setup_recovery_lock(&mut recovery_backoff).await;
@@ -233,15 +235,30 @@ async fn backoff_after_setup_recovery_lock(delay: &mut Duration) {
 	*delay = delay.saturating_mul(2).min(SETUP_RECOVERY_BACKOFF_MAX);
 }
 
-fn has_pending_deinit_at(layout: &RepositoryLayout, common: &Dir, git: &Dir) -> Result<bool> {
-	Ok(repository_has_pending_deinit(common, git, layout)?)
+fn pending_submodule_command_at(
+	layout: &RepositoryLayout,
+	common: &Dir,
+	git: &Dir,
+) -> Result<Option<&'static str>> {
+	if repository_has_pending_deinit(common, git, layout)? {
+		return Ok(Some("deinit"));
+	}
+	for (git_dir, owner) in deinit_recovery_git_dirs(common, git, layout)? {
+		if repository_has_pending_set_url(&owner, &git_dir)? {
+			return Ok(Some("set-url"));
+		}
+	}
+	Ok(None)
 }
 
 async fn pending_configs_require_restore_at(
 	layout: &RepositoryLayout,
 	common: &Dir,
 	git: &Dir,
+	worktree: Option<&Dir>,
 ) -> Result<bool> {
+	let current_identity =
+		directory_identity(git).with_context(|| format!("identifying {}", layout.git_dir.display()))?;
 	for (git_dir, git) in deinit_recovery_git_dirs(common, git, layout)? {
 		let configuration = WorktreeConfiguration::new(
 			common
@@ -253,8 +270,56 @@ async fn pending_configs_require_restore_at(
 			&layout.common_dir,
 			&git_dir,
 		);
-		if pending_deinit_configs_require_restore(git, &git_dir, &configuration).await? {
+		if pending_deinit_configs_require_restore(git.try_clone()?, &git_dir, &configuration).await? {
 			return Ok(true);
+		}
+		let owner_identity =
+			directory_identity(&git).with_context(|| format!("identifying {}", git_dir.display()))?;
+		let work = if owner_identity == current_identity {
+			worktree
+				.map(|work| {
+					work.try_clone().map(|work| {
+						(
+							work,
+							layout
+								.worktree_root
+								.clone()
+								.expect("work capability has a root"),
+						)
+					})
+				})
+				.transpose()?
+		} else {
+			None
+		};
+		if pending_set_url_configs_require_restore(
+			git
+				.try_clone()
+				.map_err(|error| anyhow!("opening {}: {error}", git_dir.display()))?,
+			&git_dir,
+			common.try_clone()?,
+			&layout.common_dir,
+			work,
+			&configuration,
+		)
+		.await?
+		{
+			return Ok(true);
+		}
+		if repository_has_set_url_participant_claim(&git, &git_dir)?
+			&& gitana_config_native::read_file_at(
+				git.try_clone()?,
+				Path::new("config"),
+				&git_dir.join("config"),
+			)
+			.await?
+			.is_none()
+		{
+			return Err(SubmoduleError::RecoveryRequired(format!(
+				"a parent submodule set-url left '{}' temporarily unavailable; retry that set-url from its owning superproject",
+				git_dir.join("config").display()
+			))
+			.into());
 		}
 	}
 	Ok(false)
@@ -269,23 +334,31 @@ pub(crate) fn ensure_no_pending_deinit_at(
 	common: &Dir,
 	git: &Dir,
 ) -> Result<()> {
-	if has_pending_deinit_at(layout, common, git)? {
-		return pending_deinit_error();
+	if let Some(command) = pending_submodule_command_at(layout, common, git)? {
+		return pending_submodule_recovery_error(command);
 	}
 	Ok(())
 }
 
-fn pending_deinit_error() -> Result<()> {
-	Err(
-		SubmoduleError::RecoveryRequired(
-			"a pending submodule deinit must be completed with 'gta submodule deinit' before changing repository configuration"
-				.to_owned(),
+fn pending_submodule_recovery_error(command: &str) -> Result<()> {
+	let message = if command == "set-url" {
+		"a pending submodule set-url must be retried from its owning superproject before changing repository configuration".to_owned()
+	} else {
+		format!(
+			"a pending submodule {command} must be completed with 'gta submodule {command}' before changing repository configuration"
 		)
-		.into(),
-	)
+	};
+	Err(SubmoduleError::RecoveryRequired(message).into())
 }
 
-async fn restore_command_setup(layout: &RepositoryLayout, common: Dir, git: Dir) -> Result<()> {
+async fn restore_command_setup(
+	layout: &RepositoryLayout,
+	common: Dir,
+	git: Dir,
+	worktree: Option<Dir>,
+) -> Result<()> {
+	let current_identity = directory_identity(&git)
+		.with_context(|| format!("identifying {}", layout.git_dir.display()))?;
 	for (git_dir, git) in deinit_recovery_git_dirs(&common, &git, layout)? {
 		let recovery_git = git
 			.try_clone()
@@ -294,7 +367,9 @@ async fn restore_command_setup(layout: &RepositoryLayout, common: Dir, git: Dir)
 			common
 				.try_clone()
 				.map_err(|error| anyhow!("opening {}: {error}", layout.common_dir.display()))?,
-			git,
+			git
+				.try_clone()
+				.map_err(|error| anyhow!("opening {}: {error}", git_dir.display()))?,
 			&layout.common_dir,
 			&git_dir,
 		);
@@ -305,6 +380,35 @@ async fn restore_command_setup(layout: &RepositoryLayout, common: Dir, git: Dir)
 				.try_clone()
 				.map_err(|error| anyhow!("opening {}: {error}", layout.common_dir.display()))?,
 			&layout.common_dir,
+			&configuration,
+		)
+		.await?;
+		let owner_identity =
+			directory_identity(&git).with_context(|| format!("identifying {}", git_dir.display()))?;
+		let work = if owner_identity == current_identity {
+			worktree
+				.as_ref()
+				.map(|work| {
+					work.try_clone().map(|work| {
+						(
+							work,
+							layout
+								.worktree_root
+								.clone()
+								.expect("work capability has a root"),
+						)
+					})
+				})
+				.transpose()?
+		} else {
+			None
+		};
+		restore_pending_set_url_configs(
+			git.try_clone()?,
+			&git_dir,
+			common.try_clone()?,
+			&layout.common_dir,
+			work,
 			&configuration,
 		)
 		.await?;

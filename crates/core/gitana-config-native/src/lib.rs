@@ -809,6 +809,32 @@ where
 	.map_err(|error| anyhow!("prepared config publication worker failed: {error}"))?
 }
 
+/// Remove an unpublished, journaled private config image while the planned target is unchanged.
+///
+/// This is used when a multi-config transaction is interrupted before any participant is allowed
+/// to publish. The removal is identity-conditioned and directory-synced, so a replacement private
+/// entry is never discarded and recovery may safely retry after a crash.
+pub async fn discard_prepared_file_at_guarded<K>(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: ConfigTargetIdentity,
+	prepared: PreparedConfigPublication,
+	keepalive: K,
+) -> Result<()>
+where
+	K: Send + 'static,
+{
+	let path = path.to_owned();
+	let display_path = display_path.to_owned();
+	tokio::task::spawn_blocking(move || {
+		let _keepalive = keepalive;
+		discard_prepared_file_at_sync(directory, &path, &display_path, &expected, prepared)
+	})
+	.await
+	.map_err(|error| anyhow!("prepared config discard worker failed: {error}"))?
+}
+
 /// Restore the planned before-image when Windows config publication was interrupted after
 /// displacing the target but before installing the prepared image.
 ///
@@ -1249,6 +1275,36 @@ where
 	ensure_target_identity(&pinned, &state, expected, display_path)?;
 	sync_config_directory(&pinned.target.directory)?;
 	Ok(result)
+}
+
+fn discard_prepared_file_at_sync(
+	directory: Dir,
+	path: &Path,
+	display_path: &Path,
+	expected: &ConfigTargetIdentity,
+	prepared: PreparedConfigPublication,
+) -> Result<()> {
+	let pinned = pin_config_target(directory, path, display_path)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	let (_, state) = read_pinned_config_bytes(&pinned.target, display_path)?;
+	ensure_target_identity(&pinned, &state, expected, display_path)?;
+	match named_file_identity(&pinned.target.directory, &prepared.name, display_path)? {
+		None => {}
+		Some(identity) if identity == prepared.identity => {
+			remove_file_if_identity(&pinned.target.directory, &prepared.name, identity)
+				.map_err(|error| anyhow!("discarding prepared {}: {error}", display_path.display()))?;
+		}
+		Some(_) => {
+			return Err(anyhow!(
+				"prepared config namespace changed before discarding {}",
+				display_path.display()
+			));
+		}
+	}
+	sync_config_directory(&pinned.target.directory)?;
+	ensure_config_symlinks_unchanged(&pinned, display_path)?;
+	let (_, current) = read_pinned_config_bytes(&pinned.target, display_path)?;
+	ensure_target_identity(&pinned, &current, expected, display_path)
 }
 
 fn publish_prepared_file_at_sync<B, F>(
@@ -2860,13 +2916,13 @@ pub fn parse_git_bool(value: &str) -> Option<bool> {
 mod tests {
 	#[cfg(unix)]
 	use super::{
-		PinnedConfigTarget, PreparedConfigImage, PreparedConfigOutcome, edit_file_at,
-		edit_file_at_guarded, edit_file_at_if_current, edit_file_at_tracked,
-		ensure_config_target_unchanged, open_resolved_config_directory, prepare_reserved_file_at,
-		prepare_reserved_file_at_guarded, publish_config_target, publish_prepared_file_at,
-		publish_prepared_file_at_guarded, read_config_input_sync, read_file_at_identified,
-		read_file_at_identified_with_containment, read_pinned_config_bytes, reserve_file_at_if_current,
-		resolve_config_name, restore_prepared_file_before_image_at,
+		PinnedConfigTarget, PreparedConfigImage, PreparedConfigOutcome,
+		discard_prepared_file_at_guarded, edit_file_at, edit_file_at_guarded, edit_file_at_if_current,
+		edit_file_at_tracked, ensure_config_target_unchanged, open_resolved_config_directory,
+		prepare_reserved_file_at, prepare_reserved_file_at_guarded, publish_config_target,
+		publish_prepared_file_at, publish_prepared_file_at_guarded, read_config_input_sync,
+		read_file_at_identified, read_file_at_identified_with_containment, read_pinned_config_bytes,
+		reserve_file_at_if_current, resolve_config_name, restore_prepared_file_before_image_at,
 	};
 	use super::{
 		for_worktree, for_worktree_at_excluding, from_ambient, validate_command_config,
@@ -3276,6 +3332,54 @@ mod tests {
 			.unwrap(),
 			PreparedConfigOutcome::AlreadyPublished
 		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn unpublished_prepared_config_can_be_discarded_by_identity() {
+		let temporary = tempfile::tempdir().unwrap();
+		let config = temporary.path().join("config");
+		std::fs::write(&config, "[core]\n\tbare = true\n").unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let (_, target) =
+			read_file_at_identified(directory.try_clone().unwrap(), Path::new("config"), &config)
+				.await
+				.unwrap();
+		let prepared = reserve_file_at_if_current(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+		)
+		.await
+		.unwrap();
+		let prepared_name = prepared.name().to_owned();
+
+		discard_prepared_file_at_guarded(
+			directory.try_clone().unwrap(),
+			Path::new("config"),
+			&config,
+			target.clone(),
+			prepared.clone(),
+			(),
+		)
+		.await
+		.unwrap();
+		assert!(!temporary.path().join(prepared_name).exists());
+		assert_eq!(
+			std::fs::read_to_string(&config).unwrap(),
+			"[core]\n\tbare = true\n"
+		);
+		discard_prepared_file_at_guarded(
+			directory,
+			Path::new("config"),
+			&config,
+			target,
+			prepared,
+			(),
+		)
+		.await
+		.unwrap();
 	}
 
 	#[cfg(unix)]

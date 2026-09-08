@@ -908,6 +908,16 @@ impl SubmoduleContext {
 				entry.declaration.path
 			)));
 		}
+		if crate::repository_has_pending_set_url_recovery(
+			&module_directory,
+			&module_directory,
+			&module_layout,
+		)? {
+			return Err(SubmoduleError::RecoveryRequired(format!(
+				"pending nested submodule set-url recovery in '{}' must be completed before updating its parent",
+				entry.declaration.path
+			)));
+		}
 		let mutation_lease = mutation_lease.clone().combine(module_mutation_lease);
 		let hash_directory = module_directory
 			.try_clone()
@@ -3327,7 +3337,7 @@ fn module_origin_url(
 		.ok_or_else(|| SubmoduleError::MissingModuleOrigin(module.to_owned()))
 }
 
-async fn module_update_remote<F: FileStore, H: HashAlgorithm>(
+pub(crate) async fn module_update_remote<F: FileStore, H: HashAlgorithm>(
 	repository: &Repository<F, H>,
 	config: &GitConfig,
 ) -> Result<String, SubmoduleError> {

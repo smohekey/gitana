@@ -18,7 +18,7 @@ use gitana_repository::Config;
 use gitana_submodule::{
 	ConfigurationProvider, DeinitConfigPublication, DeinitConfigTarget, DeinitConfigTransition,
 	DeinitWorktreeAttachment, InitConfigResult, InitConfigUpdate, MarkerTargetResolver,
-	SubmoduleError, SubmoduleMutationLease,
+	SetUrlConfigurationProvider, SubmoduleError, SubmoduleMutationLease,
 };
 use sha2::{Digest, Sha256};
 
@@ -36,6 +36,10 @@ pub(crate) struct WorktreeConfiguration {
 	marker_target_pause: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
 	#[cfg(test)]
 	module_deinit_publication_pause: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
+	#[cfg(test)]
+	set_url_root_validation_pause: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
+	#[cfg(test)]
+	set_url_module_publication_pause: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
 }
 
 impl WorktreeConfiguration {
@@ -51,6 +55,10 @@ impl WorktreeConfiguration {
 			marker_target_pause: None,
 			#[cfg(test)]
 			module_deinit_publication_pause: None,
+			#[cfg(test)]
+			set_url_root_validation_pause: None,
+			#[cfg(test)]
+			set_url_module_publication_pause: None,
 		}
 	}
 
@@ -77,6 +85,26 @@ impl WorktreeConfiguration {
 		release: Arc<AtomicBool>,
 	) -> Self {
 		self.module_deinit_publication_pause = Some((entered, release));
+		self
+	}
+
+	#[cfg(test)]
+	fn with_set_url_root_validation_pause(
+		mut self,
+		entered: Arc<AtomicBool>,
+		release: Arc<AtomicBool>,
+	) -> Self {
+		self.set_url_root_validation_pause = Some((entered, release));
+		self
+	}
+
+	#[cfg(test)]
+	fn with_set_url_module_publication_pause(
+		mut self,
+		entered: Arc<AtomicBool>,
+		release: Arc<AtomicBool>,
+	) -> Self {
+		self.set_url_module_publication_pause = Some((entered, release));
 		self
 	}
 
@@ -748,6 +776,476 @@ impl ConfigurationProvider for WorktreeConfiguration {
 		)
 		.await
 	}
+}
+
+impl SetUrlConfigurationProvider for WorktreeConfiguration {
+	async fn revalidate_set_url_superproject(
+		&self,
+		worktree: Dir,
+		worktree_root: &Path,
+	) -> Result<(), SubmoduleError> {
+		#[cfg(test)]
+		if let Some((entered, release)) = self.set_url_root_validation_pause.clone() {
+			entered.store(true, Ordering::SeqCst);
+			while !release.load(Ordering::SeqCst) {
+				tokio::task::yield_now().await;
+			}
+		}
+		let expected = crate::RepositoryLayoutIdentity {
+			worktree: Some(directory_identity(&worktree).map_err(|error| {
+				SubmoduleError::Configuration(format!(
+					"identifying retained worktree {}: {error}",
+					worktree_root.display()
+				))
+			})?),
+			git: directory_identity(&self.git).map_err(|error| {
+				SubmoduleError::Configuration(format!(
+					"identifying retained Git directory {}: {error}",
+					self.git_dir.display()
+				))
+			})?,
+			common: directory_identity(&self.common).map_err(|error| {
+				SubmoduleError::Configuration(format!(
+					"identifying retained common Git directory {}: {error}",
+					self.common_dir.display()
+				))
+			})?,
+		};
+		let layout = gitana_repository_layout::RepositoryLayout {
+			worktree_root: Some(worktree_root.to_owned()),
+			git_dir: self.git_dir.clone(),
+			common_dir: self.common_dir.clone(),
+		};
+		crate::repo::revalidate_repository_layout(&layout, expected)
+			.await
+			.map(|_| ())
+			.map_err(|error| SubmoduleError::Configuration(format!("{error:#}")))
+	}
+
+	async fn plan_set_url_declaration(
+		&self,
+		directory: Dir,
+		display_path: &Path,
+		path: &str,
+		url: &str,
+	) -> Result<(String, DeinitConfigTransition), SubmoduleError> {
+		let (mut config, target) =
+			read_config_at(directory, Path::new(".gitmodules"), display_path).await?;
+		let before_fingerprint = config_fingerprint(&config);
+		let name = gitana_submodule::set_url(&mut config, path, url)?;
+		Ok((
+			name,
+			DeinitConfigTransition {
+				before_fingerprint,
+				after_fingerprint: config_fingerprint(&config),
+				target,
+				worktree_attachment: None,
+			},
+		))
+	}
+
+	async fn plan_set_url_value(
+		&self,
+		directory: Dir,
+		display_path: &Path,
+		effective: &GitConfig,
+		section: &str,
+		subsection: &str,
+		url: &str,
+	) -> Result<DeinitConfigTransition, SubmoduleError> {
+		let (mut config, target) = read_config_at(directory, Path::new("config"), display_path).await?;
+		ensure_url_owned_by_base(&config, effective, section, subsection)?;
+		let before_fingerprint = config_fingerprint(&config);
+		set_single_url(&mut config, section, subsection, url)?;
+		Ok(DeinitConfigTransition {
+			before_fingerprint,
+			after_fingerprint: config_fingerprint(&config),
+			target,
+			worktree_attachment: None,
+		})
+	}
+
+	async fn validate_set_url_effective_value(
+		&self,
+		directory: Dir,
+		path: gitana_submodule::SetUrlConfigPath<'_>,
+		effective: &GitConfig,
+		key: (&str, &str),
+		transition: &DeinitConfigTransition,
+		publication: Option<&DeinitConfigPublication>,
+	) -> Result<(), SubmoduleError> {
+		let (section, subsection) = key;
+		let (config, target) = read_config_at(directory, path.relative, path.display).await?;
+		let expected_target = if transition.changes() {
+			let publication = publication.ok_or_else(|| {
+				SubmoduleError::RecoveryRequired(
+					"changed set-url transition has no prepared publication".to_owned(),
+				)
+			})?;
+			DeinitConfigTarget::new(
+				transition.target.parent(),
+				Some((publication.device, publication.inode)),
+				transition.target.symlinks(),
+			)
+		} else {
+			if publication.is_some() {
+				return Err(SubmoduleError::RecoveryRequired(
+					"unchanged set-url transition records a publication".to_owned(),
+				));
+			}
+			transition.target.clone()
+		};
+		if target != expected_target || config_fingerprint(&config) != transition.after_fingerprint {
+			return Err(SubmoduleError::Configuration(format!(
+				"config changed after set-url was published: {}",
+				path.display.display()
+			)));
+		}
+		ensure_url_owned_by_base(&config, effective, section, subsection)?;
+		if !matches!(
+			config
+				.get_all_raw(section, Some(subsection), "url")
+				.as_slice(),
+			[Some(_)]
+		) {
+			return Err(SubmoduleError::Configuration(format!(
+				"published {section}.{subsection}.url is not a single valued assignment"
+			)));
+		}
+		Ok(())
+	}
+
+	async fn reserve_set_url_config(
+		&self,
+		directory: Dir,
+		relative_path: &Path,
+		display_path: &Path,
+		transition: &DeinitConfigTransition,
+		lease: SubmoduleMutationLease,
+	) -> Result<Option<DeinitConfigPublication>, SubmoduleError> {
+		if !transition.changes() {
+			validate_current_url_transition(directory, relative_path, display_path, transition).await?;
+			return Ok(None);
+		}
+		let prepared = gitana_config_native::reserve_file_at_if_current_guarded(
+			directory,
+			relative_path,
+			display_path,
+			native_target(&transition.target),
+			lease,
+		)
+		.await
+		.map_err(|error| SubmoduleError::Configuration(format!("{error:#}")))?;
+		let (device, inode) = prepared.identity().parts();
+		let name = prepared.name().to_str().ok_or_else(|| {
+			SubmoduleError::Configuration("reserved set-url config name is not valid UTF-8".to_owned())
+		})?;
+		Ok(Some(DeinitConfigPublication::new(
+			name.to_owned(),
+			device,
+			inode,
+		)))
+	}
+
+	async fn prepare_set_url_value(
+		&self,
+		directory: Dir,
+		path: gitana_submodule::SetUrlConfigPath<'_>,
+		value: gitana_submodule::SetUrlValue<'_>,
+		transition: &DeinitConfigTransition,
+		publication: &DeinitConfigPublication,
+		lease: SubmoduleMutationLease,
+	) -> Result<(), SubmoduleError> {
+		let transition = transition.clone();
+		let section = value.section.to_owned();
+		let subsection = value.subsection.to_owned();
+		let url = value.url.to_owned();
+		gitana_config_native::prepare_reserved_file_at_guarded(
+			directory,
+			path.relative,
+			path.display,
+			native_target(&transition.target),
+			native_publication(publication),
+			lease,
+			move |config| {
+				if config_fingerprint(config) != transition.before_fingerprint {
+					bail!("config changed after set-url was planned");
+				}
+				set_single_url(config, &section, &subsection, &url)
+					.map_err(|error| anyhow::anyhow!(error.to_string()))?;
+				if config_fingerprint(config) != transition.after_fingerprint {
+					bail!("set-url config transition did not produce its planned fingerprint");
+				}
+				Ok(())
+			},
+		)
+		.await
+		.map_err(|error| SubmoduleError::Configuration(format!("{error:#}")))
+	}
+
+	async fn apply_set_url_config(
+		&self,
+		directory: Dir,
+		relative_path: &Path,
+		display_path: &Path,
+		transition: &DeinitConfigTransition,
+		publication: Option<&DeinitConfigPublication>,
+		lease: SubmoduleMutationLease,
+	) -> Result<bool, SubmoduleError> {
+		#[cfg(test)]
+		if relative_path == Path::new("config")
+			&& display_path != self.common_dir.join("config")
+			&& let Some((entered, release)) = self.set_url_module_publication_pause.clone()
+		{
+			entered.store(true, Ordering::SeqCst);
+			while !release.load(Ordering::SeqCst) {
+				tokio::task::yield_now().await;
+			}
+		}
+		apply_prepared_url_transition(
+			directory,
+			relative_path,
+			display_path,
+			transition,
+			publication,
+			lease,
+		)
+		.await
+	}
+
+	async fn restore_set_url_before_image(
+		&self,
+		directory: Dir,
+		relative_path: &Path,
+		display_path: &Path,
+		transition: &DeinitConfigTransition,
+		publication: &DeinitConfigPublication,
+		lease: SubmoduleMutationLease,
+	) -> Result<bool, SubmoduleError> {
+		restore_prepared_url_before_image(
+			directory,
+			relative_path,
+			display_path,
+			transition,
+			publication,
+			lease,
+		)
+		.await
+	}
+
+	async fn set_url_before_image_requires_restore(
+		&self,
+		directory: Dir,
+		relative_path: &Path,
+		display_path: &Path,
+		transition: &DeinitConfigTransition,
+		publication: &DeinitConfigPublication,
+	) -> Result<bool, SubmoduleError> {
+		url_before_image_requires_restore(
+			directory,
+			relative_path,
+			display_path,
+			transition,
+			publication,
+		)
+		.await
+	}
+
+	async fn discard_set_url_config(
+		&self,
+		directory: Dir,
+		relative_path: &Path,
+		display_path: &Path,
+		transition: &DeinitConfigTransition,
+		publication: &DeinitConfigPublication,
+		lease: SubmoduleMutationLease,
+	) -> Result<(), SubmoduleError> {
+		gitana_config_native::discard_prepared_file_at_guarded(
+			directory,
+			relative_path,
+			display_path,
+			native_target(&transition.target),
+			native_publication(publication),
+			lease,
+		)
+		.await
+		.map_err(|error| SubmoduleError::Configuration(format!("{error:#}")))
+	}
+}
+
+async fn read_config_at(
+	directory: Dir,
+	relative_path: &Path,
+	display_path: &Path,
+) -> Result<(GitConfig, DeinitConfigTarget), SubmoduleError> {
+	let (bytes, target) =
+		gitana_config_native::read_file_at_identified(directory, relative_path, display_path)
+			.await
+			.map_err(|error| SubmoduleError::Configuration(format!("{error:#}")))?;
+	Ok((
+		parse_local_config(bytes, display_path)?,
+		deinit_target(target),
+	))
+}
+
+fn set_single_url(
+	config: &mut GitConfig,
+	section: &str,
+	subsection: &str,
+	url: &str,
+) -> Result<(), SubmoduleError> {
+	if config.get_all_raw(section, Some(subsection), "url").len() > 1 {
+		return Err(
+			gitana_config::ConfigError::MultipleValues(format!("{section}.{subsection}.url")).into(),
+		);
+	}
+	config.set(section, Some(subsection), "url", url)?;
+	Ok(())
+}
+
+fn ensure_url_owned_by_base(
+	base: &GitConfig,
+	effective: &GitConfig,
+	section: &str,
+	subsection: &str,
+) -> Result<(), SubmoduleError> {
+	let key = format!("{section}.{subsection}.url");
+	if base.get_all_raw(section, Some(subsection), "url")
+		!= effective.get_all_raw(section, Some(subsection), "url")
+	{
+		return Err(SubmoduleError::Configuration(format!(
+			"effective {key} is defined outside the writable base config"
+		)));
+	}
+	Ok(())
+}
+
+async fn validate_current_url_transition(
+	directory: Dir,
+	relative_path: &Path,
+	display_path: &Path,
+	transition: &DeinitConfigTransition,
+) -> Result<(), SubmoduleError> {
+	let (config, target) = read_config_at(directory, relative_path, display_path).await?;
+	if target != transition.target || config_fingerprint(&config) != transition.before_fingerprint {
+		return Err(SubmoduleError::Configuration(format!(
+			"config changed after set-url was planned: {}",
+			display_path.display()
+		)));
+	}
+	Ok(())
+}
+
+async fn apply_prepared_url_transition(
+	directory: Dir,
+	relative_path: &Path,
+	display_path: &Path,
+	transition: &DeinitConfigTransition,
+	publication: Option<&DeinitConfigPublication>,
+	lease: SubmoduleMutationLease,
+) -> Result<bool, SubmoduleError> {
+	if !transition.changes() {
+		if publication.is_some() {
+			return Err(SubmoduleError::RecoveryRequired(
+				"unchanged set-url transition records a publication".to_owned(),
+			));
+		}
+		validate_current_url_transition(directory, relative_path, display_path, transition).await?;
+		return Ok(false);
+	}
+	let publication = publication.ok_or_else(|| {
+		SubmoduleError::RecoveryRequired(
+			"changed set-url transition has no prepared publication".to_owned(),
+		)
+	})?;
+	let before = transition.before_fingerprint.clone();
+	let after = transition.after_fingerprint.clone();
+	let outcome = gitana_config_native::publish_prepared_file_at_guarded(
+		directory,
+		relative_path,
+		display_path,
+		native_target(&transition.target),
+		native_publication(publication),
+		lease,
+		move |image, config| {
+			let expected = match image {
+				gitana_config_native::PreparedConfigImage::Before => &before,
+				gitana_config_native::PreparedConfigImage::After => &after,
+			};
+			if config_fingerprint(config) != *expected {
+				bail!("journaled set-url config image does not match its planned fingerprint");
+			}
+			Ok(())
+		},
+	)
+	.await
+	.map_err(|error| SubmoduleError::Configuration(format!("{error:#}")))?;
+	Ok(matches!(
+		outcome,
+		gitana_config_native::PreparedConfigOutcome::Published
+	))
+}
+
+async fn restore_prepared_url_before_image(
+	directory: Dir,
+	relative_path: &Path,
+	display_path: &Path,
+	transition: &DeinitConfigTransition,
+	publication: &DeinitConfigPublication,
+	lease: SubmoduleMutationLease,
+) -> Result<bool, SubmoduleError> {
+	let before = transition.before_fingerprint.clone();
+	let after = transition.after_fingerprint.clone();
+	gitana_config_native::restore_prepared_file_before_image_at_guarded(
+		directory,
+		relative_path,
+		display_path,
+		native_target(&transition.target),
+		native_publication(publication),
+		lease,
+		move |image, config| {
+			let expected = match image {
+				gitana_config_native::PreparedConfigImage::Before => &before,
+				gitana_config_native::PreparedConfigImage::After => &after,
+			};
+			if config_fingerprint(config) != *expected {
+				bail!("journaled set-url config image does not match its planned fingerprint");
+			}
+			Ok(())
+		},
+	)
+	.await
+	.map_err(|error| SubmoduleError::Configuration(format!("{error:#}")))
+}
+
+async fn url_before_image_requires_restore(
+	directory: Dir,
+	relative_path: &Path,
+	display_path: &Path,
+	transition: &DeinitConfigTransition,
+	publication: &DeinitConfigPublication,
+) -> Result<bool, SubmoduleError> {
+	let before = transition.before_fingerprint.clone();
+	let after = transition.after_fingerprint.clone();
+	gitana_config_native::prepared_file_before_image_requires_restore_at(
+		directory,
+		relative_path,
+		display_path,
+		native_target(&transition.target),
+		native_publication(publication),
+		move |image, config| {
+			let expected = match image {
+				gitana_config_native::PreparedConfigImage::Before => &before,
+				gitana_config_native::PreparedConfigImage::After => &after,
+			};
+			if config_fingerprint(config) != *expected {
+				bail!("journaled set-url config image does not match its planned fingerprint");
+			}
+			Ok(())
+		},
+	)
+	.await
+	.map_err(|error| SubmoduleError::Configuration(format!("{error:#}")))
 }
 
 async fn read_local_config(
@@ -1573,8 +2071,8 @@ mod tests {
 	use gitana_repository_layout::RepositoryLayout;
 	use gitana_submodule::{
 		ConfigViews, FetchRepository, FetchSource, FetchedTransfer, InitRequest, PrepareRepository,
-		PrepareSource, PreparedTransfer, RepositoryTransfer, SubmoduleContext, SubmoduleMutationLease,
-		SubmoduleObjectId, UpdateOutcomeState, UpdateRequest,
+		PrepareSource, PreparedTransfer, RepositoryTransfer, SetUrlRequest, SubmoduleContext,
+		SubmoduleMutationLease, SubmoduleObjectId, UpdateOutcomeState, UpdateRequest,
 	};
 	use gitana_worktree::{Index, IndexEntry, Stat};
 	use std::os::unix::fs::symlink;
@@ -1584,6 +2082,239 @@ mod tests {
 
 	fn mutation_lease() -> SubmoduleMutationLease {
 		SubmoduleMutationLease::retain(Arc::new(()))
+	}
+
+	#[test]
+	fn set_url_ownership_rejects_matching_values_from_an_overlay() {
+		let base = GitConfig::parse("[submodule \"one\"]\n\turl = next\n").unwrap();
+		let mut unrelated = base.clone();
+		unrelated
+			.overlay([gitana_config::GitConfigSource::parse("[core]\n\tfilemode = false\n").unwrap()]);
+		ensure_url_owned_by_base(&base, &unrelated, "submodule", "one").unwrap();
+
+		let mut effective = base.clone();
+		effective
+			.overlay([
+				gitana_config::GitConfigSource::parse("[submodule \"one\"]\n\turl = next\n").unwrap(),
+			]);
+
+		let error = ensure_url_owned_by_base(&base, &effective, "submodule", "one").unwrap_err();
+		assert!(
+			error
+				.to_string()
+				.contains("defined outside the writable base config")
+		);
+	}
+
+	#[tokio::test]
+	async fn set_url_revalidates_the_root_after_acquiring_its_mutation_locks() {
+		let temporary = tempfile::tempdir().unwrap();
+		let temporary_root = temporary.path().canonicalize().unwrap();
+		let worktree = temporary_root.join("work");
+		let git_dir = worktree.join(".git");
+		std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+		std::fs::create_dir(git_dir.join("refs")).unwrap();
+		let config = "[core]\n\trepositoryformatversion = 0\n";
+		let modules = "[submodule \"one\"]\n\tpath = modules/one\n\turl = old\n";
+		std::fs::write(git_dir.join("config"), config).unwrap();
+		std::fs::write(worktree.join(".gitmodules"), modules).unwrap();
+
+		let common = Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap();
+		let git = common.try_clone().unwrap();
+		let entered = Arc::new(AtomicBool::new(false));
+		let release = Arc::new(AtomicBool::new(false));
+		let configuration = Arc::new(
+			WorktreeConfiguration::new(
+				common.try_clone().unwrap(),
+				git.try_clone().unwrap(),
+				&git_dir,
+				&git_dir,
+			)
+			.with_set_url_root_validation_pause(Arc::clone(&entered), Arc::clone(&release)),
+		);
+		let effective = configuration.reload().await.unwrap();
+		let context = Arc::new(
+			SubmoduleContext::new(
+				RepositoryLayout {
+					worktree_root: Some(worktree.clone()),
+					git_dir: git_dir.clone(),
+					common_dir: git_dir.clone(),
+				},
+				common,
+				git,
+				Dir::open_ambient_dir(&worktree, ambient_authority()).unwrap(),
+				ConfigViews::new(effective),
+				String::new(),
+				HashKind::Sha1,
+			)
+			.unwrap(),
+		);
+		let running_context = Arc::clone(&context);
+		let running_configuration = Arc::clone(&configuration);
+		let task = tokio::spawn(async move {
+			running_context
+				.set_url(
+					&SetUrlRequest {
+						path: "modules/one".to_owned(),
+						url: "next".to_owned(),
+					},
+					running_configuration.as_ref(),
+				)
+				.await
+		});
+		for _ in 0..100_000 {
+			if entered.load(Ordering::SeqCst) {
+				break;
+			}
+			tokio::task::yield_now().await;
+		}
+		assert!(entered.load(Ordering::SeqCst));
+
+		let displaced = temporary_root.join("displaced");
+		std::fs::rename(&worktree, &displaced).unwrap();
+		std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+		std::fs::create_dir(git_dir.join("refs")).unwrap();
+		std::fs::write(git_dir.join("config"), config).unwrap();
+		std::fs::write(worktree.join(".gitmodules"), "replacement\n").unwrap();
+		release.store(true, Ordering::SeqCst);
+
+		let error = task.await.unwrap().unwrap_err();
+		assert!(
+			error
+				.to_string()
+				.contains("worktree changed while waiting for repository setup"),
+			"unexpected error: {error}"
+		);
+		assert_eq!(
+			std::fs::read_to_string(displaced.join(".gitmodules")).unwrap(),
+			modules
+		);
+		assert_eq!(
+			std::fs::read_to_string(worktree.join(".gitmodules")).unwrap(),
+			"replacement\n"
+		);
+		assert!(!displaced.join(".git/gitana-submodule-set-url").exists());
+		assert!(!worktree.join(".git/gitana-submodule-set-url").exists());
+	}
+
+	#[tokio::test]
+	async fn set_url_revalidates_the_visible_module_after_config_publication() {
+		let temporary = tempfile::tempdir().unwrap();
+		let worktree = temporary.path().canonicalize().unwrap().join("work");
+		let git_dir = worktree.join(".git");
+		let module_git = git_dir.join("modules/one");
+		let module_worktree = worktree.join("modules/one");
+		for directory in [
+			git_dir.join("objects"),
+			git_dir.join("refs"),
+			module_git.join("objects"),
+			module_git.join("refs"),
+			module_worktree.clone(),
+		] {
+			std::fs::create_dir_all(directory).unwrap();
+		}
+		let super_config = "[core]\n\trepositoryformatversion = 0\n\
+			[submodule \"one\"]\n\tactive = true\n\turl = old\n";
+		let module_config = "[core]\n\trepositoryformatversion = 0\n\tworktree = ../../../modules/one\n\
+			[remote \"origin\"]\n\turl = old\n";
+		let modules = "[submodule \"one\"]\n\tpath = modules/one\n\turl = old\n";
+		std::fs::write(git_dir.join("config"), super_config).unwrap();
+		std::fs::write(worktree.join(".gitmodules"), modules).unwrap();
+		std::fs::write(module_git.join("config"), module_config).unwrap();
+		std::fs::write(module_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		std::fs::write(
+			module_worktree.join(".git"),
+			"gitdir: ../../.git/modules/one\n",
+		)
+		.unwrap();
+
+		let common = Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap();
+		let git = common.try_clone().unwrap();
+		let entered = Arc::new(AtomicBool::new(false));
+		let release = Arc::new(AtomicBool::new(false));
+		let configuration = Arc::new(
+			WorktreeConfiguration::new(
+				common.try_clone().unwrap(),
+				git.try_clone().unwrap(),
+				&git_dir,
+				&git_dir,
+			)
+			.with_set_url_module_publication_pause(Arc::clone(&entered), Arc::clone(&release)),
+		);
+		let effective = configuration.reload().await.unwrap();
+		let context = Arc::new(
+			SubmoduleContext::new(
+				RepositoryLayout {
+					worktree_root: Some(worktree.clone()),
+					git_dir: git_dir.clone(),
+					common_dir: git_dir.clone(),
+				},
+				common,
+				git,
+				Dir::open_ambient_dir(&worktree, ambient_authority()).unwrap(),
+				ConfigViews::new(effective),
+				String::new(),
+				HashKind::Sha1,
+			)
+			.unwrap(),
+		);
+		let running_context = Arc::clone(&context);
+		let running_configuration = Arc::clone(&configuration);
+		let task = tokio::spawn(async move {
+			running_context
+				.set_url(
+					&SetUrlRequest {
+						path: "modules/one".to_owned(),
+						url: "next".to_owned(),
+					},
+					running_configuration.as_ref(),
+				)
+				.await
+		});
+		for _ in 0..100_000 {
+			if entered.load(Ordering::SeqCst) {
+				break;
+			}
+			if task.is_finished() {
+				break;
+			}
+			tokio::task::yield_now().await;
+		}
+		if !entered.load(Ordering::SeqCst) {
+			panic!(
+				"set-url finished before module publication: {:?}",
+				task.await.unwrap()
+			);
+		}
+
+		let displaced = git_dir.join("modules/displaced");
+		std::fs::rename(&module_git, &displaced).unwrap();
+		std::fs::create_dir_all(module_git.join("objects")).unwrap();
+		std::fs::create_dir(module_git.join("refs")).unwrap();
+		let replacement_config = "[core]\n\trepositoryformatversion = 0\n\tworktree = ../../../modules/one\n\
+			[remote \"origin\"]\n\turl = replacement\n";
+		std::fs::write(module_git.join("config"), replacement_config).unwrap();
+		std::fs::write(module_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		release.store(true, Ordering::SeqCst);
+
+		let error = task.await.unwrap().unwrap_err();
+		assert!(matches!(error, SubmoduleError::InvalidRepository(ref name) if name == "one"));
+		assert_eq!(
+			std::fs::read_to_string(module_git.join("config")).unwrap(),
+			replacement_config
+		);
+		assert!(
+			std::fs::read_to_string(displaced.join("config"))
+				.unwrap()
+				.contains("url = next")
+		);
+		assert!(
+			git_dir
+				.join("gitana-submodule-set-url/intent.json")
+				.exists()
+		);
+		assert!(displaced.join("gitana-submodule-set-url.claim").exists());
+		assert!(!module_git.join("gitana-submodule-set-url.claim").exists());
 	}
 
 	struct UnexpectedTransfer;
