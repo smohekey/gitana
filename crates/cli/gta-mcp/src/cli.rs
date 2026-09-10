@@ -659,6 +659,14 @@ enum SubmoduleAction {
 		#[arg(long = "new-url")]
 		url: String,
 	},
+	/// Synchronize registered submodule URLs from `.gitmodules`.
+	Sync {
+		/// Recursively synchronize initialized descendants.
+		#[arg(long)]
+		recursive: bool,
+		#[arg(long = "path")]
+		paths: Vec<String>,
+	},
 }
 
 #[derive(Args)]
@@ -1254,6 +1262,7 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 			path,
 		} => Action::SetBranch { branch, path },
 		SubmoduleAction::SetUrl { path, url } => Action::SetUrl { path, url },
+		SubmoduleAction::Sync { recursive, paths } => Action::Sync { recursive, paths },
 	}
 }
 
@@ -1511,6 +1520,26 @@ mod tests {
 			submodule_action(action),
 			commands::submodule::Action::SetUrl { path, url }
 				if path == "modules/one" && url == "../new"
+		));
+	}
+
+	#[test]
+	fn sync_maps_named_arguments_to_the_shared_action() {
+		let cli = Cli::try_parse_from([
+			"gta-mcp",
+			"submodule",
+			"sync",
+			"--recursive",
+			"--path=modules/one",
+		])
+		.unwrap();
+		let Command::Submodule { action } = cli.command else {
+			panic!("expected submodule command");
+		};
+		assert!(matches!(
+			submodule_action(action),
+			commands::submodule::Action::Sync { recursive: true, paths }
+				if paths == ["modules/one"]
 		));
 	}
 }

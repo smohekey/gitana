@@ -3,7 +3,8 @@
 ## Scope
 
 Gitana implements the consumer commands `submodule status`, `submodule init`, `submodule update`,
-`submodule deinit`, `submodule set-branch`, and `submodule set-url`. `status --recursive` and `update --recursive`
+`submodule deinit`, `submodule set-branch`, `submodule set-url`, and `submodule sync`.
+`status --recursive`, `update --recursive`, and `sync --recursive`
 explicitly recurse into nested
 submodules; omitted flags remain one-level operations, and root pathspecs select only the first
 level before every eligible descendant is considered. `clone --recurse-submodules[=<pathspec>]`
@@ -158,6 +159,26 @@ reloads each effective configuration to prove that no surviving overlay can supe
 published URL. It then retires the coordinator before its participant claim; a crash between those
 steps leaves a blocking, self-identifying orphan claim that the owning coordinator can safely retire
 on retry.
+
+`submodule sync [--recursive] [<path>...]` treats the selected `.gitmodules` URLs as immutable
+inputs and uses the set-URL transaction to copy their resolved, password-redacted values into
+registered configuration. Selection uses the current index and ordinary pathspec rules. A module
+must already be registered and active; unlike initialization, an explicit path does not override an
+inactive setting. Unregistered and inactive modules are silent, while every synchronized
+registration prints Git's synchronization notice even when its value was already current. An
+attached module also updates the remote selected by its current branch; an unmounted module leaves its
+retained repository config unchanged. A declaration changed after selection is rejected rather than
+written back, and `.gitmodules` is never staged.
+
+The command resumes any current set-URL intent before consulting the current index. A multi-module
+sync is a sequence of durable per-module transactions: a later failure retains and reports the
+completed prefix. Recursive sync first scans the selected initialized subtree (plus an owner needed
+by root recovery) and resumes nested set-URL journals deepest-first. Normal synchronization is then
+parent-first, completing each repository-local batch before entering attached synchronized
+children, so descendant relative URLs resolve against the newly synchronized parent remote. Root
+pathspecs select only the first level; inactive, unregistered, detached, and conflicted parents stop
+descent. No parent repository lock is retained while acquiring a child lock, and every recursive
+level uses the same exact-root identity validation as recursive update.
 
 A rejected non-fast-forward remote-tracking update fails the submodule update before checkout. Any
 objects and unrelated refs already fetched may remain, but the module HEAD and worktree are not

@@ -10262,6 +10262,506 @@ fn set_branch_preserves_a_symlinked_gitmodules_file() {
 }
 
 #[test]
+fn sync_updates_only_active_registered_submodules_without_changing_declarations() {
+	let fixture = Fixture::new("sync-active-registered");
+	let unregistered = gta(&fixture.consumer, false, &["submodule", "sync"]);
+	assert_success(&unregistered, "skip unregistered module");
+	assert!(stdout(&unregistered).is_empty());
+	assert!(stderr(&unregistered).is_empty());
+	assert!(
+		!git_path(&fixture.consumer, "gitana-submodule-update.lock").exists(),
+		"a read-only no-op must not create the mutation lock"
+	);
+	assert_success(
+		&gta(&fixture.consumer, false, &["submodule", "init"]),
+		"register module",
+	);
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.url",
+			"../replacement",
+		],
+	);
+	let declaration = std::fs::read(fixture.consumer.join(".gitmodules")).unwrap();
+	let synchronized = gta(&fixture.consumer, false, &["submodule", "sync"]);
+	assert_success(&synchronized, "synchronize registered module");
+	assert_eq!(
+		stdout(&synchronized),
+		"Synchronizing submodule url for 'modules/one'\n"
+	);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".gitmodules")).unwrap(),
+		declaration,
+		"sync must treat .gitmodules as an immutable source"
+	);
+	let expected = fixture.root.join("replacement");
+	assert_eq!(
+		git(&fixture.consumer, &["config", "--get", "submodule.one.url"]),
+		format!("{}\n", expected.display())
+	);
+	let already_current = gta(&fixture.consumer, false, &["submodule", "sync"]);
+	assert_success(
+		&already_current,
+		"report an already synchronized registration",
+	);
+	assert_eq!(
+		stdout(&already_current),
+		"Synchronizing submodule url for 'modules/one'\n"
+	);
+
+	git_ok(
+		&fixture.consumer,
+		&["config", "submodule.one.active", "false"],
+	);
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.url",
+			"../inactive",
+		],
+	);
+	let inactive = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "sync", "modules/one"],
+	);
+	assert_success(&inactive, "skip explicitly selected inactive module");
+	assert!(stdout(&inactive).is_empty());
+	assert_eq!(
+		git(&fixture.consumer, &["config", "--get", "submodule.one.url"]),
+		format!("{}\n", expected.display())
+	);
+
+	let missing = gta(&fixture.consumer, false, &["submodule", "sync", "missing"]);
+	assert!(!missing.status.success());
+	assert!(stderr(&missing).contains("pathspec 'missing' did not match"));
+}
+
+#[test]
+fn sync_uses_the_effective_multi_valued_declaration_url_without_editing_it() {
+	let fixture = Fixture::new("sync-multi-valued-declaration");
+	assert_success(
+		&gta(&fixture.consumer, false, &["submodule", "init"]),
+		"register module",
+	);
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"--add",
+			"submodule.one.url",
+			"../replacement",
+		],
+	);
+	let declarations = std::fs::read(fixture.consumer.join(".gitmodules")).unwrap();
+
+	let synchronized = gta(&fixture.consumer, false, &["submodule", "sync"]);
+	assert_success(&synchronized, "synchronize effective declaration URL");
+	assert_eq!(
+		stdout(&synchronized),
+		"Synchronizing submodule url for 'modules/one'\n"
+	);
+	assert_eq!(
+		git(&fixture.consumer, &["config", "--get", "submodule.one.url"]),
+		format!("{}\n", fixture.root.join("replacement").display())
+	);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".gitmodules")).unwrap(),
+		declarations,
+		"sync must preserve every declaration URL occurrence"
+	);
+}
+
+#[test]
+fn sync_skips_an_inactive_module_before_reading_its_valueless_registration_url() {
+	let fixture = Fixture::new("sync-inactive-valueless-registration");
+	assert_success(
+		&gta(&fixture.consumer, false, &["submodule", "init"]),
+		"register module",
+	);
+	git_ok(
+		&fixture.consumer,
+		&["config", "submodule.one.active", "false"],
+	);
+	git_ok(
+		&fixture.consumer,
+		&["config", "--unset-all", "submodule.one.url"],
+	);
+	let config_path = git_path(&fixture.consumer, "config");
+	let mut config = std::fs::read_to_string(&config_path).unwrap();
+	config.push_str("[submodule \"one\"]\n\turl\n");
+	std::fs::write(&config_path, config).unwrap();
+	let before = std::fs::read(&config_path).unwrap();
+
+	let inactive = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "sync", "modules/one"],
+	);
+	assert_success(&inactive, "skip inactive valueless registration");
+	assert!(stdout(&inactive).is_empty());
+	assert!(stderr(&inactive).is_empty());
+	assert_eq!(std::fs::read(&config_path).unwrap(), before);
+
+	git_ok(
+		&fixture.consumer,
+		&["config", "submodule.one.active", "true"],
+	);
+	let active = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "sync", "modules/one"],
+	);
+	assert!(!active.status.success());
+	assert!(stderr(&active).contains("submodule.one.url"));
+	assert!(stderr(&active).contains("missing value"));
+}
+
+#[test]
+fn sync_skips_a_conflicted_gitlink() {
+	use std::io::Write as _;
+
+	let fixture = Fixture::new("sync-conflicted");
+	assert_success(
+		&gta(&fixture.consumer, false, &["submodule", "init"]),
+		"register module",
+	);
+	git_ok(
+		&fixture.consumer,
+		&["config", "submodule.one.url", "preserved"],
+	);
+	git_ok(
+		&fixture.consumer,
+		&["update-index", "--force-remove", "modules/one"],
+	);
+	let mut conflict = Command::new("git")
+		.args(["-C", fixture.consumer.to_str().unwrap()])
+		.args(["update-index", "--index-info"])
+		.stdin(std::process::Stdio::piped())
+		.spawn()
+		.unwrap();
+	let stages = format!(
+		"160000 {} 1\tmodules/one\n160000 {} 2\tmodules/one\n160000 {} 3\tmodules/one\n",
+		fixture.old, fixture.old, fixture.old
+	);
+	conflict
+		.stdin
+		.take()
+		.unwrap()
+		.write_all(stages.as_bytes())
+		.unwrap();
+	assert!(conflict.wait().unwrap().success());
+
+	let synchronized = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "sync", "--recursive"],
+	);
+	assert_success(&synchronized, "skip conflicted module");
+	assert!(stdout(&synchronized).is_empty());
+	assert_eq!(
+		git(&fixture.consumer, &["config", "--get", "submodule.one.url"]),
+		"preserved\n"
+	);
+}
+
+#[test]
+fn sync_retires_an_empty_set_url_control_before_a_no_op() {
+	let fixture = Fixture::new("sync-empty-set-url-control");
+	let control = git_path(&fixture.consumer, "gitana-submodule-set-url");
+	std::fs::create_dir(&control).unwrap();
+	let synchronized = gta(&fixture.consumer, false, &["submodule", "sync"]);
+	assert_success(&synchronized, "retire empty set-url control");
+	assert!(stdout(&synchronized).is_empty());
+	assert!(!control.exists());
+}
+
+#[test]
+fn recursive_sync_retires_recovery_before_reporting_an_unmatched_pathspec() {
+	let fixture = Fixture::new("recursive-sync-unmatched-recovery");
+	let control = git_path(&fixture.consumer, "gitana-submodule-set-url");
+	std::fs::create_dir(&control).unwrap();
+
+	let synchronized = gta(
+		&fixture.consumer,
+		false,
+		&["submodule", "sync", "--recursive", "missing"],
+	);
+	assert!(!synchronized.status.success());
+	assert!(stderr(&synchronized).contains("pathspec 'missing' did not match"));
+	assert!(
+		!control.exists(),
+		"recovery must retire the empty control directory before strict selection"
+	);
+}
+
+#[test]
+fn sync_redacts_credentials_already_present_in_the_declaration() {
+	let fixture = Fixture::new("sync-redacts-declaration-credentials");
+	assert_success(
+		&gta(&fixture.consumer, false, &["submodule", "init"]),
+		"register module",
+	);
+	let credential_url = "https://alice:secret@example.test/repository";
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.url",
+			credential_url,
+		],
+	);
+	let synchronized = gta(&fixture.consumer, false, &["submodule", "sync"]);
+	assert_success(&synchronized, "synchronize redacted URL");
+	assert_eq!(
+		git(&fixture.consumer, &["config", "--get", "submodule.one.url"]),
+		"https://alice@example.test/repository\n"
+	);
+	assert_eq!(
+		git(
+			&fixture.consumer,
+			&["config", "-f", ".gitmodules", "--get", "submodule.one.url",]
+		),
+		format!("{credential_url}\n")
+	);
+	assert!(!stdout(&synchronized).contains("secret"));
+	assert!(!stderr(&synchronized).contains("secret"));
+}
+
+#[test]
+fn sync_reports_the_completed_prefix_when_a_later_declaration_is_invalid() {
+	let fixture = Fixture::new("sync-completed-prefix");
+	add_second_module_mapping(&fixture);
+	assert_success(
+		&gta(&fixture.consumer, false, &["submodule", "init"]),
+		"register both modules",
+	);
+	let replacement = fixture.root.join("replacement");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.url",
+			replacement.to_str().unwrap(),
+		],
+	);
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"--unset",
+			"submodule.two.url",
+		],
+	);
+
+	let synchronized = gta(&fixture.consumer, false, &["submodule", "sync"]);
+	assert!(!synchronized.status.success());
+	assert_eq!(
+		stdout(&synchronized),
+		"Synchronizing submodule url for 'modules/one'\n"
+	);
+	assert!(
+		stderr(&synchronized).contains("no URL found in .gitmodules for submodule path 'modules/two'")
+	);
+	assert_eq!(
+		git(&fixture.consumer, &["config", "--get", "submodule.one.url"]),
+		format!("{}\n", replacement.display())
+	);
+}
+
+#[test]
+fn sync_updates_the_attached_modules_selected_remote() {
+	let fixture = Fixture::new("sync-attached-remote");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initialize module",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(&module, &["switch", "-q", "-c", "topic"]);
+	git_ok(&module, &["config", "branch.topic.remote", "upstream"]);
+	git_ok(&module, &["remote", "add", "upstream", "old"]);
+	let replacement = fixture.root.join("replacement");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.url",
+			replacement.to_str().unwrap(),
+		],
+	);
+	let declaration = std::fs::read(fixture.consumer.join(".gitmodules")).unwrap();
+	let synchronized = gta(&fixture.consumer, false, &["submodule", "sync"]);
+	assert_success(&synchronized, "synchronize attached module");
+	assert_eq!(
+		git(&module, &["config", "--get", "remote.upstream.url"]),
+		format!("{}\n", replacement.display())
+	);
+	assert_ne!(
+		git(&module, &["config", "--get", "remote.origin.url"]),
+		format!("{}\n", replacement.display())
+	);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".gitmodules")).unwrap(),
+		declaration
+	);
+}
+
+#[test]
+fn recursive_sync_updates_parents_before_resolving_descendant_urls() {
+	let root = unique_tmp("sync-recursive");
+	let leaf = root.join("leaf");
+	let parent = root.join("parent");
+	let superproject = root.join("super");
+	let consumer = root.join("consumer");
+	for repository in [&leaf, &parent, &superproject] {
+		std::fs::create_dir_all(repository).unwrap();
+		init_repository(repository, None);
+		std::fs::write(
+			repository.join("file.txt"),
+			repository.display().to_string(),
+		)
+		.unwrap();
+		git_ok(repository, &["add", "file.txt"]);
+		commit(repository, "root");
+	}
+	git_allow(
+		&parent,
+		&[
+			"submodule",
+			"add",
+			"--name",
+			"leaf",
+			"../leaf",
+			"nested/leaf",
+		],
+	);
+	commit(&parent, "add leaf");
+	git_allow(
+		&superproject,
+		&[
+			"submodule",
+			"add",
+			"--name",
+			"parent",
+			"../parent",
+			"modules/parent",
+		],
+	);
+	commit(&superproject, "add parent");
+	assert_success(
+		&gta(
+			&root,
+			false,
+			&[
+				"clone",
+				superproject.to_str().unwrap(),
+				consumer.to_str().unwrap(),
+			],
+		),
+		"clone recursive sync fixture",
+	);
+	assert_success(
+		&gta(
+			&consumer,
+			true,
+			&["submodule", "update", "--init", "--recursive"],
+		),
+		"initialize recursive sync fixture",
+	);
+	git_ok(
+		&consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.parent.url",
+			"../parent-next",
+		],
+	);
+	let parent_worktree = consumer.join("modules/parent");
+	git_ok(
+		&parent_worktree,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.leaf.url",
+			"../leaf-next",
+		],
+	);
+	let one_level = gta(&consumer, false, &["submodule", "sync"]);
+	assert_success(&one_level, "one-level sync");
+	assert_eq!(
+		stdout(&one_level),
+		"Synchronizing submodule url for 'modules/parent'\n"
+	);
+	assert_ne!(
+		git(
+			&parent_worktree.join("nested/leaf"),
+			&["config", "--get", "remote.origin.url"]
+		),
+		format!("{}\n", root.join("leaf-next").display())
+	);
+	let root_control = git_path(&consumer, "gitana-submodule-set-url");
+	let child_control = git_path(&parent_worktree, "gitana-submodule-set-url");
+	std::fs::create_dir(&root_control).unwrap();
+	std::fs::create_dir(&child_control).unwrap();
+
+	let synchronized = gta(&consumer, false, &["submodule", "sync", "--recursive"]);
+	assert_success(&synchronized, "recursive sync");
+	assert_eq!(
+		stdout(&synchronized),
+		concat!(
+			"Synchronizing submodule url for 'modules/parent'\n",
+			"Synchronizing submodule url for 'modules/parent/nested/leaf'\n"
+		)
+	);
+	assert!(!root_control.exists());
+	assert!(!child_control.exists());
+	for (repository, key, expected) in [
+		(&consumer, "submodule.parent.url", root.join("parent-next")),
+		(
+			&parent_worktree,
+			"remote.origin.url",
+			root.join("parent-next"),
+		),
+		(
+			&parent_worktree,
+			"submodule.leaf.url",
+			root.join("leaf-next"),
+		),
+		(
+			&parent_worktree.join("nested/leaf"),
+			"remote.origin.url",
+			root.join("leaf-next"),
+		),
+	] {
+		assert_eq!(
+			git(repository, &["config", "--get", key]),
+			format!("{}\n", expected.display())
+		);
+	}
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn set_url_updates_the_declaration_and_registered_config_without_a_gitlink() {
 	let root = unique_tmp("set-url-uninitialized");
 	init_repository(&root, None);

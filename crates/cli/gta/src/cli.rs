@@ -609,6 +609,14 @@ enum SubmoduleAction {
 		#[arg(value_name = "newurl")]
 		url: String,
 	},
+	/// Synchronize registered submodule URLs from `.gitmodules`.
+	Sync {
+		/// Recursively synchronize initialized descendants.
+		#[arg(long)]
+		recursive: bool,
+		#[arg(value_name = "path")]
+		paths: Vec<String>,
+	},
 }
 
 #[derive(Args)]
@@ -1180,6 +1188,7 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 			path,
 		} => Action::SetBranch { branch, path },
 		SubmoduleAction::SetUrl { path, url } => Action::SetUrl { path, url },
+		SubmoduleAction::Sync { recursive, paths } => Action::Sync { recursive, paths },
 	}
 }
 

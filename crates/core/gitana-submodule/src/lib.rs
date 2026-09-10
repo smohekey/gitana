@@ -39,6 +39,7 @@ mod set_url_value;
 mod shared_config_guard;
 mod status;
 mod submodule_mutation_lease;
+mod sync;
 #[cfg(not(target_arch = "wasm32"))]
 mod transfer;
 mod update;
@@ -68,6 +69,8 @@ pub use config_views::ConfigViews;
 pub use configuration_provider::{ConfigurationProvider, InitConfigResult, InitConfigUpdate};
 #[cfg(not(target_arch = "wasm32"))]
 pub use context::SubmoduleContext;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use context::is_active;
 pub use deinit_config_publication::DeinitConfigPublication;
 pub use deinit_config_target::DeinitConfigTarget;
 pub use deinit_worktree_attachment::DeinitWorktreeAttachment;
@@ -98,6 +101,7 @@ pub use set_url_value::SetUrlValue;
 pub(crate) use shared_config_guard::SharedConfigGuard;
 pub use status::{SubmoduleStatus, SubmoduleStatusState};
 pub use submodule_mutation_lease::SubmoduleMutationLease;
+pub use sync::{SyncFailure, SyncOutcome, SyncOutcomeState, SyncReport, SyncRequest};
 #[cfg(not(target_arch = "wasm32"))]
 pub use transfer::{
 	FetchRepository, FetchSource, FetchedTransfer, PrepareRepository, PrepareSource,

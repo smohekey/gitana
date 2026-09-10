@@ -26,6 +26,21 @@ pub trait SetUrlConfigurationProvider: ConfigurationProvider {
 		url: &str,
 	) -> Result<(String, DeinitConfigTransition), SubmoduleError>;
 
+	/// Read and pin the immutable declarations used by URL synchronization.
+	async fn read_sync_declarations(
+		&self,
+		directory: Dir,
+		display_path: &Path,
+	) -> Result<(GitConfig, DeinitConfigTransition), SubmoduleError>;
+
+	/// Revalidate the immutable declarations at the synchronization completion boundary.
+	async fn validate_sync_declarations(
+		&self,
+		directory: Dir,
+		display_path: &Path,
+		transition: &DeinitConfigTransition,
+	) -> Result<(), SubmoduleError>;
+
 	/// Plan one repository-local URL assignment.
 	async fn plan_set_url_value(
 		&self,

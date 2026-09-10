@@ -23,8 +23,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	DeinitConfigPublication, DeinitConfigTransition, DeinitMountMarker, DurableIdentity, InitNotice,
 	SetUrlConfigPath, SetUrlConfigurationProvider, SetUrlReport, SetUrlRequest, SetUrlValue,
-	SubmoduleContext, SubmoduleDeclaration, SubmoduleError, SubmoduleMutationLease, UpdateLockGuard,
-	acquire_update_lock_with_common, module_update_remote,
+	SubmoduleContext, SubmoduleDeclaration, SubmoduleError, SubmoduleMutationLease, SyncFailure,
+	SyncOutcome, SyncOutcomeState, SyncReport, SyncRequest, UpdateLockGuard,
+	acquire_update_lock_with_common, declarations_by_path, is_active, module_update_remote,
 	try_acquire_submodule_config_mutation_lease, validate_name, validate_path,
 };
 
@@ -113,6 +114,11 @@ struct SetUrlPreparation<'a, C> {
 	lock: &'a UpdateLockGuard,
 }
 
+enum PlannedSync {
+	Skip(SyncOutcome),
+	Synchronize(SubmoduleDeclaration),
+}
+
 impl SubmoduleContext {
 	/// Set one declaration URL and durably synchronize registered configuration.
 	pub async fn set_url<C: SetUrlConfigurationProvider>(
@@ -141,6 +147,17 @@ impl SubmoduleContext {
 		configuration: &C,
 	) -> Result<SetUrlReport, SubmoduleError> {
 		let lock = self.acquire_config_update_lock()?;
+		self.prepare_set_url_operation(configuration, &lock).await?;
+		self
+			.set_url_locked::<H, C>(request, configuration, &lock, None)
+			.await
+	}
+
+	async fn prepare_set_url_operation<C: SetUrlConfigurationProvider>(
+		&self,
+		configuration: &C,
+		lock: &UpdateLockGuard,
+	) -> Result<(), SubmoduleError> {
 		lock.validate()?;
 		self.revalidate_set_url_superproject(configuration).await?;
 		if repository_has_set_url_participant_claim(&self.git, &self.layout.git_dir)? {
@@ -150,23 +167,62 @@ impl SubmoduleContext {
 		}
 		if let Some((intent, identity)) = self.read_set_url_intent()? {
 			self
-				.complete_or_abandon_set_url(intent, identity, configuration, &lock)
+				.complete_or_abandon_set_url(intent, identity, configuration, lock)
 				.await?;
 		} else {
 			self.retire_unpublished_set_url_control()?;
 		}
+		if repository_has_pending_set_url_recovery(&self.common, &self.git, &self.layout)? {
+			return Err(SubmoduleError::RecoveryRequired(
+				"a pending submodule set-url in another worktree must be retried from its owner".to_owned(),
+			));
+		}
 		self.ensure_no_repository_deinit_recovery()?;
 		self.ensure_no_update_recovery()?;
+		Ok(())
+	}
 
+	async fn set_url_locked<H: HashAlgorithm, C: SetUrlConfigurationProvider>(
+		&self,
+		request: &SetUrlRequest,
+		configuration: &C,
+		lock: &UpdateLockGuard,
+		expected_name: Option<&str>,
+	) -> Result<SetUrlReport, SubmoduleError> {
 		let declaration_path = self.worktree_root().join(".gitmodules");
-		let (name, declaration_transition) = configuration
-			.plan_set_url_declaration(
-				self.clone_dir(&self.work, self.worktree_root())?,
-				&declaration_path,
-				&request.path,
-				&request.url,
-			)
-			.await?;
+		let (name, declaration_transition) = if let Some(expected_name) = expected_name {
+			let (config, transition) = configuration
+				.read_sync_declarations(
+					self.clone_dir(&self.work, self.worktree_root())?,
+					&declaration_path,
+				)
+				.await?;
+			let mut declarations = declarations_by_path(SubmoduleDeclaration::from_config(&config)?)?;
+			let declaration = declarations.remove(&request.path).ok_or_else(|| {
+				SubmoduleError::Configuration(format!(
+					"submodule declaration changed while synchronizing '{}'",
+					request.path
+				))
+			})?;
+			if declaration.name != expected_name
+				|| declaration.url.as_deref() != Some(request.url.as_str())
+			{
+				return Err(SubmoduleError::Configuration(format!(
+					"submodule declaration changed while synchronizing '{}'",
+					request.path
+				)));
+			}
+			(declaration.name, transition)
+		} else {
+			configuration
+				.plan_set_url_declaration(
+					self.clone_dir(&self.work, self.worktree_root())?,
+					&declaration_path,
+					&request.path,
+					&request.url,
+				)
+				.await?
+		};
 		validate_name(&name)?;
 		validate_path(&request.path)?;
 		let declaration = SubmoduleDeclaration {
@@ -294,7 +350,7 @@ impl SubmoduleContext {
 					&mut intent_identity,
 					module.as_ref(),
 					configuration,
-					&lock,
+					lock,
 				)
 				.await?;
 			self
@@ -306,7 +362,7 @@ impl SubmoduleContext {
 						resolved_url: resolved_url.as_deref(),
 						module: module.as_ref(),
 						configuration,
-						lock: &lock,
+						lock,
 					},
 				)
 				.await?;
@@ -323,7 +379,7 @@ impl SubmoduleContext {
 					&mut intent_identity,
 					module.as_ref(),
 					configuration,
-					&lock,
+					lock,
 				)
 				.await?;
 			self
@@ -332,7 +388,7 @@ impl SubmoduleContext {
 					&mut intent_identity,
 					module.as_ref(),
 					configuration,
-					&lock,
+					lock,
 				)
 				.await?;
 			self
@@ -348,6 +404,15 @@ impl SubmoduleContext {
 				.revalidate_set_url_completion(&intent, module.as_ref(), configuration)
 				.await?;
 		}
+		if expected_name.is_some() {
+			configuration
+				.validate_sync_declarations(
+					self.clone_dir(&self.work, self.worktree_root())?,
+					&declaration_path,
+					&intent.declaration.transition,
+				)
+				.await?;
+		}
 		self.revalidate_set_url_superproject(configuration).await?;
 		lock.validate()?;
 		Ok(SetUrlReport {
@@ -358,6 +423,205 @@ impl SubmoduleContext {
 			module_remote,
 			notices,
 		})
+	}
+
+	/// Synchronize selected active registrations from their current declarations.
+	pub async fn sync<C: SetUrlConfigurationProvider>(
+		&self,
+		request: &SyncRequest,
+		configuration: &C,
+	) -> Result<SyncReport, SyncFailure> {
+		match self.hash_kind {
+			HashKind::Sha1 => self.sync_typed::<Sha1, C>(request, configuration).await,
+			HashKind::Sha256 => self.sync_typed::<Sha256, C>(request, configuration).await,
+		}
+	}
+
+	/// Resume this worktree's pending set-URL transaction without starting a new operation.
+	pub async fn resume_pending_set_url<C: SetUrlConfigurationProvider>(
+		&self,
+		configuration: &C,
+	) -> Result<bool, SubmoduleError> {
+		let setup = self.acquire_config_setup_lease().await?;
+		if !set_url_control_exists(&self.git, &self.layout.git_dir)? {
+			return Ok(false);
+		}
+		drop(setup);
+		let lock = self.acquire_config_update_lock()?;
+		self.prepare_set_url_operation(configuration, &lock).await?;
+		lock.validate()?;
+		Ok(true)
+	}
+
+	/// Return the literal owner selection for this worktree's pending set-URL transaction.
+	pub fn pending_set_url_query(&self) -> Result<Option<crate::SubmoduleQuery>, SubmoduleError> {
+		if !set_url_control_exists(&self.git, &self.layout.git_dir)? {
+			return Ok(None);
+		}
+		let lock = self.acquire_update_lock()?;
+		lock.validate()?;
+		if !repository_has_set_url_coordinator(&self.git, &self.layout.git_dir)? {
+			return Ok(None);
+		}
+		let Some((intent, _)) = self.read_set_url_intent()? else {
+			return Ok(None);
+		};
+		validate_set_url_intent(&intent)?;
+		if intent.path.is_empty() {
+			return Err(SubmoduleError::RecoveryRequired(
+				"set-url intent records an empty submodule path".to_owned(),
+			));
+		}
+		let mut query = crate::SubmoduleQuery::top_literal(&intent.path);
+		query.allow_unmatched = true;
+		lock.validate()?;
+		Ok(Some(query))
+	}
+
+	async fn sync_typed<H: HashAlgorithm, C: SetUrlConfigurationProvider>(
+		&self,
+		request: &SyncRequest,
+		configuration: &C,
+	) -> Result<SyncReport, SyncFailure> {
+		let setup = self
+			.acquire_config_setup_lease()
+			.await
+			.map_err(SyncFailure::preflight)?;
+		let recovery = set_url_control_exists(&self.git, &self.layout.git_dir)
+			.map_err(SyncFailure::preflight)?
+			|| repository_has_set_url_participant_claim(&self.git, &self.layout.git_dir)
+				.map_err(SyncFailure::preflight)?;
+		if !recovery {
+			let preview = self
+				.plan_sync::<H, C>(request, configuration)
+				.await
+				.map_err(SyncFailure::preflight)?;
+			if !preview
+				.iter()
+				.any(|entry| matches!(entry, PlannedSync::Synchronize(_)))
+			{
+				self
+					.revalidate_set_url_superproject(configuration)
+					.await
+					.map_err(SyncFailure::preflight)?;
+				return Ok(SyncReport {
+					outcomes: preview
+						.into_iter()
+						.filter_map(|entry| match entry {
+							PlannedSync::Skip(outcome) => Some(outcome),
+							PlannedSync::Synchronize(_) => None,
+						})
+						.collect(),
+				});
+			}
+		}
+		drop(setup);
+
+		let lock = self
+			.acquire_config_update_lock()
+			.map_err(SyncFailure::preflight)?;
+		self
+			.prepare_set_url_operation(configuration, &lock)
+			.await
+			.map_err(SyncFailure::preflight)?;
+		let planned = self
+			.plan_sync::<H, C>(request, configuration)
+			.await
+			.map_err(SyncFailure::preflight)?;
+		let mut completed = SyncReport::default();
+		for entry in planned {
+			match entry {
+				PlannedSync::Skip(outcome) => completed.outcomes.push(outcome),
+				PlannedSync::Synchronize(declaration) => {
+					let url = declaration.url.as_deref().ok_or_else(|| SyncFailure {
+						completed: completed.clone(),
+						module: Some(declaration.name.clone()),
+						source: SubmoduleError::MissingUrl(declaration.path.clone()),
+					})?;
+					let report = self
+						.set_url_locked::<H, C>(
+							&SetUrlRequest {
+								path: declaration.path.clone(),
+								url: url.to_owned(),
+							},
+							configuration,
+							&lock,
+							Some(&declaration.name),
+						)
+						.await
+						.map_err(|source| SyncFailure {
+							completed: completed.clone(),
+							module: Some(declaration.name.clone()),
+							source,
+						})?;
+					let state = if report.registration_synced {
+						SyncOutcomeState::Synchronized
+					} else {
+						SyncOutcomeState::SkippedUnregistered
+					};
+					completed.outcomes.push(SyncOutcome {
+						name: report.name,
+						path: report.path,
+						state,
+						module_remote: report.module_remote,
+						notices: report.notices,
+					});
+				}
+			}
+		}
+		lock.validate().map_err(|source| SyncFailure {
+			completed: completed.clone(),
+			module: None,
+			source,
+		})?;
+		Ok(completed)
+	}
+
+	async fn plan_sync<H: HashAlgorithm, C: SetUrlConfigurationProvider>(
+		&self,
+		request: &SyncRequest,
+		configuration: &C,
+	) -> Result<Vec<PlannedSync>, SubmoduleError> {
+		let worktree = self.worktree::<H>()?;
+		let index = worktree.load_index().await?;
+		let selected = self.select_gitlinks(&index, &request.query)?;
+		let declarations = declarations_by_path(self.declarations().await?)?;
+		let effective = configuration.reload().await?;
+		let mut planned = Vec::with_capacity(selected.len());
+		for path in selected {
+			let declaration = declarations
+				.get(&path)
+				.ok_or_else(|| SubmoduleError::MissingMapping(path.clone()))?
+				.clone();
+			let state = if index.conflict(&path).is_some() {
+				Some(SyncOutcomeState::SkippedConflicted)
+			} else if !is_active(&effective, &declaration.name, &declaration.path)? {
+				Some(SyncOutcomeState::SkippedInactive)
+			} else {
+				match effective.get_raw("submodule", Some(&declaration.name), "url") {
+					Some(Some(_)) => None,
+					Some(None) => {
+						return Err(SubmoduleError::MissingValue(format!(
+							"submodule.{}.url",
+							declaration.name
+						)));
+					}
+					None => Some(SyncOutcomeState::SkippedUnregistered),
+				}
+			};
+			if let Some(state) = state {
+				planned.push(PlannedSync::Skip(SyncOutcome {
+					name: declaration.name,
+					path,
+					state,
+					module_remote: None,
+					notices: Vec::new(),
+				}));
+			} else {
+				planned.push(PlannedSync::Synchronize(declaration));
+			}
+		}
+		Ok(planned)
 	}
 
 	async fn plan_set_url_module<H: HashAlgorithm, C: SetUrlConfigurationProvider>(
@@ -1238,12 +1502,23 @@ impl SubmoduleContext {
 
 /// Whether this per-worktree Git directory owns active set-URL recovery state.
 pub fn repository_has_pending_set_url(git: &Dir, git_dir: &Path) -> Result<bool, SubmoduleError> {
-	let control_pending = match git.symlink_metadata(CONTROL_DIR) {
+	let control_pending = repository_has_set_url_coordinator(git, git_dir)?;
+	let claim_pending = repository_has_set_url_participant_claim(git, git_dir)?;
+	Ok(control_pending || claim_pending)
+}
+
+fn repository_has_set_url_coordinator(git: &Dir, git_dir: &Path) -> Result<bool, SubmoduleError> {
+	if !set_url_control_exists(git, git_dir)? {
+		return Ok(false);
+	}
+	let _ = read_set_url_intent_at(git, git_dir)?;
+	Ok(true)
+}
+
+fn set_url_control_exists(git: &Dir, git_dir: &Path) -> Result<bool, SubmoduleError> {
+	Ok(match git.symlink_metadata(CONTROL_DIR) {
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-		Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-			let _ = read_set_url_intent_at(git, git_dir)?;
-			true
-		}
+		Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
 		Ok(_) => {
 			return Err(SubmoduleError::RecoveryRequired(
 				"submodule set-url control path is not a directory".to_owned(),
@@ -1255,9 +1530,7 @@ pub fn repository_has_pending_set_url(git: &Dir, git_dir: &Path) -> Result<bool,
 				source,
 			});
 		}
-	};
-	let claim_pending = repository_has_set_url_participant_claim(git, git_dir)?;
-	Ok(control_pending || claim_pending)
+	})
 }
 
 /// Whether any worktree in this repository owns active set-URL recovery state.
@@ -2293,6 +2566,7 @@ mod tests {
 		write_new_module_claim(&module, &module_path, &claim).unwrap();
 
 		assert!(repository_has_pending_set_url(&module, &module_path).unwrap());
+		assert!(!repository_has_set_url_coordinator(&module, &module_path).unwrap());
 		assert!(repository_has_set_url_participant_claim(&module, &module_path).unwrap());
 		clear_orphaned_set_url_module_claim(
 			&module,
@@ -2388,6 +2662,7 @@ mod tests {
 		let git = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
 
 		assert!(repository_has_pending_set_url(&git, temporary.path()).unwrap());
+		assert!(repository_has_set_url_coordinator(&git, temporary.path()).unwrap());
 		assert!(!repository_has_set_url_participant_claim(&git, temporary.path()).unwrap());
 	}
 

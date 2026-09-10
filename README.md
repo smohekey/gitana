@@ -97,7 +97,7 @@ Major gaps:
 - `gta submodule status [--recursive]` / `init` /
   `update [--init] [--recursive] [--remote] [-N|--no-fetch] [--depth N]` / `deinit` /
   `set-branch (-b|--branch <branch> | -d|--default) <path>` /
-  `set-url <path> <newurl>`
+  `set-url <path> <newurl>` / `sync [--recursive] [<path>...]`
   implement consumer operations. `gta clone --recurse-submodules[=<pathspec>]` (alias
   `--recursive[=<pathspec>]`) publishes the root clone, records the requested root-level
   `submodule.active` values (`.` for the bare flag), and then initializes every selected active
@@ -210,7 +210,9 @@ Implemented command groups:
 	`submodule update [--init] [--recursive] [--remote] [-N|--no-fetch] [--depth N]`, and
 	`submodule deinit [-f|--force] (--all | <path>...)`, plus
 	`submodule set-branch (-b|--branch <branch> | -d|--default) <path>` and
-	`submodule set-url <path> <newurl>`. Root pathspecs select
+	`submodule set-url <path> <newurl>` / `submodule sync [--recursive] [<path>...]`.
+	Sync copies active, registered declaration URLs into repository and attached-module remote
+	configuration without changing `.gitmodules`. Root pathspecs select
 	top-level modules;
 	recursive status is depth-first and recursive update completes each repository-local batch before
 	entering successful child worktrees. `clone --recurse-submodules[=<pathspec>]`

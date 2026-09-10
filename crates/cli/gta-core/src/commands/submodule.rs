@@ -10,9 +10,9 @@ use cap_std::{ambient_authority, fs::Dir};
 use gitana_fs_native::{EntryIdentity, directory_identity};
 use gitana_submodule::{
 	ConfigViews, ConfigurationProvider, DeinitRequest, DeinitSelection, InitNotice, InitRequest,
-	SetBranchOutcome, SetUrlRequest, SubmoduleContext, SubmoduleError, SubmoduleMutationLease,
-	SubmoduleQuery, SubmoduleStatus, SubmoduleStatusState, UpdateOutcomeState, UpdateReport,
-	UpdateRequest,
+	SetBranchOutcome, SetUrlRequest, SubmoduleContext, SubmoduleDeclaration, SubmoduleError,
+	SubmoduleMutationLease, SubmoduleQuery, SubmoduleStatus, SubmoduleStatusState, SyncOutcomeState,
+	SyncReport, SyncRequest, UpdateOutcomeState, UpdateReport, UpdateRequest,
 };
 
 use crate::submodule_configuration::WorktreeConfiguration;
@@ -48,6 +48,10 @@ pub enum Action {
 	SetUrl {
 		path: String,
 		url: String,
+	},
+	Sync {
+		recursive: bool,
+		paths: Vec<String>,
 	},
 }
 
@@ -116,6 +120,18 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 			))
 			.await;
 		}
+		Action::Sync {
+			recursive: true,
+			paths,
+		} => {
+			return Box::pin(recursive_sync(
+				layout.clone(),
+				identity,
+				&prefix,
+				SubmoduleQuery::paths(paths.clone()),
+			))
+			.await;
+		}
 		Action::Status {
 			recursive: false, ..
 		}
@@ -126,6 +142,9 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 		| Action::Deinit { .. } => {}
 		Action::SetBranch { .. } => unreachable!("set-branch returns before opening the root context"),
 		Action::SetUrl { .. } => {}
+		Action::Sync {
+			recursive: false, ..
+		} => {}
 	}
 	let (setup, common, git, work) = repo::command_setup_lease(&layout, identity).await?;
 	let work = work.ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?;
@@ -259,10 +278,34 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 				);
 			}
 		}
+		Action::Sync {
+			recursive: false,
+			paths,
+		} => {
+			drop(setup);
+			match context
+				.sync(
+					&SyncRequest {
+						query: SubmoduleQuery::paths(paths),
+					},
+					&configuration,
+				)
+				.await
+			{
+				Ok(report) => render_sync(&prefix, "", &report),
+				Err(failure) => {
+					render_sync(&prefix, "", &failure.completed);
+					return Err(failure.into());
+				}
+			}
+		}
 		Action::Status {
 			recursive: true, ..
 		}
 		| Action::Update {
+			recursive: true, ..
+		}
+		| Action::Sync {
 			recursive: true, ..
 		} => unreachable!("recursive actions return before opening the root context"),
 		Action::SetBranch { .. } => unreachable!("set-branch returns before opening the root context"),
@@ -342,8 +385,7 @@ fn recursive_status_level<'a>(
 			discovered_root,
 			&query_prefix,
 			&query,
-			false,
-			false,
+			(false, false, false, false),
 		)
 		.await?;
 		for status in statuses {
@@ -559,11 +601,272 @@ pub(crate) async fn update_published_clone(
 	.await
 }
 
+async fn recursive_sync(
+	root_layout: repo::RepositoryLayout,
+	root_identity: RepositoryLayoutIdentity,
+	prefix: &str,
+	query: SubmoduleQuery,
+) -> Result<()> {
+	let root = root_layout
+		.worktree_root
+		.as_ref()
+		.expect("recursive sync requires a worktree")
+		.clone();
+	let root_proof = (root_layout, root_identity);
+	let recovery_levels = Box::pin(initialized_sync_subtree(
+		&root,
+		prefix,
+		query.clone(),
+		root_proof.clone(),
+	))
+	.await?;
+	for (level_root, expected_git_dir, discovered_root, _) in recovery_levels {
+		Box::pin(resume_set_url_level(
+			&level_root,
+			expected_git_dir.as_deref(),
+			discovered_root,
+		))
+		.await?;
+	}
+
+	let mut pending = VecDeque::from([(
+		root,
+		None,
+		Some(root_proof),
+		prefix.to_owned(),
+		String::new(),
+		query,
+	)]);
+	while let Some((
+		level_root,
+		expected_git_dir,
+		discovered_root,
+		query_prefix,
+		level_prefix,
+		query,
+	)) = pending.pop_front()
+	{
+		let (layout, report) = Box::pin(sync_level(
+			&level_root,
+			expected_git_dir.as_deref(),
+			discovered_root,
+			(&query_prefix, prefix, &level_prefix),
+			query,
+		))
+		.await?;
+		for outcome in report.outcomes {
+			if outcome.state == SyncOutcomeState::Synchronized && outcome.module_remote.is_some() {
+				pending.push_back((
+					level_root.join(&outcome.path),
+					Some(layout.git_dir.join("modules").join(&outcome.name)),
+					None,
+					String::new(),
+					join_submodule_path(&level_prefix, &outcome.path),
+					SubmoduleQuery::all(),
+				));
+			}
+		}
+	}
+	Ok(())
+}
+
+async fn resume_set_url_level(
+	root: &Path,
+	expected_git_dir: Option<&Path>,
+	discovered_root: Option<(repo::RepositoryLayout, RepositoryLayoutIdentity)>,
+) -> Result<()> {
+	let (layout, setup, common, git, work, configuration, superproject, hash_kind) =
+		Box::pin(open_level(root, expected_git_dir, discovered_root)).await?;
+	repo::ensure_no_deinit_recovery_at(&layout, &common, &git)?;
+	drop(setup);
+	let context = SubmoduleContext::new(
+		layout,
+		common,
+		git,
+		work,
+		ConfigViews::new(superproject),
+		String::new(),
+		hash_kind,
+	)?;
+	context.resume_pending_set_url(&configuration).await?;
+	Ok(())
+}
+
+async fn sync_level(
+	root: &Path,
+	expected_git_dir: Option<&Path>,
+	discovered_root: Option<(repo::RepositoryLayout, RepositoryLayoutIdentity)>,
+	scope: (&str, &str, &str),
+	query: SubmoduleQuery,
+) -> Result<(repo::RepositoryLayout, SyncReport)> {
+	let (query_prefix, prefix, level_prefix) = scope;
+	let (layout, setup, common, git, work, configuration, superproject, hash_kind) =
+		Box::pin(open_level(root, expected_git_dir, discovered_root)).await?;
+	repo::ensure_no_pending_deinit_at(&layout, &common, &git)?;
+	drop(setup);
+	let returned_layout = layout.clone();
+	let context = SubmoduleContext::new(
+		layout,
+		common,
+		git,
+		work,
+		ConfigViews::new(superproject),
+		query_prefix.to_owned(),
+		hash_kind,
+	)?;
+	match context.sync(&SyncRequest { query }, &configuration).await {
+		Ok(report) => {
+			render_sync(prefix, level_prefix, &report);
+			Ok((returned_layout, report))
+		}
+		Err(failure) => {
+			render_sync(prefix, level_prefix, &failure.completed);
+			Err(failure.into())
+		}
+	}
+}
+
 async fn initialized_subtree(
 	root: &Path,
 	root_prefix: &str,
 	query: SubmoduleQuery,
 	root_proof: (repo::RepositoryLayout, RepositoryLayoutIdentity),
+) -> Result<
+	Vec<(
+		PathBuf,
+		Option<PathBuf>,
+		Option<(repo::RepositoryLayout, RepositoryLayoutIdentity)>,
+		String,
+	)>,
+> {
+	initialized_recovery_subtree(root, root_prefix, query, root_proof, true, false).await
+}
+
+async fn initialized_sync_subtree(
+	root: &Path,
+	root_prefix: &str,
+	query: SubmoduleQuery,
+	root_proof: (repo::RepositoryLayout, RepositoryLayoutIdentity),
+) -> Result<
+	Vec<(
+		PathBuf,
+		Option<PathBuf>,
+		Option<(repo::RepositoryLayout, RepositoryLayoutIdentity)>,
+		String,
+	)>,
+> {
+	let mut levels = Vec::new();
+	let mut pending = vec![(
+		root.to_owned(),
+		None,
+		Some(root_proof),
+		root_prefix.to_owned(),
+		String::new(),
+		query,
+		0_usize,
+	)];
+	while let Some((
+		level_root,
+		expected_git_dir,
+		discovered_root,
+		query_prefix,
+		level_prefix,
+		query,
+		depth,
+	)) = pending.pop()
+	{
+		let returned_root = discovered_root.clone();
+		let (layout, modules) = Box::pin(sync_recovery_modules_level(
+			&level_root,
+			expected_git_dir.as_deref(),
+			discovered_root,
+			&query_prefix,
+			&query,
+			depth == 0,
+		))
+		.await?;
+		levels.push((
+			level_root.clone(),
+			expected_git_dir,
+			returned_root,
+			level_prefix.clone(),
+			depth,
+		));
+		let mut children = modules
+			.into_iter()
+			.map(|module| {
+				(
+					level_root.join(&module.path),
+					Some(layout.git_dir.join("modules").join(&module.name)),
+					None,
+					String::new(),
+					join_submodule_path(&level_prefix, &module.path),
+					SubmoduleQuery::all(),
+					depth + 1,
+				)
+			})
+			.collect::<Vec<_>>();
+		children.reverse();
+		pending.extend(children);
+	}
+	levels.sort_by_key(|(_, _, _, _, depth)| std::cmp::Reverse(*depth));
+	Ok(
+		levels
+			.into_iter()
+			.map(|(root, expected, discovered, prefix, _)| (root, expected, discovered, prefix))
+			.collect(),
+	)
+}
+
+async fn sync_recovery_modules_level(
+	root: &Path,
+	expected_git_dir: Option<&Path>,
+	discovered_root: Option<(repo::RepositoryLayout, RepositoryLayoutIdentity)>,
+	query_prefix: &str,
+	query: &SubmoduleQuery,
+	include_pending_owner: bool,
+) -> Result<(repo::RepositoryLayout, Vec<SubmoduleDeclaration>)> {
+	let (layout, setup, common, git, work, _configuration, superproject, hash_kind) =
+		Box::pin(open_level(root, expected_git_dir, discovered_root)).await?;
+	repo::ensure_no_deinit_recovery_at(&layout, &common, &git)?;
+	let returned_layout = layout.clone();
+	let context = SubmoduleContext::new(
+		layout,
+		common,
+		git,
+		work,
+		ConfigViews::new(superproject),
+		query_prefix.to_owned(),
+		hash_kind,
+	)?;
+	let pending_owner = if include_pending_owner {
+		context.pending_set_url_query()?
+	} else {
+		None
+	};
+	let modules = with_setup_lease(setup, async move {
+		let mut modules = context.initialized_recovery_modules(query).await?;
+		if let Some(owner) = pending_owner {
+			for module in context.initialized_recovery_modules(&owner).await? {
+				if !modules.iter().any(|current| current.path == module.path) {
+					modules.push(module);
+				}
+			}
+		}
+		Ok::<_, SubmoduleError>(modules)
+	})
+	.await
+	.map_err(anyhow::Error::from)?;
+	Ok((returned_layout, modules))
+}
+
+async fn initialized_recovery_subtree(
+	root: &Path,
+	root_prefix: &str,
+	query: SubmoduleQuery,
+	root_proof: (repo::RepositoryLayout, RepositoryLayoutIdentity),
+	include_update_owner: bool,
+	include_set_url_owner: bool,
 ) -> Result<
 	Vec<(
 		PathBuf,
@@ -599,8 +902,12 @@ async fn initialized_subtree(
 			discovered_root,
 			&query_prefix,
 			&query,
-			true,
-			depth == 0,
+			(
+				true,
+				include_update_owner && depth == 0,
+				include_set_url_owner && depth == 0,
+				include_set_url_owner,
+			),
 		))
 		.await?;
 		levels.push((
@@ -644,13 +951,22 @@ async fn status_level(
 	discovered_root: Option<(repo::RepositoryLayout, RepositoryLayoutIdentity)>,
 	query_prefix: &str,
 	query: &SubmoduleQuery,
-	reject_deinit: bool,
-	include_pending_owner: bool,
+	recovery: (bool, bool, bool, bool),
 ) -> Result<(repo::RepositoryLayout, Vec<SubmoduleStatus>)> {
+	let (
+		reject_deinit,
+		include_pending_update_owner,
+		include_pending_set_url_owner,
+		allow_pending_set_url,
+	) = recovery;
 	let (layout, setup, common, git, work, configuration, superproject, hash_kind) =
 		Box::pin(open_level(root, expected_git_dir, discovered_root)).await?;
 	if reject_deinit {
-		repo::ensure_no_pending_deinit_at(&layout, &common, &git)?;
+		if allow_pending_set_url {
+			repo::ensure_no_deinit_recovery_at(&layout, &common, &git)?;
+		} else {
+			repo::ensure_no_pending_deinit_at(&layout, &common, &git)?;
+		}
 	}
 	let returned_layout = layout.clone();
 	let context = SubmoduleContext::new(
@@ -662,14 +978,22 @@ async fn status_level(
 		query_prefix.to_owned(),
 		hash_kind,
 	)?;
-	let pending_owner = if include_pending_owner {
+	let pending_update_owner = if include_pending_update_owner {
 		context.pending_update_query()?
+	} else {
+		None
+	};
+	let pending_set_url_owner = if include_pending_set_url_owner {
+		context.pending_set_url_query()?
 	} else {
 		None
 	};
 	let statuses = with_setup_lease(setup, async move {
 		let mut statuses = context.status(query, &configuration).await?;
-		if let Some(owner) = pending_owner {
+		for owner in [pending_update_owner, pending_set_url_owner]
+			.into_iter()
+			.flatten()
+		{
 			for status in context.status(&owner, &configuration).await? {
 				if !statuses.iter().any(|current| current.path == status.path) {
 					statuses.push(status);
@@ -886,6 +1210,20 @@ fn render_deinit(prefix: &str, report: &gitana_submodule::DeinitReport) {
 
 fn render_update(prefix: &str, report: &gitana_submodule::UpdateReport) {
 	render_update_at(prefix, "", report);
+}
+
+fn render_sync(prefix: &str, level_prefix: &str, report: &SyncReport) {
+	for outcome in &report.outcomes {
+		for notice in &outcome.notices {
+			render_init_notice(notice);
+		}
+		if outcome.state == SyncOutcomeState::Synchronized {
+			println!(
+				"Synchronizing submodule url for '{}'",
+				render_nested_relative(prefix, level_prefix, &outcome.path)
+			);
+		}
+	}
 }
 
 fn render_update_at(prefix: &str, level_prefix: &str, report: &gitana_submodule::UpdateReport) {

@@ -340,6 +340,18 @@ pub(crate) fn ensure_no_pending_deinit_at(
 	Ok(())
 }
 
+/// Reject deinit recovery while allowing the current command to resume set-URL recovery.
+pub(crate) fn ensure_no_deinit_recovery_at(
+	layout: &RepositoryLayout,
+	common: &Dir,
+	git: &Dir,
+) -> Result<()> {
+	if repository_has_pending_deinit(common, git, layout)? {
+		return pending_submodule_recovery_error("deinit");
+	}
+	Ok(())
+}
+
 fn pending_submodule_recovery_error(command: &str) -> Result<()> {
 	let message = if command == "set-url" {
 		"a pending submodule set-url must be retried from its owning superproject before changing repository configuration".to_owned()

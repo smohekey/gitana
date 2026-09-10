@@ -21,12 +21,16 @@ pub struct SubmoduleDeclaration {
 impl SubmoduleDeclaration {
 	pub fn parse_all(text: &str) -> Result<Vec<Self>, SubmoduleError> {
 		let config = GitConfig::parse(text)?;
+		Self::from_config(&config)
+	}
+
+	pub(crate) fn from_config(config: &GitConfig) -> Result<Vec<Self>, SubmoduleError> {
 		let mut declarations = Vec::new();
 		for name in config.subsections("submodule") {
-			let path = field(&config, name, "path", true)?;
-			let url = field(&config, name, "url", true)?;
-			let branch = field(&config, name, "branch", false)?;
-			let update = field(&config, name, "update", false)?;
+			let path = field(config, name, "path", true)?;
+			let url = field(config, name, "url", true)?;
+			let branch = field(config, name, "branch", false)?;
+			let update = field(config, name, "update", false)?;
 			let shallow = config.get_bool_validated("submodule", Some(name), "shallow")?;
 			let Some(path) = path else {
 				continue;

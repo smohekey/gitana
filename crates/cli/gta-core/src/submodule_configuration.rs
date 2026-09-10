@@ -40,6 +40,8 @@ pub(crate) struct WorktreeConfiguration {
 	set_url_root_validation_pause: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
 	#[cfg(test)]
 	set_url_module_publication_pause: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
+	#[cfg(test)]
+	sync_declaration_validation_pause: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
 }
 
 impl WorktreeConfiguration {
@@ -59,6 +61,8 @@ impl WorktreeConfiguration {
 			set_url_root_validation_pause: None,
 			#[cfg(test)]
 			set_url_module_publication_pause: None,
+			#[cfg(test)]
+			sync_declaration_validation_pause: None,
 		}
 	}
 
@@ -105,6 +109,16 @@ impl WorktreeConfiguration {
 		release: Arc<AtomicBool>,
 	) -> Self {
 		self.set_url_module_publication_pause = Some((entered, release));
+		self
+	}
+
+	#[cfg(test)]
+	fn with_sync_declaration_validation_pause(
+		mut self,
+		entered: Arc<AtomicBool>,
+		release: Arc<AtomicBool>,
+	) -> Self {
+		self.sync_declaration_validation_pause = Some((entered, release));
 		self
 	}
 
@@ -842,6 +856,47 @@ impl SetUrlConfigurationProvider for WorktreeConfiguration {
 				worktree_attachment: None,
 			},
 		))
+	}
+
+	async fn read_sync_declarations(
+		&self,
+		directory: Dir,
+		display_path: &Path,
+	) -> Result<(GitConfig, DeinitConfigTransition), SubmoduleError> {
+		let (config, target) =
+			read_config_at(directory, Path::new(".gitmodules"), display_path).await?;
+		let fingerprint = config_fingerprint(&config);
+		Ok((
+			config,
+			DeinitConfigTransition {
+				before_fingerprint: fingerprint.clone(),
+				after_fingerprint: fingerprint,
+				target,
+				worktree_attachment: None,
+			},
+		))
+	}
+
+	async fn validate_sync_declarations(
+		&self,
+		directory: Dir,
+		display_path: &Path,
+		transition: &DeinitConfigTransition,
+	) -> Result<(), SubmoduleError> {
+		#[cfg(test)]
+		if let Some((entered, release)) = self.sync_declaration_validation_pause.clone() {
+			entered.store(true, Ordering::SeqCst);
+			while !release.load(Ordering::SeqCst) {
+				tokio::task::yield_now().await;
+			}
+		}
+		validate_current_url_transition(
+			directory,
+			Path::new(".gitmodules"),
+			display_path,
+			transition,
+		)
+		.await
 	}
 
 	async fn plan_set_url_value(
@@ -2072,7 +2127,8 @@ mod tests {
 	use gitana_submodule::{
 		ConfigViews, FetchRepository, FetchSource, FetchedTransfer, InitRequest, PrepareRepository,
 		PrepareSource, PreparedTransfer, RepositoryTransfer, SetUrlRequest, SubmoduleContext,
-		SubmoduleMutationLease, SubmoduleObjectId, UpdateOutcomeState, UpdateRequest,
+		SubmoduleMutationLease, SubmoduleObjectId, SubmoduleQuery, SyncRequest, UpdateOutcomeState,
+		UpdateRequest,
 	};
 	use gitana_worktree::{Index, IndexEntry, Stat};
 	use std::os::unix::fs::symlink;
@@ -2820,6 +2876,175 @@ mod tests {
 				.contains("stop after observing serialized configuration")
 		);
 		assert_eq!(observations.load(Ordering::SeqCst), 2);
+	}
+
+	#[tokio::test]
+	async fn sync_revalidates_unchanged_declarations_before_reporting_success() {
+		let temporary = tempfile::tempdir().unwrap();
+		let worktree = temporary.path().canonicalize().unwrap().join("work");
+		let git_dir = worktree.join(".git");
+		std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+		std::fs::create_dir(git_dir.join("refs")).unwrap();
+		let modules =
+			"[submodule \"one\"]\n\tpath = modules/one\n\turl = https://example.invalid/one\n";
+		std::fs::write(worktree.join(".gitmodules"), modules).unwrap();
+		let mut index = Index::<Sha1>::new();
+		index.upsert(IndexEntry {
+			stat: Stat::default(),
+			mode: 0o160000,
+			oid: ObjectId::from_hex(&"1".repeat(40)).unwrap(),
+			stage: 0,
+			assume_valid: false,
+			skip_worktree: false,
+			intent_to_add: false,
+			path: "modules/one".to_owned(),
+		});
+		std::fs::write(git_dir.join("index"), index.write_v4()).unwrap();
+		std::fs::write(
+			git_dir.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\
+			 [submodule \"one\"]\n\tactive = true\n\turl = https://example.invalid/one\n",
+		)
+		.unwrap();
+
+		let common = Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap();
+		let git = common.try_clone().unwrap();
+		let entered = Arc::new(AtomicBool::new(false));
+		let release = Arc::new(AtomicBool::new(false));
+		let configuration = Arc::new(
+			WorktreeConfiguration::new(
+				common.try_clone().unwrap(),
+				git.try_clone().unwrap(),
+				&git_dir,
+				&git_dir,
+			)
+			.with_sync_declaration_validation_pause(Arc::clone(&entered), Arc::clone(&release)),
+		);
+		let effective = configuration.reload().await.unwrap();
+		let context = Arc::new(
+			SubmoduleContext::new(
+				RepositoryLayout {
+					worktree_root: Some(worktree.clone()),
+					git_dir: git_dir.clone(),
+					common_dir: git_dir.clone(),
+				},
+				common,
+				git,
+				Dir::open_ambient_dir(&worktree, ambient_authority()).unwrap(),
+				ConfigViews::new(effective),
+				String::new(),
+				HashKind::Sha1,
+			)
+			.unwrap(),
+		);
+		let running_context = Arc::clone(&context);
+		let running_configuration = Arc::clone(&configuration);
+		let task = tokio::spawn(async move {
+			running_context
+				.sync(
+					&SyncRequest {
+						query: SubmoduleQuery::all(),
+					},
+					running_configuration.as_ref(),
+				)
+				.await
+		});
+		for _ in 0..100_000 {
+			if entered.load(Ordering::SeqCst) {
+				break;
+			}
+			if task.is_finished() {
+				break;
+			}
+			tokio::task::yield_now().await;
+		}
+		if !entered.load(Ordering::SeqCst) {
+			panic!(
+				"sync completed before terminal validation: {:?}",
+				task.await.unwrap()
+			);
+		}
+
+		let displaced = worktree.join(".gitmodules.displaced");
+		std::fs::rename(worktree.join(".gitmodules"), &displaced).unwrap();
+		std::fs::write(worktree.join(".gitmodules"), modules).unwrap();
+		release.store(true, Ordering::SeqCst);
+
+		let error = task.await.unwrap().unwrap_err();
+		assert!(
+			error
+				.to_string()
+				.contains("config changed after set-url was planned"),
+			"unexpected error: {error}"
+		);
+		assert!(!git_dir.join("gitana-submodule-set-url").exists());
+	}
+
+	#[tokio::test]
+	async fn recovery_module_enumeration_does_not_read_a_missing_child_config() {
+		let temporary = tempfile::tempdir().unwrap();
+		let worktree = temporary.path().join("work");
+		let git_dir = worktree.join(".git");
+		let module_git = git_dir.join("modules/one");
+		let module_worktree = worktree.join("modules/one");
+		for directory in [
+			git_dir.join("objects"),
+			git_dir.join("refs"),
+			module_git.join("objects"),
+			module_git.join("refs"),
+			module_worktree.clone(),
+		] {
+			std::fs::create_dir_all(directory).unwrap();
+		}
+		std::fs::write(
+			worktree.join(".gitmodules"),
+			"[submodule \"one\"]\n\tpath = modules/one\n\turl = https://example.invalid/one\n",
+		)
+		.unwrap();
+		std::fs::write(
+			module_worktree.join(".git"),
+			"gitdir: ../../.git/modules/one\n",
+		)
+		.unwrap();
+		let mut index = Index::<Sha1>::new();
+		index.upsert(IndexEntry {
+			stat: Stat::default(),
+			mode: 0o160000,
+			oid: ObjectId::from_hex(&"1".repeat(40)).unwrap(),
+			stage: 0,
+			assume_valid: false,
+			skip_worktree: false,
+			intent_to_add: false,
+			path: "modules/one".to_owned(),
+		});
+		std::fs::write(git_dir.join("index"), index.write_v4()).unwrap();
+		let config = "[core]\n\trepositoryformatversion = 0\n";
+		std::fs::write(git_dir.join("config"), config).unwrap();
+
+		let common = Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap();
+		let git = common.try_clone().unwrap();
+		let context = SubmoduleContext::new(
+			RepositoryLayout {
+				worktree_root: Some(worktree.clone()),
+				git_dir: git_dir.clone(),
+				common_dir: git_dir,
+			},
+			common,
+			git,
+			Dir::open_ambient_dir(&worktree, ambient_authority()).unwrap(),
+			ConfigViews::new(GitConfig::parse(config).unwrap()),
+			String::new(),
+			HashKind::Sha1,
+		)
+		.unwrap();
+
+		let modules = context
+			.initialized_recovery_modules(&SubmoduleQuery::all())
+			.await
+			.unwrap();
+		assert_eq!(modules.len(), 1);
+		assert_eq!(modules[0].path, "modules/one");
+		assert!(!module_git.join("config").exists());
 	}
 
 	#[tokio::test]

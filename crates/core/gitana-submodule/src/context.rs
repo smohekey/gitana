@@ -94,6 +94,25 @@ impl SubmoduleContext {
 		}
 	}
 
+	/// Select mounted children for recovery traversal without opening their repositories.
+	///
+	/// The caller must reopen each returned child through its normal recovery-aware setup path before
+	/// reading the child's configuration or HEAD. Unmatched pathspecs are tolerated here because the
+	/// ordinary operation re-applies the original strict query after recovery completes.
+	pub async fn initialized_recovery_modules(
+		&self,
+		query: &SubmoduleQuery,
+	) -> Result<Vec<SubmoduleDeclaration>, SubmoduleError> {
+		match self.hash_kind {
+			HashKind::Sha1 => self.initialized_recovery_modules_typed::<Sha1>(query).await,
+			HashKind::Sha256 => {
+				self
+					.initialized_recovery_modules_typed::<Sha256>(query)
+					.await
+			}
+		}
+	}
+
 	pub async fn init<C: ConfigurationProvider>(
 		&self,
 		request: &InitRequest,
@@ -230,6 +249,33 @@ impl SubmoduleContext {
 			});
 		}
 		Ok(statuses)
+	}
+
+	async fn initialized_recovery_modules_typed<H: HashAlgorithm>(
+		&self,
+		query: &SubmoduleQuery,
+	) -> Result<Vec<SubmoduleDeclaration>, SubmoduleError> {
+		let worktree = self.worktree::<H>()?;
+		let index = worktree.load_index().await?;
+		let mut tolerant = query.clone();
+		tolerant.allow_unmatched = true;
+		let selected = self.select_gitlinks(&index, &tolerant)?;
+		let declarations = declarations_by_path(self.declarations().await?)?;
+		let mut initialized = Vec::with_capacity(selected.len());
+		for path in selected {
+			if index.conflict(&path).is_some() {
+				continue;
+			}
+			let declaration = declarations
+				.get(&path)
+				.ok_or_else(|| SubmoduleError::MissingMapping(path.clone()))?;
+			validate_name(&declaration.name)?;
+			validate_path(&declaration.path)?;
+			if self.mount_is_attached(declaration)? {
+				initialized.push(declaration.clone());
+			}
+		}
+		Ok(initialized)
 	}
 
 	async fn init_typed<H: HashAlgorithm, C: ConfigurationProvider>(
