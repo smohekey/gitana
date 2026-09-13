@@ -4564,8 +4564,12 @@ mod tests {
 			let before = git_dir.read("config").unwrap();
 			let after = b"[core]\n\tworktree = ../../modules/one\n".to_vec();
 			git_dir.write("config", &after).unwrap();
+			let mut replacement = self.marker.as_os_str().to_owned();
+			replacement.push(".replacement");
+			let replacement = PathBuf::from(replacement);
+			std::fs::write(&replacement, &self.marker_bytes).unwrap();
 			let _ = std::fs::remove_file(&self.marker);
-			std::fs::write(&self.marker, &self.marker_bytes).unwrap();
+			std::fs::rename(replacement, &self.marker).unwrap();
 			Ok((before, after))
 		}
 
