@@ -40,6 +40,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  wasi-component-build:
+    name: WASI component build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+      # Build the production guest root. A workspace-wide WASI build would incorrectly select
+      # native CLI and test/dev dependency graphs that are not part of the component.
+      - run: cargo build -p gitana-repo-component --target wasm32-wasip2
+
   test:
     name: test
     runs-on: ubuntu-latest
@@ -61,6 +74,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Compile the complete native MSVC workspace graph, including tests and examples.
+      - run: cargo check --workspace --all-targets
       # Runtime coverage matters here: a cross-target check cannot establish whether Windows can
       # flush the writable directory handles used by the durability barrier.
       - run: cargo test -p gitana-file-store-local -p gitana-linked-worktree --lib

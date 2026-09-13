@@ -2918,17 +2918,16 @@ mod tests {
 	use super::{
 		PinnedConfigTarget, PreparedConfigImage, PreparedConfigOutcome,
 		discard_prepared_file_at_guarded, edit_file_at, edit_file_at_guarded, edit_file_at_if_current,
-		edit_file_at_tracked, ensure_config_target_unchanged, open_resolved_config_directory,
+		edit_file_at_tracked, ensure_config_target_unchanged, for_worktree_at_excluding,
 		prepare_reserved_file_at, prepare_reserved_file_at_guarded, publish_config_target,
 		publish_prepared_file_at, publish_prepared_file_at_guarded, read_config_input_sync,
 		read_file_at_identified, read_file_at_identified_with_containment, read_pinned_config_bytes,
-		reserve_file_at_if_current, resolve_config_name, restore_prepared_file_before_image_at,
+		reserve_file_at_if_current, restore_prepared_file_before_image_at,
 	};
 	use super::{
-		for_worktree, for_worktree_at_excluding, from_ambient, validate_command_config,
-		with_command_config,
+		for_worktree, from_ambient, open_resolved_config_directory, resolve_config_name,
+		validate_command_config, with_command_config,
 	};
-	#[cfg(unix)]
 	use cap_std::{ambient_authority, fs::Dir};
 	#[cfg(unix)]
 	use gitana_fs_native::entry_identity;

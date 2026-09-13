@@ -1772,6 +1772,7 @@ fn rm_of_a_file_at_a_gitlink_slot_matches_git() {
 /// `gta diff` must abort like git when a tracked gitlink slot is occupied by a SYMBOLIC LINK — git
 /// refuses to treat the link as the submodule ("expected submodule path 'sub' not to be a symbolic
 /// link"), rather than rendering a type-change diff of the link target.
+#[cfg(unix)]
 #[test]
 fn diff_rejects_a_symlink_at_a_gitlink_like_git() {
 	if !git_supports_sha256() {
@@ -1986,6 +1987,7 @@ fn force_checkout_off_a_mixed_conflict_unlinks_the_file_like_git() {
 /// tree and delete the real target — git aborts because the ancestor is symbolic. A non-force `rm
 /// link/sub` (where `link` → `actual/`) must refuse and leave `actual/sub` untouched, matching git's
 /// refusal (the messages differ; the data-safety outcome must not).
+#[cfg(unix)]
 #[test]
 fn rm_refuses_a_gitlink_through_a_symlinked_ancestor_like_git() {
 	if !git_supports_sha256() {

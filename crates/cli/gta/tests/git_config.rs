@@ -1716,6 +1716,7 @@ fn command_scope_remote_url_activates_a_file_hasconfig() {
 	std::fs::remove_dir_all(&gdir).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn symlinked_config_splits_relative_include_from_dot_gitdir() {
 	if !git_supports_sha256() {
@@ -2004,6 +2005,7 @@ fn signing_switch_from_included_config_refuses_the_commit_like_git() {
 	std::fs::remove_dir_all(&cfgdir).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn symlinked_gitdir_condition_matches_via_pwd_like_git() {
 	if !git_supports_sha256() {
@@ -2094,6 +2096,7 @@ fn symlinked_gitdir_condition_matches_via_pwd_like_git() {
 	std::fs::remove_dir_all(&base).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn symlinked_bare_gitdir_condition_matches_via_pwd_like_git() {
 	if !git_supports_sha256() {
