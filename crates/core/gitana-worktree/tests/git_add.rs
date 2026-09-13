@@ -48,7 +48,12 @@ async fn preserves_non_utf8_paths_through_index_tree_status_and_restore() {
 	let path = GitPath::from_bytes(raw.clone()).unwrap();
 	let pathspec = GitPathspec::from_bytes(raw).unwrap();
 	worktree
-		.add_pathspecs(&[pathspec.clone()], &GitPath::root(), false, None)
+		.add_pathspecs(
+			std::slice::from_ref(&pathspec),
+			&GitPath::root(),
+			false,
+			None,
+		)
 		.await
 		.unwrap();
 
