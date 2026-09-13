@@ -4409,8 +4409,10 @@ mod tests {
 			.inspect_module_mount(&entry, &configuration)
 			.await
 			.unwrap();
+		let replacement = temporary.path().join("work/modules/one/.git.replacement");
+		std::fs::write(&replacement, entry.pointers.marker.as_bytes()).unwrap();
 		std::fs::remove_file(&marker).unwrap();
-		std::fs::write(&marker, entry.pointers.marker.as_bytes()).unwrap();
+		std::fs::rename(replacement, &marker).unwrap();
 		assert!(matches!(
 			context
 				.revalidate_module_mount(&entry, &before, &configuration)
