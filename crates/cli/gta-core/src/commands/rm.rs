@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use crate::Backend;
+use crate::{Backend, ResultPathMode};
 use anyhow::{Result, bail};
 use gitana_object::HashAlgorithm;
+use gitana_path::GitPathspec;
 use gitana_worktree::WorkTree;
 
 use crate::dispatch::{self, WorkTreeCommand};
@@ -18,7 +19,8 @@ pub async fn run(
 	force: bool,
 	recursive: bool,
 	dry_run: bool,
-	pathspecs: Vec<String>,
+	pathspecs: Vec<GitPathspec>,
+	result_path_mode: ResultPathMode,
 ) -> Result<()> {
 	dispatch::on_worktree(
 		cwd,
@@ -28,6 +30,7 @@ pub async fn run(
 			recursive,
 			dry_run,
 			pathspecs,
+			result_path_mode,
 		},
 	)
 	.await
@@ -38,22 +41,22 @@ struct Rm {
 	force: bool,
 	recursive: bool,
 	dry_run: bool,
-	pathspecs: Vec<String>,
+	pathspecs: Vec<GitPathspec>,
+	result_path_mode: ResultPathMode,
 }
 
 impl WorkTreeCommand for Rm {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		prefix: String,
+		prefix: gitana_path::GitPath,
 	) -> Result<()> {
 		if self.pathspecs.is_empty() {
 			bail!("no pathspec given");
 		}
-		let specs: Vec<&str> = self.pathspecs.iter().map(String::as_str).collect();
 		let outcome = worktree
-			.rm(
-				&specs,
+			.rm_pathspecs(
+				&self.pathspecs,
 				&prefix,
 				self.cached,
 				self.force,
@@ -64,6 +67,7 @@ impl WorkTreeCommand for Rm {
 		// Report the removals that did happen first, then surface a per-path failure — so the side
 		// effects are visible even when a later path could not be removed.
 		for path in &outcome.removed {
+			let path = crate::git_path::render_result_path(path, self.result_path_mode);
 			println!("rm '{path}'");
 		}
 		if let Some(error) = outcome.failure {

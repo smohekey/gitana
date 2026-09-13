@@ -593,7 +593,7 @@ impl SubmoduleContext {
 				.get(&path)
 				.ok_or_else(|| SubmoduleError::MissingMapping(path.clone()))?
 				.clone();
-			let state = if index.conflict(&path).is_some() {
+			let state = if index.conflict(&crate::git_path(&path)).is_some() {
 				Some(SyncOutcomeState::SkippedConflicted)
 			} else if !is_active(&effective, &declaration.name, &declaration.path)? {
 				Some(SyncOutcomeState::SkippedInactive)

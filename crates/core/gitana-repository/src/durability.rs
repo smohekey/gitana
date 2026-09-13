@@ -450,6 +450,7 @@ mod tests {
 		loose_object_path,
 	};
 	use gitana_object_store::ObjectStore;
+	use gitana_path::{GitPath, GitPathComponent};
 	use tokio::sync::Notify;
 
 	use super::*;
@@ -732,7 +733,7 @@ mod tests {
 		let baseline_blob = repo.write_blob(b"base").await.unwrap();
 		let baseline_tree = repo
 			.write_tree(&[TreeBuildEntry {
-				path: "value".to_owned(),
+				path: GitPath::from_utf8("value").unwrap(),
 				mode: FileMode::Regular,
 				id: baseline_blob,
 			}])
@@ -751,7 +752,7 @@ mod tests {
 		let new_blob = repo.write_blob(b"new").await.unwrap();
 		let new_tree = repo
 			.write_tree(&[TreeBuildEntry {
-				path: "value".to_owned(),
+				path: GitPath::from_utf8("value").unwrap(),
 				mode: FileMode::Regular,
 				id: new_blob,
 			}])
@@ -808,7 +809,7 @@ mod tests {
 			let blob = ObjectId::<Sha256>::compute(ObjectKind::Blob, &blob_data);
 			let tree_data = encode_tree(&[TreeEntry {
 				mode: "100644".to_owned(),
-				name: "value".to_owned(),
+				name: gitana_path::GitTreeEntryName::from_utf8("value").unwrap(),
 				id: blob,
 			}]);
 			let tree = ObjectId::<Sha256>::compute(ObjectKind::Tree, &tree_data);
@@ -893,7 +894,7 @@ mod tests {
 		let baseline_blob = repo.write_blob(b"baseline").await.unwrap();
 		let baseline_tree = repo
 			.write_tree(&[TreeBuildEntry {
-				path: "value".to_owned(),
+				path: GitPath::from_utf8("value").unwrap(),
 				mode: FileMode::Regular,
 				id: baseline_blob,
 			}])
@@ -913,7 +914,7 @@ mod tests {
 		let new_blob = repo.write_blob(b"new").await.unwrap();
 		let new_tree = repo
 			.write_tree(&[TreeBuildEntry {
-				path: "value".to_owned(),
+				path: GitPath::from_utf8("value").unwrap(),
 				mode: FileMode::Regular,
 				id: new_blob,
 			}])
@@ -975,7 +976,7 @@ mod tests {
 		let blob = repo.write_blob(b"value").await.unwrap();
 		let tree = repo
 			.write_tree(&[TreeBuildEntry {
-				path: "value".to_owned(),
+				path: GitPath::from_utf8("value").unwrap(),
 				mode: FileMode::Regular,
 				id: blob,
 			}])
@@ -1019,7 +1020,7 @@ mod tests {
 		let blob = ObjectId::<Sha256>::compute(ObjectKind::Blob, &blob_data);
 		let tree_data = encode_tree(&[TreeEntry {
 			mode: "100644".to_owned(),
-			name: "value".to_owned(),
+			name: GitPathComponent::from_utf8("value").unwrap().into(),
 			id: blob,
 		}]);
 		let tree = ObjectId::<Sha256>::compute(ObjectKind::Tree, &tree_data);
@@ -1147,7 +1148,7 @@ mod tests {
 		let blob = repo.write_blob(b"value").await.unwrap();
 		let tree = repo
 			.write_tree(&[TreeBuildEntry {
-				path: "value".to_owned(),
+				path: GitPath::from_utf8("value").unwrap(),
 				mode: FileMode::Regular,
 				id: blob,
 			}])
@@ -1278,7 +1279,7 @@ mod tests {
 			.unwrap();
 		let tree_data = encode_tree(&[TreeEntry {
 			mode: "100644".to_owned(),
-			name: "value".to_owned(),
+			name: GitPathComponent::from_utf8("value").unwrap().into(),
 			id: blob,
 		}]);
 		let tree = repo

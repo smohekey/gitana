@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -8,8 +10,12 @@ use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 
 use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
-use gitana_repository::Repository;
+use gitana_path::GitPath;
+use gitana_repository::{FileMode, Repository, TreeBuildEntry};
 use gitana_worktree::{IndexEntry, Stat, WorkTree, WorktreeError};
+
+mod support;
+use support::make_utf8_only_repo;
 
 fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
 	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
@@ -86,6 +92,204 @@ async fn checkout_materialises_a_tree_like_git() {
 	assert!(
 		git(&["-C", w, "diff", "--cached", &first]).is_empty(),
 		"index must equal tree"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn force_checkout_preflights_backend_path_representation() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("checkout-path-representation");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"old\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+
+	let before_index = std::fs::read(work.join(".git/index")).unwrap();
+	let wt = make_utf8_only_repo(&work);
+	let ordinary_blob = wt.repository().write_blob(b"new\n").await.unwrap();
+	let raw_blob = wt.repository().write_blob(b"raw\n").await.unwrap();
+	let raw_path = GitPath::from_bytes(b"z-raw-\xff".to_vec()).unwrap();
+	let target_tree = wt
+		.repository()
+		.write_tree(&[
+			TreeBuildEntry {
+				path: GitPath::from_utf8("a.txt").unwrap(),
+				mode: FileMode::Regular,
+				id: ordinary_blob,
+			},
+			TreeBuildEntry {
+				path: raw_path,
+				mode: FileMode::Regular,
+				id: raw_blob,
+			},
+		])
+		.await
+		.unwrap();
+	let error = wt.checkout(target_tree, true, None).await.unwrap_err();
+	assert!(
+		matches!(error, WorktreeError::Io(ref error) if error.kind() == io::ErrorKind::Unsupported),
+		"unexpected error: {error:?}"
+	);
+	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"old\n");
+	assert_eq!(
+		std::fs::read(work.join(".git/index")).unwrap(),
+		before_index
+	);
+	assert!(!work.join(".git/index.lock").exists());
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[tokio::test]
+async fn materialise_paths_preflights_backend_path_representation() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("materialise-path-representation");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"old\n").unwrap();
+
+	let wt = make_utf8_only_repo(&work);
+	let ordinary_blob = wt.repository().write_blob(b"new\n").await.unwrap();
+	let raw_blob = wt.repository().write_blob(b"raw\n").await.unwrap();
+	let raw_path = GitPath::from_bytes(b"z-raw-\xff".to_vec()).unwrap();
+	let target_tree = wt
+		.repository()
+		.write_tree(&[
+			TreeBuildEntry {
+				path: GitPath::from_utf8("a.txt").unwrap(),
+				mode: FileMode::Regular,
+				id: ordinary_blob,
+			},
+			TreeBuildEntry {
+				path: raw_path.clone(),
+				mode: FileMode::Regular,
+				id: raw_blob,
+			},
+		])
+		.await
+		.unwrap();
+	let paths = [GitPath::from_utf8("a.txt").unwrap(), raw_path.clone()];
+
+	let error = wt
+		.materialise_paths(target_tree, &paths, &Default::default())
+		.await
+		.unwrap_err();
+	assert!(
+		matches!(error, WorktreeError::Io(ref error) if error.kind() == io::ErrorKind::Unsupported),
+		"unexpected error: {error:?}"
+	);
+	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"old\n");
+	assert!(
+		!work
+			.join(std::ffi::OsString::from_vec(raw_path.as_bytes().to_vec()))
+			.exists()
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_cap_workdir_preflights_raw_target_names_before_mutation() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("checkout-macos-path-representation");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"old\n").unwrap();
+	git(&["-C", w, "add", "-A"]);
+	commit(w, "base");
+
+	let before_index = std::fs::read(work.join(".git/index")).unwrap();
+	let wt = make_repo(&work);
+	let ordinary_blob = wt.repository().write_blob(b"new\n").await.unwrap();
+	let raw_blob = wt.repository().write_blob(b"raw\n").await.unwrap();
+	let target_tree = wt
+		.repository()
+		.write_tree(&[
+			TreeBuildEntry {
+				path: GitPath::from_utf8("a.txt").unwrap(),
+				mode: FileMode::Regular,
+				id: ordinary_blob,
+			},
+			TreeBuildEntry {
+				path: GitPath::from_bytes(b"z-raw-\xff".to_vec()).unwrap(),
+				mode: FileMode::Regular,
+				id: raw_blob,
+			},
+		])
+		.await
+		.unwrap();
+
+	let error = wt.checkout(target_tree, true, None).await.unwrap_err();
+	assert!(
+		matches!(error, WorktreeError::Io(ref error) if error.kind() == io::ErrorKind::Unsupported),
+		"unexpected error: {error:?}"
+	);
+	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"old\n");
+	assert_eq!(
+		std::fs::read(work.join(".git/index")).unwrap(),
+		before_index
+	);
+	assert!(!work.join(".git/index.lock").exists());
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_materialise_paths_preflights_raw_names_before_mutation() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("materialise-macos-path-representation");
+	let w = work.to_str().unwrap();
+	git(&["init", "--object-format=sha256", "-q", w]);
+	std::fs::write(work.join("a.txt"), b"old\n").unwrap();
+
+	let wt = make_repo(&work);
+	let ordinary_blob = wt.repository().write_blob(b"new\n").await.unwrap();
+	let raw_blob = wt.repository().write_blob(b"raw\n").await.unwrap();
+	let raw_path = GitPath::from_bytes(b"z-raw-\xff".to_vec()).unwrap();
+	let target_tree = wt
+		.repository()
+		.write_tree(&[
+			TreeBuildEntry {
+				path: GitPath::from_utf8("a.txt").unwrap(),
+				mode: FileMode::Regular,
+				id: ordinary_blob,
+			},
+			TreeBuildEntry {
+				path: raw_path.clone(),
+				mode: FileMode::Regular,
+				id: raw_blob,
+			},
+		])
+		.await
+		.unwrap();
+	let paths = [GitPath::from_utf8("a.txt").unwrap(), raw_path.clone()];
+
+	let error = wt
+		.materialise_paths(target_tree, &paths, &Default::default())
+		.await
+		.unwrap_err();
+	assert!(
+		matches!(error, WorktreeError::Io(ref error) if error.kind() == io::ErrorKind::Unsupported),
+		"unexpected error: {error:?}"
+	);
+	assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"old\n");
+	assert!(
+		!work
+			.join(std::ffi::OsString::from_vec(raw_path.as_bytes().to_vec()))
+			.exists()
 	);
 
 	std::fs::remove_dir_all(&work).ok();
@@ -1724,7 +1928,7 @@ async fn checkout_refuses_a_traversal_index_entry() {
 		assume_valid: false,
 		skip_worktree: false,
 		intent_to_add: false,
-		path: "../victim-checkout-traversal".to_owned(),
+		path: gitana_path::GitPath::from_utf8(".git/config").unwrap(),
 	});
 	wt.save_index(&index).await.unwrap();
 
@@ -1867,7 +2071,7 @@ async fn checkout_refuses_removal_through_a_symlinked_ancestor() {
 		assume_valid: false,
 		skip_worktree: false,
 		intent_to_add: false,
-		path: "link/victim".to_owned(),
+		path: gitana_path::GitPath::from_utf8("link/victim").unwrap(),
 	});
 	wt.save_index(&index).await.unwrap();
 

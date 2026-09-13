@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::pin::Pin;
 
-use crate::Backend;
+use crate::{Backend, PathQuoteMode};
 use anyhow::Result;
 use gitana_object::{
 	HashAlgorithm, ObjectId, ObjectKind, Signature, parse_commit, parse_tag, parse_tree,
@@ -17,11 +17,18 @@ use crate::dispatch::{self, ObjectCommand};
 /// Show an object: a commit (header plus its diff against the first parent), an annotated tag
 /// (header plus the object it points at), a tree (its entries), or a blob (its raw bytes).
 /// Defaults to `HEAD`.
-pub async fn run(cwd: &Path, object: Option<String>) -> Result<()> {
-	dispatch::on_object(cwd, object.as_deref().unwrap_or("HEAD"), Show).await
+pub async fn run(cwd: &Path, object: Option<Vec<u8>>, quote_path: PathQuoteMode) -> Result<()> {
+	dispatch::on_object(
+		cwd,
+		object.as_deref().unwrap_or(b"HEAD"),
+		Show { quote_path },
+	)
+	.await
 }
 
-struct Show;
+struct Show {
+	quote_path: PathQuoteMode,
+}
 
 impl ObjectCommand for Show {
 	async fn run<H: HashAlgorithm>(
@@ -29,7 +36,8 @@ impl ObjectCommand for Show {
 		repo: Repository<Backend, H>,
 		oid: ObjectId<H>,
 	) -> Result<()> {
-		show_object(&repo, oid).await
+		let quote_non_ascii = quote_non_ascii(&repo, self.quote_path).await?;
+		show_object(&repo, oid, self.quote_path, quote_non_ascii).await
 	}
 }
 
@@ -37,22 +45,41 @@ impl ObjectCommand for Show {
 fn show_object<'a, H: HashAlgorithm>(
 	repo: &'a Repository<Backend, H>,
 	oid: ObjectId<H>,
+	quote_path: PathQuoteMode,
+	quote_non_ascii: bool,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
 	Box::pin(async move {
 		let (kind, payload) = repo.objects().read_object(&oid).await?;
 		match kind {
-			ObjectKind::Commit => show_commit(repo, oid, &payload).await,
-			ObjectKind::Tag => show_tag(repo, &payload).await,
-			ObjectKind::Tree => show_tree(oid, &payload),
+			ObjectKind::Commit => show_commit(repo, oid, &payload, quote_non_ascii).await,
+			ObjectKind::Tag => show_tag(repo, &payload, quote_path, quote_non_ascii).await,
+			ObjectKind::Tree => show_tree(oid, &payload, quote_path),
 			ObjectKind::Blob => Ok(std::io::stdout().write_all(&payload)?),
 		}
 	})
+}
+
+async fn quote_non_ascii<H: HashAlgorithm>(
+	repo: &Repository<Backend, H>,
+	quote_path: PathQuoteMode,
+) -> Result<bool> {
+	match quote_path {
+		PathQuoteMode::Always => Ok(true),
+		PathQuoteMode::Config => Ok(
+			repo
+				.effective_config()
+				.await?
+				.get_bool_validated("core", None, "quotepath")?
+				.unwrap_or(true),
+		),
+	}
 }
 
 async fn show_commit<H: HashAlgorithm>(
 	repo: &Repository<Backend, H>,
 	oid: ObjectId<H>,
 	payload: &[u8],
+	quote_non_ascii: bool,
 ) -> Result<()> {
 	let commit = parse_commit::<H>(payload)?;
 	let mut out = Vec::new();
@@ -70,13 +97,18 @@ async fn show_commit<H: HashAlgorithm>(
 		None => None,
 	};
 	for file in diff_trees(repo, old_tree, commit.tree).await? {
-		diff::format_file(&mut out, &file);
+		diff::format_file(&mut out, &file, quote_non_ascii);
 	}
 	std::io::stdout().write_all(&out)?;
 	Ok(())
 }
 
-async fn show_tag<H: HashAlgorithm>(repo: &Repository<Backend, H>, payload: &[u8]) -> Result<()> {
+async fn show_tag<H: HashAlgorithm>(
+	repo: &Repository<Backend, H>,
+	payload: &[u8],
+	quote_path: PathQuoteMode,
+	quote_non_ascii: bool,
+) -> Result<()> {
 	let tag = parse_tag::<H>(payload)?;
 	let mut out = Vec::new();
 	out.extend_from_slice(format!("tag {}\n", tag.name).as_bytes());
@@ -98,16 +130,26 @@ async fn show_tag<H: HashAlgorithm>(repo: &Repository<Backend, H>, payload: &[u8
 	std::io::stdout().write_all(&out)?;
 
 	// Then show the object the tag points at (commonly a commit).
-	show_object(repo, tag.object).await
+	show_object(repo, tag.object, quote_path, quote_non_ascii).await
 }
 
-fn show_tree<H: HashAlgorithm>(oid: ObjectId<H>, payload: &[u8]) -> Result<()> {
-	let mut out = format!("tree {oid}\n\n");
+fn show_tree<H: HashAlgorithm>(
+	oid: ObjectId<H>,
+	payload: &[u8],
+	quote_path: PathQuoteMode,
+) -> Result<()> {
+	let mut out = format!("tree {oid}\n\n").into_bytes();
 	for entry in parse_tree::<H>(payload)? {
-		out.push_str(&entry.name);
-		out.push('\n');
+		match quote_path {
+			// Unlike `ls-tree` and diff headers, Git's direct tree `show` output writes entry names exactly as
+			// stored and does not consult core.quotePath.
+			PathQuoteMode::Config => out.extend_from_slice(entry.name.as_bytes()),
+			// MCP transport is UTF-8 text, so its frontend keeps the established reversible representation.
+			PathQuoteMode::Always => out.extend_from_slice(&entry.name.render(true)),
+		}
+		out.push(b'\n');
 	}
-	print!("{out}");
+	std::io::stdout().write_all(&out)?;
 	Ok(())
 }
 

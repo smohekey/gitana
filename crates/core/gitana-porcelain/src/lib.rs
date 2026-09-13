@@ -26,6 +26,7 @@ mod trust;
 pub use cherry_pick::{PickOutcome, abort_cherry_pick, cherry_pick, continue_cherry_pick};
 pub use commit::{commit, commit_signed};
 pub use commit_error::CommitError;
+pub use conflict::ConflictOverwriteError;
 pub use gitana_git_http::Deepen;
 pub use merge::{
 	MergeOutcome, abort_merge, continue_merge, merge, merge_with_excludes, merge_with_excludes_loader,
@@ -204,7 +205,7 @@ pub(crate) mod test_support {
 			assume_valid: false,
 			skip_worktree: false,
 			intent_to_add: false,
-			path: path.to_owned(),
+			path: gitana_path::GitPath::from_utf8(path).unwrap(),
 		});
 	}
 
@@ -235,7 +236,7 @@ pub(crate) mod test_support {
 		let blob = repo.write_blob(content).await.unwrap();
 		let tree = repo
 			.write_tree(&[TreeBuildEntry {
-				path: path.to_owned(),
+				path: gitana_path::GitPath::from_utf8(path).unwrap(),
 				mode: FileMode::Regular,
 				id: blob,
 			}])

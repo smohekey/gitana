@@ -28,9 +28,12 @@ pub enum MergeOutcome<H: HashAlgorithm> {
 	},
 	/// A true two-parent merge commit was recorded on the branch.
 	Made { commit: ObjectId<H> },
+	/// A true merge was refused because rebuilding the index would overwrite staged changes. No
+	/// merge state was recorded; the caller renders the byte-preserving paths and signals failure.
+	WouldOverwrite { paths: Vec<gitana_path::GitPath> },
 	/// The merge conflicted; an in-progress merge has been materialised (`MERGE_HEAD`, `MERGE_MSG`, a
 	/// conflicted index and work tree). The caller renders the conflicted paths and signals failure.
-	Conflict { paths: Vec<String> },
+	Conflict { paths: Vec<gitana_path::GitPath> },
 }
 
 /// Merge `commit_spec` into the current branch.
@@ -71,7 +74,7 @@ pub async fn merge_with_excludes<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S
 	identity: &impl Identity,
 	signer: Option<&S>,
 ) -> Result<MergeOutcome<H>> {
-	let excludes_file = excludes_file.map(str::to_owned);
+	let excludes_file = excludes_file.map(|value| value.as_bytes().to_vec());
 	merge_inner(
 		wt,
 		commit_spec,
@@ -96,7 +99,7 @@ pub async fn merge_with_excludes_loader<
 	H: HashAlgorithm,
 	S: Signer,
 	L: FnOnce() -> LF,
-	LF: Future<Output = Result<Option<String>>>,
+	LF: Future<Output = Result<Option<Vec<u8>>>>,
 >(
 	wt: &WorkTree<F, W, H>,
 	commit_spec: &str,
@@ -124,7 +127,7 @@ async fn merge_inner<
 	H: HashAlgorithm,
 	S: Signer,
 	L: FnOnce() -> LF,
-	LF: Future<Output = Result<Option<String>>>,
+	LF: Future<Output = Result<Option<Vec<u8>>>>,
 >(
 	wt: &WorkTree<F, W, H>,
 	commit_spec: &str,
@@ -210,7 +213,7 @@ async fn merge_inner<
 		{
 			Ok(()) => {}
 			Err(WorktreeError::Conflict(path)) | Err(WorktreeError::UntrackedOverwrite(path)) => {
-				bail!("{}", would_overwrite_message(&[path]));
+				return Ok(MergeOutcome::WouldOverwrite { paths: vec![path] });
 			}
 			Err(error) => return Err(error.into()),
 		}
@@ -233,7 +236,7 @@ async fn merge_inner<
 	// (the index must equal HEAD) — otherwise the materialising checkout would silently drop it.
 	let staged = tree_diff_paths(repository, head_tree, conflict::index_tree(wt).await?).await?;
 	if !staged.is_empty() {
-		bail!("{}", would_overwrite_message(&staged));
+		return Ok(MergeOutcome::WouldOverwrite { paths: staged });
 	}
 
 	let message = match message {
@@ -321,10 +324,10 @@ async fn merge_inner<
 	})
 }
 
-async fn load_merge_excludes<L, LF>(loader: &mut Option<L>) -> Result<Option<String>>
+async fn load_merge_excludes<L, LF>(loader: &mut Option<L>) -> Result<Option<Vec<u8>>>
 where
 	L: FnOnce() -> LF,
-	LF: Future<Output = Result<Option<String>>>,
+	LF: Future<Output = Result<Option<Vec<u8>>>>,
 {
 	(loader
 		.take()
@@ -395,22 +398,14 @@ pub async fn abort_merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	Ok(())
 }
 
-/// git's "your local changes would be overwritten" refusal, listing the offending paths.
-fn would_overwrite_message(paths: &[String]) -> String {
-	format!(
-		"Your local changes to the following files would be overwritten by merge:\n  {}\nPlease commit your changes or stash them before you merge.",
-		paths.join("\n  ")
-	)
-}
-
 /// The paths that differ between two trees (added/removed/modified), sorted.
 async fn tree_diff_paths<F: FileStore, H: HashAlgorithm>(
 	repository: &Repository<F, H>,
 	a: ObjectId<H>,
 	b: ObjectId<H>,
-) -> Result<Vec<String>> {
+) -> Result<Vec<gitana_path::GitPath>> {
 	use std::collections::{HashMap, HashSet};
-	let map = |entries: Vec<(String, String, ObjectId<H>)>| {
+	let map = |entries: Vec<(gitana_path::GitPath, String, ObjectId<H>)>| {
 		entries
 			.into_iter()
 			.map(|(path, mode, oid)| (path, (mode, oid)))
@@ -418,7 +413,7 @@ async fn tree_diff_paths<F: FileStore, H: HashAlgorithm>(
 	};
 	let am = map(repository.read_tree(a).await?);
 	let bm = map(repository.read_tree(b).await?);
-	let mut paths: Vec<String> = am
+	let mut paths: Vec<gitana_path::GitPath> = am
 		.keys()
 		.chain(bm.keys())
 		.cloned()
@@ -481,6 +476,9 @@ async fn virtual_base_tree<F: FileStore, H: HashAlgorithm>(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use std::sync::atomic::{AtomicBool, Ordering};
+
+	use gitana_path::GitPath;
+	use gitana_worktree::{IndexEntry, Stat};
 
 	use super::*;
 	use crate::test_support::{
@@ -622,6 +620,59 @@ mod tests {
 			.unwrap();
 		let commit = commit_file(dir.path(), &wt, "after.txt", b"after\n", &id).await;
 		assert_eq!(refs.resolve("refs/heads/team").await.unwrap(), Some(commit));
+	}
+
+	#[tokio::test]
+	async fn staged_refusal_preserves_distinct_raw_paths_for_the_frontend() {
+		let (dir, wt) = fixture().await;
+		let id = TestIdentity::default();
+		let base = commit_file(dir.path(), &wt, "base.txt", b"base\n", &id).await;
+		let ours = commit_file(dir.path(), &wt, "ours.txt", b"ours\n", &id).await;
+		let theirs = loose_commit(wt.repository(), vec![base], "theirs.txt", b"theirs\n").await;
+		let raw = GitPath::from_bytes(b"raw-\xff".to_vec()).unwrap();
+		let literal = GitPath::from_utf8("\"raw-\\377\"").unwrap();
+		let blob = wt.repository().write_blob(b"staged\n").await.unwrap();
+		let mut index = wt.load_index().await.unwrap();
+		for path in [&raw, &literal] {
+			index.upsert(IndexEntry {
+				stat: Stat::default(),
+				mode: 0o100644,
+				oid: blob,
+				stage: 0,
+				assume_valid: false,
+				skip_worktree: false,
+				intent_to_add: false,
+				path: path.clone(),
+			});
+		}
+		wt.save_index(&index).await.unwrap();
+
+		let outcome = merge(
+			&wt,
+			&theirs.to_hex(),
+			None,
+			false,
+			false,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap();
+		let MergeOutcome::WouldOverwrite { paths } = outcome else {
+			panic!("expected a staged-change refusal");
+		};
+		assert_eq!(paths.len(), 2);
+		assert!(paths.contains(&raw));
+		assert!(paths.contains(&literal));
+		assert_eq!(
+			wt.repository()
+				.refs()
+				.resolve("refs/heads/main")
+				.await
+				.unwrap(),
+			Some(ours)
+		);
+		assert_eq!(wt.repository().merge_head().await.unwrap(), None);
 	}
 
 	#[tokio::test]

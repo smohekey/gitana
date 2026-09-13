@@ -17,7 +17,7 @@ pub enum PickOutcome<H: HashAlgorithm> {
 	Picked { commit: ObjectId<H> },
 	/// The pick conflicted; an in-progress cherry-pick has been materialised (`CHERRY_PICK_HEAD`,
 	/// `MERGE_MSG`, a conflicted index and work tree). The caller renders the paths and signals failure.
-	Conflict { paths: Vec<String> },
+	Conflict { paths: Vec<gitana_path::GitPath> },
 }
 
 /// Cherry-pick `commit_spec` onto the current branch.
@@ -228,7 +228,7 @@ mod tests {
 		let blob = repo.write_blob(b"v2\n").await.unwrap();
 		let tree = repo
 			.write_tree(&[TreeBuildEntry {
-				path: "f.txt".to_owned(),
+				path: gitana_path::GitPath::from_utf8("f.txt").unwrap(),
 				mode: FileMode::Regular,
 				id: blob,
 			}])
@@ -252,7 +252,11 @@ mod tests {
 		let entries = repo.read_tree(tree).await.unwrap();
 		assert_eq!(
 			entries,
-			vec![("f.txt".to_owned(), "100644".to_owned(), blob)]
+			vec![(
+				gitana_path::GitPath::from_utf8("f.txt").unwrap(),
+				"100644".to_owned(),
+				blob,
+			)]
 		);
 	}
 

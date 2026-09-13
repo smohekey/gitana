@@ -68,7 +68,7 @@ impl SubmoduleContext {
 
 	pub async fn declarations(&self) -> Result<Vec<SubmoduleDeclaration>, SubmoduleError> {
 		let work = CapWorkDir::from_dir(self.clone_dir(&self.work, self.worktree_root())?);
-		let bytes = match work.read(".gitmodules") {
+		let bytes = match work.read(&crate::git_path(".gitmodules")) {
 			Ok(bytes) => bytes,
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
 			Err(source) => {
@@ -220,7 +220,7 @@ impl SubmoduleContext {
 				.ok_or_else(|| SubmoduleError::MissingMapping(path.clone()))?;
 			validate_name(&declaration.name)?;
 			validate_path(&declaration.path)?;
-			if index.conflict(&path).is_some() {
+			if index.conflict(&crate::git_path(&path)).is_some() {
 				statuses.push(SubmoduleStatus {
 					name: declaration.name.clone(),
 					path,
@@ -229,7 +229,7 @@ impl SubmoduleContext {
 				});
 				continue;
 			}
-			let Some(entry) = index.entry(&path) else {
+			let Some(entry) = index.entry(&crate::git_path(&path)) else {
 				continue;
 			};
 			let (state, oid) = match self.module_head::<H, C>(declaration, configuration).await? {
@@ -268,7 +268,7 @@ impl SubmoduleContext {
 		let declarations = declarations_by_path(self.declarations().await?)?;
 		let mut initialized = Vec::with_capacity(selected.len());
 		for path in selected {
-			if index.conflict(&path).is_some() {
+			if index.conflict(&crate::git_path(&path)).is_some() {
 				continue;
 			}
 			let declaration = declarations
@@ -473,14 +473,20 @@ impl SubmoduleContext {
 				set.matches(&entry.path)
 			};
 			if matched && entry.mode == 0o160000 && seen.insert(entry.path.clone()) {
-				selected.push(entry.path.clone());
+				let path = entry.path.as_utf8().ok_or_else(|| {
+					SubmoduleError::MissingValue(format!(
+						"submodule gitlink path {} is not representable as UTF-8",
+						entry.path
+					))
+				})?;
+				selected.push(path.to_owned());
 			}
 		}
 		if !query.allow_unmatched
 			&& !query.pathspecs.is_empty()
 			&& let Some(unmatched) = set.unmatched()
 		{
-			return Err(SubmoduleError::PathspecNoMatch(unmatched.to_owned()));
+			return Err(SubmoduleError::PathspecNoMatch(unmatched.to_string()));
 		}
 		Ok(selected)
 	}
@@ -537,20 +543,25 @@ impl SubmoduleContext {
 			return Ok(None);
 		};
 		let work = CapWorkDir::from_dir(directory);
-		let Some(metadata) = work.lstat(".git").map_err(|source| SubmoduleError::Io {
-			path: mount.join(".git"),
-			source,
-		})?
+		let Some(metadata) =
+			work
+				.lstat(&crate::git_path(".git"))
+				.map_err(|source| SubmoduleError::Io {
+					path: mount.join(".git"),
+					source,
+				})?
 		else {
 			return Ok(None);
 		};
 		if !metadata.kind.is_file() {
 			return Err(SubmoduleError::ForeignMount(declaration.path.clone()));
 		}
-		let marker = work.read(".git").map_err(|source| SubmoduleError::Io {
-			path: mount.join(".git"),
-			source,
-		})?;
+		let marker = work
+			.read(&crate::git_path(".git"))
+			.map_err(|source| SubmoduleError::Io {
+				path: mount.join(".git"),
+				source,
+			})?;
 		let marker = std::str::from_utf8(&marker)
 			.map_err(|_| SubmoduleError::ForeignMount(declaration.path.clone()))?;
 		let target = parse_marker_target(marker)

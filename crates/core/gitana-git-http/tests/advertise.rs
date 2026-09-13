@@ -20,7 +20,7 @@ async fn repo_with_commit() -> (Repository<MemoryFileStore, Sha256>, String) {
 	let blob = repo.write_blob(b"hello\n").await.expect("blob");
 	let tree = repo
 		.write_tree(&[TreeBuildEntry {
-			path: "file.txt".to_owned(),
+			path: gitana_path::GitPath::from_utf8("file.txt").unwrap(),
 			mode: FileMode::Regular,
 			id: blob,
 		}])
@@ -58,7 +58,7 @@ async fn sha1_advertisement_negotiates_and_parses() {
 	let blob = repo.write_blob(b"hello\n").await.expect("blob");
 	let tree = repo
 		.write_tree(&[TreeBuildEntry {
-			path: "file.txt".to_owned(),
+			path: gitana_path::GitPath::from_utf8("file.txt").unwrap(),
 			mode: FileMode::Regular,
 			id: blob,
 		}])

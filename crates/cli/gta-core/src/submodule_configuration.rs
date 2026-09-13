@@ -353,8 +353,8 @@ impl ConfigurationProvider for WorktreeConfiguration {
 		&self,
 		config: &GitConfig,
 		worktree_root: &Path,
-	) -> Result<Option<String>, SubmoduleError> {
-		crate::excludes::resolve_excludes_file(config, worktree_root, "")
+	) -> Result<Option<Vec<u8>>, SubmoduleError> {
+		crate::excludes::resolve_excludes_file(config, worktree_root, &gitana_path::GitPath::root())
 			.await
 			.map_err(|error| SubmoduleError::Configuration(format!("{error:#}")))
 	}
@@ -364,7 +364,7 @@ impl ConfigurationProvider for WorktreeConfiguration {
 		config: &GitConfig,
 		worktree: Dir,
 		worktree_root: &Path,
-	) -> Result<Option<String>, SubmoduleError> {
+	) -> Result<Option<Vec<u8>>, SubmoduleError> {
 		crate::excludes::resolve_excludes_file_at(config, worktree, worktree_root)
 			.await
 			.map_err(|error| SubmoduleError::Configuration(format!("{error:#}")))
@@ -2645,7 +2645,7 @@ mod tests {
 			assume_valid: false,
 			skip_worktree: false,
 			intent_to_add: false,
-			path: "modules/one".to_owned(),
+			path: gitana_path::GitPath::from_utf8("modules/one").unwrap(),
 		});
 		std::fs::write(git_dir.join("index"), index.write_v4()).unwrap();
 		let stale_config = "[core]\n\trepositoryformatversion = 0\n\
@@ -2718,7 +2718,7 @@ mod tests {
 			assume_valid: false,
 			skip_worktree: false,
 			intent_to_add: false,
-			path: "modules/one".to_owned(),
+			path: gitana_path::GitPath::from_utf8("modules/one").unwrap(),
 		});
 		std::fs::write(git_dir.join("index"), index.write_v4()).unwrap();
 		std::fs::write(
@@ -2807,7 +2807,7 @@ mod tests {
 			assume_valid: false,
 			skip_worktree: false,
 			intent_to_add: false,
-			path: "modules/one".to_owned(),
+			path: gitana_path::GitPath::from_utf8("modules/one").unwrap(),
 		});
 		std::fs::write(git_dir.join("index"), index.write_v4()).unwrap();
 		std::fs::write(
@@ -2901,7 +2901,7 @@ mod tests {
 			assume_valid: false,
 			skip_worktree: false,
 			intent_to_add: false,
-			path: "modules/one".to_owned(),
+			path: gitana_path::GitPath::from_utf8("modules/one").unwrap(),
 		});
 		std::fs::write(git_dir.join("index"), index.write_v4()).unwrap();
 		std::fs::write(
@@ -3019,7 +3019,7 @@ mod tests {
 			assume_valid: false,
 			skip_worktree: false,
 			intent_to_add: false,
-			path: "modules/one".to_owned(),
+			path: gitana_path::GitPath::from_utf8("modules/one").unwrap(),
 		});
 		std::fs::write(git_dir.join("index"), index.write_v4()).unwrap();
 		let config = "[core]\n\trepositoryformatversion = 0\n";
@@ -3072,7 +3072,7 @@ mod tests {
 			assume_valid: false,
 			skip_worktree: false,
 			intent_to_add: false,
-			path: "modules/one".to_owned(),
+			path: gitana_path::GitPath::from_utf8("modules/one").unwrap(),
 		});
 		std::fs::write(git_dir.join("index"), index.write_v4()).unwrap();
 		std::fs::write(

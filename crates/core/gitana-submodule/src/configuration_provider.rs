@@ -85,7 +85,7 @@ pub trait ConfigurationProvider: MarkerTargetResolver {
 		&self,
 		config: &GitConfig,
 		worktree_root: &Path,
-	) -> Result<Option<String>, SubmoduleError>;
+	) -> Result<Option<Vec<u8>>, SubmoduleError>;
 
 	/// Resolve module-wide excludes through the exact opened worktree, including after its public
 	/// mount name has been displaced during deinit.
@@ -95,7 +95,7 @@ pub trait ConfigurationProvider: MarkerTargetResolver {
 		config: &GitConfig,
 		worktree: Dir,
 		worktree_root: &Path,
-	) -> Result<Option<String>, SubmoduleError>;
+	) -> Result<Option<Vec<u8>>, SubmoduleError>;
 
 	/// Atomically update the module's repository-local `core.worktree` while preserving config
 	/// symlinks and the target file's permissions. `git_dir` is the already-open module directory;

@@ -9,12 +9,13 @@ use gitana_submodule::{
 };
 use gitana_worktree::WorkTree;
 
+use crate::git_path::render_result_path;
 use crate::identity::CliIdentity;
 use crate::signer;
 
 /// Native history integration for submodule updates.
 #[derive(Clone, Copy)]
-pub(crate) struct SubmoduleUpdateStrategy;
+pub(crate) struct SubmoduleUpdateStrategy(pub(crate) crate::ResultPathMode);
 
 impl UpdateStrategyExecutor for SubmoduleUpdateStrategy {
 	async fn merge<H: HashAlgorithm>(
@@ -62,6 +63,12 @@ impl UpdateStrategyExecutor for SubmoduleUpdateStrategy {
 			MergeOutcome::Made { commit } => UpdateMergeResult::Completed(UpdateMergeOutcome::Made {
 				commit: SubmoduleObjectId::from_typed(commit),
 			}),
+			MergeOutcome::WouldOverwrite { paths } => {
+				return Err(SubmoduleError::Merge(
+					gitana_porcelain::conflict::ConflictOverwriteError::new(paths)
+						.render_with_paths(|path| render_result_path(path, self.0)),
+				));
+			}
 			MergeOutcome::Conflict { paths } => UpdateMergeResult::Conflict { paths },
 		})
 	}

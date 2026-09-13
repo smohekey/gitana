@@ -15,7 +15,7 @@ struct Pattern {
 	negated: bool,
 	dir_only: bool,
 	anchored: bool,
-	glob: String,
+	glob: Vec<u8>,
 }
 
 /// The patterns from one directory's `.gitignore`, tagged with that directory's
@@ -23,46 +23,47 @@ struct Pattern {
 /// per-directory stack with the shared whole-tree base levels (see [`crate::excludes`]).
 #[derive(Clone)]
 pub(crate) struct DirIgnore {
-	dir: String,
+	dir: Vec<u8>,
 	patterns: Vec<Pattern>,
 }
 
 /// Parse a `.gitignore` whose directory is `dir` (relative to the root).
-pub(crate) fn parse(text: &str, dir: &str) -> DirIgnore {
+pub(crate) fn parse(text: impl AsRef<[u8]>, dir: impl AsRef<[u8]>) -> DirIgnore {
 	let mut patterns = Vec::new();
-	for raw in text.lines() {
+	for raw in text.as_ref().split(|byte| *byte == b'\n') {
+		let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
 		let line = trim_trailing_spaces(raw);
 		if line.is_empty() {
 			continue;
 		}
 		// A leading backslash escapes a `#` or `!` so it is a literal first character rather than a
 		// comment or negation marker: `\#hash` matches the file `#hash`, `\!keep` the file `!keep`.
-		let (negated, body) = match line.strip_prefix('\\') {
-			Some(rest) if rest.starts_with('#') || rest.starts_with('!') => (false, rest),
-			_ if line.starts_with('#') => continue,
-			_ => match line.strip_prefix('!') {
+		let (negated, body) = match line.strip_prefix(b"\\") {
+			Some(rest) if rest.starts_with(b"#") || rest.starts_with(b"!") => (false, rest),
+			_ if line.starts_with(b"#") => continue,
+			_ => match line.strip_prefix(b"!") {
 				Some(rest) => (true, rest),
 				None => (false, line),
 			},
 		};
-		let dir_only = body.ends_with('/');
-		let mut glob = body.strip_suffix('/').unwrap_or(body);
-		let anchored = match glob.strip_prefix('/') {
+		let dir_only = body.ends_with(b"/");
+		let mut glob = body.strip_suffix(b"/").unwrap_or(body);
+		let anchored = match glob.strip_prefix(b"/") {
 			Some(rest) => {
 				glob = rest;
 				true
 			}
-			None => glob.contains('/'),
+			None => glob.contains(&b'/'),
 		};
 		patterns.push(Pattern {
 			negated,
 			dir_only,
 			anchored,
-			glob: glob.to_owned(),
+			glob: glob.to_vec(),
 		});
 	}
 	DirIgnore {
-		dir: dir.to_owned(),
+		dir: dir.as_ref().to_vec(),
 		patterns,
 	}
 }
@@ -70,11 +71,10 @@ pub(crate) fn parse(text: &str, dir: &str) -> DirIgnore {
 /// Trim trailing spaces that are *not* backslash-escaped, matching git: a trailing space is dropped
 /// unless preceded by an odd number of backslashes (`file\ ` keeps its escaped space). Leading
 /// whitespace is significant and left untouched; only lines end with `\n`/`\r\n` (already split off).
-fn trim_trailing_spaces(line: &str) -> &str {
-	let bytes = line.as_bytes();
-	let mut end = bytes.len();
-	while end > 0 && bytes[end - 1] == b' ' {
-		let backslashes = bytes[..end - 1]
+fn trim_trailing_spaces(line: &[u8]) -> &[u8] {
+	let mut end = line.len();
+	while end > 0 && line[end - 1] == b' ' {
+		let backslashes = line[..end - 1]
 			.iter()
 			.rev()
 			.take_while(|&&b| b == b'\\')
@@ -97,7 +97,13 @@ pub(crate) fn is_ignored(path: &str, is_dir: bool, stack: &[DirIgnore]) -> bool 
 
 /// [`is_ignored`], but folding ASCII case when `fold` (git's `core.ignoreCase`, the default on
 /// case-insensitive filesystems such as macOS) — then a pattern like `*.LOG` also matches `x.log`.
-pub(crate) fn is_ignored_fold(path: &str, is_dir: bool, stack: &[DirIgnore], fold: bool) -> bool {
+pub(crate) fn is_ignored_fold(
+	path: impl AsRef<[u8]>,
+	is_dir: bool,
+	stack: &[DirIgnore],
+	fold: bool,
+) -> bool {
+	let path = path.as_ref();
 	let mut ignored = false;
 	for level in stack {
 		let Some(rel) = strip_dir(path, &level.dir) else {
@@ -110,9 +116,9 @@ pub(crate) fn is_ignored_fold(path: &str, is_dir: bool, stack: &[DirIgnore], fol
 			let subject = if pattern.anchored {
 				rel
 			} else {
-				rel.rsplit('/').next().unwrap_or(rel)
+				rel.rsplit(|byte| *byte == b'/').next().unwrap_or(rel)
 			};
-			if glob_match(pattern.glob.as_bytes(), subject.as_bytes(), fold, true) {
+			if glob_match(&pattern.glob, subject, fold, true) {
 				ignored = !pattern.negated;
 			}
 		}
@@ -136,11 +142,12 @@ pub(crate) fn is_ignored_fold(path: &str, is_dir: bool, stack: &[DirIgnore], fol
 /// earlier `*.log` included: at the `baz` directory level `!baz/` excludes, but at the file level
 /// `*.log` matches (and the dir-only `!baz/` does not), so the file's own level re-includes it. And it
 /// is what makes a deeper `!/foo/sub/` exclude `foo/sub/*` while leaving `foo/*` included.
-pub(crate) fn sparse_match(path: &str, patterns: &DirIgnore, fold: bool) -> bool {
+pub(crate) fn sparse_match(path: impl AsRef<[u8]>, patterns: &DirIgnore, fold: bool) -> bool {
+	let path = path.as_ref();
 	let mut included = false;
 	let mut idx = 0;
 	loop {
-		let (level, is_dir, last) = match path[idx..].find('/') {
+		let (level, is_dir, last) = match path[idx..].iter().position(|byte| *byte == b'/') {
 			Some(next) => (&path[..idx + next], true, false),
 			None => (path, false, true),
 		};
@@ -157,7 +164,7 @@ pub(crate) fn sparse_match(path: &str, patterns: &DirIgnore, fold: bool) -> bool
 /// The verdict (`true` = included, `false` = excluded) of the *last* pattern that matches `subject` at
 /// this level, or `None` when no pattern matches (so the level inherits its parent's verdict). `fold`
 /// matches case-insensitively (git's `core.ignoreCase`).
-fn last_matching(patterns: &DirIgnore, subject: &str, is_dir: bool, fold: bool) -> Option<bool> {
+fn last_matching(patterns: &DirIgnore, subject: &[u8], is_dir: bool, fold: bool) -> Option<bool> {
 	let mut verdict = None;
 	for pattern in &patterns.patterns {
 		if matches_subject(pattern, subject, is_dir, fold) {
@@ -171,25 +178,28 @@ fn last_matching(patterns: &DirIgnore, subject: &str, is_dir: bool, fold: bool) 
 /// the same rule [`is_ignored`] applies per level: a dir-only pattern needs `is_dir`, an anchored
 /// pattern matches the full relative subject, an unanchored one matches the basename. `fold` matches
 /// case-insensitively (git's `core.ignoreCase`).
-fn matches_subject(pattern: &Pattern, subject: &str, is_dir: bool, fold: bool) -> bool {
+fn matches_subject(pattern: &Pattern, subject: &[u8], is_dir: bool, fold: bool) -> bool {
 	if pattern.dir_only && !is_dir {
 		return false;
 	}
 	let glob_subject = if pattern.anchored {
 		subject
 	} else {
-		subject.rsplit('/').next().unwrap_or(subject)
+		subject
+			.rsplit(|byte| *byte == b'/')
+			.next()
+			.unwrap_or(subject)
 	};
-	glob_match(pattern.glob.as_bytes(), glob_subject.as_bytes(), fold, true)
+	glob_match(&pattern.glob, glob_subject, fold, true)
 }
 
-fn strip_dir<'a>(path: &'a str, dir: &str) -> Option<&'a str> {
+fn strip_dir<'a>(path: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
 	if dir.is_empty() {
 		Some(path)
 	} else {
 		path
 			.strip_prefix(dir)
-			.and_then(|rest| rest.strip_prefix('/'))
+			.and_then(|rest| rest.strip_prefix(b"/"))
 	}
 }
 
@@ -701,5 +711,22 @@ mod tests {
 		let stack = [root, nested];
 		assert!(is_ignored("src/secret.txt", false, &stack));
 		assert!(!is_ignored("secret.txt", false, &stack));
+	}
+
+	#[test]
+	fn ignore_patterns_match_raw_non_utf8_bytes() {
+		let root = parse(b"\xff\n", b"");
+		assert!(is_ignored_fold(
+			b"\xff",
+			false,
+			std::slice::from_ref(&root),
+			false
+		));
+		assert!(!is_ignored_fold(
+			"�".as_bytes(),
+			false,
+			std::slice::from_ref(&root),
+			false
+		));
 	}
 }

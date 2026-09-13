@@ -66,6 +66,28 @@ fn changed_entries_precede_untracked() {
 }
 
 #[test]
+fn untracked_directories_sort_by_their_presented_name() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-status-directory-order");
+	let w = work.to_str().unwrap();
+
+	write(&work, "tracked", "base\n");
+	commit_all(w, "base");
+	write(&work, "foo.", "file\n");
+	std::fs::create_dir_all(work.join("foo")).unwrap();
+	write(&work, "foo/inside", "content\n");
+
+	let theirs = git(w, &["status", "--porcelain"]);
+	assert_eq!(theirs, "?? foo.\n?? foo/\n");
+	assert_eq!(gta(w, &["status"], b""), theirs);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
 fn rm_cached_shows_staged_deletion_and_untracked() {
 	if !git_supports_sha256() {
 		return;

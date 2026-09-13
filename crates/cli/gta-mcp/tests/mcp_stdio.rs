@@ -156,4 +156,13 @@ fn mcp_stdio_advertises_gta_tools() {
 		"resource schema must retain the hierarchical clap command name"
 	);
 	assert_eq!(reply(5)["error"]["code"], -32602);
+
+	let ls_files = tools
+		.iter()
+		.find(|tool| tool["name"] == "ls-files")
+		.expect("ls-files tool");
+	assert!(
+		ls_files["inputSchema"]["properties"].get("z").is_none(),
+		"MCP ls-files must not advertise raw NUL-delimited output: {ls_files}"
+	);
 }

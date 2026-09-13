@@ -236,6 +236,72 @@ fn diff_matches_git() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+#[test]
+fn diff_quotes_the_complete_prefixed_path_like_git() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("gta-diff-quoted-path");
+	let w = work.to_str().unwrap();
+	gta(w, &["init"], b"");
+
+	let path = work.join("line\nfile");
+	std::fs::write(&path, b"old\n").unwrap();
+	git(w, &["add", "."]);
+	commit(w, "base");
+	std::fs::write(path, b"new\n").unwrap();
+
+	let ours_output = gta(w, &["diff"], b"");
+	let theirs_output = git(w, &["diff"]);
+	let ours = diff_path_headers(&ours_output);
+	let theirs = diff_path_headers(&theirs_output);
+	assert_eq!(ours, theirs, "diff path headers must match git");
+	assert_eq!(
+		ours,
+		vec![
+			"diff --git \"a/line\\nfile\" \"b/line\\nfile\"",
+			"--- \"a/line\\nfile\"",
+			"+++ \"b/line\\nfile\"",
+		]
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
+fn path_output_honours_core_quotepath_false() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = unique_tmp("gta-quotepath-false");
+	let w = work.to_str().unwrap();
+	gta(w, &["init"], b"");
+	std::fs::write(work.join("café"), b"old\n").unwrap();
+	git(w, &["add", "."]);
+	commit(w, "base");
+	git(w, &["config", "core.quotePath", "false"]);
+	std::fs::write(work.join("café"), b"new\n").unwrap();
+
+	assert_eq!(
+		gta(w, &["status"], b""),
+		git(w, &["status", "--porcelain=v1"])
+	);
+	assert_eq!(
+		diff_path_headers(&gta(w, &["diff"], b"")),
+		diff_path_headers(&git(w, &["diff"]))
+	);
+	let tree = git(w, &["rev-parse", "HEAD^{tree}"]);
+	assert_eq!(
+		gta(w, &["ls-tree", tree.trim()], b""),
+		git(w, &["ls-tree", tree.trim()])
+	);
+	let shown = gta(w, &["show", "HEAD"], b"");
+	assert!(shown.contains("diff --git a/café b/café"));
+	assert!(!shown.contains("\\303\\251"));
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 /// The semantic content of a unified diff: every added/removed line (sign + text),
 /// sorted, ignoring file headers, hunk headers, and the no-newline marker. Used to
 /// compare gta's diff to git's without depending on git's exact byte framing.
@@ -249,6 +315,15 @@ fn diff_payload(text: &str) -> Vec<String> {
 		.collect();
 	out.sort();
 	out
+}
+
+fn diff_path_headers(text: &str) -> Vec<&str> {
+	text
+		.lines()
+		.filter(|line| {
+			line.starts_with("diff --git ") || line.starts_with("--- ") || line.starts_with("+++ ")
+		})
+		.collect()
 }
 
 fn gta_env(dir: &str, args: &[&str], env: &[(&str, &str)]) -> String {

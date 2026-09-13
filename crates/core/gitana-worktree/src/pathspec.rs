@@ -17,6 +17,7 @@
 //! resolves to a parent the way git accepts `a.txt/..` (the directory above the file).
 
 use crate::WorktreeError;
+use gitana_path::GitPathspec;
 
 /// A parsed pathspec: its canonical worktree-relative form (the caller's `prefix` applied, `.`/`..`
 /// resolved) plus how it matches. A pathspec with a glob metacharacter (`*`/`?`/`[`) matches by
@@ -28,7 +29,7 @@ use crate::WorktreeError;
 /// pathspec (see [`PathspecSet`]). Matching a single spec against a path is [`matches`](Self::matches).
 pub(crate) struct Pathspec {
 	/// The canonical worktree-relative pattern (empty means the work-tree root).
-	normalized: String,
+	normalized: Vec<u8>,
 	/// When `normalized` is empty, whether it means "the whole tree" (`.`, a bare `:` / `:/` / `:(top)`)
 	/// rather than "matches nothing". A magic prefix with a *non-empty* path that resolves to the root —
 	/// `:/.` or `:(top).` — is the latter: git reports it unmatched for `rm`/`restore` and a no-op for
@@ -62,32 +63,43 @@ struct Magic {
 /// `attr:`, which needs `.gitattributes` — is rejected) and the short forms `:/` (top) and `:!` / `:^`
 /// (exclude). A `:` not followed by recognised magic is treated as a literal path (git accepts a bare
 /// `:` as the repo top; `:x` matches nothing there, and a literal `:x` likewise matches no such file).
-fn strip_magic(spec: &str) -> Result<(Magic, &str), WorktreeError> {
+fn display_spec(spec: &[u8]) -> String {
+	GitPathspec::from_bytes(spec.to_vec())
+		.map_or_else(|_| "<invalid pathspec>".to_owned(), |spec| spec.to_string())
+}
+
+fn retained_spec(spec: &[u8]) -> Result<GitPathspec, WorktreeError> {
+	GitPathspec::from_bytes(spec.to_vec()).map_err(|_| WorktreeError::InvalidPath(display_spec(spec)))
+}
+
+fn strip_magic(spec: &[u8]) -> Result<(Magic, &[u8]), WorktreeError> {
 	let mut magic = Magic::default();
-	if let Some(rest) = spec.strip_prefix(":(") {
+	if let Some(rest) = spec.strip_prefix(b":(") {
+		let retained = retained_spec(spec)?;
 		let close = rest
-			.find(')')
-			.ok_or_else(|| WorktreeError::InvalidPathspecMagic(spec.to_owned()))?;
-		for word in rest[..close].split(',') {
+			.iter()
+			.position(|byte| *byte == b')')
+			.ok_or_else(|| WorktreeError::InvalidPathspecMagic(retained.clone()))?;
+		for word in rest[..close].split(|byte| *byte == b',') {
 			match word {
-				"" => {}
-				"top" => magic.top = true,
-				"literal" => magic.literal = true,
-				"glob" => magic.glob = true,
-				"icase" => magic.icase = true,
-				"exclude" => magic.exclude = true,
-				_ => return Err(WorktreeError::InvalidPathspecMagic(spec.to_owned())),
+				b"" => {}
+				b"top" => magic.top = true,
+				b"literal" => magic.literal = true,
+				b"glob" => magic.glob = true,
+				b"icase" => magic.icase = true,
+				b"exclude" => magic.exclude = true,
+				_ => return Err(WorktreeError::InvalidPathspecMagic(retained)),
 			}
 		}
 		Ok((magic, &rest[close + 1..]))
-	} else if let Some(rest) = spec.strip_prefix(':') {
+	} else if let Some(rest) = spec.strip_prefix(b":") {
 		// Short form: the leading `:` is magic. Consume the signature bytes `/` (top) and `!`/`^` (exclude);
 		// a `:` terminates the magic (`::x`). git reserves other punctuation as short-magic *signatures* and
 		// aborts on an unrecognised one (`:@x` → "unimplemented magic"), rather than taking it as a literal
 		// path — so we reject those. A non-signature byte (alnum, `.`, `$`, a glob metacharacter, …) ends
 		// the magic and begins the path: `:x` is path `x` with empty magic, `:/x` a top-relative `x`
 		// (probed vs git 2.50.1).
-		let bytes = rest.as_bytes();
+		let bytes = rest;
 		let mut i = 0;
 		while i < bytes.len() {
 			match bytes[i] {
@@ -95,14 +107,14 @@ fn strip_magic(spec: &str) -> Result<(Magic, &str), WorktreeError> {
 				b'!' | b'^' => magic.exclude = true,
 				b':' => break, // an explicit terminator (`::x`)
 				b if is_reserved_magic_signature(b) => {
-					return Err(WorktreeError::InvalidPathspecMagic(spec.to_owned()));
+					return Err(WorktreeError::InvalidPathspecMagic(retained_spec(spec)?));
 				}
 				_ => break, // a non-signature byte — the path starts here
 			}
 			i += 1;
 		}
 		let after = &rest[i..];
-		Ok((magic, after.strip_prefix(':').unwrap_or(after)))
+		Ok((magic, after.strip_prefix(b":").unwrap_or(after)))
 	} else {
 		Ok((magic, spec))
 	}
@@ -147,11 +159,11 @@ fn bytes_eq(a: &[u8], b: &[u8], icase: bool) -> bool {
 /// Whether `pat` needs the wildmatch engine, matching git: a `*` or `?` always, a `\` (which escapes the
 /// next byte — `foo\[` selects the file `foo[`), or a `[` that a `]` closes. An unterminated `[` (e.g.
 /// `foo[`) is an ordinary literal character, not a class.
-fn has_wildcard(pat: &str) -> bool {
+fn has_wildcard(pat: &[u8]) -> bool {
 	// Single linear pass (not a rescan of the tail at every `[`, which is quadratic on `[[[[…`): a `[`
 	// is a wildcard only once a `]` closes it somewhere later.
 	let mut open_bracket = false;
-	for &b in pat.as_bytes() {
+	for &b in pat {
 		match b {
 			b'*' | b'?' | b'\\' => return true,
 			b'[' => open_bracket = true,
@@ -166,14 +178,22 @@ impl Pathspec {
 	/// Parse `spec` (from the command line, relative to `prefix`) into a matcher. Rejects the same
 	/// forms [`normalize`] does (empty, absolute, an escape above the root), plus an unknown or
 	/// incompatible magic.
-	pub(crate) fn parse(spec: &str, prefix: &str) -> Result<Self, WorktreeError> {
+	pub(crate) fn parse<S: AsRef<[u8]>, P: AsRef<[u8]>>(
+		spec: S,
+		prefix: P,
+	) -> Result<Self, WorktreeError> {
+		let spec = spec.as_ref();
+		let prefix = prefix.as_ref();
+		if spec.contains(&0) {
+			return Err(WorktreeError::InvalidPath(display_spec(spec)));
+		}
 		let (magic, rest) = strip_magic(spec)?;
 		// `literal` and `glob` are mutually exclusive — git rejects the combination.
 		if magic.literal && magic.glob {
-			return Err(WorktreeError::InvalidPathspecMagic(spec.to_owned()));
+			return Err(WorktreeError::InvalidPathspecMagic(retained_spec(spec)?));
 		}
 		// `:(top)` / `:/` resolve from the repository root, ignoring the invocation prefix.
-		let effective_prefix = if magic.top { "" } else { prefix };
+		let effective_prefix: &[u8] = if magic.top { b"" } else { prefix };
 		// A magic prefix with an empty path (`:`, `:/`, `:(top)`, `:(icase)`) matches the caller's directory
 		// — the *effective prefix* — not an empty-pathspec error. That prefix is the repo root only for
 		// `:(top)`/`:/`; from a subdirectory, `:` / `:(icase)` / `:(glob)` stay scoped to it (probed vs git
@@ -181,7 +201,7 @@ impl Pathspec {
 		// still errors via `normalize`.
 		let had_magic = rest.len() < spec.len();
 		let (normalized, dir_only) = if rest.is_empty() && had_magic {
-			(effective_prefix.to_owned(), false)
+			(effective_prefix.to_vec(), false)
 		} else {
 			normalize(rest, effective_prefix)?
 		};
@@ -209,13 +229,13 @@ impl Pathspec {
 	/// match. `rm` requires `-r` for such an expansion, for a literal *and* a wildcard spec (probed vs git
 	/// 2.50.1: `rm 'a?'` on the literally-named directory `a?/` needs `-r`, while a glob file match like
 	/// `rm 'a?/f'` selecting `ax/f` does not). Folds ASCII case under `:(icase)`.
-	pub(crate) fn expands_directory(&self, path: &str) -> bool {
+	pub(crate) fn expands_directory(&self, path: impl AsRef<[u8]>) -> bool {
 		// The root pathspec (`.`, `./`, `:`, `:/`, a magic-only form — `normalized` is empty) matches every
 		// path as the whole-tree expansion, so `rm .` is recursive and git rejects it without `-r`.
 		if self.normalized.is_empty() {
 			return true;
 		}
-		let (n, p) = (self.normalized.as_bytes(), path.as_bytes());
+		let (n, p) = (self.normalized.as_slice(), path.as_ref());
 		p.len() > n.len() && p[n.len()] == b'/' && bytes_eq(&p[..n.len()], n, self.icase)
 	}
 
@@ -246,7 +266,7 @@ impl Pathspec {
 	}
 
 	/// The canonical worktree-relative pattern (empty = the root).
-	pub(crate) fn as_str(&self) -> &str {
+	pub(crate) fn as_bytes(&self) -> &[u8] {
 		&self.normalized
 	}
 
@@ -268,19 +288,23 @@ impl Pathspec {
 	/// byte, e.g. an escaped separator `dir\/foo`) also ends the literal prefix, so the derivation never
 	/// treats the backslash as part of a real directory name and skips the walk — it falls back to the
 	/// root, and `matches` filters (probed vs git 2.50.1: `add 'dir\/foo'` stages `dir/foo`).
-	pub(crate) fn base_dir(&self) -> &str {
+	pub(crate) fn base_dir(&self) -> &[u8] {
 		// Under `:(icase)` the directory casing is unknown, so walk from the root and let `matches` fold.
 		if self.icase {
-			return "";
+			return b"";
 		}
 		let first_wild = self
 			.normalized
-			.bytes()
+			.iter()
+			.copied()
 			.position(|b| matches!(b, b'*' | b'?' | b'[' | b'\\'))
 			.unwrap_or(self.normalized.len());
-		match self.normalized[..first_wild].rfind('/') {
+		match self.normalized[..first_wild]
+			.iter()
+			.rposition(|byte| *byte == b'/')
+		{
 			Some(i) => &self.normalized[..i],
-			None => "",
+			None => b"",
 		}
 	}
 
@@ -288,10 +312,11 @@ impl Pathspec {
 	/// component (unlike [`base_dir`], which drops it) and regardless of `:(icase)` (the path structure is
 	/// still known even when the casing is not). `sub/*` → `sub/`, `:(icase)sub/new` → `sub/new`, `*` → ``.
 	/// Used to detect a spec rooted inside a tracked submodule (`add sub/*` is git's "is in submodule").
-	pub(crate) fn rooted_prefix(&self) -> &str {
+	pub(crate) fn rooted_prefix(&self) -> &[u8] {
 		let first_wild = self
 			.normalized
-			.bytes()
+			.iter()
+			.copied()
 			.position(|b| matches!(b, b'*' | b'?' | b'[' | b'\\'))
 			.unwrap_or(self.normalized.len());
 		&self.normalized[..first_wild]
@@ -302,7 +327,7 @@ impl Pathspec {
 	/// matches `path` exactly (unless it required a directory) or as a leading directory of `path`. A
 	/// glob that merely matches a directory does **not** pull in its contents (git only expands a literal
 	/// leading directory), so no directory-prefix rule is applied to a glob.
-	pub(crate) fn matches(&self, path: &str) -> bool {
+	pub(crate) fn matches(&self, path: impl AsRef<[u8]>) -> bool {
 		self.matches_entry(path, false)
 	}
 
@@ -311,17 +336,17 @@ impl Pathspec {
 	/// Unlike [`matches`](Self::matches), an exact match satisfies a trailing slash or final `.`
 	/// requirement. Submodule gitlinks use this because Git presents them to pathspecs as directories
 	/// even though the index stores them as mode `160000` entries.
-	fn matches_directory(&self, path: &str) -> bool {
+	fn matches_directory(&self, path: impl AsRef<[u8]>) -> bool {
 		self.matches_entry(path, true)
 	}
 
-	fn matches_entry(&self, path: &str, is_directory: bool) -> bool {
+	fn matches_entry(&self, path: impl AsRef<[u8]>, is_directory: bool) -> bool {
 		if self.normalized.is_empty() {
 			// The whole tree (`.`, bare `:` / `:/`) — or, for a magic path that only *resolved* to the root
 			// (`:/.`), nothing at all.
 			return self.matches_root;
 		}
-		let (n, p) = (self.normalized.as_bytes(), path.as_bytes());
+		let (n, p) = (self.normalized.as_slice(), path.as_ref());
 		// Exact (unless the spec required a directory), or a leading directory of `path` — folding ASCII
 		// case under `:(icase)`. The `/` boundary check keeps the prefix slice byte-aligned. git applies
 		// this literal pass to the pattern's raw spelling for *every* spec, so a wildcard spec also selects
@@ -339,9 +364,9 @@ impl Pathspec {
 			// match every `a`-prefixed path); `a**/` matches `a` alone. Probed vs git 2.50.1.
 			let glob = if self.dir_only {
 				self.pathname
-					&& self.normalized.ends_with("**")
+					&& self.normalized.ends_with(b"**")
 					&& crate::ignore::glob_match(
-						format!("{}/", self.normalized).as_bytes(),
+						&[self.normalized.as_slice(), b"/"].concat(),
 						p,
 						self.icase,
 						self.pathname,
@@ -363,7 +388,7 @@ impl Pathspec {
 pub struct PathspecSet {
 	// `AtomicBool` (not `Cell`) so `PathspecSet` stays `Sync`: `WorkTree::add` holds a `&PathspecSet`
 	// across awaits, and callers `tokio::spawn` that future, so it must remain `Send`.
-	positive: Vec<(String, Pathspec, std::sync::atomic::AtomicBool)>,
+	positive: Vec<(GitPathspec, Pathspec, std::sync::atomic::AtomicBool)>,
 	negative: Vec<Pathspec>,
 }
 
@@ -377,16 +402,21 @@ const _: fn() = || {
 impl PathspecSet {
 	/// Parse each raw spec (relative to `prefix`) into the set, routing `:(exclude)` ones to the
 	/// negatives. Rejects the same forms [`Pathspec::parse`] does (empty/absolute/escape/unknown magic).
-	pub fn parse(specs: &[&str], prefix: &str) -> Result<Self, WorktreeError> {
+	pub fn parse<S: AsRef<[u8]>, P: AsRef<[u8]>>(
+		specs: &[S],
+		prefix: P,
+	) -> Result<Self, WorktreeError> {
+		let prefix = prefix.as_ref();
 		let mut positive = Vec::new();
 		let mut negative = Vec::new();
-		for &spec in specs {
+		for spec in specs {
+			let spec = spec.as_ref();
 			let parsed = Pathspec::parse(spec, prefix)?;
 			if parsed.is_exclude() {
 				negative.push(parsed);
 			} else {
 				positive.push((
-					spec.to_owned(),
+					retained_spec(spec)?,
 					parsed,
 					std::sync::atomic::AtomicBool::new(false),
 				));
@@ -396,13 +426,13 @@ impl PathspecSet {
 	}
 
 	/// Whether `path` is excluded by a negative pathspec.
-	pub(crate) fn is_excluded(&self, path: &str) -> bool {
+	pub(crate) fn is_excluded(&self, path: impl AsRef<[u8]> + Copy) -> bool {
 		self.negative.iter().any(|negative| negative.matches(path))
 	}
 
 	/// Whether `path` is selected by the set (matches a positive — or there are none — and no negative).
 	/// Records the positives that matched, for [`unmatched`](Self::unmatched).
-	pub fn matches(&self, path: &str) -> bool {
+	pub fn matches(&self, path: impl AsRef<[u8]>) -> bool {
 		self.matches_entry(path, false)
 	}
 
@@ -412,11 +442,12 @@ impl PathspecSet {
 	/// but allows an exact literal directory-only pathspec to match the directory entry itself.
 	/// Directory-only wildcards retain Git's ordinary no-match behavior for a gitlink. Consumers
 	/// representing submodule gitlinks as directories use this without changing index-file matching.
-	pub fn matches_directory(&self, path: &str) -> bool {
+	pub fn matches_directory(&self, path: impl AsRef<[u8]>) -> bool {
 		self.matches_entry(path, true)
 	}
 
-	fn matches_entry(&self, path: &str, is_directory: bool) -> bool {
+	fn matches_entry(&self, path: impl AsRef<[u8]>, is_directory: bool) -> bool {
+		let path = path.as_ref();
 		let mut positive_hit = self.positive.is_empty();
 		for (_, pathspec, matched) in &self.positive {
 			let matches = if is_directory {
@@ -442,12 +473,12 @@ impl PathspecSet {
 	/// The original text of the first positive pathspec that matched nothing (git's "did not match any
 	/// files"), or `None` if every positive matched. Call after iterating all candidate paths through
 	/// [`matches`](Self::matches).
-	pub fn unmatched(&self) -> Option<&str> {
+	pub fn unmatched(&self) -> Option<&GitPathspec> {
 		self
 			.positive
 			.iter()
 			.find(|(_, _, matched)| !matched.load(std::sync::atomic::Ordering::Relaxed))
-			.map(|(spec, _, _)| spec.as_str())
+			.map(|(spec, _, _)| spec)
 	}
 
 	/// Every pathspec in the set — positives then negatives — for consumers that inspect each element
@@ -463,11 +494,11 @@ impl PathspecSet {
 
 	/// The positive pathspecs paired with their original spec text — for consumers (like `rm`) that need
 	/// per-spec handling beyond plain selection.
-	pub(crate) fn positives(&self) -> impl Iterator<Item = (&str, &Pathspec)> {
+	pub(crate) fn positives(&self) -> impl Iterator<Item = (&GitPathspec, &Pathspec)> {
 		self
 			.positive
 			.iter()
-			.map(|(spec, pathspec, _)| (spec.as_str(), pathspec))
+			.map(|(spec, pathspec, _)| (spec, pathspec))
 	}
 
 	/// Whether the set has no positive pathspecs (only negatives, or empty) — then every non-excluded
@@ -479,23 +510,31 @@ impl PathspecSet {
 
 /// Returns the canonical worktree-relative path together with `dir_only` (the spec ended in a
 /// slash or a `.` component and so may only match a directory).
-pub(crate) fn normalize(spec: &str, prefix: &str) -> Result<(String, bool), WorktreeError> {
-	if spec.starts_with('/') {
-		return Err(WorktreeError::AbsolutePathspec(spec.to_owned()));
+pub(crate) fn normalize<S: AsRef<[u8]>, P: AsRef<[u8]>>(
+	spec: S,
+	prefix: P,
+) -> Result<(Vec<u8>, bool), WorktreeError> {
+	let spec = spec.as_ref();
+	let prefix = prefix.as_ref();
+	if spec.starts_with(b"/") {
+		return Err(WorktreeError::AbsolutePathspec(retained_spec(spec)?));
 	}
 
 	// Resolve the spec against the (already-canonical) prefix, applying `.`/`..` as we go.
-	let mut stack: Vec<&str> = prefix.split('/').filter(|part| !part.is_empty()).collect();
+	let mut stack: Vec<&[u8]> = prefix
+		.split(|byte| *byte == b'/')
+		.filter(|part| !part.is_empty())
+		.collect();
 	let mut named_a_path = false;
 	let mut had_dot = false;
-	for part in spec.split('/') {
+	for part in spec.split(|byte| *byte == b'/') {
 		match part {
-			"" => {}
-			"." => had_dot = true,
-			".." => {
+			b"" => {}
+			b"." => had_dot = true,
+			b".." => {
 				if stack.pop().is_none() {
 					// Climbs above the work-tree root (e.g. `../x` at the root): outside the repo.
-					return Err(WorktreeError::UnsafePath(spec.to_owned()));
+					return Err(WorktreeError::UnsafePathspec(retained_spec(spec)?));
 				}
 				named_a_path = true;
 			}
@@ -511,9 +550,18 @@ pub(crate) fn normalize(spec: &str, prefix: &str) -> Result<(String, bool), Work
 		return Err(WorktreeError::EmptyPathspec);
 	}
 	// A trailing slash, or a final `.` component (e.g. `a.txt/.`), means a directory is required.
-	let last_named = spec.rsplit('/').find(|part| !part.is_empty());
-	let dir_only = spec.ends_with('/') || last_named == Some(".");
-	Ok((stack.join("/"), dir_only))
+	let last_named = spec
+		.rsplit(|byte| *byte == b'/')
+		.find(|part| !part.is_empty());
+	let dir_only = spec.ends_with(b"/") || last_named == Some(b".".as_slice());
+	let mut normalized = Vec::new();
+	for (index, component) in stack.into_iter().enumerate() {
+		if index > 0 {
+			normalized.push(b'/');
+		}
+		normalized.extend_from_slice(component);
+	}
+	Ok((normalized, dir_only))
 }
 
 #[cfg(test)]
@@ -641,7 +689,10 @@ mod tests {
 		for spec in ["modules/a/", "modules/a/."] {
 			let set = PathspecSet::parse(&[spec], "").unwrap();
 			assert!(!set.matches("modules/a"), "{spec} must not match a file");
-			assert_eq!(set.unmatched(), Some(spec));
+			assert_eq!(
+				set.unmatched().map(ToString::to_string).as_deref(),
+				Some(spec)
+			);
 			assert!(
 				set.matches_directory("modules/a"),
 				"{spec} must match a directory"
@@ -656,7 +707,10 @@ mod tests {
 				!set.matches_directory("modules/a"),
 				"{spec} must not match a gitlink"
 			);
-			assert_eq!(set.unmatched(), Some(spec));
+			assert_eq!(
+				set.unmatched().map(ToString::to_string).as_deref(),
+				Some(spec)
+			);
 		}
 
 		let excluded = PathspecSet::parse(&[":(exclude)modules/b/"], "").unwrap();
@@ -750,8 +804,8 @@ mod tests {
 			);
 		}
 		// Non-signature bytes still begin the path (the leading `:` is consumed): `:x`, `:.x`, `:*x`.
-		assert_eq!(ps(":x").as_str(), "x");
-		assert_eq!(ps(":.x").as_str(), ".x");
+		assert_eq!(ps(":x").as_bytes(), b"x");
+		assert_eq!(ps(":.x").as_bytes(), b".x");
 		assert!(ps(":*x").matches("ax")); // `*x` glob
 		// Recognised signatures keep working.
 		assert!(ps(":/x").matches("x")); // top-relative
@@ -782,7 +836,10 @@ mod tests {
 	fn set_reports_an_unmatched_positive() {
 		let set = PathspecSet::parse(&["*.rs", "nomatch/*"], "").unwrap();
 		assert!(set.matches("src/a.rs")); // `*.rs` matches; `nomatch/*` does not
-		assert_eq!(set.unmatched(), Some("nomatch/*"));
+		assert_eq!(
+			set.unmatched().map(AsRef::as_ref),
+			Some(b"nomatch/*".as_slice())
+		);
 	}
 
 	#[test]

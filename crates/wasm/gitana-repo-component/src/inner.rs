@@ -9,9 +9,9 @@ use gitana_worktree::WorkTree;
 use wasip2::filesystem::types::Descriptor;
 
 use crate::bindings::exports::gitana::repo::porcelain::{
-	CommitInfo, FetchOutcome, HashKind, HeadState, ObjectInfo, PushOutcome, RefEntry, ReflogRequest,
-	RepackReport, RepoError, SparseOutcome, SparsePatterns, TagInfo, TreeBuildEntry, TreeEntry,
-	WorktreeStatus,
+	CommitInfo, FetchOutcome, GitPath, HashKind, HeadState, ObjectInfo, PushOutcome, RefEntry,
+	ReflogRequest, RepackReport, RepoError, SparseEntry, SparseOutcome, SparsePatterns, TagInfo,
+	TreeBuildEntry, TreeEntry, WorktreeStatus,
 };
 use crate::block_on::block_on;
 use crate::ops;
@@ -248,27 +248,27 @@ impl Inner {
 		dispatch!(self, held => block_on(ops::read_config(held.repository())))
 	}
 
-	pub(crate) fn read_object(&self, spec: &str) -> Result<ObjectInfo, RepoError> {
+	pub(crate) fn read_object(&self, spec: &[u8]) -> Result<ObjectInfo, RepoError> {
 		dispatch!(self, held => block_on(ops::read_object(held.repository(), spec)))
 	}
 
-	pub(crate) fn read_blob(&self, spec: &str) -> Result<Vec<u8>, RepoError> {
+	pub(crate) fn read_blob(&self, spec: &[u8]) -> Result<Vec<u8>, RepoError> {
 		dispatch!(self, held => block_on(ops::read_blob(held.repository(), spec)))
 	}
 
-	pub(crate) fn read_commit(&self, spec: &str) -> Result<CommitInfo, RepoError> {
+	pub(crate) fn read_commit(&self, spec: &[u8]) -> Result<CommitInfo, RepoError> {
 		dispatch!(self, held => block_on(ops::read_commit(held.repository(), spec)))
 	}
 
-	pub(crate) fn read_tag(&self, spec: &str) -> Result<TagInfo, RepoError> {
+	pub(crate) fn read_tag(&self, spec: &[u8]) -> Result<TagInfo, RepoError> {
 		dispatch!(self, held => block_on(ops::read_tag(held.repository(), spec)))
 	}
 
-	pub(crate) fn ls_tree(&self, spec: &str) -> Result<Vec<TreeEntry>, RepoError> {
+	pub(crate) fn ls_tree(&self, spec: &[u8]) -> Result<Vec<TreeEntry>, RepoError> {
 		dispatch!(self, held => block_on(ops::ls_tree(held.repository(), spec)))
 	}
 
-	pub(crate) fn rev_parse(&self, spec: &str) -> Result<String, RepoError> {
+	pub(crate) fn rev_parse(&self, spec: &[u8]) -> Result<String, RepoError> {
 		dispatch!(self, held => block_on(ops::rev_parse(held.repository(), spec)))
 	}
 
@@ -369,14 +369,14 @@ impl Inner {
 
 	pub(crate) fn add(
 		&self,
-		pathspecs: &[String],
-		prefix: &str,
+		pathspecs: &[GitPath],
+		prefix: &GitPath,
 		force: bool,
 	) -> Result<(), RepoError> {
 		dispatch!(self, held => block_on(ops::add(held.worktree()?, pathspecs, prefix, force)))
 	}
 
-	pub(crate) fn checkout(&self, tree_ish: &str, force: bool) -> Result<(), RepoError> {
+	pub(crate) fn checkout(&self, tree_ish: &[u8], force: bool) -> Result<(), RepoError> {
 		dispatch!(self, held => block_on(ops::checkout(held.worktree()?, tree_ish, force)))
 	}
 
@@ -391,13 +391,13 @@ impl Inner {
 
 	pub(crate) fn sparse_set(
 		&self,
-		patterns: Vec<String>,
+		patterns: Vec<SparseEntry>,
 		cone: bool,
 	) -> Result<SparseOutcome, RepoError> {
 		dispatch!(self, held => block_on(ops::sparse_set(held.worktree()?, patterns, cone)))
 	}
 
-	pub(crate) fn sparse_add(&self, patterns: Vec<String>) -> Result<SparseOutcome, RepoError> {
+	pub(crate) fn sparse_add(&self, patterns: Vec<SparseEntry>) -> Result<SparseOutcome, RepoError> {
 		dispatch!(self, held => block_on(ops::sparse_add(held.worktree()?, patterns)))
 	}
 

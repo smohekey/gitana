@@ -13,6 +13,7 @@ workspace = true
 anyhow = { workspace = true }
 clap.workspace = true
 gta-core = { workspace = true }
+gitana-path.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
 
 [dev-dependencies]

@@ -14,6 +14,7 @@ use std::pin::Pin;
 use anyhow::{Result, anyhow, bail};
 use cap_std::fs::Dir;
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
+use gitana_path::GitPath;
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
 
@@ -65,7 +66,7 @@ pub trait WorkTreeCommand {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		prefix: String,
+		prefix: GitPath,
 	) -> Result<()>;
 }
 
@@ -197,7 +198,7 @@ async fn on_discovered_worktree<C: WorkTreeCommand>(
 	found: RepositoryLayout,
 	identity: RepositoryLayoutIdentity,
 	command_directory: RetainedCommandDirectory,
-	prefix: String,
+	prefix: GitPath,
 	mut command: C,
 	access: ConfigAccess,
 ) -> Result<()> {
@@ -353,7 +354,7 @@ pub trait ObjectCommand {
 
 /// Resolve `spec` to an object in the repository containing `cwd`, then run `command`
 /// under the repo's hash algorithm.
-pub async fn on_object<C: ObjectCommand>(cwd: &Path, spec: &str, command: C) -> Result<()> {
+pub async fn on_object<C: ObjectCommand>(cwd: &Path, spec: &[u8], command: C) -> Result<()> {
 	let found = repo::discover(cwd).await?;
 	let identity = repo::capture_repository_layout_identity(&found)?;
 	let (setup, common, git, work) = repo::command_setup_lease(&found, identity).await?;
@@ -376,7 +377,7 @@ pub async fn on_object<C: ObjectCommand>(cwd: &Path, spec: &str, command: C) -> 
 /// repository alone, so object-only lookups do not require a work tree.
 async fn resolve_object<H: HashAlgorithm>(
 	found: &RepositoryLayout,
-	spec: &str,
+	spec: &[u8],
 	common: Dir,
 	git: Dir,
 	work: Option<Dir>,
@@ -389,7 +390,7 @@ async fn resolve_object<H: HashAlgorithm>(
 		.map_err(|error| anyhow!("opening {}: {error}", found.git_dir.display()))?;
 	let repo =
 		repo::open_generic_from_dirs::<H>(common, git, &found.git_dir, &found.common_dir).await?;
-	let oid = if spec.starts_with(':') {
+	let oid = if spec.starts_with(b":") {
 		let worktree_root = found
 			.worktree_root
 			.clone()
@@ -483,6 +484,7 @@ mod worktree_tests {
 	use anyhow::Result;
 	use cap_std::{ambient_authority, fs::Dir};
 	use gitana_object::{HashAlgorithm, HashKind, Sha1};
+	use gitana_path::GitPath;
 	use gitana_repository::Repository;
 	use gitana_submodule::{
 		acquire_submodule_config_mutation_lease, acquire_worktree_mutation_guard,
@@ -516,7 +518,7 @@ mod worktree_tests {
 		async fn run<H: HashAlgorithm>(
 			self,
 			_worktree: WorkTree<Backend, WorkDir, H>,
-			_prefix: String,
+			_prefix: GitPath,
 		) -> Result<()> {
 			self.entered.store(true, Ordering::SeqCst);
 			while !self.release.load(Ordering::SeqCst) {
@@ -535,7 +537,7 @@ mod worktree_tests {
 		async fn run<H: HashAlgorithm>(
 			self,
 			_worktree: WorkTree<Backend, WorkDir, H>,
-			_prefix: String,
+			_prefix: GitPath,
 		) -> Result<()> {
 			self.entered.store(true, Ordering::SeqCst);
 			while !self.release.load(Ordering::SeqCst) {
@@ -704,7 +706,7 @@ mod worktree_tests {
 			found,
 			identity,
 			retained,
-			"nested".to_owned(),
+			GitPath::from_utf8("nested").unwrap(),
 			PausedWorktreeCommand {
 				entered: Arc::clone(&entered),
 				release: Arc::new(AtomicBool::new(true)),
@@ -872,7 +874,7 @@ mod worktree_tests {
 			RetainedCommandDirectory::capture(worktree.clone())
 				.await
 				.unwrap(),
-			String::new(),
+			GitPath::root(),
 			PausedWorktreeCommand {
 				entered: Arc::clone(&entered),
 				release: Arc::new(AtomicBool::new(true)),

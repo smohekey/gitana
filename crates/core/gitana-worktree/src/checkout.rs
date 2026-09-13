@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::{PopulationEntry, WorkDirFs};
 use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_path::GitPath;
 
 use crate::CheckoutMode;
 use crate::fsmeta::{blob_of, effective_mode, join_rel, push_gitignore, stat_of};
@@ -20,16 +21,16 @@ use crate::{IndexEntry, SparseCheckout, WorkTree, WorktreeError};
 type EntryRef<'a, H> = &'a (String, ObjectId<H>);
 /// Current stage-0 entries grouped by fold-key, each keeping its actual index spelling — a case-colliding
 /// index (`Foo`+`foo`) keeps both under one key.
-type FoldGroups<'a, H> = std::collections::HashMap<String, Vec<(&'a str, EntryRef<'a, H>)>>;
+type FoldGroups<'a, H> = std::collections::HashMap<Vec<u8>, Vec<(&'a GitPath, EntryRef<'a, H>)>>;
 /// The (path, entry) pairs whose working-tree cleanliness the checkout guard verifies before writing a
 /// target path; `None` entry = a new addition checked only for an in-the-way untracked file.
-type CheckList<'a, H> = Vec<(&'a str, Option<EntryRef<'a, H>>)>;
+type CheckList<'a, H> = Vec<(&'a GitPath, Option<EntryRef<'a, H>>)>;
 
 pub(crate) async fn run<F, W, H>(
 	wt: &WorkTree<F, W, H>,
 	tree: ObjectId<H>,
 	mode: CheckoutMode<H>,
-	excludes_file: Option<&str>,
+	excludes_file: Option<&[u8]>,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
@@ -47,9 +48,9 @@ where
 	}
 	let force = matches!(mode, CheckoutMode::Reset);
 	let target = wt.repository().read_tree(tree).await?;
-	let target_paths: HashMap<&str, (&str, ObjectId<H>)> = target
+	let target_paths: HashMap<&GitPath, (&str, ObjectId<H>)> = target
 		.iter()
-		.map(|(path, mode, oid)| (path.as_str(), (mode.as_str(), *oid)))
+		.map(|(path, mode, oid)| (path, (mode.as_str(), *oid)))
 		.collect();
 
 	let sparse = wt.sparse_checkout().await?;
@@ -59,7 +60,7 @@ where
 	// `index.lock` (the working tree still matches the index); the apply phase marks mutation and commits.
 	let lock = wt.lock_index().await?;
 	let mut index = wt.load_index().await?;
-	let current: HashMap<String, (String, ObjectId<H>)> = index
+	let current: HashMap<GitPath, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
 		.filter(|e| e.stage == 0)
@@ -74,7 +75,7 @@ where
 	// forced or not.)
 	let fold = crate::excludes::ignore_case(wt).await?;
 	// Target paths keyed by fold — the identity of what the checkout will (re)create.
-	let target_fold: HashSet<String> = target_paths.keys().map(|p| fold_key(p, fold)).collect();
+	let target_fold: HashSet<Vec<u8>> = target_paths.keys().map(|p| fold_key(p, fold)).collect();
 	// Current stage-0 entries indexed by fold, for the guard's case-insensitive lookups. The value keeps
 	// the entry's ACTUAL index spelling alongside its (mode, oid): a case-rename must check the file that
 	// really exists (`Foo`), not the target spelling (`foo`) which does not exist on a case-*sensitive*
@@ -85,9 +86,7 @@ where
 	let current_fold_all: FoldGroups<H> = {
 		let mut m: FoldGroups<H> = HashMap::new();
 		for (k, v) in &current {
-			m.entry(fold_key(k, fold))
-				.or_default()
-				.push((k.as_str(), v));
+			m.entry(fold_key(k, fold)).or_default().push((k, v));
 		}
 		m
 	};
@@ -105,11 +104,11 @@ where
 	} else {
 		Vec::new()
 	};
-	let head_paths: HashSet<&str> = head_entries.iter().map(|(p, _, _)| p.as_str()).collect();
+	let head_paths: HashSet<&GitPath> = head_entries.iter().map(|(p, _, _)| p).collect();
 	// HEAD's entry per fold-key: to tell a target that KEEPS a staged-renamed path unchanged from HEAD (the
 	// staged recase is preserved) from one that MODIFIES it (refuse — the incoming edit conflicts with the
 	// staged rename, as git does).
-	let head_fold: HashMap<String, (&str, &ObjectId<H>)> = head_entries
+	let head_fold: HashMap<Vec<u8>, (&str, &ObjectId<H>)> = head_entries
 		.iter()
 		.map(|(p, m, o)| (fold_key(p, fold), (m.as_str(), o)))
 		.collect();
@@ -118,8 +117,8 @@ where
 	//    recase forward, so keep the index entry and do not materialise the target's other-cased spelling.
 	//  * REFUSE — the target MODIFIES this fold-key (its entry differs from HEAD): the incoming edit conflicts
 	//    with the staged rename, and git aborts the switch (probed vs git 2.55).
-	let mut preserve_folds: HashSet<String> = HashSet::new();
-	let mut refuse_folds: HashSet<String> = HashSet::new();
+	let mut preserve_folds: HashSet<Vec<u8>> = HashSet::new();
+	let mut refuse_folds: HashSet<Vec<u8>> = HashSet::new();
 	if fold && !force {
 		// Index the HEAD and target spellings by fold-key ONCE, so the per-entry classification below stays
 		// linear rather than rescanning HEAD and the target for every staged rename (a bulk recase would
@@ -129,23 +128,23 @@ where
 		//   * `target_spelling_indexed` — fold-keys whose target spelling is a retained current entry (a case
 		//     collision);
 		//   * `target_fold_entry` — the target's `(mode, oid)` per fold-key, to compare against HEAD's.
-		let head_spelling_indexed: HashSet<String> = head_entries
+		let head_spelling_indexed: HashSet<Vec<u8>> = head_entries
 			.iter()
-			.filter(|(hp, _, _)| current.contains_key(hp.as_str()))
+			.filter(|(hp, _, _)| current.contains_key(hp))
 			.map(|(hp, _, _)| fold_key(hp, fold))
 			.collect();
-		let target_spelling_indexed: HashSet<String> = target_paths
+		let target_spelling_indexed: HashSet<Vec<u8>> = target_paths
 			.iter()
-			.filter(|(t, _)| current.contains_key(**t))
+			.filter(|(t, _)| current.contains_key(t.as_bytes()))
 			.map(|(t, _)| fold_key(t, fold))
 			.collect();
-		let target_fold_entry: HashMap<String, (&str, ObjectId<H>)> = target_paths
+		let target_fold_entry: HashMap<Vec<u8>, (&str, ObjectId<H>)> = target_paths
 			.iter()
 			.map(|(t, (m, o))| (fold_key(t, fold), (*m, *o)))
 			.collect();
 		for path in current.keys() {
 			// The target keeps this exact spelling → not a rename at all.
-			if target_paths.contains_key(path.as_str()) {
+			if target_paths.contains_key(path) {
 				continue;
 			}
 			let key = fold_key(path, fold);
@@ -154,7 +153,7 @@ where
 				continue;
 			}
 			// HEAD tracks this exact spelling → a genuine branch case-rename, applied as before.
-			if head_paths.contains(path.as_str()) {
+			if head_paths.contains(path) {
 				continue;
 			}
 			// HEAD's OWN spelling for this fold-key is still in the index → a colliding ADDITION (the index keeps
@@ -200,7 +199,7 @@ where
 		// direction for a data-destroying guard.
 		// Keyed by fold-key (see `merge_apply`) so a case-variant tracked file is recognised in the D/F
 		// untracked-overwrite checks under `core.ignoreCase`.
-		let tracked: HashSet<String> = current.keys().map(|p| fold_key(p, fold)).collect();
+		let tracked: HashSet<Vec<u8>> = current.keys().map(|p| fold_key(p, fold)).collect();
 		for (path, (mode, oid)) in &target_paths {
 			let key = fold_key(path, fold);
 			// A staged case-rename this checkout preserves is not materialised, so it cannot overwrite anything —
@@ -211,7 +210,7 @@ where
 			// A staged case-rename the DESTINATION modifies (its entry differs from HEAD) conflicts with the
 			// staged rename: git aborts. Refuse before writing, naming the target path.
 			if refuse_folds.contains(&key) {
-				return Err(WorktreeError::Conflict((*path).to_string()));
+				return Err(WorktreeError::Conflict((*path).clone()));
 			}
 			// A path needs materialising when its **exact** entry differs — so a case-only rename
 			// (`Foo`→`foo`, identical blob/mode) still counts as differing and gets the cleanliness check
@@ -356,9 +355,9 @@ where
 		// refuses. We instead always preserve BOTH the file and the colliding index entry, never deleting a
 		// file a retained entry still tracks nor discarding staged content git keeps (probed vs git 2.55: the
 		// index keeps both spellings). Safe for a triply-pathological, hand-crafted-index case.
-		let retained_folds: HashSet<String> = current
+		let retained_folds: HashSet<Vec<u8>> = current
 			.keys()
-			.filter(|path| target_paths.contains_key(path.as_str()))
+			.filter(|path| target_paths.contains_key(*path))
 			.map(|path| fold_key(path, fold))
 			.collect();
 
@@ -370,11 +369,11 @@ where
 		// - **true stray** (fold-key absent from the target): removed from the working tree and index.
 		// Computed and lexically validated up front so a hostile index path (`../x`, `.git/…`) aborts with
 		// the tree untouched.
-		let candidates: std::collections::BTreeSet<String> = index
+		let candidates: std::collections::BTreeSet<GitPath> = index
 			.entries
 			.iter()
 			.map(|e| e.path.clone())
-			.filter(|path| !target_paths.contains_key(path.as_str()))
+			.filter(|path| !target_paths.contains_key(path))
 			.collect();
 		let mut collision = Vec::new();
 		let mut preserved = Vec::new();
@@ -400,6 +399,12 @@ where
 		{
 			validate_path(path)?;
 		}
+		// The backend may impose a stricter representation than Git's raw pathname bytes (WASI and
+		// non-Unix native filesystems currently require UTF-8). Preflight every source the apply phase
+		// removes before any sibling write can land.
+		for path in stray.iter().chain(&renamed_away) {
+			wt.work().validate_path_representable(path)?;
+		}
 
 		// A case-rename removes its stale-cased SOURCE before the write loop runs, so a missing/corrupt blob
 		// anywhere in the checkout — the rename's own target OR an unrelated path materialised later — would
@@ -422,6 +427,9 @@ where
 			{
 				continue;
 			}
+			// `write_entry` either materialises this path or inspects/removes an excluded occupant. Reject a
+			// backend-unrepresentable target now, before `mark_mutation_started`, rather than during apply.
+			wt.work().validate_path_representable(path)?;
 			// A gitlink names a submodule commit, not a blob — nothing INCOMING to validate; `write_entry`
 			// creates an empty mount directory rather than reading a blob. But installing the mount REMOVES
 			// the outgoing content it supplants — an ordinary file at the exact slot, OR the descendants of a
@@ -435,7 +443,8 @@ where
 				// (or its subtree children) is the same slot, so match the OUTGOING blob to validate by
 				// fold-key, not exact case — else the recase would skip the guard and delete the sole copy.
 				let key = fold_key(path, fold);
-				let child_prefix = format!("{key}/");
+				let mut child_prefix = key.clone();
+				child_prefix.push(b'/');
 				for (cur_path, (cur_mode, cur_oid)) in &current {
 					if cur_mode == "160000" {
 						continue;
@@ -573,9 +582,13 @@ where
 {
 	let target = wt.repository().read_tree(tree).await?;
 	let sparse = wt.sparse_checkout().await?;
+	for (path, _, _) in &target {
+		validate_path(path)?;
+		wt.work().validate_path_representable(path)?;
+	}
 	let lock = wt.lock_index().await?;
 	let mut index = wt.load_index().await?;
-	let prior: HashMap<String, IndexEntry<H>> = index
+	let prior: HashMap<GitPath, IndexEntry<H>> = index
 		.entries
 		.iter()
 		.filter(|entry| entry.stage == 0)
@@ -588,7 +601,6 @@ where
 	let mut opaque = HashSet::new();
 	let result = async {
 		for (path, mode, oid) in &target {
-			validate_path(path)?;
 			let prior = prior.get(path);
 			let excluded = match sparse.as_ref() {
 				Some(matcher) => !matcher.includes(path),
@@ -601,7 +613,7 @@ where
 				let meta = wt.work().lstat(path)?.ok_or_else(|| {
 					std::io::Error::new(std::io::ErrorKind::NotFound, "populated entry is missing")
 				})?;
-				for parent in path_parents(path) {
+				for parent in path.strict_ancestors() {
 					directories.insert(parent);
 				}
 				if mode == "160000" {
@@ -624,7 +636,7 @@ where
 			});
 		}
 
-		verify_population(wt, "", &expected, &directories, &opaque)?;
+		verify_population(wt, &GitPath::root(), &expected, &directories, &opaque)?;
 		for (path, (mode, oid)) in &expected {
 			if !population_entry_matches(wt, path, mode, *oid)? {
 				return Err(WorktreeError::UntrackedOverwrite(path.clone()));
@@ -652,7 +664,7 @@ where
 
 async fn populate_entry<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-	path: &str,
+	path: &GitPath,
 	mode: &str,
 	oid: ObjectId<H>,
 ) -> Result<(), WorktreeError>
@@ -701,7 +713,7 @@ where
 
 fn population_entry_matches<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-	path: &str,
+	path: &GitPath,
 	mode: &str,
 	oid: ObjectId<H>,
 ) -> Result<bool, WorktreeError>
@@ -733,10 +745,10 @@ fn population_mode_matches(
 
 fn verify_population<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-	directory: &str,
-	expected: &HashMap<String, (String, ObjectId<H>)>,
-	directories: &HashSet<String>,
-	opaque: &HashSet<String>,
+	directory: &GitPath,
+	expected: &HashMap<GitPath, (String, ObjectId<H>)>,
+	directories: &HashSet<GitPath>,
+	opaque: &HashSet<GitPath>,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
@@ -744,12 +756,8 @@ where
 	H: HashAlgorithm,
 {
 	for entry in wt.work().read_dir(directory)? {
-		let path = if directory.is_empty() {
-			entry.name
-		} else {
-			format!("{directory}/{}", entry.name)
-		};
-		if directory.is_empty() && path == ".git" {
+		let path = directory.join(&entry.name);
+		if directory.is_root() && entry.name.as_bytes() == b".git" {
 			continue;
 		}
 		if expected.contains_key(&path) {
@@ -764,16 +772,6 @@ where
 		return Err(WorktreeError::UntrackedOverwrite(path));
 	}
 	Ok(())
-}
-
-fn path_parents(path: &str) -> Vec<String> {
-	let mut parents = Vec::new();
-	let mut current = path;
-	while let Some((parent, _)) = current.rsplit_once('/') {
-		parents.push(parent.to_owned());
-		current = parent;
-	}
-	parents
 }
 
 /// git's two-tree merge (`read-tree -m -u`) from `head` to `target`: touch only the paths that differ
@@ -793,7 +791,7 @@ async fn merge_apply<F, W, H>(
 	wt: &WorkTree<F, W, H>,
 	head: ObjectId<H>,
 	target: ObjectId<H>,
-	excludes_file: Option<&str>,
+	excludes_file: Option<&[u8]>,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
@@ -805,10 +803,9 @@ where
 
 	// The only paths this update touches: those that differ between the two trees. Everything else — an
 	// unrelated staged addition, a dirty file the switch does not touch — is left exactly as it is.
-	let mut changed: Vec<&str> = from
+	let mut changed: Vec<&GitPath> = from
 		.keys()
 		.chain(to.keys())
-		.map(String::as_str)
 		.collect::<HashSet<_>>()
 		.into_iter()
 		.filter(|path| from.get(*path) != to.get(*path))
@@ -830,7 +827,7 @@ where
 	if index.has_conflicts() {
 		return Err(WorktreeError::Unmerged);
 	}
-	let staged: HashMap<String, (String, ObjectId<H>)> = index
+	let staged: HashMap<GitPath, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
 		.filter(|e| e.stage == 0)
@@ -841,7 +838,7 @@ where
 	// 2.55: `add -N p/c` + target file `p` aborts on both `switch` and a fast-forward). An overwrite of one is
 	// already caught by the generic staged-conflict check (the empty blob diverges from HEAD and the target),
 	// but a D/F drop bypasses that, so it is refused explicitly below.
-	let intent_to_add: HashSet<String> = index
+	let intent_to_add: HashSet<GitPath> = index
 		.entries
 		.iter()
 		.filter(|e| e.stage == 0 && e.intent_to_add)
@@ -851,35 +848,35 @@ where
 	// Keyed by fold-key so the D/F untracked-overwrite checks recognise a case-variant tracked file: with
 	// `core.ignoreCase` on a case-insensitive filesystem, HEAD's `P` and a target subtree `p/c` share the
 	// `p` slot, and `p` must read as tracked (not an untracked ancestor that would abort the switch).
-	let tracked: HashSet<String> = staged.keys().map(|p| fold_key(p, fold)).collect();
+	let tracked: HashSet<Vec<u8>> = staged.keys().map(|p| fold_key(p, fold)).collect();
 	// Strict ancestor directories of every staged path, precomputed once: the satisfied-deletion loop asks
 	// "is any staged path nested under this deleted path?" — which is exactly "is this path a staged ancestor
 	// dir?" — so an O(1) lookup replaces a per-deletion scan of the whole index (git switches with tens of
 	// thousands of staged deletions would otherwise be O(deletions × index entries)).
-	let staged_ancestor_dirs = strict_ancestor_dirs(staged.keys().map(String::as_str));
+	let staged_ancestor_dirs = strict_ancestor_dirs(staged.keys());
 	let base = crate::excludes::load_base(wt, excludes_file).await?;
 	// Under `core.ignoreCase` the index is case-insensitive, so `from`/`to`/`staged` compare by fold-key: a
 	// `Foo`→`foo` case-rename is one path, not an add+delete.
-	let from_fold: HashMap<String, &(String, ObjectId<H>)> =
+	let from_fold: HashMap<Vec<u8>, &(String, ObjectId<H>)> =
 		from.iter().map(|(k, v)| (fold_key(k, fold), v)).collect();
-	let staged_fold: HashMap<String, &(String, ObjectId<H>)> =
+	let staged_fold: HashMap<Vec<u8>, &(String, ObjectId<H>)> =
 		staged.iter().map(|(k, v)| (fold_key(k, fold), v)).collect();
-	let from_paths: HashSet<&str> = from.keys().map(String::as_str).collect();
-	let to_fold: HashSet<String> = to.keys().map(|p| fold_key(p, fold)).collect();
+	let from_paths: HashSet<&GitPath> = from.keys().collect();
+	let to_fold: HashSet<Vec<u8>> = to.keys().map(|p| fold_key(p, fold)).collect();
 	// A locally STAGED case-rename (`Foo`→`foo`): the index carries a spelling `from` (HEAD) lacks. git
 	// refuses a switch that still writes that fold-key (it would overwrite the staged rename) but allows one
 	// that only deletes it. This is a rename only when HEAD's OWN spelling is no longer in the index — if the
 	// index keeps `Foo` AND additionally stages `foo`, that is a colliding ADDITION, not a rename, and `Foo`
 	// must be removed / `foo` carried normally.
-	let head_spelling_staged: HashSet<String> = from
+	let head_spelling_staged: HashSet<Vec<u8>> = from
 		.keys()
-		.filter(|hp| staged.contains_key(hp.as_str()))
+		.filter(|hp| staged.contains_key(*hp))
 		.map(|hp| fold_key(hp, fold))
 		.collect();
-	let staged_recase_folds: HashSet<String> = if fold {
+	let staged_recase_folds: HashSet<Vec<u8>> = if fold {
 		staged
 			.keys()
-			.filter(|s| !from_paths.contains(s.as_str()))
+			.filter(|s| !from_paths.contains(*s))
 			.map(|s| fold_key(s, fold))
 			.filter(|k| from_fold.contains_key(k) && !head_spelling_staged.contains(k))
 			.collect()
@@ -890,8 +887,8 @@ where
 	// creatable by hand-crafted trees. The folded lookups above retain an arbitrary one of the colliding
 	// entries, so a switch that touches such a key must be refused DETERMINISTICALLY (git refuses too) rather
 	// than depending on which entry `HashMap` iteration happened to keep.
-	let colliding_folds: HashSet<String> = if fold {
-		let mut count: HashMap<String, u32> = HashMap::new();
+	let colliding_folds: HashSet<Vec<u8>> = if fold {
+		let mut count: HashMap<Vec<u8>, u32> = HashMap::new();
 		for k in staged.keys() {
 			*count.entry(fold_key(k, fold)).or_default() += 1;
 		}
@@ -908,7 +905,7 @@ where
 	// an unstaged deletion stays deleted (` D`), not re-materialised. The match must be exact, not folded: a
 	// case-only rename (index `Foo`, target `foo`, same blob) is NOT satisfied — the index still holds the
 	// other spelling and the rename must be applied, not skipped.
-	let satisfied: HashSet<&str> = changed
+	let satisfied: HashSet<&GitPath> = changed
 		.iter()
 		.copied()
 		.filter(|&path| staged.get(path) == to.get(path))
@@ -918,19 +915,20 @@ where
 	// the inverse). git's two-tree merge drops such colliding staged entries so the index stays valid — but
 	// only when they are clean; a colliding staged path with an unstaged edit makes git abort rather than
 	// lose that edit (checked in the refuse phase, applied in the apply phase).
-	let write_paths: HashSet<&str> = changed
+	let write_paths: HashSet<GitPath> = changed
 		.iter()
 		.copied()
 		.filter(|&p| !satisfied.contains(p) && to.contains_key(p))
+		.cloned()
 		.collect();
 	// HEAD paths the switch removes (present in `from`, absent from `to`). A staged-only path that D/F-collides
 	// with one of these is dropped too: it needed the removed HEAD file to be a directory, so git discards it
 	// when that file goes away (probed vs git 2.55: `D p` + staged `p/c`, switching to a tree without `p`, ends
 	// with `p/c` gone).
-	let removed_from: HashSet<&str> = from
+	let removed_from: HashSet<GitPath> = from
 		.keys()
-		.map(String::as_str)
 		.filter(|&p| !to.contains_key(p))
+		.cloned()
 		.collect();
 	// A staged-only path that directory/file-collides with a write is discarded (target wins) only when its
 	// working file is PRESENT — a real on-disk collision. If it has an unstaged deletion (working file
@@ -942,11 +940,11 @@ where
 	// empty slot instead of the checked-out target.
 	// Precompute ancestor-dir membership so every D/F check below is O(path depth), not O(paths) — an ordinary
 	// large branch switch (thousands of non-colliding files) must not degrade to O(N²) prefix comparisons.
-	let write_ancestor_dirs = strict_ancestor_dirs(write_paths.iter().copied());
-	let removed_ancestor_dirs = strict_ancestor_dirs(removed_from.iter().copied());
-	let mut df_removals: Vec<&str> = Vec::new();
-	let mut df_preserved: HashSet<&str> = HashSet::new();
-	for sp in staged.keys().map(String::as_str) {
+	let write_ancestor_dirs = strict_ancestor_dirs(write_paths.iter());
+	let removed_ancestor_dirs = strict_ancestor_dirs(removed_from.iter());
+	let mut df_removals: Vec<&GitPath> = Vec::new();
+	let mut df_preserved: HashSet<GitPath> = HashSet::new();
+	for sp in staged.keys() {
 		if to.contains_key(sp) || from.contains_key(sp) {
 			continue;
 		}
@@ -965,13 +963,13 @@ where
 		if collider.is_none() && !parent_of_write {
 			// Collides only as the parent of a removed child (or does not collide) → nothing to reconcile.
 			if removed_ancestor_dirs.contains(sp) {
-				df_preserved.insert(sp);
+				df_preserved.insert(sp.clone());
 			}
 			continue;
 		}
 		let discard = match collider {
-			Some(c) => wt.work().lstat(c)?.is_some(), // slot present → target wins; absent → preserve
-			None => true,                             // parent_of_write → always discarded
+			Some(ref c) => wt.work().lstat(c)?.is_some(), // slot present → target wins; absent → preserve
+			None => true,                                 // parent_of_write → always discarded
 		};
 		// ...but an OUT-OF-CONE (sparse-excluded) staged CHILD of an incoming write/removal is preserved rather
 		// than discarded: git keeps out-of-cone staged content nested under a D/F collision instead of dropping
@@ -983,13 +981,13 @@ where
 		if discard && !excluded {
 			df_removals.push(sp);
 		} else {
-			df_preserved.insert(sp);
+			df_preserved.insert(sp.clone());
 		}
 	}
 	// Ancestor dirs of the preserved paths, so a write's D/F collision with the preserved set is an
 	// O(path-depth) lookup, not an O(preserved) pairwise scan: a write collides with a preserved path iff it
 	// is an ancestor dir of one (`df_preserved_ancestor_dirs`) or nested under one (`ancestor_in`).
-	let df_preserved_ancestor_dirs = strict_ancestor_dirs(df_preserved.iter().copied());
+	let df_preserved_ancestor_dirs = strict_ancestor_dirs(df_preserved.iter());
 
 	// A satisfied DELETION — index and target agree the path is gone, but HEAD tracked it — must still refuse
 	// if the working file was recreated as a non-ignored untracked file: git treats it as in the way (probed
@@ -1007,7 +1005,7 @@ where
 		// staged alias's blob rather than exempting it outright.
 		if let Some(alias) = staged_fold.get(&fold_key(path, fold)) {
 			if !is_clean(wt, path, Some(*alias), &base, fold)? {
-				return Err(WorktreeError::Conflict(path.to_owned()));
+				return Err(WorktreeError::Conflict(path.clone()));
 			}
 			continue;
 		}
@@ -1021,18 +1019,12 @@ where
 		// UNTRACKED (an in-the-way untracked file). A tracked ancestor owned by the target or index is the
 		// legitimate file there, and git switches over it (probed vs git 2.55).
 		{
-			let mut anc = String::new();
-			let parts: Vec<&str> = path.split('/').collect();
-			for part in &parts[..parts.len().saturating_sub(1)] {
-				if !anc.is_empty() {
-					anc.push('/');
-				}
-				anc.push_str(part);
+			for anc in path.strict_ancestors() {
 				if matches!(wt.work().lstat(&anc)?, Some(m) if !m.kind.is_dir())
-					&& !staged.contains_key(anc.as_str())
-					&& !to.contains_key(anc.as_str())
+					&& !staged.contains_key(&anc)
+					&& !to.contains_key(&anc)
 				{
-					return Err(WorktreeError::UntrackedOverwrite(path.to_owned()));
+					return Err(WorktreeError::UntrackedOverwrite(path.clone()));
 				}
 			}
 		}
@@ -1049,7 +1041,7 @@ where
 				}
 			}
 			Some(_) if !path_ignored(wt.work(), path, &base, fold)? => {
-				return Err(WorktreeError::UntrackedOverwrite(path.to_owned()));
+				return Err(WorktreeError::UntrackedOverwrite(path.clone()));
 			}
 			_ => {}
 		}
@@ -1066,10 +1058,10 @@ where
 	// scan, only an `lstat` per transitioning slot on the case-sensitive path.
 	if !fold {
 		for slot in write_ancestor_dirs.iter().chain(&removed_ancestor_dirs) {
-			if from.contains_key(slot.as_str()) {
+			if from.contains_key(slot) {
 				continue;
 			}
-			if matches!(wt.work().lstat(slot.as_str())?, Some(meta) if !meta.kind.is_dir()) {
+			if matches!(wt.work().lstat(slot)?, Some(meta) if !meta.kind.is_dir()) {
 				return Err(WorktreeError::Conflict(slot.clone()));
 			}
 		}
@@ -1085,7 +1077,7 @@ where
 				|| removed_ancestor_dirs.contains(path)
 				|| under_any(path, &removed_from);
 			if in_df && staged.contains_key(path) && !is_clean(wt, path, staged.get(path), &base, fold)? {
-				return Err(WorktreeError::Conflict(path.to_owned()));
+				return Err(WorktreeError::Conflict(path.clone()));
 			}
 			continue;
 		}
@@ -1094,11 +1086,11 @@ where
 		// resolve which colliding entry the recase overwrites). A switch that only DELETES the fold-key does
 		// not conflict — git removes the extra spellings and carries the rest — so it is left to normal handling.
 		if colliding_folds.contains(&key) && to_fold.contains(&key) {
-			return Err(WorktreeError::Conflict(path.to_owned()));
+			return Err(WorktreeError::Conflict(path.clone()));
 		}
 		// A staged case-rename conflicts with any incoming change that still writes its fold-key.
 		if staged_recase_folds.contains(&key) && to_fold.contains(&key) {
-			return Err(WorktreeError::Conflict(path.to_owned()));
+			return Err(WorktreeError::Conflict(path.clone()));
 		}
 		// The current index entry for this path. Fall back to a differently-cased staged entry ONLY when HEAD
 		// (`from`) tracks the fold-key — a genuine case-rename context. When HEAD lacks the fold-key entirely,
@@ -1190,7 +1182,7 @@ where
 				&& from_here != current
 				&& current != to_here
 			{
-				return Err(WorktreeError::Conflict(path.to_owned()));
+				return Err(WorktreeError::Conflict(path.clone()));
 			}
 			// Working-tree cleanliness, dir-aware. A path the switch MATERIALISES whose slot is a *directory*
 			// is a directory→file/symlink change: refuse only if the directory holds untracked, non-ignored
@@ -1208,7 +1200,7 @@ where
 					// it, including IGNORED ones. Only a directory covering a tracked *subtree* (no entry for `path`
 					// itself) reaches the content scan and is git's to replace when clean.
 					if owner.is_some() {
-						return Err(WorktreeError::Conflict(path.to_owned()));
+						return Err(WorktreeError::Conflict(path.clone()));
 					}
 					let mut stack = ignore_prefix(wt.work(), path, &base)?;
 					if let Some(untracked) =
@@ -1217,7 +1209,7 @@ where
 						return Err(WorktreeError::UntrackedOverwrite(untracked));
 					}
 				} else if !is_clean(wt, path, owner, &base, fold)? {
-					return Err(WorktreeError::Conflict(path.to_owned()));
+					return Err(WorktreeError::Conflict(path.clone()));
 				}
 			}
 			// A path the switch materialises must not sit under an untracked file (a file→directory change).
@@ -1242,21 +1234,21 @@ where
 		// not enough. But an ABSENT placeholder (`git add -N x; rm x`) git DROPS during D/F resolution, so it
 		// must not be refused (probed vs git 2.55: switching to a target with `x/c` succeeds).
 		if intent_to_add.contains(sp) && wt.work().lstat(sp)?.is_some() {
-			return Err(WorktreeError::Conflict(sp.to_owned()));
+			return Err(WorktreeError::Conflict(sp.clone()));
 		}
 		if matches!(wt.work().lstat(sp)?, Some(m) if m.kind.is_dir()) {
 			continue;
 		}
 		if !is_clean(wt, sp, staged.get(sp), &base, fold)? {
-			return Err(WorktreeError::Conflict(sp.to_owned()));
+			return Err(WorktreeError::Conflict(sp.clone()));
 		}
 	}
 	// A PRESERVED staged D/F entry is kept as-is; but a dirty working file over it still blocks the switch
 	// (git aborts "local changes would be overwritten"). An absent working file (the common preserve case)
 	// is clean.
-	for &sp in &df_preserved {
+	for sp in &df_preserved {
 		if !is_clean(wt, sp, staged.get(sp), &base, fold)? {
-			return Err(WorktreeError::Conflict(sp.to_owned()));
+			return Err(WorktreeError::Conflict(sp.clone()));
 		}
 	}
 
@@ -1265,9 +1257,9 @@ where
 		// Fold-keys the to-tree keeps under an exact spelling that is also staged (a retained path whose file
 		// stays), and staged case-renames the to-tree deletes: the differently-cased staged entry owns the
 		// shared inode, so its file must not be removed. Preserve both (as `run` does).
-		let retained_folds: HashSet<String> = staged
+		let retained_folds: HashSet<Vec<u8>> = staged
 			.keys()
-			.filter(|path| to.contains_key(path.as_str()))
+			.filter(|path| to.contains_key(*path))
 			.map(|path| fold_key(path, fold))
 			.collect();
 		let mut collision = Vec::new();
@@ -1306,6 +1298,7 @@ where
 		// up front keeps the working tree untouched.
 		for path in removals.iter().chain(&writes).chain(&df_removals) {
 			validate_path(path)?;
+			wt.work().validate_path_representable(path)?;
 		}
 		// Validate every pending write's blob BEFORE removing anything, so a missing/corrupt blob aborts with
 		// the working tree untouched rather than after a case-rename source has been removed. A sparse-excluded
@@ -1385,16 +1378,16 @@ where
 		// the matcher, not among the handled writes/collisions, and not being removed), so their on-disk state,
 		// and thus this classification, is identical now and after the apply. Applied (index bit + file removal)
 		// after the mutations below.
-		let sparse_reconcile: Vec<(String, crate::status::WorktreeContent)> =
+		let sparse_reconcile: Vec<(GitPath, crate::status::WorktreeContent)> =
 			if let Some(matcher) = sparse.as_ref() {
-				let handled: HashSet<&str> = writes.iter().chain(&collision).copied().collect();
-				let gone: HashSet<&str> = removals.iter().chain(&df_removals).copied().collect();
+				let handled: HashSet<&GitPath> = writes.iter().chain(&collision).copied().collect();
+				let gone: HashSet<&GitPath> = removals.iter().chain(&df_removals).copied().collect();
 				let file_mode = crate::status::worktree_file_mode(wt).await;
 				let mut out = Vec::new();
 				for entry in &index.entries {
 					if entry.stage != 0
-						|| handled.contains(entry.path.as_str())
-						|| gone.contains(entry.path.as_str())
+						|| handled.contains(&entry.path)
+						|| gone.contains(&entry.path)
 						|| matcher.includes(&entry.path)
 					{
 						continue;
@@ -1427,6 +1420,7 @@ where
 		// Validate every reconcile path here, pre-mutation, to keep the half-apply invariant (conventions.md).
 		for (path, _) in &sparse_reconcile {
 			validate_path(path)?;
+			wt.work().validate_path_representable(path)?;
 		}
 		let _keep_collision_untouched = &collision;
 		// The working tree is about to change: a cancellation from here must NOT release
@@ -1479,17 +1473,17 @@ where
 			}
 		}
 		if !sparse_reconcile.is_empty() {
-			let bits: HashMap<&str, bool> = sparse_reconcile
+			let bits: HashMap<&GitPath, bool> = sparse_reconcile
 				.iter()
 				.map(|(path, state)| {
 					(
-						path.as_str(),
+						path,
 						!matches!(state, crate::status::WorktreeContent::Diverged),
 					)
 				})
 				.collect();
 			for entry in index.entries.iter_mut() {
-				if let Some(&bit) = bits.get(entry.path.as_str()) {
+				if let Some(&bit) = bits.get(&entry.path) {
 					entry.skip_worktree = bit;
 				}
 			}
@@ -1508,36 +1502,31 @@ where
 
 /// The nearest strict ancestor of `path` that is a member of `set` (`p` for `p/c` when `p ∈ set`), or
 /// `None`. O(path depth) — used so the D/F checks never scan all paths pairwise.
-fn ancestor_in<'a>(path: &'a str, set: &HashSet<&str>) -> Option<&'a str> {
+fn ancestor_in(path: &GitPath, set: &HashSet<GitPath>) -> Option<GitPath> {
 	path
-		.char_indices()
-		.filter(|&(_, ch)| ch == '/')
-		.map(|(i, _)| &path[..i])
+		.strict_ancestors()
+		.into_iter()
 		.find(|anc| set.contains(anc))
 }
 
 /// Whether any strict ancestor of `path` is in `set`.
-fn under_any(path: &str, set: &HashSet<&str>) -> bool {
+fn under_any(path: &GitPath, set: &HashSet<GitPath>) -> bool {
 	ancestor_in(path, set).is_some()
 }
 
 /// Every strict ancestor directory of every path in `paths` (`{a, a/b}` for `a/b/c`).
-fn strict_ancestor_dirs<'a>(paths: impl Iterator<Item = &'a str>) -> HashSet<String> {
+fn strict_ancestor_dirs<'a>(paths: impl Iterator<Item = &'a GitPath>) -> HashSet<GitPath> {
 	let mut dirs = HashSet::new();
 	for p in paths {
-		for (i, ch) in p.char_indices() {
-			if ch == '/' {
-				dirs.insert(p[..i].to_owned());
-			}
-		}
+		dirs.extend(p.strict_ancestors());
 	}
 	dirs
 }
 
 /// A recursive tree listing as `path -> (mode, oid)`.
 fn tree_map<H: HashAlgorithm>(
-	entries: Vec<(String, String, ObjectId<H>)>,
-) -> HashMap<String, (String, ObjectId<H>)> {
+	entries: Vec<(GitPath, String, ObjectId<H>)>,
+) -> HashMap<GitPath, (String, ObjectId<H>)> {
 	entries
 		.into_iter()
 		.map(|(path, mode, oid)| (path, (mode, oid)))
@@ -1550,7 +1539,7 @@ fn tree_map<H: HashAlgorithm>(
 /// [`ensure_no_overwrite`] but as a boolean for the two-tree merge's batch check.
 fn is_clean<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-	path: &str,
+	path: &GitPath,
 	current: Option<&(String, ObjectId<H>)>,
 	base: &[DirIgnore],
 	fold: bool,
@@ -1581,7 +1570,7 @@ where
 /// working-tree write with the matching index upsert; used to materialise a whole tree.
 pub(crate) async fn write_entry<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-	path: &str,
+	path: &GitPath,
 	mode: &str,
 	oid: ObjectId<H>,
 	index: &mut crate::Index<H>,
@@ -1673,7 +1662,7 @@ where
 /// destination (a file, symlink, or directory).
 pub(crate) async fn write_worktree_file<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-	path: &str,
+	path: &GitPath,
 	mode: &str,
 	oid: ObjectId<H>,
 ) -> Result<(), WorktreeError>
@@ -1730,7 +1719,7 @@ where
 /// CVE class); both `checkout`'s removal loop and `restore` rely on this.
 pub(crate) fn remove_worktree_path<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-	path: &str,
+	path: &GitPath,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
@@ -1759,7 +1748,7 @@ where
 /// for a removed submodule. Anything else is an ordinary file/symlink removal via [`remove_worktree_path`].
 fn remove_current_path<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-	path: &str,
+	path: &GitPath,
 	is_gitlink: bool,
 ) -> Result<(), WorktreeError>
 where
@@ -1780,7 +1769,7 @@ where
 /// as [`remove_worktree_path`]), for the tree paths the two-tree merge removes.
 pub(crate) fn remove_worktree_file<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-	path: &str,
+	path: &GitPath,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
@@ -1807,7 +1796,7 @@ where
 /// directory — unlike [`remove_worktree_file`], whose `remove_file` would fail on the mount directory.
 pub(crate) fn remove_gitlink_mount<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-	path: &str,
+	path: &GitPath,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
@@ -1837,10 +1826,10 @@ where
 pub(crate) fn reject_null_gitlink_oid<H: HashAlgorithm>(
 	mode: &str,
 	oid: &ObjectId<H>,
-	path: &str,
+	path: &GitPath,
 ) -> Result<(), WorktreeError> {
 	if mode == "160000" && oid.as_bytes().iter().all(|&byte| byte == 0) {
-		return Err(WorktreeError::NullGitlinkOid(path.to_owned()));
+		return Err(WorktreeError::NullGitlinkOid(path.clone()));
 	}
 	Ok(())
 }
@@ -1851,14 +1840,8 @@ pub(crate) fn reject_null_gitlink_oid<H: HashAlgorithm>(
 /// already gone — so the removal is skipped. Lexical [`validate_path`] cannot catch this: `link/x`
 /// is lexically safe, yet `link` may point outside. A non-existent (or unstattable) ancestor is not
 /// a symlink.
-pub(crate) fn has_symlinked_ancestor<W: WorkDirFs>(work: &W, path: &str) -> bool {
-	let parts: Vec<&str> = path.split('/').collect();
-	let mut ancestor = String::new();
-	for part in &parts[..parts.len().saturating_sub(1)] {
-		if !ancestor.is_empty() {
-			ancestor.push('/');
-		}
-		ancestor.push_str(part);
+pub(crate) fn has_symlinked_ancestor<W: WorkDirFs>(work: &W, path: &GitPath) -> bool {
+	for ancestor in path.strict_ancestors() {
 		if work
 			.lstat(&ancestor)
 			.ok()
@@ -1876,7 +1859,7 @@ pub(crate) fn has_symlinked_ancestor<W: WorkDirFs>(work: &W, path: &str) -> bool
 /// materialises a gitlink over it (so a routine away-and-back switch keeps the retained submodule),
 /// exempting it from the untracked-content overwrite guard. An arbitrary untracked directory (no `.git`)
 /// is NOT a submodule checkout and stays protected.
-fn is_submodule_checkout<W: WorkDirFs>(work: &W, path: &str) -> bool {
+fn is_submodule_checkout<W: WorkDirFs>(work: &W, path: &GitPath) -> bool {
 	// git materialises an incoming gitlink by REUSING whatever DIRECTORY sits at the slot — a submodule
 	// checkout, an arbitrary untracked directory (marker-free), whatever — leaving its contents in place
 	// (probed vs git 2.55: a marker-free `sub/` with content is preserved and the gitlink recorded). Only a
@@ -1892,7 +1875,7 @@ fn is_submodule_checkout<W: WorkDirFs>(work: &W, path: &str) -> bool {
 
 fn ensure_no_overwrite<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-	path: &str,
+	path: &GitPath,
 	current: Option<&(String, ObjectId<H>)>,
 	base: &[DirIgnore],
 	fold: bool,
@@ -1920,13 +1903,13 @@ where
 			let expected = u32::from_str_radix(mode, 8).unwrap_or(0);
 			match blob_of(wt.work(), path, &meta)? {
 				Some((woid, _)) if woid == *oid && effective_mode(&meta, expected) == expected => Ok(()),
-				_ => Err(WorktreeError::Conflict(path.to_owned())),
+				_ => Err(WorktreeError::Conflict(path.clone())),
 			}
 		}
 		// Untracked file in the way of a checked-out path — refuse unless it is `.gitignore`d
 		// (ignored files are expendable, as git overwrites them).
 		None if path_ignored(wt.work(), path, base, fold)? => Ok(()),
-		None => Err(WorktreeError::UntrackedOverwrite(path.to_owned())),
+		None => Err(WorktreeError::UntrackedOverwrite(path.clone())),
 	}
 }
 
@@ -1939,7 +1922,7 @@ where
 /// gated on `fold` by the caller.
 async fn head_tree_entries<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-) -> Result<Vec<(String, String, ObjectId<H>)>, WorktreeError>
+) -> Result<Vec<(GitPath, String, ObjectId<H>)>, WorktreeError>
 where
 	F: FileStore,
 	W: WorkDirFs,
@@ -1953,11 +1936,11 @@ where
 	Ok(repo.read_tree(tree).await?)
 }
 
-fn fold_key(path: &str, fold: bool) -> String {
+fn fold_key(path: &GitPath, fold: bool) -> Vec<u8> {
 	if fold {
-		path.to_ascii_lowercase()
+		path.ascii_folded()
 	} else {
-		path.to_owned()
+		path.as_bytes().to_vec()
 	}
 }
 
@@ -1971,32 +1954,26 @@ fn fold_key(path: &str, fold: bool) -> String {
 /// `foo/` is ignored).
 fn path_ignored<W: WorkDirFs>(
 	work: &W,
-	path: &str,
+	path: &GitPath,
 	base: &[DirIgnore],
 	fold: bool,
 ) -> Result<bool, WorktreeError> {
 	let stack = ignore_prefix(work, path, base)?;
-	let mut idx = 0;
-	while let Some(next) = path[idx..].find('/') {
-		let ancestor = &path[..idx + next];
-		if ignore::is_ignored_fold(ancestor, true, &stack, fold) {
+	for ancestor in path.strict_ancestors() {
+		if ignore::is_ignored_fold(&ancestor, true, &stack, fold) {
 			return Ok(true);
 		}
-		idx += next + 1;
 	}
 	Ok(ignore::is_ignored_fold(path, false, &stack, fold))
 }
 
-pub(crate) fn validate_path(path: &str) -> Result<(), WorktreeError> {
-	for part in path.split('/') {
-		if part.is_empty()
-			|| part == "."
-			|| part == ".."
-			|| part.eq_ignore_ascii_case(".git")
-			|| part.contains('\0')
-		{
-			return Err(WorktreeError::UnsafePath(path.to_owned()));
-		}
+pub(crate) fn validate_path(path: &GitPath) -> Result<(), WorktreeError> {
+	if path.is_root()
+		|| path
+			.components()
+			.any(|part| part.eq_ignore_ascii_case(b".git"))
+	{
+		return Err(WorktreeError::UnsafePath(path.clone()));
 	}
 	Ok(())
 }
@@ -2008,14 +1985,11 @@ pub(crate) fn validate_path(path: &str) -> Result<(), WorktreeError> {
 /// A free (absent) ancestor needs no directory yet, so it is not a blocker. Skipping the write here is
 /// also strictly safer than [`ensure_parents`]' `UnsafePath` error on a symlinked ancestor, which
 /// would otherwise abort the reapply *after* the new config and pattern file were already persisted.
-pub(crate) fn ancestor_blocked<W: WorkDirFs>(work: &W, path: &str) -> Result<bool, WorktreeError> {
-	let parts: Vec<&str> = path.split('/').collect();
-	let mut ancestor = String::new();
-	for part in &parts[..parts.len().saturating_sub(1)] {
-		if !ancestor.is_empty() {
-			ancestor.push('/');
-		}
-		ancestor.push_str(part);
+pub(crate) fn ancestor_blocked<W: WorkDirFs>(
+	work: &W,
+	path: &GitPath,
+) -> Result<bool, WorktreeError> {
+	for ancestor in path.strict_ancestors() {
 		match work.lstat(&ancestor)? {
 			Some(meta) if meta.kind.is_dir() => {}
 			Some(_) => return Ok(true),
@@ -2028,18 +2002,12 @@ pub(crate) fn ancestor_blocked<W: WorkDirFs>(work: &W, path: &str) -> Result<boo
 /// Create the parent directories of `path`, refusing to traverse a symlinked ancestor. A regular
 /// file occupying a directory slot is replaced by the directory (a file->directory type change, as
 /// git checkout does); a symlink is never traversed or removed here (the checkout CVE class).
-fn ensure_parents<W: WorkDirFs>(work: &W, path: &str) -> Result<(), WorktreeError> {
-	let parts: Vec<&str> = path.split('/').collect();
-	let mut ancestor = String::new();
-	for part in &parts[..parts.len().saturating_sub(1)] {
-		if !ancestor.is_empty() {
-			ancestor.push('/');
-		}
-		ancestor.push_str(part);
+fn ensure_parents<W: WorkDirFs>(work: &W, path: &GitPath) -> Result<(), WorktreeError> {
+	for ancestor in path.strict_ancestors() {
 		match work.lstat(&ancestor)? {
 			Some(meta) if meta.kind.is_dir() => {}
 			Some(meta) if meta.kind.is_symlink() => {
-				return Err(WorktreeError::UnsafePath(path.to_owned()));
+				return Err(WorktreeError::UnsafePath(path.clone()));
 			}
 			Some(_) => {
 				work.remove_file(&ancestor)?;
@@ -2059,11 +2027,11 @@ fn ensure_parents<W: WorkDirFs>(work: &W, path: &str) -> Result<(), WorktreeErro
 /// `dir_rel`'s parent; this descends `dir_rel`, pushing its own `.gitignore`.
 fn first_untracked_under<W: WorkDirFs>(
 	work: &W,
-	dir_rel: &str,
-	tracked: &HashSet<String>,
+	dir_rel: &GitPath,
+	tracked: &HashSet<Vec<u8>>,
 	stack: &mut Vec<DirIgnore>,
 	fold: bool,
-) -> Result<Option<String>, WorktreeError> {
+) -> Result<Option<GitPath>, WorktreeError> {
 	// A wholly-ignored directory is expendable — git doesn't descend into it.
 	if ignore::is_ignored_fold(dir_rel, true, stack, fold) {
 		return Ok(None);
@@ -2101,21 +2069,12 @@ fn first_untracked_under<W: WorkDirFs>(
 /// validated by the removal loop, and an ignored one is expendable.
 fn untracked_file_ancestor<W: WorkDirFs>(
 	work: &W,
-	path: &str,
-	tracked: &HashSet<String>,
+	path: &GitPath,
+	tracked: &HashSet<Vec<u8>>,
 	base: &[DirIgnore],
 	fold: bool,
-) -> Result<Option<String>, WorktreeError> {
-	let mut ancestor = String::new();
-	let mut components = path.split('/').peekable();
-	while let Some(component) = components.next() {
-		if components.peek().is_none() {
-			break; // `path` itself, not an ancestor
-		}
-		if !ancestor.is_empty() {
-			ancestor.push('/');
-		}
-		ancestor.push_str(component);
+) -> Result<Option<GitPath>, WorktreeError> {
+	for ancestor in path.strict_ancestors() {
 		match work.lstat(&ancestor)? {
 			// A file/symlink occupies this ancestor; deeper components cannot exist beyond it.
 			Some(meta) if !meta.kind.is_dir() => {
@@ -2125,7 +2084,7 @@ fn untracked_file_ancestor<W: WorkDirFs>(
 				// Expendable if ignored — including via an ignored *ancestor directory* (`a/` over a file
 				// at `a/foo`), so use the ancestor-aware `path_ignored` rather than a leaf-only match.
 				let ignored = path_ignored(work, &ancestor, base, fold)?;
-				return Ok((!ignored).then(|| ancestor.clone()));
+				return Ok((!ignored).then_some(ancestor));
 			}
 			Some(_) => {}
 			None => return Ok(None),
@@ -2139,18 +2098,12 @@ fn untracked_file_ancestor<W: WorkDirFs>(
 /// and that of each directory strictly above `dir_rel` — ready for matching paths at `dir_rel`.
 pub(crate) fn ignore_prefix<W: WorkDirFs>(
 	work: &W,
-	dir_rel: &str,
+	dir_rel: &GitPath,
 	base: &[DirIgnore],
 ) -> Result<Vec<DirIgnore>, WorktreeError> {
 	let mut stack = base.to_vec();
-	push_gitignore(work, "", &mut stack)?;
-	let components: Vec<&str> = dir_rel.split('/').filter(|part| !part.is_empty()).collect();
-	let mut ancestor = String::new();
-	for component in &components[..components.len().saturating_sub(1)] {
-		if !ancestor.is_empty() {
-			ancestor.push('/');
-		}
-		ancestor.push_str(component);
+	push_gitignore(work, &GitPath::root(), &mut stack)?;
+	for ancestor in dir_rel.strict_ancestors() {
 		push_gitignore(work, &ancestor, &mut stack)?;
 	}
 	Ok(stack)
@@ -2158,7 +2111,7 @@ pub(crate) fn ignore_prefix<W: WorkDirFs>(
 
 /// Remove whatever currently occupies `path` — a file, a symlink, or a whole directory —
 /// leaving nothing behind, so a new entry can be written in its place.
-fn clear_dest<W: WorkDirFs>(work: &W, path: &str) -> Result<(), WorktreeError> {
+fn clear_dest<W: WorkDirFs>(work: &W, path: &GitPath) -> Result<(), WorktreeError> {
 	match work.lstat(path)? {
 		Some(meta) if meta.kind.is_dir() => work.remove_dir_all(path)?,
 		Some(_) => work.remove_file(path)?,
@@ -2169,10 +2122,8 @@ fn clear_dest<W: WorkDirFs>(work: &W, path: &str) -> Result<(), WorktreeError> {
 
 /// Prune directories left empty above `path`, from its parent upward, stopping at the first that is
 /// non-empty (or the work-tree root).
-fn remove_empty_parents<W: WorkDirFs>(work: &W, path: &str) {
-	let parts: Vec<&str> = path.split('/').collect();
-	for depth in (1..parts.len()).rev() {
-		let dir = parts[..depth].join("/");
+fn remove_empty_parents<W: WorkDirFs>(work: &W, path: &GitPath) {
+	for dir in path.strict_ancestors().into_iter().rev() {
 		if work.remove_dir(&dir).is_err() {
 			break;
 		}

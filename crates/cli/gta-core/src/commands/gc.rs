@@ -18,7 +18,7 @@ impl WorkTreeCommand for Gc {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		_prefix: String,
+		_prefix: gitana_path::GitPath,
 	) -> Result<()> {
 		let (prune, repack, bitmap) = gitana_porcelain::gc(&worktree).await?;
 		println!("Pruned {} unreachable object(s).", prune.pruned);

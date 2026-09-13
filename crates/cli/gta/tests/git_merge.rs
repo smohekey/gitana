@@ -613,6 +613,40 @@ fn merge_refuses_when_a_touched_path_is_dirty() {
 }
 
 #[test]
+fn conflict_refusal_formats_dirty_paths_without_debug_wrappers() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-merge-dirty-conflict");
+	let w = work.to_str().unwrap();
+	let main = head_branch(w);
+
+	write(&work, "f.txt", "base\n");
+	commit_all(w, "base");
+	git(w, &["checkout", "-q", "-b", "feature"]);
+	write(&work, "f.txt", "feature\n");
+	commit_all(w, "feature");
+	git(w, &["checkout", "-q", &main]);
+	write(&work, "f.txt", "main\n");
+	let main_tip = commit_all(w, "main");
+	write(&work, "f.txt", "dirty\n");
+
+	let error = gta_fail(w, &["merge", "feature"]);
+	assert_eq!(
+		error,
+		"gta: your local changes to [\"f.txt\"] would be overwritten by the merge; commit or stash them first\n"
+	);
+	assert!(!error.contains("GitPath("));
+	assert_eq!(gta(w, &["rev-parse", "HEAD"], b"").trim(), main_tip);
+	assert_eq!(
+		std::fs::read_to_string(work.join("f.txt")).unwrap(),
+		"dirty\n"
+	);
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
+#[test]
 fn refuses_to_merge_with_an_unconcluded_merge() {
 	if !git_supports_sha256() {
 		return;

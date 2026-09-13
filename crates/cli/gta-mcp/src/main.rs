@@ -1,6 +1,7 @@
 //! `gta-mcp` — normal one-shot command execution plus path-aware MCP stdio/HTTP serving.
 
 mod cli;
+mod git_path;
 mod mcp_bridge;
 
 use std::net::SocketAddr;
@@ -52,7 +53,10 @@ fn main() -> ExitCode {
 			if let Some(silent) = error.downcast_ref::<gta_core::SilentExit>() {
 				eprintln!("{}", silent.reason);
 			} else {
-				eprintln!("gta-mcp: {error:#}");
+				eprintln!(
+					"gta-mcp: {}",
+					gta_core::render_error(&error, gta_core::ResultPathMode::Reversible)
+				);
 			}
 			ExitCode::FAILURE
 		}

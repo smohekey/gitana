@@ -19,5 +19,6 @@ tokio = { workspace = true, features = ["sync"] }
 flate2.workspace = true
 gitana-file-store-memory.workspace = true
 gitana-object.workspace = true
+gitana-path.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

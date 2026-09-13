@@ -1,5 +1,7 @@
 use std::fmt;
 
+use gitana_path::GitPath;
+
 use crate::SubmoduleObjectId;
 
 /// A merge update that left a module worktree in a conflict state.
@@ -8,7 +10,7 @@ pub struct UpdateMergeConflict {
 	pub name: String,
 	pub path: String,
 	pub target: SubmoduleObjectId,
-	pub paths: Vec<String>,
+	pub paths: Vec<GitPath>,
 }
 
 impl fmt::Display for UpdateMergeConflict {

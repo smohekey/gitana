@@ -20,7 +20,24 @@ use crate::commands::conflict;
 use crate::submodule_configuration::WorktreeConfiguration;
 use crate::submodule_transfer::SubmoduleTransfer;
 use crate::submodule_update_strategy::SubmoduleUpdateStrategy;
-use crate::{CommandContext, RepositoryLayoutIdentity, SilentExit, git_config, repo};
+use crate::{
+	CommandContext, RepositoryLayoutIdentity, ResultPathMode, SilentExit, git_config, repo,
+};
+
+#[derive(Clone, Copy)]
+pub(crate) struct UpdateFrontend<'a> {
+	command: &'a CommandContext,
+	result_path_mode: ResultPathMode,
+}
+
+impl<'a> UpdateFrontend<'a> {
+	pub(crate) fn new(command: &'a CommandContext, result_path_mode: ResultPathMode) -> Self {
+		Self {
+			command,
+			result_path_mode,
+		}
+	}
+}
 
 pub enum Action {
 	Status {
@@ -69,11 +86,20 @@ async fn with_setup_lease<T>(
 	operation.await
 }
 
-pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result<()> {
+pub async fn run(
+	cwd: &Path,
+	command: &CommandContext,
+	action: Action,
+	result_path_mode: ResultPathMode,
+) -> Result<()> {
 	if matches!(&action, Action::Update { depth: Some(0), .. }) {
 		return Err(anyhow!("--depth must be a positive number of commits"));
 	}
 	let (layout, _command_cwd, prefix) = repo::discover_worktree_with_prefix(cwd).await?;
+	let prefix = prefix
+		.as_utf8()
+		.ok_or_else(|| anyhow!("submodule command prefix is not representable as UTF-8: {prefix}"))?
+		.to_owned();
 	let worktree_root = layout
 		.worktree_root
 		.as_ref()
@@ -110,7 +136,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 				layout.clone(),
 				identity,
 				&prefix,
-				command,
+				UpdateFrontend::new(command, result_path_mode),
 				UpdateRequest {
 					query: SubmoduleQuery::paths(paths.clone()),
 					initialize: *init,
@@ -249,14 +275,19 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 				&request,
 				&configuration,
 				&transfer,
-				&SubmoduleUpdateStrategy,
+				&SubmoduleUpdateStrategy(result_path_mode),
 			))
 			.await
 			{
 				Ok(report) => render_update(&prefix, &report),
 				Err(failure) => {
 					render_update(&prefix, &failure.completed);
-					return Err(render_update_failure(&prefix, "", failure));
+					return Err(render_update_failure(
+						&prefix,
+						"",
+						failure,
+						result_path_mode,
+					));
 				}
 			}
 		}
@@ -434,7 +465,7 @@ async fn recursive_update(
 	root_layout: repo::RepositoryLayout,
 	root_identity: RepositoryLayoutIdentity,
 	prefix: &str,
-	command: &CommandContext,
+	frontend: UpdateFrontend<'_>,
 	request: UpdateRequest,
 	credential_url_base: Option<String>,
 ) -> Result<()> {
@@ -471,7 +502,7 @@ async fn recursive_update(
 			discovered_root,
 			prefix,
 			&level_prefix,
-			command,
+			frontend,
 			(module_base.clone(), depth, recommend_shallow, remote, fetch),
 		))
 		.await?
@@ -524,7 +555,7 @@ async fn recursive_update(
 			expected_git_dir.as_deref(),
 			discovered_root,
 			(&query_prefix, prefix, &level_prefix),
-			command,
+			frontend,
 			(module_base.clone(), credential_url_base),
 			UpdateRequest {
 				query,
@@ -582,7 +613,7 @@ async fn recursive_update(
 pub(crate) async fn update_published_clone(
 	root_layout: repo::RepositoryLayout,
 	root_identity: RepositoryLayoutIdentity,
-	command: &CommandContext,
+	frontend: UpdateFrontend<'_>,
 	active_pathspecs: Vec<String>,
 	credential_url_base: Option<String>,
 	depth: Option<u32>,
@@ -606,7 +637,7 @@ pub(crate) async fn update_published_clone(
 		root_layout,
 		root_identity,
 		"",
-		command,
+		frontend,
 		UpdateRequest {
 			query: SubmoduleQuery::all(),
 			initialize: true,
@@ -1035,7 +1066,7 @@ async fn resume_update_level(
 	discovered_root: Option<(repo::RepositoryLayout, RepositoryLayoutIdentity)>,
 	prefix: &str,
 	level_prefix: &str,
-	command: &CommandContext,
+	frontend: UpdateFrontend<'_>,
 	recovery_state: (gitana_config::GitConfig, Option<u32>, bool, bool, bool),
 ) -> Result<Option<(UpdateReport, HashMap<String, String>)>> {
 	let (module_base, depth, recommend_shallow, remote, fetch) = recovery_state;
@@ -1052,11 +1083,11 @@ async fn resume_update_level(
 		String::new(),
 		hash_kind,
 	)?;
-	let transfer = SubmoduleTransfer::new(command, root, module_base, None);
+	let transfer = SubmoduleTransfer::new(frontend.command, root, module_base, None);
 	match Box::pin(context.resume_pending_update(
 		&configuration,
 		&transfer,
-		&SubmoduleUpdateStrategy,
+		&SubmoduleUpdateStrategy(frontend.result_path_mode),
 		Some(committer(&superproject)),
 		depth,
 		recommend_shallow,
@@ -1073,7 +1104,12 @@ async fn resume_update_level(
 		Ok(None) => Ok(None),
 		Err(failure) => {
 			render_update_at(prefix, level_prefix, &failure.completed);
-			Err(render_update_failure(prefix, level_prefix, failure))
+			Err(render_update_failure(
+				prefix,
+				level_prefix,
+				failure,
+				frontend.result_path_mode,
+			))
 		}
 	}
 }
@@ -1083,7 +1119,7 @@ async fn update_level(
 	expected_git_dir: Option<&Path>,
 	discovered_root: Option<(repo::RepositoryLayout, RepositoryLayoutIdentity)>,
 	scope: (&str, &str, &str),
-	command: &CommandContext,
+	frontend: UpdateFrontend<'_>,
 	transfer_state: (gitana_config::GitConfig, Option<String>),
 	mut request: UpdateRequest,
 ) -> Result<(
@@ -1108,12 +1144,12 @@ async fn update_level(
 		hash_kind,
 	)?;
 	request.reflog_committer = Some(committer(&superproject));
-	let transfer = SubmoduleTransfer::new(command, root, module_base, credential_url_base);
+	let transfer = SubmoduleTransfer::new(frontend.command, root, module_base, credential_url_base);
 	match Box::pin(context.update(
 		&request,
 		&configuration,
 		&transfer,
-		&SubmoduleUpdateStrategy,
+		&SubmoduleUpdateStrategy(frontend.result_path_mode),
 	))
 	.await
 	{
@@ -1124,7 +1160,12 @@ async fn update_level(
 		}
 		Err(failure) => {
 			render_update_at(prefix, level_prefix, &failure.completed);
-			Err(render_update_failure(prefix, level_prefix, failure))
+			Err(render_update_failure(
+				prefix,
+				level_prefix,
+				failure,
+				frontend.result_path_mode,
+			))
 		}
 	}
 }
@@ -1320,9 +1361,10 @@ fn render_update_failure(
 	prefix: &str,
 	level_prefix: &str,
 	failure: gitana_submodule::UpdateFailure,
+	result_path_mode: ResultPathMode,
 ) -> anyhow::Error {
 	if let SubmoduleError::MergeConflict(conflict) = &failure.source {
-		let error = conflict::report_conflicts(&conflict.paths);
+		let error = conflict::report_conflicts(&conflict.paths, result_path_mode);
 		eprintln!(
 			"Unable to merge '{}' in submodule path '{}'",
 			conflict.target,

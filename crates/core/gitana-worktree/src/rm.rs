@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::HashAlgorithm;
+use gitana_path::{GitPath, GitPathspec};
 
 use crate::checkout::{remove_worktree_file, validate_path};
 use crate::fsmeta::blob_of;
@@ -30,14 +31,14 @@ use crate::{WorkTree, WorktreeError};
 /// — the index stays consistent with the working tree — so the caller reports the removed paths
 /// and then surfaces the error, rather than hiding the side effects behind it.
 pub struct RmOutcome {
-	pub removed: Vec<String>,
+	pub removed: Vec<GitPath>,
 	pub failure: Option<WorktreeError>,
 }
 
 pub(crate) async fn run<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-	pathspecs: &[&str],
-	prefix: &str,
+	pathspecs: &[GitPathspec],
+	prefix: &GitPath,
 	cached: bool,
 	force: bool,
 	recursive: bool,
@@ -58,7 +59,7 @@ where
 	// outside the definition — probed vs git 2.50.1, `rm -r .` there preserves it (it would otherwise be
 	// deleted and staged, losing the local content).
 	let sparse = wt.sparse_checkout().await?;
-	let mut tracked: Vec<String> = index
+	let mut tracked: Vec<GitPath> = index
 		.entries
 		.iter()
 		.filter(|e| {
@@ -70,13 +71,13 @@ where
 		})
 		.map(|e| e.path.clone())
 		.collect();
-	tracked.extend(index.unmerged_paths().map(str::to_owned));
+	tracked.extend(index.unmerged_paths().cloned());
 
 	// Match each pathspec against tracked paths: an exact file, or — needing `recursive` — the
 	// contents of a directory (the empty spec from `.` matches every tracked path). A `:(exclude)`
 	// pathspec subtracts from what the positives select.
 	let set = PathspecSet::parse(pathspecs, prefix)?;
-	let mut selected: BTreeSet<&str> = BTreeSet::new();
+	let mut selected: BTreeSet<&GitPath> = BTreeSet::new();
 	for (spec, pathspec) in set.positives() {
 		let mut matched = false;
 		// A pathspec requires `-r` only when every match was a leading-directory expansion; if it also
@@ -106,10 +107,10 @@ where
 			}
 		}
 		if !matched {
-			return Err(WorktreeError::PathspecMatch(spec.to_owned()));
+			return Err(WorktreeError::PathspecMatch(spec.clone()));
 		}
 		if has_dir_expansion && !has_file_match && !recursive {
-			return Err(WorktreeError::RecursiveRequired(spec.to_owned()));
+			return Err(WorktreeError::RecursiveRequired(spec.clone()));
 		}
 	}
 	// With only negative pathspecs (`rm :!keep`), git applies them to an implicit `.` *relative to the
@@ -117,8 +118,7 @@ where
 	// still requires `-r`, exactly as `rm .` does. A *truly* empty pathspec list is not this case: it
 	// specifies nothing to remove, so it is a no-op (never the implicit `.`).
 	if set.is_positive_empty() && !pathspecs.is_empty() {
-		let under_prefix =
-			|path: &str| prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/"));
+		let under_prefix = |path: &GitPath| path.is_at_or_below(prefix);
 		// The implicit `.` matches every tracked path under the prefix *before* exclusions, so recursion is
 		// required whenever any such path exists — even if the negatives exclude them all (`rm :!a` in a
 		// repo tracking only `a` still needs `-r`).
@@ -127,7 +127,7 @@ where
 			if under_prefix(path) {
 				implicit_matched = true;
 				if !set.is_excluded(path) {
-					selected.insert(path.as_str());
+					selected.insert(path);
 				}
 			}
 		}
@@ -135,11 +135,15 @@ where
 		// elsewhere. git reports the (first) negative pathspec as unmatched rather than succeeding as a
 		// no-op (probed vs git 2.50.1: `rm :!x` in an empty repo → "did not match any files").
 		if !implicit_matched {
-			let spec = pathspecs.first().copied().unwrap_or(".").to_owned();
+			let spec = pathspecs.first().cloned().unwrap_or_else(|| {
+				GitPathspec::from_utf8(".").expect("the implicit root pathspec is valid")
+			});
 			return Err(WorktreeError::PathspecMatch(spec));
 		}
 		if !recursive {
-			return Err(WorktreeError::RecursiveRequired(".".to_owned()));
+			return Err(WorktreeError::RecursiveRequired(
+				GitPathspec::from_utf8(".").expect("the implicit root pathspec is valid"),
+			));
 		}
 	}
 
@@ -148,6 +152,11 @@ where
 	// the same way).
 	for &path in &selected {
 		validate_path(path)?;
+		if !cached {
+			// A non-cached rm is one filesystem batch. Reject a pathname the backend cannot encode
+			// before safety inspection, index locking, or deleting an earlier selected path.
+			wt.work().validate_path_representable(path)?;
+		}
 	}
 
 	if !force {
@@ -195,20 +204,20 @@ where
 			};
 
 			if local && staged {
-				return Err(WorktreeError::RmStagedAndLocal(path.to_owned()));
+				return Err(WorktreeError::RmStagedAndLocal(path.clone()));
 			}
 			if !cached {
 				if staged {
-					return Err(WorktreeError::RmStagedChanges(path.to_owned()));
+					return Err(WorktreeError::RmStagedChanges(path.clone()));
 				}
 				if local {
-					return Err(WorktreeError::RmLocalModifications(path.to_owned()));
+					return Err(WorktreeError::RmLocalModifications(path.clone()));
 				}
 			}
 		}
 	}
 
-	let selected: Vec<String> = selected.iter().map(|&p| p.to_owned()).collect();
+	let selected: Vec<GitPath> = selected.iter().map(|&p| p.clone()).collect();
 	if dry_run {
 		return Ok(RmOutcome {
 			removed: selected,
@@ -246,7 +255,7 @@ where
 					// would delete the real `actual/sub`. git aborts because `link` is symbolic, so refuse here
 					// too — keeping the index entry (probed vs git 2.55).
 					if crate::checkout::has_symlinked_ancestor(wt.work(), path) {
-						Err(WorktreeError::UnsafePath(path.to_owned()))
+						Err(WorktreeError::UnsafePath(path.clone()))
 					} else {
 						// rmdir removes an EMPTY mount and errors on a populated one (kept, non-force already
 						// refused it above). DEFERRED divergence: `rm -f` of a POPULATED mount — git recursively

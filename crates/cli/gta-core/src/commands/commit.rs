@@ -54,7 +54,7 @@ impl WorkTreeCommand for Commit<'_> {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		_prefix: String,
+		_prefix: gitana_path::GitPath,
 	) -> Result<()> {
 		let repo = worktree.repository();
 		let identity = CliIdentity::new(repo);

@@ -536,7 +536,7 @@ impl SubmoduleContext {
 				.get(path)
 				.ok_or_else(|| SubmoduleError::MissingMapping(path.clone()))
 				.map_err(UpdateFailure::preflight)?;
-			if index.conflict(path).is_some() {
+			if index.conflict(&crate::git_path(path)).is_some() {
 				return Err(UpdateFailure::preflight(SubmoduleError::Conflicted(
 					path.clone(),
 				)));
@@ -639,7 +639,10 @@ impl SubmoduleContext {
 				.get(&path)
 				.expect("preflight established every mapping")
 				.clone();
-			let recorded = index.entry(&path).expect("selected stage-zero gitlink").oid;
+			let recorded = index
+				.entry(&crate::git_path(&path))
+				.expect("selected stage-zero gitlink")
+				.oid;
 			let recovery = exact_recovery
 				.as_ref()
 				.filter(|recovery| recovery.name == declaration.name && recovery.path == declaration.path);
@@ -2146,13 +2149,15 @@ impl SubmoduleContext {
 		};
 		let mount = self.worktree_root().join(&declaration.path);
 		let work = CapWorkDir::from_dir(work_directory);
-		match work.lstat(".git").map_err(|source| SubmoduleError::Io {
-			path: mount.join(".git"),
-			source,
-		})? {
+		match work
+			.lstat(&crate::git_path(".git"))
+			.map_err(|source| SubmoduleError::Io {
+				path: mount.join(".git"),
+				source,
+			})? {
 			None => {
 				if !work
-					.read_dir("")
+					.read_dir(&crate::git_path(""))
 					.map_err(|source| SubmoduleError::Io {
 						path: mount,
 						source,
@@ -2163,10 +2168,12 @@ impl SubmoduleContext {
 				}
 			}
 			Some(metadata) if metadata.kind.is_file() => {
-				let current = work.read(".git").map_err(|source| SubmoduleError::Io {
-					path: mount.join(".git"),
-					source,
-				})?;
+				let current = work
+					.read(&crate::git_path(".git"))
+					.map_err(|source| SubmoduleError::Io {
+						path: mount.join(".git"),
+						source,
+					})?;
 				let equivalent = if current == pointers.marker.as_bytes() {
 					true
 				} else if let Some(target) = std::str::from_utf8(&current)
@@ -2207,15 +2214,15 @@ impl SubmoduleContext {
 						source,
 					})?,
 			);
-		let marker = ".git";
+		let marker = crate::git_path(".git");
 		let (mounted, newly_attached, marker_snapshot) =
-			match work.lstat(marker).map_err(|source| SubmoduleError::Io {
+			match work.lstat(&marker).map_err(|source| SubmoduleError::Io {
 				path: mount.join(".git"),
 				source,
 			})? {
 				None => {
 					if !work
-						.read_dir("")
+						.read_dir(&crate::git_path(""))
 						.map_err(|source| SubmoduleError::Io {
 							path: mount.clone(),
 							source,
@@ -2236,7 +2243,7 @@ impl SubmoduleContext {
 							}
 						})?);
 					let (current, _) = marker_store
-						.read_path_versioned(marker)
+						.read_path_versioned(".git")
 						.await
 						.map_err(gitana_object_store::ObjectStoreError::from)?;
 					if marker_identity(&work_directory, &mount.join(".git"), &declaration.path)? != identity {
@@ -2359,13 +2366,15 @@ impl SubmoduleContext {
 				source,
 			}
 		})?);
-		let marker = work.read(".git").map_err(|source| SubmoduleError::Io {
-			path: self
-				.worktree_root()
-				.join(&entry.declaration.path)
-				.join(".git"),
-			source,
-		})?;
+		let marker = work
+			.read(&crate::git_path(".git"))
+			.map_err(|source| SubmoduleError::Io {
+				path: self
+					.worktree_root()
+					.join(&entry.declaration.path)
+					.join(".git"),
+				source,
+			})?;
 		let expected = match &mount_plan.marker {
 			MarkerSnapshot::Absent => entry.pointers.marker.as_bytes(),
 			MarkerSnapshot::File { identity, bytes } => {
@@ -2401,13 +2410,15 @@ impl SubmoduleContext {
 				source,
 			}
 		})?);
-		let marker = work.read(".git").map_err(|source| SubmoduleError::Io {
-			path: self
-				.worktree_root()
-				.join(&entry.declaration.path)
-				.join(".git"),
-			source,
-		})?;
+		let marker = work
+			.read(&crate::git_path(".git"))
+			.map_err(|source| SubmoduleError::Io {
+				path: self
+					.worktree_root()
+					.join(&entry.declaration.path)
+					.join(".git"),
+				source,
+			})?;
 		let expected = match &mount_plan.marker {
 			MarkerSnapshot::Absent => entry.pointers.marker.as_bytes(),
 			MarkerSnapshot::File { identity, bytes } => {
@@ -4524,7 +4535,7 @@ mod tests {
 			&self,
 			_config: &GitConfig,
 			_worktree_root: &Path,
-		) -> Result<Option<String>, SubmoduleError> {
+		) -> Result<Option<Vec<u8>>, SubmoduleError> {
 			unreachable!()
 		}
 
@@ -4533,7 +4544,7 @@ mod tests {
 			_config: &GitConfig,
 			_worktree: Dir,
 			_worktree_root: &Path,
-		) -> Result<Option<String>, SubmoduleError> {
+		) -> Result<Option<Vec<u8>>, SubmoduleError> {
 			unreachable!()
 		}
 
@@ -5025,7 +5036,7 @@ mod tests {
 		for result in [
 			UpdateMergeResult::Completed(UpdateMergeOutcome::AlreadyUpToDate),
 			UpdateMergeResult::Conflict {
-				paths: vec!["conflicted".to_owned()],
+				paths: vec![gitana_path::GitPath::from_utf8("conflicted").unwrap()],
 			},
 		] {
 			assert!(matches!(

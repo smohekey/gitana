@@ -25,7 +25,7 @@ use crate::{
 };
 
 /// Pull `HEAD`'s branch from the origin.
-pub async fn run(cwd: &Path) -> Result<()> {
+pub async fn run(cwd: &Path, result_path_mode: crate::ResultPathMode) -> Result<()> {
 	let cwd = tokio::fs::canonicalize(cwd).await?;
 	let found = repo::discover(&cwd).await?;
 	let command_directory = RetainedCommandDirectory::capture(cwd.clone()).await?;
@@ -66,6 +66,7 @@ pub async fn run(cwd: &Path) -> Result<()> {
 				&body,
 				&display,
 				command_directory,
+				result_path_mode,
 			)
 			.await
 		}
@@ -81,6 +82,7 @@ pub async fn run(cwd: &Path) -> Result<()> {
 				&body,
 				&display,
 				command_directory,
+				result_path_mode,
 			)
 			.await
 		}
@@ -126,6 +128,7 @@ pub async fn run(cwd: &Path) -> Result<()> {
 						&body,
 						&display,
 						command_directory,
+						result_path_mode,
 					)
 					.await
 				}
@@ -157,6 +160,7 @@ pub async fn run(cwd: &Path) -> Result<()> {
 						&body,
 						&display,
 						command_directory,
+						result_path_mode,
 					)
 					.await
 				}
@@ -173,6 +177,7 @@ async fn pull_dispatch(
 	body: &[u8],
 	url: &str,
 	command_directory: RetainedCommandDirectory,
+	result_path_mode: crate::ResultPathMode,
 ) -> Result<()> {
 	let (setup, common, _, _) = repo::command_setup_lease(found, identity).await?;
 	let local = dispatch::detect_algorithm_at(&common, &found.common_dir).await?;
@@ -180,10 +185,28 @@ async fn pull_dispatch(
 	transport::ensure_same_format(local, transport::negotiated_kind(body)?)?;
 	match local {
 		HashKind::Sha1 => {
-			pull_into::<Sha1>(fetcher, found, identity, body, url, command_directory).await
+			pull_into::<Sha1>(
+				fetcher,
+				found,
+				identity,
+				body,
+				url,
+				command_directory,
+				result_path_mode,
+			)
+			.await
 		}
 		HashKind::Sha256 => {
-			pull_into::<Sha256>(fetcher, found, identity, body, url, command_directory).await
+			pull_into::<Sha256>(
+				fetcher,
+				found,
+				identity,
+				body,
+				url,
+				command_directory,
+				result_path_mode,
+			)
+			.await
 		}
 	}
 }
@@ -198,6 +221,7 @@ async fn pull_into<H: HashAlgorithm>(
 	body: &[u8],
 	url: &str,
 	command_directory: RetainedCommandDirectory,
+	result_path_mode: crate::ResultPathMode,
 ) -> Result<()> {
 	let work = found
 		.worktree_root
@@ -289,7 +313,7 @@ async fn pull_into<H: HashAlgorithm>(
 	.await;
 	mutation_guard.validate()?;
 	let outcome = outcome?;
-	merge::render(outcome)
+	merge::render(outcome, result_path_mode)
 }
 
 /// Reopen the pull target for post-fetch integration under worker-bound config serialization.

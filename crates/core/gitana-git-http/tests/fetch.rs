@@ -25,7 +25,7 @@ async fn repo_with_commit() -> (Repository<MemoryFileStore, Sha256>, ObjectId<Sh
 	let blob = repo.write_blob(b"hello\n").await.expect("blob");
 	let tree = repo
 		.write_tree(&[TreeBuildEntry {
-			path: "file.txt".to_owned(),
+			path: gitana_path::GitPath::from_utf8("file.txt").unwrap(),
 			mode: FileMode::Regular,
 			id: blob,
 		}])
@@ -123,7 +123,7 @@ async fn fetch_excludes_objects_reachable_from_haves() {
 	let blob = repo.write_blob(b"second\n").await.expect("blob");
 	let tree = repo
 		.write_tree(&[TreeBuildEntry {
-			path: "file.txt".to_owned(),
+			path: gitana_path::GitPath::from_utf8("file.txt").unwrap(),
 			mode: FileMode::Regular,
 			id: blob,
 		}])
@@ -171,7 +171,7 @@ async fn v0_and_v2_propagate_a_source_shallow_boundary_with_retained_parents() {
 	let blob = repo.write_blob(b"tip\n").await.expect("tip blob");
 	let tree = repo
 		.write_tree(&[TreeBuildEntry {
-			path: "file.txt".to_owned(),
+			path: gitana_path::GitPath::from_utf8("file.txt").unwrap(),
 			mode: FileMode::Regular,
 			id: blob,
 		}])
@@ -356,7 +356,7 @@ async fn repo_with_two_big_commits() -> (
 		let blob = repo.write_blob(content).await.expect("blob");
 		let tree = repo
 			.write_tree(&[TreeBuildEntry {
-				path: "file.txt".to_owned(),
+				path: gitana_path::GitPath::from_utf8("file.txt").unwrap(),
 				mode: FileMode::Regular,
 				id: blob,
 			}])

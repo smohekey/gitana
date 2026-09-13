@@ -1,10 +1,12 @@
+use std::ffi::OsString;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cap_fs_ext::DirExt;
 use cap_std::fs::{Dir, FileType, Metadata};
 use gitana_fs_native::{EntryIdentity, file_identity, remove_file_if_identity};
+use gitana_path::{GitPath, GitPathComponent};
 
 use crate::{DirEntry, FileKind, Meta, PopulationEntry, WorkDirFs};
 
@@ -16,10 +18,11 @@ static POPULATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// from a real path (`CapWorkDir::from_dir(Dir::open_ambient_dir(work, …))`, at the program edge).
 ///
 /// On unix it reports the full `stat(2)` identity (mode/uid/gid/dev/ino) and stores symlink targets
-/// as raw bytes; on other targets it degrades to size-only metadata and writes a symlink's target as
-/// a regular file — the same fallback the working tree used before this capability existed. That
-/// unix-vs-other split is contained here, at the platform boundary, so nothing above it branches on
-/// the target.
+/// as raw bytes; working-tree names preserve raw bytes on byte-path unix filesystems, while macOS
+/// rejects non-UTF-8 names during preflight because its native filesystems cannot create them. On
+/// non-unix targets metadata degrades to size-only and a symlink's target is written as a regular
+/// file — the same fallback the working tree used before this capability existed. Those platform
+/// splits stay contained here so nothing above this boundary branches on the target.
 pub struct CapWorkDir {
 	dir: Dir,
 }
@@ -36,13 +39,18 @@ impl WorkDirFs for CapWorkDir {
 		cfg!(not(unix))
 	}
 
-	fn lstat(&self, path: &str) -> io::Result<Option<Meta>> {
+	fn validate_path_representable(&self, path: &GitPath) -> io::Result<()> {
+		validate_representable(path)
+	}
+
+	fn lstat(&self, path: &GitPath) -> io::Result<Option<Meta>> {
+		let native = native_path(path)?;
 		// The empty path is the work-tree root itself (e.g. a `.` pathspec normalises to `""`);
 		// `symlink_metadata("")` would report it missing, so stat the directory handle directly.
-		let result = if path.is_empty() {
+		let result = if path.is_root() {
 			self.dir.dir_metadata()
 		} else {
-			self.dir.symlink_metadata(path)
+			self.dir.symlink_metadata(&native)
 		};
 		match result {
 			Ok(md) => Ok(Some(meta_of(&md))),
@@ -69,86 +77,92 @@ impl WorkDirFs for CapWorkDir {
 		}
 	}
 
-	fn read(&self, path: &str) -> io::Result<Vec<u8>> {
-		self.dir.read(path)
+	fn read(&self, path: &GitPath) -> io::Result<Vec<u8>> {
+		self.dir.read(native_path(path)?)
 	}
 
-	fn read_link(&self, path: &str) -> io::Result<Vec<u8>> {
-		Ok(link_bytes(self.dir.read_link(path)?))
+	fn read_link(&self, path: &GitPath) -> io::Result<Vec<u8>> {
+		Ok(link_bytes(self.dir.read_link(native_path(path)?)?))
 	}
 
-	fn read_dir(&self, path: &str) -> io::Result<Vec<DirEntry>> {
-		let entries = if path.is_empty() {
+	fn read_dir(&self, path: &GitPath) -> io::Result<Vec<DirEntry>> {
+		let entries = if path.is_root() {
 			self.dir.entries()?
 		} else {
-			self.dir.read_dir(path)?
+			self.dir.read_dir(native_path(path)?)?
 		};
 		let mut out = Vec::new();
 		for entry in entries {
 			let entry = entry?;
 			out.push(DirEntry {
-				name: entry.file_name().to_string_lossy().into_owned(),
+				name: component_from_native(&entry.file_name())?,
 				kind: kind_of_type(&entry.file_type()?),
 			});
 		}
 		Ok(out)
 	}
 
-	fn write(&self, path: &str, bytes: &[u8], executable: bool) -> io::Result<()> {
-		self.dir.write(path, bytes)?;
+	fn write(&self, path: &GitPath, bytes: &[u8], executable: bool) -> io::Result<()> {
+		let native = native_path(path)?;
+		self.dir.write(&native, bytes)?;
 		// Normalise the mode either way, so replacing an executable file with a plain one (or the
 		// reverse) lands the right bit — mirroring git's checkout. A no-op where modes are absent.
-		set_exec(&self.dir, path, executable)
+		set_exec(&self.dir, &native, executable)
 	}
 
-	fn populate_new(&self, path: &str, entry: PopulationEntry<'_>) -> io::Result<bool> {
-		let (parent, name) = population_parent(&self.dir, path)?;
+	fn populate_new(&self, path: &GitPath, entry: PopulationEntry<'_>) -> io::Result<bool> {
+		let native = native_path(path)?;
+		let (parent, name) = population_parent(&self.dir, &native)?;
 		match entry {
-			PopulationEntry::Directory => match parent.create_dir(name) {
+			PopulationEntry::Directory => match parent.create_dir(&name) {
 				Ok(()) => Ok(true),
 				Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
 				Err(error) => Err(error),
 			},
 			PopulationEntry::Regular { bytes, executable } => {
-				populate_regular_file(&parent, name, |file| {
+				populate_regular_file(&parent, &name, |file| {
 					file.write_all(bytes)?;
 					set_exec_file(file, executable)
 				})
 			}
-			PopulationEntry::Symlink(target) => make_population_symlink(&parent, target, name),
+			PopulationEntry::Symlink(target) => {
+				make_population_symlink(&parent, target, Path::new(&name))
+			}
 		}
 	}
 
-	fn symlink(&self, target: &[u8], path: &str) -> io::Result<()> {
-		make_symlink(&self.dir, target, path)
+	fn symlink(&self, target: &[u8], path: &GitPath) -> io::Result<()> {
+		make_symlink(&self.dir, target, &native_path(path)?)
 	}
 
-	fn create_dir(&self, path: &str) -> io::Result<()> {
-		self.dir.create_dir(path)
+	fn create_dir(&self, path: &GitPath) -> io::Result<()> {
+		self.dir.create_dir(native_path(path)?)
 	}
 
-	fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-		self.dir.rename(from, &self.dir, to)
+	fn rename(&self, from: &GitPath, to: &GitPath) -> io::Result<()> {
+		self
+			.dir
+			.rename(native_path(from)?, &self.dir, native_path(to)?)
 	}
 
-	fn remove_file(&self, path: &str) -> io::Result<()> {
-		self.dir.remove_file(path)
+	fn remove_file(&self, path: &GitPath) -> io::Result<()> {
+		self.dir.remove_file(native_path(path)?)
 	}
 
-	fn remove_dir(&self, path: &str) -> io::Result<()> {
-		self.dir.remove_dir(path)
+	fn remove_dir(&self, path: &GitPath) -> io::Result<()> {
+		self.dir.remove_dir(native_path(path)?)
 	}
 
-	fn remove_dir_all(&self, path: &str) -> io::Result<()> {
-		self.dir.remove_dir_all(path)
+	fn remove_dir_all(&self, path: &GitPath) -> io::Result<()> {
+		self.dir.remove_dir_all(native_path(path)?)
 	}
 }
 
 /// Resolve the leaf parent through retained directory handles. Every accepted component is opened
 /// without following a symlink, so a concurrent namespace replacement cannot redirect the final
 /// exclusive create through a different directory tree.
-fn population_parent<'a>(root: &Dir, path: &'a str) -> io::Result<(Dir, &'a str)> {
-	let mut components = path.split('/').peekable();
+fn population_parent(root: &Dir, path: &Path) -> io::Result<(Dir, OsString)> {
+	let mut components = path.components().peekable();
 	let mut parent = root.try_clone()?;
 	loop {
 		let Some(component) = components.next() else {
@@ -157,14 +171,14 @@ fn population_parent<'a>(root: &Dir, path: &'a str) -> io::Result<(Dir, &'a str)
 				"empty population path",
 			));
 		};
-		if component.is_empty() || matches!(component, "." | "..") {
+		let Component::Normal(component) = component else {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidInput,
 				"invalid population path component",
 			));
-		}
+		};
 		if components.peek().is_none() {
-			return Ok((parent, component));
+			return Ok((parent, component.to_owned()));
 		}
 		parent = match parent.open_dir_nofollow(component) {
 			Ok(child) => child,
@@ -179,6 +193,57 @@ fn population_parent<'a>(root: &Dir, path: &'a str) -> io::Result<(Dir, &'a str)
 			Err(error) => return Err(error),
 		};
 	}
+}
+
+#[cfg(unix)]
+fn native_path(path: &GitPath) -> io::Result<PathBuf> {
+	use std::os::unix::ffi::OsStringExt as _;
+	Ok(PathBuf::from(OsString::from_vec(path.as_bytes().to_vec())))
+}
+
+#[cfg(not(unix))]
+fn native_path(path: &GitPath) -> io::Result<PathBuf> {
+	let text = path.as_utf8().ok_or_else(|| {
+		io::Error::new(
+			io::ErrorKind::Unsupported,
+			"Git path is not representable on this platform",
+		)
+	})?;
+	Ok(PathBuf::from(text))
+}
+
+#[cfg(target_os = "macos")]
+fn validate_representable(path: &GitPath) -> io::Result<()> {
+	path.as_utf8().map(drop).ok_or_else(|| {
+		io::Error::new(
+			io::ErrorKind::Unsupported,
+			"Git path is not representable on this platform",
+		)
+	})
+}
+
+#[cfg(not(target_os = "macos"))]
+fn validate_representable(path: &GitPath) -> io::Result<()> {
+	native_path(path).map(drop)
+}
+
+#[cfg(unix)]
+fn component_from_native(name: &std::ffi::OsStr) -> io::Result<GitPathComponent> {
+	use std::os::unix::ffi::OsStrExt as _;
+	GitPathComponent::from_bytes(name.as_bytes().to_vec())
+		.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(not(unix))]
+fn component_from_native(name: &std::ffi::OsStr) -> io::Result<GitPathComponent> {
+	let text = name.to_str().ok_or_else(|| {
+		io::Error::new(
+			io::ErrorKind::Unsupported,
+			"native path is not representable as Git bytes",
+		)
+	})?;
+	GitPathComponent::from_utf8(text)
+		.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// The git-relevant kind of a cap-std `Metadata` (an `lstat`, so a symlink stays a symlink).
@@ -253,14 +318,14 @@ fn link_bytes(target: PathBuf) -> Vec<u8> {
 }
 
 #[cfg(unix)]
-fn make_symlink(dir: &Dir, target: &[u8], path: &str) -> io::Result<()> {
+fn make_symlink(dir: &Dir, target: &[u8], path: &std::path::Path) -> io::Result<()> {
 	use std::ffi::OsStr;
 	use std::os::unix::ffi::OsStrExt;
 	dir.symlink(OsStr::from_bytes(target), path)
 }
 
 #[cfg(unix)]
-fn make_population_symlink(dir: &Dir, target: &[u8], path: &str) -> io::Result<bool> {
+fn make_population_symlink(dir: &Dir, target: &[u8], path: &Path) -> io::Result<bool> {
 	use std::ffi::OsStr;
 	use std::os::unix::ffi::OsStrExt;
 	match dir.symlink(OsStr::from_bytes(target), path) {
@@ -273,20 +338,21 @@ fn make_population_symlink(dir: &Dir, target: &[u8], path: &str) -> io::Result<b
 /// Without unix symlinks, store the target as the file's content (a lossy but round-trippable
 /// fallback — the same one the working tree used before this capability).
 #[cfg(not(unix))]
-fn make_symlink(dir: &Dir, target: &[u8], path: &str) -> io::Result<()> {
+fn make_symlink(dir: &Dir, target: &[u8], path: &std::path::Path) -> io::Result<()> {
 	dir.write(path, target)
 }
 
 #[cfg(not(unix))]
-fn make_population_symlink(dir: &Dir, target: &[u8], path: &str) -> io::Result<bool> {
+fn make_population_symlink(dir: &Dir, target: &[u8], path: &Path) -> io::Result<bool> {
 	populate_regular_file(dir, path, |file| file.write_all(target))
 }
 
-fn populate_regular_file(
+fn populate_regular_file<P: AsRef<Path>>(
 	dir: &Dir,
-	path: &str,
+	path: P,
 	initialize: impl FnOnce(&mut cap_std::fs::File) -> io::Result<()>,
 ) -> io::Result<bool> {
+	let path = path.as_ref();
 	match dir.symlink_metadata(path) {
 		Ok(_) => return Ok(false),
 		Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -359,7 +425,7 @@ fn create_population_temp(dir: &Dir) -> io::Result<(String, cap_std::fs::File)> 
 fn publish_population_file(
 	dir: &Dir,
 	temporary: &str,
-	path: &str,
+	path: &Path,
 	identity: EntryIdentity,
 ) -> io::Result<()> {
 	gitana_fs_native::rename_noreplace_if_identity(
@@ -384,7 +450,7 @@ fn publish_population_file(
 fn publish_population_file(
 	dir: &Dir,
 	temporary: &str,
-	path: &str,
+	path: &Path,
 	identity: EntryIdentity,
 ) -> io::Result<()> {
 	dir.hard_link(temporary, dir, path)?;
@@ -416,7 +482,7 @@ fn remove_failed_population_file(dir: &Dir, path: &str, identity: EntryIdentity)
 }
 
 #[cfg(unix)]
-fn set_exec(dir: &Dir, path: &str, executable: bool) -> io::Result<()> {
+fn set_exec(dir: &Dir, path: &std::path::Path, executable: bool) -> io::Result<()> {
 	use cap_std::fs::{Permissions, PermissionsExt};
 	let mode = if executable { 0o755 } else { 0o644 };
 	dir.set_permissions(path, Permissions::from_mode(mode))
@@ -430,7 +496,7 @@ fn set_exec_file(file: &cap_std::fs::File, executable: bool) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_exec(_dir: &Dir, _path: &str, _executable: bool) -> io::Result<()> {
+fn set_exec(_dir: &Dir, _path: &std::path::Path, _executable: bool) -> io::Result<()> {
 	Ok(())
 }
 
@@ -457,7 +523,7 @@ mod tests {
 
 		let error = work
 			.populate_new(
-				"link/file",
+				&GitPath::from_utf8("link/file").unwrap(),
 				PopulationEntry::Regular {
 					bytes: b"content",
 					executable: false,
@@ -478,7 +544,7 @@ mod tests {
 		assert!(
 			work
 				.populate_new(
-					"nested/deeper/file",
+					&GitPath::from_utf8("nested/deeper/file").unwrap(),
 					PopulationEntry::Regular {
 						bytes: b"first",
 						executable: false,
@@ -489,7 +555,7 @@ mod tests {
 		assert!(
 			!work
 				.populate_new(
-					"nested/deeper/file",
+					&GitPath::from_utf8("nested/deeper/file").unwrap(),
 					PopulationEntry::Regular {
 						bytes: b"second",
 						executable: false,
@@ -574,7 +640,7 @@ mod tests {
 		std::fs::rename(temp.path().join(&name), temp.path().join("owned-temp")).unwrap();
 		std::fs::write(temp.path().join(&name), b"foreign").unwrap();
 
-		let error = publish_population_file(&dir, &name, "published", identity).unwrap_err();
+		let error = publish_population_file(&dir, &name, Path::new("published"), identity).unwrap_err();
 
 		assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
 		assert!(!temp.path().join("published").exists());
@@ -583,5 +649,21 @@ mod tests {
 			std::fs::read(temp.path().join("owned-temp")).unwrap(),
 			b"owned"
 		);
+	}
+}
+
+#[cfg(all(test, any(not(unix), target_os = "macos")))]
+mod representability_tests {
+	use std::io;
+
+	use gitana_path::GitPath;
+
+	use super::validate_representable;
+
+	#[test]
+	fn preflight_rejects_non_utf8_git_bytes() {
+		let path = GitPath::from_bytes(b"raw-\xff".to_vec()).unwrap();
+		let error = validate_representable(&path).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::Unsupported);
 	}
 }

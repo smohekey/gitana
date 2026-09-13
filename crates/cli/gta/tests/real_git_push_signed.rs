@@ -151,7 +151,9 @@ async fn install_trust_root(git_dir: &Path, keys: &[String], sign_keyfile: &Path
 		.unwrap();
 	let tree = encode_tree::<Sha1>(&[TreeEntry {
 		mode: "100644".to_owned(),
-		name: "trust.json".to_owned(),
+		name: gitana_path::GitPathComponent::from_utf8("trust.json")
+			.unwrap()
+			.into(),
 		id: blob,
 	}]);
 	let tree_id = repo

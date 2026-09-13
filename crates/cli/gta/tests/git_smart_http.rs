@@ -122,7 +122,7 @@ async fn commit_file(
 	let blob = repo.write_blob(content).await.unwrap();
 	let tree = repo
 		.write_tree(&[TreeBuildEntry {
-			path: file.to_owned(),
+			path: gitana_path::GitPath::from_utf8(file).unwrap(),
 			mode: FileMode::Regular,
 			id: blob,
 		}])
@@ -195,7 +195,7 @@ async fn clone_sparse_materialises_only_root_files() {
 	let deep = repo.write_blob(b"d\n").await.unwrap();
 	let sub = repo
 		.write_tree(&[TreeBuildEntry {
-			path: "deep.txt".to_owned(),
+			path: gitana_path::GitPath::from_utf8("deep.txt").unwrap(),
 			mode: FileMode::Regular,
 			id: deep,
 		}])
@@ -204,12 +204,12 @@ async fn clone_sparse_materialises_only_root_files() {
 	let tree = repo
 		.write_tree(&[
 			TreeBuildEntry {
-				path: "root.txt".to_owned(),
+				path: gitana_path::GitPath::from_utf8("root.txt").unwrap(),
 				mode: FileMode::Regular,
 				id: root,
 			},
 			TreeBuildEntry {
-				path: "sub".to_owned(),
+				path: gitana_path::GitPath::from_utf8("sub").unwrap(),
 				mode: FileMode::Directory,
 				id: sub,
 			},

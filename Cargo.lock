@@ -1700,6 +1700,7 @@ dependencies = [
  "gitana-file-store",
  "gitana-file-store-conformance",
  "gitana-fs-native",
+ "gitana-path",
  "sha2",
  "tempfile",
  "tokio",
@@ -1735,6 +1736,7 @@ dependencies = [
  "gitana-file-store-memory",
  "gitana-object",
  "gitana-object-store",
+ "gitana-path",
  "gitana-repository",
  "gitana-trust",
  "hmac",
@@ -1765,6 +1767,7 @@ dependencies = [
  "gitana-identity",
  "gitana-object",
  "gitana-object-store",
+ "gitana-path",
  "gitana-repository",
  "gitana-repository-layout",
  "gitana-worktree",
@@ -1781,6 +1784,7 @@ name = "gitana-object"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "gitana-path",
  "proptest",
  "sha1",
  "sha2",
@@ -1796,9 +1800,17 @@ dependencies = [
  "gitana-file-store",
  "gitana-file-store-memory",
  "gitana-object",
+ "gitana-path",
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "gitana-path"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1813,6 +1825,7 @@ dependencies = [
  "gitana-git-http",
  "gitana-object",
  "gitana-object-store",
+ "gitana-path",
  "gitana-remote",
  "gitana-repository",
  "gitana-trust",
@@ -1849,6 +1862,7 @@ dependencies = [
  "gitana-file-store-local",
  "gitana-object",
  "gitana-object-store",
+ "gitana-path",
  "gitana-porcelain",
  "gitana-remote",
  "gitana-repository",
@@ -1870,6 +1884,7 @@ dependencies = [
  "gitana-git-http",
  "gitana-object",
  "gitana-object-store",
+ "gitana-path",
  "gitana-repository",
  "tempfile",
  "tokio",
@@ -1890,6 +1905,7 @@ dependencies = [
  "gitana-file-store-memory",
  "gitana-object",
  "gitana-object-store",
+ "gitana-path",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -1916,6 +1932,7 @@ dependencies = [
  "gitana-fs-native",
  "gitana-object",
  "gitana-object-store",
+ "gitana-path",
  "gitana-remote",
  "gitana-repository",
  "gitana-repository-layout",
@@ -1936,6 +1953,7 @@ name = "gitana-trust"
 version = "0.1.0"
 dependencies = [
  "gitana-object",
+ "gitana-path",
  "pgp",
  "proptest",
  "serde",
@@ -1956,7 +1974,9 @@ dependencies = [
  "gitana-fs-native",
  "gitana-object",
  "gitana-object-store",
+ "gitana-path",
  "gitana-repository",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -1987,6 +2007,7 @@ dependencies = [
  "gitana-git-http",
  "gitana-object",
  "gitana-object-store",
+ "gitana-path",
  "gitana-remote",
  "gitana-repository",
  "gitana-submodule",
@@ -2018,6 +2039,7 @@ dependencies = [
  "gitana-linked-worktree",
  "gitana-object",
  "gitana-object-store",
+ "gitana-path",
  "gitana-porcelain",
  "gitana-remote",
  "gitana-repository",
@@ -2039,8 +2061,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "clap",
  "clap-mcp",
+ "gitana-path",
  "gta-core",
  "rmcp",
  "serde_json",

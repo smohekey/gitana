@@ -14,6 +14,7 @@ anyhow = "1.0.103"
 assert_cmd = "2.2.2"
 axum = "0.8"
 cap-fs-ext = "4.0.2"
+base64 = "0.22.1"
 cap-std = "4.0.2"
 caseless = "0.2.2"
 clap = { version = "4.6.1", features = ["derive"] }
@@ -34,6 +35,7 @@ gitana-identity = { version = "0.1.0", path = "crates/core/gitana-identity" }
 gitana-linked-worktree = { version = "0.1.0", path = "crates/core/gitana-linked-worktree" }
 gitana-object = { version = "0.1.0", path = "crates/core/gitana-object" }
 gitana-object-store = { version = "0.1.0", path = "crates/core/gitana-object-store" }
+gitana-path = { version = "0.1.0", path = "crates/core/gitana-path" }
 gitana-porcelain = { version = "0.1.0", path = "crates/core/gitana-porcelain", default-features = false }
 gitana-remote = { version = "0.1.0", path = "crates/core/gitana-remote", default-features = false }
 gitana-repository-layout = { version = "0.1.0", path = "crates/core/gitana-repository-layout" }

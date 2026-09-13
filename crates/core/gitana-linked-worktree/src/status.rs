@@ -422,7 +422,7 @@ mod native {
 		git_dir: &Path,
 		common: &Path,
 		destination: &Path,
-	) -> Result<Vec<String>, LinkedWorktreeError> {
+	) -> Result<Vec<gitana_path::GitPath>, LinkedWorktreeError> {
 		let store = open_store_raw(git_dir, common)?;
 		let work = open_work_dir(destination)?;
 		let paths = match detect_kind(&store).await? {
@@ -659,12 +659,13 @@ mod native {
 		git_dir: &Path,
 		common: &Path,
 		destination: &Path,
-	) -> Result<Vec<String>, LinkedWorktreeError> {
+	) -> Result<Vec<gitana_path::GitPath>, LinkedWorktreeError> {
 		let store = open_store_raw(git_dir, common)?;
 		let work = open_work_dir(destination)?;
 		// The set of tracked paths, normalised the same way the disk walk normalises each candidate, so
 		// membership is an exact O(1) lookup.
-		let tracked: std::collections::HashSet<String> = match detect_kind(&store).await? {
+		let tracked: std::collections::HashSet<gitana_path::GitPath> = match detect_kind(&store).await?
+		{
 			HashKind::Sha1 => {
 				let wt = WorkTree::new(
 					Repository::<_, Sha1>::new(ObjectStore::new(store)),
@@ -675,7 +676,7 @@ mod native {
 					.await?
 					.entries
 					.iter()
-					.map(|e| normalize_index_path(&e.path))
+					.map(|e| e.path.clone())
 					.collect()
 			}
 			HashKind::Sha256 => {
@@ -688,29 +689,13 @@ mod native {
 					.await?
 					.entries
 					.iter()
-					.map(|e| normalize_index_path(&e.path))
+					.map(|e| e.path.clone())
 					.collect()
 			}
 		};
 		let mut residual = Vec::new();
 		collect_residual(destination, destination, &tracked, &mut residual)?;
 		Ok(residual)
-	}
-
-	/// Normalise a path for exact tracked-set membership. Separators are converted to `/` **only on Windows**
-	/// (where the OS uses `\`): on Unix `\` is a *valid filename byte*, and both index keys and the on-disk
-	/// relative path already use `/`, so converting it there would be non-injective (`a\b` and `a/b` would
-	/// collide, letting an untracked file masquerade as a tracked one). Case is **not** folded (see
-	/// [`residual_untracked_paths`]).
-	fn normalize_index_path(path: &str) -> String {
-		#[cfg(windows)]
-		{
-			path.replace('\\', "/")
-		}
-		#[cfg(not(windows))]
-		{
-			path.to_owned()
-		}
 	}
 
 	/// The filesystem's **actual stored name** for the checkout's root `.git` pointer — `canonicalize(root/.git)`'s
@@ -733,8 +718,8 @@ mod native {
 	fn collect_residual(
 		root: &Path,
 		dir: &Path,
-		tracked: &std::collections::HashSet<String>,
-		out: &mut Vec<String>,
+		tracked: &std::collections::HashSet<gitana_path::GitPath>,
+		out: &mut Vec<gitana_path::GitPath>,
 	) -> Result<(), LinkedWorktreeError> {
 		// Only the root level holds the checkout's own `.git` pointer; resolve its real stored name once here.
 		let git_name = (dir == root).then(|| gitfile_entry_name(root));
@@ -762,49 +747,47 @@ mod native {
 				collect_residual(root, &path, tracked, out)?;
 			} else {
 				// A file or symlink is residual unless its normalised `/`-relative path is tracked exactly.
-				let rel = path.strip_prefix(root).ok().and_then(|r| r.to_str());
-				match rel {
-					Some(rel) => {
-						let key = normalize_index_path(rel);
-						if !tracked.contains(&key) {
-							// Report the worktree-relative path with `/` separators (a no-op on Unix, where the
-							// path is already `/`-joined and `\` is a literal filename byte).
-							#[cfg(windows)]
-							out.push(rel.replace('\\', "/"));
-							#[cfg(not(windows))]
-							out.push(rel.to_owned());
-						}
-					}
-					// A non-UTF-8 relative path: keep it worktree-*relative* (strip the root) and lossily convert,
-					// so `ResidualContent.paths` stays relative as documented.
-					None => out.push(
-						path
-							.strip_prefix(root)
-							.unwrap_or(&path)
-							.to_string_lossy()
-							.into_owned(),
-					),
+				let rel = path.strip_prefix(root).map_err(|error| {
+					LinkedWorktreeError::io(
+						"resolving worktree-relative path",
+						&path,
+						std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+					)
+				})?;
+				let key = native_relative_git_path(rel).map_err(|source| {
+					LinkedWorktreeError::io("encoding worktree-relative path", &path, source)
+				})?;
+				if !tracked.contains(&key) {
+					out.push(key);
 				}
 			}
 		}
 		Ok(())
 	}
 
+	#[cfg(unix)]
+	fn native_relative_git_path(path: &Path) -> Result<gitana_path::GitPath, std::io::Error> {
+		use std::os::unix::ffi::OsStrExt;
+
+		gitana_path::GitPath::from_bytes(path.as_os_str().as_bytes())
+			.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+	}
+
+	#[cfg(not(unix))]
+	fn native_relative_git_path(path: &Path) -> Result<gitana_path::GitPath, std::io::Error> {
+		let value = path.to_str().ok_or_else(|| {
+			std::io::Error::new(
+				std::io::ErrorKind::Unsupported,
+				"the host filesystem path cannot be represented as Git bytes",
+			)
+		})?;
+		gitana_path::GitPath::from_utf8(&value.replace('\\', "/"))
+			.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+	}
+
 	#[cfg(test)]
 	mod tests {
-		use super::{gitfile_entry_name, normalize_index_path};
-
-		#[test]
-		fn normalizes_platform_separators_without_folding_case() {
-			// Case is preserved (never folded — folding is unsound for the residual gate).
-			assert_eq!(normalize_index_path("Foo/Bar"), "Foo/Bar");
-			// `\` is a separator only on Windows; on Unix it is a valid filename byte and must be preserved
-			// (otherwise `a\b` and `a/b` would collide and an untracked file could masquerade as tracked).
-			#[cfg(windows)]
-			assert_eq!(normalize_index_path("a\\b\\c"), "a/b/c");
-			#[cfg(not(windows))]
-			assert_eq!(normalize_index_path("a\\b\\c"), "a\\b\\c");
-		}
+		use super::gitfile_entry_name;
 
 		#[cfg(unix)]
 		#[test]

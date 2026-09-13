@@ -10,6 +10,7 @@ use gitana_file_store_local::LocalFileStore;
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_object::{ObjectId, ObjectKind, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
+use gitana_path::GitPath;
 use gitana_repository::{
 	FileMode, HeadState, ReflogIntent, Repository, TreeBuildEntry, compute_tree_id,
 };
@@ -20,6 +21,32 @@ fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
 
 fn mem_repo() -> Repository<MemoryFileStore, Sha256> {
 	Repository::new(ObjectStore::new(MemoryFileStore::new()))
+}
+
+#[tokio::test]
+async fn rev_parse_preserves_non_utf8_tree_path_suffixes() {
+	let repo = mem_repo();
+	repo.init().await.unwrap();
+	let blob = repo.write_blob(b"raw path\n").await.unwrap();
+	let tree = repo
+		.write_tree(&[TreeBuildEntry {
+			path: GitPath::from_bytes(b"bad-\xff".to_vec()).unwrap(),
+			mode: FileMode::Regular,
+			id: blob,
+		}])
+		.await
+		.unwrap();
+	repo
+		.commit_on_head(
+			tree,
+			"T E St <t@e> 1700000000 +0000",
+			"T E St <t@e> 1700000000 +0000",
+			"raw path\n",
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(repo.rev_parse(b"HEAD:bad-\xff").await.unwrap(), blob);
 }
 
 #[tokio::test]
@@ -224,7 +251,7 @@ async fn abbreviations_resolve_across_loose_and_packed_objects() {
 			.unwrap();
 		let tree = repo
 			.write_tree(&[TreeBuildEntry {
-				path: "f.txt".to_owned(),
+				path: GitPath::from_utf8("f.txt").unwrap(),
 				mode: FileMode::Regular,
 				id: blob,
 			}])
@@ -313,12 +340,12 @@ async fn engine_commit_is_read_by_git() {
 	let blob = repo.write_blob(b"hello\n").await.unwrap();
 	let entries = [
 		TreeBuildEntry {
-			path: "greeting.txt".to_owned(),
+			path: GitPath::from_utf8("greeting.txt").unwrap(),
 			mode: FileMode::Regular,
 			id: blob,
 		},
 		TreeBuildEntry {
-			path: "src/lib.rs".to_owned(),
+			path: GitPath::from_utf8("src/lib.rs").unwrap(),
 			mode: FileMode::Regular,
 			id: blob,
 		},
@@ -382,7 +409,7 @@ async fn git_reads_a_sha1_engine_initialised_repo_and_commit() {
 	let blob = repo.write_blob(b"hello\n").await.unwrap();
 	let tree = repo
 		.write_tree(&[TreeBuildEntry {
-			path: "greeting.txt".to_owned(),
+			path: GitPath::from_utf8("greeting.txt").unwrap(),
 			mode: FileMode::Regular,
 			id: blob,
 		}])
@@ -430,7 +457,7 @@ async fn make_commit(
 	let blob = repo.write_blob(content).await.unwrap();
 	let tree = repo
 		.write_tree(&[TreeBuildEntry {
-			path: "f.txt".to_owned(),
+			path: GitPath::from_utf8("f.txt").unwrap(),
 			mode: FileMode::Regular,
 			id: blob,
 		}])

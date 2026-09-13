@@ -66,6 +66,7 @@ impl GtaMcpServer {
 		for argument in &mut tool_schema.root.args {
 			argument.global = true;
 		}
+		strip_mcp_excluded_arguments(&mut tool_schema.root, &mut Vec::new());
 		rename_nested_commands(&mut tool_schema.root, &mut Vec::new());
 		let metadata = ClapMcpSchemaMetadata {
 			skip_root_command_when_subcommands: true,
@@ -363,7 +364,13 @@ fn collect_specs(
 		path.push(schema.name.clone());
 		let mut args = inherited.to_vec();
 		let prefix_count = args.len();
-		args.extend(schema.args.clone());
+		args.extend(
+			schema
+				.args
+				.iter()
+				.filter(|argument| !mcp_argument_is_excluded(&path[1..], &argument.id))
+				.cloned(),
+		);
 		let mut allowed_values = inherited_allowed_values.clone();
 		for argument in command.get_arguments() {
 			let values: Vec<String> = argument
@@ -437,6 +444,21 @@ fn collect_specs(
 		&mut out,
 	)?;
 	Ok(out)
+}
+
+fn strip_mcp_excluded_arguments(command: &mut clap_mcp::ClapCommand, path: &mut Vec<String>) {
+	path.push(command.name.clone());
+	command
+		.args
+		.retain(|argument| !mcp_argument_is_excluded(&path[1..], &argument.id));
+	for child in &mut command.subcommands {
+		strip_mcp_excluded_arguments(child, path);
+	}
+	path.pop();
+}
+
+fn mcp_argument_is_excluded(path: &[String], argument: &str) -> bool {
+	path.len() == 1 && path[0] == "ls-files" && argument == "z"
 }
 
 fn rename_nested_commands(command: &mut clap_mcp::ClapCommand, path: &mut Vec<String>) {

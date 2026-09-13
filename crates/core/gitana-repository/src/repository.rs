@@ -2,7 +2,7 @@ use gitana_file_store::{FileStore, FileStoreError};
 use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit, parse_commit};
 use gitana_object_store::ObjectStore;
 
-use crate::tree::{FlatEntry, build_tree};
+use crate::tree::{FlatEntry, RawFlatEntry, build_tree};
 use crate::{Config, HeadState, RefStore, ReflogIntent, RepositoryError, TreeBuildEntry};
 
 /// A git repository: the object graph plus refs, over one repo-scoped store.
@@ -96,6 +96,17 @@ where
 	/// Recursively read a tree into `(path, mode, oid)` entries (`ls-tree -r`).
 	pub async fn read_tree(&self, tree: ObjectId<H>) -> Result<Vec<FlatEntry<H>>, RepositoryError> {
 		crate::tree::read_tree_recursive(&self.objects, tree).await
+	}
+
+	/// Recursively read a structurally readable tree without requiring canonical filesystem paths.
+	///
+	/// This is for read-only plumbing over damaged or foreign objects. Use [`Repository::read_tree`]
+	/// before feeding entries to an index or working tree.
+	pub async fn read_tree_raw(
+		&self,
+		tree: ObjectId<H>,
+	) -> Result<Vec<RawFlatEntry<H>>, RepositoryError> {
+		crate::tree::read_tree_recursive_raw(&self.objects, tree).await
 	}
 
 	/// Peel `id` — a commit, tag, or tree — to its tree id, dereferencing tags;
@@ -535,8 +546,8 @@ where
 
 	/// Resolve a revision spec (`HEAD`, `main`, `<oid>`, `HEAD~2`, `v1^{commit}`, …)
 	/// to an object id.
-	pub async fn rev_parse(&self, spec: &str) -> Result<ObjectId<H>, RepositoryError> {
-		crate::revision::rev_parse(self, spec).await
+	pub async fn rev_parse(&self, spec: impl AsRef<[u8]>) -> Result<ObjectId<H>, RepositoryError> {
+		crate::revision::rev_parse(self, spec.as_ref()).await
 	}
 
 	/// Walk commits reachable from `tips` in committer-date order (newest first).

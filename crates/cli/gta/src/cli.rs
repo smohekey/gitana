@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -57,7 +58,7 @@ enum Command {
 		#[arg(short = 'p', group = "mode")]
 		pretty: bool,
 		/// The object (oid, abbreviation, or revision).
-		object: String,
+		object: OsString,
 	},
 	/// List the contents of a tree.
 	LsTree {
@@ -65,12 +66,12 @@ enum Command {
 		#[arg(short = 'r')]
 		recursive: bool,
 		/// A tree, commit, or revision.
-		treeish: String,
+		treeish: OsString,
 	},
 	/// Resolve a revision to an object id.
 	RevParse {
 		/// The revision (oid, abbreviation, ref, `HEAD`, `~`/`^`/`^{}`).
-		spec: String,
+		spec: OsString,
 	},
 	/// List commits reachable from a revision, newest first.
 	RevList {
@@ -119,7 +120,7 @@ enum Command {
 		#[arg(short = 'z')]
 		z: bool,
 		/// Pathspecs to filter by: files, directories, globs (`*.rs`), and magic (`:(exclude)`/`:!`, `:/`, `:(icase)`, `:(literal)`, `:(glob)`).
-		pathspecs: Vec<String>,
+		pathspecs: Vec<OsString>,
 	},
 	/// Point a ref at an object.
 	UpdateRef {
@@ -142,7 +143,7 @@ enum Command {
 		force: bool,
 		/// Pathspecs to stage: files, directories, `.`, globs (`*.rs`), and magic (`:(exclude)`/`:!`, `:/`, `:(icase)`, `:(literal)`, `:(glob)`).
 		#[arg(required = true)]
-		pathspecs: Vec<String>,
+		pathspecs: Vec<OsString>,
 	},
 	/// Show the working-tree status (porcelain v1).
 	Status,
@@ -237,7 +238,7 @@ enum Command {
 	/// Show an object: a commit and its diff, a tag, a tree, or a blob (default: HEAD).
 	Show {
 		/// The object to show (default: HEAD).
-		object: Option<String>,
+		object: Option<OsString>,
 	},
 	/// Read or write git configuration.
 	///
@@ -330,10 +331,10 @@ enum Command {
 		#[arg(short = 'f', long = "force")]
 		force: bool,
 		/// Branch to switch to, or tree-ish to restore paths from (before `--`).
-		target: Option<String>,
+		target: Option<OsString>,
 		/// Paths to restore (after `--`).
 		#[arg(last = true, value_name = "path")]
-		paths: Vec<String>,
+		paths: Vec<OsString>,
 	},
 	/// Restore working-tree and/or staged paths from a tree-ish, the index, or `HEAD`.
 	Restore {
@@ -345,10 +346,10 @@ enum Command {
 		staged: bool,
 		/// Tree-ish to restore from (default: the index, or `HEAD` with `--staged`).
 		#[arg(short = 's', long, value_name = "tree")]
-		source: Option<String>,
+		source: Option<OsString>,
 		/// Paths to restore.
 		#[arg(value_name = "pathspec")]
-		paths: Vec<String>,
+		paths: Vec<OsString>,
 	},
 	/// Reset the current branch (and optionally index/working tree) to a commit, or reset paths.
 	Reset {
@@ -362,10 +363,10 @@ enum Command {
 		#[arg(long)]
 		hard: bool,
 		/// Commit to reset to (before `--`), default `HEAD`.
-		target: Option<String>,
+		target: Option<OsString>,
 		/// Paths to reset in the index (after `--`); does not move `HEAD`.
 		#[arg(last = true, value_name = "path")]
-		paths: Vec<String>,
+		paths: Vec<OsString>,
 	},
 	/// Remove tracked files from the index and the working tree.
 	Rm {
@@ -383,7 +384,7 @@ enum Command {
 		dry_run: bool,
 		/// Paths to remove.
 		#[arg(value_name = "pathspec")]
-		pathspecs: Vec<String>,
+		pathspecs: Vec<OsString>,
 	},
 	/// Move or rename a tracked file or directory (filesystem move plus index update).
 	Mv {
@@ -398,7 +399,7 @@ enum Command {
 		verbose: bool,
 		/// One or more sources followed by the destination.
 		#[arg(value_name = "path", required = true)]
-		paths: Vec<String>,
+		paths: Vec<OsString>,
 	},
 	/// Show changes between commits, the index, and the working tree.
 	Diff {
@@ -649,7 +650,7 @@ enum SparseCheckoutAction {
 	Set {
 		/// Directories (cone) or patterns (`--no-cone`) to include.
 		#[arg(value_name = "pattern")]
-		patterns: Vec<String>,
+		patterns: Vec<OsString>,
 		/// Use full gitignore-style patterns instead of cone mode.
 		#[arg(long = "no-cone")]
 		no_cone: bool,
@@ -658,7 +659,7 @@ enum SparseCheckoutAction {
 	Add {
 		/// Directories (cone) or patterns (`--no-cone`) to add.
 		#[arg(value_name = "pattern")]
-		patterns: Vec<String>,
+		patterns: Vec<OsString>,
 	},
 	/// Print the current sparse-checkout set.
 	List,
@@ -896,11 +897,26 @@ impl Cli {
 					show_size,
 					pretty,
 					object,
-				} => commands::cat_file::run(&cwd, show_type, show_size, pretty, &object).await,
-				Command::LsTree { recursive, treeish } => {
-					commands::ls_tree::run(&cwd, recursive, &treeish).await
+				} => {
+					let object = gta_core::bytes_from_os(&object)?;
+					commands::cat_file::run(
+						&cwd,
+						show_type,
+						show_size,
+						pretty,
+						&object,
+						gta_core::PathQuoteMode::Config,
+					)
+					.await
 				}
-				Command::RevParse { spec } => commands::rev_parse::run(&cwd, &spec).await,
+				Command::LsTree { recursive, treeish } => {
+					let treeish = gta_core::bytes_from_os(&treeish)?;
+					commands::ls_tree::run(&cwd, recursive, &treeish, gta_core::PathQuoteMode::Config).await
+				}
+				Command::RevParse { spec } => {
+					let spec = gta_core::bytes_from_os(&spec)?;
+					commands::rev_parse::run(&cwd, &spec).await
+				}
 				Command::RevList { spec } => commands::rev_list::run(&cwd, &spec).await,
 				Command::MergeBase {
 					all,
@@ -919,6 +935,7 @@ impl Cli {
 					z,
 					pathspecs,
 				} => {
+					let pathspecs = native_pathspecs(pathspecs)?;
 					commands::ls_files::run(
 						&cwd,
 						&pathspecs,
@@ -933,6 +950,7 @@ impl Cli {
 							z,
 							full_name,
 						},
+						gta_core::PathQuoteMode::Config,
 					)
 					.await
 				}
@@ -940,8 +958,11 @@ impl Cli {
 				Command::SymbolicRef { name, target } => {
 					commands::symbolic_ref::run(&cwd, &name, target).await
 				}
-				Command::Add { force, pathspecs } => commands::add::run(&cwd, &pathspecs, force).await,
-				Command::Status => commands::status::run(&cwd).await,
+				Command::Add { force, pathspecs } => {
+					let pathspecs = native_pathspecs(pathspecs)?;
+					commands::add::run(&cwd, &pathspecs, force, gta_core::ResultPathMode::Human).await
+				}
+				Command::Status => commands::status::run(&cwd, gta_core::PathQuoteMode::Config).await,
 				Command::Commit {
 					message,
 					sign,
@@ -955,29 +976,75 @@ impl Cli {
 					ff_only,
 					abort,
 					continue_,
-				} => commands::merge::run(&cwd, commit, message, no_ff, ff_only, abort, continue_).await,
+				} => {
+					commands::merge::run(
+						&cwd,
+						commit,
+						message,
+						no_ff,
+						ff_only,
+						abort,
+						continue_,
+						gta_core::ResultPathMode::Human,
+					)
+					.await
+				}
 				Command::CherryPick {
 					commit,
 					abort,
 					continue_,
-				} => commands::cherry_pick::run(&cwd, commit, abort, continue_).await,
+				} => {
+					commands::cherry_pick::run(
+						&cwd,
+						commit,
+						abort,
+						continue_,
+						gta_core::ResultPathMode::Human,
+					)
+					.await
+				}
 				Command::Revert {
 					commit,
 					abort,
 					continue_,
-				} => commands::revert::run(&cwd, commit, abort, continue_).await,
+				} => {
+					commands::revert::run(
+						&cwd,
+						commit,
+						abort,
+						continue_,
+						gta_core::ResultPathMode::Human,
+					)
+					.await
+				}
 				Command::Rebase {
 					upstream,
 					onto,
 					abort,
 					continue_,
 					skip,
-				} => commands::rebase::run(&cwd, upstream, onto, abort, continue_, skip).await,
+				} => {
+					commands::rebase::run(
+						&cwd,
+						upstream,
+						onto,
+						abort,
+						continue_,
+						skip,
+						gta_core::ResultPathMode::Human,
+					)
+					.await
+				}
 				Command::Repack { geometric } => commands::repack::run(&cwd, geometric).await,
 				Command::Prune => commands::prune::run(&cwd).await,
 				Command::Gc => commands::gc::run(&cwd).await,
 				Command::Log => commands::log::run(&cwd).await,
-				Command::Show { object } => commands::show::run(&cwd, object).await,
+				Command::Show { object } => {
+					let object = object
+						.map(|object| gta_core::bytes_from_os(&object))
+						.transpose()?;
+					commands::show::run(&cwd, object, gta_core::PathQuoteMode::Config).await
+				}
 				Command::Config {
 					get,
 					get_all,
@@ -1043,34 +1110,72 @@ impl Cli {
 					force,
 					target,
 					paths,
-				} => commands::checkout::run(&cwd, force, target, paths).await,
+				} => {
+					let target = target
+						.map(|target| gta_core::bytes_from_os(&target))
+						.transpose()?;
+					commands::checkout::run(&cwd, force, target, native_pathspecs(paths)?).await
+				}
 				Command::Restore {
 					worktree,
 					staged,
 					source,
 					paths,
-				} => commands::restore::run(&cwd, worktree, staged, source, paths).await,
+				} => {
+					let source = source
+						.map(|source| gta_core::bytes_from_os(&source))
+						.transpose()?;
+					commands::restore::run(&cwd, worktree, staged, source, native_pathspecs(paths)?).await
+				}
 				Command::Reset {
 					soft,
 					mixed,
 					hard,
 					target,
 					paths,
-				} => commands::reset::run(&cwd, soft, mixed, hard, target, paths).await,
+				} => {
+					let target = target
+						.map(|target| gta_core::bytes_from_os(&target))
+						.transpose()?;
+					commands::reset::run(&cwd, soft, mixed, hard, target, native_pathspecs(paths)?).await
+				}
 				Command::Rm {
 					cached,
 					force,
 					recursive,
 					dry_run,
 					pathspecs,
-				} => commands::rm::run(&cwd, cached, force, recursive, dry_run, pathspecs).await,
+				} => {
+					commands::rm::run(
+						&cwd,
+						cached,
+						force,
+						recursive,
+						dry_run,
+						native_pathspecs(pathspecs)?,
+						gta_core::ResultPathMode::Human,
+					)
+					.await
+				}
 				Command::Mv {
 					force,
 					dry_run,
 					verbose,
 					paths,
-				} => commands::mv::run(&cwd, force, dry_run, verbose, paths).await,
-				Command::Diff { cached } => commands::diff::run(&cwd, cached).await,
+				} => {
+					commands::mv::run(
+						&cwd,
+						force,
+						dry_run,
+						verbose,
+						native_pathspecs(paths)?,
+						gta_core::ResultPathMode::Human,
+					)
+					.await
+				}
+				Command::Diff { cached } => {
+					commands::diff::run(&cwd, cached, gta_core::PathQuoteMode::Config).await
+				}
 				Command::Clone {
 					url,
 					path,
@@ -1097,6 +1202,7 @@ impl Cli {
 						recurse_submodules,
 						shallow_submodules,
 						remote_submodules,
+						gta_core::ResultPathMode::Human,
 					)
 					.await
 				}
@@ -1120,7 +1226,7 @@ impl Cli {
 				)
 				.await
 				.map(|_| ()),
-				Command::Pull => commands::pull::run(&cwd).await,
+				Command::Pull => commands::pull::run(&cwd, gta_core::ResultPathMode::Human).await,
 				Command::Push {
 					repository,
 					refspecs,
@@ -1147,7 +1253,13 @@ impl Cli {
 					.await
 				}
 				Command::Submodule { action } => {
-					commands::submodule::run(&cwd, &command_context, submodule_action(action)).await
+					commands::submodule::run(
+						&cwd,
+						&command_context,
+						submodule_action(action),
+						gta_core::ResultPathMode::Human,
+					)
+					.await
 				}
 				Command::Remote { verbose, action } => {
 					commands::remote::run(&cwd, remote_action(verbose, action)).await
@@ -1157,7 +1269,12 @@ impl Cli {
 					commands::worktree::run(&cwd, worktree_action(action)).await
 				}
 				Command::SparseCheckout { action } => {
-					commands::sparse_checkout::run(&cwd, sparse_checkout_action(action)).await
+					commands::sparse_checkout::run(
+						&cwd,
+						sparse_checkout_action(action)?,
+						gta_core::ResultPathMode::Human,
+					)
+					.await
 				}
 			}
 		};
@@ -1208,16 +1325,30 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 }
 
 /// Map the clap `sparse-checkout` sub-command to the `gta-core` action.
-fn sparse_checkout_action(action: SparseCheckoutAction) -> commands::sparse_checkout::Action {
+fn sparse_checkout_action(
+	action: SparseCheckoutAction,
+) -> Result<commands::sparse_checkout::Action> {
 	use commands::sparse_checkout::Action;
-	match action {
+	Ok(match action {
 		SparseCheckoutAction::Init { no_cone } => Action::Init { no_cone },
-		SparseCheckoutAction::Set { patterns, no_cone } => Action::Set { patterns, no_cone },
-		SparseCheckoutAction::Add { patterns } => Action::Add { patterns },
+		SparseCheckoutAction::Set { patterns, no_cone } => Action::Set {
+			patterns: native_pathspecs(patterns)?,
+			no_cone,
+		},
+		SparseCheckoutAction::Add { patterns } => Action::Add {
+			patterns: native_pathspecs(patterns)?,
+		},
 		SparseCheckoutAction::List => Action::List,
 		SparseCheckoutAction::Disable => Action::Disable,
 		SparseCheckoutAction::Reapply => Action::Reapply,
-	}
+	})
+}
+
+fn native_pathspecs(values: Vec<OsString>) -> Result<Vec<gitana_path::GitPathspec>> {
+	values
+		.iter()
+		.map(|value| gta_core::pathspec_from_os(value))
+		.collect()
 }
 
 /// Map the clap `worktree` sub-command to the `gta-core` action. `-b`/`-B <name>` collapse to a

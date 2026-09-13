@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId, ObjectKind};
+use gitana_path::{GitPath, GitPathComponent, GitPathspec};
 
 use crate::fsmeta::{join_rel, push_gitignore};
 use crate::ignore::{self, DirIgnore};
@@ -22,8 +23,8 @@ use crate::{IndexEntry, LsFilesOptions, WorkTree, WorktreeError};
 /// shown. git prints the matched entries *and then* exits non-zero, so the caller writes `text`
 /// verbatim before acting on `unmatched`.
 pub struct LsFilesOutput {
-	pub text: String,
-	pub unmatched: Option<String>,
+	pub text: Vec<u8>,
+	pub unmatched: Option<GitPathspec>,
 }
 
 /// Config the caller resolves from git's full stack, which the sandboxed worktree crate cannot reach
@@ -39,14 +40,14 @@ pub struct LsFilesConfig<'a> {
 	/// The effective `core.symlinks`. When `false`, a `120000` symlink entry is materialised as a plain
 	/// file holding the link target, and such a placeholder is *not* a modification for `-m`.
 	pub symlinks: bool,
-	pub excludes_file: Option<&'a str>,
+	pub excludes_file: Option<&'a [u8]>,
 }
 
 /// Run `ls-files` over `wt` with the caller-resolved `config`.
 pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
-	pathspecs: &[&str],
-	prefix: &str,
+	pathspecs: &[GitPathspec],
+	prefix: &GitPath,
 	opts: &LsFilesOptions,
 	config: &LsFilesConfig<'_>,
 ) -> Result<LsFilesOutput, WorktreeError> {
@@ -58,14 +59,14 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	// `:(exclude)` ones — git still scopes the listing to the current subtree, so synthesize the
 	// prefix directory as an implicit `.` positive (parsed at the same prefix as the rest).
 	let mut set = PathspecSet::parse(pathspecs, prefix)?;
-	if set.is_positive_empty() && !prefix.trim_end_matches('/').is_empty() {
-		let mut scoped: Vec<&str> = Vec::with_capacity(pathspecs.len() + 1);
-		scoped.push(".");
+	if set.is_positive_empty() && !prefix.is_root() {
+		let mut scoped = Vec::with_capacity(pathspecs.len() + 1);
+		scoped.push(GitPathspec::from_utf8(".").expect("dot is a valid pathspec"));
 		scoped.extend_from_slice(pathspecs);
 		set = PathspecSet::parse(&scoped, prefix)?;
 	}
 
-	let term = if opts.z { '\0' } else { '\n' };
+	let term = if opts.z { b'\0' } else { b'\n' };
 	// `--error-unmatch` with pathspecs that each name an *exact single file* collapses the output to one
 	// line per path — dropping the per-selector duplicates and a conflicted path's extra stages, keeping
 	// the first line emitted for each (probed vs git 2.50.1: `--error-unmatch del` prints `del` once, but a
@@ -75,19 +76,19 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	// as matched, but the same over an *untracked* excluded path does not) — is not reproduced. For those
 	// exotic exclusion combinations both the duplicate-line output and, in the untracked case, the exit
 	// status can differ from git; a deliberately documented divergence (see TODO.md / the initiative notes).
-	let index_paths: HashSet<&str> = index.entries.iter().map(|e| e.path.as_str()).collect();
+	let index_paths: HashSet<&GitPath> = index.entries.iter().map(|e| &e.path).collect();
 	let dedup = opts.error_unmatch
 		&& !pathspecs.is_empty()
 		&& pathspecs
 			.iter()
-			.all(|spec| is_exact_file_pathspec(spec, prefix, &index_paths));
-	let mut seen: HashSet<String> = HashSet::new();
-	let mut out = String::new();
-	let mut emit = |out: &mut String, path: &str, line: String| {
-		if dedup && !seen.insert(path.to_owned()) {
+			.all(|spec| is_exact_file_pathspec(spec.as_bytes(), prefix, &index_paths));
+	let mut seen: HashSet<GitPath> = HashSet::new();
+	let mut out = Vec::new();
+	let mut emit = |out: &mut Vec<u8>, path: &GitPath, line: Vec<u8>| {
+		if dedup && !seen.insert(path.clone()) {
 			return;
 		}
-		out.push_str(&line);
+		out.extend_from_slice(&line);
 		out.push(term);
 	};
 
@@ -97,14 +98,14 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		// Under `core.ignoreCase` git matches a working-tree entry to a tracked index path case-folded, so a
 		// disk `foo` counts as the tracked `Foo` (untracked detection is ASCII-case-insensitive). Fold the
 		// membership keys — and the lookups in `collect_others` — the same way.
-		let fold_key = |path: &str| {
+		let fold_key = |path: &GitPath| {
 			if config.ignore_case {
-				path.to_ascii_lowercase()
+				path.ascii_folded()
 			} else {
-				path.to_owned()
+				path.as_bytes().to_vec()
 			}
 		};
-		let tracked: HashSet<String> = index.entries.iter().map(|e| fold_key(&e.path)).collect();
+		let tracked: HashSet<Vec<u8>> = index.entries.iter().map(|e| fold_key(&e.path)).collect();
 		// Gitlink (submodule) paths — mode `160000`. git never lists a tracked gitlink directory under
 		// `-o`; an ordinary tracked file whose path is now a directory (a file→dir replacement) is *not* a
 		// gitlink, so it is still descended into.
@@ -112,14 +113,15 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		// on-disk directory holds tracked files, so `-o` descends into it and reports `sub/new`, as status
 		// does — not an opaque submodule mount.
 		// Fold-aware (matches `fold_key`): a mixed `160000 Sub` + `sub/f` conflict compares by fold-key.
-		let has_tracked_child = |path: &str| {
-			let prefix = format!("{}/", fold_key(path));
+		let has_tracked_child = |path: &GitPath| {
+			let mut prefix = fold_key(path);
+			prefix.push(b'/');
 			index
 				.entries
 				.iter()
 				.any(|e| fold_key(&e.path).starts_with(&prefix))
 		};
-		let gitlinks: HashSet<String> = index
+		let gitlinks: HashSet<Vec<u8>> = index
 			.entries
 			.iter()
 			.filter(|e| e.mode == 0o160000 && !has_tracked_child(&e.path))
@@ -131,10 +133,10 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		// rule overrides them (git's precedence, evaluated last-match-wins in the stack).
 		if opts.exclude_standard {
 			if let Some(text) = excludes_file {
-				stack.push(ignore::parse(text, ""));
+				stack.push(ignore::parse(text, b""));
 			}
 			if let Some(text) = crate::excludes::read_info_exclude(wt).await? {
-				stack.push(ignore::parse(&text, ""));
+				stack.push(ignore::parse(&text, b""));
 			}
 		}
 		let mut others = Vec::new();
@@ -144,14 +146,39 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			exclude_standard: opts.exclude_standard,
 			ignore_case: config.ignore_case,
 		};
-		collect_others(wt.work(), "", &walk, &mut stack, &mut others)?;
-		others.sort();
-		for path in &others {
-			if set.matches(path) {
+		collect_others(wt.work(), &GitPath::root(), &walk, &mut stack, &mut others)?;
+		// Git orders the names it serializes, so an opaque directory's presentation-only `/`
+		// participates in the comparison (`foo.` sorts before `foo/`). Keep the domain path
+		// canonical while comparing the raw presented byte streams without allocating.
+		others.sort_by(|left, right| {
+			left
+				.path
+				.as_bytes()
+				.iter()
+				.copied()
+				.chain(left.directory.then_some(b'/'))
+				.cmp(
+					right
+						.path
+						.as_bytes()
+						.iter()
+						.copied()
+						.chain(right.directory.then_some(b'/')),
+				)
+		});
+		for entry in &others {
+			if matches_presented_path(&set, &entry.path, entry.directory) {
 				emit(
 					&mut out,
-					path,
-					render(None::<&IndexEntry<H>>, path, prefix, opts, quote_path),
+					&entry.path,
+					render(
+						None::<&IndexEntry<H>>,
+						&entry.path,
+						entry.directory,
+						prefix,
+						opts,
+						quote_path,
+					),
 				);
 			}
 		}
@@ -163,11 +190,19 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	// pathspec test is guarded behind each set's condition.
 	if opts.show_cached() || opts.modified || opts.deleted {
 		for entry in &index.entries {
-			if opts.show_cached() && set.matches(&entry.path) {
+			let directory = entry.mode & 0o170000 == 0o040000;
+			if opts.show_cached() && matches_presented_path(&set, &entry.path, directory) {
 				emit(
 					&mut out,
 					&entry.path,
-					render(Some(entry), &entry.path, prefix, opts, quote_path),
+					render(
+						Some(entry),
+						&entry.path,
+						directory,
+						prefix,
+						opts,
+						quote_path,
+					),
 				);
 			}
 			if opts.modified || opts.deleted {
@@ -225,21 +260,21 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 						emit(
 							&mut out,
 							&entry.path,
-							render(Some(entry), &entry.path, prefix, opts, quote_path),
+							render(Some(entry), &entry.path, false, prefix, opts, quote_path),
 						);
 					}
 					if opts.modified && set.matches(&entry.path) {
 						emit(
 							&mut out,
 							&entry.path,
-							render(Some(entry), &entry.path, prefix, opts, quote_path),
+							render(Some(entry), &entry.path, false, prefix, opts, quote_path),
 						);
 					}
 				} else if code == 'M' && opts.modified && set.matches(&entry.path) {
 					emit(
 						&mut out,
 						&entry.path,
-						render(Some(entry), &entry.path, prefix, opts, quote_path),
+						render(Some(entry), &entry.path, false, prefix, opts, quote_path),
 					);
 				}
 			}
@@ -248,16 +283,16 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 
 	let unmatched = if opts.error_unmatch {
 		match set.unmatched() {
-			Some(spec) => Some(spec.to_owned()),
+			Some(spec) => Some(spec.clone()),
 			// An exclusion-*only* pathspec (no positives) that shows nothing is still a failure: git checks
 			// the implicit `.` scope and reports it unmatched (`ls-files -o --error-unmatch ':!u'` with `u`
 			// the only untracked file exits non-zero). Gated on `is_positive_empty` so a matched-then-excluded
 			// positive — `--error-unmatch a ':!a'`, which git exits 0 on — is not misreported.
-			None if set.is_positive_empty() && out.is_empty() && !pathspecs.is_empty() => Some(
-				pathspecs
-					.first()
-					.map_or_else(|| ".".to_owned(), |spec| (*spec).to_owned()),
-			),
+			None if set.is_positive_empty() && out.is_empty() && !pathspecs.is_empty() => {
+				Some(pathspecs.first().cloned().unwrap_or_else(|| {
+					GitPathspec::from_utf8(".").expect("the implicit root pathspec is valid")
+				}))
+			}
 			None => None,
 		}
 	} else {
@@ -269,34 +304,55 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	})
 }
 
+/// Match the pathname as it is presented by `ls-files`. Domain [`GitPath`] values stay canonical
+/// and therefore never carry a trailing slash, while opaque working-tree directories and sparse
+/// index directory entries are matched by their serialized `path/` spelling.
+fn matches_presented_path(set: &PathspecSet, path: &GitPath, directory: bool) -> bool {
+	if !directory {
+		return set.matches(path);
+	}
+	let mut presented = Vec::with_capacity(path.as_bytes().len() + 1);
+	presented.extend_from_slice(path.as_bytes());
+	presented.push(b'/');
+	set.matches(presented.as_slice())
+}
+
 /// Render one output entry: the `path` relativised and quoted per `opts`, prefixed with
 /// `<mode> <sha> <stage>\t` when `opts.stage` and an index `entry` is supplied (others are always
 /// plain, so they pass `None`).
 fn render<H: HashAlgorithm>(
 	entry: Option<&IndexEntry<H>>,
-	path: &str,
-	prefix: &str,
+	path: &GitPath,
+	directory: bool,
+	prefix: &GitPath,
 	opts: &LsFilesOptions,
 	quote_path: bool,
-) -> String {
-	let rel = if opts.full_name {
-		path.to_owned()
+) -> Vec<u8> {
+	let mut rel = if opts.full_name {
+		path.as_bytes().to_vec()
 	} else {
 		relativize(path, prefix)
 	};
+	if directory {
+		rel.push(b'/');
+	}
 	let rendered = if opts.z {
 		rel
 	} else {
 		quote_c_style(&rel, quote_path)
 	};
 	match entry {
-		Some(entry) if opts.stage => format!(
-			"{:06o} {} {}\t{}",
-			entry.mode,
-			entry.oid.to_hex(),
-			entry.stage,
-			rendered
-		),
+		Some(entry) if opts.stage => {
+			let mut line = format!(
+				"{:06o} {} {}\t",
+				entry.mode,
+				entry.oid.to_hex(),
+				entry.stage,
+			)
+			.into_bytes();
+			line.extend_from_slice(&rendered);
+			line
+		}
 		_ => rendered,
 	}
 }
@@ -305,10 +361,16 @@ fn render<H: HashAlgorithm>(
 /// recursion: the tracked / gitlink path sets (keys already folded per `core.ignoreCase`), whether
 /// `--exclude-standard` is applying the ignore stack, and the `core.ignoreCase` fold flag.
 struct OthersWalk<'a> {
-	tracked: &'a HashSet<String>,
-	gitlinks: &'a HashSet<String>,
+	tracked: &'a HashSet<Vec<u8>>,
+	gitlinks: &'a HashSet<Vec<u8>>,
 	exclude_standard: bool,
 	ignore_case: bool,
+}
+
+#[derive(Eq, PartialEq)]
+struct OtherEntry {
+	path: GitPath,
+	directory: bool,
 }
 
 /// Recursively collect the working-tree files not present in the index (at any stage). With
@@ -318,10 +380,10 @@ struct OthersWalk<'a> {
 /// opaque directory entry (`inner/`) rather than descending into its contents.
 fn collect_others<W: WorkDirFs>(
 	work: &W,
-	dir_rel: &str,
+	dir_rel: &GitPath,
 	walk: &OthersWalk<'_>,
 	stack: &mut Vec<DirIgnore>,
-	out: &mut Vec<String>,
+	out: &mut Vec<OtherEntry>,
 ) -> Result<(), WorktreeError> {
 	// A directory we cannot read is skipped rather than fatal — git warns and continues (`ls-files -o`
 	// stays exit 0 with a permission-denied directory present).
@@ -341,9 +403,9 @@ fn collect_others<W: WorkDirFs>(
 		// The membership key mirrors `core.ignoreCase`: ASCII-case-folded when set, so a disk `foo` matches
 		// the tracked/gitlink `Foo`.
 		let rel_key = if walk.ignore_case {
-			rel.to_ascii_lowercase()
+			rel.ascii_folded()
 		} else {
-			rel.clone()
+			rel.as_bytes().to_vec()
 		};
 		// The kind is an `lstat`: a symlinked directory is a symlink (a file), not a directory.
 		let is_dir = entry.kind.is_dir();
@@ -359,7 +421,10 @@ fn collect_others<W: WorkDirFs>(
 			// An untracked *valid* embedded repository is opaque: git lists the single `dir/` entry and
 			// never recurses. An empty or malformed `.git` is not a repository — git (and we) descend.
 			if is_embedded_repo(work, &rel) {
-				out.push(format!("{rel}/"));
+				out.push(OtherEntry {
+					path: rel,
+					directory: true,
+				});
 			} else {
 				collect_others(work, &rel, walk, stack, out)?;
 			}
@@ -367,7 +432,10 @@ fn collect_others<W: WorkDirFs>(
 		{
 			// git's `-o` lists regular files and symlinks; a socket / FIFO / device is never tracked and
 			// never listed.
-			out.push(rel);
+			out.push(OtherEntry {
+				path: rel,
+				directory: false,
+			});
 		}
 	}
 
@@ -382,8 +450,8 @@ fn collect_others<W: WorkDirFs>(
 /// a directory opaquely under `-o`. An empty or malformed `.git`, or a `.git` gitfile (whose target
 /// may lie outside the worktree capability), is not recognised here — git validates the marker, so an
 /// unrecognised one is descended into like any ordinary directory.
-pub(crate) fn is_embedded_repo<W: WorkDirFs>(work: &W, dir: &str) -> bool {
-	let git = format!("{dir}/.git");
+pub(crate) fn is_embedded_repo<W: WorkDirFs>(work: &W, dir: &GitPath) -> bool {
+	let git = dir.join(&GitPathComponent::from_utf8(".git").expect("valid marker"));
 	// `.git` must be a directory; any `lstat` failure (e.g. an unreadable directory) leaves it
 	// unrecognised — descended into, where an unreadable directory is then skipped by [`collect_others`].
 	if !matches!(work.lstat(&git), Ok(Some(meta)) if meta.kind.is_dir()) {
@@ -391,13 +459,15 @@ pub(crate) fn is_embedded_repo<W: WorkDirFs>(work: &W, dir: &str) -> bool {
 	}
 	// `objects` and `refs` must be directories.
 	for marker in ["objects", "refs"] {
-		if !matches!(work.lstat(&format!("{git}/{marker}")), Ok(Some(meta)) if meta.kind.is_dir()) {
+		let marker = git.join(&GitPathComponent::from_utf8(marker).expect("valid marker"));
+		if !matches!(work.lstat(&marker), Ok(Some(meta)) if meta.kind.is_dir()) {
 			return false;
 		}
 	}
 	// `HEAD` must be a file whose content is a valid ref (git's `validate_headref`): a `ref:` symref, or a
 	// bare object id. `HEAD` containing garbage is not a repository — git descends.
-	match work.read(&format!("{git}/HEAD")) {
+	let head = git.join(&GitPathComponent::from_utf8("HEAD").expect("valid marker"));
+	match work.read(&head) {
 		Ok(bytes) => is_valid_head(&bytes),
 		Err(_) => false,
 	}
@@ -439,22 +509,25 @@ fn is_valid_head(bytes: &[u8]) -> bool {
 /// only for such pathspecs (see [`run`]); a directory pathspec, a glob, or other magic keeps the
 /// per-selector duplicates. The spec is normalised (prefix applied, `.`/`..` resolved) before the
 /// comparison, since a pathspec is cwd-relative while index paths are repository-relative.
-fn is_exact_file_pathspec(spec: &str, prefix: &str, index_paths: &HashSet<&str>) -> bool {
+fn is_exact_file_pathspec(spec: &[u8], prefix: &GitPath, index_paths: &HashSet<&GitPath>) -> bool {
 	// The literal path and the base it resolves against, for the magic forms that can still name an exact
 	// file: plain and `:(literal)` are prefix-relative; top magic (`:/` / `:(top)`) is repository-root
 	// relative. Any other magic (`:!`, `:^`, `:(glob)`, `:(icase)`, …) is not a plain exact-file spec.
-	let (literal, base) = if let Some(rest) = spec.strip_prefix(":(literal)") {
-		(rest, prefix)
-	} else if let Some(rest) = spec.strip_prefix(":(top)") {
-		(rest, "")
-	} else if let Some(rest) = spec.strip_prefix(":/") {
-		(rest, "")
-	} else if spec.starts_with(':') {
+	let (literal, base): (&[u8], &[u8]) = if let Some(rest) = spec.strip_prefix(b":(literal)") {
+		(rest, prefix.as_bytes())
+	} else if let Some(rest) = spec.strip_prefix(b":(top)") {
+		(rest, b"")
+	} else if let Some(rest) = spec.strip_prefix(b":/") {
+		(rest, b"")
+	} else if spec.starts_with(b":") {
 		return false;
 	} else {
-		(spec, prefix)
+		(spec, prefix.as_bytes())
 	};
-	if literal.contains(['*', '?', '[']) {
+	if literal
+		.iter()
+		.any(|byte| matches!(byte, b'*' | b'?' | b'['))
+	{
 		return false; // a glob is not an exact file
 	}
 	let Ok((path, dir_only)) = crate::pathspec::normalize(literal, base) else {
@@ -463,34 +536,36 @@ fn is_exact_file_pathspec(spec: &str, prefix: &str, index_paths: &HashSet<&str>)
 	if dir_only {
 		return false; // a trailing-slash / `.` spec is a directory, never an exact file
 	}
-	index_paths.contains(path.as_str())
-		&& !index_paths.iter().any(|entry| {
-			entry.len() > path.len()
-				&& entry.starts_with(path.as_str())
-				&& entry.as_bytes()[path.len()] == b'/'
-		})
+	let Ok(path) = GitPath::from_bytes(path) else {
+		return false;
+	};
+	index_paths.contains(&path) && !index_paths.iter().any(|entry| entry.is_below(&path))
 }
 
 /// Render `path` (worktree-relative, `/`-joined) relative to the `prefix` directory — git's
 /// cwd-relative output. A path under the prefix has it stripped; one outside gets `../` segments.
 /// An empty prefix returns `path` unchanged.
-fn relativize(path: &str, prefix: &str) -> String {
-	let prefix = prefix.trim_end_matches('/');
-	if prefix.is_empty() {
-		return path.to_owned();
+fn relativize(path: &GitPath, prefix: &GitPath) -> Vec<u8> {
+	if prefix.is_root() {
+		return path.as_bytes().to_vec();
 	}
-	let prefix_parts: Vec<&str> = prefix.split('/').collect();
-	let path_parts: Vec<&str> = path.split('/').collect();
+	let prefix_parts: Vec<&[u8]> = prefix.components().collect();
+	let path_parts: Vec<&[u8]> = path.components().collect();
 	let common = prefix_parts
 		.iter()
 		.zip(&path_parts)
 		.take_while(|(a, b)| a == b)
 		.count();
-	let mut out = String::new();
+	let mut out = Vec::new();
 	for _ in 0..prefix_parts.len() - common {
-		out.push_str("../");
+		out.extend_from_slice(b"../");
 	}
-	out.push_str(&path_parts[common..].join("/"));
+	for (index, part) in path_parts[common..].iter().enumerate() {
+		if index > 0 {
+			out.push(b'/');
+		}
+		out.extend_from_slice(part);
+	}
 	out
 }
 
@@ -498,44 +573,46 @@ fn relativize(path: &str, prefix: &str) -> String {
 /// escaping; otherwise wraps it in double quotes, escaping backslash, double-quote, the named
 /// control escapes (`\a \b \t \n \v \f \r`), other control bytes and DEL as octal `\NNN`, and — when
 /// `quote_path` (`core.quotePath`) is set — every byte of a non-ASCII character as octal too.
-fn quote_c_style(s: &str, quote_path: bool) -> String {
-	if !s.chars().any(|c| needs_quote(c, quote_path)) {
-		return s.to_owned();
+fn quote_c_style(s: &[u8], quote_path: bool) -> Vec<u8> {
+	if !s.iter().copied().any(|byte| needs_quote(byte, quote_path)) {
+		return s.to_vec();
 	}
-	let mut out = String::with_capacity(s.len() + 2);
-	out.push('"');
-	for c in s.chars() {
-		if c.is_ascii() {
-			let b = c as u8;
-			match named_escape(b) {
+	let mut out = Vec::with_capacity(s.len() + 2);
+	out.push(b'"');
+	for &byte in s {
+		if byte.is_ascii() {
+			match named_escape(byte) {
 				Some(escape) => {
-					out.push('\\');
-					out.push(escape);
+					out.push(b'\\');
+					out.push(escape as u8);
 				}
-				None if b < 0x20 || b == 0x7f => push_octal(&mut out, b),
-				None => out.push(c),
+				None if byte < 0x20 || byte == 0x7f => push_octal_bytes(&mut out, byte),
+				None => out.push(byte),
 			}
 		} else if quote_path {
-			let mut buf = [0u8; 4];
-			for &b in c.encode_utf8(&mut buf).as_bytes() {
-				push_octal(&mut out, b);
-			}
+			push_octal_bytes(&mut out, byte);
 		} else {
-			out.push(c);
+			out.push(byte);
 		}
 	}
-	out.push('"');
+	out.push(b'"');
 	out
 }
 
 /// Whether `c` would be escaped by [`quote_c_style`] (so the whole string must be quoted).
-fn needs_quote(c: char, quote_path: bool) -> bool {
-	if c.is_ascii() {
-		let b = c as u8;
-		named_escape(b).is_some() || b < 0x20 || b == 0x7f
+fn needs_quote(byte: u8, quote_path: bool) -> bool {
+	if byte.is_ascii() {
+		named_escape(byte).is_some() || byte < 0x20 || byte == 0x7f
 	} else {
 		quote_path
 	}
+}
+
+fn push_octal_bytes(out: &mut Vec<u8>, byte: u8) {
+	out.push(b'\\');
+	out.push(b'0' + ((byte >> 6) & 0x07));
+	out.push(b'0' + ((byte >> 3) & 0x07));
+	out.push(b'0' + (byte & 0x07));
 }
 
 /// git's single-letter C escape for a byte (`\a \b \t \n \v \f \r \" \\`), or `None`.
@@ -554,42 +631,43 @@ fn named_escape(b: u8) -> Option<char> {
 	}
 }
 
-/// Append `\NNN` (a three-digit octal escape) for `b`.
-fn push_octal(out: &mut String, b: u8) {
-	out.push('\\');
-	out.push(char::from(b'0' + (b >> 6)));
-	out.push(char::from(b'0' + ((b >> 3) & 0o7)));
-	out.push(char::from(b'0' + (b & 0o7)));
-}
-
 #[cfg(test)]
 mod tests {
+	use gitana_path::GitPath;
+
 	use super::{quote_c_style, relativize};
 
 	#[test]
 	fn relativize_strips_and_ascends() {
-		assert_eq!(relativize("src/lib.rs", "src"), "lib.rs");
-		assert_eq!(relativize("src/lib.rs", "src/"), "lib.rs");
-		assert_eq!(relativize("vendor/x.rs", "src"), "../vendor/x.rs");
-		assert_eq!(relativize("a/b/c.rs", "a/x"), "../b/c.rs");
-		assert_eq!(relativize("README.md", ""), "README.md");
+		let path = |value| GitPath::from_utf8(value).unwrap();
+		assert_eq!(relativize(&path("src/lib.rs"), &path("src")), b"lib.rs");
+		assert_eq!(relativize(&path("src/lib.rs"), &path("src")), b"lib.rs");
+		assert_eq!(
+			relativize(&path("vendor/x.rs"), &path("src")),
+			b"../vendor/x.rs"
+		);
+		assert_eq!(relativize(&path("a/b/c.rs"), &path("a/x")), b"../b/c.rs");
+		assert_eq!(
+			relativize(&path("README.md"), &GitPath::root()),
+			b"README.md"
+		);
 	}
 
 	/// C-style quoting matches git: no quoting when unnecessary, named escapes, octal for control and
 	/// (under `core.quotePath`) non-ASCII bytes, and raw non-ASCII when `quotePath` is off.
 	#[test]
 	fn quote_c_style_matches_git() {
-		assert_eq!(quote_c_style("plain.txt", true), "plain.txt");
-		assert_eq!(quote_c_style("back\\slash", true), "\"back\\\\slash\"");
-		assert_eq!(quote_c_style("quo\"te", true), "\"quo\\\"te\"");
-		assert_eq!(quote_c_style("tab\tfile", true), "\"tab\\tfile\"");
-		assert_eq!(quote_c_style("line\nfeed", true), "\"line\\nfeed\"");
+		assert_eq!(quote_c_style(b"plain.txt", true), b"plain.txt");
+		assert_eq!(quote_c_style(b"back\\slash", true), b"\"back\\\\slash\"");
+		assert_eq!(quote_c_style(b"quo\"te", true), b"\"quo\\\"te\"");
+		assert_eq!(quote_c_style(b"tab\tfile", true), b"\"tab\\tfile\"");
+		assert_eq!(quote_c_style(b"line\nfeed", true), b"\"line\\nfeed\"");
 		// A bell (0x07) uses the named `\a`; a vertical tab (0x0b) uses `\v`.
-		assert_eq!(quote_c_style("a\u{07}b", true), "\"a\\ab\"");
+		assert_eq!(quote_c_style(b"a\x07b", true), b"\"a\\ab\"");
 		// DEL (0x7f) and other unnamed control bytes are octal.
-		assert_eq!(quote_c_style("x\u{7f}y", true), "\"x\\177y\"");
+		assert_eq!(quote_c_style(b"x\x7fy", true), b"\"x\\177y\"");
 		// "café" — the é is UTF-8 c3 a9: octal-escaped per byte with quotePath, literal without.
-		assert_eq!(quote_c_style("café", true), "\"caf\\303\\251\"");
-		assert_eq!(quote_c_style("café", false), "café");
+		assert_eq!(quote_c_style("café".as_bytes(), true), b"\"caf\\303\\251\"");
+		assert_eq!(quote_c_style("café".as_bytes(), false), "café".as_bytes());
 	}
 }

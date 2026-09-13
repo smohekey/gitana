@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_path::{GitPath, GitPathComponent};
 
 use crate::WorkTree;
 
@@ -19,13 +20,11 @@ use crate::WorkTree;
 /// unresolved and is treated as unchanged rather than a false `M`.
 pub(crate) async fn submodule_head_oid<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
-	path: &str,
+	path: &GitPath,
 ) -> Option<ObjectId<H>> {
-	let gitfile = wt.work().read(&format!("{path}/.git")).ok()?;
-	let target = std::str::from_utf8(&gitfile)
-		.ok()?
-		.strip_prefix("gitdir: ")?
-		.trim_end_matches(['\n', '\r']);
+	let git_name = GitPathComponent::from_utf8(".git").ok()?;
+	let gitfile = wt.work().read(&path.join(&git_name)).ok()?;
+	let target = trim_ascii(gitfile.strip_prefix(b"gitdir:")?);
 	if target.is_empty() {
 		return None;
 	}
@@ -67,14 +66,16 @@ pub(crate) async fn submodule_head_oid<F: FileStore, W: WorkDirFs, H: HashAlgori
 fn resolve_located_module_gitdir(
 	worktree_root: &Path,
 	git_dir: &Path,
-	path: &str,
-	target: &str,
+	path: &GitPath,
+	target: &[u8],
 ) -> Option<String> {
-	let target = Path::new(target);
+	let target = native_path(target)?;
 	let resolved = if target.is_absolute() {
-		target.to_path_buf()
+		target
 	} else {
-		worktree_root.join(path).join(target)
+		worktree_root
+			.join(native_path(path.as_bytes())?)
+			.join(target)
 	};
 	let resolved = lexical_normalize(&resolved)?;
 	let modules = lexical_normalize(&git_dir.join("modules"))?;
@@ -99,18 +100,71 @@ fn resolve_located_module_gitdir(
 
 /// Descriptor-only callers do not have a native worktree-root path. Preserve their existing ordinary
 /// repository support by resolving a marker lexically to a path below the worktree's `.git/` store.
-fn resolve_legacy_module_gitdir(path: &str, target: &str) -> Option<String> {
-	let mut parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-	for component in target.split('/') {
+fn resolve_legacy_module_gitdir(path: &GitPath, target: &[u8]) -> Option<String> {
+	let mut parts: Vec<&[u8]> = path.components().collect();
+	for component in target.split(|byte| *byte == b'/') {
 		match component {
-			"" | "." => {}
-			".." => {
+			b"" | b"." => {}
+			b".." => {
 				parts.pop()?;
 			}
 			other => parts.push(other),
 		}
 	}
-	parts.join("/").strip_prefix(".git/").map(str::to_owned)
+	let mut resolved = Vec::new();
+	for (index, part) in parts.iter().enumerate() {
+		if index != 0 {
+			resolved.push(b'/');
+		}
+		resolved.extend_from_slice(part);
+	}
+	let relative = resolved.strip_prefix(b".git/")?;
+	Some(std::str::from_utf8(relative).ok()?.to_owned())
+}
+
+#[cfg(unix)]
+fn native_path(bytes: &[u8]) -> Option<PathBuf> {
+	use std::ffi::OsString;
+	use std::os::unix::ffi::OsStringExt as _;
+	Some(PathBuf::from(OsString::from_vec(bytes.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn native_path(bytes: &[u8]) -> Option<PathBuf> {
+	Some(PathBuf::from(std::str::from_utf8(bytes).ok()?))
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+	while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+		bytes = &bytes[1..];
+	}
+	while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+		bytes = &bytes[..bytes.len() - 1];
+	}
+	bytes
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn resolves_a_module_below_a_raw_mount_path() {
+		let mount = GitPath::from_bytes(b"raw-\xff".to_vec()).unwrap();
+		assert_eq!(
+			resolve_legacy_module_gitdir(&mount, b"../.git/modules/sub"),
+			Some("modules/sub".to_owned())
+		);
+	}
+
+	#[test]
+	fn rejects_a_non_utf8_repository_store_key() {
+		let mount = GitPath::from_utf8("sub").unwrap();
+		assert_eq!(
+			resolve_legacy_module_gitdir(&mount, b"../.git/modules/raw-\xff"),
+			None
+		);
+	}
 }
 
 fn lexical_normalize(path: &Path) -> Option<PathBuf> {
@@ -130,7 +184,7 @@ fn lexical_normalize(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+mod located_tests {
 	use super::*;
 
 	#[test]
@@ -139,8 +193,8 @@ mod tests {
 			resolve_located_module_gitdir(
 				Path::new("/repo"),
 				Path::new("/repo/.git"),
-				"modules/one",
-				"../../.git/modules/one",
+				&GitPath::from_utf8("modules/one").unwrap(),
+				b"../../.git/modules/one",
 			),
 			Some("modules/one".to_owned())
 		);
@@ -148,8 +202,8 @@ mod tests {
 			resolve_located_module_gitdir(
 				Path::new("/repo/linked"),
 				Path::new("/repo/main/.git/worktrees/linked"),
-				"modules/one",
-				"../../../main/.git/worktrees/linked/modules/one",
+				&GitPath::from_utf8("modules/one").unwrap(),
+				b"../../../main/.git/worktrees/linked/modules/one",
 			),
 			Some("modules/one".to_owned())
 		);
@@ -166,8 +220,8 @@ mod tests {
 				resolve_located_module_gitdir(
 					Path::new("/repo"),
 					Path::new("/repo/.git"),
-					"modules/one",
-					target,
+					&GitPath::from_utf8("modules/one").unwrap(),
+					target.as_bytes(),
 				),
 				None,
 				"{target} must not resolve as a module repository"

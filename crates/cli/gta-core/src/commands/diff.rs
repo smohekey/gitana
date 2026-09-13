@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use crate::Backend;
+use crate::{Backend, PathQuoteMode};
 use anyhow::Result;
 use gitana_diff::Edit;
 use gitana_object::HashAlgorithm;
@@ -14,20 +14,29 @@ const CONTEXT: usize = 3;
 
 /// Show changes between the index and the working tree, or (with `cached`) between
 /// `HEAD` and the index. Output is gta's own unified-diff form.
-pub async fn run(cwd: &Path, cached: bool) -> Result<()> {
-	dispatch::on_worktree(cwd, Diff { cached }).await
+pub async fn run(cwd: &Path, cached: bool, quote_path: PathQuoteMode) -> Result<()> {
+	dispatch::on_worktree(cwd, Diff { cached, quote_path }).await
 }
 
 struct Diff {
 	cached: bool,
+	quote_path: PathQuoteMode,
 }
 
 impl WorkTreeCommand for Diff {
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
-		_prefix: String,
+		_prefix: gitana_path::GitPath,
 	) -> Result<()> {
+		let config = worktree.repository().effective_config().await?;
+		let configured_quote_path = config
+			.get_bool_validated("core", None, "quotepath")?
+			.unwrap_or(true);
+		let quote_path = match self.quote_path {
+			PathQuoteMode::Config => configured_quote_path,
+			PathQuoteMode::Always => true,
+		};
 		let files = if self.cached {
 			worktree.diff_staged().await?
 		} else {
@@ -36,19 +45,25 @@ impl WorkTreeCommand for Diff {
 
 		let mut out = Vec::new();
 		for file in &files {
-			format_file(&mut out, file);
+			format_file(&mut out, file, quote_path);
 		}
 		std::io::stdout().write_all(&out)?;
 		Ok(())
 	}
 }
 
-pub(crate) fn format_file(out: &mut Vec<u8>, file: &FileDiff) {
+pub(crate) fn format_file(out: &mut Vec<u8>, file: &FileDiff, quote_non_ascii: bool) {
 	let path = &file.path;
 	let old = file.old.as_ref();
 	let new = file.new.as_ref();
+	let old_path = path.render_with_affixes(b"a/", b"", quote_non_ascii);
+	let new_path = path.render_with_affixes(b"b/", b"", quote_non_ascii);
 
-	push(out, &format!("diff --git a/{path} b/{path}\n"));
+	out.extend_from_slice(b"diff --git ");
+	out.extend_from_slice(&old_path);
+	out.push(b' ');
+	out.extend_from_slice(&new_path);
+	out.push(b'\n');
 	if let (Some((_, om)), Some((_, nm))) = (old, new)
 		&& om != nm
 	{
@@ -58,21 +73,29 @@ pub(crate) fn format_file(out: &mut Vec<u8>, file: &FileDiff) {
 	let old_bytes = old.map(|(c, _)| c.as_slice()).unwrap_or(&[]);
 	let new_bytes = new.map(|(c, _)| c.as_slice()).unwrap_or(&[]);
 	if is_binary(old_bytes) || is_binary(new_bytes) {
-		push(out, &format!("Binary files a/{path} and b/{path} differ\n"));
+		out.extend_from_slice(b"Binary files ");
+		out.extend_from_slice(&old_path);
+		out.extend_from_slice(b" and ");
+		out.extend_from_slice(&new_path);
+		out.extend_from_slice(b" differ\n");
 		return;
 	}
 
-	let from = if old.is_some() {
-		format!("a/{path}")
+	let from: &[u8] = if old.is_some() {
+		&old_path
 	} else {
-		"/dev/null".to_owned()
+		b"/dev/null"
 	};
-	let to = if new.is_some() {
-		format!("b/{path}")
+	let to: &[u8] = if new.is_some() {
+		&new_path
 	} else {
-		"/dev/null".to_owned()
+		b"/dev/null"
 	};
-	push(out, &format!("--- {from}\n+++ {to}\n"));
+	out.extend_from_slice(b"--- ");
+	out.extend_from_slice(from);
+	out.extend_from_slice(b"\n+++ ");
+	out.extend_from_slice(to);
+	out.push(b'\n');
 
 	let old_lines: Vec<&[u8]> = lines(old_bytes);
 	let new_lines: Vec<&[u8]> = lines(new_bytes);
@@ -197,4 +220,26 @@ fn b_index(e: &Edit) -> Option<usize> {
 
 fn push(out: &mut Vec<u8>, text: &str) {
 	out.extend_from_slice(text.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn quotes_complete_prefixed_diff_paths() {
+		let file = FileDiff {
+			path: gitana_path::GitPath::from_utf8("line\nfile")
+				.unwrap()
+				.into(),
+			old: Some((b"old\n".to_vec(), 0o100644)),
+			new: Some((b"new\n".to_vec(), 0o100644)),
+		};
+		let mut output = Vec::new();
+		format_file(&mut output, &file, true);
+		let output = String::from_utf8(output).unwrap();
+		assert!(output.starts_with(
+			"diff --git \"a/line\\nfile\" \"b/line\\nfile\"\n--- \"a/line\\nfile\"\n+++ \"b/line\\nfile\"\n"
+		));
+	}
 }

@@ -633,10 +633,13 @@ impl SubmoduleContext {
 				.clone();
 			validate_name(&declaration.name).map_err(&preflight)?;
 			validate_path(&declaration.path).map_err(&preflight)?;
-			if index.conflict(&path).is_some() {
+			if index.conflict(&crate::git_path(&path)).is_some() {
 				return Err(preflight(SubmoduleError::Conflicted(path)));
 			}
-			let recorded = index.entry(&path).expect("selected stage-zero gitlink").oid;
+			let recorded = index
+				.entry(&crate::git_path(&path))
+				.expect("selected stage-zero gitlink")
+				.oid;
 			let pointers = self.module_pointers(&declaration).map_err(&preflight)?;
 			self
 				.preflight_module_namespaces(&declaration, &pointers, configuration)

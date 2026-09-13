@@ -268,7 +268,8 @@ mod tests {
 		let (_dir, wt) = fixture().await;
 		let blob = wt.repository().write_blob(b"x\n").await.unwrap();
 		let mut index = Index::<Sha256>::new();
-		index.record_conflict("f.txt", Some((0o100644, blob)), None, None); // a stage-1 entry
+		let path = gitana_path::GitPath::from_utf8("f.txt").unwrap();
+		index.record_conflict(&path, Some((0o100644, blob)), None, None); // a stage-1 entry
 		wt.save_index(&index).await.unwrap();
 
 		let err = commit(&wt, "x", &TestIdentity::default())

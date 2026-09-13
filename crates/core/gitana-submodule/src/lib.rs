@@ -1,6 +1,10 @@
 //! Capability-scoped, structured consumer operations for Git submodules.
 #![allow(async_fn_in_trait)]
 
+fn git_path(path: &str) -> gitana_path::GitPath {
+	gitana_path::GitPath::from_utf8(path).expect("validated UTF-8 submodule path")
+}
+
 mod config_identity;
 mod config_transition;
 mod config_views;

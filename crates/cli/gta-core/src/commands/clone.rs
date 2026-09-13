@@ -32,6 +32,7 @@ pub async fn run(
 	recurse_submodules: Vec<String>,
 	shallow_submodules: bool,
 	remote_submodules: bool,
+	result_path_mode: crate::ResultPathMode,
 ) -> Result<()> {
 	// Fail fast on a bad `--shallow-since` before any network round-trip.
 	let deepen = build_deepen(depth, shallow_since.as_deref(), shallow_exclude)?;
@@ -250,7 +251,7 @@ pub async fn run(
 		super::submodule::update_published_clone(
 			layout,
 			published_identity,
-			command,
+			super::submodule::UpdateFrontend::new(command, result_path_mode),
 			recurse_submodules,
 			credential_url_base,
 			shallow_submodules.then_some(1),
@@ -544,7 +545,7 @@ mod tests {
 		let error = crate::commands::submodule::update_published_clone(
 			layout,
 			identity,
-			&command,
+			crate::commands::submodule::UpdateFrontend::new(&command, crate::ResultPathMode::Human),
 			vec![".".to_owned()],
 			None,
 			None,

@@ -27,7 +27,7 @@ pub enum RebaseOutcome<H: HashAlgorithm> {
 	Conflict {
 		commit: ObjectId<H>,
 		subject: String,
-		paths: Vec<String>,
+		paths: Vec<gitana_path::GitPath>,
 	},
 }
 

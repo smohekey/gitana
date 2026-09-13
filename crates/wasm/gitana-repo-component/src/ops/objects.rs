@@ -12,12 +12,12 @@ use crate::bindings::exports::gitana::repo::porcelain::{
 	FileMode as WitFileMode, ObjectKind as WitObjectKind, TreeBuildEntry as WitTreeBuildEntry,
 };
 
-use super::repo_error;
+use super::{display_path, display_revision, git_path_from_wit, repo_error, tree_path_into_wit};
 
 /// Resolve `spec` and require the object it names to be of `kind`.
 async fn resolve_kind<H: HashAlgorithm>(
 	repo: &Repository<WorktreeFileStore, H>,
-	spec: &str,
+	spec: &[u8],
 	kind: ObjectKind,
 ) -> Result<ObjectId<H>, RepoError> {
 	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
@@ -28,7 +28,8 @@ async fn resolve_kind<H: HashAlgorithm>(
 		.map_err(|error| repo_error(RepositoryError::ObjectStore(error)))?;
 	if actual != kind {
 		return Err(RepoError::Invalid(format!(
-			"{spec} is a {}, not a {}",
+			"{} is a {}, not a {}",
+			display_revision(spec),
 			actual.as_str(),
 			kind.as_str()
 		)));
@@ -48,7 +49,7 @@ fn wit_kind(kind: ObjectKind) -> WitObjectKind {
 
 pub(crate) async fn read_object<H: HashAlgorithm>(
 	repo: &Repository<WorktreeFileStore, H>,
-	spec: &str,
+	spec: &[u8],
 ) -> Result<ObjectInfo, RepoError> {
 	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
 	let (kind, payload) = repo
@@ -65,7 +66,7 @@ pub(crate) async fn read_object<H: HashAlgorithm>(
 
 pub(crate) async fn read_blob<H: HashAlgorithm>(
 	repo: &Repository<WorktreeFileStore, H>,
-	spec: &str,
+	spec: &[u8],
 ) -> Result<Vec<u8>, RepoError> {
 	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
 	repo.read_blob(id).await.map_err(repo_error)
@@ -73,7 +74,7 @@ pub(crate) async fn read_blob<H: HashAlgorithm>(
 
 pub(crate) async fn read_tag<H: HashAlgorithm>(
 	repo: &Repository<WorktreeFileStore, H>,
-	spec: &str,
+	spec: &[u8],
 ) -> Result<TagInfo, RepoError> {
 	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
 	let (kind, payload) = repo
@@ -83,7 +84,8 @@ pub(crate) async fn read_tag<H: HashAlgorithm>(
 		.map_err(|error| repo_error(RepositoryError::ObjectStore(error)))?;
 	if kind != ObjectKind::Tag {
 		return Err(RepoError::Invalid(format!(
-			"{spec} is a {}, not a tag",
+			"{} is a {}, not a tag",
+			display_revision(spec),
 			kind.as_str()
 		)));
 	}
@@ -107,16 +109,16 @@ pub(crate) async fn read_tag<H: HashAlgorithm>(
 
 pub(crate) async fn ls_tree<H: HashAlgorithm>(
 	repo: &Repository<WorktreeFileStore, H>,
-	spec: &str,
+	spec: &[u8],
 ) -> Result<Vec<TreeEntry>, RepoError> {
 	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
 	let tree = repo.peel_to_tree(id).await.map_err(repo_error)?;
-	let entries = repo.read_tree(tree).await.map_err(repo_error)?;
+	let entries = repo.read_tree_raw(tree).await.map_err(repo_error)?;
 	Ok(
 		entries
 			.into_iter()
 			.map(|(path, mode, id)| TreeEntry {
-				path,
+				path: tree_path_into_wit(path),
 				mode,
 				id: id.to_hex(),
 			})
@@ -126,7 +128,7 @@ pub(crate) async fn ls_tree<H: HashAlgorithm>(
 
 pub(crate) async fn read_commit<H: HashAlgorithm>(
 	repo: &Repository<WorktreeFileStore, H>,
-	spec: &str,
+	spec: &[u8],
 ) -> Result<CommitInfo, RepoError> {
 	let id = repo.rev_parse(spec).await.map_err(repo_error)?;
 	let (kind, payload) = repo
@@ -136,7 +138,8 @@ pub(crate) async fn read_commit<H: HashAlgorithm>(
 		.map_err(|error| repo_error(RepositoryError::ObjectStore(error)))?;
 	if kind != ObjectKind::Commit {
 		return Err(RepoError::Invalid(format!(
-			"{spec} is a {}, not a commit",
+			"{} is a {}, not a commit",
+			display_revision(spec),
 			kind.as_str()
 		)));
 	}
@@ -164,62 +167,53 @@ pub(crate) async fn write_blob<H: HashAlgorithm>(
 	Ok(id.to_hex())
 }
 
-/// Lexically validate a `write-tree` entry path: `/`-separated, no empty, `.`,
-/// `..`, or NUL-carrying components (NUL is the tree codec's separator).
-fn validate_tree_path(path: &str) -> Result<(), RepoError> {
-	let valid = !path.is_empty()
-		&& path
-			.split('/')
-			.all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains('\0'));
-	if valid {
-		Ok(())
-	} else {
-		Err(RepoError::Invalid(format!("invalid tree path: {path:?}")))
-	}
-}
-
 pub(crate) async fn write_tree<H: HashAlgorithm>(
 	repo: &Repository<WorktreeFileStore, H>,
 	entries: Vec<WitTreeBuildEntry>,
 ) -> Result<String, RepoError> {
+	let mut decoded = Vec::with_capacity(entries.len());
+	for entry in entries {
+		decoded.push((git_path_from_wit(entry.path)?, entry.mode, entry.id));
+	}
 	// Validate the path *set* first: duplicates, or one path serving as both a
 	// file and a directory, would encode a tree `git fsck` rejects.
-	let mut paths: std::collections::HashSet<&str> = std::collections::HashSet::new();
-	let mut dirs: std::collections::HashSet<&str> = std::collections::HashSet::new();
-	for entry in &entries {
-		validate_tree_path(&entry.path)?;
-		if !paths.insert(&entry.path) {
+	let mut paths: std::collections::HashSet<gitana_path::GitPath> = std::collections::HashSet::new();
+	let mut dirs: std::collections::HashSet<gitana_path::GitPath> = std::collections::HashSet::new();
+	for (path, _, _) in &decoded {
+		if path.is_root() {
+			return Err(RepoError::Invalid(
+				"a tree entry path cannot be empty".to_owned(),
+			));
+		}
+		if !paths.insert(path.clone()) {
 			return Err(RepoError::Invalid(format!(
 				"duplicate tree path: {}",
-				entry.path
+				display_path(path)
 			)));
 		}
-		let mut rest = entry.path.as_str();
-		while let Some((dir, _)) = rest.rsplit_once('/') {
-			dirs.insert(dir);
-			rest = dir;
-		}
+		dirs.extend(path.strict_ancestors());
 	}
 	if let Some(conflict) = paths.iter().find(|path| dirs.contains(*path)) {
 		return Err(RepoError::Invalid(format!(
-			"tree path {conflict} is both a file and a directory"
+			"tree path {} is both a file and a directory",
+			display_path(conflict)
 		)));
 	}
 
-	let mut converted = Vec::with_capacity(entries.len());
-	for entry in entries {
-		let id = ObjectId::from_hex(&entry.id)
-			.map_err(|_| RepoError::Invalid(format!("not a full object id: {}", entry.id)))?;
+	let mut converted = Vec::with_capacity(decoded.len());
+	for (path, wit_mode, id_text) in decoded {
+		let id = ObjectId::from_hex(&id_text)
+			.map_err(|_| RepoError::Invalid(format!("not a full object id: {id_text}")))?;
 		// A null (all-zero) id is never a valid tree entry — `validate_tree_structure` and `git fsck`
 		// both reject it. Catch it here, since the gitlink path below skips the object lookup (a real
 		// submodule commit is non-null and need not be present, but the null sentinel still isn't).
 		if id.as_bytes().iter().all(|&byte| byte == 0) {
 			return Err(RepoError::Invalid(format!(
 				"tree entry {}: the null object id is not a valid entry",
-				entry.path
+				display_path(&path)
 			)));
 		}
-		let mode = match entry.mode {
+		let mode = match wit_mode {
 			WitFileMode::Regular => FileMode::Regular,
 			WitFileMode::Executable => FileMode::Executable,
 			WitFileMode::Symlink => FileMode::Symlink,
@@ -236,8 +230,8 @@ pub(crate) async fn write_tree<H: HashAlgorithm>(
 				Ok((kind, _)) => {
 					return Err(RepoError::Invalid(format!(
 						"tree entry {}: {} is a {}, not a commit",
-						entry.path,
-						entry.id,
+						display_path(&path),
+						id_text,
 						kind.as_str()
 					)));
 				}
@@ -252,7 +246,8 @@ pub(crate) async fn write_tree<H: HashAlgorithm>(
 				Err(ObjectStoreError::NotFound) => {
 					return Err(RepoError::Invalid(format!(
 						"tree entry {}: no such object {}",
-						entry.path, entry.id
+						display_path(&path),
+						id_text
 					)));
 				}
 				Err(error) => return Err(repo_error(RepositoryError::ObjectStore(error))),
@@ -260,17 +255,13 @@ pub(crate) async fn write_tree<H: HashAlgorithm>(
 			if kind != ObjectKind::Blob {
 				return Err(RepoError::Invalid(format!(
 					"tree entry {}: {} is a {}, not a blob",
-					entry.path,
-					entry.id,
+					display_path(&path),
+					id_text,
 					kind.as_str()
 				)));
 			}
 		}
-		converted.push(TreeBuildEntry {
-			path: entry.path,
-			mode,
-			id,
-		});
+		converted.push(TreeBuildEntry { path, mode, id });
 	}
 	let id = repo.write_tree(&converted).await.map_err(repo_error)?;
 	Ok(id.to_hex())
@@ -284,10 +275,10 @@ pub(crate) async fn create_commit<H: HashAlgorithm>(
 	committer: &str,
 	message: &str,
 ) -> Result<String, RepoError> {
-	let tree = resolve_kind(repo, tree, ObjectKind::Tree).await?;
+	let tree = resolve_kind(repo, tree.as_bytes(), ObjectKind::Tree).await?;
 	let mut parent_ids = Vec::with_capacity(parents.len());
 	for parent in parents {
-		parent_ids.push(resolve_kind(repo, parent, ObjectKind::Commit).await?);
+		parent_ids.push(resolve_kind(repo, parent.as_bytes(), ObjectKind::Commit).await?);
 	}
 	let id = repo
 		.create_commit(tree, parent_ids, author, committer, message)

@@ -4,6 +4,7 @@
 
 #[allow(dead_code)]
 mod cli;
+mod git_path;
 #[cfg(test)]
 #[allow(dead_code)]
 mod mcp_bridge;
