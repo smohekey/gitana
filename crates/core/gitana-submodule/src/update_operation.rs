@@ -286,6 +286,9 @@ impl Drop for ConditionalFileCleanup {
 	}
 }
 
+// `UpdateFailure` deliberately carries the completed update prefix alongside the structured source
+// error. Boxing either public field would break the API for an error-path-only size optimization.
+#[allow(clippy::result_large_err)]
 impl SubmoduleContext {
 	pub async fn update<
 		C: ConfigurationProvider,
@@ -2726,6 +2729,7 @@ async fn await_retained_merge_task(
 	})?
 }
 
+#[allow(clippy::result_large_err)] // See the `SubmoduleContext` implementation above.
 async fn update_effective_config<C: ConfigurationProvider>(
 	configuration: &C,
 	report: &UpdateReport,
