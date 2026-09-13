@@ -4342,9 +4342,14 @@ mod tests {
 		parent.create_dir("prepared").unwrap();
 		let empty = entry_identity(&parent, OsStr::new("prepared")).unwrap();
 		parent.rename(&target, &parent, "displaced").unwrap();
+		// Allocate the replacement while the original still owns its inode. Creating it only after
+		// removing `prepared` lets Linux immediately recycle that inode, defeating this fixture's
+		// identity-change precondition.
+		parent.create_dir("raced-empty").unwrap();
+		let raced = entry_identity(&parent, OsStr::new("raced-empty")).unwrap();
+		assert_ne!(raced, empty);
 		parent.remove_dir("prepared").unwrap();
-		parent.create_dir(&target).unwrap();
-		let raced = entry_identity(&parent, &target).unwrap();
+		parent.rename("raced-empty", &parent, &target).unwrap();
 		let mut intent = journal_intent(DeinitPhase::MountDisplaced);
 		let mut intent_identity = mount;
 
