@@ -3315,8 +3315,9 @@ mod tests {
 			.plan_superproject_deinit("one", None, temporary.path())
 			.await
 			.unwrap();
+		symlink("foreign-config", common.join("config.replacement")).unwrap();
 		std::fs::remove_file(common.join("config")).unwrap();
-		symlink("foreign-config", common.join("config")).unwrap();
+		std::fs::rename(common.join("config.replacement"), common.join("config")).unwrap();
 
 		let result = configuration
 			.reserve_superproject_deinit(&transition, mutation_lease())
