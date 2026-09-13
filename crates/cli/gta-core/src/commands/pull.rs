@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use cap_std::fs::Dir;
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_porcelain::Identity;
 use gitana_remote::{
@@ -11,6 +12,7 @@ use gitana_remote::{
 	RemoteUrl, SshConnection, SshPackFetcher,
 };
 use gitana_repository::HeadState;
+use gitana_submodule::WorktreeMutationGuard;
 use gitana_worktree::WorkTree;
 
 use crate::commands::merge;
@@ -18,12 +20,15 @@ use crate::dispatch;
 use crate::identity::CliIdentity;
 use crate::signer;
 use crate::{
-	CommandContext, RepositoryLayoutIdentity, WorkDir, git_config, repo, transport_for, url_rewrite,
+	CommandContext, RepositoryLayoutIdentity, RetainedCommandDirectory, WorkDir, git_config, repo,
+	transport_for, url_rewrite,
 };
 
 /// Pull `HEAD`'s branch from the origin.
 pub async fn run(cwd: &Path) -> Result<()> {
-	let found = repo::discover(cwd).await?;
+	let cwd = tokio::fs::canonicalize(cwd).await?;
+	let found = repo::discover(&cwd).await?;
+	let command_directory = RetainedCommandDirectory::capture(cwd.clone()).await?;
 	let identity = repo::capture_worktree_layout_identity(&found)?;
 	// The origin URL is `remote.origin.url` with `url.*.insteadOf` applied, read from the merged config.
 	let (setup, common, git, _) = repo::command_setup_lease(&found, identity).await?;
@@ -54,14 +59,30 @@ pub async fn run(cwd: &Path) -> Result<()> {
 			let http = transport_for(config, &origin, askpass_cwd)?;
 			let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
 			let mut fetcher = HttpPackFetcher::new(&http, &origin);
-			pull_dispatch(&mut fetcher, &found, identity, &body, &display, cwd).await
+			pull_dispatch(
+				&mut fetcher,
+				&found,
+				identity,
+				&body,
+				&display,
+				command_directory,
+			)
+			.await
 		}
 		RemoteUrl::Ssh(ssh) => {
 			let ssh_cmd = crate::ssh::resolve_ssh_command(&config)?;
 			let connection = SshConnection::open(&ssh, "git-upload-pack", &ssh_cmd, &askpass_cwd).await?;
 			let body = connection.advertisement().to_vec();
 			let mut fetcher = SshPackFetcher::new(connection);
-			pull_dispatch(&mut fetcher, &found, identity, &body, &display, cwd).await
+			pull_dispatch(
+				&mut fetcher,
+				&found,
+				identity,
+				&body,
+				&display,
+				command_directory,
+			)
+			.await
 		}
 		RemoteUrl::Local(path) => {
 			let source = {
@@ -98,7 +119,15 @@ pub async fn run(cwd: &Path) -> Result<()> {
 					.await?;
 					drop(source_setup);
 					let mut fetcher = LocalPackFetcher::new(source);
-					pull_dispatch(&mut fetcher, &found, identity, &body, &display, cwd).await
+					pull_dispatch(
+						&mut fetcher,
+						&found,
+						identity,
+						&body,
+						&display,
+						command_directory,
+					)
+					.await
 				}
 				HashKind::Sha256 => {
 					let second_common = common.try_clone()?;
@@ -121,7 +150,15 @@ pub async fn run(cwd: &Path) -> Result<()> {
 					.await?;
 					drop(source_setup);
 					let mut fetcher = LocalPackFetcher::new(source);
-					pull_dispatch(&mut fetcher, &found, identity, &body, &display, cwd).await
+					pull_dispatch(
+						&mut fetcher,
+						&found,
+						identity,
+						&body,
+						&display,
+						command_directory,
+					)
+					.await
 				}
 			}
 		}
@@ -135,15 +172,19 @@ async fn pull_dispatch(
 	identity: RepositoryLayoutIdentity,
 	body: &[u8],
 	url: &str,
-	cwd: &Path,
+	command_directory: RetainedCommandDirectory,
 ) -> Result<()> {
 	let (setup, common, _, _) = repo::command_setup_lease(found, identity).await?;
 	let local = dispatch::detect_algorithm_at(&common, &found.common_dir).await?;
 	drop(setup);
 	transport::ensure_same_format(local, transport::negotiated_kind(body)?)?;
 	match local {
-		HashKind::Sha1 => pull_into::<Sha1>(fetcher, found, identity, body, url, cwd).await,
-		HashKind::Sha256 => pull_into::<Sha256>(fetcher, found, identity, body, url, cwd).await,
+		HashKind::Sha1 => {
+			pull_into::<Sha1>(fetcher, found, identity, body, url, command_directory).await
+		}
+		HashKind::Sha256 => {
+			pull_into::<Sha256>(fetcher, found, identity, body, url, command_directory).await
+		}
 	}
 }
 
@@ -156,7 +197,7 @@ async fn pull_into<H: HashAlgorithm>(
 	identity: RepositoryLayoutIdentity,
 	body: &[u8],
 	url: &str,
-	cwd: &Path,
+	command_directory: RetainedCommandDirectory,
 ) -> Result<()> {
 	let work = found
 		.worktree_root
@@ -229,11 +270,13 @@ async fn pull_into<H: HashAlgorithm>(
 	// Fetch must not retain shared-config serialization across network I/O. Reacquire it only for
 	// integration, then bind it to the repository backend so a cancelled merge cannot release the
 	// lease while a detached config or checkout worker can still observe the Windows publication gap.
-	let worktree = open_merge_worktree::<H>(found, identity, &work).await?;
+	let (worktree, command_path, cwd_directory, mutation_guard) =
+		open_merge_worktree::<H>(found, identity, &work, command_directory).await?;
 	let identity = CliIdentity::new(worktree.repository());
 
 	// A pull's merge commit is signed when git config requests it, like a plain `gta merge`.
-	let signer = signer::config_signer(worktree.repository(), cwd).await?;
+	let signer =
+		signer::config_signer_in(worktree.repository(), &command_path, &cwd_directory).await?;
 	let outcome = gitana_porcelain::merge(
 		&worktree,
 		&upstream.to_hex(),
@@ -243,7 +286,9 @@ async fn pull_into<H: HashAlgorithm>(
 		&identity,
 		signer.as_ref(),
 	)
-	.await?;
+	.await;
+	mutation_guard.validate()?;
+	let outcome = outcome?;
 	merge::render(outcome)
 }
 
@@ -252,12 +297,35 @@ async fn open_merge_worktree<H: HashAlgorithm>(
 	found: &repo::RepositoryLayout,
 	identity: RepositoryLayoutIdentity,
 	work: &Path,
-) -> Result<WorkTree<crate::Backend, crate::WorkDir, H>> {
-	let (setup, common, git, work_dir) = repo::command_setup_lease(found, identity)
-		.await
-		.with_context(|| format!("pull worktree changed during fetch: {}", work.display()))?;
+	command_directory: RetainedCommandDirectory,
+) -> Result<(
+	WorkTree<crate::Backend, crate::WorkDir, H>,
+	std::path::PathBuf,
+	Dir,
+	WorktreeMutationGuard,
+)> {
+	let (guard, setup, common, git, work_dir) =
+		repo::command_worktree_mutation_lease(found, identity)
+			.await
+			.with_context(|| format!("pull worktree changed during fetch: {}", work.display()))?;
 	let work_dir =
 		work_dir.with_context(|| format!("pull worktree changed during fetch: {}", work.display()))?;
+	let repo::RevalidatedCommandDirectory {
+		path: command_path,
+		directory: cwd_directory,
+		common,
+		git,
+		worktree,
+	} = repo::revalidated_command_directory(
+		found,
+		command_directory,
+		&setup,
+		common,
+		git,
+		Some(work_dir),
+	)
+	.await?;
+	let work_dir = worktree.expect("pull supplied the worktree directory");
 	let repository = repo::open_generic_from_dirs_with_worker_lease::<H>(
 		common,
 		git,
@@ -266,11 +334,16 @@ async fn open_merge_worktree<H: HashAlgorithm>(
 		setup,
 	)
 	.await?;
-	Ok(WorkTree::new_located(
-		repository,
-		WorkDir::from_dir(work_dir),
-		found.git_dir.clone(),
-		work.to_owned(),
+	Ok((
+		WorkTree::new_located(
+			repository,
+			WorkDir::from_dir(work_dir),
+			found.git_dir.clone(),
+			work.to_owned(),
+		),
+		command_path,
+		cwd_directory,
+		guard,
 	))
 }
 
@@ -284,12 +357,14 @@ mod tests {
 	use gitana_submodule::acquire_submodule_config_mutation_lease;
 
 	use super::open_merge_worktree;
+	use crate::RetainedCommandDirectory;
 	use crate::repo;
 
 	#[tokio::test]
 	async fn merge_worktree_retains_setup_serialization_until_dropped() {
 		let temporary = tempfile::tempdir().unwrap();
-		let work = temporary.path().join("work");
+		let temporary_root = std::fs::canonicalize(temporary.path()).unwrap();
+		let work = temporary_root.join("work");
 		let git = work.join(".git");
 		std::fs::create_dir_all(git.join("objects")).unwrap();
 		std::fs::create_dir_all(git.join("refs")).unwrap();
@@ -301,9 +376,12 @@ mod tests {
 		.unwrap();
 		let layout = repo::inspect_root(&work).await.unwrap();
 		let identity = repo::capture_worktree_layout_identity(&layout).unwrap();
-		let worktree = open_merge_worktree::<Sha1>(&layout, identity, &work)
-			.await
-			.unwrap();
+		let cwd = std::fs::canonicalize(&work).unwrap();
+		let command_directory = RetainedCommandDirectory::capture(cwd).await.unwrap();
+		let (worktree, _command_path, _cwd_directory, mutation_guard) =
+			open_merge_worktree::<Sha1>(&layout, identity, &work, command_directory)
+				.await
+				.unwrap();
 
 		let (started_sender, started_receiver) = channel();
 		let (acquired_sender, acquired_receiver) = channel();
@@ -322,6 +400,7 @@ mod tests {
 		));
 
 		drop(worktree);
+		drop(mutation_guard);
 		acquired_receiver
 			.recv_timeout(Duration::from_secs(1))
 			.expect("merge worktree must release setup serialization when dropped");
@@ -331,9 +410,10 @@ mod tests {
 	#[tokio::test]
 	async fn merge_worktree_rejects_a_public_checkout_replaced_during_fetch() {
 		let temporary = tempfile::tempdir().unwrap();
-		let work = temporary.path().join("work");
-		let retained = temporary.path().join("retained");
-		let git = temporary.path().join("module.git");
+		let temporary_root = std::fs::canonicalize(temporary.path()).unwrap();
+		let work = temporary_root.join("work");
+		let retained = temporary_root.join("retained");
+		let git = temporary_root.join("module.git");
 		std::fs::create_dir_all(&work).unwrap();
 		std::fs::create_dir_all(git.join("objects")).unwrap();
 		std::fs::create_dir_all(git.join("refs")).unwrap();
@@ -351,7 +431,11 @@ mod tests {
 		std::fs::create_dir(&work).unwrap();
 		std::fs::write(work.join(".git"), "gitdir: ../module.git\n").unwrap();
 
-		let error = match open_merge_worktree::<Sha1>(&found, identity, &work).await {
+		let command_directory = RetainedCommandDirectory::capture(work.clone())
+			.await
+			.unwrap();
+		let error = match open_merge_worktree::<Sha1>(&found, identity, &work, command_directory).await
+		{
 			Ok(_) => panic!("a replaced public checkout must not be reopened for integration"),
 			Err(error) => error,
 		};

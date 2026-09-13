@@ -43,10 +43,19 @@ mod sync;
 #[cfg(not(target_arch = "wasm32"))]
 mod transfer;
 mod update;
+mod update_merge_conflict;
+mod update_merge_outcome;
+#[cfg(not(target_arch = "wasm32"))]
+mod update_merge_result;
 #[cfg(not(target_arch = "wasm32"))]
 mod update_operation;
+mod update_strategy;
+#[cfg(not(target_arch = "wasm32"))]
+mod update_strategy_executor;
 #[cfg(not(target_arch = "wasm32"))]
 mod update_target;
+#[cfg(not(target_arch = "wasm32"))]
+mod worktree_mutation_guard;
 
 pub(crate) use self::config_identity::ConfigIdentity;
 pub use self::declaration::SubmoduleDeclaration;
@@ -108,9 +117,13 @@ pub use transfer::{
 	PreparedTransfer, RepositoryTransfer,
 };
 pub use update::{UpdateFailure, UpdateOutcome, UpdateOutcomeState, UpdateReport, UpdateRequest};
+pub use update_merge_conflict::UpdateMergeConflict;
+pub use update_merge_outcome::UpdateMergeOutcome;
+#[cfg(not(target_arch = "wasm32"))]
+pub use update_merge_result::UpdateMergeResult;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use update_operation::{
-	UpdateLockGuard, acquire_update_lock_with_common, module_update_remote,
+	UpdateLockGuard, acquire_update_lock, acquire_update_lock_with_common, module_update_remote,
 	try_acquire_submodule_config_mutation_lease,
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -118,5 +131,10 @@ pub use update_operation::{
 	acquire_submodule_config_mutation_lease, acquire_submodule_config_setup_lease,
 	repository_has_pending_update, try_acquire_submodule_config_setup_lease,
 };
+pub use update_strategy::UpdateStrategy;
+#[cfg(not(target_arch = "wasm32"))]
+pub use update_strategy_executor::UpdateStrategyExecutor;
 #[cfg(not(target_arch = "wasm32"))]
 pub use update_target::SubmoduleUpdateTarget;
+#[cfg(not(target_arch = "wasm32"))]
+pub use worktree_mutation_guard::{WorktreeMutationGuard, acquire_worktree_mutation_guard};

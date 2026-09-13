@@ -1,6 +1,8 @@
 use std::fmt;
 
-use crate::{InitReport, SubmoduleError, SubmoduleObjectId, SubmoduleQuery};
+use crate::{
+	InitReport, SubmoduleError, SubmoduleObjectId, SubmoduleQuery, UpdateMergeOutcome, UpdateStrategy,
+};
 
 /// A one-level update request.
 #[derive(Clone, Debug)]
@@ -15,6 +17,8 @@ pub struct UpdateRequest {
 	pub remote: bool,
 	/// Permit network fetches. When false, target selection uses only existing local objects and refs.
 	pub fetch: bool,
+	/// Explicit strategy override. `None` uses effective configuration and then `.gitmodules`.
+	pub strategy: Option<UpdateStrategy>,
 	/// Force initialization to modules that are already active in the serialized effective
 	/// configuration. Recursive clone enables this for an explicit root selector so command/global
 	/// exclusions are not overwritten by ordinary per-module activation. A no-path initialization
@@ -33,6 +37,7 @@ impl Default for UpdateRequest {
 			recommend_shallow: true,
 			remote: false,
 			fetch: true,
+			strategy: None,
 			initialize_only_active: false,
 			reflog_committer: None,
 		}
@@ -48,6 +53,7 @@ pub enum UpdateOutcomeState {
 	AlreadyCurrent,
 	Cloned,
 	CheckedOut,
+	Merged,
 }
 
 /// A structured per-module update result.
@@ -56,9 +62,11 @@ pub struct UpdateOutcome {
 	pub name: String,
 	pub path: String,
 	pub recorded: SubmoduleObjectId,
-	/// The commit selected for checkout. Skipped modules have no selected target.
+	/// The commit selected as the update input. Skipped modules have no selected target.
 	pub target: Option<SubmoduleObjectId>,
 	pub state: UpdateOutcomeState,
+	/// Present when the merge strategy ran for an existing mounted module.
+	pub merge: Option<UpdateMergeOutcome>,
 }
 
 /// Completed outcomes in selection order.

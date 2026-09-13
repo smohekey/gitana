@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::Backend;
 use anyhow::{Result, bail};
+use cap_std::fs::Dir;
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_porcelain::MergeOutcome;
 use gitana_worktree::WorkTree;
@@ -30,7 +31,7 @@ pub async fn run(
 	if abort && continue_ {
 		bail!("--abort and --continue are incompatible");
 	}
-	dispatch::on_worktree(
+	dispatch::on_worktree_history_mutation(
 		cwd,
 		Merge {
 			commit,
@@ -40,6 +41,7 @@ pub async fn run(
 			abort,
 			continue_,
 			cwd: cwd.to_path_buf(),
+			cwd_directory: None,
 		},
 	)
 	.await
@@ -54,9 +56,15 @@ struct Merge {
 	continue_: bool,
 	/// The effective working directory, for resolving a relative `user.signingkey` (`-C`).
 	cwd: std::path::PathBuf,
+	cwd_directory: Option<Dir>,
 }
 
 impl WorkTreeCommand for Merge {
+	fn set_command_directory(&mut self, path: std::path::PathBuf, directory: Dir) {
+		self.cwd = path;
+		self.cwd_directory = Some(directory);
+	}
+
 	async fn run<H: HashAlgorithm>(
 		self,
 		wt: WorkTree<Backend, crate::WorkDir, H>,
@@ -67,7 +75,15 @@ impl WorkTreeCommand for Merge {
 		}
 		let identity = CliIdentity::new(wt.repository());
 		// The merge commit is signed when git config requests it (`commit.gpgsign` + `gpg.format=ssh`).
-		let signer = signer::config_signer(wt.repository(), &self.cwd).await?;
+		let signer = signer::config_signer_in(
+			wt.repository(),
+			&self.cwd,
+			self
+				.cwd_directory
+				.as_ref()
+				.expect("dispatch retained the command directory"),
+		)
+		.await?;
 		if self.continue_ {
 			let commit = gitana_porcelain::continue_merge(&wt, None, &identity, signer.as_ref()).await?;
 			println!("{commit}");

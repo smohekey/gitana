@@ -55,6 +55,32 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 	theirs_tree: ObjectId<H>,
 	conflicts: &[String],
 ) -> Result<()> {
+	write_conflicted_state_with_excludes(
+		wt,
+		merged_tree,
+		base_tree,
+		ours_tree,
+		theirs_tree,
+		conflicts,
+		None,
+	)
+	.await
+}
+
+/// [`write_conflicted_state`] with caller-resolved global excludes for checkout obstruction checks.
+pub(crate) async fn write_conflicted_state_with_excludes<
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+>(
+	wt: &WorkTree<F, W, H>,
+	merged_tree: ObjectId<H>,
+	base_tree: ObjectId<H>,
+	ours_tree: ObjectId<H>,
+	theirs_tree: ObjectId<H>,
+	conflicts: &[String],
+	excludes_file: Option<&str>,
+) -> Result<()> {
 	let repository = wt.repository();
 	let base = tree_entry_map(repository, base_tree).await?;
 	let ours = tree_entry_map(repository, ours_tree).await?;
@@ -86,7 +112,8 @@ pub async fn write_conflicted_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 	// index equals HEAD here (each caller guarantees a clean index before recording conflict stages below),
 	// so this lays down the merged/marker content while preserving unrelated local work, sharing `switch`'s
 	// lock-safe, D/F- and sparse-correct engine.
-	wt.checkout_merge(ours_tree, merged_tree, None).await?;
+	wt.checkout_merge(ours_tree, merged_tree, excludes_file)
+		.await?;
 	// A conflict on an out-of-cone path would have been sparse-omitted by the checkout above, leaving the
 	// `UU` marker file unwritten and the conflict unresolvable. Conflicts are incompatible with
 	// skip-worktree, so vivify every conflicted path's merged (marker) content regardless of the sparse

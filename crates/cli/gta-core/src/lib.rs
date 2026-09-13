@@ -16,11 +16,13 @@ mod identity;
 mod prompt;
 mod repo;
 mod repository_layout_identity;
+mod retained_command_directory;
 mod shallow;
 mod signer;
 mod ssh;
 mod submodule_configuration;
 mod submodule_transfer;
+mod submodule_update_strategy;
 mod url_rewrite;
 
 pub(crate) use clone_destination::CloneDestination;
@@ -32,6 +34,7 @@ use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
 pub use gitana_worktree::LsFilesOptions;
 pub use prompt::with_terminal_prompts_disabled;
 pub(crate) use repository_layout_identity::RepositoryLayoutIdentity;
+pub(crate) use retained_command_directory::RetainedCommandDirectory;
 
 /// The local file-store backend every command operates over: a [`WorktreeFileStore`], which routes
 /// git's per-worktree files and shared files to the right directory so commands work the same in

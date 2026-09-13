@@ -22,18 +22,19 @@ pub async fn run(
 	target: Option<String>,
 	paths: Vec<String>,
 ) -> Result<()> {
-	dispatch::on_worktree(
-		cwd,
-		Reset {
-			cwd: cwd.to_owned(),
-			soft,
-			mixed,
-			hard,
-			target,
-			paths,
-		},
-	)
-	.await
+	let command = Reset {
+		cwd: cwd.to_owned(),
+		soft,
+		mixed,
+		hard,
+		target,
+		paths,
+	};
+	if command.paths.is_empty() {
+		dispatch::on_worktree_history_mutation(cwd, command).await
+	} else {
+		dispatch::on_worktree(cwd, command).await
+	}
 }
 
 struct Reset {

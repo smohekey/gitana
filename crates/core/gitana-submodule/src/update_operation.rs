@@ -28,8 +28,9 @@ use crate::context::{
 use crate::{
 	ConfigurationProvider, FetchRepository, FetchSource, InitRequest, PrepareRepository,
 	PrepareSource, RepositoryTransfer, SharedConfigGuard, SubmoduleContext, SubmoduleDeclaration,
-	SubmoduleError, SubmoduleObjectId, SubmoduleUpdateTarget, UpdateFailure, UpdateOutcome,
-	UpdateOutcomeState, UpdateReport, UpdateRequest, declarations_by_path,
+	SubmoduleError, SubmoduleObjectId, SubmoduleUpdateTarget, UpdateFailure, UpdateMergeConflict,
+	UpdateMergeOutcome, UpdateMergeResult, UpdateOutcome, UpdateOutcomeState, UpdateReport,
+	UpdateRequest, UpdateStrategy, UpdateStrategyExecutor, declarations_by_path,
 };
 
 const CONTROL_DIR: &str = "gitana-submodule-update";
@@ -51,6 +52,7 @@ enum SharedConfigAccess {
 	Mutation,
 }
 
+#[derive(Clone)]
 struct Planned<H: HashAlgorithm> {
 	declaration: SubmoduleDeclaration,
 	/// Commit recorded by the superproject gitlink, retained for status/reporting.
@@ -64,6 +66,7 @@ struct Planned<H: HashAlgorithm> {
 	superproject_branch: Option<String>,
 	source_url: Option<String>,
 	state: Option<UpdateOutcomeState>,
+	strategy: Option<UpdateStrategy>,
 	recovering: bool,
 	intent_identity: Option<EntryIdentity>,
 	module_config_lease: Option<crate::SubmoduleMutationLease>,
@@ -73,6 +76,11 @@ struct Planned<H: HashAlgorithm> {
 	/// Effective depth for initial repository creation, including `.gitmodules` recommendations.
 	clone_depth: Option<u32>,
 	pointers: ModulePointers,
+}
+
+struct UpdateExecution<'a, T, S> {
+	transfer: &'a T,
+	strategies: &'a S,
 }
 
 struct ExactRecoveryHint<H: HashAlgorithm> {
@@ -114,6 +122,7 @@ impl DirectoryNamespace<'_> {
 	}
 }
 
+#[derive(Clone)]
 pub(crate) struct ModulePointers {
 	pub(crate) core_worktree: String,
 	pub(crate) marker: String,
@@ -278,21 +287,26 @@ impl Drop for ConditionalFileCleanup {
 }
 
 impl SubmoduleContext {
-	pub async fn update<C: ConfigurationProvider, T: RepositoryTransfer>(
+	pub async fn update<
+		C: ConfigurationProvider,
+		T: RepositoryTransfer,
+		S: UpdateStrategyExecutor,
+	>(
 		&self,
 		request: &UpdateRequest,
 		configuration: &C,
 		transfer: &T,
+		strategies: &S,
 	) -> Result<UpdateReport, UpdateFailure> {
 		match self.hash_kind {
 			HashKind::Sha1 => {
 				self
-					.update_typed::<Sha1, C, T>(request, configuration, transfer, None)
+					.update_typed::<Sha1, C, T, S>(request, configuration, transfer, strategies, None)
 					.await
 			}
 			HashKind::Sha256 => {
 				self
-					.update_typed::<Sha256, C, T>(request, configuration, transfer, None)
+					.update_typed::<Sha256, C, T, S>(request, configuration, transfer, strategies, None)
 					.await
 			}
 		}
@@ -304,10 +318,15 @@ impl SubmoduleContext {
 	/// path query. An empty control directory is retired directly under the update lock so recovery
 	/// never broadens the caller's selection merely to reach the ordinary update state machine.
 	#[allow(clippy::too_many_arguments)]
-	pub async fn resume_pending_update<C: ConfigurationProvider, T: RepositoryTransfer>(
+	pub async fn resume_pending_update<
+		C: ConfigurationProvider,
+		T: RepositoryTransfer,
+		S: UpdateStrategyExecutor,
+	>(
 		&self,
 		configuration: &C,
 		transfer: &T,
+		strategies: &S,
 		reflog_committer: Option<String>,
 		depth: Option<u32>,
 		recommend_shallow: bool,
@@ -336,18 +355,25 @@ impl SubmoduleContext {
 			recommend_shallow,
 			remote,
 			fetch,
+			strategy: None,
 			initialize_only_active: false,
 			reflog_committer,
 		};
 		let report = match self.hash_kind {
 			HashKind::Sha1 => {
 				self
-					.update_typed::<Sha1, C, T>(&request, configuration, transfer, Some(lock))
+					.update_typed::<Sha1, C, T, S>(&request, configuration, transfer, strategies, Some(lock))
 					.await
 			}
 			HashKind::Sha256 => {
 				self
-					.update_typed::<Sha256, C, T>(&request, configuration, transfer, Some(lock))
+					.update_typed::<Sha256, C, T, S>(
+						&request,
+						configuration,
+						transfer,
+						strategies,
+						Some(lock),
+					)
 					.await
 			}
 		}?;
@@ -470,11 +496,17 @@ impl SubmoduleContext {
 		}))
 	}
 
-	async fn update_typed<H: HashAlgorithm, C: ConfigurationProvider, T: RepositoryTransfer>(
+	async fn update_typed<
+		H: HashAlgorithm,
+		C: ConfigurationProvider,
+		T: RepositoryTransfer,
+		S: UpdateStrategyExecutor,
+	>(
 		&self,
 		request: &UpdateRequest,
 		configuration: &C,
 		transfer: &T,
+		strategies: &S,
 		retained_lock: Option<UpdateLockGuard>,
 	) -> Result<UpdateReport, UpdateFailure> {
 		if request.depth == Some(0) {
@@ -509,7 +541,9 @@ impl SubmoduleContext {
 					path.clone(),
 				)));
 			}
-			if let Some(strategy) = declaration.update.as_deref() {
+			if request.strategy.is_none()
+				&& let Some(strategy) = declaration.update.as_deref()
+			{
 				validate_update_strategy(&declaration.name, strategy).map_err(UpdateFailure::preflight)?;
 			}
 			let module_pointers = self
@@ -565,6 +599,7 @@ impl SubmoduleContext {
 					},
 					configuration,
 					request.initialize_only_active,
+					request.strategy,
 					mutation_lease.clone(),
 				)
 				.await
@@ -615,15 +650,16 @@ impl SubmoduleContext {
 					.map_err(|source| UpdateFailure::after_init(&report, source))?
 			};
 			let strategy = if recovery.is_some() {
-				"checkout".to_owned()
+				Some(UpdateStrategy::Checkout)
+			} else if let Some(strategy) = request.strategy {
+				Some(strategy)
 			} else {
 				let strategy = configured_update_strategy(&effective, &declaration.name)
 					.map_err(|source| UpdateFailure::after_init(&report, source))?
 					.or_else(|| declaration.update.clone())
 					.unwrap_or_else(|| "checkout".to_owned());
-				validate_update_strategy(&declaration.name, &strategy)
-					.map_err(|source| UpdateFailure::after_init(&report, source))?;
-				strategy
+				parse_update_strategy(&declaration.name, &strategy)
+					.map_err(|source| UpdateFailure::after_init(&report, source))?
 			};
 			if recovery.is_none() && initialize_only_active && !active {
 				let clone_depth = recommended_clone_depth(request, &declaration);
@@ -636,6 +672,7 @@ impl SubmoduleContext {
 					superproject_branch: None,
 					source_url: None,
 					state: Some(UpdateOutcomeState::SkippedInactive),
+					strategy,
 					recovering: false,
 					intent_identity: None,
 					module_config_lease: None,
@@ -693,7 +730,7 @@ impl SubmoduleContext {
 				Some(UpdateOutcomeState::SkippedUnregistered)
 			} else if !active {
 				Some(UpdateOutcomeState::SkippedInactive)
-			} else if strategy == "none" {
+			} else if strategy.is_none() {
 				Some(UpdateOutcomeState::SkippedByStrategy)
 			} else {
 				None
@@ -736,6 +773,7 @@ impl SubmoduleContext {
 				superproject_branch,
 				source_url,
 				state,
+				strategy,
 				recovering: false,
 				intent_identity: None,
 				module_config_lease,
@@ -767,6 +805,10 @@ impl SubmoduleContext {
 			let recovering = plan.remove(recovery_index);
 			plan.insert(0, recovering);
 		}
+		let execution = UpdateExecution {
+			transfer,
+			strategies,
+		};
 		for entry in plan {
 			lock.validate().map_err(|source| UpdateFailure {
 				completed: report.clone(),
@@ -774,7 +816,7 @@ impl SubmoduleContext {
 				source,
 			})?;
 			if let Some(state) = entry.state {
-				report.outcomes.push(outcome(&entry, state, None));
+				report.outcomes.push(outcome(&entry, state, None, None));
 				continue;
 			}
 			let module = entry.declaration.name.clone();
@@ -784,13 +826,15 @@ impl SubmoduleContext {
 					request.reflog_committer.as_deref(),
 					&effective,
 					configuration,
-					transfer,
+					&execution,
 					&mutation_lease,
 				)
 				.await;
 			match update {
-				Ok((state, target)) => {
-					report.outcomes.push(outcome(&entry, state, Some(target)));
+				Ok((state, target, merge)) => {
+					report
+						.outcomes
+						.push(outcome(&entry, state, Some(target), merge));
 					lock.validate().map_err(|source| UpdateFailure {
 						completed: report.clone(),
 						module: Some(module),
@@ -813,15 +857,20 @@ impl SubmoduleContext {
 		Ok(report)
 	}
 
-	async fn update_one<H: HashAlgorithm, C: ConfigurationProvider, T: RepositoryTransfer>(
+	async fn update_one<
+		H: HashAlgorithm,
+		C: ConfigurationProvider,
+		T: RepositoryTransfer,
+		S: UpdateStrategyExecutor,
+	>(
 		&self,
 		entry: &Planned<H>,
 		committer: Option<&str>,
 		effective: &GitConfig,
 		configuration: &C,
-		transfer: &T,
+		execution: &UpdateExecution<'_, T, S>,
 		mutation_lease: &crate::SubmoduleMutationLease,
-	) -> Result<(UpdateOutcomeState, ObjectId<H>), SubmoduleError> {
+	) -> Result<(UpdateOutcomeState, ObjectId<H>, Option<UpdateMergeOutcome>), SubmoduleError> {
 		let mut intent_identity = entry.intent_identity;
 		let mut selected_target = entry.recovery_target;
 		let module_relative = Path::new("modules").join(&entry.declaration.name);
@@ -858,7 +907,13 @@ impl SubmoduleContext {
 				.as_ref()
 				.ok_or_else(|| SubmoduleError::Unregistered(entry.declaration.name.clone()))?;
 			let prepared = self
-				.prepare_module(entry, source, effective, transfer, mutation_lease.clone())
+				.prepare_module(
+					entry,
+					source,
+					effective,
+					execution.transfer,
+					mutation_lease.clone(),
+				)
 				.await?;
 			intent_identity = Some(prepared.0);
 			selected_target = Some(prepared.1);
@@ -980,23 +1035,23 @@ impl SubmoduleContext {
 					worktree_dir: self.worktree_root().join(&entry.declaration.path),
 					config: config.clone(),
 				};
-				let resolved = transfer
+				let resolved = execution
+					.transfer
 					.resolve_fetch_source_identity(&fetch_source)
 					.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
-				let fetched = transfer
-					.fetch_target(
-						FetchRepository {
-							source: fetch_source,
-							git_dir: transfer_directory,
-							display_git_dir: module_git_dir.clone(),
-							hash_kind: crate::object_id::kind::<H>(),
-							target: entry.target.clone(),
-							depth: entry.depth,
-						},
-						mutation_lease.clone(),
-					)
-					.await
-					.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
+				let fetched = Box::pin(execution.transfer.fetch_target(
+					FetchRepository {
+						source: fetch_source,
+						git_dir: transfer_directory,
+						display_git_dir: module_git_dir.clone(),
+						hash_kind: crate::object_id::kind::<H>(),
+						target: entry.target.clone(),
+						depth: entry.depth,
+					},
+					mutation_lease.clone(),
+				))
+				.await
+				.map_err(|error| SubmoduleError::Transfer(error.to_string()))?;
 				if fetched.resolved_source != resolved {
 					return Err(SubmoduleError::Transfer(
 						"submodule transfer source changed during fetch".to_owned(),
@@ -1029,21 +1084,27 @@ impl SubmoduleContext {
 				.durability_barrier_object_graphs(&roots, &[])
 				.await?;
 		}
-		let target_tree = repository.commit_tree(selected_target).await?;
-		let head_lock = repository.refs().lock_head().await?;
+		let merge_existing = entry.strategy == Some(UpdateStrategy::Merge)
+			&& existing
+			&& !completion_required
+			&& mount_before_transfer.mounted;
+		let head_lock = if merge_existing {
+			None
+		} else {
+			Some(repository.refs().lock_head().await?)
+		};
 		let current = repository.refs().resolve_head().await?;
 		if !completion_required && mount_before_transfer.mounted && current.is_none() {
-			drop(head_lock);
 			return Err(SubmoduleError::UnbornModuleHead(
 				entry.declaration.name.clone(),
 			));
 		}
-		let needs_checkout = completion_required || current != Some(selected_target);
+		let needs_checkout =
+			!merge_existing && (completion_required || current != Some(selected_target));
 		if existing
-			&& needs_checkout
+			&& (merge_existing || needs_checkout)
 			&& let Some(operation) = operation_in_progress(&repository).await?
 		{
-			drop(head_lock);
 			return Err(SubmoduleError::OperationInProgress {
 				name: entry.declaration.name.clone(),
 				operation,
@@ -1069,7 +1130,8 @@ impl SubmoduleContext {
 		} else {
 			None
 		};
-		if !completion_required && mount.mounted && current == Some(selected_target) {
+		if !merge_existing && !completion_required && mount.mounted && current == Some(selected_target)
+		{
 			let published_intent = self
 				.publish_module_mount(
 					entry,
@@ -1088,9 +1150,111 @@ impl SubmoduleContext {
 			self.ensure_module_identity(entry, &module_directory)?;
 			self.ensure_mount_identity(entry, &mount)?;
 			self.ensure_mount_marker(entry, &mount)?;
-			drop(head_lock);
-			return Ok((UpdateOutcomeState::AlreadyCurrent, selected_target));
+			return Ok((UpdateOutcomeState::AlreadyCurrent, selected_target, None));
 		}
+		if merge_existing {
+			let published_intent = self
+				.publish_module_mount(
+					entry,
+					&mount,
+					&module_directory,
+					selected_target,
+					false,
+					(configuration, &mutation_lease),
+					None,
+					existing_remote.as_deref(),
+				)
+				.await?;
+			debug_assert!(published_intent.is_none());
+			self.ensure_module_identity(entry, &module_directory)?;
+			self.ensure_mount_identity(entry, &mount)?;
+			self.ensure_mount_marker(entry, &mount)?;
+			let module_worktree_root = self.worktree_root().join(&entry.declaration.path);
+			let work_directory = mount
+				.directory
+				.try_clone()
+				.map_err(|source| SubmoduleError::Io {
+					path: module_worktree_root.clone(),
+					source,
+				})?;
+			let repository = module_repository_with_worker_keepalive::<H>(
+				&module_directory,
+				&module_git_dir,
+				&config,
+				mutation_lease.clone(),
+			)?;
+			let worktree = WorkTree::new_located(
+				repository,
+				CapWorkDir::from_dir(work_directory),
+				self.layout.git_dir.join(&module_relative),
+				module_worktree_root.clone(),
+			);
+			let worker_context = retained_merge_context(self)?;
+			let worker_entry = entry.clone();
+			let worker_mount =
+				retained_mount_plan(&mount, &self.worktree_root().join(&entry.declaration.path))?;
+			let worker_module_directory =
+				module_directory
+					.try_clone()
+					.map_err(|source| SubmoduleError::Io {
+						path: module_git_dir.clone(),
+						source,
+					})?;
+			let worktree_directory =
+				mount
+					.directory
+					.try_clone()
+					.map_err(|source| SubmoduleError::Io {
+						path: module_worktree_root.clone(),
+						source,
+					})?;
+			let worker_lease = mutation_lease.clone();
+			let strategy = execution.strategies.clone();
+			let name = entry.declaration.name.clone();
+			let merge_task = tokio::spawn(async move {
+				validate_merge_authority(
+					&worker_context,
+					&worker_entry,
+					&worker_mount,
+					&worker_module_directory,
+					&worker_lease,
+				)?;
+				let result = strategy
+					.merge(
+						name,
+						worktree,
+						module_worktree_root,
+						worktree_directory,
+						selected_target,
+					)
+					.await;
+				finish_merge_after_validation(result, || {
+					validate_merge_authority(
+						&worker_context,
+						&worker_entry,
+						&worker_mount,
+						&worker_module_directory,
+						&worker_lease,
+					)
+				})
+			});
+			let result = await_retained_merge_task(merge_task).await?;
+			return match result {
+				UpdateMergeResult::Completed(outcome) => {
+					Ok((UpdateOutcomeState::Merged, selected_target, Some(outcome)))
+				}
+				UpdateMergeResult::Conflict { paths } => Err(SubmoduleError::MergeConflict(Box::new(
+					UpdateMergeConflict {
+						name: entry.declaration.name.clone(),
+						path: entry.declaration.path.clone(),
+						target: SubmoduleObjectId::from_typed(selected_target),
+						paths,
+					},
+				))),
+			};
+		}
+		let target_tree = repository.commit_tree(selected_target).await?;
+		let head_lock = head_lock.expect("checkout strategy retains the HEAD lock");
 		let message = format!(
 			"checkout: moving from {} to {}",
 			current.map_or_else(|| "unborn".to_owned(), |oid| oid.to_hex()),
@@ -1184,6 +1348,7 @@ impl SubmoduleContext {
 				UpdateOutcomeState::CheckedOut
 			},
 			selected_target,
+			None,
 		))
 	}
 
@@ -2476,6 +2641,80 @@ impl SubmoduleContext {
 	}
 }
 
+fn module_repository_with_worker_keepalive<H: HashAlgorithm>(
+	module_directory: &Dir,
+	module_git_dir: &Path,
+	config: &GitConfig,
+	mutation_lease: crate::SubmoduleMutationLease,
+) -> Result<Repository<LocalFileStore, H>, SubmoduleError> {
+	let files = LocalFileStore::from_dir(module_directory.try_clone().map_err(|source| {
+		SubmoduleError::Io {
+			path: module_git_dir.to_owned(),
+			source,
+		}
+	})?)
+	.with_worker_keepalive(Arc::new(mutation_lease));
+	let mut repository = Repository::new(ObjectStore::new(files));
+	repository.set_effective_config(config.clone());
+	Ok(repository)
+}
+
+fn retained_merge_context(context: &SubmoduleContext) -> Result<SubmoduleContext, SubmoduleError> {
+	SubmoduleContext::new(
+		context.layout.clone(),
+		context.clone_dir(&context.common, &context.layout.common_dir)?,
+		context.clone_dir(&context.git, &context.layout.git_dir)?,
+		context.clone_dir(&context.work, context.worktree_root())?,
+		context.configs.clone(),
+		context.prefix.clone(),
+		context.hash_kind,
+	)
+}
+
+fn retained_mount_plan(mount: &MountPlan, path: &Path) -> Result<MountPlan, SubmoduleError> {
+	Ok(MountPlan {
+		directory: mount
+			.directory
+			.try_clone()
+			.map_err(|source| SubmoduleError::Io {
+				path: path.to_owned(),
+				source,
+			})?,
+		mounted: mount.mounted,
+		newly_attached: mount.newly_attached,
+		marker: mount.marker.clone(),
+	})
+}
+
+fn validate_merge_authority<H: HashAlgorithm>(
+	context: &SubmoduleContext,
+	entry: &Planned<H>,
+	mount: &MountPlan,
+	module_directory: &Dir,
+	lease: &crate::SubmoduleMutationLease,
+) -> Result<(), SubmoduleError> {
+	lease.validate()?;
+	context.ensure_mount_identity(entry, mount)?;
+	context.ensure_mount_marker(entry, mount)?;
+	context.ensure_module_identity(entry, module_directory)
+}
+
+fn finish_merge_after_validation(
+	result: Result<UpdateMergeResult, SubmoduleError>,
+	validate: impl FnOnce() -> Result<(), SubmoduleError>,
+) -> Result<UpdateMergeResult, SubmoduleError> {
+	validate()?;
+	result
+}
+
+async fn await_retained_merge_task(
+	task: tokio::task::JoinHandle<Result<UpdateMergeResult, SubmoduleError>>,
+) -> Result<UpdateMergeResult, SubmoduleError> {
+	task.await.map_err(|error| {
+		SubmoduleError::Merge(format!("retained submodule merge worker failed: {error}"))
+	})?
+}
+
 async fn update_effective_config<C: ConfigurationProvider>(
 	configuration: &C,
 	report: &UpdateReport,
@@ -3258,6 +3497,21 @@ fn configured_update_strategy(
 	}
 }
 
+fn parse_update_strategy(
+	name: &str,
+	strategy: &str,
+) -> Result<Option<UpdateStrategy>, SubmoduleError> {
+	match strategy {
+		"checkout" => Ok(Some(UpdateStrategy::Checkout)),
+		"merge" => Ok(Some(UpdateStrategy::Merge)),
+		"none" => Ok(None),
+		_ => Err(SubmoduleError::UnsupportedStrategy {
+			name: name.to_owned(),
+			strategy: strategy.to_owned(),
+		}),
+	}
+}
+
 async fn configured_update_target<F: FileStore, H: HashAlgorithm>(
 	request: &UpdateRequest,
 	config: &GitConfig,
@@ -3476,6 +3730,7 @@ fn outcome<H: HashAlgorithm>(
 	entry: &Planned<H>,
 	state: UpdateOutcomeState,
 	target: Option<ObjectId<H>>,
+	merge: Option<UpdateMergeOutcome>,
 ) -> UpdateOutcome {
 	UpdateOutcome {
 		name: entry.declaration.name.clone(),
@@ -3483,6 +3738,7 @@ fn outcome<H: HashAlgorithm>(
 		recorded: SubmoduleObjectId::from_typed(entry.recorded),
 		target: target.map(SubmoduleObjectId::from_typed),
 		state,
+		merge,
 	}
 }
 
@@ -3788,21 +4044,28 @@ mod tests {
 		CONTROL_DIR, DirectoryNamespace, INTENT_NAME, IntentSourceContext, MarkerSnapshot, Planned,
 		SHARED_CONFIG_LOCK, StageIntent, UPDATE_LOCK, acquire_submodule_config_mutation_lease,
 		acquire_submodule_config_setup_lease, acquire_update_lock_with_common,
-		ensure_directory_components, intent_gitlink, intent_matches_reprepare, intent_matches_source,
-		intent_source_context, intent_target, legacy_source_fingerprint, marker_identity,
-		module_origin_url, publish_new_mount_marker, publish_stage_intent, recommended_clone_depth,
-		remove_staged_repository, rename_directory_noreplace, source_fingerprint, stage_intent,
+		await_retained_merge_task, ensure_directory_components, finish_merge_after_validation,
+		intent_gitlink, intent_matches_reprepare, intent_matches_source, intent_source_context,
+		intent_target, legacy_source_fingerprint, marker_identity, module_origin_url,
+		module_repository_with_worker_keepalive, parse_update_strategy, publish_new_mount_marker,
+		publish_stage_intent, recommended_clone_depth, remove_staged_repository,
+		rename_directory_noreplace, source_fingerprint, stage_intent,
 		sync_repository_publication_parents, update_effective_config, validate_ref_fragment,
 	};
 	use crate::{
 		ConfigViews, ConfigurationProvider, InitConfigResult, InitConfigUpdate, MarkerTargetResolver,
-		SubmoduleContext, SubmoduleDeclaration, SubmoduleError, UpdateReport, UpdateRequest,
+		SubmoduleContext, SubmoduleDeclaration, SubmoduleError, UpdateMergeOutcome, UpdateMergeResult,
+		UpdateReport, UpdateRequest, UpdateStrategy,
 	};
 	use cap_std::{ambient_authority, fs::Dir};
 	use gitana_config::GitConfig;
 	use gitana_object::{HashKind, ObjectId, Sha256};
 	use gitana_repository_layout::RepositoryLayout;
 	use std::path::{Path, PathBuf};
+	use std::sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	};
 
 	fn intent(version: u32, source_fingerprint: String) -> StageIntent {
 		StageIntent {
@@ -4748,6 +5011,122 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
+	fn merge_completion_rejects_a_replaced_module_config_guard() {
+		let (_temporary, context, _entry) = mount_fixture("replaced-merge-config-guard");
+		let guard = context.acquire_config_update_lock().unwrap();
+		let lease = guard.lease();
+
+		context
+			.git
+			.rename("refs", &context.git, "detached-refs")
+			.unwrap();
+		context.git.create_dir("refs").unwrap();
+
+		for result in [
+			UpdateMergeResult::Completed(UpdateMergeOutcome::AlreadyUpToDate),
+			UpdateMergeResult::Conflict {
+				paths: vec!["conflicted".to_owned()],
+			},
+		] {
+			assert!(matches!(
+				finish_merge_after_validation(Ok(result), || lease.validate()),
+				Err(SubmoduleError::RecoveryRequired(message))
+					if message.contains("shared config guard changed")
+			));
+		}
+	}
+
+	#[test]
+	fn merge_completion_validates_authority_before_propagating_an_executor_error() {
+		assert!(matches!(
+			finish_merge_after_validation(
+				Err(SubmoduleError::Merge("executor failed".to_owned())),
+				|| Err(SubmoduleError::RecoveryRequired("authority changed".to_owned())),
+			),
+			Err(SubmoduleError::RecoveryRequired(message)) if message == "authority changed"
+		));
+		assert!(matches!(
+			finish_merge_after_validation(
+				Err(SubmoduleError::Merge("executor failed".to_owned())),
+				|| Ok(()),
+			),
+			Err(SubmoduleError::Merge(message)) if message == "executor failed"
+		));
+	}
+
+	#[tokio::test]
+	async fn cancelled_merge_waiter_does_not_cancel_the_retained_worker() {
+		let retained = Arc::new(());
+		let retained_weak = Arc::downgrade(&retained);
+		let started = Arc::new(AtomicBool::new(false));
+		let release = Arc::new(AtomicBool::new(false));
+		let completed = Arc::new(AtomicBool::new(false));
+		let task_started = started.clone();
+		let task_release = release.clone();
+		let task_completed = completed.clone();
+		let merge_task = tokio::spawn(async move {
+			let _retained = retained;
+			task_started.store(true, Ordering::Release);
+			while !task_release.load(Ordering::Acquire) {
+				tokio::task::yield_now().await;
+			}
+			task_completed.store(true, Ordering::Release);
+			Ok(UpdateMergeResult::Completed(
+				UpdateMergeOutcome::AlreadyUpToDate,
+			))
+		});
+		let waiter = tokio::spawn(await_retained_merge_task(merge_task));
+
+		while !started.load(Ordering::Acquire) {
+			tokio::task::yield_now().await;
+		}
+		waiter.abort();
+		let _ = waiter.await;
+		for _ in 0..10 {
+			tokio::task::yield_now().await;
+		}
+		assert!(retained_weak.upgrade().is_some());
+		assert!(!completed.load(Ordering::Acquire));
+
+		release.store(true, Ordering::Release);
+		for _ in 0..100 {
+			if completed.load(Ordering::Acquire) && retained_weak.upgrade().is_none() {
+				break;
+			}
+			tokio::task::yield_now().await;
+		}
+		assert!(completed.load(Ordering::Acquire));
+		assert!(retained_weak.upgrade().is_none());
+	}
+
+	#[cfg(any(unix, windows))]
+	#[test]
+	fn merge_repository_backend_retains_the_combined_mutation_lease() {
+		let (_temporary, context, _entry) = mount_fixture("merge-worker-keepalive");
+		let guard = context.acquire_config_update_lock().unwrap();
+		let lease = guard.lease();
+		let repository = module_repository_with_worker_keepalive::<Sha256>(
+			&context.git,
+			&context.layout.git_dir,
+			&GitConfig::new(),
+			lease.clone(),
+		)
+		.unwrap();
+		drop(lease);
+		drop(guard);
+
+		assert!(matches!(
+			context.acquire_config_update_lock(),
+			Err(SubmoduleError::UpdateLocked)
+		));
+
+		drop(repository);
+		let replacement = context.acquire_config_update_lock().unwrap();
+		replacement.validate().unwrap();
+	}
+
+	#[cfg(unix)]
+	#[test]
 	fn pending_recovery_query_is_read_under_the_retained_update_guard() {
 		let (_temporary, context, _entry) = mount_fixture("retained-recovery-lock");
 		let second = reopen_context(&context);
@@ -5135,6 +5514,7 @@ mod tests {
 			superproject_branch: None,
 			source_url: Some("source".to_owned()),
 			state: None,
+			strategy: Some(UpdateStrategy::Checkout),
 			recovering: false,
 			intent_identity: None,
 			module_config_lease: None,
@@ -5169,5 +5549,23 @@ mod tests {
 		request.recommend_shallow = true;
 		declaration.shallow = Some(false);
 		assert_eq!(recommended_clone_depth(&request, &declaration), None);
+	}
+
+	#[test]
+	fn update_strategies_parse_to_typed_execution_policy() {
+		assert_eq!(
+			parse_update_strategy("one", "checkout").unwrap(),
+			Some(UpdateStrategy::Checkout)
+		);
+		assert_eq!(
+			parse_update_strategy("one", "merge").unwrap(),
+			Some(UpdateStrategy::Merge)
+		);
+		assert_eq!(parse_update_strategy("one", "none").unwrap(), None);
+		assert!(matches!(
+			parse_update_strategy("one", "rebase"),
+			Err(SubmoduleError::UnsupportedStrategy { name, strategy })
+				if name == "one" && strategy == "rebase"
+		));
 	}
 }

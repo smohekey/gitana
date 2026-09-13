@@ -80,7 +80,7 @@ impl SubmoduleMutationLease {
 
 	/// Retain two independently acquired mutation authorities as one worker keepalive.
 	#[cfg(not(target_arch = "wasm32"))]
-	pub(crate) fn combine(self, other: Self) -> Self {
+	pub fn combine(self, other: Self) -> Self {
 		let config_directories = {
 			let mut config_directories = self.config_directories.as_ref().clone();
 			for identity in other.config_directories.iter().copied() {

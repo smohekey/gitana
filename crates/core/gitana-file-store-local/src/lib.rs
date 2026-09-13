@@ -262,15 +262,31 @@ impl FileStore for LocalFileStore {
 		let path = self.resolve(path)?.to_owned();
 		let fs = Arc::clone(&self.backend);
 		blocking(move || {
-			if let Some(parent) = parent_of(&path) {
-				fs.create_dir_all(parent).map_err(backend_err)?;
-			}
-			let Some(file) = fs.create_new(&path).map_err(backend_err)? else {
-				return Ok(None);
+			let parent = parent_of(&path);
+			let mut parent_repairs = 0;
+			let file = loop {
+				if let Some(parent) = parent {
+					fs.create_dir_all(parent).map_err(backend_err)?;
+				}
+				match fs.create_new(&path) {
+					Ok(Some(file)) => break file,
+					Ok(None) => return Ok(None),
+					// A sibling lock can be released after `create_dir_all` and prune the shared
+					// parent before this create. Repair that namespace race and try the atomic
+					// create again; every other error still reports the underlying conflict.
+					Err(error) if parent.is_some() && error.kind() == std::io::ErrorKind::NotFound => {
+						parent_repairs += 1;
+						if parent_repairs >= LOCK_ATTEMPTS {
+							return Err(backend_err(error));
+						}
+					}
+					Err(error) => return Err(backend_err(error)),
+				}
 			};
 			drop(file);
 			Ok(Some(PathLock::new(move || {
 				let _ = fs.remove_file(&path);
+				prune_ref_lock_parents(&*fs, &path);
 			})))
 		})
 		.await
@@ -737,6 +753,27 @@ fn parent_of(path: &str) -> Option<&str> {
 	path.rfind('/').map(|i| &path[..i])
 }
 
+/// Remove empty namespace directories created while taking a nested ref lock.
+///
+/// Lock release is deliberately synchronous for cancellation safety, so its corresponding cleanup
+/// must be synchronous too: an async task could be lost when the operation future or process exits.
+/// Preserve the stable `refs/<namespace>` anchors, and stop at the first directory another writer
+/// has made non-empty.
+fn prune_ref_lock_parents(fs: &dyn Backend, lock_path: &str) {
+	let Some(mut current) = lock_path.strip_suffix(".lock") else {
+		return;
+	};
+	if !current.starts_with("refs/") {
+		return;
+	}
+	while let Some(parent) = parent_of(current) {
+		if parent.matches('/').count() < 2 || fs.remove_dir(parent).is_err() {
+			break;
+		}
+		current = parent;
+	}
+}
+
 /// Flush every targeted regular value, then every targeted directory from the leaves back to the
 /// store root.
 ///
@@ -1192,6 +1229,128 @@ mod conditional_write_tests {
 				.file_type()
 				.is_symlink()
 		);
+	}
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod path_lock_parent_race_tests {
+	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::sync::{Arc, Barrier};
+
+	use cap_std::{ambient_authority, fs::Dir};
+	use gitana_file_store::FileStore;
+
+	use super::*;
+
+	struct PausingCreateBackend {
+		inner: CapBackend,
+		pause_path: String,
+		pause_once: AtomicBool,
+		create_entered: Arc<Barrier>,
+		create_resumed: Arc<Barrier>,
+	}
+
+	impl Backend for PausingCreateBackend {
+		fn read(&self, path: &str) -> std::io::Result<Vec<u8>> {
+			self.inner.read(path)
+		}
+
+		fn read_range(&self, path: &str, offset: u64, length: u64) -> std::io::Result<Vec<u8>> {
+			self.inner.read_range(path, offset, length)
+		}
+
+		fn create_dir_all(&self, path: &str) -> std::io::Result<()> {
+			self.inner.create_dir_all(path)
+		}
+
+		fn create_new(&self, path: &str) -> std::io::Result<Option<Box<dyn Write + Send>>> {
+			if path == self.pause_path && self.pause_once.swap(false, Ordering::SeqCst) {
+				self.create_entered.wait();
+				self.create_resumed.wait();
+			}
+			self.inner.create_new(path)
+		}
+
+		fn open_read(&self, path: &str) -> std::io::Result<Box<dyn Read + Send>> {
+			self.inner.open_read(path)
+		}
+
+		fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+			self.inner.rename(from, to)
+		}
+
+		fn remove_file(&self, path: &str) -> std::io::Result<()> {
+			self.inner.remove_file(path)
+		}
+
+		fn remove_dir(&self, path: &str) -> std::io::Result<()> {
+			self.inner.remove_dir(path)
+		}
+
+		fn exists(&self, path: &str) -> std::io::Result<bool> {
+			self.inner.exists(path)
+		}
+
+		fn is_dir(&self, path: &str) -> std::io::Result<bool> {
+			self.inner.is_dir(path)
+		}
+
+		fn size(&self, path: &str) -> std::io::Result<u64> {
+			self.inner.size(path)
+		}
+
+		fn list_names(&self, path: &str) -> std::io::Result<Vec<String>> {
+			self.inner.list_names(path)
+		}
+
+		fn kind(&self, path: &str) -> std::io::Result<FileKind> {
+			self.inner.kind(path)
+		}
+
+		fn sync_file(&self, path: &str) -> std::io::Result<()> {
+			self.inner.sync_file(path)
+		}
+
+		fn sync_dir(&self, path: &str) -> std::io::Result<()> {
+			self.inner.sync_dir(path)
+		}
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn nested_lock_creation_repairs_a_parent_pruned_by_a_sibling_release() {
+		let temporary = tempfile::tempdir().unwrap();
+		let root = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let create_entered = Arc::new(Barrier::new(2));
+		let create_resumed = Arc::new(Barrier::new(2));
+		let second_path = "refs/heads/topic/second.lock";
+		let store = LocalFileStore::with_backend(Arc::new(PausingCreateBackend {
+			inner: CapBackend { dir: root },
+			pause_path: second_path.to_owned(),
+			pause_once: AtomicBool::new(true),
+			create_entered: Arc::clone(&create_entered),
+			create_resumed: Arc::clone(&create_resumed),
+		}));
+		let first = store
+			.try_lock_path("refs/heads/topic/first.lock")
+			.await
+			.unwrap()
+			.expect("acquire the first sibling lock");
+		let prune = tokio::task::spawn_blocking(move || {
+			create_entered.wait();
+			drop(first);
+			create_resumed.wait();
+		});
+
+		let second = store
+			.try_lock_path(second_path)
+			.await
+			.unwrap()
+			.expect("repair the pruned parent and acquire the independent lock");
+		prune.await.unwrap();
+		assert!(temporary.path().join(second_path).is_file());
+
+		drop(second);
+		assert!(!temporary.path().join("refs/heads/topic").exists());
 	}
 }
 

@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use gitana_file_store::{FileStore, FileStoreError, PathLock};
 use gitana_object::{HashAlgorithm, ObjectId};
 
-use crate::{HeadLock, HeadState, RefOp, RepositoryError};
+use crate::{HeadLock, HeadResetPlan, HeadState, HeadTransaction, RefOp, RepositoryError};
 
 /// The maximum symbolic-ref chain depth to follow (git's limit), a guard against a cycle.
 const MAX_SYMREF_DEPTH: usize = 5;
@@ -173,6 +173,43 @@ fn borrow_ref_ops<H: HashAlgorithm>(ops: &[OwnedRefOp<H>]) -> Vec<RefOp<'_, H>> 
 			reflog: op.reflog.borrow(),
 		})
 		.collect()
+}
+
+fn head_transaction_target(head_chain: &[String]) -> &str {
+	head_chain
+		.last()
+		.map(String::as_str)
+		.expect("a HEAD resolution always contains HEAD")
+}
+
+fn head_reset_ops<'a, H: HashAlgorithm>(
+	head_chain: &[String],
+	tip: Option<ObjectId<H>>,
+	plan: &'a HeadResetPlan<H>,
+) -> Vec<RefOp<'a, H>> {
+	let mut ops = Vec::with_capacity(2);
+	let terminal = head_transaction_target(head_chain);
+	if let Some(tip) = tip
+		&& terminal != "ORIG_HEAD"
+	{
+		ops.push(RefOp {
+			name: "ORIG_HEAD".to_owned(),
+			expected: plan.orig_head,
+			new: Some(tip),
+			reflog: ReflogIntent::Skip,
+		});
+	}
+	let reflog = match (&plan.committer, &plan.message) {
+		(Some(committer), Some(message)) => ReflogIntent::Log { committer, message },
+		_ => ReflogIntent::Skip,
+	};
+	ops.push(RefOp {
+		name: terminal.to_owned(),
+		expected: tip,
+		new: Some(plan.target),
+		reflog,
+	});
+	ops
 }
 
 impl<'a, F, H> RefStore<'a, F, H>
@@ -1471,6 +1508,234 @@ where
 		let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
 		let lock = store.lock_ref("HEAD").await?;
 		Ok(HeadLock::new(files, effective, lock))
+	}
+
+	/// Lock `HEAD`, every symbolic hop, the terminal ref, and `ORIG_HEAD` for reset-style history
+	/// integration.
+	///
+	/// Holding the returned capability prevents a concurrent checkout from retargeting `HEAD` and
+	/// prevents the starting branch from moving during a worktree merge. The complete set is sorted
+	/// and deduplicated before acquisition so transactions use the same ordering as multi-ref writes,
+	/// including when a symbolic chain itself terminates at `ORIG_HEAD`.
+	pub async fn lock_head_transaction(
+		&self,
+	) -> Result<HeadTransaction<F::Shared, H>, RepositoryError> {
+		let files = self.files.shared_handle();
+		let effective = self.effective.cloned();
+		let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+		let state = store.read_head().await?;
+		let planned = store.symbolic_ref_resolution("HEAD").await?;
+		let mut names = planned.chain.clone();
+		names.push("ORIG_HEAD".to_owned());
+		if planned.terminal.starts_with("refs/") {
+			names.push(PACKED_REFS.to_owned());
+		}
+		let acquired = store.lock_all(&names).await.map_err(|(_, error)| error)?;
+		let observed_state = match store.read_head().await {
+			Ok(observed) => observed,
+			Err(error) => {
+				store.release_locks(acquired).await;
+				return Err(error);
+			}
+		};
+		let observed = match store.symbolic_ref_resolution("HEAD").await {
+			Ok(observed) => observed,
+			Err(error) => {
+				store.release_locks(acquired).await;
+				return Err(error);
+			}
+		};
+		if observed_state != state
+			|| observed.chain != planned.chain
+			|| observed.terminal != planned.terminal
+		{
+			store.release_locks(acquired).await;
+			return Err(RepositoryError::RefMoved {
+				name: "HEAD".to_owned(),
+			});
+		}
+		let tip = match &state {
+			HeadState::Symbolic(_) => match store.resolve(&planned.terminal).await {
+				Ok(tip) => tip,
+				Err(error) => {
+					store.release_locks(acquired).await;
+					return Err(error);
+				}
+			},
+			HeadState::Detached(oid) => Some(*oid),
+		};
+		let HeldRefLocks { names, locks } = acquired;
+		Ok(HeadTransaction {
+			files,
+			effective,
+			locks,
+			lock_names: names,
+			state,
+			head_chain: planned.chain,
+			tip,
+			prepared: None,
+		})
+	}
+
+	pub(crate) async fn prepare_head_reset(
+		&self,
+		state: &HeadState<H>,
+		head_chain: &[String],
+		tip: Option<ObjectId<H>>,
+		target: ObjectId<H>,
+		reflog: ReflogIntent<'_>,
+	) -> Result<HeadResetPlan<H>, RepositoryError> {
+		self.validate_head_snapshot(state, head_chain, tip).await?;
+		let orig_head = if tip.is_some() && head_transaction_target(head_chain) != "ORIG_HEAD" {
+			self.resolve("ORIG_HEAD").await?
+		} else {
+			None
+		};
+		let (committer, message) = match reflog {
+			ReflogIntent::Log { committer, message } => {
+				(Some(committer.to_owned()), Some(message.to_owned()))
+			}
+			ReflogIntent::Skip => (None, None),
+		};
+		let plan = HeadResetPlan {
+			target,
+			orig_head,
+			committer,
+			message,
+		};
+		let ops = head_reset_ops(head_chain, tip, &plan);
+		let cascades = vec![false; ops.len()];
+		let policy = self.reflog_policy().await?;
+		self
+			.validate_locked(&ops, &cascades, policy)
+			.await
+			.map_err(|(_, error)| error)?;
+		self
+			.head_reset_symbolic_reflogs(state, head_chain, &plan, policy)
+			.await?;
+		Ok(plan)
+	}
+
+	pub(crate) async fn commit_head_reset(
+		&self,
+		state: &HeadState<H>,
+		head_chain: &[String],
+		tip: Option<ObjectId<H>>,
+		plan: &HeadResetPlan<H>,
+	) -> Result<(), RepositoryError> {
+		self.validate_head_snapshot(state, head_chain, tip).await?;
+		let ops = head_reset_ops(head_chain, tip, plan);
+		let cascades = vec![false; ops.len()];
+		let policy = self.reflog_policy().await?;
+		let olds = self
+			.validate_locked(&ops, &cascades, policy)
+			.await
+			.map_err(|(_, error)| error)?;
+		let symbolic_reflogs = self
+			.head_reset_symbolic_reflogs(state, head_chain, plan, policy)
+			.await?;
+		if let (Some(committer), Some(message)) = (&plan.committer, &plan.message) {
+			for name in symbolic_reflogs {
+				self
+					.append_reflog(&name, tip, Some(plan.target), committer, message)
+					.await?;
+			}
+		}
+		self
+			.commit_validated(&ops, &olds, &cascades, policy)
+			.await
+			.map_err(|(_, error)| error)
+	}
+
+	pub(crate) async fn commit_head_orig(
+		&self,
+		state: &HeadState<H>,
+		head_chain: &[String],
+		tip: ObjectId<H>,
+	) -> Result<(), RepositoryError> {
+		self
+			.validate_head_snapshot(state, head_chain, Some(tip))
+			.await?;
+		if head_transaction_target(head_chain) == "ORIG_HEAD" {
+			return Ok(());
+		}
+		let op = RefOp {
+			name: "ORIG_HEAD".to_owned(),
+			expected: self.resolve("ORIG_HEAD").await?,
+			new: Some(tip),
+			reflog: ReflogIntent::Skip,
+		};
+		let cascades = [false];
+		let policy = self.reflog_policy().await?;
+		let olds = self
+			.validate_locked(std::slice::from_ref(&op), &cascades, policy)
+			.await
+			.map_err(|(_, error)| error)?;
+		self
+			.commit_validated(std::slice::from_ref(&op), &olds, &cascades, policy)
+			.await
+			.map_err(|(_, error)| error)
+	}
+
+	async fn validate_head_snapshot(
+		&self,
+		state: &HeadState<H>,
+		head_chain: &[String],
+		tip: Option<ObjectId<H>>,
+	) -> Result<(), RepositoryError> {
+		if self.read_head().await? != *state {
+			return Err(RepositoryError::RefMoved {
+				name: "HEAD".to_owned(),
+			});
+		}
+		let observed = self.symbolic_ref_resolution("HEAD").await?;
+		if observed.chain != head_chain || observed.terminal != head_transaction_target(head_chain) {
+			return Err(RepositoryError::RefMoved {
+				name: "HEAD".to_owned(),
+			});
+		}
+		let observed_tip = match state {
+			HeadState::Symbolic(_) => self.resolve(&observed.terminal).await?,
+			HeadState::Detached(oid) => Some(*oid),
+		};
+		if observed_tip != tip {
+			return Err(RepositoryError::RefMoved {
+				name: observed.terminal,
+			});
+		}
+		Ok(())
+	}
+
+	async fn head_reset_symbolic_reflogs(
+		&self,
+		state: &HeadState<H>,
+		head_chain: &[String],
+		plan: &HeadResetPlan<H>,
+		policy: ReflogPolicy,
+	) -> Result<Vec<String>, RepositoryError> {
+		if !matches!(state, HeadState::Symbolic(_))
+			|| plan.committer.is_none()
+			|| plan.message.is_none()
+		{
+			return Ok(Vec::new());
+		}
+
+		let mut logged = Vec::new();
+		for name in head_chain.iter().take(head_chain.len().saturating_sub(1)) {
+			if self.should_log(name, policy).await? {
+				if self.path_write_blocked(&format!("logs/{name}")).await? {
+					return Err(RepositoryError::InvalidRef(format!(
+						"HEAD: reflog path {name} blocked by an existing file or directory"
+					)));
+				}
+				logged.push(name.clone());
+			}
+		}
+		Ok(logged)
+	}
+
+	pub(crate) async fn prune_lock_parents(&self, name: &str) {
+		self.prune_empty_dirs(name).await;
 	}
 
 	/// Publish a checkout while the caller's `head_lock` (this worktree's `HEAD.lock`) is held, consuming
@@ -4434,6 +4699,156 @@ mod tests {
 			.await
 			.expect("releasing the checkout lock lets the move through");
 		assert_eq!(store.resolve("refs/heads/main").await.unwrap(), Some(next));
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn head_transaction_publishes_only_to_the_captured_branch() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let old = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"old");
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"target");
+		store
+			.update_ref("refs/heads/main", old, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		store
+			.update_ref("refs/heads/other", old, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		store
+			.set_symbolic("HEAD", "refs/heads/main", ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		let mut transaction = store.lock_head_transaction().await.unwrap();
+		assert_eq!(
+			transaction.state(),
+			&HeadState::Symbolic("refs/heads/main".to_owned())
+		);
+		assert_eq!(transaction.tip(), Some(old));
+		let error = store
+			.set_symbolic("HEAD", "refs/heads/other", ReflogIntent::Skip)
+			.await
+			.expect_err("the retained HEAD lock must reject a concurrent branch switch");
+		assert!(
+			matches!(&error, crate::RepositoryError::RefLocked { name } if name == "HEAD"),
+			"expected HEAD.lock contention, got {error:?}",
+		);
+
+		transaction
+			.prepare_reset(target, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		transaction.finish().await.unwrap();
+
+		assert_eq!(
+			store.resolve("refs/heads/main").await.unwrap(),
+			Some(target)
+		);
+		assert_eq!(store.resolve("refs/heads/other").await.unwrap(), Some(old));
+		assert_eq!(
+			store.read_head().await.unwrap(),
+			HeadState::Symbolic("refs/heads/main".to_owned())
+		);
+		assert_eq!(store.resolve("ORIG_HEAD").await.unwrap(), Some(old));
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn head_transaction_preserves_and_logs_a_symbolic_chain() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let old = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"old");
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"target");
+		let committer = "A U Thor <a@example.com> 1700000000 +0000";
+		files
+			.write_path_if_absent("HEAD", b"ref: refs/heads/alias\n")
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent("refs/heads/alias", b"ref: refs/heads/main\n")
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent("refs/heads/main", format!("{old}\n").as_bytes())
+			.await
+			.unwrap();
+
+		let mut transaction = store.lock_head_transaction().await.unwrap();
+		assert_eq!(transaction.tip(), Some(old));
+		transaction
+			.prepare_reset(
+				target,
+				ReflogIntent::Log {
+					committer,
+					message: "merge target: Fast-forward",
+				},
+			)
+			.await
+			.unwrap();
+		transaction.finish().await.unwrap();
+
+		assert_eq!(
+			files.read_path("HEAD").await.unwrap(),
+			b"ref: refs/heads/alias\n"
+		);
+		assert_eq!(
+			files.read_path("refs/heads/alias").await.unwrap(),
+			b"ref: refs/heads/main\n"
+		);
+		assert_eq!(
+			store.resolve("refs/heads/main").await.unwrap(),
+			Some(target)
+		);
+		assert_eq!(store.resolve("ORIG_HEAD").await.unwrap(), Some(old));
+		let reflog = format!("{old} {target} {committer}\tmerge target: Fast-forward\n");
+		for name in ["HEAD", "refs/heads/alias", "refs/heads/main"] {
+			assert_eq!(
+				files.read_path(&format!("logs/{name}")).await.unwrap(),
+				reflog.as_bytes(),
+				"the reset must log {name}"
+			);
+		}
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn head_transaction_deduplicates_orig_head_as_the_terminal_ref() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let old = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"old");
+		let target = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"target");
+		files
+			.write_path_if_absent("HEAD", b"ref: refs/heads/alias\n")
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent("refs/heads/alias", b"ref: ORIG_HEAD\n")
+			.await
+			.unwrap();
+		files
+			.write_path_if_absent("ORIG_HEAD", format!("{old}\n").as_bytes())
+			.await
+			.unwrap();
+
+		let mut transaction = store.lock_head_transaction().await.unwrap();
+		assert_eq!(transaction.tip(), Some(old));
+		transaction
+			.prepare_reset(target, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		transaction.finish().await.unwrap();
+
+		assert_eq!(
+			files.read_path("HEAD").await.unwrap(),
+			b"ref: refs/heads/alias\n"
+		);
+		assert_eq!(
+			files.read_path("refs/heads/alias").await.unwrap(),
+			b"ref: ORIG_HEAD\n"
+		);
+		assert_eq!(store.resolve("ORIG_HEAD").await.unwrap(), Some(target));
 	}
 
 	/// Deleting a nested ref frees its parent name while keeping the namespace anchors: after

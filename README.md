@@ -95,7 +95,7 @@ Major gaps:
   new base (linear histories only), with `--continue` / `--skip` / `--abort`.
   Non-interactive: no `-i`, autosquash, or `--rebase-merges`.
 - `gta submodule status [--recursive]` / `init` /
-  `update [--init] [--recursive] [--remote] [-N|--no-fetch] [--depth N]` / `deinit` /
+  `update [--init] [--recursive] [--remote] [-N|--no-fetch] [--depth N] [--checkout|--merge]` / `deinit` /
   `set-branch (-b|--branch <branch> | -d|--default) <path>` /
   `set-url <path> <newurl>` / `sync [--recursive] [<path>...]`
   implement consumer operations. `gta clone --recurse-submodules[=<pathspec>]` (alias
@@ -113,10 +113,14 @@ Major gaps:
   remaining modules with full history. `.gitmodules` shallow recommendations and their
   `--[no-]recommend-shallow` controls are supported. `update --remote` follows the effective
   per-module branch (or the selected remote's HEAD), while `--no-fetch` confines selection to local
-  objects and tracking refs; both policies propagate recursively. Recursive clone accepts
-  `--[no-]remote-submodules`, with the last occurrence winning. Clone-time jobs, shallow
-  since/exclude propagation and the `merge`, `rebase`, or custom-command update strategies are not
-  yet supported.
+  objects and tracking refs; both policies propagate recursively. `--merge` integrates the selected
+  target into an existing mounted module with the normal merge engine (including true merge commits,
+  signing, and materialized conflicts); newly cloned, reattached, and recovered modules retain exact
+  detached checkout. `--checkout` restores that default explicitly, and either override propagates
+  recursively; when both native flags are supplied, `--checkout` takes precedence. Recursive clone
+  accepts `--[no-]remote-submodules`, with the last occurrence winning. Clone-time jobs, shallow
+  since/exclude propagation and the `rebase` or custom-command update strategies are not yet
+  supported.
 - There is no interactive rebase, stash, blame, bisect, or hook support.
 - `checkout` switches branches and restores paths (`checkout [<tree-ish>] -- <paths>`),
   but switching to a detached commit is not yet supported.
@@ -207,7 +211,8 @@ Implemented command groups:
   `worktree.useRelativePaths` pointers are preserved across a move/repair. The result is byte-for-byte
   git's layout, so stock git reads and operates in a gta-created worktree.
 - Submodules: `submodule status [--recursive]`, `submodule init`,
-	`submodule update [--init] [--recursive] [--remote] [-N|--no-fetch] [--depth N]`, and
+	`submodule update [--init] [--recursive] [--remote] [-N|--no-fetch] [--depth N]
+	[--checkout|--merge]`, and
 	`submodule deinit [-f|--force] (--all | <path>...)`, plus
 	`submodule set-branch (-b|--branch <branch> | -d|--default) <path>` and
 	`submodule set-url <path> <newurl>` / `submodule sync [--recursive] [<path>...]`.

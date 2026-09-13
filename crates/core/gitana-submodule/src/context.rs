@@ -14,8 +14,8 @@ use gitana_worktree::{PathspecSet, WorkTree};
 use crate::{
 	ConfigViews, ConfigurationProvider, InitConfigResult, InitConfigUpdate, InitNotice, InitOutcome,
 	InitReport, InitRequest, MarkerTargetResolver, SubmoduleDeclaration, SubmoduleError,
-	SubmoduleObjectId, SubmoduleQuery, SubmoduleStatus, SubmoduleStatusState, declarations_by_path,
-	resolve_relative_url, validate_name, validate_path,
+	SubmoduleObjectId, SubmoduleQuery, SubmoduleStatus, SubmoduleStatusState, UpdateStrategy,
+	declarations_by_path, resolve_relative_url, validate_name, validate_path,
 };
 
 /// An explicit, capability-scoped superproject context.
@@ -131,6 +131,7 @@ impl SubmoduleContext {
 						&effective,
 						initialize_only_active,
 						None,
+						None,
 					)
 					.await?
 			}
@@ -141,6 +142,7 @@ impl SubmoduleContext {
 						configuration,
 						&effective,
 						initialize_only_active,
+						None,
 						None,
 					)
 					.await?
@@ -155,7 +157,7 @@ impl SubmoduleContext {
 		lock.validate()?;
 		self.ensure_no_repository_deinit_recovery()?;
 		let report = self
-			.init_unlocked(request, configuration, false, lock.lease())
+			.init_unlocked(request, configuration, false, None, lock.lease())
 			.await?;
 		lock.validate()?;
 		Ok(report)
@@ -166,6 +168,7 @@ impl SubmoduleContext {
 		request: &InitRequest,
 		configuration: &C,
 		initialize_only_active: bool,
+		strategy_override: Option<UpdateStrategy>,
 		lease: crate::SubmoduleMutationLease,
 	) -> Result<InitReport, SubmoduleError> {
 		let effective = configuration.reload().await?;
@@ -179,6 +182,7 @@ impl SubmoduleContext {
 						configuration,
 						&effective,
 						initialize_only_active,
+						strategy_override,
 						Some(lease),
 					)
 					.await?
@@ -190,6 +194,7 @@ impl SubmoduleContext {
 						configuration,
 						&effective,
 						initialize_only_active,
+						strategy_override,
 						Some(lease),
 					)
 					.await?
@@ -284,6 +289,7 @@ impl SubmoduleContext {
 		configuration: &C,
 		effective: &gitana_config::GitConfig,
 		initialize_only_active: bool,
+		strategy_override: Option<UpdateStrategy>,
 		lease: Option<crate::SubmoduleMutationLease>,
 	) -> Result<Option<InitReport>, SubmoduleError> {
 		struct Planned {
@@ -310,7 +316,9 @@ impl SubmoduleContext {
 				.ok_or_else(|| SubmoduleError::MissingMapping(path.clone()))?;
 			validate_name(&declaration.name)?;
 			validate_path(&declaration.path)?;
-			if let Some(strategy) = declaration.update.as_deref() {
+			if strategy_override.is_none()
+				&& let Some(strategy) = declaration.update.as_deref()
+			{
 				validate_update_strategy(&declaration.name, strategy)?;
 			}
 			let active = is_active(effective, &declaration.name, &declaration.path)?;
@@ -354,9 +362,12 @@ impl SubmoduleContext {
 				};
 			let update = match effective.get_raw("submodule", Some(&declaration.name), "update") {
 				Some(Some(strategy)) => {
-					validate_update_strategy(&declaration.name, strategy)?;
+					if strategy_override.is_none() {
+						validate_update_strategy(&declaration.name, strategy)?;
+					}
 					None
 				}
+				Some(None) if strategy_override.is_some() => None,
 				Some(None) => {
 					return Err(SubmoduleError::MissingValue(format!(
 						"submodule.{}.update",
@@ -366,8 +377,7 @@ impl SubmoduleContext {
 				None => declaration
 					.update
 					.as_ref()
-					.filter(|strategy| !strategy.starts_with('!'))
-					.cloned(),
+					.and_then(|strategy| (!strategy.starts_with('!')).then(|| strategy.clone())),
 			};
 			planned.push(Planned {
 				name: declaration.name.clone(),
@@ -763,7 +773,7 @@ pub(crate) fn parse_marker_target(marker: &str) -> Option<&str> {
 }
 
 pub(crate) fn validate_update_strategy(name: &str, strategy: &str) -> Result<(), SubmoduleError> {
-	if matches!(strategy, "checkout" | "none") {
+	if matches!(strategy, "checkout" | "merge" | "none") {
 		Ok(())
 	} else {
 		Err(SubmoduleError::UnsupportedStrategy {

@@ -5,25 +5,25 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::Backend;
 use anyhow::Result;
+use gitana_file_store::FileStore;
 use gitana_object::HashAlgorithm;
 use gitana_porcelain::Identity;
 use gitana_repository::Repository;
 
 /// The CLI's [`Identity`] for porcelain operations. Holds the repository so config lookups happen
 /// lazily, only when an operation actually asks for a signature.
-pub(crate) struct CliIdentity<'a, H: HashAlgorithm> {
-	repo: &'a Repository<Backend, H>,
+pub(crate) struct CliIdentity<'a, F: FileStore, H: HashAlgorithm> {
+	repo: &'a Repository<F, H>,
 }
 
-impl<'a, H: HashAlgorithm> CliIdentity<'a, H> {
-	pub(crate) fn new(repo: &'a Repository<Backend, H>) -> Self {
+impl<'a, F: FileStore, H: HashAlgorithm> CliIdentity<'a, F, H> {
+	pub(crate) fn new(repo: &'a Repository<F, H>) -> Self {
 		Self { repo }
 	}
 }
 
-impl<H: HashAlgorithm> Identity for CliIdentity<'_, H> {
+impl<F: FileStore, H: HashAlgorithm> Identity for CliIdentity<'_, F, H> {
 	async fn author(&self) -> Result<String> {
 		signature(self.repo, "AUTHOR").await
 	}
@@ -39,8 +39,8 @@ impl<H: HashAlgorithm> Identity for CliIdentity<'_, H> {
 /// falling back to `user.name`/`user.email` in config. Errors when neither is set — for operations
 /// like `commit` that must record a real identity. Config is resolved across git's full precedence
 /// stack (system, global, local), so a globally-configured identity is honoured.
-pub async fn signature<H: HashAlgorithm>(
-	repo: &Repository<Backend, H>,
+pub async fn signature<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
 	role: &str,
 ) -> Result<String> {
 	let config = repo.effective_config().await?;
@@ -57,8 +57,8 @@ pub async fn signature<H: HashAlgorithm>(
 /// for reflog entries (e.g. `reset`) that git records without a configured identity. It still errors
 /// if the config stack itself cannot be read (a malformed global/system file), as git aborts the
 /// whole operation on a bad config. Config is resolved across git's full precedence stack.
-pub async fn signature_or_default<H: HashAlgorithm>(
-	repo: &Repository<Backend, H>,
+pub async fn signature_or_default<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
 	role: &str,
 ) -> Result<String> {
 	let config = repo.effective_config().await?;

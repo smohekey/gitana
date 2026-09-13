@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::Backend;
 use anyhow::{Result, bail};
+use cap_std::fs::Dir;
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_porcelain::RebaseOutcome;
 use gitana_worktree::WorkTree;
@@ -31,7 +32,7 @@ pub async fn run(
 	if [abort, continue_, skip].iter().filter(|&&f| f).count() > 1 {
 		bail!("--abort, --continue, and --skip are mutually exclusive");
 	}
-	dispatch::on_worktree(
+	dispatch::on_worktree_history_mutation(
 		cwd,
 		Rebase {
 			upstream,
@@ -40,6 +41,7 @@ pub async fn run(
 			continue_,
 			skip,
 			cwd: cwd.to_path_buf(),
+			cwd_directory: None,
 		},
 	)
 	.await
@@ -53,9 +55,15 @@ struct Rebase {
 	skip: bool,
 	/// The effective working directory, for resolving a relative `user.signingkey` (`-C`).
 	cwd: std::path::PathBuf,
+	cwd_directory: Option<Dir>,
 }
 
 impl WorkTreeCommand for Rebase {
+	fn set_command_directory(&mut self, path: std::path::PathBuf, directory: Dir) {
+		self.cwd = path;
+		self.cwd_directory = Some(directory);
+	}
+
 	async fn run<H: HashAlgorithm>(
 		self,
 		wt: WorkTree<Backend, crate::WorkDir, H>,
@@ -66,7 +74,15 @@ impl WorkTreeCommand for Rebase {
 			return gitana_porcelain::abort_rebase(&wt, &identity).await;
 		}
 		// Each replayed commit is signed when git config requests it (`commit.gpgsign` + `gpg.format=ssh`).
-		let signer = signer::config_signer(wt.repository(), &self.cwd).await?;
+		let signer = signer::config_signer_in(
+			wt.repository(),
+			&self.cwd,
+			self
+				.cwd_directory
+				.as_ref()
+				.expect("dispatch retained the command directory"),
+		)
+		.await?;
 		let outcome = if self.continue_ {
 			gitana_porcelain::continue_rebase(&wt, &identity, signer.as_ref()).await?
 		} else if self.skip {

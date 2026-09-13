@@ -8,15 +8,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow};
 use cap_std::{ambient_authority, fs::Dir};
 use gitana_fs_native::{EntryIdentity, directory_identity};
+pub use gitana_submodule::UpdateStrategy;
 use gitana_submodule::{
 	ConfigViews, ConfigurationProvider, DeinitRequest, DeinitSelection, InitNotice, InitRequest,
 	SetBranchOutcome, SetUrlRequest, SubmoduleContext, SubmoduleDeclaration, SubmoduleError,
 	SubmoduleMutationLease, SubmoduleQuery, SubmoduleStatus, SubmoduleStatusState, SyncOutcomeState,
-	SyncReport, SyncRequest, UpdateOutcomeState, UpdateReport, UpdateRequest,
+	SyncReport, SyncRequest, UpdateMergeOutcome, UpdateOutcomeState, UpdateReport, UpdateRequest,
 };
 
+use crate::commands::conflict;
 use crate::submodule_configuration::WorktreeConfiguration;
 use crate::submodule_transfer::SubmoduleTransfer;
+use crate::submodule_update_strategy::SubmoduleUpdateStrategy;
 use crate::{CommandContext, RepositoryLayoutIdentity, SilentExit, git_config, repo};
 
 pub enum Action {
@@ -33,6 +36,7 @@ pub enum Action {
 		recommend_shallow: bool,
 		remote: bool,
 		fetch: bool,
+		strategy: Option<UpdateStrategy>,
 		recursive: bool,
 		paths: Vec<String>,
 	},
@@ -69,7 +73,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 	if matches!(&action, Action::Update { depth: Some(0), .. }) {
 		return Err(anyhow!("--depth must be a positive number of commits"));
 	}
-	let (layout, prefix) = repo::discover_worktree_with_prefix(cwd).await?;
+	let (layout, _command_cwd, prefix) = repo::discover_worktree_with_prefix(cwd).await?;
 	let worktree_root = layout
 		.worktree_root
 		.as_ref()
@@ -98,6 +102,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 			recommend_shallow,
 			remote,
 			fetch,
+			strategy,
 			recursive: true,
 			paths,
 		} => {
@@ -113,6 +118,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 					recommend_shallow: *recommend_shallow,
 					remote: *remote,
 					fetch: *fetch,
+					strategy: *strategy,
 					initialize_only_active: false,
 					reflog_committer: None,
 				},
@@ -218,6 +224,7 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 			recommend_shallow,
 			remote,
 			fetch,
+			strategy,
 			recursive: false,
 			paths,
 		} => {
@@ -234,14 +241,22 @@ pub async fn run(cwd: &Path, command: &CommandContext, action: Action) -> Result
 				recommend_shallow,
 				remote,
 				fetch,
+				strategy,
 				initialize_only_active: false,
 				reflog_committer: Some(committer(&superproject)),
 			};
-			match Box::pin(context.update(&request, &configuration, &transfer)).await {
+			match Box::pin(context.update(
+				&request,
+				&configuration,
+				&transfer,
+				&SubmoduleUpdateStrategy,
+			))
+			.await
+			{
 				Ok(report) => render_update(&prefix, &report),
 				Err(failure) => {
 					render_update(&prefix, &failure.completed);
-					return Err(failure.into());
+					return Err(render_update_failure(&prefix, "", failure));
 				}
 			}
 		}
@@ -430,8 +445,9 @@ async fn recursive_update(
 		recommend_shallow,
 		remote,
 		fetch,
+		strategy,
 		initialize_only_active,
-		..
+		reflog_committer: _,
 	} = request;
 	let root = root_layout
 		.worktree_root
@@ -477,6 +493,7 @@ async fn recursive_update(
 		recommend_shallow,
 		remote,
 		fetch,
+		strategy,
 	)]);
 	while let Some((
 		level_root,
@@ -491,6 +508,7 @@ async fn recursive_update(
 		recommend_shallow,
 		remote,
 		fetch,
+		strategy,
 	)) = pending.pop_front()
 	{
 		let recovered = recovered_levels.remove(&level_prefix);
@@ -515,6 +533,7 @@ async fn recursive_update(
 				recommend_shallow,
 				remote,
 				fetch,
+				strategy,
 				initialize_only_active,
 				reflog_committer: None,
 			},
@@ -534,6 +553,7 @@ async fn recursive_update(
 				outcome.state,
 				UpdateOutcomeState::Cloned
 					| UpdateOutcomeState::CheckedOut
+					| UpdateOutcomeState::Merged
 					| UpdateOutcomeState::AlreadyCurrent
 			) {
 				pending.push_back((
@@ -549,6 +569,7 @@ async fn recursive_update(
 					recommend_shallow,
 					remote,
 					fetch,
+					strategy,
 				));
 			}
 		}
@@ -593,6 +614,7 @@ pub(crate) async fn update_published_clone(
 			recommend_shallow: true,
 			remote,
 			fetch: true,
+			strategy: None,
 			initialize_only_active: true,
 			reflog_committer: None,
 		},
@@ -1034,6 +1056,7 @@ async fn resume_update_level(
 	match Box::pin(context.resume_pending_update(
 		&configuration,
 		&transfer,
+		&SubmoduleUpdateStrategy,
 		Some(committer(&superproject)),
 		depth,
 		recommend_shallow,
@@ -1050,7 +1073,7 @@ async fn resume_update_level(
 		Ok(None) => Ok(None),
 		Err(failure) => {
 			render_update_at(prefix, level_prefix, &failure.completed);
-			Err(failure.into())
+			Err(render_update_failure(prefix, level_prefix, failure))
 		}
 	}
 }
@@ -1086,7 +1109,14 @@ async fn update_level(
 	)?;
 	request.reflog_committer = Some(committer(&superproject));
 	let transfer = SubmoduleTransfer::new(command, root, module_base, credential_url_base);
-	match Box::pin(context.update(&request, &configuration, &transfer)).await {
+	match Box::pin(context.update(
+		&request,
+		&configuration,
+		&transfer,
+		&SubmoduleUpdateStrategy,
+	))
+	.await
+	{
 		Ok(report) => {
 			let descendant_url_bases = transfer.take_descendant_url_bases()?;
 			render_update_at(prefix, level_prefix, &report);
@@ -1094,7 +1124,7 @@ async fn update_level(
 		}
 		Err(failure) => {
 			render_update_at(prefix, level_prefix, &failure.completed);
-			Err(failure.into())
+			Err(render_update_failure(prefix, level_prefix, failure))
 		}
 	}
 }
@@ -1251,11 +1281,61 @@ fn render_update_at(prefix: &str, level_prefix: &str, report: &gitana_submodule:
 				"Skipping submodule '{}'",
 				render_nested_relative(prefix, level_prefix, &outcome.path)
 			),
+			UpdateOutcomeState::Merged => {
+				match outcome
+					.merge
+					.as_ref()
+					.expect("merged updates always report their merge outcome")
+				{
+					UpdateMergeOutcome::AlreadyUpToDate => println!("Already up to date."),
+					UpdateMergeOutcome::FastForward { from, to } => match from {
+						Some(from) => println!(
+							"Updating {}..{}\nFast-forward",
+							short_submodule_oid(from),
+							short_submodule_oid(to)
+						),
+						None => println!("Fast-forward"),
+					},
+					UpdateMergeOutcome::Made { .. } => {
+						println!("Merge made by the 'recursive' strategy.")
+					}
+				}
+				println!(
+					"Submodule path '{}': merged in '{}'",
+					render_nested_relative(prefix, level_prefix, &outcome.path),
+					outcome
+						.target
+						.as_ref()
+						.expect("merged updates always report their selected target")
+				);
+			}
 			UpdateOutcomeState::SkippedUnregistered
 			| UpdateOutcomeState::SkippedInactive
 			| UpdateOutcomeState::AlreadyCurrent => {}
 		}
 	}
+}
+
+fn render_update_failure(
+	prefix: &str,
+	level_prefix: &str,
+	failure: gitana_submodule::UpdateFailure,
+) -> anyhow::Error {
+	if let SubmoduleError::MergeConflict(conflict) = &failure.source {
+		let error = conflict::report_conflicts(&conflict.paths);
+		eprintln!(
+			"Unable to merge '{}' in submodule path '{}'",
+			conflict.target,
+			render_nested_relative(prefix, level_prefix, &conflict.path)
+		);
+		return error;
+	}
+	failure.into()
+}
+
+fn short_submodule_oid(id: &gitana_submodule::SubmoduleObjectId) -> String {
+	let hex = id.to_string();
+	hex[..12.min(hex.len())].to_owned()
 }
 
 fn render_nested_relative(prefix: &str, level_prefix: &str, path: &str) -> String {

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::Backend;
 use anyhow::{Result, bail};
+use cap_std::fs::Dir;
 use gitana_object::HashAlgorithm;
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
@@ -28,6 +29,7 @@ pub async fn run(
 			no_sign,
 			signing_key,
 			cwd: cwd.to_path_buf(),
+			cwd_directory: None,
 		},
 	)
 	.await
@@ -40,9 +42,15 @@ struct Commit<'a> {
 	signing_key: Option<PathBuf>,
 	/// The effective working directory, for resolving a relative signing-key path (`-C`).
 	cwd: PathBuf,
+	cwd_directory: Option<Dir>,
 }
 
 impl WorkTreeCommand for Commit<'_> {
+	fn set_command_directory(&mut self, path: PathBuf, directory: Dir) {
+		self.cwd = path;
+		self.cwd_directory = Some(directory);
+	}
+
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
@@ -56,7 +64,18 @@ impl WorkTreeCommand for Commit<'_> {
 		let signer = self
 			.should_sign(repo)
 			.await?
-			.then(|| LazyCliSigner::new(repo, self.signing_key, self.cwd));
+			.then(|| {
+				LazyCliSigner::new_in(
+					repo,
+					self.signing_key,
+					self.cwd,
+					self
+						.cwd_directory
+						.as_ref()
+						.expect("dispatch retained the command directory"),
+				)
+			})
+			.transpose()?;
 		let signer = signer.as_ref();
 
 		// A rebase replays commits itself; a plain `gta commit` would create a stray commit the

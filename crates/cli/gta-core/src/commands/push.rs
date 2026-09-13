@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::Backend;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use cap_std::fs::Dir;
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_porcelain::PushTags;
 use gitana_remote::{
@@ -16,7 +17,10 @@ use gitana_remote::{
 };
 use gitana_repository::Repository;
 
-use crate::{CommandContext, RepositoryLayoutIdentity, git_config, transport_for, url_rewrite};
+use crate::{
+	CommandContext, RepositoryLayoutIdentity, RetainedCommandDirectory, git_config, transport_for,
+	url_rewrite,
+};
 
 use crate::dispatch;
 use crate::repo;
@@ -39,6 +43,7 @@ pub async fn run(
 	all_tags: bool,
 	follow_tags: bool,
 ) -> Result<()> {
+	let cwd = tokio::fs::canonicalize(cwd).await?;
 	let tags = if all_tags {
 		PushTags::All
 	} else if follow_tags {
@@ -66,7 +71,8 @@ pub async fn run(
 		specs.push(PushRefspec::parse(&format!(":{target}"))?);
 	}
 
-	let found = repo::discover(cwd).await?;
+	let found = repo::discover(&cwd).await?;
+	let command_directory = RetainedCommandDirectory::capture(cwd.clone()).await?;
 	let identity = repo::capture_repository_layout_identity(&found)?;
 	// git's push-URL selection: `remote.origin.pushurl` (with `insteadOf`) if set, else
 	// `remote.origin.url` with `pushInsteadOf` (falling back to `insteadOf`) — over the merged config.
@@ -119,7 +125,7 @@ pub async fn run(
 				force,
 				atomic,
 				tags,
-				cwd,
+				command_directory,
 			)
 			.await
 		}
@@ -140,7 +146,7 @@ pub async fn run(
 				force,
 				atomic,
 				tags,
-				cwd,
+				command_directory,
 			)
 			.await
 		}
@@ -162,7 +168,7 @@ async fn push_dispatch(
 	force: bool,
 	atomic: bool,
 	tags: PushTags,
-	cwd: &Path,
+	command_directory: RetainedCommandDirectory,
 ) -> Result<()> {
 	let (setup, common, _, _) = repo::command_setup_lease(found, identity).await?;
 	let local = dispatch::detect_algorithm_at(&common, &found.common_dir).await?;
@@ -182,7 +188,7 @@ async fn push_dispatch(
 				force,
 				atomic,
 				tags,
-				cwd,
+				command_directory,
 			)
 			.await
 		}
@@ -199,7 +205,7 @@ async fn push_dispatch(
 				force,
 				atomic,
 				tags,
-				cwd,
+				command_directory,
 			)
 			.await
 		}
@@ -219,9 +225,17 @@ async fn push_into<H: HashAlgorithm>(
 	force: bool,
 	atomic: bool,
 	tags: PushTags,
-	cwd: &Path,
+	command_directory: RetainedCommandDirectory,
 ) -> Result<()> {
-	let (setup, common, git, _) = repo::command_setup_lease(found, identity).await?;
+	let (setup, common, git, worktree) = repo::command_setup_lease(found, identity).await?;
+	let repo::RevalidatedCommandDirectory {
+		path: command_path,
+		directory: cwd_directory,
+		common,
+		git,
+		worktree: _,
+	} = revalidated_push_command_directory(found, command_directory, &setup, common, git, worktree)
+		.await?;
 	let repository = if signed {
 		repo::open_generic_from_dirs_with_worker_lease::<H>(
 			common,
@@ -241,7 +255,7 @@ async fn push_into<H: HashAlgorithm>(
 	// OpenPGP, git's default), and the key is resolved lazily so a "server does not accept signed
 	// pushes" error is not masked by a missing signing key. The certificate's pushee is the push URL.
 	let outcome = if signed {
-		let signer = LazyCliSigner::new(&repository, signing_key, cwd.to_path_buf());
+		let signer = LazyCliSigner::new_in(&repository, signing_key, command_path, &cwd_directory)?;
 		gitana_porcelain::push_signed(
 			connection,
 			&repository,
@@ -280,6 +294,25 @@ async fn push_into<H: HashAlgorithm>(
 	Ok(())
 }
 
+async fn revalidated_push_command_directory(
+	found: &repo::RepositoryLayout,
+	command_directory: RetainedCommandDirectory,
+	setup: &gitana_submodule::SubmoduleMutationLease,
+	common: Dir,
+	git: Dir,
+	worktree: Option<Dir>,
+) -> Result<repo::RevalidatedCommandDirectory> {
+	let display = command_directory.path().to_owned();
+	repo::revalidated_command_directory(found, command_directory, setup, common, git, worktree)
+		.await
+		.with_context(|| {
+			format!(
+				"push command directory changed during remote negotiation: {}",
+				display.display()
+			)
+		})
+}
+
 /// The pusher identity for a certificate: `Name <email> <unix-ts> +0000`. Always stamped with the
 /// push time, so unlike a commit it ignores any `GIT_AUTHOR_DATE`.
 async fn pusher_ident<H: HashAlgorithm>(repo: &Repository<Backend, H>) -> Result<String> {
@@ -312,10 +345,59 @@ async fn pusher_ident_with_overrides<H: HashAlgorithm>(
 
 #[cfg(all(test, unix))]
 mod tests {
+	use crate::RetainedCommandDirectory;
 	use gitana_object::Sha1;
 
-	use super::pusher_ident_with_overrides;
+	use super::{pusher_ident_with_overrides, revalidated_push_command_directory};
 	use crate::repo;
+
+	#[tokio::test]
+	async fn signed_push_rejects_a_nested_command_directory_replaced_during_negotiation() {
+		let temporary = tempfile::tempdir().unwrap();
+		let worktree = temporary.path().join("worktree");
+		let nested = worktree.join("nested");
+		let retained = worktree.join("retained");
+		let git = worktree.join(".git");
+		std::fs::create_dir_all(&nested).unwrap();
+		std::fs::create_dir_all(git.join("objects")).unwrap();
+		std::fs::create_dir_all(git.join("refs")).unwrap();
+		std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		std::fs::write(
+			git.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+		)
+		.unwrap();
+		let nested = std::fs::canonicalize(nested).unwrap();
+		let found = repo::discover(&nested).await.unwrap();
+		let identity = repo::capture_repository_layout_identity(&found).unwrap();
+		let command_directory = RetainedCommandDirectory::capture(nested.clone())
+			.await
+			.unwrap();
+
+		std::fs::rename(&nested, &retained).unwrap();
+		std::fs::create_dir(&nested).unwrap();
+		let (setup, common, git, worktree) = repo::command_setup_lease(&found, identity).await.unwrap();
+		let error = match revalidated_push_command_directory(
+			&found,
+			command_directory,
+			&setup,
+			common,
+			git,
+			worktree,
+		)
+		.await
+		{
+			Ok(_) => panic!("a replaced push command directory must be rejected"),
+			Err(error) => error,
+		};
+		drop(setup);
+		assert!(
+			error
+				.to_string()
+				.contains("push command directory changed during remote negotiation"),
+			"{error:#}"
+		);
+	}
 
 	#[tokio::test]
 	async fn pusher_identity_uses_the_retained_repository_after_path_replacement() {

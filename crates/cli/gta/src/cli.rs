@@ -570,6 +570,12 @@ enum SubmoduleAction {
 		/// Do not fetch; use only locally available objects and remote-tracking refs.
 		#[arg(short = 'N', long)]
 		no_fetch: bool,
+		/// Check out the selected commit on a detached HEAD, overriding configured strategy.
+		#[arg(long)]
+		checkout: bool,
+		/// Merge the selected commit into the module's current branch or detached HEAD.
+		#[arg(long)]
+		merge: bool,
 		/// Recursively update initialized descendants (and initialize them with `--init`).
 		#[arg(long)]
 		recursive: bool,
@@ -1171,6 +1177,8 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 			no_recommend_shallow,
 			remote,
 			no_fetch,
+			checkout,
+			merge,
 			recursive,
 			paths,
 		} => Action::Update {
@@ -1179,6 +1187,13 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 			recommend_shallow: recommend_shallow || !no_recommend_shallow,
 			remote,
 			fetch: !no_fetch,
+			strategy: if checkout {
+				Some(commands::submodule::UpdateStrategy::Checkout)
+			} else if merge {
+				Some(commands::submodule::UpdateStrategy::Merge)
+			} else {
+				None
+			},
 			recursive,
 			paths,
 		},
@@ -1299,5 +1314,44 @@ fn remote_action(verbose: bool, action: Option<RemoteAction>) -> commands::remot
 		Some(RemoteAction::Remove { name }) => Action::Remove { name },
 		Some(RemoteAction::Rename { old, new }) => Action::Rename { old, new },
 		Some(RemoteAction::SetUrl { name, url }) => Action::SetUrl { name, url },
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn update_strategy_flags_use_checkout_precedence_and_map_to_the_shared_action() {
+		for (flag, expected) in [
+			("--checkout", commands::submodule::UpdateStrategy::Checkout),
+			("--merge", commands::submodule::UpdateStrategy::Merge),
+		] {
+			let cli = Cli::try_parse_from(["gta", "submodule", "update", flag]).unwrap();
+			let Command::Submodule { action } = cli.command else {
+				panic!("expected submodule command");
+			};
+			assert!(matches!(
+				submodule_action(action),
+				commands::submodule::Action::Update {
+					strategy: Some(strategy),
+					..
+				} if strategy == expected
+			));
+		}
+		for flags in [["--checkout", "--merge"], ["--merge", "--checkout"]] {
+			let cli =
+				Cli::try_parse_from(["gta", "submodule", "update"].into_iter().chain(flags)).unwrap();
+			let Command::Submodule { action } = cli.command else {
+				panic!("expected submodule command");
+			};
+			assert!(matches!(
+				submodule_action(action),
+				commands::submodule::Action::Update {
+					strategy: Some(commands::submodule::UpdateStrategy::Checkout),
+					..
+				}
+			));
+		}
 	}
 }

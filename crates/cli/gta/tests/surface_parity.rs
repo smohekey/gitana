@@ -7,12 +7,13 @@
 //! counted), global-ness, allowed values, and defaults. Argument *groups* (mutual exclusion /
 //! required-one) are compared too.
 //!
-//! Deliberately excluded are the two surfaces' **intended** differences: presentation (`gta` uses
+//! Deliberately normalized are the two surfaces' **intended** differences: presentation (`gta` uses
 //! positionals where `gta-mcp` uses `--named` arguments — so long/short flags, positional-ness,
 //! value names, and the raw `num_args` that encodes them are not compared; `action` carries the
-//! semantic arity instead), and the clap-mcp serving flags that exist on `gta-mcp` only. Raw value
-//! parsers (e.g. `String` vs `PathBuf`) are not compared either — only restricted `possible_values`,
-//! which is the surface-affecting part.
+//! semantic arity instead), native Git-compatible `--checkout` / `--merge` flags versus the MCP
+//! `strategy` enum, and the clap-mcp serving flags that exist on `gta-mcp` only. Raw value parsers
+//! (e.g. `String` vs `PathBuf`) are not compared either — only restricted `possible_values`, which
+//! is the surface-affecting part.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,8 +23,9 @@ const MCP_ONLY_ARG_IDS: &[&str] = &["mcp", "mcp-http"];
 
 #[test]
 fn gta_and_mcp_expose_the_same_surface() {
-	let gta = CommandSpec::of(&gta::clap_command());
-	let mcp = CommandSpec::of(&gta_mcp::clap_command());
+	let mut gta = CommandSpec::of(&gta::clap_command());
+	let mut mcp = CommandSpec::of(&gta_mcp::clap_command());
+	normalize_submodule_update_strategy(&mut gta, &mut mcp);
 
 	let mut diffs = Vec::new();
 	gta.diff("gta", &mcp, &mut diffs);
@@ -34,6 +36,34 @@ fn gta_and_mcp_expose_the_same_surface() {
 	);
 }
 
+/// The native CLI follows Git's flag spelling and checkout precedence when both flags are present,
+/// while the JSON-facing MCP tool uses one enum-valued field. Prove both shapes and then compare them
+/// as the same semantic choice.
+fn normalize_submodule_update_strategy(gta: &mut CommandSpec, mcp: &mut CommandSpec) {
+	let gta = gta
+		.subcommands
+		.get_mut("submodule")
+		.and_then(|command| command.subcommands.get_mut("update"))
+		.expect("gta submodule update command");
+	let mcp = mcp
+		.subcommands
+		.get_mut("submodule")
+		.and_then(|command| command.subcommands.get_mut("update"))
+		.expect("gta-mcp submodule update command");
+	let checkout = gta.args.remove("checkout").expect("native --checkout");
+	let merge = gta.args.remove("merge").expect("native --merge");
+	assert_eq!(checkout.action, "SetTrue");
+	assert_eq!(merge.action, "SetTrue");
+	let strategy = mcp.args.get("strategy").expect("MCP strategy enum");
+	assert_eq!(strategy.action, "Set");
+	assert_eq!(strategy.possible_values, ["checkout", "merge"]);
+	gta.args.insert("strategy".to_owned(), strategy.clone());
+	let group = gta.groups.get_mut("Update").expect("native update group");
+	group.args.remove("checkout");
+	group.args.remove("merge");
+	group.args.insert("strategy".to_owned());
+}
+
 /// The presentation-agnostic shape of one (sub)command: its arguments, groups, and subcommands.
 struct CommandSpec {
 	args: BTreeMap<String, ArgSpec>,
@@ -42,7 +72,7 @@ struct CommandSpec {
 }
 
 /// The semantic properties of one argument, ignoring how it is presented on the command line.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct ArgSpec {
 	required: bool,
 	/// Debug of the clap `ArgAction` — `SetTrue` (flag), `Set` (one value), `Append`

@@ -18,7 +18,7 @@ use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
 
 use crate::repo::{self, RepositoryLayout};
-use crate::{Backend, RepositoryLayoutIdentity, WorkDir};
+use crate::{Backend, RepositoryLayoutIdentity, RetainedCommandDirectory, WorkDir};
 
 /// Read the object format through a common-directory capability that has already been identity
 /// checked. The path is retained only for diagnostics and supported config-symlink resolution.
@@ -50,12 +50,18 @@ fn detect_algorithm_text(text: &str) -> Result<HashKind> {
 /// A command that needs only the object graph and refs, written once over the repo's hash
 /// algorithm `H`.
 pub trait RepoCommand {
+	/// Retain the effective command directory for operations that spawn configured child processes.
+	fn set_command_directory(&mut self, _path: std::path::PathBuf, _directory: Dir) {}
+
 	async fn run<H: HashAlgorithm>(self, repo: Repository<Backend, H>) -> Result<()>;
 }
 
 /// A command that needs the working tree (index + work dir), also given the pathspec
 /// `prefix` (the `/`-joined work-tree-relative subdirectory the command was invoked from).
 pub trait WorkTreeCommand {
+	/// Retain the effective command directory for operations that spawn configured child processes.
+	fn set_command_directory(&mut self, _path: std::path::PathBuf, _directory: Dir) {}
+
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
@@ -68,6 +74,7 @@ enum ConfigAccess {
 	SetupOnly,
 	Read,
 	Mutation,
+	HistoryMutation,
 }
 
 /// Discover the repository containing `cwd`, then run `command` under the repo's hash
@@ -90,23 +97,34 @@ pub async fn on_repo_config_mutation<C: RepoCommand>(cwd: &Path, command: C) -> 
 }
 
 async fn on_repo_inner<C: RepoCommand>(cwd: &Path, command: C, access: ConfigAccess) -> Result<()> {
-	let found = repo::discover(cwd).await?;
+	let cwd = tokio::fs::canonicalize(cwd).await?;
+	let found = repo::discover(&cwd).await?;
+	let command_directory = RetainedCommandDirectory::capture(cwd).await?;
 	let identity = repo::capture_repository_layout_identity(&found)?;
-	on_discovered_repo(found, identity, command, access).await
+	on_discovered_repo(found, identity, command_directory, command, access).await
 }
 
 async fn on_discovered_repo<C: RepoCommand>(
 	found: RepositoryLayout,
 	identity: RepositoryLayoutIdentity,
-	command: C,
+	command_directory: RetainedCommandDirectory,
+	mut command: C,
 	access: ConfigAccess,
 ) -> Result<()> {
-	let (setup, common, git, _) = if matches!(access, ConfigAccess::Mutation) {
+	let (setup, common, git, worktree) = if matches!(access, ConfigAccess::Mutation) {
 		repo::command_config_mutation_lease(&found, identity).await?
 	} else {
 		repo::command_setup_lease(&found, identity).await?
 	};
-	setup.validate()?;
+	let repo::RevalidatedCommandDirectory {
+		path: command_path,
+		directory: cwd_directory,
+		common,
+		git,
+		worktree: _,
+	} = repo::revalidated_command_directory(&found, command_directory, &setup, common, git, worktree)
+		.await?;
+	command.set_command_directory(command_path, cwd_directory);
 	if matches!(access, ConfigAccess::Mutation) {
 		repo::ensure_no_pending_deinit_at(&found, &common, &git)?;
 	}
@@ -155,74 +173,113 @@ pub async fn on_worktree_config_mutation<C: WorkTreeCommand>(cwd: &Path, command
 	on_worktree_inner(cwd, command, ConfigAccess::Mutation).await
 }
 
+/// Run a multi-resource history operation under the worktree guard shared with submodule update.
+/// Contention is reported before the command can alter its index, checkout, or operation state.
+pub async fn on_worktree_history_mutation<C: WorkTreeCommand>(
+	cwd: &Path,
+	command: C,
+) -> Result<()> {
+	on_worktree_inner(cwd, command, ConfigAccess::HistoryMutation).await
+}
+
 async fn on_worktree_inner<C: WorkTreeCommand>(
 	cwd: &Path,
 	command: C,
 	access: ConfigAccess,
 ) -> Result<()> {
-	let (found, prefix) = repo::discover_worktree_with_prefix(cwd).await?;
+	let (found, command_cwd, prefix) = repo::discover_worktree_with_prefix(cwd).await?;
+	let command_directory = RetainedCommandDirectory::capture(command_cwd).await?;
 	let identity = repo::capture_worktree_layout_identity(&found)?;
-	on_discovered_worktree(found, identity, prefix, command, access).await
+	on_discovered_worktree(found, identity, command_directory, prefix, command, access).await
 }
 
 async fn on_discovered_worktree<C: WorkTreeCommand>(
 	found: RepositoryLayout,
 	identity: RepositoryLayoutIdentity,
+	command_directory: RetainedCommandDirectory,
 	prefix: String,
-	command: C,
+	mut command: C,
 	access: ConfigAccess,
 ) -> Result<()> {
 	let worktree_root = found.worktree_root.clone().expect("discovered work tree");
-	let (setup, common, git, work) = if matches!(access, ConfigAccess::Mutation) {
-		repo::command_config_mutation_lease(&found, identity).await?
+	let (history_guard, setup, common, git, work) = if matches!(access, ConfigAccess::HistoryMutation)
+	{
+		let (guard, setup, common, git, work) =
+			repo::command_worktree_mutation_lease(&found, identity).await?;
+		(Some(guard), setup, common, git, work)
+	} else if matches!(access, ConfigAccess::Mutation) {
+		let (setup, common, git, work) = repo::command_config_mutation_lease(&found, identity).await?;
+		(None, setup, common, git, work)
 	} else {
-		repo::command_setup_lease(&found, identity).await?
+		let (setup, common, git, work) = repo::command_setup_lease(&found, identity).await?;
+		(None, setup, common, git, work)
 	};
+	let repo::RevalidatedCommandDirectory {
+		path: command_path,
+		directory: cwd_directory,
+		common,
+		git,
+		worktree: work,
+	} = repo::revalidated_command_directory(&found, command_directory, &setup, common, git, work)
+		.await?;
 	let work = work.ok_or_else(|| anyhow!("this operation must be run in a work tree"))?;
-	setup.validate()?;
+	command.set_command_directory(command_path, cwd_directory);
 	if matches!(access, ConfigAccess::Mutation) {
 		repo::ensure_no_pending_deinit_at(&found, &common, &git)?;
 	}
 	let work = WorkDir::from_dir(work);
 	let retain_config_lease = !matches!(access, ConfigAccess::SetupOnly);
-	match detect_algorithm_at(&common, &found.common_dir).await? {
-		HashKind::Sha1 => {
-			let wt = WorkTree::new_located(
-				open_for_worktree_config_command::<Sha1>(&found, &setup, retain_config_lease, common, git)
+	let result = async {
+		match detect_algorithm_at(&common, &found.common_dir).await? {
+			HashKind::Sha1 => {
+				let wt = WorkTree::new_located(
+					open_for_worktree_config_command::<Sha1>(
+						&found,
+						&setup,
+						retain_config_lease,
+						common,
+						git,
+					)
 					.await?,
-				work,
-				found.git_dir,
-				worktree_root,
-			);
-			run_with_config_lease(
-				setup,
-				retain_config_lease,
-				Box::pin(command.run(wt, prefix)),
-			)
-			.await
-		}
-		HashKind::Sha256 => {
-			let wt = WorkTree::new_located(
-				open_for_worktree_config_command::<Sha256>(
-					&found,
-					&setup,
+					work,
+					found.git_dir,
+					worktree_root,
+				);
+				run_with_config_lease(
+					setup,
 					retain_config_lease,
-					common,
-					git,
+					Box::pin(command.run(wt, prefix)),
 				)
-				.await?,
-				work,
-				found.git_dir,
-				worktree_root,
-			);
-			run_with_config_lease(
-				setup,
-				retain_config_lease,
-				Box::pin(command.run(wt, prefix)),
-			)
-			.await
+				.await
+			}
+			HashKind::Sha256 => {
+				let wt = WorkTree::new_located(
+					open_for_worktree_config_command::<Sha256>(
+						&found,
+						&setup,
+						retain_config_lease,
+						common,
+						git,
+					)
+					.await?,
+					work,
+					found.git_dir,
+					worktree_root,
+				);
+				run_with_config_lease(
+					setup,
+					retain_config_lease,
+					Box::pin(command.run(wt, prefix)),
+				)
+				.await
+			}
 		}
 	}
+	.await;
+	if let Some(guard) = history_guard {
+		guard.validate()?;
+	}
+	result
 }
 
 async fn run_with_config_lease(
@@ -418,14 +475,18 @@ mod tests {
 #[cfg(all(test, unix))]
 mod worktree_tests {
 	use std::fs::{OpenOptions, TryLockError};
-	use std::sync::Arc;
+	#[cfg(target_os = "linux")]
+	use std::os::unix::ffi::OsStringExt as _;
 	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::sync::{Arc, Mutex};
 
 	use anyhow::Result;
 	use cap_std::{ambient_authority, fs::Dir};
 	use gitana_object::{HashAlgorithm, HashKind, Sha1};
 	use gitana_repository::Repository;
-	use gitana_submodule::acquire_submodule_config_mutation_lease;
+	use gitana_submodule::{
+		acquire_submodule_config_mutation_lease, acquire_worktree_mutation_guard,
+	};
 	use gitana_worktree::WorkTree;
 
 	use super::{
@@ -433,11 +494,41 @@ mod worktree_tests {
 		on_discovered_worktree, on_worktree,
 	};
 	use crate::repo;
-	use crate::{Backend, WorkDir};
+	use crate::{Backend, RetainedCommandDirectory, WorkDir};
 
 	struct PausedWorktreeCommand {
 		entered: Arc<AtomicBool>,
 		release: Arc<AtomicBool>,
+	}
+
+	struct RetainedCwdCommand {
+		directory: Option<Dir>,
+		entered: Arc<AtomicBool>,
+		release: Arc<AtomicBool>,
+		observed: Arc<Mutex<Option<String>>>,
+	}
+
+	impl WorkTreeCommand for RetainedCwdCommand {
+		fn set_command_directory(&mut self, _path: std::path::PathBuf, directory: Dir) {
+			self.directory = Some(directory);
+		}
+
+		async fn run<H: HashAlgorithm>(
+			self,
+			_worktree: WorkTree<Backend, WorkDir, H>,
+			_prefix: String,
+		) -> Result<()> {
+			self.entered.store(true, Ordering::SeqCst);
+			while !self.release.load(Ordering::SeqCst) {
+				tokio::task::yield_now().await;
+			}
+			let value = self
+				.directory
+				.expect("dispatch retained the command directory")
+				.read_to_string("signer-context")?;
+			*self.observed.lock().unwrap() = Some(value);
+			Ok(())
+		}
 	}
 
 	impl WorkTreeCommand for PausedWorktreeCommand {
@@ -500,6 +591,9 @@ mod worktree_tests {
 		let operation = on_discovered_repo(
 			found,
 			identity,
+			RetainedCommandDirectory::capture(visible.clone())
+				.await
+				.unwrap(),
 			RecordingRepoCommand {
 				entered: Arc::clone(&entered),
 			},
@@ -581,6 +675,176 @@ mod worktree_tests {
 	}
 
 	#[tokio::test]
+	async fn worktree_dispatch_rejects_a_nested_command_directory_replaced_while_waiting() {
+		let temporary = tempfile::tempdir().unwrap();
+		let worktree = temporary.path().join("work");
+		let command_directory = worktree.join("nested");
+		let retired = worktree.join("nested-retired");
+		let git_dir = worktree.join(".git");
+		std::fs::create_dir_all(&command_directory).unwrap();
+		std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+		std::fs::create_dir(git_dir.join("refs")).unwrap();
+		std::fs::write(
+			git_dir.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+		)
+		.unwrap();
+		std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		let found = repo::inspect_root(&worktree).await.unwrap();
+		let identity = repo::capture_worktree_layout_identity(&found).unwrap();
+		let retained =
+			RetainedCommandDirectory::capture(std::fs::canonicalize(&command_directory).unwrap())
+				.await
+				.unwrap();
+		let common = Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap();
+		let mutation = acquire_submodule_config_mutation_lease(&common, &git_dir).unwrap();
+		let entered = Arc::new(AtomicBool::new(false));
+
+		let operation = on_discovered_worktree(
+			found,
+			identity,
+			retained,
+			"nested".to_owned(),
+			PausedWorktreeCommand {
+				entered: Arc::clone(&entered),
+				release: Arc::new(AtomicBool::new(true)),
+			},
+			ConfigAccess::Read,
+		);
+		let replace = async {
+			tokio::task::yield_now().await;
+			std::fs::rename(&command_directory, &retired).unwrap();
+			std::fs::create_dir(&command_directory).unwrap();
+			drop(mutation);
+		};
+		let (result, ()) = tokio::join!(operation, replace);
+
+		let error = result.expect_err("dispatch must reject a replaced command directory");
+		assert!(
+			error
+				.to_string()
+				.contains("command working directory changed while waiting"),
+			"unexpected error: {error:#}"
+		);
+		assert!(!entered.load(Ordering::SeqCst));
+	}
+
+	#[tokio::test]
+	async fn history_dispatch_contends_before_entering_the_command() {
+		let temporary = tempfile::tempdir().unwrap();
+		let worktree = temporary.path().join("work");
+		let git_dir = worktree.join(".git");
+		std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+		std::fs::create_dir(git_dir.join("refs")).unwrap();
+		std::fs::write(
+			git_dir.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+		)
+		.unwrap();
+		std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		let git = Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap();
+		let retained = acquire_worktree_mutation_guard(&git, &git_dir).unwrap();
+		let entered = Arc::new(AtomicBool::new(false));
+
+		let result = super::on_worktree_history_mutation(
+			&worktree,
+			PausedWorktreeCommand {
+				entered: Arc::clone(&entered),
+				release: Arc::new(AtomicBool::new(true)),
+			},
+		)
+		.await;
+
+		let error = result.expect_err("a second history mutation must contend");
+		assert!(
+			error
+				.to_string()
+				.contains("another Gitana worktree mutation is in progress"),
+			"unexpected error: {error:#}"
+		);
+		assert!(!entered.load(Ordering::SeqCst));
+		drop(retained);
+	}
+
+	#[tokio::test]
+	async fn ordinary_worktree_dispatch_retains_the_original_command_directory() {
+		let temporary = tempfile::tempdir().unwrap();
+		let worktree = temporary.path().join("work");
+		let retained = temporary.path().join("retained");
+		let command_directory = worktree.join("nested");
+		let git_dir = worktree.join(".git");
+		std::fs::create_dir_all(&command_directory).unwrap();
+		std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+		std::fs::create_dir(git_dir.join("refs")).unwrap();
+		std::fs::write(
+			git_dir.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+		)
+		.unwrap();
+		std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		std::fs::write(command_directory.join("signer-context"), "original").unwrap();
+
+		let entered = Arc::new(AtomicBool::new(false));
+		let release = Arc::new(AtomicBool::new(false));
+		let observed = Arc::new(Mutex::new(None));
+		let operation = on_worktree(
+			&command_directory,
+			RetainedCwdCommand {
+				directory: None,
+				entered: Arc::clone(&entered),
+				release: Arc::clone(&release),
+				observed: Arc::clone(&observed),
+			},
+		);
+		let replace = async {
+			while !entered.load(Ordering::SeqCst) {
+				tokio::task::yield_now().await;
+			}
+			std::fs::rename(&worktree, &retained).unwrap();
+			std::fs::create_dir_all(&command_directory).unwrap();
+			std::fs::write(command_directory.join("signer-context"), "replacement").unwrap();
+			release.store(true, Ordering::SeqCst);
+		};
+		let (result, ()) = tokio::join!(operation, replace);
+		result.unwrap();
+		assert_eq!(observed.lock().unwrap().as_deref(), Some("original"));
+	}
+
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn ordinary_worktree_dispatch_preserves_a_non_utf8_command_directory() {
+		let temporary = tempfile::tempdir().unwrap();
+		let worktree = temporary.path().join("work");
+		let command_directory = worktree.join(std::ffi::OsString::from_vec(b"nested-\xff".to_vec()));
+		let git_dir = worktree.join(".git");
+		std::fs::create_dir_all(&command_directory).unwrap();
+		std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+		std::fs::create_dir(git_dir.join("refs")).unwrap();
+		std::fs::write(
+			git_dir.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+		)
+		.unwrap();
+		std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		std::fs::write(command_directory.join("signer-context"), "native").unwrap();
+
+		let observed = Arc::new(Mutex::new(None));
+		on_worktree(
+			&command_directory,
+			RetainedCwdCommand {
+				directory: None,
+				entered: Arc::new(AtomicBool::new(false)),
+				release: Arc::new(AtomicBool::new(true)),
+				observed: Arc::clone(&observed),
+			},
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(observed.lock().unwrap().as_deref(), Some("native"));
+	}
+
+	#[tokio::test]
 	async fn ordinary_worktree_dispatch_rejects_a_checkout_retired_while_waiting() {
 		let temporary = tempfile::tempdir().unwrap();
 		let worktree = temporary.path().join("work");
@@ -605,6 +869,9 @@ mod worktree_tests {
 		let operation = on_discovered_worktree(
 			found,
 			identity,
+			RetainedCommandDirectory::capture(worktree.clone())
+				.await
+				.unwrap(),
 			String::new(),
 			PausedWorktreeCommand {
 				entered: Arc::clone(&entered),

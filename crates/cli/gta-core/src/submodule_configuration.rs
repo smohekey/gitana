@@ -2766,11 +2766,13 @@ mod tests {
 					recommend_shallow: true,
 					remote: false,
 					fetch: true,
+					strategy: None,
 					initialize_only_active: false,
 					reflog_committer: None,
 				},
 				&configuration,
 				&UnexpectedTransfer,
+				&(),
 			)
 			.await
 			.unwrap();
@@ -2861,11 +2863,13 @@ mod tests {
 					recommend_shallow: true,
 					remote: false,
 					fetch: true,
+					strategy: None,
 					initialize_only_active: false,
 					reflog_committer: None,
 				},
 				&configuration,
 				&transfer,
+				&(),
 			)
 			.await
 			.unwrap_err();

@@ -11,14 +11,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use cap_fs_ext::DirExt as _;
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use gitana_object::HashAlgorithm;
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
 use gitana_submodule::{
-	SubmoduleError, SubmoduleMutationLease, acquire_submodule_config_mutation_lease,
-	acquire_submodule_config_setup_lease, deinit_recovery_git_dirs,
+	SubmoduleError, SubmoduleMutationLease, WorktreeMutationGuard,
+	acquire_submodule_config_mutation_lease, acquire_submodule_config_setup_lease,
+	acquire_worktree_mutation_guard, deinit_recovery_git_dirs,
 	pending_deinit_configs_require_restore, pending_set_url_configs_require_restore,
 	repository_has_pending_deinit, repository_has_pending_set_url,
 	repository_has_set_url_participant_claim, restore_pending_deinit_configs,
@@ -26,13 +28,13 @@ use gitana_submodule::{
 };
 
 use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
-use gitana_fs_native::directory_identity;
+use gitana_fs_native::{EntryIdentity, directory_identity};
 use gitana_repository_layout::{
 	discover as discover_layout_impl, try_discover as try_discover_layout_impl,
 };
 
 use crate::submodule_configuration::WorktreeConfiguration;
-use crate::{Backend, RepositoryLayoutIdentity, WorkDir};
+use crate::{Backend, RepositoryLayoutIdentity, RetainedCommandDirectory, WorkDir};
 
 pub use gitana_repository_layout::{DiscoveryError, RepositoryLayout, inspect_root};
 
@@ -88,6 +90,72 @@ pub(crate) async fn command_setup_lease(
 			}
 			Err(error) => return Err(error),
 		}
+	}
+}
+
+/// Serialize a history operation before it can mutate this worktree's index or checkout.
+///
+/// The first setup pass repairs any recoverable Windows config displacement without holding the
+/// per-worktree guard that recovery itself needs. The guard is then acquired before the second
+/// shared-config setup lease, matching submodule update's per-worktree-then-common lock order.
+pub(crate) async fn command_worktree_mutation_lease(
+	layout: &RepositoryLayout,
+	expected: RepositoryLayoutIdentity,
+) -> Result<(
+	WorktreeMutationGuard,
+	SubmoduleMutationLease,
+	Dir,
+	Dir,
+	Option<Dir>,
+)> {
+	command_worktree_mutation_lease_impl(layout, expected, false).await
+}
+
+async fn command_worktree_mutation_lease_impl(
+	layout: &RepositoryLayout,
+	expected: RepositoryLayoutIdentity,
+	mut force_retry_after_guard: bool,
+) -> Result<(
+	WorktreeMutationGuard,
+	SubmoduleMutationLease,
+	Dir,
+	Dir,
+	Option<Dir>,
+)> {
+	loop {
+		let (initial_setup, _, _, _) = command_setup_lease(layout, expected).await?;
+		drop(initial_setup);
+
+		let (_, lock_git, _) = revalidate_repository_layout(layout, expected).await?;
+		let git_dir = layout.git_dir.clone();
+		let guard =
+			tokio::task::spawn_blocking(move || acquire_worktree_mutation_guard(&lock_git, &git_dir))
+				.await
+				.map_err(|error| anyhow!("acquiring worktree mutation lock: {error}"))?
+				.map_err(|error| match error {
+					SubmoduleError::UpdateLocked => {
+						anyhow!("another Gitana worktree mutation is in progress")
+					}
+					other => anyhow::Error::from(other),
+				})?;
+
+		// Do not call the recovery-aware setup loop while holding `guard`: config recovery acquires
+		// this same per-worktree lock. Inspect once under setup serialization and retry from the
+		// guard-free phase if a crash window appeared after the initial pass.
+		let setup = acquire_setup_lease_once(layout).await?;
+		let (common, git, worktree) = revalidate_repository_layout(layout, expected).await?;
+		let forced_retry = std::mem::take(&mut force_retry_after_guard);
+		if forced_retry
+			|| pending_configs_require_restore_at(layout, &common, &git, worktree.as_ref()).await?
+		{
+			drop(setup);
+			drop(guard);
+			continue;
+		}
+		setup.validate()?;
+		guard.validate()?;
+		let combined = guard.lease().combine(setup);
+		return Ok((guard, combined, common, git, worktree));
 	}
 }
 
@@ -488,6 +556,120 @@ pub(crate) fn capture_worktree_layout_identity(
 	capture_repository_layout_identity(layout)
 }
 
+/// Open the command's effective working directory through the repository capabilities that were
+/// revalidated after setup serialization was acquired.
+///
+/// `cwd` is the canonical directory used for discovery. Resolving its suffix below a retained root
+/// keeps later child-process setup bound to the same repository even if the public root is renamed
+/// and replaced. Every component is opened without following a new symlink.
+fn retained_command_directory(
+	layout: &RepositoryLayout,
+	cwd: &Path,
+	common: &Dir,
+	git: &Dir,
+	worktree: Option<&Dir>,
+) -> Result<Dir> {
+	if let (Some(root), Some(directory)) = (layout.worktree_root.as_deref(), worktree)
+		&& let Ok(relative) = cwd.strip_prefix(root)
+	{
+		return open_retained_subdirectory(directory, relative, cwd);
+	}
+	if let Ok(relative) = cwd.strip_prefix(&layout.git_dir) {
+		return open_retained_subdirectory(git, relative, cwd);
+	}
+	if let Ok(relative) = cwd.strip_prefix(&layout.common_dir) {
+		return open_retained_subdirectory(common, relative, cwd);
+	}
+	bail!(
+		"command working directory is outside the retained repository: {}",
+		cwd.display()
+	)
+}
+
+/// Revalidate the visible command directory after setup waiting, then return the capability opened
+/// before that wait. Later relative-resource reads therefore remain bound to the invocation's exact
+/// directory even if its public name is replaced after this boundary.
+pub(crate) struct RevalidatedCommandDirectory {
+	pub(crate) path: PathBuf,
+	pub(crate) directory: Dir,
+	pub(crate) common: Dir,
+	pub(crate) git: Dir,
+	pub(crate) worktree: Option<Dir>,
+}
+
+pub(crate) async fn revalidated_command_directory(
+	layout: &RepositoryLayout,
+	retained: RetainedCommandDirectory,
+	setup: &SubmoduleMutationLease,
+	common: Dir,
+	git: Dir,
+	worktree: Option<Dir>,
+) -> Result<RevalidatedCommandDirectory> {
+	let layout = layout.clone();
+	let setup = setup.clone();
+	let (path, directory, identity) = retained.into_parts();
+	tokio::task::spawn_blocking(move || {
+		let visible = retained_command_directory(&layout, &path, &common, &git, worktree.as_ref())?;
+		validate_retained_command_directory(&path, &directory, identity, &visible)?;
+		setup.validate()?;
+		Ok(RevalidatedCommandDirectory {
+			path,
+			directory,
+			common,
+			git,
+			worktree,
+		})
+	})
+	.await
+	.context("joining command-directory revalidation worker")?
+}
+
+fn validate_retained_command_directory(
+	path: &Path,
+	retained: &Dir,
+	identity: EntryIdentity,
+	visible: &Dir,
+) -> Result<()> {
+	let retained = directory_identity(retained).with_context(|| {
+		format!(
+			"identifying retained command working directory {}",
+			path.display()
+		)
+	})?;
+	let current = directory_identity(visible).with_context(|| {
+		format!(
+			"identifying visible command working directory {}",
+			path.display()
+		)
+	})?;
+	if retained != identity || current != identity {
+		bail!(
+			"command working directory changed while waiting for repository setup: {}",
+			path.display()
+		);
+	}
+	Ok(())
+}
+
+/// Open a canonical repository-relative command directory without following replacement symlinks.
+fn open_retained_subdirectory(root: &Dir, relative: &Path, display: &Path) -> Result<Dir> {
+	let mut directory = root
+		.try_clone()
+		.with_context(|| format!("retaining command working directory {}", display.display()))?;
+	for component in relative.components() {
+		let std::path::Component::Normal(name) = component else {
+			if matches!(component, std::path::Component::CurDir) {
+				continue;
+			}
+			bail!("invalid command working directory: {}", display.display());
+		};
+		directory = directory
+			.open_dir_nofollow(name)
+			.with_context(|| format!("retaining command working directory {}", display.display()))?;
+	}
+	Ok(directory)
+}
+
 fn open_identity_directory(path: &Path, kind: &str) -> Result<Dir> {
 	Dir::open_ambient_dir(path, ambient_authority())
 		.with_context(|| format!("opening {kind} {}", path.display()))
@@ -651,12 +833,15 @@ pub fn open_work_dir(work: &Path) -> Result<WorkDir> {
 	Ok(CapWorkDir::from_dir(dir))
 }
 
-/// Discover the working tree containing `start` as a [`RepositoryLayout`] plus the pathspec `prefix`,
-/// without constructing a typed `WorkTree`. The runtime dispatch needs the paths so it can build a
-/// `WorkTree<_, H>` for whichever hash algorithm the repo uses. The prefix is the `/`-joined path
-/// from the work-tree root down to `start` (empty at the root), making pathspecs relative to the
-/// caller's subdirectory, the way `git -C <subdir>` does.
-pub async fn discover_worktree_with_prefix(start: &Path) -> Result<(RepositoryLayout, String)> {
+/// Discover the working tree containing `start` as a [`RepositoryLayout`], the canonical native
+/// command directory, and the pathspec `prefix`, without constructing a typed `WorkTree`. The
+/// runtime dispatch needs the paths so it can build a `WorkTree<_, H>` for whichever hash algorithm
+/// the repo uses. The prefix is the `/`-joined path from the work-tree root down to `start` (empty at
+/// the root), making pathspecs relative to the caller's subdirectory, the way `git -C <subdir>` does.
+/// The native path must remain separate because the pathspec string can be lossy on Unix.
+pub async fn discover_worktree_with_prefix(
+	start: &Path,
+) -> Result<(RepositoryLayout, PathBuf, String)> {
 	// Resolve symlinks before discovering, so the prefix reflects the physical location of the
 	// caller's directory under the work tree (e.g. `-C linksub` where `linksub -> sub`).
 	// Otherwise the lexical name would be matched/recorded as a tracked path. Discovery canonicalizes
@@ -676,7 +861,7 @@ pub async fn discover_worktree_with_prefix(start: &Path) -> Result<(RepositoryLa
 		.map(|component| component.as_os_str().to_string_lossy())
 		.collect::<Vec<_>>()
 		.join("/");
-	Ok((found, prefix))
+	Ok((found, start, prefix))
 }
 
 /// If `branch` (a full ref like `refs/heads/main`) is checked out in a *different* worktree of this
@@ -822,6 +1007,39 @@ pub(crate) fn is_bare(common_dir: &Path) -> bool {
 
 fn canonical(path: &Path) -> PathBuf {
 	std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod worktree_mutation_tests {
+	use std::time::Duration;
+
+	use super::*;
+
+	#[tokio::test]
+	async fn mutation_setup_drops_its_guard_before_a_recovery_retry() {
+		let temporary = tempfile::tempdir().unwrap();
+		let worktree = temporary.path().join("worktree");
+		let git = worktree.join(".git");
+		std::fs::create_dir_all(git.join("objects")).unwrap();
+		std::fs::create_dir_all(git.join("refs")).unwrap();
+		std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		std::fs::write(
+			git.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+		)
+		.unwrap();
+		let layout = inspect_root(&worktree).await.unwrap();
+		let identity = capture_worktree_layout_identity(&layout).unwrap();
+
+		let acquired = tokio::time::timeout(
+			Duration::from_secs(1),
+			command_worktree_mutation_lease_impl(&layout, identity, true),
+		)
+		.await
+		.expect("a recovery retry must not contend with its own worktree guard")
+		.unwrap();
+		drop(acquired);
+	}
 }
 
 #[cfg(all(test, unix))]

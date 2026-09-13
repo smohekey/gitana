@@ -15,6 +15,8 @@ mod error;
 mod gated_file_store;
 mod head;
 mod head_lock;
+mod head_reset_plan;
+mod head_transaction;
 mod merge;
 mod merge_base;
 mod merge_state;
@@ -33,6 +35,7 @@ pub use self::{
 	error::RepositoryError,
 	head::HeadState,
 	head_lock::{HeadLock, PreparedDetachedHead},
+	head_transaction::HeadTransaction,
 	merge::TreeMerge,
 	mode::FileMode,
 	rebase_state::RebaseState,
@@ -41,6 +44,8 @@ pub use self::{
 	repository::Repository,
 	tree::{TreeBuildEntry, compute_tree_id},
 };
+
+pub(crate) use self::head_reset_plan::HeadResetPlan;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) use self::gated_file_store::GatedFileStore;

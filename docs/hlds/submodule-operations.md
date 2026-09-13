@@ -9,8 +9,8 @@ explicitly recurse into nested
 submodules; omitted flags remain one-level operations, and root pathspecs select only the first
 level before every eligible descendant is considered. `clone --recurse-submodules[=<pathspec>]`
 (also spelled `--recursive[=<pathspec>]`) publishes the root clone and then performs an initializing
-recursive update over the selected submodules. The `merge`, `rebase`, and custom-command update
-strategies remain unsupported.
+recursive update over the selected submodules. The `checkout`, `merge`, and `none` update strategies
+are supported; `rebase` and custom-command strategies remain unsupported.
 Unsupported strategies are rejected before initialization or module filesystem mutation; `none` is
 an explicit skip.
 
@@ -105,8 +105,81 @@ revalidated after transfer and immediately before publication. For an existing m
 the current module branch's effective `branch.<name>.remote`, defaulting to `origin`; the local `.`
 remote selects the module's own refs without transport. Named remotes use their own URL, tag policy,
 and fetch refspecs. A hidden `HEAD` pseudo-ref still selects the OID of its advertised symbolic target;
-an explicit advertised `HEAD` remains authoritative when both are present. Checkout remains detached,
-and merge, rebase, and custom-command forms remain out of scope.
+an explicit advertised `HEAD` remains authoritative when both are present. Checkout remains detached
+unless merge strategy integration is selected.
+
+Update strategy precedence is an explicit `--checkout` or `--merge`, then the effective
+repository/command `submodule.<name>.update` value, then the `.gitmodules` declaration, then
+`checkout`. The MCP surface represents the same explicit choice as `strategy=checkout|merge`.
+The native Git-compatible surface accepts both explicit flags together and gives `--checkout`
+precedence regardless of their argument order; the single-valued MCP form is unambiguous.
+Initialization accepts and persists the safe `merge` declaration value. An explicit strategy
+overrides a configured unsupported value for that invocation without rewriting it.
+
+`merge` applies only to an existing, initialized, mounted module after target selection and any
+fetch have completed. It invokes the same porcelain merge engine as `gta merge`, preserving the
+module's current branch or detached HEAD, `core.fileMode`, sparse-checkout behavior,
+author/committer identity, configured SSH commit signing, reflogs, fast-forwards, and true
+two-parent merge commits. The merge snapshots `HEAD`, then acquires one sorted, deduplicated lock set
+covering `HEAD`, every symbolic hop, its terminal direct ref, `ORIG_HEAD`, and `packed-refs` when
+applicable before integration. It retains those locks through signing and checkout and publishes
+only to that captured terminal while preserving the symbolic files. If the chain itself terminates
+at `ORIG_HEAD`, the target advances that terminal directly instead of also trying to store the old
+tip under the same name. Each hop is revalidated and receives Git-compatible reflog entries; a
+concurrent checkout or symbolic-ref retarget therefore cannot redirect a merge onto a different
+same-tip branch. The delegated merge runs in an owned in-process
+task that retains the superproject/module leases and namespace capabilities through its terminal
+validation, so cancelling its caller does not expose a half-applied checkout to another Gitana
+mutation. Dropping any retained ref lock synchronously removes the lock and prunes empty nested ref
+directories created solely for that lock, so a failed merge on an unborn nested branch cannot leave
+a parent ref name blocked. If that pruning removes a parent between another lock's parent creation
+and atomic file creation, the acquiring worker recreates the namespace and retries only that
+`NotFound` race; contention and other namespace errors retain their normal meaning.
+
+Every native signing command receives its effective working directory from the repository or
+worktree capability revalidated by command dispatch. A relative SSH signing key is canonicalized
+through that retained directory on a blocking worker and opened once. Retained public-key reads use
+that file handle. On Unix, `ssh-keygen` receives a mode-0400 private snapshot owned by the signer
+guard, so closing inherited descriptors cannot discard the selected key and replacing the original
+pathname cannot select new contents. Snapshot creation, copying, permissions, and retained-file
+reads run on blocking workers; uses of the retained file are serialized. On Windows, key and signer
+path retention likewise runs on a blocking worker, and the key handle denies write and delete
+sharing while `ssh-keygen` reopens its path.
+Symlink chains that resolve within the retained worktree therefore keep the selected file after a
+namespace move, while a chain that escapes it is rejected before the process is spawned.
+Unix rejects path-bearing relative signer programs because it cannot portably execute an already
+open program descriptor; callers must use a bare `PATH` name or an absolute path. On Windows, a
+path-bearing relative signer executable is canonicalized through the retained command directory,
+made absolute, and opened without write or delete sharing through `CreateProcess`. An omitted
+`.exe` suffix follows Rust's process resolution order: the suffixed entry is selected when present,
+otherwise the literal spelling is retained. Every mutable
+directory component is pinned through process creation as well, preventing junction or symlink
+retargeting. Drive and UNC roots are excluded from that write-denying set. A bare program name
+retains normal `PATH` lookup, while a drive-relative spelling such as `C:tools\\signer.exe` is
+rejected because it depends on ambient per-drive process state. The blocking Windows retention runs
+on a blocking worker before the asynchronous signer spawns the process.
+Absolute and UNC paths retain their normal Git meaning. Parent-relative signer resources are
+rejected before mutation because moving a retained Unix directory to another parent changes the
+meaning of `..`.
+Relative public-key file arguments for `trust add-key` and `trust remove-key` are read through the
+same retained command-directory capability. Lexically contained `.` and `..` components are
+normalized, while an escape above that retained directory is rejected instead of being reopened
+through the ambient namespace. Parseable inline OpenSSH and OpenPGP keys are classified before this
+path confinement, so key comments that contain path-like text remain literal arguments.
+Native targets without a handle-bound child working-directory primitive reject signing rather
+than falling back to an ambient path. Already-current targets still pass through merge and report
+an already-up-to-date merge outcome without resolving `core.excludesFile`; excludes are loaded only
+under the locked HEAD snapshot once checkout or conflict materialisation is required. A conflict
+leaves the module's conflict stages, worktree markers,
+`MERGE_HEAD`, and `MERGE_MSG` materialized for resolution with normal commands in that module,
+reports its paths, and fails the submodule update. A pending merge, cherry-pick, revert, or rebase
+refuses a new integration before mutation.
+
+Newly cloned modules, retained repositories being reattached, and durable update recovery always
+use the exact detached-checkout path, even when `merge` is configured or requested. This keeps
+publication and crash recovery pinned to their recorded target without extending the journal
+schema to history integration. The requested strategy propagates to recursive descendants, and a
+successfully merged parent is eligible for descent. `rebase` and custom commands remain out of scope.
 
 `submodule set-branch (-b|--branch <branch> | -d|--default) <path>` edits the declaration selected
 by an exact repository-root `.gitmodules` path. The path is not a pathspec and is not resolved from
@@ -744,23 +817,36 @@ capabilities validated against that proof and binds the lease to detached file-s
 Signing, identity resolution, sparse and file-mode
 reconciliation, checkout, and ref publication therefore remain serialized through post-fetch
 integration without holding the common config guard across network I/O.
-Signed push keeps the setup lease attached to the originally opened repository and resolves the
-lazy certificate identity through that retained repository capability. The identity is still not
-read unless the server accepts signed pushes, while a rename or path replacement cannot mix the
-original refs and objects with another repository's signer identity.
-Ordinary worktree dispatch discovers only the layout and path prefix before acquiring its shared
-setup lease. Before waiting it records the worktree, per-worktree Git-directory, and common-directory
+Signed push captures the exact invocation directory before HTTP or SSH negotiation, revalidates its
+visible identity after setup serialization is reacquired, and then gives the original directory
+capability to the lazy signer. It keeps the setup lease attached to the originally opened repository
+and still does not read the certificate identity unless the server accepts signed pushes. Replacing
+the repository or only a nested invocation directory during the network wait therefore fails before
+signing or remote mutation.
+Ordinary worktree dispatch discovers the layout, canonical native command directory, and path
+prefix before acquiring its shared setup lease. Before waiting it opens the exact command directory
+and records its identity together with the worktree, per-worktree Git-directory, and common-directory
 identities. While holding the lease it exact-root revalidates both the canonical layout and those
-identities, then consumes the exact checked capabilities. Hash selection, pending-recovery gating,
+identities, reopens the visible command-directory suffix through the checked repository capability,
+and compares it with the retained pre-wait directory. Commands consume that original directory
+handle rather than the post-wait reopen. Initial capture and post-wait reopening and identity checks
+run on blocking workers. The revalidation worker owns the repository capabilities and a setup-lease
+clone until it has finished, so cancellation cannot release serialization while namespace I/O is
+still running. Hash selection, pending-recovery gating,
 the repository-local config, and `config.worktree` are all read through those retained directories;
 the canonical paths remain only for Git path-matching semantics and diagnostics. An empty
 replacement, moved checkout, rebound repository, or same-layout inode replacement therefore fails
 before command execution, while a replacement installed after revalidation cannot be mixed with
 the retained repository. Dispatch retains the lease through
-the complete command future and passes a clone to detached file-store workers. Status, switch,
-reset, remove, move, checkout, and other worktree operations therefore serialize every deferred
-`core.fileMode`, sparse-checkout, and repository-config read without requiring a command-by-command
-allow-list.
+the complete command future and passes a clone to detached file-store workers. A replacement of
+only a nested invocation directory is therefore rejected before command execution, while a later
+replacement cannot redirect relative signer or trust-key reads away from the retained directory.
+The native command
+directory remains a `PathBuf` throughout capability reopening; the display/pathspec string is never
+parsed back into a filesystem path, so non-UTF-8 Unix directory names remain addressable. Status,
+switch, reset, remove, move, checkout, and other worktree operations therefore serialize every
+deferred `core.fileMode`, sparse-checkout, and repository-config read without requiring a
+command-by-command allow-list.
 Repository-only dispatch follows the same rule, including bare repositories: it records the optional
 worktree plus per-worktree and common Git-directory identities before waiting, exact-root revalidates
 them under setup serialization, and supplies hash detection, effective-config loading, and pending
@@ -855,7 +941,16 @@ original local-modification refusal. `RollingBack`, `RolledBack`, and `RollbackC
 the persisted intent's force and phase semantics; a new request without `--force` never repeats a
 fresh cleanliness check against the restored dirty checkout before retiring the journal.
 
-`init`, `update`, and `deinit` share the per-worktree mutation lock. Operations that may change the
+`init`, `update`, and `deinit` share the per-worktree mutation lock. The same stable guard serializes
+multi-resource history operations whose index or worktree publication precedes their final ref or
+operation-state publication: merge, full reset, cherry-pick, revert, and rebase, including their
+continue/abort forms. These commands perform recovery-aware setup, acquire the per-worktree guard,
+then reacquire shared-config setup in that order. If a recoverable config displacement appeared
+between those phases, they drop both setup and worktree guards and restart recovery without holding
+the per-worktree lock recovery itself needs. A contender therefore fails before changing the index
+or worktree instead of discovering the retained merge's ref locks after partial mutation.
+Pull retains no such lock during network transfer and acquires it only for post-fetch integration.
+The historical `gitana-submodule-update.lock` filename remains the common on-disk guard. Operations that may change the
 shared superproject config also share the common config lock described above. Config publication and
 before-image restoration pass an opaque lease into their blocking namespace workers, so cancelling
 the awaiting future cannot release serialization while a worker can still move the active config.

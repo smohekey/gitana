@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::Backend;
 use anyhow::{Result, bail};
+use cap_std::fs::Dir;
 use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_porcelain::Identity;
 use gitana_repository::{ReflogIntent, Repository};
@@ -38,6 +39,7 @@ pub async fn run(
 			message,
 			signing_key,
 			cwd: cwd.to_path_buf(),
+			cwd_directory: None,
 		},
 	)
 	.await
@@ -53,9 +55,15 @@ struct Tag {
 	signing_key: Option<PathBuf>,
 	/// The effective working directory, for resolving a relative signing-key path (`-C`).
 	cwd: PathBuf,
+	cwd_directory: Option<Dir>,
 }
 
 impl RepoCommand for Tag {
+	fn set_command_directory(&mut self, path: PathBuf, directory: Dir) {
+		self.cwd = path;
+		self.cwd_directory = Some(directory);
+	}
+
 	async fn run<H: HashAlgorithm>(self, repo: Repository<Backend, H>) -> Result<()> {
 		let Some(name) = self.name.clone() else {
 			for (name, _) in repo.refs().list("refs/tags/").await? {
@@ -116,7 +124,15 @@ impl Tag {
 		let tagger = CliIdentity::new(repo).committer().await?;
 
 		if self.should_sign(repo).await? {
-			let signer = LazyCliSigner::new(repo, self.signing_key, self.cwd);
+			let signer = LazyCliSigner::new_in(
+				repo,
+				self.signing_key,
+				self.cwd,
+				self
+					.cwd_directory
+					.as_ref()
+					.expect("dispatch retained the command directory"),
+			)?;
 			gitana_porcelain::tag_signed(repo, oid, name, &tagger, message, &signer).await
 		} else {
 			gitana_porcelain::tag(repo, oid, name, &tagger, message).await

@@ -8,6 +8,10 @@
 mod entry_identity;
 mod namespace;
 mod path;
+#[allow(unsafe_code)]
+mod process;
+mod process_current_dir_guard;
+mod process_file_guard;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows;
@@ -18,3 +22,6 @@ pub use self::namespace::{
 	rename_noreplace_if_identity, replace_if_identities, replace_if_identity,
 };
 pub use self::path::{lexical_normalize, paths_equivalent, strip_path_prefix};
+pub use self::process::{configure_process_current_dir, configure_process_file, open_process_file};
+pub use self::process_current_dir_guard::ProcessCurrentDirGuard;
+pub use self::process_file_guard::ProcessFileGuard;

@@ -33,6 +33,7 @@ struct ToolSpec {
 	path: Vec<String>,
 	args: Vec<ClapArg>,
 	arg_groups: Vec<ClapArgGroup>,
+	allowed_values: HashMap<String, Vec<String>>,
 	prefix_count: usize,
 }
 
@@ -84,6 +85,7 @@ impl GtaMcpServer {
 			.filter(|tool| specs.contains_key(tool.name.as_ref()))
 			.collect();
 		constrain_count_schemas(&mut tools, &specs);
+		constrain_allowed_value_schemas(&mut tools, &specs);
 		constrain_required_exclusive_group_schemas(&mut tools, &specs);
 		Ok(Self {
 			tools: Arc::new(tools),
@@ -355,12 +357,24 @@ fn collect_specs(
 		schema: &clap_mcp::ClapCommand,
 		path: &mut Vec<String>,
 		inherited: &[ClapArg],
+		inherited_allowed_values: &HashMap<String, Vec<String>>,
 		out: &mut HashMap<String, ToolSpec>,
 	) -> Result<()> {
 		path.push(schema.name.clone());
 		let mut args = inherited.to_vec();
 		let prefix_count = args.len();
 		args.extend(schema.args.clone());
+		let mut allowed_values = inherited_allowed_values.clone();
+		for argument in command.get_arguments() {
+			let values: Vec<String> = argument
+				.get_possible_values()
+				.iter()
+				.map(|value| value.get_name().to_owned())
+				.collect();
+			if !values.is_empty() {
+				allowed_values.insert(argument.get_id().as_str().to_owned(), values);
+			}
+		}
 		let executable = schema.subcommands.is_empty() || !command.is_subcommand_required_set();
 		if path.len() > 1 && executable {
 			let name = tool_name(&path[1..]);
@@ -371,6 +385,7 @@ fn collect_specs(
 						path: path[1..].to_vec(),
 						args: args.clone(),
 						arg_groups: schema.arg_groups.clone(),
+						allowed_values: allowed_values.clone(),
 						prefix_count,
 					},
 				)
@@ -393,19 +408,34 @@ fn collect_specs(
 				.chain(schema.args.iter().filter(|arg| arg.global).cloned())
 				.collect()
 		};
+		let global_ids: HashSet<&str> = globals
+			.iter()
+			.map(|argument| argument.id.as_str())
+			.collect();
+		let global_allowed_values = allowed_values
+			.into_iter()
+			.filter(|(id, _)| global_ids.contains(id.as_str()))
+			.collect();
 		for child in &schema.subcommands {
 			let actual = command
 				.get_subcommands()
 				.find(|candidate| candidate.get_name() == child.name)
 				.ok_or_else(|| anyhow!("clap schema drift at {}", child.name))?;
-			walk(actual, child, path, &globals, out)?;
+			walk(actual, child, path, &globals, &global_allowed_values, out)?;
 		}
 		path.pop();
 		Ok(())
 	}
 
 	let mut out = HashMap::new();
-	walk(command, &schema.root, &mut Vec::new(), &[], &mut out)?;
+	walk(
+		command,
+		&schema.root,
+		&mut Vec::new(),
+		&[],
+		&HashMap::new(),
+		&mut out,
+	)?;
 	Ok(out)
 }
 
@@ -451,7 +481,12 @@ fn validate_arguments(
 			}
 			continue;
 		};
-		validate_argument(tool, arg, value)?;
+		validate_argument(
+			tool,
+			arg,
+			value,
+			spec.allowed_values.get(&arg.id).map(Vec::as_slice),
+		)?;
 	}
 	validate_required_exclusive_groups(spec, arguments, tool)?;
 	Ok(())
@@ -486,7 +521,12 @@ fn validate_required_exclusive_groups(
 	Ok(())
 }
 
-fn validate_argument(tool: &str, arg: &ClapArg, value: &Value) -> Result<(), McpError> {
+fn validate_argument(
+	tool: &str,
+	arg: &ClapArg,
+	value: &Value,
+	allowed_values: Option<&[String]>,
+) -> Result<(), McpError> {
 	let invalid = |expected: &str| {
 		invalid_argument(
 			tool,
@@ -520,6 +560,24 @@ fn validate_argument(tool: &str, arg: &ClapArg, value: &Value) -> Result<(), Mcp
 			}
 		}
 	}
+	if let Some(allowed_values) = allowed_values {
+		let valid = match value {
+			Value::String(value) => allowed_values.contains(value),
+			Value::Array(values) => values.iter().all(|value| {
+				value
+					.as_str()
+					.is_some_and(|value| allowed_values.iter().any(|allowed| allowed == value))
+			}),
+			_ => true,
+		};
+		if !valid {
+			return Err(invalid_argument(
+				tool,
+				arg,
+				&format!("must be one of {}", allowed_values.join(", ")),
+			));
+		}
+	}
 	Ok(())
 }
 
@@ -547,6 +605,37 @@ fn constrain_count_schemas(tools: &mut [Tool], specs: &HashMap<String, ToolSpec>
 			};
 			property.insert("minimum".to_owned(), Value::from(0));
 			property.insert("maximum".to_owned(), Value::from(MAX_COUNT_ARGUMENT));
+		}
+	}
+}
+
+fn constrain_allowed_value_schemas(tools: &mut [Tool], specs: &HashMap<String, ToolSpec>) {
+	for tool in tools {
+		let Some(spec) = specs.get(tool.name.as_ref()) else {
+			continue;
+		};
+		let schema = Arc::make_mut(&mut tool.input_schema);
+		let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
+			continue;
+		};
+		for (id, allowed_values) in &spec.allowed_values {
+			let Some(property) = properties.get_mut(id).and_then(Value::as_object_mut) else {
+				continue;
+			};
+			let choices = Value::Array(allowed_values.iter().cloned().map(Value::String).collect());
+			if argument_is_array(
+				spec
+					.args
+					.iter()
+					.find(|argument| argument.id == *id)
+					.expect("allowed values belong to a tool argument"),
+			) {
+				if let Some(items) = property.get_mut("items").and_then(Value::as_object_mut) {
+					items.insert("enum".to_owned(), choices);
+				}
+			} else {
+				property.insert("enum".to_owned(), choices);
+			}
 		}
 	}
 }
@@ -848,6 +937,17 @@ mod tests {
 		assert!(!server.specs.contains_key("status_2"));
 		let spec = server.specs.get("submodule_update").unwrap();
 		assert!(spec.args.iter().any(|argument| argument.id == "config"));
+		let update_tool = server
+			.tools
+			.iter()
+			.find(|tool| tool.name.as_ref() == "submodule_update")
+			.unwrap();
+		assert_eq!(
+			update_tool.input_schema["properties"]["strategy"]["enum"],
+			serde_json::json!(["checkout", "merge"]),
+			"strategy schema: {}",
+			update_tool.input_schema["properties"]["strategy"]
+		);
 		let arguments = serde_json::from_value(serde_json::json!({
 			"config": ["protocol.file.allow=always"],
 			"init": true
@@ -961,6 +1061,12 @@ mod tests {
 
 		let cat_file = server.specs.get("cat-file").unwrap();
 		assert!(validate_arguments(cat_file, &Map::new(), "cat-file").is_err());
+
+		let update = server.specs.get("submodule_update").unwrap();
+		let accepted = serde_json::from_value(serde_json::json!({ "strategy": "merge" })).unwrap();
+		validate_arguments(update, &accepted, "submodule_update").unwrap();
+		let rejected = serde_json::from_value(serde_json::json!({ "strategy": "rebase" })).unwrap();
+		assert!(validate_arguments(update, &rejected, "submodule_update").is_err());
 	}
 
 	#[test]

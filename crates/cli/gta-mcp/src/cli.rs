@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use gta_core::commands;
 
 /// Drive one parsed command to completion on a fresh current-thread runtime.
@@ -624,6 +624,9 @@ enum SubmoduleAction {
 		/// Do not fetch; use only locally available objects and remote-tracking refs.
 		#[arg(short = 'N', long)]
 		no_fetch: bool,
+		/// Override the configured update strategy.
+		#[arg(long, value_enum)]
+		strategy: Option<SubmoduleUpdateStrategy>,
 		/// Recursively update initialized descendants (and initialize them with `--init`).
 		#[arg(long)]
 		recursive: bool,
@@ -667,6 +670,12 @@ enum SubmoduleAction {
 		#[arg(long = "path")]
 		paths: Vec<String>,
 	},
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SubmoduleUpdateStrategy {
+	Checkout,
+	Merge,
 }
 
 #[derive(Args)]
@@ -1245,6 +1254,7 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 			no_recommend_shallow,
 			remote,
 			no_fetch,
+			strategy,
 			recursive,
 			paths,
 		} => Action::Update {
@@ -1253,6 +1263,10 @@ fn submodule_action(action: SubmoduleAction) -> commands::submodule::Action {
 			recommend_shallow: recommend_shallow || !no_recommend_shallow,
 			remote,
 			fetch: !no_fetch,
+			strategy: strategy.map(|strategy| match strategy {
+				SubmoduleUpdateStrategy::Checkout => commands::submodule::UpdateStrategy::Checkout,
+				SubmoduleUpdateStrategy::Merge => commands::submodule::UpdateStrategy::Merge,
+			}),
 			recursive,
 			paths,
 		},
@@ -1413,6 +1427,17 @@ mod tests {
 		recommend_shallow
 	}
 
+	fn update_strategy(arguments: &[&str]) -> Option<commands::submodule::UpdateStrategy> {
+		let cli = Cli::try_parse_from(arguments).unwrap();
+		let Command::Submodule { action } = cli.command else {
+			panic!("expected submodule command");
+		};
+		let commands::submodule::Action::Update { strategy, .. } = submodule_action(action) else {
+			panic!("expected submodule update command");
+		};
+		strategy
+	}
+
 	#[test]
 	fn shallow_policy_negations_follow_the_last_occurrence() {
 		assert!(!clone_is_forced_shallow(&[
@@ -1445,6 +1470,20 @@ mod tests {
 			"--no-recommend-shallow",
 			"--recommend-shallow",
 		]));
+	}
+
+	#[test]
+	fn update_strategy_enum_maps_to_the_shared_action() {
+		assert_eq!(update_strategy(&["gta-mcp", "submodule", "update"]), None);
+		assert_eq!(
+			update_strategy(&["gta-mcp", "submodule", "update", "--strategy=checkout",]),
+			Some(commands::submodule::UpdateStrategy::Checkout)
+		);
+		assert_eq!(
+			update_strategy(&["gta-mcp", "submodule", "update", "--strategy=merge",]),
+			Some(commands::submodule::UpdateStrategy::Merge)
+		);
+		assert!(Cli::try_parse_from(["gta-mcp", "submodule", "update", "--strategy=rebase",]).is_err());
 	}
 
 	#[test]

@@ -3,10 +3,11 @@
 //! signed updates; `list` shows the current policy and enrolled key fingerprints; `sync` safely
 //! adopts the origin's trust root (forward-only, only if it verifies).
 
-use std::io::{IsTerminal, Write};
+use std::io::{ErrorKind, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use cap_std::fs::Dir;
 use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_porcelain::{
 	TRUST_REF, TrustSyncOutcome, trust_add_key, trust_init, trust_list, trust_remove_key,
@@ -72,6 +73,7 @@ pub async fn run(cwd: &Path, action: Action) -> Result<()> {
 		Trust {
 			action,
 			cwd: cwd.to_path_buf(),
+			cwd_directory: None,
 		},
 	)
 	.await
@@ -207,11 +209,21 @@ struct Trust {
 	action: Action,
 	/// The effective working directory, for resolving relative signing-key/public-key paths (`-C`).
 	cwd: PathBuf,
+	cwd_directory: Option<Dir>,
 }
 
 impl RepoCommand for Trust {
+	fn set_command_directory(&mut self, path: PathBuf, directory: Dir) {
+		self.cwd = path;
+		self.cwd_directory = Some(directory);
+	}
+
 	async fn run<H: HashAlgorithm>(self, repo: Repository<Backend, H>) -> Result<()> {
 		let identity = CliIdentity::new(&repo);
+		let cwd_directory = self
+			.cwd_directory
+			.as_ref()
+			.expect("dispatch retained the command directory");
 		match self.action {
 			Action::Init {
 				policy,
@@ -220,7 +232,7 @@ impl RepoCommand for Trust {
 				dry_run,
 			} => {
 				let policy = parse_policy(&policy)?;
-				let signer = CliSigner::resolve(&repo, signing_key, &self.cwd).await?;
+				let signer = CliSigner::resolve_in(&repo, signing_key, &self.cwd, cwd_directory).await?;
 				let pubkey = signer.public_line().await?;
 				if dry_run {
 					return init_preflight(&repo, policy, break_glass, &pubkey).await;
@@ -233,8 +245,8 @@ impl RepoCommand for Trust {
 			}
 			Action::List => print_root(&repo).await,
 			Action::AddKey { key, signing_key } => {
-				let signer = CliSigner::resolve(&repo, signing_key, &self.cwd).await?;
-				let key_line = read_key_arg(&key, &self.cwd).await?;
+				let signer = CliSigner::resolve_in(&repo, signing_key, &self.cwd, cwd_directory).await?;
+				let key_line = read_key_arg(&key, &self.cwd, cwd_directory).await?;
 				let (tip, event) = trust_add_key(&repo, &key_line, &identity, &signer).await?;
 				println!("Enrolled key; {TRUST_REF} now at {tip}");
 				eprintln!("{event}");
@@ -245,8 +257,8 @@ impl RepoCommand for Trust {
 				signing_key,
 				break_glass,
 			} => {
-				let signer = CliSigner::resolve(&repo, signing_key, &self.cwd).await?;
-				let selector = read_key_arg(&key, &self.cwd).await?;
+				let signer = CliSigner::resolve_in(&repo, signing_key, &self.cwd, cwd_directory).await?;
+				let selector = read_key_arg(&key, &self.cwd, cwd_directory).await?;
 				let (tip, event) =
 					trust_remove_key(&repo, &selector, break_glass, &identity, &signer).await?;
 				println!("Removed key; {TRUST_REF} now at {tip}");
@@ -263,7 +275,7 @@ impl RepoCommand for Trust {
 				if dry_run {
 					return set_policy_preflight(&repo, policy, break_glass).await;
 				}
-				let signer = CliSigner::resolve(&repo, signing_key, &self.cwd).await?;
+				let signer = CliSigner::resolve_in(&repo, signing_key, &self.cwd, cwd_directory).await?;
 				let (tip, event) = trust_set_policy(&repo, policy, break_glass, &identity, &signer).await?;
 				println!("Policy set to {policy}; {TRUST_REF} now at {tip}");
 				eprintln!("{event}");
@@ -389,12 +401,48 @@ fn print_trust_root(root: &TrustRoot) {
 /// out of it — an armored OpenPGP certificate verbatim, otherwise the OpenSSH public-key line;
 /// if it does not name a file, pass it through verbatim (a literal OpenSSH/OpenPGP key, or — for
 /// `remove-key` — a `SHA256:…`/OpenPGP fingerprint). A relative file path honors `-C` via `cwd`.
-async fn read_key_arg(arg: &str, cwd: &Path) -> Result<String> {
-	let path = cwd.join(arg);
-	if path.is_file() {
-		let contents = tokio::fs::read_to_string(&path)
-			.await
-			.with_context(|| format!("reading public key {}", path.display()))?;
+async fn read_key_arg(arg: &str, cwd: &Path, cwd_directory: &Dir) -> Result<String> {
+	let literal = arg.trim();
+	let valid_literal = TrustedKey::parse(literal).is_ok();
+	let argument = Path::new(arg);
+	let path = cwd.join(argument);
+	let contents = if argument.is_absolute() {
+		if !path.is_file() {
+			None
+		} else {
+			Some(
+				tokio::fs::read_to_string(&path)
+					.await
+					.with_context(|| format!("reading public key {}", path.display()))?,
+			)
+		}
+	} else {
+		let relative = match confined_relative_key_path(argument, &path) {
+			Ok(relative) => relative,
+			Err(_) if valid_literal => return Ok(literal.to_owned()),
+			Err(error) => return Err(error),
+		};
+		let directory = cwd_directory
+			.try_clone()
+			.with_context(|| format!("retaining command directory for {}", path.display()))?;
+		tokio::task::spawn_blocking(move || match directory.metadata(&relative) {
+			Ok(metadata) if metadata.is_file() => directory.read_to_string(&relative).map(Some),
+			Ok(_) => Ok(None),
+			Err(error)
+				if matches!(
+					error.kind(),
+					ErrorKind::NotFound | ErrorKind::InvalidInput | ErrorKind::InvalidFilename
+				) =>
+			{
+				Ok(None)
+			}
+			Err(error) => Err(error),
+		})
+		.await
+		.map_err(|error| anyhow!("reading public key {}: {error}", path.display()))?
+		.with_context(|| format!("reading public key {}", path.display()))?
+	};
+	if let Some(contents) = contents {
 		// An armored OpenPGP public key spans multiple lines and is used verbatim; an OpenSSH key is a
 		// single line extracted from the file (e.g. a `.pub` or a private-key file's comment).
 		if contents.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----") {
@@ -407,7 +455,26 @@ async fn read_key_arg(arg: &str, cwd: &Path) -> Result<String> {
 			)
 		});
 	}
-	Ok(arg.trim().to_owned())
+	Ok(literal.to_owned())
+}
+
+fn confined_relative_key_path(path: &Path, display: &Path) -> Result<PathBuf> {
+	let mut relative = PathBuf::new();
+	for component in path.components() {
+		match component {
+			std::path::Component::CurDir => {}
+			std::path::Component::Normal(name) => relative.push(name),
+			std::path::Component::ParentDir if relative.pop() => {}
+			std::path::Component::ParentDir => {
+				bail!(
+					"relative public-key path escapes the retained command directory: {}",
+					display.display()
+				)
+			}
+			_ => bail!("invalid relative public-key path: {}", display.display()),
+		}
+	}
+	Ok(relative)
 }
 
 /// Parse the `--policy` value. Accepts git-trust's three policies; the default is `warn`.
@@ -417,5 +484,101 @@ fn parse_policy(value: &str) -> Result<Policy> {
 		"warn" => Ok(Policy::Warn),
 		"require" => Ok(Policy::Require),
 		other => bail!("unknown policy `{other}` (expected off, warn, or require)"),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use cap_std::{ambient_authority, fs::Dir};
+	use gitana_trust::TrustedKey;
+
+	use super::read_key_arg;
+
+	const ORIGINAL: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOriginal original@example.com";
+	const REPLACEMENT: &str =
+		"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIReplacement replacement@example.com";
+	const VALID_OPENSSH_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID5Nhef6H6xysJyj00CxhgxEAQTGQ7yCZwrRSE9JgCzS test@example.com";
+	const SSH_FINGERPRINT: &str = "SHA256:8rQT7qQXoP52gfbVe93AMgGBOJeEDmR5il4Sj/mmxG0";
+
+	#[tokio::test]
+	async fn relative_key_reads_remain_bound_to_the_retained_command_directory() {
+		let temporary = tempfile::tempdir().unwrap();
+		let visible = temporary.path().join("command");
+		let retained = temporary.path().join("retained");
+		std::fs::create_dir(&visible).unwrap();
+		std::fs::write(visible.join("key.pub"), ORIGINAL).unwrap();
+		let directory = Dir::open_ambient_dir(&visible, ambient_authority()).unwrap();
+		std::fs::rename(&visible, &retained).unwrap();
+		std::fs::create_dir(&visible).unwrap();
+		std::fs::write(visible.join("key.pub"), REPLACEMENT).unwrap();
+
+		let key = read_key_arg("key.pub", &visible, &directory).await.unwrap();
+		assert_eq!(key, ORIGINAL);
+	}
+
+	#[tokio::test]
+	async fn relative_key_paths_normalize_without_escaping_the_retained_directory() {
+		let temporary = tempfile::tempdir().unwrap();
+		std::fs::create_dir(temporary.path().join("nested")).unwrap();
+		std::fs::write(temporary.path().join("key.pub"), ORIGINAL).unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+
+		let key = read_key_arg("nested/../key.pub", temporary.path(), &directory)
+			.await
+			.unwrap();
+		assert_eq!(key, ORIGINAL);
+		let error = read_key_arg("../key.pub", temporary.path(), &directory)
+			.await
+			.unwrap_err();
+		assert!(
+			error
+				.to_string()
+				.contains("escapes the retained command directory")
+		);
+	}
+
+	#[tokio::test]
+	async fn invalid_filename_key_arguments_remain_literals() {
+		let temporary = tempfile::tempdir().unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let long_key = format!("{VALID_OPENSSH_KEY} {}", "x".repeat(512));
+		TrustedKey::parse(&long_key).unwrap();
+
+		let key = read_key_arg(&long_key, temporary.path(), &directory)
+			.await
+			.unwrap();
+		assert_eq!(key, long_key);
+
+		let selector = read_key_arg(SSH_FINGERPRINT, temporary.path(), &directory)
+			.await
+			.unwrap();
+		assert_eq!(selector, SSH_FINGERPRINT);
+	}
+
+	#[tokio::test]
+	async fn inline_key_comments_are_classified_before_path_confinement() {
+		let temporary = tempfile::tempdir().unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		let key = format!("{VALID_OPENSSH_KEY} foo/../../bar");
+		TrustedKey::parse(&key).unwrap();
+
+		let resolved = read_key_arg(&key, temporary.path(), &directory)
+			.await
+			.unwrap();
+		assert_eq!(resolved, key);
+
+		let error = read_key_arg(
+			"ssh-ed25519 not-base64 foo/../../bar",
+			temporary.path(),
+			&directory,
+		)
+		.await
+		.unwrap_err();
+		assert!(
+			error
+				.to_string()
+				.contains("escapes the retained command directory"),
+			"{error:#}"
+		);
 	}
 }

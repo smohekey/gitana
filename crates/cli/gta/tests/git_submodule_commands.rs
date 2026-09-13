@@ -6611,7 +6611,7 @@ fn module_merge_checkout_honors_configured_and_default_global_excludes() {
 			let xdg = xdg.to_str().unwrap();
 			gta_with_environment(
 				&fixture.consumer,
-				&["submodule", "update"],
+				&["submodule", "update", "--merge"],
 				&[
 					("GIT_ALLOW_PROTOCOL", "file"),
 					("GIT_CONFIG_GLOBAL", "/dev/null"),
@@ -6624,7 +6624,7 @@ fn module_merge_checkout_honors_configured_and_default_global_excludes() {
 			gta_with_configs(
 				&fixture.consumer,
 				&["protocol.file.allow=always", &setting],
-				&["submodule", "update"],
+				&["submodule", "update", "--merge"],
 			)
 		};
 		assert_success(&update, "module update with global excludes");
@@ -9469,11 +9469,7 @@ fn unsupported_update_strategy_fails_before_init_or_repository_creation() {
 
 #[test]
 fn standalone_init_rejects_every_unsupported_declaration_strategy_before_config_mutation() {
-	for (tag, strategy) in [
-		("init-rebase", "rebase"),
-		("init-merge", "merge"),
-		("init-custom", "!echo nope"),
-	] {
+	for (tag, strategy) in [("init-rebase", "rebase"), ("init-custom", "!echo nope")] {
 		let fixture = Fixture::new(tag);
 		let modules = fixture.consumer.join(".gitmodules");
 		let mut declaration = std::fs::read_to_string(&modules).unwrap();
@@ -9506,7 +9502,6 @@ fn standalone_init_rejects_every_unsupported_declaration_strategy_before_config_
 fn standalone_init_rejects_unsupported_effective_strategies_before_config_mutation() {
 	for (tag, strategy) in [
 		("configured-rebase", "rebase"),
-		("configured-merge", "merge"),
 		("configured-custom", "!echo nope"),
 	] {
 		let fixture = Fixture::new(tag);
@@ -9541,6 +9536,634 @@ fn standalone_init_rejects_unsupported_effective_strategies_before_config_mutati
 	);
 	assert!(stderr(&init).contains("unsupported submodule update strategy"));
 	assert_eq!(std::fs::read(&config).unwrap(), before);
+}
+
+#[test]
+fn init_accepts_and_records_the_merge_update_strategy() {
+	let fixture = Fixture::new("init-merge-strategy");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.update",
+			"merge",
+		],
+	);
+
+	let init = gta(&fixture.consumer, false, &["submodule", "init"]);
+	assert_success(&init, "init with merge strategy");
+	assert_eq!(
+		git(
+			&fixture.consumer,
+			&["config", "--get", "submodule.one.update"]
+		)
+		.trim(),
+		"merge"
+	);
+}
+
+#[test]
+fn merge_strategy_uses_exact_checkout_for_new_and_reattached_modules() {
+	let fixture = Fixture::new("new-module-merge-strategy");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"config",
+			"-f",
+			".gitmodules",
+			"submodule.one.update",
+			"merge",
+		],
+	);
+
+	let update = gta(&fixture.consumer, true, &["submodule", "update", "--init"]);
+	assert_success(&update, "initial update with merge strategy");
+	let module = fixture.consumer.join("modules/one");
+	assert!(
+		git(&module, &["branch", "--show-current"])
+			.trim()
+			.is_empty()
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), fixture.old);
+	assert!(stdout(&update).contains(&format!(
+		"Submodule path 'modules/one': checked out '{}'",
+		fixture.old
+	)));
+	assert!(!stdout(&update).contains("merged in"));
+
+	git_ok(&module, &["checkout", "-q", "-b", "topic"]);
+	assert_success(
+		&gta(
+			&fixture.consumer,
+			false,
+			&["submodule", "deinit", "-f", "modules/one"],
+		),
+		"retain the module",
+	);
+	let target = fixture.commit_source("reattached\n", "advance source for reattachment");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{target},modules/one"),
+		],
+	);
+	let update = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--init", "--merge"],
+	);
+	assert_success(&update, "reattachment with merge strategy");
+	assert!(
+		git(&module, &["branch", "--show-current"])
+			.trim()
+			.is_empty()
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), target);
+	assert!(stdout(&update).contains(&format!(
+		"Submodule path 'modules/one': checked out '{target}'"
+	)));
+	assert!(!stdout(&update).contains("merged in"));
+}
+
+#[test]
+fn configured_merge_update_fast_forwards_the_current_module_branch() {
+	let fixture = Fixture::new("configured-merge-fast-forward");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(&module, &["checkout", "-q", "-b", "topic"]);
+	let target = fixture.commit_source("new\n", "advance source");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{target},modules/one"),
+		],
+	);
+	git_ok(
+		&fixture.consumer,
+		&["config", "submodule.one.update", "merge"],
+	);
+	git_ok(&module, &["config", "commit.gpgSign", "true"]);
+	git_ok(&module, &["config", "gpg.format", "unsupported"]);
+
+	let update = gta(&fixture.consumer, true, &["submodule", "update"]);
+	assert_success(&update, "configured merge update");
+	assert_eq!(
+		git(&module, &["symbolic-ref", "--short", "HEAD"]).trim(),
+		"topic"
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), target);
+	assert!(stdout(&update).contains("Fast-forward"));
+	assert!(stdout(&update).contains(&format!(
+		"Submodule path 'modules/one': merged in '{target}'"
+	)));
+
+	let current = gta(&fixture.consumer, true, &["submodule", "update"]);
+	assert_success(&current, "already-current configured merge update");
+	assert!(stdout(&current).contains("Already up to date."));
+	assert!(stdout(&current).contains(&format!(
+		"Submodule path 'modules/one': merged in '{target}'"
+	)));
+}
+
+#[test]
+fn already_current_merge_defers_invalid_excludes_files() {
+	let valueless = Fixture::new("merge-current-valueless-excludes");
+	assert_success(
+		&gta(
+			&valueless.consumer,
+			true,
+			&["submodule", "update", "--init"],
+		),
+		"initial valueless-excludes update",
+	);
+	let module = valueless.consumer.join("modules/one");
+	let config_path = git_path(&module, "config");
+	let mut config = std::fs::read_to_string(&config_path).unwrap();
+	config.push_str("[core]\n\texcludesFile\n");
+	std::fs::write(&config_path, config).unwrap();
+	let current = gta(
+		&valueless.consumer,
+		true,
+		&["submodule", "update", "--merge"],
+	);
+	assert_success(&current, "already-current merge with valueless excludes");
+	assert!(stdout(&current).contains("Already up to date."));
+
+	let directory = Fixture::new("merge-current-directory-excludes");
+	assert_success(
+		&gta(
+			&directory.consumer,
+			true,
+			&["submodule", "update", "--init"],
+		),
+		"initial directory-excludes update",
+	);
+	let module = directory.consumer.join("modules/one");
+	std::fs::create_dir(module.join("exclude-dir")).unwrap();
+	git_ok(&module, &["config", "core.excludesFile", "exclude-dir"]);
+	let current = gta(
+		&directory.consumer,
+		true,
+		&["submodule", "update", "--merge"],
+	);
+	assert_success(&current, "already-current merge with excludes directory");
+	assert!(stdout(&current).contains("Already up to date."));
+
+	let target = directory.commit_source("new\n", "advance source");
+	git_ok(
+		&directory.consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{target},modules/one"),
+		],
+	);
+	let update = gta(
+		&directory.consumer,
+		true,
+		&["submodule", "update", "--merge"],
+	);
+	assert!(!update.status.success(), "a checkout must resolve excludes");
+	assert!(
+		stderr(&update).contains("cannot use") && stderr(&update).contains("as an exclude file"),
+		"unexpected excludes error: {}",
+		stderr(&update)
+	);
+}
+
+#[test]
+fn remote_merge_updates_the_current_module_branch() {
+	let fixture = Fixture::new("remote-merge-fast-forward");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(&module, &["checkout", "-q", "-b", "topic"]);
+	let target = fixture.commit_source("remote tip\n", "advance source");
+
+	let update = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--remote", "--merge"],
+	);
+	assert_success(&update, "remote merge update");
+	assert_eq!(git(&module, &["branch", "--show-current"]).trim(), "topic");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), target);
+	assert_eq!(
+		git(&module, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+		target
+	);
+	assert!(stdout(&update).contains(&format!(
+		"Submodule path 'modules/one': merged in '{target}'"
+	)));
+}
+
+#[test]
+fn explicit_merge_update_creates_a_two_parent_commit() {
+	let fixture = Fixture::new("explicit-merge-commit");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(&module, &["checkout", "-q", "-b", "topic"]);
+	std::fs::write(module.join("local.txt"), b"local\n").unwrap();
+	git_ok(&module, &["add", "local.txt"]);
+	commit(&module, "local change");
+	let local = git(&module, &["rev-parse", "HEAD"]).trim().to_owned();
+	git_ok(&module, &["config", "user.name", "Test"]);
+	git_ok(&module, &["config", "user.email", "test@example.com"]);
+	let target = fixture.commit_source("remote\n", "remote change");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{target},modules/one"),
+		],
+	);
+
+	let update = gta(&fixture.consumer, true, &["submodule", "update", "--merge"]);
+	assert_success(&update, "explicit merge update");
+	let head = git(&module, &["rev-parse", "HEAD"]).trim().to_owned();
+	assert_ne!(head, target);
+	assert_eq!(
+		git(&module, &["show", "-s", "--format=%P", "HEAD"])
+			.split_whitespace()
+			.collect::<Vec<_>>(),
+		vec![local.as_str(), target.as_str()]
+	);
+	assert!(stdout(&update).contains("Merge made by the 'recursive' strategy."));
+	assert!(stdout(&update).contains(&format!(
+		"Submodule path 'modules/one': merged in '{target}'"
+	)));
+}
+
+#[cfg(unix)]
+#[test]
+fn signed_module_merge_resolves_relative_key_from_the_module() {
+	if Command::new("ssh-keygen").arg("-?").output().is_err() {
+		eprintln!("skipping: ssh-keygen not available");
+		return;
+	}
+	let fixture = Fixture::new("signed-module-merge-relative-paths");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(&module, &["checkout", "-q", "-b", "topic"]);
+	std::fs::write(module.join("local.txt"), b"local\n").unwrap();
+	git_ok(&module, &["add", "local.txt"]);
+	commit(&module, "local change");
+	let target = fixture.commit_source("remote\n", "remote change");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{target},modules/one"),
+		],
+	);
+
+	let key = module.join("signing-key");
+	let keygen = Command::new("ssh-keygen")
+		.args(["-q", "-t", "ed25519", "-N", "", "-f"])
+		.arg(&key)
+		.output()
+		.expect("run ssh-keygen");
+	assert_success(&keygen, "generate module signing key");
+	git_ok(&module, &["config", "user.name", "Test"]);
+	git_ok(&module, &["config", "user.email", "test@example.com"]);
+	git_ok(&module, &["config", "commit.gpgSign", "true"]);
+	git_ok(&module, &["config", "gpg.format", "ssh"]);
+	git_ok(&module, &["config", "gpg.ssh.program", "ssh-keygen"]);
+	git_ok(&module, &["config", "user.signingkey", "signing-key"]);
+
+	let update = gta(&fixture.consumer, true, &["submodule", "update", "--merge"]);
+	assert_success(&update, "signed merge with module-relative signing key");
+	assert!(
+		git(&module, &["cat-file", "-p", "HEAD"]).contains("gpgsig -----BEGIN SSH SIGNATURE-----"),
+		"the merge commit must carry the configured SSH signature"
+	);
+}
+
+#[test]
+fn signed_module_merge_rejects_parent_relative_key_before_mutation() {
+	let fixture = Fixture::new("signed-module-merge-parent-key");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(&module, &["checkout", "-q", "-b", "topic"]);
+	std::fs::write(module.join("local.txt"), b"local\n").unwrap();
+	git_ok(&module, &["add", "local.txt"]);
+	commit(&module, "local change");
+	let before = git(&module, &["rev-parse", "HEAD"]).trim().to_owned();
+	let target = fixture.commit_source("remote\n", "remote change");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{target},modules/one"),
+		],
+	);
+
+	std::fs::write(module.parent().unwrap().join("signing-key"), b"unused\n").unwrap();
+	git_ok(&module, &["config", "user.name", "Test"]);
+	git_ok(&module, &["config", "user.email", "test@example.com"]);
+	git_ok(&module, &["config", "commit.gpgSign", "true"]);
+	git_ok(&module, &["config", "gpg.format", "ssh"]);
+	git_ok(&module, &["config", "user.signingkey", "../signing-key"]);
+
+	let update = gta(&fixture.consumer, true, &["submodule", "update", "--merge"]);
+	assert!(!update.status.success(), "parent-relative key must fail");
+	assert!(
+		stderr(&update).contains("cannot use parent-relative signing key from a retained worktree"),
+		"unexpected error: {}",
+		stderr(&update)
+	);
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), before);
+	assert!(git(&module, &["status", "--porcelain"]).trim().is_empty());
+	assert!(!git_path(&module, "MERGE_HEAD").exists());
+}
+
+#[test]
+fn recursive_merge_descends_through_a_merged_parent() {
+	let root = unique_tmp("recursive-merge");
+	let leaf = root.join("leaf");
+	let parent = root.join("parent");
+	let superproject = root.join("super");
+	let consumer = root.join("consumer");
+	for repository in [&leaf, &parent, &superproject] {
+		std::fs::create_dir_all(repository).unwrap();
+		init_repository(repository, None);
+		std::fs::write(repository.join("file.txt"), b"recorded\n").unwrap();
+		git_ok(repository, &["add", "file.txt"]);
+		commit(repository, "recorded");
+	}
+	git_allow(&parent, &["submodule", "add", "../leaf", "child"]);
+	commit(&parent, "add child");
+	git_allow(
+		&superproject,
+		&["submodule", "add", "../parent", "modules/parent"],
+	);
+	commit(&superproject, "add parent");
+	assert_success(
+		&Command::new("git")
+			.args(["clone", "-q", "--no-recurse-submodules"])
+			.arg(&superproject)
+			.arg(&consumer)
+			.output()
+			.unwrap(),
+		"clone recursive merge fixture",
+	);
+	assert_success(
+		&gta(
+			&consumer,
+			true,
+			&["submodule", "update", "--init", "--recursive"],
+		),
+		"initialize recursive merge fixture",
+	);
+	let mounted_parent = consumer.join("modules/parent");
+	let mounted_leaf = mounted_parent.join("child");
+	git_ok(&mounted_parent, &["checkout", "-q", "-b", "topic"]);
+	git_ok(&mounted_leaf, &["checkout", "-q", "-b", "topic"]);
+
+	std::fs::write(leaf.join("file.txt"), b"leaf tip\n").unwrap();
+	git_ok(&leaf, &["add", "file.txt"]);
+	commit(&leaf, "advance leaf");
+	let leaf_tip = git(&leaf, &["rev-parse", "HEAD"]).trim().to_owned();
+	git_allow(&parent.join("child"), &["fetch", "origin"]);
+	git_ok(&parent.join("child"), &["checkout", "-q", &leaf_tip]);
+	git_ok(&parent, &["add", "child"]);
+	commit(&parent, "advance child gitlink");
+	let parent_tip = git(&parent, &["rev-parse", "HEAD"]).trim().to_owned();
+	git_ok(
+		&consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{parent_tip},modules/parent"),
+		],
+	);
+
+	let update = gta(
+		&consumer,
+		true,
+		&["submodule", "update", "--recursive", "--merge"],
+	);
+	assert_success(&update, "recursive merge update");
+	assert_eq!(
+		git(&mounted_parent, &["branch", "--show-current"]).trim(),
+		"topic"
+	);
+	assert_eq!(
+		git(&mounted_leaf, &["branch", "--show-current"]).trim(),
+		"topic"
+	);
+	assert_eq!(
+		git(&mounted_parent, &["rev-parse", "HEAD"]).trim(),
+		parent_tip
+	);
+	assert_eq!(git(&mounted_leaf, &["rev-parse", "HEAD"]).trim(), leaf_tip);
+	assert!(stdout(&update).contains(&format!(
+		"Submodule path 'modules/parent': merged in '{parent_tip}'"
+	)));
+	assert!(stdout(&update).contains(&format!(
+		"Submodule path 'modules/parent/child': merged in '{leaf_tip}'"
+	)));
+
+	std::fs::write(mounted_leaf.join("file.txt"), b"local nested change\n").unwrap();
+	git_ok(&mounted_leaf, &["add", "file.txt"]);
+	commit(&mounted_leaf, "local nested change");
+	let nested_before = git(&mounted_leaf, &["rev-parse", "HEAD"]).trim().to_owned();
+	std::fs::write(leaf.join("file.txt"), b"remote nested change\n").unwrap();
+	git_ok(&leaf, &["add", "file.txt"]);
+	commit(&leaf, "remote nested change");
+	let conflicting_leaf_tip = git(&leaf, &["rev-parse", "HEAD"]).trim().to_owned();
+	git_allow(&parent.join("child"), &["fetch", "origin"]);
+	git_ok(
+		&parent.join("child"),
+		&["checkout", "-q", &conflicting_leaf_tip],
+	);
+	git_ok(&parent, &["add", "child"]);
+	commit(&parent, "advance child gitlink for conflict");
+	let conflicting_parent_tip = git(&parent, &["rev-parse", "HEAD"]).trim().to_owned();
+	git_ok(
+		&consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{conflicting_parent_tip},modules/parent"),
+		],
+	);
+
+	let conflict = gta(
+		&consumer,
+		true,
+		&["submodule", "update", "--recursive", "--merge"],
+	);
+	assert!(
+		!conflict.status.success(),
+		"nested merge conflict must fail"
+	);
+	assert!(stdout(&conflict).contains("CONFLICT (content): Merge conflict in file.txt"));
+	assert!(stderr(&conflict).contains(&format!(
+		"Unable to merge '{conflicting_leaf_tip}' in submodule path 'modules/parent/child'"
+	)));
+	assert_eq!(
+		git(&mounted_parent, &["rev-parse", "HEAD"]).trim(),
+		conflicting_parent_tip
+	);
+	assert_eq!(
+		git(&mounted_leaf, &["rev-parse", "HEAD"]).trim(),
+		nested_before
+	);
+	assert_eq!(
+		git(&mounted_leaf, &["rev-parse", "MERGE_HEAD"]).trim(),
+		conflicting_leaf_tip
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn merge_conflict_is_left_for_resolution_inside_the_module() {
+	let fixture = Fixture::new("merge-conflict");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	git_ok(&module, &["checkout", "-q", "-b", "topic"]);
+	std::fs::write(module.join("file.txt"), b"local\n").unwrap();
+	git_ok(&module, &["add", "file.txt"]);
+	commit(&module, "local change");
+	let before = git(&module, &["rev-parse", "HEAD"]).trim().to_owned();
+	git_ok(&module, &["config", "user.name", "Test"]);
+	git_ok(&module, &["config", "user.email", "test@example.com"]);
+	let target = fixture.commit_source("remote\n", "remote change");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{target},modules/one"),
+		],
+	);
+
+	let update = gta(&fixture.consumer, true, &["submodule", "update", "--merge"]);
+	assert!(!update.status.success(), "conflicted update must fail");
+	assert!(stdout(&update).contains("CONFLICT (content): Merge conflict in file.txt"));
+	assert!(
+		stdout(&update).contains("Automatic merge failed"),
+		"unexpected merge diagnostic: {}",
+		stdout(&update)
+	);
+	assert!(stderr(&update).contains(&format!(
+		"Unable to merge '{target}' in submodule path 'modules/one'"
+	)));
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), before);
+	assert_eq!(git(&module, &["rev-parse", "MERGE_HEAD"]).trim(), target);
+	assert!(!git(&module, &["ls-files", "-u"]).trim().is_empty());
+	assert!(!git_path(&fixture.consumer, "gitana-submodule-update").exists());
+}
+
+#[test]
+fn explicit_checkout_and_merge_override_configured_strategies() {
+	let fixture = Fixture::new("explicit-strategy-overrides");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module = fixture.consumer.join("modules/one");
+	let target = fixture.commit_source("new\n", "advance source");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{target},modules/one"),
+		],
+	);
+	git_ok(
+		&fixture.consumer,
+		&["config", "submodule.one.update", "rebase"],
+	);
+	let checkout = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--checkout"],
+	);
+	assert_success(&checkout, "checkout override");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), target);
+
+	git_ok(&module, &["checkout", "-q", "-b", "topic", &fixture.old]);
+	git_ok(
+		&fixture.consumer,
+		&["config", "submodule.one.update", "none"],
+	);
+	let merge = gta(&fixture.consumer, true, &["submodule", "update", "--merge"]);
+	assert_success(&merge, "merge override");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), target);
+
+	let checkout_target = fixture.commit_source("checkout wins\n", "advance for combined flags");
+	git_ok(
+		&fixture.consumer,
+		&[
+			"update-index",
+			"--cacheinfo",
+			&format!("160000,{checkout_target},modules/one"),
+		],
+	);
+	let checkout = gta(
+		&fixture.consumer,
+		true,
+		&["submodule", "update", "--merge", "--checkout"],
+	);
+	assert_success(&checkout, "combined strategy flags");
+	assert_eq!(git(&module, &["rev-parse", "HEAD"]).trim(), checkout_target);
+	assert!(
+		git(&module, &["branch", "--show-current"])
+			.trim()
+			.is_empty()
+	);
+
+	let valueless = Fixture::new("explicit-strategy-overrides-valueless");
+	let config = valueless.consumer.join(".git/config");
+	let mut contents = std::fs::read_to_string(&config).unwrap();
+	contents.push_str("[submodule \"one\"]\n\tupdate\n");
+	std::fs::write(&config, contents).unwrap();
+	let checkout = gta(
+		&valueless.consumer,
+		true,
+		&["submodule", "update", "--init", "--checkout"],
+	);
+	assert_success(
+		&checkout,
+		"checkout override for a valueless configured strategy",
+	);
+	assert_eq!(
+		git(
+			&valueless.consumer.join("modules/one"),
+			&["rev-parse", "HEAD"]
+		)
+		.trim(),
+		valueless.old
+	);
 }
 
 #[test]

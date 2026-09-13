@@ -3,11 +3,13 @@
 //! CLI adapter renders; a conflict materialises in-progress state and reports its paths as data
 //! rather than printing.
 
+use std::future::Future;
+
 use anyhow::{Context, Result, bail};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_object::{HashAlgorithm, ObjectId};
-use gitana_repository::{HeadState, Repository};
+use gitana_repository::{ReflogIntent, Repository};
 use gitana_worktree::{WorkTree, WorktreeError};
 
 use crate::conflict;
@@ -45,6 +47,95 @@ pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	identity: &impl Identity,
 	signer: Option<&S>,
 ) -> Result<MergeOutcome<H>> {
+	merge_inner(
+		wt,
+		commit_spec,
+		(message, || async { Ok(None) }),
+		no_ff,
+		ff_only,
+		identity,
+		signer,
+	)
+	.await
+}
+
+/// Merge `commit_spec` with the default merge message, using the caller-resolved global excludes
+/// file when deciding whether an untracked obstruction may be overwritten. Repository-local
+/// `.gitignore` and `.git/info/exclude` inputs are still resolved by the worktree engine.
+pub async fn merge_with_excludes<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
+	wt: &WorkTree<F, W, H>,
+	commit_spec: &str,
+	excludes_file: Option<&str>,
+	no_ff: bool,
+	ff_only: bool,
+	identity: &impl Identity,
+	signer: Option<&S>,
+) -> Result<MergeOutcome<H>> {
+	let excludes_file = excludes_file.map(str::to_owned);
+	merge_inner(
+		wt,
+		commit_spec,
+		(None, || async move { Ok(excludes_file) }),
+		no_ff,
+		ff_only,
+		identity,
+		signer,
+	)
+	.await
+}
+
+/// Merge `commit_spec` while resolving the caller's global excludes only if checkout or conflict
+/// materialisation is required.
+///
+/// The one-shot loader runs under the locked HEAD snapshot, after the already-up-to-date and other
+/// graph-only outcomes have been decided. Repository-local `.gitignore` and `.git/info/exclude`
+/// inputs remain the worktree engine's responsibility.
+pub async fn merge_with_excludes_loader<
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+	S: Signer,
+	L: FnOnce() -> LF,
+	LF: Future<Output = Result<Option<String>>>,
+>(
+	wt: &WorkTree<F, W, H>,
+	commit_spec: &str,
+	load_excludes: L,
+	no_ff: bool,
+	ff_only: bool,
+	identity: &impl Identity,
+	signer: Option<&S>,
+) -> Result<MergeOutcome<H>> {
+	merge_inner(
+		wt,
+		commit_spec,
+		(None, load_excludes),
+		no_ff,
+		ff_only,
+		identity,
+		signer,
+	)
+	.await
+}
+
+async fn merge_inner<
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+	S: Signer,
+	L: FnOnce() -> LF,
+	LF: Future<Output = Result<Option<String>>>,
+>(
+	wt: &WorkTree<F, W, H>,
+	commit_spec: &str,
+	message_and_excludes: (Option<String>, L),
+	no_ff: bool,
+	ff_only: bool,
+	identity: &impl Identity,
+	signer: Option<&S>,
+) -> Result<MergeOutcome<H>> {
+	let (message, load_excludes) = message_and_excludes;
+	let mut load_excludes = Some(load_excludes);
 	if no_ff && ff_only {
 		bail!("--no-ff and --ff-only are incompatible");
 	}
@@ -59,15 +150,14 @@ pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 		bail!("merging is not possible because you have unmerged files");
 	}
 
+	let mut head_transaction = repository.refs().lock_head_transaction().await?;
 	let theirs = repository
 		.rev_parse(&format!("{commit_spec}^{{commit}}"))
 		.await?;
-	// The current tip: the branch's commit, or the detached HEAD object id (git fast-forwards a
-	// detached HEAD, and `reset_head` handles both).
-	let head_tip = match repository.refs().read_head().await? {
-		HeadState::Symbolic(branch) => repository.refs().resolve(&branch).await?,
-		HeadState::Detached(id) => Some(id),
-	};
+	// The transaction pins both the exact HEAD spelling and its starting branch through worktree and
+	// ref publication. A concurrent checkout therefore cannot redirect the eventual reset to another
+	// same-tip branch while signing is in flight.
+	let head_tip = head_transaction.tip();
 
 	// Already up to date: `commit_spec` is already reachable from the current tip. git reports this
 	// even with a dirty work tree, so check it before doing any work.
@@ -85,6 +175,7 @@ pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 
 	// Fast-forward (always for an unborn branch — there is no commit to be a merge parent).
 	if can_fast_forward && (!no_ff || head_tip.is_none()) {
+		let excludes_file = load_merge_excludes(&mut load_excludes).await?;
 		// Apply only the HEAD→theirs diff (git's two-tree merge), so unrelated staged or dirty files
 		// survive; a local change to a path the fast-forward updates is refused, not clobbered. This is the
 		// same lock-safe, D/F- and sparse-correct engine as `switch` — it aborts on the FIRST conflicting
@@ -101,22 +192,29 @@ pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 		// HEAD's tree on a born branch, the empty tree when unborn — so the fast-forward always runs through
 		// `merge_apply` (which validates every target blob). The rebuild is atomic under the index lock (a
 		// no-op if the index exists), so it cannot discard a concurrent writer's staged work.
+		let committer = identity.committer_or_default().await?;
+		let reflog_message = format!("merge {commit_spec}: Fast-forward");
+		head_transaction
+			.prepare_reset(
+				theirs,
+				ReflogIntent::Log {
+					committer: &committer,
+					message: &reflog_message,
+				},
+			)
+			.await?;
 		wt.ensure_index_from_tree_if_missing(from_tree).await?;
-		match wt.checkout_merge(from_tree, theirs_tree, None).await {
+		match wt
+			.checkout_merge(from_tree, theirs_tree, excludes_file.as_deref())
+			.await
+		{
 			Ok(()) => {}
 			Err(WorktreeError::Conflict(path)) | Err(WorktreeError::UntrackedOverwrite(path)) => {
 				bail!("{}", would_overwrite_message(&[path]));
 			}
 			Err(error) => return Err(error.into()),
 		}
-		let committer = identity.committer_or_default().await?;
-		repository
-			.reset_head(
-				theirs,
-				&committer,
-				&format!("merge {commit_spec}: Fast-forward"),
-			)
-			.await?;
+		head_transaction.finish().await?;
 		return Ok(MergeOutcome::FastForward {
 			from: head_tip,
 			to: theirs,
@@ -161,18 +259,20 @@ pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 			.merge_trees(base_tree, head_tree, theirs_tree)
 			.await?;
 		if !merge.conflicts.is_empty() {
+			let excludes_file = load_merge_excludes(&mut load_excludes).await?;
 			// Materialise the conflict for the user to resolve: conflicted work tree and index,
 			// `ORIG_HEAD`, then `MERGE_HEAD`/`MERGE_MSG`.
-			conflict::write_conflicted_state(
+			conflict::write_conflicted_state_with_excludes(
 				wt,
 				merge.tree,
 				base_tree,
 				head_tree,
 				theirs_tree,
 				&merge.conflicts,
+				excludes_file.as_deref(),
 			)
 			.await?;
-			repository.set_orig_head(head).await?;
+			head_transaction.finish_orig_head().await?;
 			repository.start_merge(theirs, &message).await?;
 			return Ok(MergeOutcome::Conflict {
 				paths: merge.conflicts,
@@ -180,6 +280,7 @@ pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 		}
 		merge.tree
 	};
+	let excludes_file = load_merge_excludes(&mut load_excludes).await?;
 
 	let author = identity.author().await?;
 	let committer = identity.committer().await?;
@@ -199,20 +300,36 @@ pub async fn merge<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 		signer,
 	)
 	.await?;
+	let reflog_message = format!("merge {commit_spec}: Merge made by the 'recursive' strategy.");
+	head_transaction
+		.prepare_reset(
+			merge_commit,
+			ReflogIntent::Log {
+				committer: &committer,
+				message: &reflog_message,
+			},
+		)
+		.await?;
 	// Two-tree merge from HEAD's tree to the merged result: the index equals HEAD here (guarded above), so
 	// this lays down the merge while preserving unrelated local work and refusing a real conflict, sharing
 	// `switch`'s lock-safe, D/F- and sparse-correct engine.
-	wt.checkout_merge(head_tree, merged_tree, None).await?;
-	repository
-		.reset_head(
-			merge_commit,
-			&committer,
-			&format!("merge {commit_spec}: Merge made by the 'recursive' strategy."),
-		)
+	wt.checkout_merge(head_tree, merged_tree, excludes_file.as_deref())
 		.await?;
+	head_transaction.finish().await?;
 	Ok(MergeOutcome::Made {
 		commit: merge_commit,
 	})
+}
+
+async fn load_merge_excludes<L, LF>(loader: &mut Option<L>) -> Result<Option<String>>
+where
+	L: FnOnce() -> LF,
+	LF: Future<Output = Result<Option<String>>>,
+{
+	(loader
+		.take()
+		.expect("each merge path resolves excludes at most once"))()
+	.await
 }
 
 /// Conclude an in-progress merge: a two-parent commit from the resolved index, returning the new
@@ -363,10 +480,36 @@ async fn virtual_base_tree<F: FileStore, H: HashAlgorithm>(
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+	use std::sync::atomic::{AtomicBool, Ordering};
+
 	use super::*;
 	use crate::test_support::{
 		FailingSigner, TestIdentity, TestSigner, commit_file, fixture, loose_commit,
 	};
+	use gitana_file_store::FileStore;
+	use gitana_file_store_local::LocalFileStore;
+	use gitana_object::Sha256;
+	use gitana_repository::{HeadState, RefStore};
+
+	struct BranchSwitchingSigner {
+		files: LocalFileStore,
+		signer: TestSigner,
+	}
+
+	impl Signer for BranchSwitchingSigner {
+		async fn sign(&self, payload: &[u8]) -> Result<String> {
+			let refs: RefStore<'_, LocalFileStore, Sha256> = RefStore::new(&self.files);
+			let error = refs
+				.set_symbolic("HEAD", "refs/heads/other", ReflogIntent::Skip)
+				.await
+				.expect_err("the merge must retain HEAD while signing");
+			assert!(
+				matches!(&error, gitana_repository::RepositoryError::RefLocked { name } if name == "HEAD"),
+				"expected HEAD.lock contention, got {error:?}",
+			);
+			self.signer.sign(payload).await
+		}
+	}
 
 	#[tokio::test]
 	async fn a_failed_signature_leaves_a_clean_merge_recoverable() {
@@ -424,6 +567,64 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn already_up_to_date_does_not_resolve_excludes() {
+		let (dir, wt) = fixture().await;
+		let id = TestIdentity::default();
+		let target = commit_file(dir.path(), &wt, "f.txt", b"a\n", &id).await;
+		let called = AtomicBool::new(false);
+
+		let outcome = merge_with_excludes_loader(
+			&wt,
+			&target.to_hex(),
+			|| async {
+				called.store(true, Ordering::SeqCst);
+				bail!("excludes must stay lazy for an already-current merge")
+			},
+			false,
+			false,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap();
+
+		assert!(matches!(outcome, MergeOutcome::AlreadyUpToDate));
+		assert!(!called.load(Ordering::SeqCst));
+	}
+
+	#[tokio::test]
+	async fn failed_merge_prunes_directories_created_for_an_unborn_head_lock() {
+		let (dir, wt) = fixture().await;
+		let id = TestIdentity::default();
+		let refs = wt.repository().refs();
+		refs
+			.set_head_symbolic("refs/heads/team/topic", ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		merge(
+			&wt,
+			"does-not-exist",
+			None,
+			false,
+			false,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap_err();
+
+		assert!(!dir.path().join(".git/refs/heads/team").exists());
+		assert!(dir.path().join(".git/refs/heads").is_dir());
+		refs
+			.set_head_symbolic("refs/heads/team", ReflogIntent::Skip)
+			.await
+			.unwrap();
+		let commit = commit_file(dir.path(), &wt, "after.txt", b"after\n", &id).await;
+		assert_eq!(refs.resolve("refs/heads/team").await.unwrap(), Some(commit));
+	}
+
+	#[tokio::test]
 	async fn fast_forward_advances_the_branch() {
 		let (dir, wt) = fixture().await;
 		let id = TestIdentity::default();
@@ -452,6 +653,106 @@ mod tests {
 				.await
 				.unwrap(),
 			Some(b)
+		);
+	}
+
+	#[tokio::test]
+	async fn fast_forward_preserves_a_symbolic_head_chain() {
+		let (dir, wt) = fixture().await;
+		let id = TestIdentity::default();
+		let a = commit_file(dir.path(), &wt, "f.txt", b"a\n", &id).await;
+		let b = loose_commit(wt.repository(), vec![a], "f.txt", b"b\n").await;
+		let refs = wt.repository().refs();
+		refs
+			.set_symbolic("refs/heads/alias", "refs/heads/main", ReflogIntent::Skip)
+			.await
+			.unwrap();
+		refs
+			.set_head_symbolic("refs/heads/alias", ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		let outcome = merge(
+			&wt,
+			&b.to_hex(),
+			None,
+			false,
+			false,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap();
+
+		assert!(matches!(outcome, MergeOutcome::FastForward { to, .. } if to == b));
+		assert_eq!(
+			refs.read_head().await.unwrap(),
+			gitana_repository::HeadState::Symbolic("refs/heads/alias".to_owned())
+		);
+		assert_eq!(
+			refs
+				.read_symbolic("refs/heads/alias")
+				.await
+				.unwrap()
+				.as_deref(),
+			Some("refs/heads/main")
+		);
+		assert_eq!(refs.resolve("refs/heads/main").await.unwrap(), Some(b));
+		assert_eq!(std::fs::read(dir.path().join("f.txt")).unwrap(), b"b\n");
+	}
+
+	#[tokio::test]
+	async fn merge_excludes_allow_ignored_untracked_obstructions() {
+		let (dir, wt) = fixture().await;
+		let id = TestIdentity::default();
+		let base = commit_file(dir.path(), &wt, "base.txt", b"base\n", &id).await;
+		let target = loose_commit(wt.repository(), vec![base], "ignored.txt", b"upstream\n").await;
+		std::fs::write(dir.path().join("ignored.txt"), b"local obstruction\n").unwrap();
+
+		let outcome = merge_with_excludes(
+			&wt,
+			&target.to_hex(),
+			Some("ignored.txt\n"),
+			false,
+			false,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap();
+
+		assert!(matches!(outcome, MergeOutcome::FastForward { to, .. } if to == target));
+		assert_eq!(
+			std::fs::read(dir.path().join("ignored.txt")).unwrap(),
+			b"upstream\n"
+		);
+	}
+
+	#[tokio::test]
+	async fn true_merge_uses_excludes_for_checkout_obstructions() {
+		let (dir, wt) = fixture().await;
+		let id = TestIdentity::default();
+		let base = commit_file(dir.path(), &wt, "base.txt", b"base\n", &id).await;
+		let _ours = commit_file(dir.path(), &wt, "ours.txt", b"ours\n", &id).await;
+		let target = loose_commit(wt.repository(), vec![base], "ignored.txt", b"upstream\n").await;
+		std::fs::write(dir.path().join("ignored.txt"), b"local obstruction\n").unwrap();
+
+		let outcome = merge_with_excludes(
+			&wt,
+			&target.to_hex(),
+			Some("ignored.txt\n"),
+			false,
+			false,
+			&id,
+			None::<&TestSigner>,
+		)
+		.await
+		.unwrap();
+
+		assert!(matches!(outcome, MergeOutcome::Made { .. }));
+		assert_eq!(
+			std::fs::read(dir.path().join("ignored.txt")).unwrap(),
+			b"upstream\n"
 		);
 	}
 
@@ -485,6 +786,59 @@ mod tests {
 		assert_eq!(
 			repo.refs().resolve("refs/heads/main").await.unwrap(),
 			Some(commit)
+		);
+	}
+
+	#[tokio::test]
+	async fn signed_merge_cannot_publish_to_a_concurrently_selected_same_tip_branch() {
+		let (dir, wt) = fixture().await;
+		let id = TestIdentity::default();
+		let base = commit_file(dir.path(), &wt, "base.txt", b"base\n", &id).await;
+		let ours = commit_file(dir.path(), &wt, "ours.txt", b"ours\n", &id).await;
+		let theirs = loose_commit(wt.repository(), vec![base], "theirs.txt", b"theirs\n").await;
+		wt.repository()
+			.refs()
+			.update_ref("refs/heads/other", ours, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		let signer = BranchSwitchingSigner {
+			files: wt.repository().objects().file_store().shared_handle(),
+			signer: TestSigner::new(7),
+		};
+
+		let outcome = merge(
+			&wt,
+			&theirs.to_hex(),
+			None,
+			false,
+			false,
+			&id,
+			Some(&signer),
+		)
+		.await
+		.unwrap();
+		let MergeOutcome::Made { commit } = outcome else {
+			panic!("expected a merge commit");
+		};
+		assert_eq!(
+			wt.repository().refs().read_head().await.unwrap(),
+			HeadState::Symbolic("refs/heads/main".to_owned())
+		);
+		assert_eq!(
+			wt.repository()
+				.refs()
+				.resolve("refs/heads/main")
+				.await
+				.unwrap(),
+			Some(commit)
+		);
+		assert_eq!(
+			wt.repository()
+				.refs()
+				.resolve("refs/heads/other")
+				.await
+				.unwrap(),
+			Some(ours)
 		);
 	}
 

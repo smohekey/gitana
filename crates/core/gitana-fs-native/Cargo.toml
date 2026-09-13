@@ -17,8 +17,9 @@ unsafe_op_in_unsafe_fn = "deny"
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 
-[target.'cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "redox", target_os = "tvos", target_os = "visionos", target_os = "watchos"))'.dependencies]
-rustix.workspace = true
+[target.'cfg(all(unix, not(target_os = "fuchsia")))'.dependencies]
+rustix = { workspace = true, features = ["process"] }
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

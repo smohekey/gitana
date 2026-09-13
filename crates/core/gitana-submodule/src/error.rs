@@ -72,6 +72,10 @@ pub enum SubmoduleError {
 		name: String,
 		operation: &'static str,
 	},
+	#[error("{0}")]
+	Merge(String),
+	#[error("{0}")]
+	MergeConflict(Box<crate::UpdateMergeConflict>),
 	#[error("submodule update recovery state does not match the requested operation: {0}")]
 	RecoveryRequired(String),
 	#[error("repository transfer failed: {0}")]
