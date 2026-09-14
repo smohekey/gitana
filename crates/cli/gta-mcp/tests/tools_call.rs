@@ -171,12 +171,14 @@ fn mcp_add_advisory_paths_are_reversibly_quoted() {
 		std::fs::write(repo.join(OsString::from_vec(path.to_vec())), b"ignored\n")
 			.expect("write ignored path");
 	}
+	let mut literal_collision_pathspec = b":(literal)".to_vec();
+	literal_collision_pathspec.extend_from_slice(literal_collision);
 
 	let reply = call_tool(
 		Some(repo),
 		"add",
 		json!({
-			"pathspecs": [path_token(raw), path_token(literal_collision)],
+			"pathspecs": [path_token(raw), path_token(&literal_collision_pathspec)],
 		}),
 	);
 	assert_eq!(
