@@ -2,6 +2,10 @@
 //! locate objects through the index (and materialise base + delta objects on demand), a
 //! miss is `NotFound`, and reads still succeed when the sidecar is absent.
 
+mod support;
+
+pub(crate) use support::DisappearingLooseFileStore;
+
 use std::collections::HashSet;
 
 use gitana_file_store::FileStore;
@@ -9,8 +13,20 @@ use gitana_file_store_memory::MemoryFileStore;
 use gitana_object::{
 	Commit, EwahBitmap, ObjectId, ObjectKind, PackedObject, Sha256, TreeEntry, decode_midx_bitmap,
 	decode_multi_pack_index, encode_commit, encode_midx_bitmap, encode_pack, encode_tree,
+	loose_object_path,
 };
-use gitana_object_store::{ObjectBacking, ObjectStore};
+use gitana_object_store::{ObjectBacking, ObjectReadLimits, ObjectStore, ObjectStoreError};
+
+fn generous_read_limits() -> ObjectReadLimits {
+	ObjectReadLimits::new(
+		2 * 1024 * 1024,
+		2 * 1024 * 1024,
+		8 * 1024 * 1024,
+		64,
+		16,
+		2 * 1024 * 1024,
+	)
+}
 
 /// A small object graph with two delta-friendly blobs, a tree, and a commit — enough that the
 /// encoded pack carries both full and delta entries at several offsets.
@@ -54,6 +70,125 @@ fn sample_graph() -> Vec<PackedObject<Sha256>> {
 	objects
 }
 
+fn shrinking_delta_objects() -> Vec<PackedObject<Sha256>> {
+	let base: Vec<u8> = (0..800).map(|index| (index % 251) as u8).collect();
+	let target = base[..400].to_vec();
+	[base, target]
+		.into_iter()
+		.map(|data| PackedObject {
+			id: ObjectId::<Sha256>::compute(ObjectKind::Blob, &data),
+			kind: ObjectKind::Blob,
+			data,
+		})
+		.collect()
+}
+
+async fn stored_pack_files(objects: &[PackedObject<Sha256>]) -> Vec<(String, Vec<u8>)> {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	store
+		.write_pack(encode_pack(objects))
+		.await
+		.expect("write staged pack");
+	let mut paths = store
+		.file_store()
+		.list_prefix("objects/pack/")
+		.await
+		.expect("list staged pack");
+	paths.sort_unstable();
+	let mut files = Vec::with_capacity(paths.len());
+	for path in paths {
+		let bytes = store
+			.file_store()
+			.read_path(&path)
+			.await
+			.expect("read staged pack file");
+		files.push((path, bytes));
+	}
+	files
+}
+
+async fn bounded_read_during_pack_replacement(
+	transition_on_range_read: bool,
+	max_pack_count: usize,
+	preserve_full_index_budget: bool,
+) -> Result<(ObjectKind, Vec<u8>), ObjectStoreError> {
+	let payload = b"packed through a concurrent replacement".to_vec();
+	let target = PackedObject {
+		id: ObjectId::<Sha256>::compute(ObjectKind::Blob, &payload),
+		kind: ObjectKind::Blob,
+		data: payload.clone(),
+	};
+	let extra_data = b"forces a different replacement pack checksum".to_vec();
+	let extra = PackedObject {
+		id: ObjectId::<Sha256>::compute(ObjectKind::Blob, &extra_data),
+		kind: ObjectKind::Blob,
+		data: extra_data,
+	};
+	let replacement = stored_pack_files(&[target.clone(), extra]).await;
+	let replacement_index_size = replacement
+		.iter()
+		.find(|(path, _)| path.ends_with(".idx"))
+		.expect("replacement index")
+		.1
+		.len() as u64;
+
+	let store = ObjectStore::<_, Sha256>::new(DisappearingLooseFileStore::new());
+	store
+		.write_pack(encode_pack(std::slice::from_ref(&target)))
+		.await
+		.expect("write original pack");
+	let paths = store
+		.file_store()
+		.list_prefix("objects/pack/")
+		.await
+		.expect("list original pack");
+	let old_pack = paths
+		.iter()
+		.find(|path| path.ends_with(".pack"))
+		.expect("original pack")
+		.clone();
+	let old_index = paths
+		.iter()
+		.find(|path| path.ends_with(".idx"))
+		.expect("original index")
+		.clone();
+	let original_index_size = store
+		.file_store()
+		.size(&old_index)
+		.await
+		.expect("original index size");
+	assert!(
+		replacement.iter().all(|(path, _)| path != &old_pack),
+		"replacement must use a new content-addressed pack path"
+	);
+
+	if transition_on_range_read {
+		store
+			.file_store()
+			.replace_pack_on_next_range_read(&old_pack, &old_index, replacement);
+	} else {
+		store
+			.file_store()
+			.replace_pack_on_next_size(&old_pack, &old_index, replacement);
+	}
+
+	let complete_index_budget = original_index_size + replacement_index_size;
+	let max_index_bytes = if preserve_full_index_budget {
+		complete_index_budget
+	} else {
+		complete_index_budget - 1
+	};
+	let limits = ObjectReadLimits::new(
+		payload.len() as u64,
+		2 * 1024 * 1024,
+		2 * 1024 * 1024,
+		64,
+		max_pack_count,
+		max_index_bytes,
+	);
+	store.read_object_with_limits(&target.id, &limits).await
+}
+
 #[tokio::test]
 async fn reads_every_object_in_a_stored_pack() {
 	let objects = sample_graph();
@@ -72,6 +207,406 @@ async fn reads_every_object_in_a_stored_pack() {
 		assert_eq!(data, object.data);
 		assert!(store.exists_object(&object.id).await.expect("exists"));
 	}
+}
+
+#[tokio::test]
+async fn bounded_read_supports_loose_and_packed_objects() {
+	let objects = sample_graph();
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let loose_id = store
+		.write_object(ObjectKind::Blob, b"bounded loose")
+		.await
+		.expect("write loose");
+	store
+		.write_pack(encode_pack(&objects))
+		.await
+		.expect("write pack");
+
+	let limits = generous_read_limits();
+	let (kind, payload) = store
+		.read_object_with_limits(&loose_id, &limits)
+		.await
+		.expect("bounded loose read");
+	assert_eq!(kind, ObjectKind::Blob);
+	assert_eq!(payload, b"bounded loose");
+
+	for object in &objects {
+		let (kind, payload) = store
+			.read_object_with_limits(&object.id, &limits)
+			.await
+			.expect("bounded packed read");
+		assert_eq!(kind, object.kind);
+		assert_eq!(payload, object.data);
+	}
+}
+
+#[tokio::test]
+async fn bounded_read_retries_packed_when_loose_disappears_after_sizing() {
+	let payload = b"moves during a bounded read".to_vec();
+	let id = ObjectId::<Sha256>::compute(ObjectKind::Blob, &payload);
+	let store = ObjectStore::<_, Sha256>::new(DisappearingLooseFileStore::new());
+	store
+		.write_object(ObjectKind::Blob, &payload)
+		.await
+		.expect("write loose object");
+	store
+		.write_pack(encode_pack(&[PackedObject {
+			id,
+			kind: ObjectKind::Blob,
+			data: payload.clone(),
+		}]))
+		.await
+		.expect("write packed object");
+
+	let paths = store
+		.file_store()
+		.list_prefix("objects/pack/")
+		.await
+		.expect("list pack directory");
+	let pack_path = paths
+		.iter()
+		.find(|path| path.ends_with(".pack"))
+		.expect("pack path");
+	let index_path = paths
+		.iter()
+		.find(|path| path.ends_with(".idx"))
+		.expect("index path");
+	let pack_size = store.file_store().size(pack_path).await.expect("pack size");
+	let index_size = store
+		.file_store()
+		.size(index_path)
+		.await
+		.expect("index size");
+	let loose_path = loose_object_path(&id);
+	store.file_store().disappear_on_next_range_read(&loose_path);
+
+	let payload_size = payload.len() as u64;
+	let limits = ObjectReadLimits::new(payload_size, pack_size, payload_size, 0, 1, index_size);
+	let (kind, read) = store
+		.read_object_with_limits(&id, &limits)
+		.await
+		.expect("retry packed object");
+
+	assert_eq!(kind, ObjectKind::Blob);
+	assert_eq!(read, payload);
+	assert!(
+		!store
+			.file_store()
+			.exists(&loose_path)
+			.await
+			.expect("exists")
+	);
+}
+
+#[tokio::test]
+async fn bounded_read_retries_when_a_pack_disappears_during_sizing() {
+	let (kind, payload) = bounded_read_during_pack_replacement(false, 2, true)
+		.await
+		.expect("read replacement pack");
+
+	assert_eq!(kind, ObjectKind::Blob);
+	assert_eq!(payload, b"packed through a concurrent replacement");
+}
+
+#[tokio::test]
+async fn bounded_read_retries_when_a_pack_disappears_during_a_range_read() {
+	let (kind, payload) = bounded_read_during_pack_replacement(true, 2, true)
+		.await
+		.expect("read replacement pack");
+
+	assert_eq!(kind, ObjectKind::Blob);
+	assert_eq!(payload, b"packed through a concurrent replacement");
+}
+
+#[tokio::test]
+async fn bounded_pack_retries_preserve_pack_and_index_budgets() {
+	assert!(matches!(
+		bounded_read_during_pack_replacement(false, 1, true).await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "pack-count",
+			limit: 1,
+		})
+	));
+	assert!(matches!(
+		bounded_read_during_pack_replacement(false, 2, false).await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "index-bytes",
+			..
+		})
+	));
+}
+
+#[tokio::test]
+async fn bounded_loose_read_enforces_object_and_backing_limits() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let id = store
+		.write_object(ObjectKind::Blob, b"bounded loose")
+		.await
+		.expect("write loose");
+	let object_limited = ObjectReadLimits::new(4, 1_000, 1_000, 0, 0, 0);
+	assert!(matches!(
+		store.read_object_with_limits(&id, &object_limited).await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "object-bytes",
+			..
+		})
+	));
+
+	let backing_limited = ObjectReadLimits::new(1_000, 1, 1_000, 0, 0, 0);
+	assert!(matches!(
+		store.read_object_with_limits(&id, &backing_limited).await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "backing-bytes",
+			..
+		})
+	));
+
+	let expanded_limited = ObjectReadLimits::new(1_000, 1_000, 4, 0, 0, 0);
+	assert!(matches!(
+		store.read_object_with_limits(&id, &expanded_limited).await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "expanded-bytes",
+			..
+		})
+	));
+}
+
+#[tokio::test]
+async fn bounded_packed_read_enforces_index_backing_and_pack_limits() {
+	let objects = sample_graph();
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	store
+		.write_pack(encode_pack(&objects))
+		.await
+		.expect("write pack");
+	let id = objects[0].id;
+
+	let index_limited = ObjectReadLimits::new(1_000_000, 1_000_000, 1_000_000, 64, 16, 1);
+	assert!(matches!(
+		store.read_object_with_limits(&id, &index_limited).await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "index-bytes",
+			..
+		})
+	));
+
+	let backing_limited = ObjectReadLimits::new(1_000_000, 1, 1_000_000, 64, 16, 1_000_000);
+	assert!(matches!(
+		store.read_object_with_limits(&id, &backing_limited).await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "backing-bytes",
+			..
+		})
+	));
+
+	let pack_limited = ObjectReadLimits::new(1_000_000, 1_000_000, 1_000_000, 64, 0, 1_000_000);
+	assert!(matches!(
+		store.read_object_with_limits(&id, &pack_limited).await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "pack-count",
+			..
+		})
+	));
+}
+
+#[tokio::test]
+async fn bounded_pack_listing_exhaustion_is_a_pack_count_limit() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	for index in 0..5 {
+		store
+			.file_store()
+			.write_path_if_absent(&format!("objects/pack/unexpected-{index}"), b"entry")
+			.await
+			.expect("write unexpected pack-directory entry");
+	}
+	let id = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"absent object");
+	let limits = ObjectReadLimits::new(1_000, 1_000, 1_000, 0, 0, 0);
+
+	assert!(matches!(
+		store.read_object_with_limits(&id, &limits).await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "pack-count",
+			limit: 0,
+		})
+	));
+}
+
+#[tokio::test]
+async fn bounded_packed_base_enforces_object_limit_before_inflating() {
+	let payload = vec![b'x'; 300];
+	let object = PackedObject {
+		id: ObjectId::<Sha256>::compute(ObjectKind::Blob, &payload),
+		kind: ObjectKind::Blob,
+		data: payload,
+	};
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	store
+		.write_pack(encode_pack(std::slice::from_ref(&object)))
+		.await
+		.expect("write base pack");
+	let limits = ObjectReadLimits::new(100, 1_000_000, 200, 0, 1, 1_000_000);
+
+	assert!(matches!(
+		store.read_object_with_limits(&object.id, &limits).await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "object-bytes",
+			limit: 100,
+		})
+	));
+}
+
+#[tokio::test]
+async fn bounded_packed_read_rejects_delta_depth_before_inflating() {
+	let objects = shrinking_delta_objects();
+	let target = &objects[1];
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	store
+		.write_pack(encode_pack(&objects))
+		.await
+		.expect("write delta pack");
+	let limits = ObjectReadLimits::new(target.data.len() as u64, 1_000_000, 0, 0, 1, 1_000_000);
+
+	assert!(matches!(
+		store.read_object_with_limits(&target.id, &limits).await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "delta-depth",
+			limit: 0,
+		})
+	));
+}
+
+#[tokio::test]
+async fn bounded_packed_read_requires_indexes_and_limits_delta_depth() {
+	let objects = sample_graph();
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	store
+		.write_pack(encode_pack(&objects))
+		.await
+		.expect("write pack");
+
+	let no_deltas = ObjectReadLimits::new(
+		2 * 1024 * 1024,
+		2 * 1024 * 1024,
+		8 * 1024 * 1024,
+		0,
+		16,
+		2 * 1024 * 1024,
+	);
+	let mut saw_delta = false;
+	for object in &objects {
+		if matches!(
+			store.read_object_with_limits(&object.id, &no_deltas).await,
+			Err(ObjectStoreError::ReadLimitExceeded {
+				resource: "delta-depth",
+				..
+			})
+		) {
+			saw_delta = true;
+		}
+	}
+	assert!(saw_delta, "sample pack must exercise a delta entry");
+
+	let idx_path = store
+		.file_store()
+		.list_prefix("objects/pack/")
+		.await
+		.expect("list")
+		.into_iter()
+		.find(|path| path.ends_with(".idx"))
+		.expect("index path");
+	store
+		.file_store()
+		.delete_path(&idx_path, None)
+		.await
+		.expect("delete index");
+	assert!(matches!(
+		store
+			.read_object_with_limits(&objects[0].id, &generous_read_limits())
+			.await,
+		Err(ObjectStoreError::MissingPackIndex { .. })
+	));
+}
+
+#[tokio::test]
+async fn bounded_packed_read_allows_a_delta_base_larger_than_the_target() {
+	let objects = shrinking_delta_objects();
+	let base_len = objects[0].data.len() as u64;
+	let target = &objects[1];
+	let target_len = target.data.len() as u64;
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	store
+		.write_pack(encode_pack(&objects))
+		.await
+		.expect("write delta pack");
+
+	let no_deltas = ObjectReadLimits::new(target_len, 1_000_000, 4_096, 0, 1, 1_000_000);
+	assert!(matches!(
+		store.read_object_with_limits(&target.id, &no_deltas).await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "delta-depth",
+			limit: 0,
+		})
+	));
+
+	let limits = ObjectReadLimits::new(target_len, 1_000_000, 4_096, 1, 1, 1_000_000);
+	let (kind, payload) = store
+		.read_object_with_limits(&target.id, &limits)
+		.await
+		.expect("read target through larger delta base");
+	assert_eq!(kind, ObjectKind::Blob);
+	assert_eq!(payload, target.data);
+
+	let object_limit = target_len - 1;
+	let object_limited = ObjectReadLimits::new(object_limit, 1_000_000, 4_096, 1, 1, 1_000_000);
+	assert!(matches!(
+		store
+			.read_object_with_limits(&target.id, &object_limited)
+			.await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "object-bytes",
+			limit,
+		}) if limit == object_limit
+	));
+
+	assert!(base_len > target_len);
+}
+
+#[tokio::test]
+async fn bounded_packed_read_reports_the_configured_expanded_limit() {
+	let objects = shrinking_delta_objects();
+	let base_len = objects[0].data.len() as u64;
+	let target = &objects[1];
+	let target_len = target.data.len() as u64;
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	store
+		.write_pack(encode_pack(&objects))
+		.await
+		.expect("write delta pack");
+
+	let inflate_limit = base_len;
+	let inflate_limited = ObjectReadLimits::new(1_000, 1_000_000, inflate_limit, 1, 1, 1_000_000);
+	assert!(matches!(
+		store
+			.read_object_with_limits(&target.id, &inflate_limited)
+			.await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "expanded-bytes",
+			limit,
+		}) if limit == inflate_limit
+	));
+
+	let application_limit = base_len + target_len - 1;
+	let application_limited =
+		ObjectReadLimits::new(1_000, 1_000_000, application_limit, 1, 1, 1_000_000);
+	assert!(matches!(
+		store
+			.read_object_with_limits(&target.id, &application_limited)
+			.await,
+		Err(ObjectStoreError::ReadLimitExceeded {
+			resource: "expanded-bytes",
+			limit,
+		}) if limit == application_limit
+	));
 }
 
 #[tokio::test]

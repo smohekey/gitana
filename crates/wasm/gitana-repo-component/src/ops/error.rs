@@ -40,7 +40,13 @@ fn object_store_error(error: ObjectStoreError) -> RepoError {
 			RepoError::Corruption(corruption.to_string())
 		}
 		// A too-large input is the caller's fault, not a storage failure.
-		too_large @ ObjectStoreError::TooLarge { .. } => RepoError::Invalid(too_large.to_string()),
+		too_large
+		@ (ObjectStoreError::TooLarge { .. } | ObjectStoreError::ReadLimitExceeded { .. }) => {
+			RepoError::Invalid(too_large.to_string())
+		}
+		missing_index @ ObjectStoreError::MissingPackIndex { .. } => {
+			RepoError::Backend(missing_index.to_string())
+		}
 		ObjectStoreError::Object(error) => RepoError::Invalid(error.to_string()),
 		ObjectStoreError::FileStore(error) => file_store_error(error),
 	}

@@ -12,7 +12,9 @@ use wasip2::filesystem::types::{
 	Descriptor, DescriptorFlags, DescriptorType, ErrorCode, OpenFlags, PathFlags,
 };
 
-use crate::{Backend, DescriptorReader, DescriptorWriter, FileKind};
+use gitana_file_store::{FileStoreError, Result};
+
+use crate::{Backend, DescriptorReader, DescriptorWriter, FileKind, charge_listing_entry};
 
 /// How many bytes to request per positional `descriptor.read` call.
 const READ_CHUNK: u64 = 64 * 1024;
@@ -147,6 +149,51 @@ impl Backend for DescriptorBackend {
 		let stream = dir.read_directory().map_err(io_error)?;
 		let mut names = Vec::new();
 		while let Some(entry) = stream.read_directory_entry().map_err(io_error)? {
+			names.push(entry.name);
+		}
+		Ok(names)
+	}
+
+	fn list_names_bounded(
+		&self,
+		dir_rel: &str,
+		max_entries: usize,
+		max_bytes: u64,
+	) -> Result<Vec<String>> {
+		let opened;
+		let dir = if dir_rel.is_empty() {
+			&self.dir
+		} else {
+			match self.dir.open_at(
+				PathFlags::SYMLINK_FOLLOW,
+				dir_rel,
+				OpenFlags::DIRECTORY,
+				DescriptorFlags::READ,
+			) {
+				Ok(subdir) => {
+					opened = subdir;
+					&opened
+				}
+				Err(ErrorCode::NoEntry) => return Ok(Vec::new()),
+				Err(code) => return Err(FileStoreError::Backend(io_error(code).to_string())),
+			}
+		};
+		let stream = dir
+			.read_directory()
+			.map_err(|code| FileStoreError::Backend(io_error(code).to_string()))?;
+		let mut names = Vec::new();
+		let mut bytes = 0u64;
+		while let Some(entry) = stream
+			.read_directory_entry()
+			.map_err(|code| FileStoreError::Backend(io_error(code).to_string()))?
+		{
+			charge_listing_entry(
+				&mut bytes,
+				names.len(),
+				entry.name.len(),
+				max_entries,
+				max_bytes,
+			)?;
 			names.push(entry.name);
 		}
 		Ok(names)

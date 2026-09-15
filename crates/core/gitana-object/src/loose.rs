@@ -31,7 +31,21 @@ pub fn encode_loose(kind: ObjectKind, payload: &[u8]) -> Vec<u8> {
 /// Rejects streams that decompress beyond [`MAX_OBJECT_SIZE`] and payloads whose
 /// length disagrees with the header.
 pub fn decode_loose(compressed: &[u8]) -> Result<(ObjectKind, Vec<u8>), ObjectError> {
-	let raw = inflate_capped(compressed, MAX_OBJECT_SIZE)?;
+	decode_loose_with_limit(compressed, MAX_OBJECT_SIZE)
+}
+
+/// Decode a loose object while rejecting a payload larger than `max_payload_size`.
+///
+/// The bound is checked while inflating, before retaining or copying an oversized payload. A
+/// small fixed allowance covers the canonical `<kind> <size>\0` header and is not part of the
+/// returned payload budget.
+pub fn decode_loose_with_limit(
+	compressed: &[u8],
+	max_payload_size: u64,
+) -> Result<(ObjectKind, Vec<u8>), ObjectError> {
+	const MAX_HEADER_SIZE: u64 = 64;
+	let max_payload_size = max_payload_size.min(MAX_OBJECT_SIZE);
+	let mut raw = inflate_capped(compressed, max_payload_size.saturating_add(MAX_HEADER_SIZE))?;
 
 	let nul = raw
 		.iter()
@@ -44,15 +58,16 @@ pub fn decode_loose(compressed: &[u8]) -> Result<(ObjectKind, Vec<u8>), ObjectEr
 		.ok()
 		.and_then(|s| s.parse().ok())
 		.ok_or(ObjectError::MalformedHeader)?;
-
-	let payload = raw[nul + 1..].to_vec();
-	if payload.len() as u64 != declared {
-		return Err(ObjectError::LengthMismatch {
-			declared,
-			actual: payload.len() as u64,
-		});
+	if declared > max_payload_size {
+		return Err(ObjectError::TooLarge);
 	}
-	Ok((kind, payload))
+
+	let actual = raw.len().saturating_sub(nul + 1) as u64;
+	if actual != declared {
+		return Err(ObjectError::LengthMismatch { declared, actual });
+	}
+	raw.drain(..=nul);
+	Ok((kind, raw))
 }
 
 /// The repository-relative path of a loose object: `objects/<aa>/<rest>`.
@@ -129,6 +144,15 @@ mod tests {
 		assert!(matches!(
 			decode_loose(&compressed),
 			Err(ObjectError::LengthMismatch { .. })
+		));
+	}
+
+	#[test]
+	fn bounded_decode_rejects_declared_payload_before_returning_it() {
+		let compressed = encode_loose(ObjectKind::Blob, b"oversized");
+		assert!(matches!(
+			decode_loose_with_limit(&compressed, 4),
+			Err(ObjectError::TooLarge)
 		));
 	}
 }

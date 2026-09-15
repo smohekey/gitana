@@ -19,18 +19,23 @@ use gitana_file_store::{FileStore, FileStoreError, WriteOutcome};
 
 use gitana_object::{
 	BitmapIndex, EwahBitmap, HashAlgorithm, MAX_OBJECT_SIZE, MidxEntry, MultiPackIndex, ObjectError,
-	ObjectId, ObjectKind, PackEntry, PackIndex, PackedObject, apply_delta,
-	build_reachability_bitmaps, decode_loose, decode_midx_bitmap, decode_multi_pack_index,
-	decode_object_at, decode_pack_entry, decode_pack_index, encode_loose, encode_multi_pack_index,
+	ObjectId, ObjectKind, PackEntry, PackIndex, PackedObject, apply_delta, apply_delta_with_limit,
+	build_reachability_bitmaps, decode_loose, decode_loose_with_limit, decode_midx_bitmap,
+	decode_multi_pack_index, decode_object_at, decode_pack_entry, decode_pack_entry_with_limit,
+	decode_pack_index, encode_loose, encode_multi_pack_index,
 	encode_multi_pack_index_with_reverse_index, encode_pack, encode_pack_index, loose_object_path,
-	pack_index_entries, parse_commit, referenced_ids,
+	pack_entry_is_delta, pack_index_entries, parse_commit, referenced_ids,
 };
 use tokio::sync::Mutex;
 
 mod object_backing;
+mod object_read_budget;
+mod object_read_limits;
 mod object_read_session;
 
 pub use object_backing::ObjectBacking;
+pub(crate) use object_read_budget::ObjectReadBudget;
+pub use object_read_limits::ObjectReadLimits;
 pub use object_read_session::ObjectReadSession;
 
 /// Re-exported so downstream layers name the parsed reachability bitmap through the store layer.
@@ -73,6 +78,32 @@ pub enum ObjectStoreError {
 		/// The limit that was exceeded.
 		limit: u64,
 	},
+	/// An untrusted read exhausted one of its caller-supplied resource budgets.
+	#[error("object read exceeded the {resource} limit of {limit}")]
+	ReadLimitExceeded {
+		/// The budget dimension that was exhausted.
+		resource: &'static str,
+		/// The configured limit for that dimension.
+		limit: u64,
+	},
+	/// A bounded read encountered a pack without the sidecar needed for bounded lookup.
+	#[error("bounded object lookup requires an index for pack {pack}")]
+	MissingPackIndex {
+		/// Repository-relative path of the unindexed pack.
+		pack: String,
+	},
+}
+
+fn map_limited_decode<T>(
+	result: Result<T, ObjectError>,
+	resource: &'static str,
+	limit: u64,
+) -> Result<T, ObjectStoreError> {
+	match result {
+		Err(ObjectError::TooLarge) => Err(ObjectStoreError::ReadLimitExceeded { resource, limit }),
+		Err(error) => Err(error.into()),
+		Ok(value) => Ok(value),
+	}
 }
 
 fn ensure_within(len: u64, limit: u64) -> Result<(), ObjectStoreError> {
@@ -81,6 +112,21 @@ fn ensure_within(len: u64, limit: u64) -> Result<(), ObjectStoreError> {
 	} else {
 		Ok(())
 	}
+}
+
+fn verify_requested_object<H: HashAlgorithm>(
+	requested: &ObjectId<H>,
+	kind: ObjectKind,
+	payload: &[u8],
+) -> Result<(), ObjectStoreError> {
+	let actual = ObjectId::<H>::compute(kind, payload);
+	if &actual != requested {
+		return Err(ObjectStoreError::Corruption {
+			requested: requested.to_hex(),
+			actual: actual.to_hex(),
+		});
+	}
+	Ok(())
 }
 
 /// The `.idx` sidecar path for a `.pack` path (`…/pack-<hex>.pack` → `…/pack-<hex>.idx`).
@@ -435,6 +481,185 @@ where
 		}
 	}
 
+	/// Read and content-verify an object under explicit caller-supplied resource limits.
+	///
+	/// This path never reads or caches a whole pack. It bounds pack-directory enumeration, reads
+	/// `.idx` sidecars under an aggregate index budget, and range-reads only the selected object's
+	/// delta chain. A pack without a sidecar cannot be searched safely under these limits and is
+	/// reported as [`ObjectStoreError::MissingPackIndex`].
+	pub async fn read_object_with_limits(
+		&self,
+		id: &ObjectId<H>,
+		limits: &ObjectReadLimits,
+	) -> Result<(ObjectKind, Vec<u8>), ObjectStoreError> {
+		let mut budget = ObjectReadBudget::new(limits);
+		let loose_path = loose_object_path(id);
+		match self.files.size(&loose_path).await {
+			Ok(size) => {
+				budget.charge_backing(size)?;
+				let bytes = match self.files.read_path_range(&loose_path, 0, size).await {
+					Ok(bytes) => bytes,
+					Err(FileStoreError::NotFound) => {
+						budget = ObjectReadBudget::new(limits);
+						return self.read_packed_with_limits(id, &mut budget).await;
+					}
+					Err(other) => return Err(other.into()),
+				};
+				if bytes.len() as u64 != size {
+					return Err(ObjectError::MalformedHeader.into());
+				}
+				let expanded_limit = limits.max_object_bytes().min(budget.remaining_expanded());
+				let resource = if expanded_limit < limits.max_object_bytes() {
+					"expanded-bytes"
+				} else {
+					"object-bytes"
+				};
+				let (kind, payload) = map_limited_decode(
+					decode_loose_with_limit(&bytes, expanded_limit),
+					resource,
+					expanded_limit,
+				)?;
+				budget.charge_expanded(payload.len() as u64)?;
+				verify_requested_object(id, kind, &payload)?;
+				Ok((kind, payload))
+			}
+			Err(FileStoreError::NotFound) => self.read_packed_with_limits(id, &mut budget).await,
+			Err(other) => Err(other.into()),
+		}
+	}
+
+	async fn read_packed_with_limits(
+		&self,
+		id: &ObjectId<H>,
+		budget: &mut ObjectReadBudget<'_>,
+	) -> Result<(ObjectKind, Vec<u8>), ObjectStoreError> {
+		let limits = budget.limits;
+		let pack_count_limit = u64::try_from(limits.max_pack_count()).unwrap_or(u64::MAX);
+		let mut observed_pack_paths = HashSet::new();
+		let mut searched_pack_paths = HashSet::new();
+		let mut lookup_passes = 0usize;
+
+		loop {
+			if lookup_passes > limits.max_pack_count() {
+				return Err(ObjectStoreError::ReadLimitExceeded {
+					resource: "pack-count",
+					limit: pack_count_limit,
+				});
+			}
+			lookup_passes = lookup_passes.saturating_add(1);
+			let listed = match self
+				.files
+				.list_prefix_bounded(
+					"objects/pack/pack-",
+					limits.max_listing_entries(),
+					limits.max_listing_bytes(),
+				)
+				.await
+			{
+				Ok(paths) => paths,
+				Err(FileStoreError::ListingTooLarge { .. }) => {
+					return Err(ObjectStoreError::ReadLimitExceeded {
+						resource: "pack-count",
+						limit: pack_count_limit,
+					});
+				}
+				Err(other) => return Err(other.into()),
+			};
+			let mut pack_paths: Vec<String> = listed
+				.into_iter()
+				.filter(|path| path.ends_with(PACK_SUFFIX))
+				.collect();
+			pack_paths.sort_unstable();
+			pack_paths.dedup();
+			observed_pack_paths.extend(pack_paths.iter().cloned());
+			if observed_pack_paths.len() > limits.max_pack_count() {
+				return Err(ObjectStoreError::ReadLimitExceeded {
+					resource: "pack-count",
+					limit: pack_count_limit,
+				});
+			}
+
+			let mut missing_index = None;
+			let mut pack_disappeared = false;
+			for pack_path in pack_paths {
+				if searched_pack_paths.contains(&pack_path) {
+					continue;
+				}
+				let index_path = index_path(&pack_path);
+				let index_size = match self.files.size(&index_path).await {
+					Ok(size) => size,
+					Err(FileStoreError::NotFound) => match self.files.size(&pack_path).await {
+						Ok(_) => {
+							missing_index.get_or_insert(pack_path);
+							continue;
+						}
+						Err(FileStoreError::NotFound) => {
+							pack_disappeared = true;
+							continue;
+						}
+						Err(other) => return Err(other.into()),
+					},
+					Err(other) => return Err(other.into()),
+				};
+				budget.charge_index(index_size)?;
+				let index_bytes = match self.files.read_path_range(&index_path, 0, index_size).await {
+					Ok(bytes) => bytes,
+					Err(FileStoreError::NotFound) => {
+						pack_disappeared = true;
+						continue;
+					}
+					Err(other) => return Err(other.into()),
+				};
+				if index_bytes.len() as u64 != index_size {
+					return Err(ObjectError::MalformedPackIndex.into());
+				}
+				let index = decode_pack_index::<H>(&index_bytes)?;
+				let Some(offset) = index.offset_of(id) else {
+					searched_pack_paths.insert(pack_path);
+					continue;
+				};
+				let size = match self.files.size(&pack_path).await {
+					Ok(size) => size,
+					Err(FileStoreError::NotFound) => {
+						pack_disappeared = true;
+						continue;
+					}
+					Err(other) => return Err(other.into()),
+				};
+				ensure_within(size, MAX_PACK_SIZE)?;
+				let mut offsets_sorted: Vec<u64> =
+					index.entries().iter().map(|entry| entry.offset).collect();
+				offsets_sorted.sort_unstable();
+				let meta = PackMeta {
+					index,
+					offsets_sorted,
+					size,
+				};
+				let (kind, data) = match self
+					.read_packed_lazy_with_limits(&pack_path, &meta, offset, budget)
+					.await
+				{
+					Ok(object) => object,
+					Err(ObjectStoreError::FileStore(FileStoreError::NotFound)) => {
+						pack_disappeared = true;
+						continue;
+					}
+					Err(other) => return Err(other),
+				};
+				verify_requested_object(id, kind, &data)?;
+				return Ok((kind, data));
+			}
+
+			if pack_disappeared {
+				continue;
+			}
+			return match missing_index {
+				Some(pack) => Err(ObjectStoreError::MissingPackIndex { pack }),
+				None => Err(ObjectStoreError::NotFound),
+			};
+		}
+	}
+
 	/// Start a point-in-time physical-backing observation.
 	///
 	/// A session validates each pack index at most once and reuses that parsed view for the remaining
@@ -544,6 +769,147 @@ where
 		};
 		for delta in deltas.iter().rev() {
 			data = apply_delta(&data, delta)?;
+		}
+		Ok((kind, data))
+	}
+
+	async fn read_packed_lazy_with_limits(
+		&self,
+		pack_path: &str,
+		meta: &PackMeta<H>,
+		offset: u64,
+		budget: &mut ObjectReadBudget<'_>,
+	) -> Result<(ObjectKind, Vec<u8>), ObjectStoreError> {
+		const PACK_HEADER_SIZE: u64 = 12;
+		let body_end = meta
+			.size
+			.checked_sub(H::RAW_LEN as u64)
+			.ok_or(ObjectError::MalformedPack)?;
+		if body_end < PACK_HEADER_SIZE {
+			return Err(ObjectError::MalformedPack.into());
+		}
+		budget.charge_backing(PACK_HEADER_SIZE + H::RAW_LEN as u64)?;
+		let header = self
+			.files
+			.read_path_range(pack_path, 0, PACK_HEADER_SIZE)
+			.await?;
+		let trailer = self
+			.files
+			.read_path_range(pack_path, body_end, H::RAW_LEN as u64)
+			.await?;
+		if header.len() != PACK_HEADER_SIZE as usize
+			|| &header[..4] != b"PACK"
+			|| u32::from_be_bytes([header[4], header[5], header[6], header[7]]) != 2
+			|| u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize
+				!= meta.index.len()
+			|| trailer != meta.index.pack_checksum()
+		{
+			return Err(ObjectError::MalformedPack.into());
+		}
+
+		let mut deltas: Vec<Vec<u8>> = Vec::new();
+		let mut visited: HashSet<u64> = HashSet::new();
+		let mut cursor = offset;
+		let (kind, mut data) = loop {
+			if cursor < PACK_HEADER_SIZE || !visited.insert(cursor) {
+				return Err(ObjectError::MalformedPack.into());
+			}
+			let end = meta.next_offset_after(cursor).unwrap_or(body_end);
+			if cursor >= end || end > body_end {
+				return Err(ObjectError::MalformedPack.into());
+			}
+			let entry_size = end - cursor;
+			budget.charge_backing(entry_size)?;
+			let entry = self
+				.files
+				.read_path_range(pack_path, cursor, entry_size)
+				.await?;
+			if entry.len() as u64 != entry_size {
+				return Err(ObjectError::MalformedPack.into());
+			}
+			let is_delta = pack_entry_is_delta(&entry)?;
+			if is_delta && deltas.len() >= budget.limits.max_delta_depth() {
+				return Err(ObjectStoreError::ReadLimitExceeded {
+					resource: "delta-depth",
+					limit: u64::try_from(budget.limits.max_delta_depth()).unwrap_or(u64::MAX),
+				});
+			}
+			let remaining_expanded = budget.remaining_expanded();
+			let (inflated_limit, resource, configured_limit) = if !is_delta && deltas.is_empty() {
+				if remaining_expanded >= budget.limits.max_object_bytes() {
+					(
+						budget.limits.max_object_bytes(),
+						"object-bytes",
+						budget.limits.max_object_bytes(),
+					)
+				} else {
+					(
+						remaining_expanded,
+						"expanded-bytes",
+						budget.limits.max_expanded_bytes(),
+					)
+				}
+			} else {
+				(
+					remaining_expanded,
+					"expanded-bytes",
+					budget.limits.max_expanded_bytes(),
+				)
+			};
+			let decoded = map_limited_decode(
+				decode_pack_entry_with_limit::<H>(&entry, inflated_limit),
+				resource,
+				configured_limit,
+			)?;
+			match decoded {
+				PackEntry::Base { kind, data } => {
+					budget.charge_expanded(data.len() as u64)?;
+					break (kind, data);
+				}
+				PackEntry::OfsDelta { distance, delta } => {
+					budget.charge_expanded(delta.len() as u64)?;
+					deltas.push(delta);
+					cursor = cursor
+						.checked_sub(distance)
+						.ok_or(ObjectError::MalformedPack)?;
+				}
+				PackEntry::RefDelta { base, delta } => {
+					budget.charge_expanded(delta.len() as u64)?;
+					deltas.push(delta);
+					cursor = meta
+						.index
+						.offset_of(&base)
+						.ok_or(ObjectError::UnresolvedDeltaBase)?;
+				}
+			}
+		};
+		let delta_count = deltas.len();
+		for (index, delta) in deltas.iter().rev().enumerate() {
+			let remaining_expanded = budget.remaining_expanded();
+			let is_final = index + 1 == delta_count;
+			let target_limit = if is_final {
+				budget.limits.max_object_bytes().min(remaining_expanded)
+			} else {
+				remaining_expanded
+			};
+			let (resource, configured_limit) =
+				if is_final && remaining_expanded >= budget.limits.max_object_bytes() {
+					("object-bytes", budget.limits.max_object_bytes())
+				} else {
+					("expanded-bytes", budget.limits.max_expanded_bytes())
+				};
+			data = map_limited_decode(
+				apply_delta_with_limit(&data, delta, target_limit),
+				resource,
+				configured_limit,
+			)?;
+			budget.charge_expanded(data.len() as u64)?;
+		}
+		if data.len() as u64 > budget.limits.max_object_bytes() {
+			return Err(ObjectStoreError::ReadLimitExceeded {
+				resource: "object-bytes",
+				limit: budget.limits.max_object_bytes(),
+			});
 		}
 		Ok((kind, data))
 	}

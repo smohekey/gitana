@@ -416,6 +416,27 @@ impl FileStore for LocalFileStore {
 		blocking(move || list_prefix_in(&*fs, &dir_part, &dir_rel, &frag)).await
 	}
 
+	async fn list_prefix_bounded(
+		&self,
+		prefix: &str,
+		max_entries: usize,
+		max_bytes: u64,
+	) -> Result<Vec<String>> {
+		let (dir_part, frag) = split_prefix(prefix);
+		let dir_rel = dir_part.trim_end_matches('/');
+		if !dir_rel.is_empty() {
+			self.resolve(dir_rel)?;
+		}
+		let dir_part = dir_part.to_owned();
+		let dir_rel = dir_rel.to_owned();
+		let frag = frag.to_owned();
+		let fs = Arc::clone(&self.backend);
+		blocking(move || {
+			list_prefix_bounded_in(&*fs, &dir_part, &dir_rel, &frag, max_entries, max_bytes)
+		})
+		.await
+	}
+
 	async fn read_path_range(&self, path: &str, offset: u64, length: u64) -> Result<Vec<u8>> {
 		let path = self.resolve(path)?.to_owned();
 		let fs = Arc::clone(&self.backend);
@@ -589,6 +610,18 @@ trait Backend: Send + Sync + 'static {
 	/// UTF-8 entry names directly under `dir_rel` (`""` = root); empty if the dir is absent.
 	/// Returns `InvalidData` rather than lossily aliasing a native name that is not representable.
 	fn list_names(&self, dir_rel: &str) -> std::io::Result<Vec<String>>;
+	/// As [`Self::list_names`], but reject the directory while enumerating it if either limit is
+	/// exceeded. Production backends override this so the unbounded vector is never constructed.
+	fn list_names_bounded(
+		&self,
+		dir_rel: &str,
+		max_entries: usize,
+		max_bytes: u64,
+	) -> Result<Vec<String>> {
+		let names = self.list_names(dir_rel).map_err(backend_err)?;
+		ensure_listing_limits(&names, max_entries, max_bytes)?;
+		Ok(names)
+	}
 	/// Classify `path` without following a final symbolic link.
 	fn kind(&self, path: &str) -> std::io::Result<FileKind>;
 	/// Flush one regular file's data and metadata to stable storage.
@@ -687,6 +720,36 @@ impl Backend for CapBackend {
 					"directory entry name is not UTF-8",
 				)
 			})?;
+			names.push(name);
+		}
+		Ok(names)
+	}
+
+	fn list_names_bounded(
+		&self,
+		dir_rel: &str,
+		max_entries: usize,
+		max_bytes: u64,
+	) -> Result<Vec<String>> {
+		let entries = if dir_rel.is_empty() {
+			self.dir.entries()
+		} else {
+			self.dir.read_dir(dir_rel)
+		};
+		let entries = match entries {
+			Ok(entries) => entries,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+			Err(error) => return Err(backend_err(error)),
+		};
+		let mut names = Vec::new();
+		let mut bytes = 0u64;
+		for entry in entries {
+			let name = entry
+				.map_err(backend_err)?
+				.file_name()
+				.into_string()
+				.map_err(|_| FileStoreError::Backend("directory entry name is not UTF-8".to_owned()))?;
+			charge_listing_entry(&mut bytes, names.len(), name.len(), max_entries, max_bytes)?;
 			names.push(name);
 		}
 		Ok(names)
@@ -1084,6 +1147,74 @@ fn list_prefix_in(
 		out.push(format!("{dir_part}{name}"));
 	}
 	Ok(out)
+}
+
+fn list_prefix_bounded_in(
+	fs: &dyn Backend,
+	dir_part: &str,
+	dir_rel: &str,
+	frag: &str,
+	max_entries: usize,
+	max_bytes: u64,
+) -> Result<Vec<String>> {
+	let names = fs.list_names_bounded(dir_rel, max_entries, max_bytes)?;
+	filter_listing(fs, names, dir_part, dir_rel, frag)
+}
+
+fn filter_listing(
+	fs: &dyn Backend,
+	names: Vec<String>,
+	dir_part: &str,
+	dir_rel: &str,
+	frag: &str,
+) -> Result<Vec<String>> {
+	let mut out = Vec::new();
+	for name in names {
+		if !name.starts_with(frag) {
+			continue;
+		}
+		if name.ends_with(".lock") || name.starts_with(".tmp.") {
+			let path = if dir_rel.is_empty() {
+				name.clone()
+			} else {
+				format!("{dir_rel}/{name}")
+			};
+			match fs.kind(&path) {
+				Ok(FileKind::File) => continue,
+				Ok(_) => {}
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+				Err(error) => return Err(backend_err(error)),
+			}
+		}
+		out.push(format!("{dir_part}{name}"));
+	}
+	Ok(out)
+}
+
+fn ensure_listing_limits(names: &[String], max_entries: usize, max_bytes: u64) -> Result<()> {
+	let mut bytes = 0u64;
+	for (count, name) in names.iter().enumerate() {
+		charge_listing_entry(&mut bytes, count, name.len(), max_entries, max_bytes)?;
+	}
+	Ok(())
+}
+
+pub(crate) fn charge_listing_entry(
+	bytes: &mut u64,
+	count: usize,
+	entry_bytes: usize,
+	max_entries: usize,
+	max_bytes: u64,
+) -> Result<()> {
+	let next_bytes = bytes.saturating_add(entry_bytes as u64);
+	if count >= max_entries || next_bytes > max_bytes {
+		return Err(FileStoreError::ListingTooLarge {
+			max_entries,
+			max_bytes,
+		});
+	}
+	*bytes = next_bytes;
+	Ok(())
 }
 
 /// A `<path>.lock` file held for the duration of a conditional write, giving

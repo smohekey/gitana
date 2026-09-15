@@ -283,6 +283,17 @@ impl FileStore for WorktreeFileStore {
 		self.store(prefix).list_prefix(prefix)
 	}
 
+	fn list_prefix_bounded(
+		&self,
+		prefix: &str,
+		max_entries: usize,
+		max_bytes: u64,
+	) -> impl Future<Output = Result<Vec<String>>> {
+		self
+			.store(prefix)
+			.list_prefix_bounded(prefix, max_entries, max_bytes)
+	}
+
 	fn read_path_range(
 		&self,
 		path: &str,

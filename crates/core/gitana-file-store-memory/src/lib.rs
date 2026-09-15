@@ -1,6 +1,6 @@
 //! In-memory [`FileStore`] backend for tests and local CI.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -11,13 +11,83 @@ use gitana_file_store::{
 use tokio::io::AsyncReadExt;
 
 type Key = String;
-type Files = Arc<RwLock<HashMap<Key, (Vec<u8>, Version)>>>;
+type StoredValue = (Vec<u8>, Version);
+type DirectoryChildren = HashMap<String, BTreeMap<String, usize>>;
+type State = Arc<RwLock<MemoryState>>;
+
+#[derive(Default)]
+struct MemoryState {
+	files: HashMap<Key, StoredValue>,
+	directory_children: DirectoryChildren,
+}
 
 /// A `FileStore` that keeps every value in process memory.
 #[derive(Default)]
 pub struct MemoryFileStore {
-	files: Files,
+	state: State,
 	next_version: Arc<AtomicU64>,
+}
+
+fn visit_directory_entries(path: &str, mut visit: impl FnMut(&str, &str)) {
+	let mut child_start = 0;
+	loop {
+		let child_end = path[child_start..]
+			.find('/')
+			.map_or(path.len(), |relative| child_start + relative);
+		visit(&path[..child_start], &path[child_start..child_end]);
+		if child_end == path.len() {
+			break;
+		}
+		child_start = child_end + 1;
+	}
+}
+
+fn index_path(directory_children: &mut DirectoryChildren, path: &str) {
+	visit_directory_entries(path, |directory, child| {
+		let count = directory_children
+			.entry(directory.to_owned())
+			.or_default()
+			.entry(child.to_owned())
+			.or_default();
+		*count = count.saturating_add(1);
+	});
+}
+
+fn unindex_path(directory_children: &mut DirectoryChildren, path: &str) {
+	visit_directory_entries(path, |directory, child| {
+		let remove_directory = if let Some(children) = directory_children.get_mut(directory) {
+			if let Some(count) = children.get_mut(child) {
+				if *count == 1 {
+					children.remove(child);
+				} else {
+					*count -= 1;
+				}
+			}
+			children.is_empty()
+		} else {
+			false
+		};
+		if remove_directory {
+			directory_children.remove(directory);
+		}
+	});
+}
+
+fn insert_value(state: &mut MemoryState, key: Key, value: StoredValue) -> Option<StoredValue> {
+	let is_new = !state.files.contains_key(&key);
+	let previous = state.files.insert(key.clone(), value);
+	if is_new {
+		index_path(&mut state.directory_children, &key);
+	}
+	previous
+}
+
+fn remove_value(state: &mut MemoryState, key: &str) -> Option<StoredValue> {
+	let removed = state.files.remove(key);
+	if removed.is_some() {
+		unindex_path(&mut state.directory_children, key);
+	}
+	removed
 }
 
 impl MemoryFileStore {
@@ -42,7 +112,7 @@ impl FileStore for MemoryFileStore {
 
 	fn shared_handle(&self) -> Self::Shared {
 		Self {
-			files: Arc::clone(&self.files),
+			state: Arc::clone(&self.state),
 			next_version: Arc::clone(&self.next_version),
 		}
 	}
@@ -55,52 +125,51 @@ impl FileStore for MemoryFileStore {
 
 	async fn read_path(&self, path: &str) -> Result<Vec<u8>> {
 		self
-			.files
+			.state
 			.read()
 			.expect("file store lock poisoned")
-			.get(&path.to_owned())
+			.files
+			.get(path)
 			.map(|(bytes, _)| bytes.clone())
 			.ok_or(FileStoreError::NotFound)
 	}
 
 	async fn read_path_versioned(&self, path: &str) -> Result<(Vec<u8>, Version)> {
 		self
-			.files
+			.state
 			.read()
 			.expect("file store lock poisoned")
-			.get(&path.to_owned())
+			.files
+			.get(path)
 			.map(|(bytes, version)| (bytes.clone(), version.clone()))
 			.ok_or(FileStoreError::NotFound)
 	}
 
 	async fn write_path_if_absent(&self, path: &str, bytes: &[u8]) -> Result<WriteOutcome> {
 		let version = self.mint_version();
-		let mut files = self.files.write().expect("file store lock poisoned");
-		match files.entry(path.to_owned()) {
-			std::collections::hash_map::Entry::Occupied(_) => Ok(WriteOutcome::AlreadyExists),
-			std::collections::hash_map::Entry::Vacant(slot) => {
-				slot.insert((bytes.to_vec(), version));
-				Ok(WriteOutcome::Written)
-			}
+		let mut state = self.state.write().expect("file store lock poisoned");
+		if state.files.contains_key(path) {
+			Ok(WriteOutcome::AlreadyExists)
+		} else {
+			insert_value(&mut state, path.to_owned(), (bytes.to_vec(), version));
+			Ok(WriteOutcome::Written)
 		}
 	}
 
 	async fn try_lock_path(&self, path: &str) -> Result<Option<PathLock>> {
 		let version = self.mint_version();
 		let key = path.to_owned();
-		let mut files = self.files.write().expect("file store lock poisoned");
-		if files.contains_key(&key) {
+		let mut state = self.state.write().expect("file store lock poisoned");
+		if state.files.contains_key(&key) {
 			return Ok(None);
 		}
-		files.insert(key.clone(), (Vec::new(), version));
-		drop(files);
+		insert_value(&mut state, key.clone(), (Vec::new(), version));
+		drop(state);
 
-		let files = Arc::clone(&self.files);
+		let state = Arc::clone(&self.state);
 		Ok(Some(PathLock::new(move || {
-			files
-				.write()
-				.expect("file store lock poisoned")
-				.remove(&key);
+			let mut state = state.write().expect("file store lock poisoned");
+			remove_value(&mut state, &key);
 		})))
 	}
 
@@ -111,13 +180,13 @@ impl FileStore for MemoryFileStore {
 		expected: Option<&Version>,
 	) -> Result<Version> {
 		let version = self.mint_version();
-		let mut files = self.files.write().expect("file store lock poisoned");
+		let mut state = self.state.write().expect("file store lock poisoned");
 		let key = path.to_owned();
-		let current = files.get(&key).map(|(_, version)| version);
+		let current = state.files.get(&key).map(|(_, version)| version);
 		if expected != current {
 			return Err(FileStoreError::VersionMismatch);
 		}
-		files.insert(key, (bytes.to_vec(), version.clone()));
+		insert_value(&mut state, key, (bytes.to_vec(), version.clone()));
 		Ok(version)
 	}
 
@@ -125,18 +194,15 @@ impl FileStore for MemoryFileStore {
 		// The in-memory map is already an atomic overwrite under the write lock, so this is a
 		// plain unconditional insert — no version check, no lock file.
 		let version = self.mint_version();
-		self
-			.files
-			.write()
-			.expect("file store lock poisoned")
-			.insert(path.to_owned(), (bytes.to_vec(), version));
+		let mut state = self.state.write().expect("file store lock poisoned");
+		insert_value(&mut state, path.to_owned(), (bytes.to_vec(), version));
 		Ok(())
 	}
 
 	async fn delete_path(&self, path: &str, expected: Option<&Version>) -> Result<DeleteOutcome> {
-		let mut files = self.files.write().expect("file store lock poisoned");
+		let mut state = self.state.write().expect("file store lock poisoned");
 		let key = path.to_owned();
-		match files.get(&key) {
+		match state.files.get(&key) {
 			None => Ok(DeleteOutcome::NotFound),
 			Some((_, current)) => {
 				if let Some(expected) = expected
@@ -144,7 +210,7 @@ impl FileStore for MemoryFileStore {
 				{
 					return Err(FileStoreError::VersionMismatch);
 				}
-				files.remove(&key);
+				remove_value(&mut state, &key);
 				Ok(DeleteOutcome::Deleted)
 			}
 		}
@@ -153,8 +219,8 @@ impl FileStore for MemoryFileStore {
 	async fn delete_path_unlocked(&self, path: &str) -> Result<DeleteOutcome> {
 		// The map removal is already atomic under the write lock; there are no `<path>.lock` files in
 		// the memory backend, so this is just an unconditional remove.
-		let mut files = self.files.write().expect("file store lock poisoned");
-		match files.remove(&path.to_owned()) {
+		let mut state = self.state.write().expect("file store lock poisoned");
+		match remove_value(&mut state, path) {
 			Some(_) => Ok(DeleteOutcome::Deleted),
 			None => Ok(DeleteOutcome::NotFound),
 		}
@@ -163,10 +229,11 @@ impl FileStore for MemoryFileStore {
 	async fn exists(&self, path: &str) -> Result<bool> {
 		Ok(
 			self
-				.files
+				.state
 				.read()
 				.expect("file store lock poisoned")
-				.contains_key(&path.to_owned()),
+				.files
+				.contains_key(path),
 		)
 	}
 
@@ -174,17 +241,17 @@ impl FileStore for MemoryFileStore {
 		// The map has no physical directories, but descendant keys imply the same logical directory
 		// namespace as a filesystem-backed store. Report that shape so callers cannot create both a
 		// value and one of its ancestor/descendant paths.
+		if path.is_empty() {
+			return Ok(false);
+		}
+		let directory = format!("{path}/");
 		Ok(
 			self
-				.files
+				.state
 				.read()
 				.expect("file store lock poisoned")
-				.keys()
-				.any(|candidate| {
-					candidate
-						.strip_prefix(path)
-						.is_some_and(|suffix| suffix.starts_with('/'))
-				}),
+				.directory_children
+				.contains_key(&directory),
 		)
 	}
 
@@ -195,10 +262,11 @@ impl FileStore for MemoryFileStore {
 
 	async fn size(&self, path: &str) -> Result<u64> {
 		self
-			.files
+			.state
 			.read()
 			.expect("file store lock poisoned")
-			.get(&path.to_owned())
+			.files
+			.get(path)
 			.map(|(bytes, _)| bytes.len() as u64)
 			.ok_or(FileStoreError::NotFound)
 	}
@@ -209,23 +277,60 @@ impl FileStore for MemoryFileStore {
 		// nested key contributes its first path segment as a (synthetic) subdirectory
 		// entry, deduped — mirroring a real directory listing (as the file backend's
 		// `read_dir` yields), so callers like `RefStore::list` can walk the tree.
-		let mut children = std::collections::BTreeSet::new();
-		for path in self.files.read().expect("file store lock poisoned").keys() {
-			let Some(rest) = path.strip_prefix(dir) else {
-				continue;
-			};
-			let first = rest.split('/').next().unwrap_or(rest);
-			if first.starts_with(frag) {
-				children.insert(format!("{dir}{first}"));
+		let state = self.state.read().expect("file store lock poisoned");
+		let Some(children) = state.directory_children.get(dir) else {
+			return Ok(Vec::new());
+		};
+		Ok(
+			children
+				.keys()
+				.filter(|name| name.starts_with(frag))
+				.map(|name| format!("{dir}{name}"))
+				.collect(),
+		)
+	}
+
+	async fn list_prefix_bounded(
+		&self,
+		prefix: &str,
+		max_entries: usize,
+		max_bytes: u64,
+	) -> Result<Vec<String>> {
+		let (dir, frag) = gitana_file_store::split_prefix(prefix);
+		let state = self.state.read().expect("file store lock poisoned");
+		let Some(children) = state.directory_children.get(dir) else {
+			return Ok(Vec::new());
+		};
+		let mut out = Vec::new();
+		let mut bytes = 0u64;
+		for (count, name) in children.keys().enumerate() {
+			let next_bytes = bytes.saturating_add(name.len() as u64);
+			if count >= max_entries || next_bytes > max_bytes {
+				return Err(FileStoreError::ListingTooLarge {
+					max_entries,
+					max_bytes,
+				});
+			}
+			bytes = next_bytes;
+			if name.starts_with(frag) {
+				out.push(format!("{dir}{name}"));
 			}
 		}
-		Ok(children.into_iter().collect())
+		Ok(out)
 	}
 
 	async fn read_path_range(&self, path: &str, offset: u64, length: u64) -> Result<Vec<u8>> {
-		let bytes = self.read_path(path).await?;
-		let start = (offset as usize).min(bytes.len());
-		let end = start.saturating_add(length as usize).min(bytes.len());
+		let state = self.state.read().expect("file store lock poisoned");
+		let bytes = state
+			.files
+			.get(path)
+			.map(|(bytes, _)| bytes)
+			.ok_or(FileStoreError::NotFound)?;
+		let start = usize::try_from(offset)
+			.unwrap_or(usize::MAX)
+			.min(bytes.len());
+		let length = usize::try_from(length).unwrap_or(usize::MAX);
+		let end = start.saturating_add(length).min(bytes.len());
 		Ok(bytes[start..end].to_vec())
 	}
 
@@ -261,8 +366,8 @@ impl FileStore for MemoryFileStore {
 	fn remove_lock_file_sync(&self, path: &str) {
 		// Synchronous unconditional removal — the map write lock is already sync, so a `Drop`-time
 		// release needs no async path. Absent key → nothing to do.
-		let mut files = self.files.write().expect("file store lock poisoned");
-		files.remove(&path.to_owned());
+		let mut state = self.state.write().expect("file store lock poisoned");
+		remove_value(&mut state, path);
 	}
 
 	async fn replace_and_release_lock(
@@ -274,9 +379,77 @@ impl FileStore for MemoryFileStore {
 		// One write-lock critical section makes the replace and the lock removal atomic and infallible;
 		// there is no blocking task to outlive cancellation, so nothing here can be interrupted mid-way.
 		let version = self.mint_version();
-		let mut files = self.files.write().expect("file store lock poisoned");
-		files.insert(path.to_owned(), (bytes.to_vec(), version));
-		files.remove(&lock_path.to_owned());
+		let mut state = self.state.write().expect("file store lock poisoned");
+		insert_value(&mut state, path.to_owned(), (bytes.to_vec(), version));
+		remove_value(&mut state, lock_path);
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use gitana_file_store::{FileStore, FileStoreError};
+
+	use super::MemoryFileStore;
+
+	#[tokio::test]
+	async fn bounded_listing_uses_the_immediate_directory_index() {
+		let store = MemoryFileStore::new();
+		for index in 0..32 {
+			store
+				.write_path_if_absent(&format!("objects/pack/nested/object-{index}"), b"object")
+				.await
+				.expect("write descendant");
+			store
+				.write_path_if_absent(&format!("refs/heads/branch-{index}"), b"ref")
+				.await
+				.expect("write unrelated path");
+		}
+		store
+			.write_path_replace("objects/pack/nested/object-0", b"replacement")
+			.await
+			.expect("replace descendant");
+
+		assert_eq!(
+			store
+				.list_prefix_bounded("objects/pack/", 1, "nested".len() as u64)
+				.await
+				.expect("bounded listing"),
+			vec!["objects/pack/nested".to_owned()]
+		);
+		assert!(matches!(
+			store.list_prefix_bounded("objects/pack/", 0, 0).await,
+			Err(FileStoreError::ListingTooLarge {
+				max_entries: 0,
+				max_bytes: 0,
+			})
+		));
+		assert!(
+			store
+				.list_prefix_bounded("missing/", 0, 0)
+				.await
+				.expect("empty bounded listing")
+				.is_empty()
+		);
+
+		for index in 0..32 {
+			store
+				.delete_path(&format!("objects/pack/nested/object-{index}"), None)
+				.await
+				.expect("delete descendant");
+		}
+		assert!(
+			store
+				.list_prefix("objects/pack/")
+				.await
+				.expect("list after deletion")
+				.is_empty()
+		);
+		assert!(
+			!store
+				.is_dir("objects/pack/nested")
+				.await
+				.expect("directory state")
+		);
 	}
 }

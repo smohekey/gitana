@@ -231,6 +231,20 @@ async fn check_listing(store: &impl FileStore) {
 		],
 		"list_prefix must return exactly the entries directly under the prefix dir"
 	);
+	assert!(matches!(
+		store.list_prefix_bounded("objects/pack/", 1, 1_000).await,
+		Err(FileStoreError::ListingTooLarge { .. })
+	));
+	assert!(matches!(
+		store.list_prefix_bounded("objects/pack/", 10, 1).await,
+		Err(FileStoreError::ListingTooLarge { .. })
+	));
+	let mut bounded = store
+		.list_prefix_bounded("objects/pack/", 10, 1_000)
+		.await
+		.expect("bounded listing");
+	bounded.sort();
+	assert_eq!(bounded, got);
 }
 
 async fn check_immutable_writes(store: &impl FileStore) {

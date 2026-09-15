@@ -37,21 +37,24 @@ pub use commit::{
 	Commit, commit_signature_and_payload, commit_signed_payload, encode_commit, parse_commit,
 	validate_commit_structure,
 };
-pub use delta::apply_delta;
+pub use delta::{apply_delta, apply_delta_with_limit};
 pub use enumerate::{enumerate_objects, referenced_ids};
 pub use ewah::{EwahBitmap, decode_ewah, decode_ewah_bounded, encode_ewah};
 pub use hash_algorithm::{HashAlgorithm, HashKind};
 pub use id::ObjectId;
 pub use idx::{PackIndex, PackIndexEntry, decode_pack_index, encode_pack_index};
 pub use kind::ObjectKind;
-pub use loose::{MAX_OBJECT_SIZE, decode_loose, encode_loose, loose_object_path};
+pub use loose::{
+	MAX_OBJECT_SIZE, decode_loose, decode_loose_with_limit, encode_loose, loose_object_path,
+};
 pub use midx::{
 	MidxEntry, MultiPackIndex, decode_multi_pack_index, encode_multi_pack_index,
 	encode_multi_pack_index_with_reverse_index,
 };
 pub use pack::{
 	PackEntry, PackedObject, decode_object_at, decode_pack, decode_pack_entry,
-	decode_pack_with_bases, pack_index_entries, ref_delta_base_ids,
+	decode_pack_entry_with_limit, decode_pack_with_bases, pack_entry_is_delta, pack_index_entries,
+	ref_delta_base_ids,
 };
 pub use pack_encode::{encode_pack, encode_pack_with_bases};
 pub use pktline::{

@@ -184,9 +184,15 @@ pub fn decode_pack_index<H: HashAlgorithm>(bytes: &[u8]) -> Result<PackIndex<H>,
 	// Object count = the last fanout entry.
 	let n = read_u32(&bytes[header - 4..header]) as usize;
 	let ids_start = header;
-	let crc_start = ids_start + n * raw;
-	let off_start = crc_start + n * 4;
-	let large_start = off_start + n * 4;
+	let crc_start = ids_start
+		.checked_add(n.checked_mul(raw).ok_or(ObjectError::MalformedPackIndex)?)
+		.ok_or(ObjectError::MalformedPackIndex)?;
+	let off_start = crc_start
+		.checked_add(n.checked_mul(4).ok_or(ObjectError::MalformedPackIndex)?)
+		.ok_or(ObjectError::MalformedPackIndex)?;
+	let large_start = off_start
+		.checked_add(n.checked_mul(4).ok_or(ObjectError::MalformedPackIndex)?)
+		.ok_or(ObjectError::MalformedPackIndex)?;
 	// The id, crc, and small-offset tables must fit before the pack checksum.
 	if large_start > body_end - raw {
 		return Err(ObjectError::MalformedPackIndex);
@@ -204,7 +210,14 @@ pub fn decode_pack_index<H: HashAlgorithm>(bytes: &[u8]) -> Result<PackIndex<H>,
 	}
 	// The large-offset table fills exactly the gap between the small offsets and the pack
 	// checksum — one 64-bit entry per flagged small offset.
-	if large_start + large_count * 8 != body_end - raw {
+	let large_end = large_start
+		.checked_add(
+			large_count
+				.checked_mul(8)
+				.ok_or(ObjectError::MalformedPackIndex)?,
+		)
+		.ok_or(ObjectError::MalformedPackIndex)?;
+	if large_end != body_end - raw {
 		return Err(ObjectError::MalformedPackIndex);
 	}
 
@@ -424,6 +437,22 @@ mod tests {
 
 		assert!(matches!(
 			decode_pack_index::<Sha256>(&idx),
+			Err(ObjectError::MalformedPackIndex)
+		));
+	}
+
+	#[test]
+	fn rejects_an_impossible_fanout_without_arithmetic_overflow() {
+		let raw = Sha256::RAW_LEN;
+		let mut bytes = vec![0u8; 8 + FANOUT_LEN + 2 * raw];
+		bytes[0..4].copy_from_slice(&MAGIC);
+		bytes[4..8].copy_from_slice(&VERSION.to_be_bytes());
+		bytes[8 + FANOUT_LEN - 4..8 + FANOUT_LEN].copy_from_slice(&u32::MAX.to_be_bytes());
+		let body_end = bytes.len() - raw;
+		let checksum = Sha256::digest(&[&bytes[..body_end]]);
+		bytes[body_end..].copy_from_slice(checksum.as_ref());
+		assert!(matches!(
+			decode_pack_index::<Sha256>(&bytes),
 			Err(ObjectError::MalformedPackIndex)
 		));
 	}

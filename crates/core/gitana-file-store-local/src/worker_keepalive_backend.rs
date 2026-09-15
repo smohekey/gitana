@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
+use gitana_file_store::Result;
+
 use crate::{Backend, FileKind};
 
 pub(crate) struct WorkerKeepaliveBackend {
@@ -64,6 +66,15 @@ impl Backend for WorkerKeepaliveBackend {
 
 	fn list_names(&self, path: &str) -> std::io::Result<Vec<String>> {
 		self.inner.list_names(path)
+	}
+
+	fn list_names_bounded(
+		&self,
+		path: &str,
+		max_entries: usize,
+		max_bytes: u64,
+	) -> Result<Vec<String>> {
+		self.inner.list_names_bounded(path, max_entries, max_bytes)
 	}
 
 	fn kind(&self, path: &str) -> std::io::Result<FileKind> {

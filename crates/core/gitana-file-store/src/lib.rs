@@ -30,6 +30,14 @@ pub enum FileStoreError {
 		/// The cap the write was given.
 		limit: u64,
 	},
+	/// A directory listing exceeded one of the caller's bounds.
+	#[error("directory listing exceeds the maximum of {max_entries} entries or {max_bytes} bytes")]
+	ListingTooLarge {
+		/// Maximum number of directory entries that may be inspected.
+		max_entries: usize,
+		/// Maximum aggregate UTF-8 byte length of the inspected entry names.
+		max_bytes: u64,
+	},
 	/// The backend failed for an implementation-specific reason.
 	#[error("file store backend error: {0}")]
 	Backend(String),
@@ -189,6 +197,19 @@ pub trait FileStore: Send + Sync {
 	/// hide directories or other unexpected entries solely because their names
 	/// resemble transient files.
 	fn list_prefix(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> + Send;
+
+	/// List repository-relative paths beginning with `prefix`, while bounding work and allocation.
+	///
+	/// The limits apply while the backend enumerates the immediate directory, before it retains the
+	/// complete result. Backends may therefore charge entries that are later excluded by `prefix` or
+	/// by their private temporary-file rules. This deliberately bounds adversarial directory contents,
+	/// not only the returned vector.
+	fn list_prefix_bounded(
+		&self,
+		prefix: &str,
+		max_entries: usize,
+		max_bytes: u64,
+	) -> impl Future<Output = Result<Vec<String>>> + Send;
 
 	/// Read `length` bytes starting at `offset` within the value at `path`.
 	///

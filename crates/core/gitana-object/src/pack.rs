@@ -216,17 +216,38 @@ pub enum PackEntry<H: HashAlgorithm> {
 	},
 }
 
+/// Whether `entry` is a delta entry, without inflating its zlib payload.
+pub fn pack_entry_is_delta(entry: &[u8]) -> Result<bool, ObjectError> {
+	let mut cursor = 0;
+	let (raw_type, _) = read_object_header(entry, &mut cursor)?;
+	match raw_type {
+		OBJ_COMMIT | OBJ_TREE | OBJ_BLOB | OBJ_TAG => Ok(false),
+		OBJ_OFS_DELTA | OBJ_REF_DELTA => Ok(true),
+		_ => Err(ObjectError::MalformedPack),
+	}
+}
+
 /// Decode a single packfile entry from `entry` — a slice that begins at the entry's byte offset
 /// and contains at least its full compressed data (e.g. the `[offset, next_offset)` span computed
 /// from a `.idx`'s offsets). Returns the base object, or the delta with its unresolved base
 /// reference; the caller resolves the base and applies the delta with [`apply_delta`]. Touches no
 /// other part of the pack, so it underpins a lazy, memory-bounded read path.
 pub fn decode_pack_entry<H: HashAlgorithm>(entry: &[u8]) -> Result<PackEntry<H>, ObjectError> {
+	decode_pack_entry_with_limit(entry, MAX_OBJECT_SIZE)
+}
+
+/// Decode one pack entry while rejecting its inflated base or delta bytes above `max_inflated`.
+///
+/// The declared size is checked before allocating the output buffer.
+pub fn decode_pack_entry_with_limit<H: HashAlgorithm>(
+	entry: &[u8],
+	max_inflated: u64,
+) -> Result<PackEntry<H>, ObjectError> {
 	let mut cursor = 0;
 	let (raw_type, size) = read_object_header(entry, &mut cursor)?;
 	match raw_type {
 		OBJ_COMMIT | OBJ_TREE | OBJ_BLOB | OBJ_TAG => {
-			let (data, _) = inflate(&entry[cursor..], size)?;
+			let (data, _) = inflate_with_limit(&entry[cursor..], size, max_inflated)?;
 			Ok(PackEntry::Base {
 				kind: kind_of(raw_type)?,
 				data,
@@ -234,7 +255,7 @@ pub fn decode_pack_entry<H: HashAlgorithm>(entry: &[u8]) -> Result<PackEntry<H>,
 		}
 		OBJ_OFS_DELTA => {
 			let distance = read_offset(entry, &mut cursor)?;
-			let (delta, _) = inflate(&entry[cursor..], size)?;
+			let (delta, _) = inflate_with_limit(&entry[cursor..], size, max_inflated)?;
 			Ok(PackEntry::OfsDelta {
 				distance: distance as u64,
 				delta,
@@ -242,7 +263,7 @@ pub fn decode_pack_entry<H: HashAlgorithm>(entry: &[u8]) -> Result<PackEntry<H>,
 		}
 		OBJ_REF_DELTA => {
 			let base = read_object_id::<H>(entry, &mut cursor)?;
-			let (delta, _) = inflate(&entry[cursor..], size)?;
+			let (delta, _) = inflate_with_limit(&entry[cursor..], size, max_inflated)?;
 			Ok(PackEntry::RefDelta { base, delta })
 		}
 		_ => Err(ObjectError::MalformedPack),
@@ -535,27 +556,42 @@ fn read_object_id<H: HashAlgorithm>(
 
 /// Inflate one zlib stream, returning the data and the number of input bytes used.
 fn inflate(input: &[u8], expected: usize) -> Result<(Vec<u8>, usize), ObjectError> {
+	inflate_with_limit(input, expected, MAX_OBJECT_SIZE)
+}
+
+fn inflate_with_limit(
+	input: &[u8],
+	expected: usize,
+	max_inflated: u64,
+) -> Result<(Vec<u8>, usize), ObjectError> {
+	let max_inflated = max_inflated.min(MAX_OBJECT_SIZE);
+	if expected as u64 > max_inflated {
+		return Err(ObjectError::TooLarge);
+	}
 	let mut decompress = flate2::Decompress::new(true);
-	let mut out = Vec::with_capacity(expected.min(MAX_OBJECT_SIZE as usize) + 16);
+	let mut out = Vec::with_capacity(expected.saturating_add(16));
 	loop {
-		let consumed = decompress.total_in() as usize;
+		let input_before = decompress.total_in();
+		let output_before = decompress.total_out();
 		let status = decompress
 			.decompress_vec(
-				&input[consumed..],
+				&input[input_before as usize..],
 				&mut out,
 				flate2::FlushDecompress::Finish,
 			)
 			.map_err(|error| ObjectError::Zlib(error.to_string()))?;
-		if out.len() as u64 > MAX_OBJECT_SIZE {
+		if out.len() as u64 > max_inflated {
 			return Err(ObjectError::TooLarge);
+		}
+		if out.len() > expected {
+			return Err(ObjectError::MalformedPack);
 		}
 		match status {
 			flate2::Status::StreamEnd => break,
 			flate2::Status::Ok | flate2::Status::BufError => {
-				if decompress.total_in() as usize >= input.len() && out.len() >= expected {
+				if decompress.total_in() == input_before && decompress.total_out() == output_before {
 					return Err(ObjectError::Zlib("truncated zlib stream".to_owned()));
 				}
-				out.reserve(expected.max(64));
 			}
 		}
 	}
@@ -831,6 +867,30 @@ mod tests {
 			}
 			_ => panic!("expected a REF delta"),
 		}
+	}
+
+	#[test]
+	fn identifies_delta_entries_without_inflating_them() {
+		assert!(!pack_entry_is_delta(&obj_header(OBJ_BLOB, 1)).expect("base"));
+		assert!(pack_entry_is_delta(&obj_header(OBJ_OFS_DELTA, 1)).expect("ofs delta"));
+		assert!(pack_entry_is_delta(&obj_header(OBJ_REF_DELTA, 1)).expect("ref delta"));
+		assert!(matches!(
+			pack_entry_is_delta(&obj_header(0, 1)),
+			Err(ObjectError::MalformedPack)
+		));
+	}
+
+	#[test]
+	fn decode_pack_entry_rejects_truncated_zlib_without_looping() {
+		let payload = b"a payload long enough for a meaningful truncated zlib stream";
+		let compressed = zlib(payload);
+		let mut entry = obj_header(OBJ_BLOB, payload.len());
+		entry.extend_from_slice(&compressed[..compressed.len() / 2]);
+
+		assert!(matches!(
+			decode_pack_entry_with_limit::<Sha256>(&entry, payload.len() as u64),
+			Err(ObjectError::Zlib(_))
+		));
 	}
 
 	#[test]

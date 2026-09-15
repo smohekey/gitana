@@ -8,6 +8,17 @@ use crate::loose::MAX_OBJECT_SIZE;
 /// run from `base`; insert instructions carry literal bytes. See
 /// gitformat-pack(5).
 pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, ObjectError> {
+	apply_delta_with_limit(base, delta, MAX_OBJECT_SIZE)
+}
+
+/// Apply a git delta while rejecting a target larger than `max_target_size` before allocating it.
+/// Every copy and insert is also validated against the declared target size before extending the
+/// output buffer.
+pub fn apply_delta_with_limit(
+	base: &[u8],
+	delta: &[u8],
+	max_target_size: u64,
+) -> Result<Vec<u8>, ObjectError> {
 	let mut cursor = 0;
 
 	let source_size = read_size(delta, &mut cursor)?;
@@ -15,7 +26,7 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, ObjectError> {
 		return Err(ObjectError::MalformedDelta);
 	}
 	let target_size = read_size(delta, &mut cursor)?;
-	if target_size as u64 > MAX_OBJECT_SIZE {
+	if target_size as u64 > max_target_size.min(MAX_OBJECT_SIZE) {
 		return Err(ObjectError::TooLarge);
 	}
 
@@ -40,6 +51,12 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, ObjectError> {
 			if size == 0 {
 				size = 0x10000;
 			}
+			let remaining = target_size
+				.checked_sub(out.len())
+				.ok_or(ObjectError::MalformedDelta)?;
+			if size > remaining {
+				return Err(ObjectError::MalformedDelta);
+			}
 			let end = offset
 				.checked_add(size)
 				.ok_or(ObjectError::MalformedDelta)?;
@@ -48,15 +65,18 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, ObjectError> {
 		} else if cmd != 0 {
 			// Insert the next `cmd` literal bytes.
 			let len = cmd as usize;
+			let remaining = target_size
+				.checked_sub(out.len())
+				.ok_or(ObjectError::MalformedDelta)?;
+			if len > remaining {
+				return Err(ObjectError::MalformedDelta);
+			}
 			let end = cursor.checked_add(len).ok_or(ObjectError::MalformedDelta)?;
 			let run = delta.get(cursor..end).ok_or(ObjectError::MalformedDelta)?;
 			out.extend_from_slice(run);
 			cursor = end;
 		} else {
 			// A 0x00 command is reserved and invalid.
-			return Err(ObjectError::MalformedDelta);
-		}
-		if out.len() > target_size {
 			return Err(ObjectError::MalformedDelta);
 		}
 	}
@@ -163,6 +183,43 @@ mod tests {
 		delta.push(b'x');
 		assert!(matches!(
 			apply_delta(base, &delta),
+			Err(ObjectError::MalformedDelta)
+		));
+	}
+
+	#[test]
+	fn bounded_apply_rejects_target_before_allocating_it() {
+		let base = b"hello world";
+		let delta = delta_copy_then_insert(base.len(), 0, 5, b"!!!");
+		assert!(matches!(
+			apply_delta_with_limit(base, &delta, 7),
+			Err(ObjectError::TooLarge)
+		));
+	}
+
+	#[test]
+	fn rejects_copy_larger_than_remaining_target() {
+		let base = b"hello world";
+		let mut delta = Vec::new();
+		encode_size(&mut delta, base.len());
+		encode_size(&mut delta, 1);
+		delta.extend_from_slice(&[0x90, 5]);
+
+		assert!(matches!(
+			apply_delta(base, &delta),
+			Err(ObjectError::MalformedDelta)
+		));
+	}
+
+	#[test]
+	fn rejects_insert_larger_than_remaining_target() {
+		let mut delta = Vec::new();
+		encode_size(&mut delta, 0);
+		encode_size(&mut delta, 1);
+		delta.extend_from_slice(&[3, b'a', b'b', b'c']);
+
+		assert!(matches!(
+			apply_delta(b"", &delta),
 			Err(ObjectError::MalformedDelta)
 		));
 	}

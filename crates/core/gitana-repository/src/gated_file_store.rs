@@ -156,6 +156,17 @@ impl FileStore for GatedFileStore {
 		self.inner.list_prefix(prefix)
 	}
 
+	fn list_prefix_bounded(
+		&self,
+		prefix: &str,
+		max_entries: usize,
+		max_bytes: u64,
+	) -> impl Future<Output = Result<Vec<String>>> {
+		self
+			.inner
+			.list_prefix_bounded(prefix, max_entries, max_bytes)
+	}
+
 	fn read_path_range(
 		&self,
 		path: &str,
