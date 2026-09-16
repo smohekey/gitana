@@ -28,7 +28,11 @@ What works today:
   publication frontier before reporting durable success, while non-persistent backends treat it as a
   no-op.
 - Refs, symbolic `HEAD`, packed-ref reads, ref CAS updates, and reflog writes
-  for commits and resets.
+  for commits and resets. Repository clients can publish a first commit through
+  an initial-commit transaction that atomically requires an unborn,
+  otherwise-history-free repository with no linked-worktree administration and
+  retains the history gate through the ref durability barrier. Sibling libraries
+  can participate in the same gate through an opaque history-mutation lease.
 - Revision resolution for common forms such as `HEAD`, branch/tag names,
   abbreviated object IDs, `~`, `^`, and `^{type}`.
 - A Git-compatible index (including conflict stages / unmerged paths), `.gitignore`

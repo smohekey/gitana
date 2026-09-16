@@ -10,7 +10,7 @@ use gitana_file_store::FileStore;
 use gitana_git_http::{Deepen, parse_advertisement};
 use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit};
 use gitana_remote::{HttpTransport, Origin};
-use gitana_repository::{FileMode, ReflogIntent, Repository, RepositoryError, TreeBuildEntry};
+use gitana_repository::{FileMode, Repository, RepositoryError, TreeBuildEntry};
 use gitana_trust::{
 	AuditEvent, KeyId, ObjectSource, Policy, TRUST_DOCUMENT_PATH, TrustDocument, TrustRoot,
 	TrustedKey, fold_trust_root, verify_candidate_trust_update,
@@ -84,16 +84,12 @@ pub async fn trust_init<F: FileStore, H: HashAlgorithm>(
 	// anchored fold also surfaces the key that actually signed, for the audit event.
 	let folded = verify_candidate_trust_update_anchored(&RepoObjects(repo), None, tip).await?;
 
-	// The trust ref lives outside git's logged namespaces, so the move opts out and this writes the
-	// `trust:` reflog explicitly (as it has since the trust subsystem landed).
-	repo
-		.refs()
-		.update_ref(TRUST_REF, tip, None, ReflogIntent::Skip)
-		.await?;
+	// The trust ref lives outside git's normally logged namespaces, but its audit reflog is mandatory.
+	// Resolve the identity before mutation, then publish the reflog and ref in one transaction.
 	let committer = identity.committer_or_default().await?;
 	repo
 		.refs()
-		.append_reflog(TRUST_REF, None, Some(tip), &committer, "trust: bootstrap")
+		.update_ref_with_explicit_reflog(TRUST_REF, tip, None, &committer, "trust: bootstrap")
 		.await?;
 	Ok((
 		tip,
@@ -209,20 +205,10 @@ pub async fn trust_sync<F: FileStore, H: HashAlgorithm>(
 		return Ok(TrustSyncOutcome::Declined { new: remote_tip });
 	}
 
-	repo
-		.refs()
-		.update_ref(TRUST_REF, remote_tip, local_tip, ReflogIntent::Skip)
-		.await?;
 	let committer = identity.committer_or_default().await?;
 	repo
 		.refs()
-		.append_reflog(
-			TRUST_REF,
-			local_tip,
-			Some(remote_tip),
-			&committer,
-			"trust: sync",
-		)
+		.update_ref_with_explicit_reflog(TRUST_REF, remote_tip, local_tip, &committer, "trust: sync")
 		.await?;
 	Ok(TrustSyncOutcome::Updated {
 		old: local_tip,
@@ -430,17 +416,13 @@ async fn trust_update<F: FileStore, H: HashAlgorithm>(
 	// Prove the new chain (signed by a key the *previous* root trusts, and a fast-forward of it)
 	// before the ref moves — the same check receive-pack makes.
 	verify_candidate_trust_update(&RepoObjects(repo), Some(old_tip), new_tip).await?;
-	repo
-		.refs()
-		.update_ref(TRUST_REF, new_tip, Some(old_tip), ReflogIntent::Skip)
-		.await?;
 	let committer = identity.committer_or_default().await?;
 	repo
 		.refs()
-		.append_reflog(
+		.update_ref_with_explicit_reflog(
 			TRUST_REF,
+			new_tip,
 			Some(old_tip),
-			Some(new_tip),
 			&committer,
 			&format!("trust: {label}"),
 		)
@@ -633,6 +615,10 @@ mod tests {
 		let root = trust_list(client).await.unwrap().unwrap();
 		assert_eq!(root.policy, Policy::Warn);
 		assert_eq!(root.keys.len(), 1);
+		assert!(
+			trust_reflog(client).await.ends_with("\ttrust: sync\n"),
+			"sync returns its audit outcome only after the trust reflog and ref publish"
+		);
 	}
 
 	#[tokio::test]
@@ -1027,6 +1013,10 @@ mod tests {
 				policy: Policy::Warn,
 			}
 		);
+		assert!(
+			trust_reflog(repo).await.ends_with("\ttrust: bootstrap\n"),
+			"bootstrap returns its audit event only after the trust reflog and ref publish"
+		);
 	}
 
 	#[tokio::test]
@@ -1112,6 +1102,18 @@ mod tests {
 		.0
 	}
 
+	async fn trust_reflog(repo: &Repository<LocalFileStore, Sha256>) -> String {
+		String::from_utf8(
+			repo
+				.objects()
+				.file_store()
+				.read_path("logs/refs/gitana/trust")
+				.await
+				.expect("read trust reflog"),
+		)
+		.expect("trust reflog is UTF-8")
+	}
+
 	fn fingerprint(signer: &TestSigner) -> String {
 		TrustedKey::from_openssh(&signer.public_line())
 			.unwrap()
@@ -1145,6 +1147,10 @@ mod tests {
 			.map(|k| k.id().as_str().to_owned())
 			.collect();
 		assert!(ids.contains(&fingerprint(&admin)) && ids.contains(&fingerprint(&colleague)));
+		assert!(
+			trust_reflog(repo).await.ends_with("\ttrust: add key\n"),
+			"the audit reflog is part of the successful trust update"
+		);
 	}
 
 	#[tokio::test]

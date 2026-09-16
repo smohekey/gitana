@@ -3,7 +3,9 @@ use std::marker::PhantomData;
 use gitana_file_store::{FileStore, FileStoreError, PathLock};
 use gitana_object::{HashAlgorithm, ObjectId};
 
-use crate::{HeadLock, HeadResetPlan, HeadState, HeadTransaction, RefOp, RepositoryError};
+use crate::{
+	HeadLock, HeadResetPlan, HeadState, HeadTransaction, HistoryMutationLease, RefOp, RepositoryError,
+};
 
 /// The maximum symbolic-ref chain depth to follow (git's limit), a guard against a cycle.
 const MAX_SYMREF_DEPTH: usize = 5;
@@ -351,16 +353,28 @@ where
 		prefix: &str,
 	) -> Result<Vec<ObjectId<H>>, RepositoryError> {
 		let mut ids = Vec::new();
+		for (_, target) in self.symbolic_refs(prefix).await? {
+			if let Some(id) = self.follow_symref(&target).await? {
+				ids.push(id);
+			}
+		}
+		Ok(ids)
+	}
+
+	/// Enumerate every loose symbolic ref under `prefix`, including refs whose target is unborn.
+	pub(crate) async fn symbolic_refs(
+		&self,
+		prefix: &str,
+	) -> Result<Vec<(String, String)>, RepositoryError> {
+		let mut refs = Vec::new();
 		let mut stack = vec![prefix.to_owned()];
 		while let Some(dir) = stack.pop() {
 			for path in self.files.list_prefix(&dir).await? {
 				match self.files.read_path(&path).await {
 					Ok(bytes) => {
 						let text = std::str::from_utf8(&bytes).map(str::trim).unwrap_or("");
-						if let Some(target) = text.strip_prefix("ref:")
-							&& let Some(id) = self.follow_symref(target.trim()).await?
-						{
-							ids.push(id);
+						if let Some(target) = text.strip_prefix("ref:") {
+							refs.push((path, target.trim().to_owned()));
 						}
 					}
 					// A read failure here means `path` is a subdirectory; descend (as `list` does).
@@ -368,7 +382,8 @@ where
 				}
 			}
 		}
-		Ok(ids)
+		refs.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+		Ok(refs)
 	}
 
 	/// Resolve `name` to an object id, following a bounded chain of symbolic (`ref:`) refs and
@@ -472,6 +487,33 @@ where
 			.map_err(|(_, error)| error)
 	}
 
+	/// Compare-and-set a ref with an explicit reflog independent of repository logging policy.
+	///
+	/// Unlike [`ReflogIntent::Log`], this explicit reflog is not gated by
+	/// `core.logAllRefUpdates`; ordinary no-op suppression still applies. The reflog and ref move are
+	/// one transaction under the same retained history lease and ref locks, with the reflog written
+	/// first so a reported failure never leaves the ref advanced. Use this for repository metadata
+	/// whose audit log is part of the mutation's contract, such as `refs/gitana/trust`.
+	pub async fn update_ref_with_explicit_reflog(
+		&self,
+		name: &str,
+		new: ObjectId<H>,
+		expected: Option<ObjectId<H>>,
+		committer: &str,
+		message: &str,
+	) -> Result<(), RepositoryError> {
+		let op = RefOp {
+			name: name.to_owned(),
+			expected,
+			new: Some(new),
+			reflog: ReflogIntent::Log { committer, message },
+		};
+		self
+			.transact_with_policy(std::slice::from_ref(&op), Some(ReflogPolicy::Always))
+			.await
+			.map_err(|(_, error)| error)
+	}
+
 	/// Compare-and-set a ref while following any symbolic chain at `name`, matching Git's default
 	/// `update-ref` behavior. Every symbolic hop, the terminal ref, and `packed-refs` remain locked
 	/// while the chain is revalidated and the terminal value is published, so a concurrent retarget
@@ -517,6 +559,7 @@ where
 		expected: Option<ObjectId<H>>,
 		reflog: ReflogIntent<'_>,
 	) -> Result<(), RepositoryError> {
+		let _history_lease = HistoryMutationLease::acquire(self.files).await?;
 		let policy = self.reflog_policy().await?;
 		let planned = self.symbolic_ref_resolution(name).await?;
 		let head_target = self.read_symbolic("HEAD").await?;
@@ -583,7 +626,7 @@ where
 			if let ReflogIntent::Log { committer, message } = reflog {
 				for hop in logged_hops {
 					self
-						.append_reflog(&hop, olds[0], Some(new), committer, message)
+						.append_reflog_locked(&hop, olds[0], Some(new), committer, message)
 						.await?;
 				}
 			}
@@ -694,6 +737,14 @@ where
 	/// directory pruning continue to completion. Wasm file-store operations execute synchronously when
 	/// polled, so the transaction runs inline there without requiring a Tokio runtime.
 	pub async fn transact(&self, ops: &[RefOp<'_, H>]) -> Result<(), (String, RepositoryError)> {
+		self.transact_with_policy(ops, None).await
+	}
+
+	async fn transact_with_policy(
+		&self,
+		ops: &[RefOp<'_, H>],
+		policy: Option<ReflogPolicy>,
+	) -> Result<(), (String, RepositoryError)> {
 		#[cfg(not(target_arch = "wasm32"))]
 		{
 			let files = self.files.shared_handle();
@@ -702,7 +753,7 @@ where
 			match tokio::spawn(async move {
 				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
 				let ops = borrow_ref_ops(&ops);
-				store.transact_inline(&ops).await
+				store.transact_inline(&ops, policy).await
 			})
 			.await
 			{
@@ -715,12 +766,23 @@ where
 		}
 
 		#[cfg(target_arch = "wasm32")]
-		self.transact_inline(ops).await
+		self.transact_inline(ops, policy).await
 	}
 
-	async fn transact_inline(&self, ops: &[RefOp<'_, H>]) -> Result<(), (String, RepositoryError)> {
+	async fn transact_inline(
+		&self,
+		ops: &[RefOp<'_, H>],
+		policy: Option<ReflogPolicy>,
+	) -> Result<(), (String, RepositoryError)> {
 		let anon = |error| (String::new(), error);
-		let policy = self.reflog_policy().await.map_err(anon)?;
+		let history_owner = ops.first().map(|op| op.name.clone()).unwrap_or_default();
+		let _history_lease = HistoryMutationLease::acquire(self.files)
+			.await
+			.map_err(|error| (history_owner, error))?;
+		let policy = match policy {
+			Some(policy) => policy,
+			None => self.reflog_policy().await.map_err(anon)?,
+		};
 		// The branch HEAD points at (read once, before locking): an op on it cascades into `logs/HEAD`,
 		// so HEAD joins the lock set.
 		let head_target = self.read_symbolic("HEAD").await.map_err(anon)?;
@@ -959,7 +1021,7 @@ where
 					&& self.should_log("HEAD", policy).await?
 				{
 					self
-						.append_reflog("HEAD", old, None, committer, message)
+						.append_reflog_locked("HEAD", old, None, committer, message)
 						.await?;
 				}
 				self.files.delete_path_unlocked(&op.name).await?;
@@ -1124,6 +1186,7 @@ where
 	}
 
 	async fn remove_prefix_inline(&self, prefix: &str) -> Result<(), RepositoryError> {
+		let _history_lease = HistoryMutationLease::acquire(self.files).await?;
 		for _ in 0..LOCK_ATTEMPTS {
 			let snapshot = self.prefix_snapshot(prefix).await?;
 			let lock_names = remove_prefix_lock_names(&snapshot);
@@ -1189,6 +1252,7 @@ where
 	}
 
 	async fn rename_prefix_inline(&self, old: &str, new: &str) -> Result<(), RepositoryError> {
+		let _history_lease = HistoryMutationLease::acquire(self.files).await?;
 		for _ in 0..LOCK_ATTEMPTS {
 			let snapshot = self.prefix_snapshot(old).await?;
 			let lock_names = rename_prefix_lock_names(&snapshot, old, new);
@@ -1506,8 +1570,9 @@ where
 		let files = self.files.shared_handle();
 		let effective = self.effective.cloned();
 		let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+		let history_lease = HistoryMutationLease::acquire(&files).await?;
 		let lock = store.lock_ref("HEAD").await?;
-		Ok(HeadLock::new(files, effective, lock))
+		Ok(HeadLock::new(files, effective, history_lease, lock))
 	}
 
 	/// Lock `HEAD`, every symbolic hop, the terminal ref, and `ORIG_HEAD` for reset-style history
@@ -1523,6 +1588,7 @@ where
 		let files = self.files.shared_handle();
 		let effective = self.effective.cloned();
 		let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+		let history_lease = HistoryMutationLease::acquire(&files).await?;
 		let state = store.read_head().await?;
 		let planned = store.symbolic_ref_resolution("HEAD").await?;
 		let mut names = planned.chain.clone();
@@ -1568,6 +1634,7 @@ where
 		Ok(HeadTransaction {
 			files,
 			effective,
+			history_lease: Some(history_lease),
 			locks,
 			lock_names: names,
 			state,
@@ -1637,7 +1704,7 @@ where
 		if let (Some(committer), Some(message)) = (&plan.committer, &plan.message) {
 			for name in symbolic_reflogs {
 				self
-					.append_reflog(&name, tip, Some(plan.target), committer, message)
+					.append_reflog_locked(&name, tip, Some(plan.target), committer, message)
 					.await?;
 			}
 		}
@@ -2019,6 +2086,7 @@ where
 		name: &str,
 		state: &HeadState<H>,
 	) -> Result<bool, RepositoryError> {
+		let _history_lease = HistoryMutationLease::acquire(self.files).await?;
 		// A loose ancestor ref prevents the target lock's parent directory from being created. Detect
 		// that namespace shape before locking so an optional ref remains optional rather than turning a
 		// completed fetch into an error.
@@ -2148,6 +2216,7 @@ where
 		target: &str,
 		reflog: ReflogIntent<'_>,
 	) -> Result<(), RepositoryError> {
+		let _history_lease = HistoryMutationLease::acquire(self.files).await?;
 		// Hold `<name>.lock` across the reflog write and the retarget — like a ref transaction, so a
 		// reflog failure leaves the symbolic ref unchanged and no concurrent writer interleaves. A
 		// symbolic ref under `refs/` also takes `packed-refs.lock`, keeping its namespace validation
@@ -2208,7 +2277,7 @@ where
 				)));
 			}
 			self
-				.append_reflog(name, old, Some(new), committer, message)
+				.append_reflog_locked(name, old, Some(new), committer, message)
 				.await?;
 		}
 		// Commit the retarget under the held lock (a plain replace, no `<name>.lock` of its own).
@@ -2249,6 +2318,54 @@ where
 		committer: &str,
 		message: &str,
 	) -> Result<(), RepositoryError> {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let files = self.files.shared_handle();
+			let effective = self.effective.cloned();
+			let refname = refname.to_owned();
+			let committer = committer.to_owned();
+			let message = message.to_owned();
+			match tokio::spawn(async move {
+				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+				store
+					.append_reflog_inline(&refname, old, new, &committer, &message)
+					.await
+			})
+			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		self
+			.append_reflog_inline(refname, old, new, committer, message)
+			.await
+	}
+
+	async fn append_reflog_inline(
+		&self,
+		refname: &str,
+		old: Option<ObjectId<H>>,
+		new: Option<ObjectId<H>>,
+		committer: &str,
+		message: &str,
+	) -> Result<(), RepositoryError> {
+		let _history_lease = HistoryMutationLease::acquire(self.files).await?;
+		self
+			.append_reflog_locked(refname, old, new, committer, message)
+			.await
+	}
+
+	async fn append_reflog_locked(
+		&self,
+		refname: &str,
+		old: Option<ObjectId<H>>,
+		new: Option<ObjectId<H>>,
+		committer: &str,
+		message: &str,
+	) -> Result<(), RepositoryError> {
 		let path = format!("logs/{refname}");
 		let mut content = match self.files.read_path(&path).await {
 			Ok(bytes) => bytes,
@@ -2278,7 +2395,7 @@ where
 		// real move or a creation.
 		if old != Some(new) && self.should_log(name, policy).await? {
 			self
-				.append_reflog(name, old, Some(new), committer, message)
+				.append_reflog_locked(name, old, Some(new), committer, message)
 				.await?;
 		}
 		// The split HEAD update mirrored into `HEAD` when it points at the branch is a distinct update
@@ -2288,7 +2405,7 @@ where
 		// `HEAD` read here, which could race a concurrent retarget and append without `HEAD.lock`.
 		if cascade && self.should_log("HEAD", policy).await? {
 			self
-				.append_reflog("HEAD", old, Some(new), committer, message)
+				.append_reflog_locked("HEAD", old, Some(new), committer, message)
 				.await?;
 		}
 		Ok(())
@@ -2595,7 +2712,7 @@ mod tests {
 	#[cfg(not(target_arch = "wasm32"))]
 	use crate::GatedFileStore;
 
-	use super::{HeadState, PACKED_REFS, RefStore, ReflogIntent};
+	use super::{HeadState, PACKED_REFS, RefStore, ReflogIntent, reflog_line};
 
 	#[cfg(not(target_arch = "wasm32"))]
 	async fn let_retained_mutation_reach_a_held_lock() {
@@ -3818,6 +3935,32 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn explicit_reflog_update_ignores_namespace_gating() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"trust tip");
+		let committer = "Trust Admin <admin@example.invalid> 0 +0000";
+
+		store
+			.update_ref_with_explicit_reflog(
+				"refs/gitana/trust",
+				tip,
+				None,
+				committer,
+				"trust: bootstrap",
+			)
+			.await
+			.expect("explicit reflog and ref publish together");
+
+		assert_eq!(store.resolve("refs/gitana/trust").await.unwrap(), Some(tip));
+		let log = files.read_path("logs/refs/gitana/trust").await.unwrap();
+		assert_eq!(
+			log,
+			reflog_line(None, Some(tip), committer, "trust: bootstrap")
+		);
+	}
+
+	#[tokio::test]
 	async fn transact_is_all_or_nothing() {
 		let files = MemoryFileStore::new();
 		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
@@ -3938,6 +4081,40 @@ mod tests {
 			matches!(&error, crate::RepositoryError::RefLocked { name } if name == PACKED_REFS),
 			"the underlying diagnostic still identifies packed-refs.lock: {error:?}"
 		);
+	}
+
+	#[tokio::test]
+	async fn history_lock_contention_is_attributed_to_the_first_operation() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let first = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"first");
+		let second = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"second");
+		let _history_lock = files
+			.try_lock_path("gitana-history.lock")
+			.await
+			.unwrap()
+			.expect("hold the repository history lock");
+		let ops = [
+			crate::RefOp {
+				name: "refs/heads/one".to_owned(),
+				expected: None,
+				new: Some(first),
+				reflog: ReflogIntent::Skip,
+			},
+			crate::RefOp {
+				name: "refs/heads/two".to_owned(),
+				expected: None,
+				new: Some(second),
+				reflog: ReflogIntent::Skip,
+			},
+		];
+
+		let (name, error) = store
+			.transact(&ops)
+			.await
+			.expect_err("the shared history lock remains contended");
+		assert_eq!(name, "refs/heads/one");
+		assert!(matches!(error, crate::RepositoryError::HistoryLocked));
 	}
 
 	#[cfg(not(target_arch = "wasm32"))]
@@ -4067,6 +4244,41 @@ mod tests {
 		assert_eq!(store.resolve("refs/heads/b").await.unwrap(), Some(second));
 		assert!(!files.exists("refs/heads/a.lock").await.unwrap());
 		assert!(!files.exists("refs/heads/b.lock").await.unwrap());
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn cancelled_explicit_reflog_update_retains_the_complete_mutation() {
+		let files = GatedFileStore::new();
+		let store: RefStore<'_, GatedFileStore, Sha256> = RefStore::new(&files);
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"trust tip");
+		let mut update = Box::pin(store.update_ref_with_explicit_reflog(
+			"refs/gitana/trust",
+			tip,
+			None,
+			"Trust Admin <admin@example.invalid> 0 +0000",
+			"trust: bootstrap",
+		));
+		let mut context = Context::from_waker(Waker::noop());
+		assert!(matches!(update.as_mut().poll(&mut context), Poll::Pending));
+		files.wait_until_blocked().await;
+		assert!(files.exists("gitana-history.lock").await.unwrap());
+		assert!(files.exists("refs/gitana/trust.lock").await.unwrap());
+
+		drop(update);
+		assert!(files.exists("gitana-history.lock").await.unwrap());
+		files.release();
+		for _ in 0..50 {
+			tokio::task::yield_now().await;
+			if !files.exists("gitana-history.lock").await.unwrap() {
+				break;
+			}
+		}
+
+		assert_eq!(store.resolve("refs/gitana/trust").await.unwrap(), Some(tip));
+		assert!(files.exists("logs/refs/gitana/trust").await.unwrap());
+		assert!(!files.exists("gitana-history.lock").await.unwrap());
+		assert!(!files.exists("refs/gitana/trust.lock").await.unwrap());
 	}
 
 	#[cfg(not(target_arch = "wasm32"))]
@@ -4593,12 +4805,14 @@ mod tests {
 		assert!(matches!(publish.as_mut().poll(&mut context), Poll::Pending));
 		files.wait_until_blocked().await;
 		assert!(files.exists("HEAD.lock").await.unwrap());
+		assert!(files.exists("gitana-history.lock").await.unwrap());
 
 		drop(publish);
 		for _ in 0..10 {
 			tokio::task::yield_now().await;
 		}
 		assert!(files.exists("HEAD.lock").await.unwrap());
+		assert!(files.exists("gitana-history.lock").await.unwrap());
 		assert!(!files.exists("HEAD").await.unwrap());
 
 		files.release();
@@ -4610,6 +4824,7 @@ mod tests {
 		}
 		assert_eq!(store.resolve_head().await.unwrap(), Some(target));
 		assert!(!files.exists("HEAD.lock").await.unwrap());
+		assert!(!files.exists("gitana-history.lock").await.unwrap());
 	}
 
 	/// Cancellation invariant: `finish_checkout` moves the `HEAD.lock` into its owned worker, so dropping
@@ -4632,6 +4847,7 @@ mod tests {
 		assert!(matches!(publish.as_mut().poll(&mut context), Poll::Pending));
 		files.wait_until_blocked().await;
 		assert!(files.exists("HEAD.lock").await.unwrap());
+		assert!(files.exists("gitana-history.lock").await.unwrap());
 
 		drop(publish);
 		for _ in 0..10 {
@@ -4641,6 +4857,7 @@ mod tests {
 			files.exists("HEAD.lock").await.unwrap(),
 			"the retained worker must keep HEAD.lock across caller cancellation",
 		);
+		assert!(files.exists("gitana-history.lock").await.unwrap());
 		assert_eq!(store.resolve("refs/heads/feature").await.unwrap(), None);
 
 		files.release();
@@ -4659,11 +4876,11 @@ mod tests {
 			b"ref: refs/heads/feature\n"
 		);
 		assert!(!files.exists("HEAD.lock").await.unwrap());
+		assert!(!files.exists("gitana-history.lock").await.unwrap());
 	}
 
-	/// A held [`HeadLock`] (as `switch` keeps across a checkout) excludes a ref transaction that moves the
-	/// branch `HEAD` is on, because that move must lock `HEAD` for its reflog cascade. The branch cannot
-	/// move out from under the checkout while the lock is held.
+	/// A held [`HeadLock`] (as `switch` keeps across a checkout) excludes every history mutation while
+	/// the checkout is in flight, including a transaction that moves the branch `HEAD` is on.
 	#[cfg(not(target_arch = "wasm32"))]
 	#[tokio::test]
 	async fn a_held_head_lock_excludes_a_cascading_branch_move() {
@@ -4686,10 +4903,10 @@ mod tests {
 		let error = store
 			.update_ref("refs/heads/main", next, Some(tip), ReflogIntent::Skip)
 			.await
-			.expect_err("a cascading move must contend on the checkout's held HEAD.lock");
+			.expect_err("a cascading move must contend on the checkout's history lock");
 		assert!(
-			matches!(&error, crate::RepositoryError::RefLocked { name } if name == "HEAD"),
-			"expected HEAD.lock contention, got {error:?}",
+			matches!(error, crate::RepositoryError::HistoryLocked),
+			"expected repository-history contention, got {error:?}",
 		);
 		assert_eq!(store.resolve("refs/heads/main").await.unwrap(), Some(tip));
 
@@ -4730,10 +4947,10 @@ mod tests {
 		let error = store
 			.set_symbolic("HEAD", "refs/heads/other", ReflogIntent::Skip)
 			.await
-			.expect_err("the retained HEAD lock must reject a concurrent branch switch");
+			.expect_err("the retained history lock must reject a concurrent branch switch");
 		assert!(
-			matches!(&error, crate::RepositoryError::RefLocked { name } if name == "HEAD"),
-			"expected HEAD.lock contention, got {error:?}",
+			matches!(error, crate::RepositoryError::HistoryLocked),
+			"expected repository-history contention, got {error:?}",
 		);
 
 		transaction

@@ -63,6 +63,12 @@ pub enum RepositoryError {
 		/// The ref whose lock was contended.
 		name: String,
 	},
+	/// A repository-wide history mutation is already in progress.
+	#[error("repository history is being updated by another process")]
+	HistoryLocked,
+	/// Initial-commit publication found existing repository history.
+	#[error("repository already contains history")]
+	ExistingHistory,
 	/// A targeted durability boundary could not observe stable ref/object storage after bounded retries.
 	#[error("repository storage kept changing while making {name} durable")]
 	DurabilityUnstable {

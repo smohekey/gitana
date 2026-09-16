@@ -502,8 +502,8 @@ mod tests {
 				.await
 				.expect_err("the merge must retain HEAD while signing");
 			assert!(
-				matches!(&error, gitana_repository::RepositoryError::RefLocked { name } if name == "HEAD"),
-				"expected HEAD.lock contention, got {error:?}",
+				matches!(&error, gitana_repository::RepositoryError::HistoryLocked),
+				"expected repository history contention, got {error:?}",
 			);
 			self.signer.sign(payload).await
 		}

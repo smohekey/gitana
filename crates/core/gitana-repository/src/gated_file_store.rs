@@ -110,13 +110,14 @@ impl FileStore for GatedFileStore {
 		self.inner.try_lock_path(path)
 	}
 
-	fn write_path_cas(
+	async fn write_path_cas(
 		&self,
 		path: &str,
 		bytes: &[u8],
 		expected: Option<&Version>,
-	) -> impl Future<Output = Result<Version>> {
-		self.inner.write_path_cas(path, bytes, expected)
+	) -> Result<Version> {
+		self.wait_for_release().await;
+		self.inner.write_path_cas(path, bytes, expected).await
 	}
 
 	async fn write_path_replace(&self, path: &str, bytes: &[u8]) -> Result<()> {

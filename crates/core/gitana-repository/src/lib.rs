@@ -17,6 +17,8 @@ mod head;
 mod head_lock;
 mod head_reset_plan;
 mod head_transaction;
+mod history_mutation_lease;
+mod initial_commit_transaction;
 mod merge;
 mod merge_base;
 mod merge_state;
@@ -36,6 +38,8 @@ pub use self::{
 	head::HeadState,
 	head_lock::{HeadLock, PreparedDetachedHead},
 	head_transaction::HeadTransaction,
+	history_mutation_lease::HistoryMutationLease,
+	initial_commit_transaction::InitialCommitTransaction,
 	merge::TreeMerge,
 	mode::FileMode,
 	rebase_state::RebaseState,

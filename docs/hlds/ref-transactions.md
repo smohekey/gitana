@@ -104,6 +104,46 @@ rollback is deleted.
 The gating already lives in `RefStore` (`reflog_policy` / `should_log` / the split-HEAD cascade in
 `log_ref_update`); the transaction reuses it — this is a *re-plumbing*, not new reflog semantics.
 
+## Repository-wide initial publication gate
+
+`Repository::lock_initial_commit_transaction` is the stronger boundary for a caller that must
+publish a unique genesis into an unborn, otherwise-history-free repository. It acquires
+`gitana-history.lock` before the normal `HEAD` transaction locks, then validates all state capable
+of retaining or describing history:
+
+- direct refs, every loose symbolic ref outside the captured unborn `HEAD` chain, including
+  symbolic refs whose targets do not resolve yet, and every top-level pseudoref outside that chain;
+- every reflog path;
+- fetch, original-head, merge, cherry-pick, revert, rebase, bisect, and sequencer state;
+- auto-merge and shallow-boundary state;
+- any `worktrees` namespace, including partial or otherwise empty linked-worktree administration.
+
+Linked repositories are deliberately ineligible for genesis publication rather than partially
+enumerated: a repository with any `worktrees` namespace is no longer the single unborn worktree the
+transaction promises to initialize.
+
+The returned `InitialCommitTransaction` rechecks that state immediately before publication,
+validates that the candidate is a well-formed commit, moves the terminal symbolic-`HEAD` ref, and
+retains the history gate until the ref and reachable object graph cross the durability barrier.
+Dropping the caller future cannot release the gate during that sequence: native publication runs
+in an owned task, matching the cancellation behavior of the ref transactions.
+
+Every high-level Gitana operation that can add, remove, or retarget a history root participates in
+the same gate. `Repository::lock_history_mutation` exposes that gate as an opaque
+`HistoryMutationLease` for sibling libraries that publish history roots directly; linked-worktree
+creation retains one from before it writes the new admin `HEAD` through final inspection. Every
+native mutation moves its lease into an owned task before writing, so dropping the awaiting caller
+cannot release the gate while an offloaded filesystem operation continues. Plain object writes do
+not take the gate, because unreachable objects do not make a repository non-empty. A caller that
+mutates repository metadata directly through `FileStore` is outside the coordinated writer
+contract; the final validation rejects such state if it becomes visible before publication, but
+direct writes cannot share the atomic guarantee.
+
+An audit reflog that is mandatory metadata for a ref move participates in the same transaction and
+history lease. In particular, local trust bootstrap, sync, and policy/key updates write the explicit
+`refs/gitana/trust` reflog before publishing the trust ref, independent of
+`core.logAllRefUpdates`; they cannot report a post-publication history-lock failure.
+
 ## The `atomic` push capability (Phase 3)
 
 - **Advertise:** add the bare `atomic` token to the `Service::ReceivePack` arm of `base_capabilities`
@@ -193,7 +233,8 @@ Deltas from the design above and from `codex` review, recorded here rather than 
   writes are lock-assuming, so they do not try to reacquire a ref lock while holding the packed lock.
   Transaction errors attribute contention on this shared lock to the first affected operation name
   (while the `RefLocked` diagnostic still identifies `packed-refs`), so atomic receive-pack can attach
-  the concrete failure to a requested command.
+  the concrete failure to a requested command. Repository-wide history-lock contention uses the
+  same first-operation attribution rather than surfacing as an anonymous batch failure.
   `FileStore::exists` could not replace these checks because it is metadata-based and reads `true`
   for normal namespace directories. Preflighting both paths for every op means a **validated commit
   cannot fail on a D/F conflict**, so even a multi-op `--atomic` batch is all-or-nothing (the residual

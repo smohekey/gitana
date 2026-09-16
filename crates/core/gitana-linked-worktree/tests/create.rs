@@ -608,6 +608,63 @@ async fn cancelling_prepared_recovery_does_not_abandon_the_owned_partial() {
 }
 
 #[tokio::test]
+async fn cancelling_create_does_not_release_or_abandon_history_gated_publication() {
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-history-cancelled-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+		let history_lock = work.join(".git/gitana-history.lock");
+		std::fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&history_lock)
+			.unwrap();
+
+		let request = req(&work, &wt, CheckoutTarget::Detached { start });
+		let retained_request = request.clone();
+		let caller = tokio::spawn(async move { create(&retained_request, None).await });
+		for _ in 0..8 {
+			tokio::task::yield_now().await;
+		}
+		assert!(
+			!caller.is_finished(),
+			"{fmt}: create must wait for the repository history gate"
+		);
+		assert!(
+			!work.join(".git/worktrees").exists(),
+			"{fmt}: no admin history root may publish before acquiring the gate"
+		);
+
+		caller.abort();
+		assert!(caller.await.unwrap_err().is_cancelled());
+		std::fs::remove_file(&history_lock).unwrap();
+
+		let mut established = false;
+		for _ in 0..100 {
+			if wt.join(".git").is_file() {
+				established = true;
+				break;
+			}
+			tokio::task::spawn_blocking(|| {
+				std::thread::sleep(std::time::Duration::from_millis(10));
+			})
+			.await
+			.unwrap();
+		}
+		assert!(established, "{fmt}: retained create did not finish");
+		assert_eq!(
+			git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
+			head
+		);
+		durability_barrier_created(&request).await.unwrap();
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
 async fn prepared_recovery_preserves_a_partial_when_the_baseline_does_not_match() {
 	for (fmt, kind) in formats() {
 		let base = unique_tmp(&format!("create-recover-mismatch-{fmt}"));

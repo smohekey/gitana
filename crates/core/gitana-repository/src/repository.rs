@@ -3,7 +3,10 @@ use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit, 
 use gitana_object_store::ObjectStore;
 
 use crate::tree::{FlatEntry, RawFlatEntry, build_tree};
-use crate::{Config, HeadState, RefStore, ReflogIntent, RepositoryError, TreeBuildEntry};
+use crate::{
+	Config, HeadState, HistoryMutationLease, InitialCommitTransaction, RefStore, ReflogIntent,
+	RepositoryError, TreeBuildEntry,
+};
 
 /// A git repository: the object graph plus refs, over one repo-scoped store.
 ///
@@ -64,6 +67,34 @@ where
 	/// (`core.logallrefupdates`) honour git's merged precedence when the frontend has installed it.
 	pub fn refs(&self) -> RefStore<'_, F, H> {
 		RefStore::new(self.objects.file_store()).with_effective_config(self.effective.as_ref())
+	}
+
+	/// Acquire exclusive permission to add, remove, or retarget repository history roots.
+	///
+	/// Callers must retain the returned lease until their complete mutation has finished. On native
+	/// targets, a cancellation-sensitive mutation must move the lease into an owned task before its
+	/// first write so dropping the caller future cannot release the gate early.
+	pub async fn lock_history_mutation(&self) -> Result<HistoryMutationLease, RepositoryError> {
+		HistoryMutationLease::acquire(self.objects.file_store()).await
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	fn shared_repository(&self) -> Repository<F::Shared, H> {
+		let mut repository =
+			Repository::new(ObjectStore::new(self.objects.file_store().shared_handle()));
+		repository.effective = self.effective.clone();
+		repository
+	}
+
+	/// Lock and validate an unborn repository before publishing its first commit.
+	///
+	/// The returned transaction excludes every conforming history mutation until it is dropped or
+	/// durably publishes one initial commit.
+	pub async fn lock_initial_commit_transaction(
+		&self,
+	) -> Result<InitialCommitTransaction<F::Shared, H>, RepositoryError> {
+		let head = self.refs().lock_head_transaction().await?;
+		InitialCommitTransaction::new(head).await
 	}
 
 	/// Write the metadata files for a fresh repo: a `config` matching the hash algorithm
@@ -451,7 +482,21 @@ where
 		merge_head: ObjectId<H>,
 		message: &str,
 	) -> Result<(), RepositoryError> {
-		crate::merge_state::start_merge(self, merge_head, message).await
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let repository = self.shared_repository();
+			let message = message.to_owned();
+			retained_repository_task(async move {
+				let _history_lease = repository.lock_history_mutation().await?;
+				crate::merge_state::start_merge(&repository, merge_head, &message).await
+			})
+			.await
+		}
+		#[cfg(target_arch = "wasm32")]
+		{
+			let _history_lease = self.lock_history_mutation().await?;
+			crate::merge_state::start_merge(self, merge_head, message).await
+		}
 	}
 
 	/// The commit recorded in `MERGE_HEAD`, or `None` when no merge is in progress.
@@ -466,7 +511,20 @@ where
 
 	/// Clear the in-progress merge state (`MERGE_HEAD`, `MERGE_MSG`).
 	pub async fn clear_merge(&self) -> Result<(), RepositoryError> {
-		crate::merge_state::clear_merge(self).await
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let repository = self.shared_repository();
+			retained_repository_task(async move {
+				let _history_lease = repository.lock_history_mutation().await?;
+				crate::merge_state::clear_merge(&repository).await
+			})
+			.await
+		}
+		#[cfg(target_arch = "wasm32")]
+		{
+			let _history_lease = self.lock_history_mutation().await?;
+			crate::merge_state::clear_merge(self).await
+		}
 	}
 
 	/// Record an in-progress cherry-pick: `CHERRY_PICK_HEAD` (the commit being picked) and `MERGE_MSG`.
@@ -475,7 +533,21 @@ where
 		commit: ObjectId<H>,
 		message: &str,
 	) -> Result<(), RepositoryError> {
-		crate::merge_state::start_cherry_pick(self, commit, message).await
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let repository = self.shared_repository();
+			let message = message.to_owned();
+			retained_repository_task(async move {
+				let _history_lease = repository.lock_history_mutation().await?;
+				crate::merge_state::start_cherry_pick(&repository, commit, &message).await
+			})
+			.await
+		}
+		#[cfg(target_arch = "wasm32")]
+		{
+			let _history_lease = self.lock_history_mutation().await?;
+			crate::merge_state::start_cherry_pick(self, commit, message).await
+		}
 	}
 
 	/// The commit recorded in `CHERRY_PICK_HEAD`, or `None` when no cherry-pick is in progress.
@@ -485,7 +557,20 @@ where
 
 	/// Clear the in-progress cherry-pick state (`CHERRY_PICK_HEAD`, `MERGE_MSG`).
 	pub async fn clear_cherry_pick(&self) -> Result<(), RepositoryError> {
-		crate::merge_state::clear_cherry_pick(self).await
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let repository = self.shared_repository();
+			retained_repository_task(async move {
+				let _history_lease = repository.lock_history_mutation().await?;
+				crate::merge_state::clear_cherry_pick(&repository).await
+			})
+			.await
+		}
+		#[cfg(target_arch = "wasm32")]
+		{
+			let _history_lease = self.lock_history_mutation().await?;
+			crate::merge_state::clear_cherry_pick(self).await
+		}
 	}
 
 	/// Record an in-progress revert: `REVERT_HEAD` (the commit being reverted) and `MERGE_MSG`.
@@ -494,7 +579,21 @@ where
 		commit: ObjectId<H>,
 		message: &str,
 	) -> Result<(), RepositoryError> {
-		crate::merge_state::start_revert(self, commit, message).await
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let repository = self.shared_repository();
+			let message = message.to_owned();
+			retained_repository_task(async move {
+				let _history_lease = repository.lock_history_mutation().await?;
+				crate::merge_state::start_revert(&repository, commit, &message).await
+			})
+			.await
+		}
+		#[cfg(target_arch = "wasm32")]
+		{
+			let _history_lease = self.lock_history_mutation().await?;
+			crate::merge_state::start_revert(self, commit, message).await
+		}
 	}
 
 	/// The commit recorded in `REVERT_HEAD`, or `None` when no revert is in progress.
@@ -504,12 +603,44 @@ where
 
 	/// Clear the in-progress revert state (`REVERT_HEAD`, `MERGE_MSG`).
 	pub async fn clear_revert(&self) -> Result<(), RepositoryError> {
-		crate::merge_state::clear_revert(self).await
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let repository = self.shared_repository();
+			retained_repository_task(async move {
+				let _history_lease = repository.lock_history_mutation().await?;
+				crate::merge_state::clear_revert(&repository).await
+			})
+			.await
+		}
+		#[cfg(target_arch = "wasm32")]
+		{
+			let _history_lease = self.lock_history_mutation().await?;
+			crate::merge_state::clear_revert(self).await
+		}
 	}
 
 	/// Record the start of a rebase (the `rebase-merge/` state directory).
 	pub async fn start_rebase(&self, state: &crate::RebaseState<H>) -> Result<(), RepositoryError> {
-		crate::rebase_state::start_rebase(self, state).await
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let repository = self.shared_repository();
+			let state = crate::RebaseState {
+				head_name: state.head_name.clone(),
+				orig_head: state.orig_head,
+				onto: state.onto,
+				todo: state.todo.clone(),
+			};
+			retained_repository_task(async move {
+				let _history_lease = repository.lock_history_mutation().await?;
+				crate::rebase_state::start_rebase(&repository, &state).await
+			})
+			.await
+		}
+		#[cfg(target_arch = "wasm32")]
+		{
+			let _history_lease = self.lock_history_mutation().await?;
+			crate::rebase_state::start_rebase(self, state).await
+		}
 	}
 
 	/// The in-progress rebase state, or `None` when no rebase is underway.
@@ -524,12 +655,39 @@ where
 
 	/// Replace the rebase's remaining-commit list (oldest-first; current step first).
 	pub async fn set_rebase_todo(&self, todo: &[ObjectId<H>]) -> Result<(), RepositoryError> {
-		crate::rebase_state::set_rebase_todo(self, todo).await
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let repository = self.shared_repository();
+			let todo = todo.to_vec();
+			retained_repository_task(async move {
+				let _history_lease = repository.lock_history_mutation().await?;
+				crate::rebase_state::set_rebase_todo(&repository, &todo).await
+			})
+			.await
+		}
+		#[cfg(target_arch = "wasm32")]
+		{
+			let _history_lease = self.lock_history_mutation().await?;
+			crate::rebase_state::set_rebase_todo(self, todo).await
+		}
 	}
 
 	/// Clear the in-progress rebase state.
 	pub async fn clear_rebase(&self) -> Result<(), RepositoryError> {
-		crate::rebase_state::clear_rebase(self).await
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let repository = self.shared_repository();
+			retained_repository_task(async move {
+				let _history_lease = repository.lock_history_mutation().await?;
+				crate::rebase_state::clear_rebase(&repository).await
+			})
+			.await
+		}
+		#[cfg(target_arch = "wasm32")]
+		{
+			let _history_lease = self.lock_history_mutation().await?;
+			crate::rebase_state::clear_rebase(self).await
+		}
 	}
 
 	/// The commit ids at this repository's shallow boundary (`.git/shallow`) — commits whose parents
@@ -541,7 +699,21 @@ where
 	/// Replace the shallow boundary (`.git/shallow`) with `oids`; an empty `oids` deletes the file,
 	/// making the repository complete again.
 	pub async fn write_shallow(&self, oids: &[ObjectId<H>]) -> Result<(), RepositoryError> {
-		crate::shallow::write_shallow(self, oids).await
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let repository = self.shared_repository();
+			let oids = oids.to_vec();
+			retained_repository_task(async move {
+				let _history_lease = repository.lock_history_mutation().await?;
+				crate::shallow::write_shallow(&repository, &oids).await
+			})
+			.await
+		}
+		#[cfg(target_arch = "wasm32")]
+		{
+			let _history_lease = self.lock_history_mutation().await?;
+			crate::shallow::write_shallow(self, oids).await
+		}
 	}
 
 	/// Resolve a revision spec (`HEAD`, `main`, `<oid>`, `HEAD~2`, `v1^{commit}`, …)
@@ -596,6 +768,19 @@ where
 			)));
 		}
 		Ok(config)
+	}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn retained_repository_task<T>(
+	future: impl std::future::Future<Output = Result<T, RepositoryError>> + Send + 'static,
+) -> Result<T, RepositoryError>
+where
+	T: Send + 'static,
+{
+	match tokio::spawn(future).await {
+		Ok(result) => result,
+		Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
 	}
 }
 

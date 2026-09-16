@@ -534,6 +534,51 @@ async fn atomic_push_rejects_the_whole_batch() {
 	);
 }
 
+#[tokio::test]
+async fn atomic_push_attributes_history_lock_contention_to_the_first_command() {
+	let repo = repo();
+	repo.init().await.expect("init");
+	let (first_objects, first) = commit_objects(b"first\n");
+	let (second_objects, second) = commit_objects(b"second\n");
+	let pack = encode_pack(&[first_objects, second_objects].concat());
+	let request = atomic_push_request(
+		&[
+			(ZERO, &first.to_hex(), "refs/heads/main"),
+			(ZERO, &second.to_hex(), "refs/heads/feature"),
+		],
+		&pack,
+	);
+	let history_lease = repo
+		.lock_history_mutation()
+		.await
+		.expect("hold the repository history gate");
+
+	let lines = pkt_lines(
+		&receive_pack(&repo, &request, opts(false))
+			.await
+			.expect("receive")
+			.report,
+	);
+	drop(history_lease);
+
+	assert!(
+		lines.iter().any(|line| line
+			.contains("ng refs/heads/main repository history is being updated by another process")),
+		"the first requested ref owns the shared-lock failure: {lines:?}"
+	);
+	assert!(
+		lines
+			.iter()
+			.any(|line| line.contains("ng refs/heads/feature atomic push failure")),
+		"the other requested ref reports collateral atomic failure: {lines:?}"
+	);
+	assert_eq!(repo.refs().resolve("refs/heads/main").await.unwrap(), None);
+	assert_eq!(
+		repo.refs().resolve("refs/heads/feature").await.unwrap(),
+		None
+	);
+}
+
 /// An `--atomic` push naming the same ref twice is rejected outright (git's "multiple updates for a
 /// ref"), moving nothing — a `RefStore::transact` that validated both against the same pre-value would
 /// otherwise let the last update silently win.

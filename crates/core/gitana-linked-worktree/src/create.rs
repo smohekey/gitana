@@ -17,7 +17,7 @@ mod native {
 	use gitana_config::GitConfig;
 	use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 	use gitana_object_store::ObjectStore;
-	use gitana_repository::{HeadState, RefOp, ReflogIntent, Repository};
+	use gitana_repository::{HeadState, HistoryMutationLease, RefOp, ReflogIntent, Repository};
 	use gitana_worktree::{Index, WorkTree};
 
 	use crate::admin_cleanup::{deregister_admin, path_absent, remove_directory_tree};
@@ -52,7 +52,7 @@ mod native {
 		request: &CreateRequest,
 		effective: Option<&GitConfig>,
 	) -> Result<WorktreeInspection, CreateError> {
-		create_inner(request, effective, false).await
+		retained_create(request, effective, false).await
 	}
 
 	/// Establish a worktree while authorizing cleanup of the exact checkout-missing partial left by
@@ -68,9 +68,20 @@ mod native {
 		request: &CreateRequest,
 		effective: Option<&GitConfig>,
 	) -> Result<WorktreeInspection, CreateError> {
+		retained_create(request, effective, true).await
+	}
+
+	async fn retained_create(
+		request: &CreateRequest,
+		effective: Option<&GitConfig>,
+		recover_prepared: bool,
+	) -> Result<WorktreeInspection, CreateError> {
 		let request = request.clone();
 		let effective = effective.cloned();
-		match tokio::spawn(async move { create_inner(&request, effective.as_ref(), true).await }).await
+		match tokio::spawn(
+			async move { create_inner(&request, effective.as_ref(), recover_prepared).await },
+		)
+		.await
 		{
 			Ok(result) => result,
 			Err(error) => Err(LinkedWorktreeError::RetainedTask(error.to_string()).into()),
@@ -100,7 +111,7 @@ mod native {
 			inspection = inspect(&query).await?;
 		}
 
-		match decide(&inspection, &request.target)? {
+		let _history_lease = match decide(&inspection, &request.target)? {
 			Action::AlreadyThere => return Ok(inspection),
 			Action::Write { create_branch } => {
 				let common = request.repo.common_dir();
@@ -110,7 +121,7 @@ mod native {
 					HashKind::Sha256 => write_worktree::<Sha256>(request, effective, create_branch).await?,
 				}
 			}
-		}
+		};
 
 		// Re-inspect *and re-decide*: success only when the now-established state actually **is** the
 		// requested worktree. A legitimate create always re-decides to `AlreadyThere` (the worktree it just
@@ -478,7 +489,7 @@ mod native {
 		request: &CreateRequest,
 		effective: Option<&GitConfig>,
 		create_branch: bool,
-	) -> Result<(), CreateError>
+	) -> Result<HistoryMutationLease, CreateError>
 	where
 		ObjectId<H>: IntoWorktreeObjectId,
 	{
@@ -648,6 +659,14 @@ mod native {
 				.map_err(|(_, error)| LinkedWorktreeError::Repository(error))?;
 		}
 
+		// A new branch, when requested, was published through the repository's own gated ref
+		// transaction above. From this point through final post-write inspection, retain the same
+		// repository-wide gate while publishing the new worktree's per-worktree history roots.
+		let history_lease = repo
+			.lock_history_mutation()
+			.await
+			.map_err(LinkedWorktreeError::Repository)?;
+
 		// Seed the new worktree's per-worktree `logs/HEAD` under the **non-bare** default — the linked
 		// worktree is non-bare even when the host repository is bare, so git logs its HEAD unless
 		// `core.logAllRefUpdates` is *explicitly* disabled (not the host's bare default of off).
@@ -672,7 +691,7 @@ mod native {
 				.map_err(LinkedWorktreeError::Worktree)?,
 		}
 		write_checkout_gitfile(destination, &admin)?;
-		Ok(())
+		Ok(history_lease)
 	}
 
 	/// The committer line (`Name <email> seconds ±hhmm`) for the new worktree's reflogs, resolved from the

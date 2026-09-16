@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use gitana_file_store::{FileStore, PathLock};
 use gitana_object::{HashAlgorithm, ObjectId};
 
-use crate::{RefStore, ReflogIntent, RepositoryError};
+use crate::{HistoryMutationLease, RefStore, ReflogIntent, RepositoryError};
 
 /// An acquired `HEAD.lock` paired with an owned handle to the store that holds it.
 ///
@@ -17,6 +17,7 @@ use crate::{RefStore, ReflogIntent, RepositoryError};
 pub struct HeadLock<S, H: HashAlgorithm> {
 	files: S,
 	effective: Option<gitana_config::GitConfig>,
+	history_lease: HistoryMutationLease,
 	lock: PathLock,
 	_hash: PhantomData<H>,
 }
@@ -32,6 +33,7 @@ pub struct HeadLock<S, H: HashAlgorithm> {
 pub struct PreparedDetachedHead<S, H: HashAlgorithm> {
 	files: S,
 	effective: Option<gitana_config::GitConfig>,
+	history_lease: HistoryMutationLease,
 	lock: PathLock,
 	target: ObjectId<H>,
 	reflog_content: Option<Vec<u8>>,
@@ -44,10 +46,16 @@ where
 	H: HashAlgorithm,
 {
 	/// Wrap an already-acquired `HEAD.lock` with the owned store handle that will publish it.
-	pub(crate) fn new(files: S, effective: Option<gitana_config::GitConfig>, lock: PathLock) -> Self {
+	pub(crate) fn new(
+		files: S,
+		effective: Option<gitana_config::GitConfig>,
+		history_lease: HistoryMutationLease,
+		lock: PathLock,
+	) -> Self {
 		Self {
 			files,
 			effective,
+			history_lease,
 			lock,
 			_hash: PhantomData,
 		}
@@ -65,16 +73,26 @@ where
 		create: Option<(ObjectId<H>, ReflogIntent<'_>)>,
 		checkout_reflog: ReflogIntent<'_>,
 	) -> Result<(), RepositoryError> {
-		let HeadLock {
-			files,
-			effective,
-			lock,
-			_hash,
-		} = self;
-		let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
-		store
-			.commit_checkout(lock, branch, create, checkout_reflog)
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let branch = branch.to_owned();
+			let create = create.map(|(target, reflog)| (target, own_reflog(reflog)));
+			let checkout_reflog = own_reflog(checkout_reflog);
+			match tokio::spawn(async move {
+				let create = create
+					.as_ref()
+					.map(|(target, reflog)| (*target, borrow_reflog(reflog)));
+				finish_checkout_inline(self, &branch, create, borrow_reflog(&checkout_reflog)).await
+			})
 			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		finish_checkout_inline(self, branch, create, checkout_reflog).await
 	}
 
 	/// Publish a detached checkout at `target`, consuming the held `HEAD.lock`.
@@ -97,6 +115,7 @@ where
 		let HeadLock {
 			files,
 			effective,
+			history_lease,
 			lock,
 			_hash,
 		} = self;
@@ -105,6 +124,7 @@ where
 		Ok(PreparedDetachedHead {
 			files,
 			effective,
+			history_lease,
 			lock,
 			target,
 			reflog_content,
@@ -120,17 +140,80 @@ where
 {
 	/// Publish the already-prepared reflog and detached HEAD, consuming the retained lock.
 	pub async fn finish(self) -> Result<(), RepositoryError> {
-		let PreparedDetachedHead {
-			files,
-			effective,
-			lock,
-			target,
-			reflog_content,
-			_hash,
-		} = self;
-		let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
-		store
-			.commit_prepared_detached_checkout(lock, target, reflog_content)
-			.await
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			match tokio::spawn(async move { finish_detached_inline(self).await }).await {
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		finish_detached_inline(self).await
+	}
+}
+
+async fn finish_checkout_inline<S, H>(
+	head: HeadLock<S, H>,
+	branch: &str,
+	create: Option<(ObjectId<H>, ReflogIntent<'_>)>,
+	checkout_reflog: ReflogIntent<'_>,
+) -> Result<(), RepositoryError>
+where
+	S: FileStore + 'static,
+	H: HashAlgorithm,
+{
+	let HeadLock {
+		files,
+		effective,
+		history_lease,
+		lock,
+		_hash,
+	} = head;
+	let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+	let result = store
+		.commit_checkout(lock, branch, create, checkout_reflog)
+		.await;
+	drop(history_lease);
+	result
+}
+
+async fn finish_detached_inline<S, H>(
+	prepared: PreparedDetachedHead<S, H>,
+) -> Result<(), RepositoryError>
+where
+	S: FileStore + 'static,
+	H: HashAlgorithm,
+{
+	let PreparedDetachedHead {
+		files,
+		effective,
+		history_lease,
+		lock,
+		target,
+		reflog_content,
+		_hash,
+	} = prepared;
+	let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+	let result = store
+		.commit_prepared_detached_checkout(lock, target, reflog_content)
+		.await;
+	drop(history_lease);
+	result
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn own_reflog(reflog: ReflogIntent<'_>) -> Option<(String, String)> {
+	match reflog {
+		ReflogIntent::Log { committer, message } => Some((committer.to_owned(), message.to_owned())),
+		ReflogIntent::Skip => None,
+	}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn borrow_reflog(reflog: &Option<(String, String)>) -> ReflogIntent<'_> {
+	match reflog {
+		Some((committer, message)) => ReflogIntent::Log { committer, message },
+		None => ReflogIntent::Skip,
 	}
 }

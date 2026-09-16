@@ -1,7 +1,9 @@
 use gitana_file_store::{FileStore, PathLock};
 use gitana_object::{HashAlgorithm, ObjectId};
 
-use crate::{HeadResetPlan, HeadState, RefStore, ReflogIntent, RepositoryError};
+use crate::{
+	HeadResetPlan, HeadState, HistoryMutationLease, RefStore, ReflogIntent, RepositoryError,
+};
 
 /// A locked snapshot of `HEAD`, its symbolic chain, and the terminal direct ref.
 ///
@@ -12,6 +14,7 @@ use crate::{HeadResetPlan, HeadState, RefStore, ReflogIntent, RepositoryError};
 pub struct HeadTransaction<S, H: HashAlgorithm> {
 	pub(crate) files: S,
 	pub(crate) effective: Option<gitana_config::GitConfig>,
+	pub(crate) history_lease: Option<HistoryMutationLease>,
 	pub(crate) locks: Vec<PathLock>,
 	pub(crate) lock_names: Vec<String>,
 	pub(crate) state: HeadState<H>,
