@@ -33,6 +33,14 @@ where
 		&self.state
 	}
 
+	/// The exact bounded `HEAD` chain captured by Gitana's canonical symbolic-ref resolver.
+	///
+	/// The first entry is `HEAD`; the final entry is the terminal direct or unborn ref. Every entry
+	/// remains locked for the lifetime of this transaction.
+	pub fn head_chain(&self) -> &[String] {
+		&self.head_chain
+	}
+
 	/// The captured commit, or `None` for an unborn symbolic branch.
 	pub fn tip(&self) -> Option<ObjectId<H>> {
 		self.tip

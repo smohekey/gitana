@@ -4984,7 +4984,7 @@ mod tests {
 			.await
 			.unwrap();
 		files
-			.write_path_if_absent("refs/heads/alias", b"ref: refs/heads/main\n")
+			.write_path_if_absent("refs/heads/alias", "ref:\u{a0}refs/heads/main\n".as_bytes())
 			.await
 			.unwrap();
 		files
@@ -4993,6 +4993,10 @@ mod tests {
 			.unwrap();
 
 		let mut transaction = store.lock_head_transaction().await.unwrap();
+		assert_eq!(
+			transaction.head_chain(),
+			["HEAD", "refs/heads/alias", "refs/heads/main"]
+		);
 		assert_eq!(transaction.tip(), Some(old));
 		transaction
 			.prepare_reset(
@@ -5012,7 +5016,7 @@ mod tests {
 		);
 		assert_eq!(
 			files.read_path("refs/heads/alias").await.unwrap(),
-			b"ref: refs/heads/main\n"
+			"ref:\u{a0}refs/heads/main\n".as_bytes()
 		);
 		assert_eq!(
 			store.resolve("refs/heads/main").await.unwrap(),
