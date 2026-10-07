@@ -2897,7 +2897,12 @@ mod tests {
 			.await
 			.unwrap();
 		store
-			.update_ref("refs/forge/frontier", frontier_old, None, ReflogIntent::Skip)
+			.update_ref(
+				"refs/forge/frontier",
+				frontier_old,
+				None,
+				ReflogIntent::Skip,
+			)
 			.await
 			.unwrap();
 		store

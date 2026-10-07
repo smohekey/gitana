@@ -601,25 +601,25 @@ impl SubmoduleContext {
 			module: None,
 			source,
 		};
-		let worktree = self.worktree::<H>().map_err(&preflight)?;
+		let worktree = self.worktree::<H>().map_err(preflight)?;
 		let index = worktree
 			.load_index()
 			.await
 			.map_err(SubmoduleError::from)
-			.map_err(&preflight)?;
+			.map_err(preflight)?;
 		let mut selected = self
 			.select_gitlinks_with_prior_path(&index, &query, recovered_path.as_deref())
-			.map_err(&preflight)?;
+			.map_err(preflight)?;
 		if let Some(recovered_path) = &recovered_path {
 			selected.retain(|path| path != recovered_path);
 		}
 		let declarations =
-			declarations_by_path(self.declarations().await.map_err(&preflight)?).map_err(&preflight)?;
+			declarations_by_path(self.declarations().await.map_err(preflight)?).map_err(preflight)?;
 		if selected.is_empty() && recovered_path.is_none() {
 			self
 				.retire_unpublished_deinit_control()
-				.map_err(&preflight)?;
-			lock.validate().map_err(&preflight)?;
+				.map_err(preflight)?;
+			lock.validate().map_err(preflight)?;
 			return Ok(report);
 		}
 
@@ -629,10 +629,10 @@ impl SubmoduleContext {
 			let declaration = declarations
 				.get(&path)
 				.ok_or_else(|| SubmoduleError::MissingMapping(path.clone()))
-				.map_err(&preflight)?
+				.map_err(preflight)?
 				.clone();
-			validate_name(&declaration.name).map_err(&preflight)?;
-			validate_path(&declaration.path).map_err(&preflight)?;
+			validate_name(&declaration.name).map_err(preflight)?;
+			validate_path(&declaration.path).map_err(preflight)?;
 			if index.conflict(&crate::git_path(&path)).is_some() {
 				return Err(preflight(SubmoduleError::Conflicted(path)));
 			}
@@ -640,18 +640,18 @@ impl SubmoduleContext {
 				.entry(&crate::git_path(&path))
 				.expect("selected stage-zero gitlink")
 				.oid;
-			let pointers = self.module_pointers(&declaration).map_err(&preflight)?;
+			let pointers = self.module_pointers(&declaration).map_err(preflight)?;
 			self
 				.preflight_module_namespaces(&declaration, &pointers, configuration)
 				.await
-				.map_err(&preflight)?;
-			let mounted = self.mount_is_attached(&declaration).map_err(&preflight)?;
+				.map_err(preflight)?;
+			let mounted = self.mount_is_attached(&declaration).map_err(preflight)?;
 			let (mount, mount_identity, mount_marker) = if mounted {
-				let (parent, target, _) = self.mount_parent(&declaration.path).map_err(&preflight)?;
+				let (parent, target, _) = self.mount_parent(&declaration.path).map_err(preflight)?;
 				let (mount, identity, marker) = self
 					.capture_owned_mount(&declaration, &parent, &target, configuration)
 					.await
-					.map_err(&preflight)?;
+					.map_err(preflight)?;
 				(Some(mount), Some(identity.into()), Some(marker))
 			} else {
 				(None, None, None)
@@ -667,13 +667,13 @@ impl SubmoduleContext {
 							path: module_path.clone(),
 							source,
 						})
-						.map_err(&preflight)?;
+						.map_err(preflight)?;
 					let module_lease = crate::update_operation::try_acquire_submodule_config_mutation_lease(
 						&directory,
 						&module_path,
 					)
-					.map_err(&preflight)?;
-					if crate::repository_has_pending_update(&directory, &module_path).map_err(&preflight)? {
+					.map_err(preflight)?;
+					if crate::repository_has_pending_update(&directory, &module_path).map_err(preflight)? {
 						return Err(preflight(SubmoduleError::RecoveryRequired(format!(
 							"pending submodule update recovery in module '{}' must be completed before deinitializing its parent",
 							declaration.name
@@ -685,7 +685,7 @@ impl SubmoduleContext {
 						common_dir: module_path.clone(),
 					};
 					if repository_has_pending_deinit(&directory, &directory, &module_layout)
-						.map_err(&preflight)?
+						.map_err(preflight)?
 					{
 						return Err(preflight(SubmoduleError::RecoveryRequired(format!(
 							"pending submodule deinit recovery in module '{}' must be completed before deinitializing its parent",
@@ -693,7 +693,7 @@ impl SubmoduleContext {
 						))));
 					}
 					if crate::repository_has_pending_set_url_recovery(&directory, &directory, &module_layout)
-						.map_err(&preflight)?
+						.map_err(preflight)?
 					{
 						return Err(preflight(SubmoduleError::RecoveryRequired(format!(
 							"pending submodule set-url recovery in module '{}' must be completed before deinitializing its parent",
@@ -703,7 +703,7 @@ impl SubmoduleContext {
 					self
 						.ensure_module_repository_valid::<H, C>(&declaration, &directory, configuration)
 						.await
-						.map_err(&preflight)?;
+						.map_err(preflight)?;
 					let transition = configuration
 						.plan_module_deinit(
 							directory.try_clone().map_err(|source| {
@@ -727,10 +727,10 @@ impl SubmoduleContext {
 								.transpose()?,
 						)
 						.await
-						.map_err(&preflight)?;
+						.map_err(preflight)?;
 					self
 						.ensure_deinit_module_identity(&module_relative, identity)
-						.map_err(&preflight)?;
+						.map_err(preflight)?;
 					(
 						Some(directory),
 						Some(identity.into()),
@@ -769,7 +769,7 @@ impl SubmoduleContext {
 						configuration,
 					)
 					.await
-					.map_err(&preflight)?;
+					.map_err(preflight)?;
 			}
 			plan.push(Planned {
 				recorded: recorded.to_string(),
@@ -823,7 +823,7 @@ impl SubmoduleContext {
 							&checkout_path,
 						)
 						.await
-						.map_err(&preflight)?;
+						.map_err(preflight)?;
 				}
 				let selected_worktrees = plan
 					.iter()
@@ -850,7 +850,7 @@ impl SubmoduleContext {
 						selected_worktrees,
 					)
 					.await
-					.map_err(&preflight)?;
+					.map_err(preflight)?;
 			}
 		}
 		let mut super_target = None;
@@ -871,7 +871,7 @@ impl SubmoduleContext {
 					&checkout_path,
 				)
 				.await
-				.map_err(&preflight)?;
+				.map_err(preflight)?;
 			match &super_target {
 				Some(target) if target != &transition.target => {
 					return Err(preflight(SubmoduleError::Configuration(
@@ -889,7 +889,7 @@ impl SubmoduleContext {
 				configuration
 					.plan_superproject_deinit(&entry.declaration.name, None, self.worktree_root())
 					.await
-					.map_err(&preflight)?
+					.map_err(preflight)?
 					.target,
 			);
 		}
@@ -911,7 +911,7 @@ impl SubmoduleContext {
 		if let Some(target) = super_target {
 			config_targets.push(("superproject".to_owned(), target));
 		}
-		ensure_distinct_deinit_config_targets(&config_targets).map_err(&preflight)?;
+		ensure_distinct_deinit_config_targets(&config_targets).map_err(preflight)?;
 
 		for entry in plan {
 			let module = entry.declaration.name.clone();
