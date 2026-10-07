@@ -23,6 +23,7 @@ mod merge;
 mod merge_base;
 mod merge_state;
 mod mode;
+mod precondition;
 mod rebase_state;
 mod ref_op;
 mod refs;
@@ -42,6 +43,7 @@ pub use self::{
 	initial_commit_transaction::InitialCommitTransaction,
 	merge::TreeMerge,
 	mode::FileMode,
+	precondition::Precondition,
 	rebase_state::RebaseState,
 	ref_op::RefOp,
 	refs::{RefStore, ReflogIntent},

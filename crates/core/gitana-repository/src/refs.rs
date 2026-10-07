@@ -4,7 +4,8 @@ use gitana_file_store::{FileStore, FileStoreError, PathLock};
 use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::{
-	HeadLock, HeadResetPlan, HeadState, HeadTransaction, HistoryMutationLease, RefOp, RepositoryError,
+	HeadLock, HeadResetPlan, HeadState, HeadTransaction, HistoryMutationLease, Precondition, RefOp,
+	RepositoryError,
 };
 
 /// The maximum symbolic-ref chain depth to follow (git's limit), a guard against a cycle.
@@ -509,7 +510,7 @@ where
 			reflog: ReflogIntent::Log { committer, message },
 		};
 		self
-			.transact_with_policy(std::slice::from_ref(&op), Some(ReflogPolicy::Always))
+			.transact_with_policy(std::slice::from_ref(&op), Some(ReflogPolicy::Always), &[])
 			.await
 			.map_err(|(_, error)| error)
 	}
@@ -596,7 +597,7 @@ where
 				reflog,
 			};
 			let cascades = self
-				.confirm_cascades(std::slice::from_ref(&op), vec![cascade])
+				.confirm_cascades(std::slice::from_ref(&op), vec![cascade], &[])
 				.await
 				.map_err(|(_, error)| error)?;
 			let olds = self
@@ -737,23 +738,42 @@ where
 	/// directory pruning continue to completion. Wasm file-store operations execute synchronously when
 	/// polled, so the transaction runs inline there without requiring a Tokio runtime.
 	pub async fn transact(&self, ops: &[RefOp<'_, H>]) -> Result<(), (String, RepositoryError)> {
-		self.transact_with_policy(ops, None).await
+		self.transact_checked(ops, &[]).await
+	}
+
+	/// Apply `ops` as one atomic ref transaction (as [`transact`](Self::transact)), asserting every
+	/// [`Precondition`] under the transaction's held locks before any op applies.
+	///
+	/// A [`Precondition::HeadSymbolic`] forces `HEAD` into the lock set and requires `HEAD` to still
+	/// symbolically name the given ref (its immediate target) while `HEAD.lock` is held, so a
+	/// concurrent branch switch between a caller's capture and this commit fails the whole transaction
+	/// with [`RepositoryError::HeadMoved`] rather than moving a ref `HEAD` no longer names. A failed
+	/// precondition applies nothing, as any other transaction rejection does. With an empty
+	/// `preconditions` slice this is exactly [`transact`](Self::transact).
+	pub async fn transact_checked(
+		&self,
+		ops: &[RefOp<'_, H>],
+		preconditions: &[Precondition],
+	) -> Result<(), (String, RepositoryError)> {
+		self.transact_with_policy(ops, None, preconditions).await
 	}
 
 	async fn transact_with_policy(
 		&self,
 		ops: &[RefOp<'_, H>],
 		policy: Option<ReflogPolicy>,
+		preconditions: &[Precondition],
 	) -> Result<(), (String, RepositoryError)> {
 		#[cfg(not(target_arch = "wasm32"))]
 		{
 			let files = self.files.shared_handle();
 			let effective = self.effective.cloned();
 			let ops = own_ref_ops(ops);
+			let preconditions = preconditions.to_vec();
 			match tokio::spawn(async move {
 				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
 				let ops = borrow_ref_ops(&ops);
-				store.transact_inline(&ops, policy).await
+				store.transact_inline(&ops, policy, &preconditions).await
 			})
 			.await
 			{
@@ -766,13 +786,14 @@ where
 		}
 
 		#[cfg(target_arch = "wasm32")]
-		self.transact_inline(ops, policy).await
+		self.transact_inline(ops, policy, preconditions).await
 	}
 
 	async fn transact_inline(
 		&self,
 		ops: &[RefOp<'_, H>],
 		policy: Option<ReflogPolicy>,
+		preconditions: &[Precondition],
 	) -> Result<(), (String, RepositoryError)> {
 		let anon = |error| (String::new(), error);
 		let history_owner = ops.first().map(|op| op.name.clone()).unwrap_or_default();
@@ -792,7 +813,12 @@ where
 			.collect();
 
 		let mut lock_names: Vec<String> = ops.iter().map(|op| op.name.clone()).collect();
-		if cascades.iter().any(|&c| c) {
+		// A HEAD precondition is asserted under `HEAD.lock`, so lock `HEAD` whenever one is present —
+		// not only when an op cascades into `logs/HEAD`.
+		let assert_head = preconditions
+			.iter()
+			.any(|precondition| matches!(precondition, Precondition::HeadSymbolic(_)));
+		if cascades.iter().any(|&c| c) || assert_head {
 			lock_names.push("HEAD".to_owned());
 		}
 		if ops.iter().any(|op| op.name.starts_with("refs/")) {
@@ -815,7 +841,7 @@ where
 		// pre-lock→lock window), validate, then commit. On native this entire sequence lives in the
 		// retained worker, so the path-lock guards cannot be dropped while a backend write continues.
 		let outcome = async {
-			let cascades = self.confirm_cascades(ops, cascades).await?;
+			let cascades = self.confirm_cascades(ops, cascades, preconditions).await?;
 			let olds = self.validate_locked(ops, &cascades, policy).await?;
 			self.commit_validated(ops, &olds, &cascades, policy).await
 		}
@@ -829,25 +855,47 @@ where
 		outcome
 	}
 
-	/// Re-derive the HEAD cascade flags under the acquired locks. `HEAD` is read once *before* locking
-	/// to fix the lock set (it is locked iff some op cascades); re-reading it here — while we hold
-	/// `HEAD.lock` when it matters — catches a concurrent `set_symbolic` in the pre-lock→lock window.
-	/// An op then cascades only when we hold `HEAD.lock` **and** `HEAD` still points at it, so the
-	/// transaction never appends to `logs/HEAD` without holding `HEAD.lock`.
+	/// Re-derive the HEAD cascade flags under the acquired locks and assert any HEAD precondition.
+	/// `HEAD` is read once *before* locking to fix the lock set (it is locked when some op cascades or
+	/// a HEAD precondition is present); re-reading it here — while we hold `HEAD.lock` when it matters
+	/// — catches a concurrent `set_symbolic` in the pre-lock→lock window. An op then cascades only when
+	/// we hold `HEAD.lock` **and** `HEAD` still points at it, so the transaction never appends to
+	/// `logs/HEAD` without holding `HEAD.lock`. The same single read serves the precondition
+	/// assertion, so `HEAD` is read once under the lock for both purposes.
 	async fn confirm_cascades(
 		&self,
 		ops: &[RefOp<'_, H>],
 		cascades: Vec<bool>,
+		preconditions: &[Precondition],
 	) -> Result<Vec<bool>, (String, RepositoryError)> {
-		if !cascades.iter().any(|&c| c) {
-			// No op cascaded pre-lock, so `HEAD` was not locked; leave the flags off rather than trust a
-			// fresh read we could not act on safely.
+		let assert_head = preconditions
+			.iter()
+			.any(|precondition| matches!(precondition, Precondition::HeadSymbolic(_)));
+		if !cascades.iter().any(|&c| c) && !assert_head {
+			// No op cascaded pre-lock and no HEAD precondition is asserted, so `HEAD` was not locked;
+			// leave the flags off rather than trust a fresh read we could not act on safely.
 			return Ok(cascades);
 		}
 		let head = self
 			.read_symbolic("HEAD")
 			.await
 			.map_err(|error| (String::new(), error))?;
+		// Assert every HEAD precondition under the held `HEAD.lock` before any op is validated or
+		// committed, so a failed precondition applies nothing.
+		for precondition in preconditions {
+			match precondition {
+				Precondition::HeadSymbolic(expected) => {
+					if head.as_deref() != Some(expected.as_str()) {
+						return Err((
+							String::new(),
+							RepositoryError::HeadMoved {
+								expected: expected.clone(),
+							},
+						));
+					}
+				}
+			}
+		}
 		Ok(
 			ops
 				.iter()
@@ -1983,7 +2031,7 @@ where
 			let cascades =
 				vec![branch.starts_with("refs/heads/") && head_target.as_deref() == Some(branch)];
 			let cascades = self
-				.confirm_cascades(ops, cascades)
+				.confirm_cascades(ops, cascades, &[])
 				.await
 				.map_err(|(_, error)| error)?;
 			let olds = self
@@ -2831,6 +2879,83 @@ mod tests {
 		assert_eq!(
 			store.resolve("refs/tags/topic/child").await.unwrap(),
 			Some(child)
+		);
+	}
+
+	#[tokio::test]
+	async fn transact_checked_asserts_head_still_names_the_expected_branch() {
+		let files = MemoryFileStore::new();
+		let store: RefStore<'_, MemoryFileStore, Sha256> = RefStore::new(&files);
+		let tip = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"tip");
+		let advanced = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"advanced");
+		let frontier_old = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"frontier-old");
+		let frontier_new = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"frontier-new");
+
+		// Branch `a` holds `tip`, an auxiliary ref stands in for a redo frontier, and HEAD names `a`.
+		store
+			.update_ref("refs/heads/a", tip, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		store
+			.update_ref("refs/forge/frontier", frontier_old, None, ReflogIntent::Skip)
+			.await
+			.unwrap();
+		store
+			.set_symbolic("HEAD", "refs/heads/a", ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		// One atomic move of the branch tip plus the frontier — the undo/redo shape.
+		let ops = [
+			crate::RefOp {
+				name: "refs/heads/a".to_owned(),
+				expected: Some(tip),
+				new: Some(advanced),
+				reflog: ReflogIntent::Skip,
+			},
+			crate::RefOp {
+				name: "refs/forge/frontier".to_owned(),
+				expected: Some(frontier_old),
+				new: Some(frontier_new),
+				reflog: ReflogIntent::Skip,
+			},
+		];
+
+		// HEAD names `a`, but the precondition asserts `b`: the transaction aborts and applies nothing.
+		let (_, error) = store
+			.transact_checked(
+				&ops,
+				&[crate::Precondition::HeadSymbolic("refs/heads/b".to_owned())],
+			)
+			.await
+			.expect_err("a HEAD precondition for another branch must abort the transaction");
+		assert!(
+			matches!(error, crate::RepositoryError::HeadMoved { .. }),
+			"{error:?}"
+		);
+		assert_eq!(
+			store.resolve("refs/heads/a").await.unwrap(),
+			Some(tip),
+			"a refused HEAD precondition must leave the branch tip unchanged"
+		);
+		assert_eq!(
+			store.resolve("refs/forge/frontier").await.unwrap(),
+			Some(frontier_old),
+			"a refused HEAD precondition must leave the frontier untouched"
+		);
+
+		// The matching precondition applies every op in the transaction.
+		store
+			.transact_checked(
+				&ops,
+				&[crate::Precondition::HeadSymbolic("refs/heads/a".to_owned())],
+			)
+			.await
+			.expect("a HEAD precondition naming the current branch applies all ops");
+		assert_eq!(store.resolve("refs/heads/a").await.unwrap(), Some(advanced));
+		assert_eq!(
+			store.resolve("refs/forge/frontier").await.unwrap(),
+			Some(frontier_new)
 		);
 	}
 

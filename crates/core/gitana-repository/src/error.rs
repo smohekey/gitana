@@ -57,6 +57,14 @@ pub enum RepositoryError {
 		/// The ref whose update was rejected.
 		name: String,
 	},
+	/// A ref transaction's HEAD precondition failed: `HEAD` no longer symbolically names the expected
+	/// ref. Distinct from [`RefMoved`](Self::RefMoved) (a branch-tip CAS failure) so a caller can map a
+	/// HEAD switch unambiguously.
+	#[error("HEAD moved: no longer names {expected}")]
+	HeadMoved {
+		/// The ref the precondition required `HEAD` to still name.
+		expected: String,
+	},
 	/// A ref transaction could not acquire a ref's `<ref>.lock` — another writer holds it.
 	#[error("ref locked: {name} is being updated by another process")]
 	RefLocked {
