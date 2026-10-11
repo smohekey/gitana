@@ -37,8 +37,9 @@ where
 	/// Revalidate and durably publish the first commit before releasing the history lock.
 	///
 	/// The candidate must be a valid commit whose object graph has already crossed its durability
-	/// barrier. This method publishes the captured unborn terminal ref, flushes that ref and the
-	/// candidate's reachable graph, and only then permits another history mutation.
+	/// barrier, such as [`Repository::durability_barrier_object_graph`]. This method publishes the
+	/// captured unborn terminal ref and flushes that ref, trusting the candidate's graph to the
+	/// barrier it already crossed, and only then permits another history mutation.
 	pub async fn publish_durable(
 		self,
 		target: ObjectId<H>,
@@ -82,8 +83,10 @@ where
 			.expect("an initial-commit transaction retains the history lock");
 		self.head.finish().await?;
 
+		// The candidate's graph crossed its barrier before publication, and repacking keeps durable
+		// objects durable, so only the ref itself remains to flush.
 		let result = repository
-			.durability_barrier_ref(&self.terminal_ref, target, &[])
+			.durability_barrier_ref(&self.terminal_ref, target, &[target])
 			.await;
 		drop(history_lease);
 		result

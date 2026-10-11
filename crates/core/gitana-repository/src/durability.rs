@@ -1276,6 +1276,33 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn initial_commit_publication_flushes_the_ref_but_not_the_graph_again() {
+		let (files, barriers) = RecordingFileStore::new();
+		let repo = Repository::<_, Sha256>::new(ObjectStore::new(files));
+		repo.init().await.unwrap();
+		let value = repo.write_blob(b"value").await.unwrap();
+		let (commit, _) = commit_files(&repo, &[("value", value)], Vec::new(), 1).await;
+		repo
+			.durability_barrier_object_graph(commit, &[])
+			.await
+			.unwrap();
+
+		let transaction = repo.lock_initial_commit_transaction().await.unwrap();
+		transaction
+			.publish_durable(commit, ReflogIntent::Skip)
+			.await
+			.unwrap();
+
+		let calls = barriers.lock().unwrap().len();
+		assert_eq!(calls, 2);
+		assert!(flushed_objects(&barriers, 1).is_empty());
+		assert!(
+			barriers.lock().unwrap()[1].contains(&DurabilityTarget::file("refs/heads/main")),
+			"the published ref must be flushed"
+		);
+	}
+
+	#[tokio::test]
 	async fn ref_barrier_stops_commit_parent_walk_at_a_shallow_boundary() {
 		let (files, barriers) = RecordingFileStore::new();
 		let repo = Repository::<_, Sha256>::new(ObjectStore::new(files));
