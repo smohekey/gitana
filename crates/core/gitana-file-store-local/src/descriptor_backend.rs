@@ -244,16 +244,11 @@ impl Backend for DescriptorBackend {
 			&opened
 		};
 
-		// `descriptor.sync` and `descriptor.sync-data` both succeed with no effect when the
-		// descriptor was not opened for mutation. Directory entries are metadata, so require the
-		// directory-write capability explicitly and use the full fsync-equivalent operation.
-		if !directory
-			.get_flags()
-			.map_err(io_error)?
-			.contains(DescriptorFlags::MUTATE_DIRECTORY)
-		{
-			return Err(io_error(ErrorCode::ReadOnly));
-		}
+		// Directory entries are metadata, so use the full fsync-equivalent `descriptor.sync`. A
+		// subdirectory opened through `open_at` never reports `MUTATE_DIRECTORY`, because
+		// wasmtime derives a directory's mode from `READ` and `WRITE` alone. Its `sync` still
+		// reopens the directory and fsyncs it whatever that mode is, so the descriptor's flags are
+		// not consulted. This relies on the host syncing directories; see the crate README.
 		directory.sync().map_err(io_error)
 	}
 }
