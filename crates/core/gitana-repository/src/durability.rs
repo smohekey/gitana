@@ -3,8 +3,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use gitana_file_store::{DeleteOutcome, DurabilityTarget, FileStore, FileStoreError};
-use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_commit, referenced_ids};
-use gitana_object_store::{ObjectBacking, ObjectStoreError};
+use gitana_object::{
+	HashAlgorithm, ObjectId, ObjectKind, TreeEntry, parse_commit, parse_tree, referenced_ids,
+};
+use gitana_object_store::{ObjectBacking, ObjectReadSession, ObjectStoreError};
 
 use crate::{Config, HeadState, RefStore, Repository, RepositoryError};
 
@@ -61,7 +63,8 @@ where
 	}
 
 	/// Flush every object reachable from `root` beyond the supplied durable frontiers without
-	/// requiring a ref to name `root` yet.
+	/// requiring a ref to name `root` yet. Frontiers bound the walk as described for
+	/// [`Self::durability_barrier_ref`].
 	///
 	/// This is the pre-publication half of a durable ref update: callers cross this barrier first,
 	/// publish the ref with compare-and-swap, then finish with [`Self::durability_barrier_ref`]. The
@@ -152,9 +155,13 @@ where
 	/// Flush a named ref and every object newly reachable from `expected` beyond the supplied durable
 	/// frontiers.
 	///
-	/// A frontier is trusted as an already-durable object boundary: the walk does not read or flush that
-	/// object or anything reachable through it. This is the efficient shape for a session branch whose
-	/// immutable baseline and previous checkpoints have already crossed a durability boundary. The walk
+	/// A frontier is trusted as an already-durable object boundary: the walk never flushes it, and reads
+	/// it only to learn whether it is a commit. When a frontier is a commit, the walk also compares each new tree with the
+	/// frontier's tree at the same path and skips, unread, every entry whose id matches; it reads the
+	/// frontier's trees only where they differ from the new ones. Content reachable through a frontier
+	/// only at a different path is flushed again, which is redundant but safe. This is the efficient
+	/// shape for a session branch whose immutable baseline and previous checkpoints have already
+	/// crossed a durability boundary: a new commit flushes only what it changed. The walk
 	/// honours `.git/shallow`, flushes the actual loose object or pack and existing index that supplied each
 	/// object, and re-reads both the ref and object provenance after the barrier. Concurrent storage
 	/// movement is retried only while it converges to a stable view.
@@ -285,19 +292,81 @@ where
 		let shallow_file = self.objects().file_store().exists("shallow").await?;
 		let mut objects = HashMap::new();
 		let mut seen = HashSet::new();
-		let mut pending = roots.to_vec();
 		let mut reader = self.objects().read_session();
 
-		while let Some(id) = pending.pop() {
-			if frontiers.contains(&id) || !seen.insert(id) {
+		// A commit frontier also vouches for its tree. Each new tree is walked alongside the
+		// frontier trees at the same path, so an entry whose id matches theirs is skipped unread.
+		// Frontier trees are read only where the new graph differs.
+		let mut durable = frontiers.clone();
+		let mut frontier_trees = Vec::new();
+		for frontier in frontiers {
+			// A frontier the store cannot supply still bounds the walk exactly.
+			if let Some((ObjectKind::Commit, data)) = read_frontier_object(&mut reader, frontier).await? {
+				frontier_trees.push(parse_commit::<H>(&data)?.tree);
+			}
+		}
+		let mut frontier_entries: HashMap<ObjectId<H>, Option<Vec<TreeEntry<H>>>> = HashMap::new();
+		let mut pending: Vec<(ObjectId<H>, Vec<ObjectId<H>>)> =
+			roots.iter().map(|root| (*root, Vec::new())).collect();
+
+		while let Some((id, counterparts)) = pending.pop() {
+			if counterparts.contains(&id) {
+				durable.insert(id);
+			}
+			if durable.contains(&id) || !seen.insert(id) {
 				continue;
 			}
 			let (kind, data, backing) = reader.read_object_with_backing(&id).await?;
 			objects.insert(id, backing);
-			if kind == ObjectKind::Commit && shallow.contains(&id) {
-				pending.push(parse_commit::<H>(&data)?.tree);
-			} else {
-				pending.extend(referenced_ids::<H>(kind, &data)?);
+			match kind {
+				ObjectKind::Commit => {
+					let commit = parse_commit::<H>(&data)?;
+					pending.push((commit.tree, frontier_trees.clone()));
+					if !shallow.contains(&id) {
+						pending.extend(
+							commit
+								.parents
+								.into_iter()
+								.map(|parent| (parent, Vec::new())),
+						);
+					}
+				}
+				ObjectKind::Tree => {
+					for counterpart in &counterparts {
+						if !frontier_entries.contains_key(counterpart) {
+							let entries = match read_frontier_object(&mut reader, counterpart).await? {
+								Some((ObjectKind::Tree, data)) => Some(parse_tree::<H>(&data)?),
+								_ => None,
+							};
+							frontier_entries.insert(*counterpart, entries);
+						}
+					}
+					let sides: Vec<&Vec<TreeEntry<H>>> = counterparts
+						.iter()
+						.filter_map(|counterpart| frontier_entries.get(counterpart).and_then(Option::as_ref))
+						.collect();
+					// A gitlink names a commit in another repository, so it is never walked here.
+					for entry in parse_tree::<H>(&data)? {
+						if entry.mode == "160000" {
+							continue;
+						}
+						let matching = sides
+							.iter()
+							.filter_map(|entries| {
+								entries
+									.iter()
+									.find(|candidate| candidate.name == entry.name)
+									.map(|candidate| candidate.id)
+							})
+							.collect();
+						pending.push((entry.id, matching));
+					}
+				}
+				ObjectKind::Tag | ObjectKind::Blob => pending.extend(
+					referenced_ids::<H>(kind, &data)?
+						.into_iter()
+						.map(|child| (child, Vec::new())),
+				),
 			}
 		}
 
@@ -395,6 +464,25 @@ async fn absent_ref_targets(
 		closest_existing_directory(files, parent_of(&reflog).unwrap_or("")).await?,
 	));
 	Ok(targets)
+}
+
+/// Read an object on the durable side of a frontier, or `None` when the store cannot supply it.
+/// Frontier objects only narrow the walk, so a missing one costs a redundant flush, not safety.
+async fn read_frontier_object<F, H>(
+	reader: &mut ObjectReadSession<'_, F, H>,
+	id: &ObjectId<H>,
+) -> Result<Option<(ObjectKind, Vec<u8>)>, RepositoryError>
+where
+	F: FileStore,
+	H: HashAlgorithm,
+{
+	match reader.read_object_with_backing(id).await {
+		Ok((kind, data, _)) => Ok(Some((kind, data))),
+		Err(ObjectStoreError::NotFound | ObjectStoreError::FileStore(FileStoreError::NotFound)) => {
+			Ok(None)
+		}
+		Err(error) => Err(error.into()),
+	}
 }
 
 fn is_provenance_movement(error: &RepositoryError) -> bool {
@@ -977,6 +1065,214 @@ mod tests {
 				"durable frontier object must not be flushed again"
 			);
 		}
+	}
+
+	/// The loose object files flushed by the `call`th recorded barrier.
+	fn flushed_objects(barriers: &Mutex<Vec<Vec<DurabilityTarget>>>, call: usize) -> HashSet<String> {
+		barriers.lock().unwrap()[call]
+			.iter()
+			.filter_map(|target| match target {
+				DurabilityTarget::File(path) if path.starts_with("objects/") => Some(path.clone()),
+				_ => None,
+			})
+			.collect()
+	}
+
+	/// Commit regular files at `paths` with `parents`, returning the commit and its tree.
+	async fn commit_files(
+		repo: &Repository<RecordingFileStore, Sha256>,
+		paths: &[(&str, ObjectId<Sha256>)],
+		parents: Vec<ObjectId<Sha256>>,
+		time: u32,
+	) -> (ObjectId<Sha256>, ObjectId<Sha256>) {
+		let entries: Vec<_> = paths
+			.iter()
+			.map(|(path, id)| TreeBuildEntry {
+				path: GitPath::from_utf8(path).unwrap(),
+				mode: FileMode::Regular,
+				id: *id,
+			})
+			.collect();
+		let tree = repo.write_tree(&entries).await.unwrap();
+		let signature = format!("A <a@b> {time} +0000");
+		let commit = repo
+			.create_commit(tree, parents, &signature, &signature, "commit")
+			.await
+			.unwrap();
+		(commit, tree)
+	}
+
+	/// The id of the entry `name` in `tree`.
+	async fn entry_id(
+		repo: &Repository<RecordingFileStore, Sha256>,
+		tree: ObjectId<Sha256>,
+		name: &str,
+	) -> ObjectId<Sha256> {
+		let (_, data) = repo.objects().read_object(&tree).await.unwrap();
+		parse_tree::<Sha256>(&data)
+			.unwrap()
+			.into_iter()
+			.find(|entry| entry.name.as_bytes() == name.as_bytes())
+			.unwrap()
+			.id
+	}
+
+	/// Remove loose objects outright, so a walk that tried to read them would fail.
+	async fn remove_objects(repo: &Repository<RecordingFileStore, Sha256>, ids: &[ObjectId<Sha256>]) {
+		for id in ids {
+			repo
+				.objects()
+				.file_store()
+				.delete_path_unlocked(&loose_object_path(id))
+				.await
+				.unwrap();
+		}
+	}
+
+	fn loose_paths(ids: &[ObjectId<Sha256>]) -> HashSet<String> {
+		ids.iter().map(loose_object_path).collect()
+	}
+
+	#[tokio::test]
+	async fn object_graph_barrier_skips_subtrees_shared_with_a_commit_frontier_unread() {
+		let (files, barriers) = RecordingFileStore::new();
+		let repo = Repository::<_, Sha256>::new(ObjectStore::new(files));
+		repo.init().await.unwrap();
+		let inner = repo.write_blob(b"inner").await.unwrap();
+		let before = repo.write_blob(b"before").await.unwrap();
+		let after = repo.write_blob(b"after").await.unwrap();
+		let (base, base_tree) = commit_files(
+			&repo,
+			&[("shared/inner", inner), ("value", before)],
+			Vec::new(),
+			1,
+		)
+		.await;
+		let (tip, tip_tree) = commit_files(
+			&repo,
+			&[("shared/inner", inner), ("value", after)],
+			vec![base],
+			2,
+		)
+		.await;
+		let shared = entry_id(&repo, tip_tree, "shared").await;
+		assert_eq!(shared, entry_id(&repo, base_tree, "shared").await);
+		remove_objects(&repo, &[shared, inner]).await;
+
+		repo
+			.durability_barrier_object_graph(tip, &[base])
+			.await
+			.unwrap();
+
+		assert_eq!(
+			flushed_objects(&barriers, 0),
+			loose_paths(&[tip, tip_tree, after])
+		);
+	}
+
+	#[tokio::test]
+	async fn object_graph_barrier_flushes_content_moved_to_another_path() {
+		let (files, barriers) = RecordingFileStore::new();
+		let repo = Repository::<_, Sha256>::new(ObjectStore::new(files));
+		repo.init().await.unwrap();
+		let moved = repo.write_blob(b"moved").await.unwrap();
+		let (base, _) = commit_files(&repo, &[("old", moved)], Vec::new(), 1).await;
+		let (tip, tip_tree) = commit_files(&repo, &[("new", moved)], vec![base], 2).await;
+
+		repo
+			.durability_barrier_object_graph(tip, &[base])
+			.await
+			.unwrap();
+
+		assert_eq!(
+			flushed_objects(&barriers, 0),
+			loose_paths(&[tip, tip_tree, moved])
+		);
+	}
+
+	#[tokio::test]
+	async fn object_graph_barrier_skips_subtrees_shared_with_any_commit_frontier() {
+		let (files, barriers) = RecordingFileStore::new();
+		let repo = Repository::<_, Sha256>::new(ObjectStore::new(files));
+		repo.init().await.unwrap();
+		let inner = repo.write_blob(b"inner").await.unwrap();
+		let first_value = repo.write_blob(b"first").await.unwrap();
+		let second_value = repo.write_blob(b"second").await.unwrap();
+		let tip_value = repo.write_blob(b"tip").await.unwrap();
+		let (first, first_tree) = commit_files(
+			&repo,
+			&[("shared/inner", inner), ("value", first_value)],
+			Vec::new(),
+			1,
+		)
+		.await;
+		let (second, _) = commit_files(&repo, &[("value", second_value)], Vec::new(), 2).await;
+		let (tip, tip_tree) = commit_files(
+			&repo,
+			&[("shared/inner", inner), ("value", tip_value)],
+			vec![second],
+			3,
+		)
+		.await;
+		let shared = entry_id(&repo, first_tree, "shared").await;
+		remove_objects(&repo, &[shared, inner]).await;
+
+		repo
+			.durability_barrier_object_graph(tip, &[second, first])
+			.await
+			.unwrap();
+
+		assert_eq!(
+			flushed_objects(&barriers, 0),
+			loose_paths(&[tip, tip_tree, tip_value])
+		);
+	}
+
+	#[tokio::test]
+	async fn object_graph_barrier_treats_a_tree_frontier_as_an_exact_boundary() {
+		let (files, barriers) = RecordingFileStore::new();
+		let repo = Repository::<_, Sha256>::new(ObjectStore::new(files));
+		repo.init().await.unwrap();
+		let inner = repo.write_blob(b"inner").await.unwrap();
+		let value = repo.write_blob(b"value").await.unwrap();
+		let (tip, tip_tree) = commit_files(
+			&repo,
+			&[("shared/inner", inner), ("value", value)],
+			Vec::new(),
+			1,
+		)
+		.await;
+		let shared = entry_id(&repo, tip_tree, "shared").await;
+
+		repo
+			.durability_barrier_object_graph(tip, &[shared])
+			.await
+			.unwrap();
+
+		assert_eq!(
+			flushed_objects(&barriers, 0),
+			loose_paths(&[tip, tip_tree, value])
+		);
+	}
+
+	#[tokio::test]
+	async fn object_graph_barrier_treats_an_absent_frontier_as_an_exact_boundary() {
+		let (files, barriers) = RecordingFileStore::new();
+		let repo = Repository::<_, Sha256>::new(ObjectStore::new(files));
+		repo.init().await.unwrap();
+		let value = repo.write_blob(b"value").await.unwrap();
+		let (tip, tip_tree) = commit_files(&repo, &[("value", value)], Vec::new(), 1).await;
+		let absent = ObjectId::<Sha256>::compute(ObjectKind::Commit, b"absent frontier");
+
+		repo
+			.durability_barrier_object_graph(tip, &[absent])
+			.await
+			.unwrap();
+
+		assert_eq!(
+			flushed_objects(&barriers, 0),
+			loose_paths(&[tip, tip_tree, value])
+		);
 	}
 
 	#[tokio::test]
