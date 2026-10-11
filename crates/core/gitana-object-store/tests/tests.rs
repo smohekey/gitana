@@ -4,11 +4,12 @@
 
 mod support;
 
+use self::support::{RecordedEvent, RecordingFileStore};
 pub(crate) use support::DisappearingLooseFileStore;
 
 use std::collections::HashSet;
 
-use gitana_file_store::FileStore;
+use gitana_file_store::{DurabilityTarget, FileStore};
 use gitana_file_store_memory::MemoryFileStore;
 use gitana_object::{
 	Commit, EwahBitmap, ObjectId, ObjectKind, PackedObject, Sha256, TreeEntry, decode_midx_bitmap,
@@ -849,6 +850,95 @@ async fn repack_packs_loose_only_stores() {
 	assert!(!has_loose_objects(&store).await);
 	assert_eq!(store.read_object(&a).await.expect("read a").1, b"one");
 	assert_eq!(store.read_object(&b).await.expect("read b").1, b"two");
+}
+
+async fn pack_paths(files: &RecordingFileStore) -> HashSet<String> {
+	files
+		.list_prefix("objects/pack/")
+		.await
+		.expect("list packs")
+		.into_iter()
+		.filter(|path| path.ends_with(".pack"))
+		.collect()
+}
+
+/// Whether, among the events recorded from `since`, a barrier over every pack written since
+/// `before` and its index precedes the first deletion of a source.
+async fn new_packs_were_durable_before_sources_were_deleted(
+	files: &RecordingFileStore,
+	before: &HashSet<String>,
+	since: usize,
+) -> bool {
+	let written: Vec<String> = pack_paths(files)
+		.await
+		.difference(before)
+		.cloned()
+		.collect();
+	assert!(!written.is_empty(), "repack wrote no new pack");
+	let events = &files.events()[since..];
+	let first_delete = events
+		.iter()
+		.position(|event| matches!(event, RecordedEvent::Delete(_)))
+		.expect("repack deletes its sources");
+	written.iter().all(|pack| {
+		let index = format!("{}.idx", pack.trim_end_matches(".pack"));
+		events[..first_delete].iter().any(|event| {
+			matches!(event, RecordedEvent::Barrier(targets)
+				if targets.contains(&DurabilityTarget::file(pack.clone()))
+					&& targets.contains(&DurabilityTarget::file(index.clone())))
+		})
+	})
+}
+
+#[tokio::test]
+async fn repack_makes_new_packs_durable_before_deleting_sources() {
+	let files = RecordingFileStore::new();
+	let store = ObjectStore::<_, Sha256>::new(files.shared_handle());
+	store
+		.write_object(ObjectKind::Blob, b"one")
+		.await
+		.expect("write one");
+	store
+		.write_object(ObjectKind::Blob, b"two")
+		.await
+		.expect("write two");
+
+	store
+		.repack(u64::MAX)
+		.await
+		.expect("repack")
+		.expect("repack did work");
+
+	assert!(new_packs_were_durable_before_sources_were_deleted(&files, &HashSet::new(), 0).await);
+}
+
+#[tokio::test]
+async fn geometric_repack_makes_new_packs_durable_before_deleting_sources() {
+	let files = RecordingFileStore::new();
+	let store = ObjectStore::<_, Sha256>::new(files.shared_handle());
+	store
+		.write_object(ObjectKind::Blob, b"one")
+		.await
+		.expect("write one");
+	store
+		.repack(u64::MAX)
+		.await
+		.expect("first repack")
+		.expect("first repack did work");
+	store
+		.write_object(ObjectKind::Blob, b"two")
+		.await
+		.expect("write two");
+	let before = pack_paths(&files).await;
+	let since = files.events().len();
+
+	store
+		.repack_geometric(u64::MAX, 2)
+		.await
+		.expect("geometric repack")
+		.expect("geometric repack did work");
+
+	assert!(new_packs_were_durable_before_sources_were_deleted(&files, &before, since).await);
 }
 
 #[tokio::test]

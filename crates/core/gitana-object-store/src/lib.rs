@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use gitana_file_store::{FileStore, FileStoreError, WriteOutcome};
+use gitana_file_store::{DurabilityTarget, FileStore, FileStoreError, WriteOutcome};
 
 use gitana_object::{
 	BitmapIndex, EwahBitmap, HashAlgorithm, MAX_OBJECT_SIZE, MidxEntry, MultiPackIndex, ObjectError,
@@ -1591,6 +1591,23 @@ where
 			self
 				.encode_write_bounded(&objects, max_pack_size, &mut new_pack_paths)
 				.await?;
+		}
+
+		// The sources may already back durable refs, so their replacements must be durable before
+		// any source is deleted; otherwise a crash could leave only an unflushed copy.
+		let mut written: Vec<&String> = new_pack_paths.iter().collect();
+		written.sort();
+		let targets: Vec<DurabilityTarget> = written
+			.into_iter()
+			.flat_map(|path| {
+				[
+					DurabilityTarget::file(path.clone()),
+					DurabilityTarget::file(index_path(path)),
+				]
+			})
+			.collect();
+		if !targets.is_empty() {
+			self.files.durability_barrier(&targets).await?;
 		}
 
 		// Delete the batch packs (except any a re-encode reproduced) and every loose object.
