@@ -17,10 +17,9 @@ use std::path::Path;
 
 use gitana_object::Sha256;
 use gitana_repository::{FileMode, TreeBuildEntry};
-use support::{
-	ServerHash, gta_env, open, serve_gitana_basic_auth, serve_gitana_bearer_auth,
-	serve_gitana_multistage_auth, unique_tmp,
-};
+use support::{ServerHash, gta_env, open, serve_gitana_basic_auth, unique_tmp};
+#[cfg(unix)]
+use support::{serve_gitana_bearer_auth, serve_gitana_multistage_auth};
 
 /// A fixed identity for the server-side seed commit (`Name <email> seconds ±hhmm`).
 const WHO: &str = "A U Thor <a@example.com> 0 +0000";
@@ -79,6 +78,7 @@ exit 0
 
 /// Write a global gitconfig that installs `helpers` (absolute paths) as the `credential.helper` chain,
 /// in order, returning the config path to hand to `GIT_CONFIG_GLOBAL`.
+#[cfg(unix)]
 fn write_helper_config(dir: &Path, helpers: &[&Path]) -> std::path::PathBuf {
 	let mut text = String::from("[credential]\n");
 	for helper in helpers {

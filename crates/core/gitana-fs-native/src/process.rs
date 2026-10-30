@@ -28,10 +28,15 @@ pub fn open_process_file(directory: &Dir, path: &Path) -> Result<File> {
 /// the child.
 ///
 /// On Unix the returned path names a mode-0400 private snapshot. This remains reopenable by programs
-/// such as OpenSSH that close inherited descriptors during startup. On Windows `display_path`
-/// remains the child argument; [`open_process_file`] has already pinned its target against write or
-/// replacement. The returned guard must remain alive until a path-based child has opened the file;
-/// retaining it until child completion is the conservative choice.
+/// such as OpenSSH that close inherited descriptors during startup. On Windows the returned path is
+/// normally the retained file's own final path, without junction aliases from `display_path`.
+/// [`open_process_file`] denied write and delete sharing, so while the guard lives neither the file
+/// nor any directory above it can be renamed or replaced. Keep the guard until the child has exited.
+///
+/// If final-path lookup reports `ERROR_PATH_NOT_FOUND` (for example, a volume without a DOS mapping),
+/// `display_path` is returned after confirming it names the retained file. This compatibility
+/// fallback checks identity only at configuration time; aliases in that spelling can still be
+/// retargeted before child access. All other final-path lookup errors are returned unchanged.
 pub fn configure_process_file(
 	command: &mut Command,
 	file: &File,
@@ -63,27 +68,17 @@ pub fn configure_process_file(
 	#[cfg(windows)]
 	{
 		let _ = command;
-		let pins = pin_windows_path_chain(display_path)?;
-		let final_file = pins.last().ok_or_else(|| {
-			Error::new(
-				std::io::ErrorKind::InvalidInput,
-				"process file path has no file component",
-			)
+		let child_path = final_path_or_fallback(final_path(file), || {
+			let visible = File::from_std(std::fs::File::open(display_path)?);
+			if crate::file_identity(&visible)? != crate::file_identity(file)? {
+				return Err(Error::new(
+					std::io::ErrorKind::AlreadyExists,
+					"process file changed before child launch",
+				));
+			}
+			Ok(display_path.to_owned())
 		})?;
-		let visible = File::from_std(final_file.try_clone()?);
-		if crate::file_identity(&visible)? != crate::file_identity(file)? {
-			return Err(Error::new(
-				std::io::ErrorKind::AlreadyExists,
-				"process file changed before child launch",
-			));
-		}
-		Ok((
-			display_path.to_owned(),
-			ProcessFileGuard {
-				_file: retained,
-				_pins: pins,
-			},
-		))
+		Ok((child_path, ProcessFileGuard { _file: retained }))
 	}
 
 	#[cfg(not(any(windows, all(unix, not(target_os = "fuchsia")))))]
@@ -99,9 +94,17 @@ pub fn configure_process_file(
 /// Configure `command` to start in the retained `directory` rather than resolving `display_path`
 /// again through an untrusted ambient namespace.
 ///
-/// The returned guard must remain alive until the command has spawned. `display_path` is used by
-/// Windows because `CreateProcess` accepts only a path for the child's current directory; the
-/// complete visible directory chain is pinned and the final identity is checked first.
+/// On Unix the returned guard must remain alive until the command has spawned. On Windows
+/// `CreateProcess` accepts only a path, and the child opens its own working-directory handle during
+/// its startup, after `CreateProcess` returns. The child is normally started in the retained
+/// directory's own final path, without junction aliases from `display_path`. The retained directory
+/// must stay open until the child has exited, whether through this guard or the caller's own handle
+/// to it; see [`ProcessCurrentDirGuard`].
+///
+/// If final-path lookup reports `ERROR_PATH_NOT_FOUND` (for example, a volume without a DOS mapping),
+/// `display_path` is used after confirming it names the retained directory. This compatibility
+/// fallback checks identity only at configuration time; aliases in that spelling can still be
+/// retargeted before child access. All other final-path lookup errors are returned unchanged.
 pub fn configure_process_current_dir(
 	command: &mut Command,
 	directory: &Dir,
@@ -127,24 +130,19 @@ pub fn configure_process_current_dir(
 
 	#[cfg(windows)]
 	{
-		let pins = pin_windows_path_chain(display_path)?;
-		let final_directory = pins.last().ok_or_else(|| {
-			Error::new(
-				std::io::ErrorKind::InvalidInput,
-				"process working directory has no directory component",
-			)
+		let launch_path = final_path_or_fallback(final_path(directory), || {
+			let visible = Dir::open_ambient_dir(display_path, cap_std::ambient_authority())?;
+			if crate::directory_identity(&visible)? != crate::directory_identity(directory)? {
+				return Err(Error::new(
+					std::io::ErrorKind::AlreadyExists,
+					"process working directory changed before child launch",
+				));
+			}
+			Ok(display_path.to_owned())
 		})?;
-		let visible = Dir::from_std_file(final_directory.try_clone()?);
-		if crate::directory_identity(&visible)? != crate::directory_identity(directory)? {
-			return Err(Error::new(
-				std::io::ErrorKind::AlreadyExists,
-				"process working directory changed before child launch",
-			));
-		}
-		command.current_dir(display_path);
+		command.current_dir(launch_path);
 		Ok(ProcessCurrentDirGuard {
 			_directory: retained,
-			_pins: pins,
 		})
 	}
 
@@ -158,108 +156,307 @@ pub fn configure_process_current_dir(
 	}
 }
 
+/// Reopen a caller spelling only for the supported DOS-path lookup failure. Other failures must
+/// retain their original error rather than silently weakening alias protection.
 #[cfg(windows)]
-fn pin_windows_path_chain(path: &Path) -> Result<Vec<std::fs::File>> {
-	use std::os::windows::fs::OpenOptionsExt as _;
-	use std::path::{Component, PathBuf};
+fn final_path_or_fallback(
+	path: Result<PathBuf>,
+	fallback: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+	use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
+
+	match path {
+		Err(error) if error.raw_os_error() == Some(ERROR_PATH_NOT_FOUND as i32) => fallback(),
+		result => result,
+	}
+}
+
+/// The final path of an open entry, without junctions, in the ordinary spelling when Windows would
+/// resolve that to the same entry.
+#[cfg(windows)]
+fn final_path(entry: &impl std::os::windows::io::AsRawHandle) -> Result<PathBuf> {
+	use std::os::windows::ffi::OsStringExt as _;
 
 	use windows_sys::Win32::Storage::FileSystem::{
-		FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-		FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+		FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
 	};
 
-	if !path.is_absolute() {
-		return Err(Error::new(
-			std::io::ErrorKind::InvalidInput,
-			"process working directory must be absolute",
-		));
-	}
-
-	let mut current = PathBuf::new();
-	let mut pins = Vec::new();
-	for component in path.components() {
-		current.push(component.as_os_str());
-		match component {
-			Component::Prefix(_) | Component::CurDir => continue,
-			Component::ParentDir => {
-				return Err(Error::new(
-					std::io::ErrorKind::InvalidInput,
-					"process working directory must not contain parent traversal",
-				));
-			}
-			// The volume or UNC share root cannot be retargeted like a named child. Retain it for
-			// final identity validation when it is itself the cwd, but keep its sharing permissive
-			// so unrelated filesystem activity is not blocked.
-			Component::RootDir => {
-				let mut root_options = std::fs::OpenOptions::new();
-				root_options
-					.access_mode(FILE_READ_ATTRIBUTES)
-					.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-					.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
-				pins.push(root_options.open(&current)?);
-				continue;
-			}
-			Component::Normal(_) => {}
+	let mut buffer = vec![0u16; 512];
+	loop {
+		let capacity = u32::try_from(buffer.len()).map_err(Error::other)?;
+		// SAFETY: the buffer holds `capacity` elements and the handle stays open for the call.
+		let length = unsafe {
+			GetFinalPathNameByHandleW(
+				entry.as_raw_handle(),
+				buffer.as_mut_ptr(),
+				capacity,
+				FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+			)
+		} as usize;
+		if length == 0 {
+			return Err(Error::last_os_error());
 		}
-		// Pin the named entry itself as well as the directory it resolves to. The first handle keeps
-		// a junction/symlink from being retargeted; the second keeps the reached directory and proves
-		// the final identity. Neither grants write or delete sharing, so reparse data and ordinary
-		// directory names remain immutable until `CreateProcess` consumes the visible path.
-		let mut entry_options = std::fs::OpenOptions::new();
-		entry_options
-			.access_mode(FILE_READ_ATTRIBUTES)
-			.share_mode(FILE_SHARE_READ)
-			.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-		pins.push(entry_options.open(&current)?);
-		let mut target_options = std::fs::OpenOptions::new();
-		target_options
-			.access_mode(FILE_READ_ATTRIBUTES)
-			.share_mode(FILE_SHARE_READ)
-			.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
-		pins.push(target_options.open(&current)?);
+		if length < buffer.len() {
+			buffer.truncate(length);
+			let verbatim = PathBuf::from(std::ffi::OsString::from_wide(&buffer));
+			return Ok(ordinary_spelling(verbatim));
+		}
+		// The buffer was too small; `length` is the size needed, including the terminator.
+		buffer.resize(length, 0);
 	}
-	Ok(pins)
+}
+
+/// Drop the `\\?\` prefix when Windows resolves the ordinary spelling to the same path, so children
+/// receive ordinary drive-letter or UNC paths. Spellings that Windows would normalize, such as names
+/// ending in a dot, keep the verbatim prefix.
+#[cfg(windows)]
+fn ordinary_spelling(verbatim: PathBuf) -> PathBuf {
+	use std::ffi::OsString;
+	use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+	let wide = verbatim.as_os_str().encode_wide().collect::<Vec<_>>();
+	let unc_prefix = r"\\?\UNC\".encode_utf16().collect::<Vec<_>>();
+	let local_prefix = r"\\?\".encode_utf16().collect::<Vec<_>>();
+	let ordinary = if let Some(rest) = wide.strip_prefix(unc_prefix.as_slice()) {
+		r"\\"
+			.encode_utf16()
+			.chain(rest.iter().copied())
+			.collect::<Vec<_>>()
+	} else if let Some(rest) = wide.strip_prefix(local_prefix.as_slice()) {
+		rest.to_vec()
+	} else {
+		return verbatim;
+	};
+
+	let ordinary = PathBuf::from(OsString::from_wide(&ordinary));
+	match std::path::absolute(&ordinary) {
+		Ok(resolved) if resolved == ordinary => ordinary,
+		_ => verbatim,
+	}
 }
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-	use std::os::windows::fs::OpenOptionsExt as _;
-
 	use cap_std::ambient_authority;
-	use windows_sys::Win32::Storage::FileSystem::{
-		FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-		FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
-	};
 
 	use super::*;
 
 	#[test]
-	fn pinned_directory_components_deny_writers_until_released() {
-		let temporary = tempfile::tempdir().unwrap();
-		let nested = temporary.path().join("nested");
-		std::fs::create_dir(&nested).unwrap();
+	fn final_path_success_does_not_reopen_display_path() {
+		let resolved = PathBuf::from(r"C:\target\key");
 
-		let pins = pin_windows_path_chain(&nested).unwrap();
-		let mut reader = std::fs::OpenOptions::new();
-		reader
-			.access_mode(FILE_READ_ATTRIBUTES)
-			.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-			.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
-		let _reader = reader.open(&nested).expect("read access remains shareable");
-		let mut writer = std::fs::OpenOptions::new();
-		writer
-			.access_mode(FILE_WRITE_ATTRIBUTES)
-			.share_mode(FILE_SHARE_READ)
-			.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+		let path = final_path_or_fallback(Ok(resolved.clone()), || {
+			panic!("successful lookup must not reopen a mutable display path")
+		})
+		.unwrap();
+
+		assert_eq!(path, resolved);
+	}
+
+	#[test]
+	fn missing_dos_path_uses_the_validated_fallback() {
+		use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
+
+		let display = PathBuf::from(r"C:\alias\key");
+		let mut validated = false;
+
+		let path = final_path_or_fallback(
+			Err(Error::from_raw_os_error(ERROR_PATH_NOT_FOUND as i32)),
+			|| {
+				validated = true;
+				Ok(display.clone())
+			},
+		)
+		.unwrap();
+
 		assert!(
-			writer.open(&nested).is_err(),
-			"a retained component must deny write access"
+			validated,
+			"fallback must run the caller's identity validation"
+		);
+		assert_eq!(path, display);
+	}
+
+	#[test]
+	fn other_final_path_errors_do_not_reopen_display_path() {
+		use windows_sys::Win32::Foundation::{
+			ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
+			ERROR_NOT_ENOUGH_MEMORY,
+		};
+
+		for code in [
+			ERROR_ACCESS_DENIED,
+			ERROR_FILE_NOT_FOUND,
+			ERROR_INVALID_HANDLE,
+			ERROR_INVALID_PARAMETER,
+			ERROR_NOT_ENOUGH_MEMORY,
+		] {
+			let error = final_path_or_fallback(Err(Error::from_raw_os_error(code as i32)), || {
+				panic!("lookup error {code} must not reopen a mutable display path")
+			})
+			.unwrap_err();
+
+			assert_eq!(error.raw_os_error(), Some(code as i32));
+		}
+	}
+
+	#[test]
+	fn fallback_validation_failure_is_preserved() {
+		use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
+
+		let error = final_path_or_fallback(
+			Err(Error::from_raw_os_error(ERROR_PATH_NOT_FOUND as i32)),
+			|| {
+				Err(Error::new(
+					std::io::ErrorKind::AlreadyExists,
+					"identity changed",
+				))
+			},
+		)
+		.unwrap_err();
+
+		assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+		assert_eq!(error.to_string(), "identity changed");
+	}
+
+	/// Report the directory a `cmd` child started in.
+	fn child_working_directory(command: &mut Command) -> PathBuf {
+		let output = command.args(["/d", "/c", "cd"]).output().unwrap();
+		assert!(output.status.success());
+		PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+	}
+
+	fn create_junction(link: &Path, target: &Path) {
+		let output = Command::new("cmd")
+			.args(["/d", "/c", "mklink", "/J"])
+			.arg(link)
+			.arg(target)
+			.output()
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"creating a junction needs no elevation"
+		);
+	}
+
+	/// The ordinary spelling Windows reports for an existing entry, with no junction in it.
+	fn real_path(path: &Path) -> PathBuf {
+		ordinary_spelling(std::fs::canonicalize(path).unwrap())
+	}
+
+	#[test]
+	fn retained_working_directory_blocks_renames_until_released() {
+		let temporary = tempfile::tempdir().unwrap();
+		let parent = temporary.path().join("parent");
+		let nested = parent.join("nested");
+		std::fs::create_dir_all(&nested).unwrap();
+		let directory = Dir::open_ambient_dir(&nested, ambient_authority()).unwrap();
+		let mut command = Command::new("cmd");
+
+		let guard = configure_process_current_dir(&mut command, &directory, &nested).unwrap();
+		drop(directory);
+
+		assert!(
+			std::fs::rename(&nested, parent.join("moved")).is_err(),
+			"the retained working directory must not be renamed"
+		);
+		assert!(
+			std::fs::rename(&parent, temporary.path().join("moved")).is_err(),
+			"a directory above the retained working directory must not be renamed"
 		);
 
-		drop(pins);
-		writer
-			.open(&nested)
-			.expect("releasing the process guard restores write access");
+		drop(guard);
+		std::fs::rename(&nested, parent.join("moved"))
+			.expect("releasing the guard restores renaming the directory");
+		std::fs::rename(&parent, temporary.path().join("moved"))
+			.expect("releasing the guard restores renaming its parent");
+	}
+
+	#[test]
+	fn child_starts_in_the_real_directory_behind_a_junction() {
+		let temporary = tempfile::tempdir().unwrap();
+		let target = temporary.path().join("target");
+		let alias = temporary.path().join("alias");
+		std::fs::create_dir(&target).unwrap();
+		create_junction(&alias, &target);
+		let directory = Dir::open_ambient_dir(&alias, ambient_authority()).unwrap();
+		let mut command = Command::new("cmd");
+
+		let _guard = configure_process_current_dir(&mut command, &directory, &alias).unwrap();
+
+		assert_eq!(child_working_directory(&mut command), real_path(&target));
+	}
+
+	#[test]
+	fn empty_and_read_only_working_directories_are_supported() {
+		let temporary = tempfile::tempdir().unwrap();
+		let empty = temporary.path().join("empty");
+		let read_only = temporary.path().join("read-only");
+		std::fs::create_dir(&empty).unwrap();
+		std::fs::create_dir(&read_only).unwrap();
+		let user = format!(
+			"{}\\{}",
+			std::env::var("USERDOMAIN").unwrap(),
+			std::env::var("USERNAME").unwrap()
+		);
+		let restricted = Command::new("icacls")
+			.arg(&read_only)
+			.args(["/inheritance:r", "/grant:r"])
+			.arg(format!("{user}:(OI)(CI)(RX)"))
+			.output()
+			.unwrap();
+		assert!(restricted.status.success());
+		assert!(
+			std::fs::write(read_only.join("probe"), b"").is_err(),
+			"the read-only fixture must deny new files"
+		);
+
+		for path in [&empty, &read_only] {
+			let directory = Dir::open_ambient_dir(path, ambient_authority()).unwrap();
+			let mut command = Command::new("cmd");
+
+			let _guard = configure_process_current_dir(&mut command, &directory, path).unwrap();
+
+			assert_eq!(child_working_directory(&mut command), real_path(path));
+			assert_eq!(
+				std::fs::read_dir(path).unwrap().count(),
+				0,
+				"configuring the child must not modify its working directory"
+			);
+		}
+	}
+
+	#[test]
+	fn retained_process_file_is_passed_by_its_real_path() {
+		let temporary = tempfile::tempdir().unwrap();
+		let target = temporary.path().join("target");
+		let alias = temporary.path().join("alias");
+		std::fs::create_dir(&target).unwrap();
+		std::fs::write(target.join("key"), b"key").unwrap();
+		create_junction(&alias, &target);
+		let directory = Dir::open_ambient_dir(&alias, ambient_authority()).unwrap();
+		let file = open_process_file(&directory, Path::new("key")).unwrap();
+		let mut command = Command::new("cmd");
+
+		let (path, _guard) = configure_process_file(&mut command, &file, &alias.join("key")).unwrap();
+
+		assert_eq!(path, real_path(&target.join("key")));
+	}
+
+	#[test]
+	fn ordinary_spelling_keeps_paths_windows_would_normalize() {
+		assert_eq!(
+			ordinary_spelling(PathBuf::from(r"\\?\C:\work\repo")),
+			PathBuf::from(r"C:\work\repo")
+		);
+		assert_eq!(
+			ordinary_spelling(PathBuf::from(r"\\?\UNC\server\share\repo")),
+			PathBuf::from(r"\\server\share\repo")
+		);
+
+		assert_eq!(
+			ordinary_spelling(PathBuf::from(r"\\?\C:\work\name.")),
+			PathBuf::from(r"\\?\C:\work\name.")
+		);
 	}
 
 	#[test]

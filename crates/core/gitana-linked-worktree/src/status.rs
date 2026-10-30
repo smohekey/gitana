@@ -781,7 +781,7 @@ mod native {
 				"the host filesystem path cannot be represented as Git bytes",
 			)
 		})?;
-		gitana_path::GitPath::from_utf8(&value.replace('\\', "/"))
+		gitana_path::GitPath::from_utf8(value.replace('\\', "/"))
 			.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 	}
 

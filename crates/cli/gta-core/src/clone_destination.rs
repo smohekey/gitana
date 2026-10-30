@@ -805,6 +805,7 @@ mod tests {
 			std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
 		}
 		let original = Dir::open_ambient_dir(&target, ambient_authority()).unwrap();
+		#[cfg(unix)]
 		let before = std::fs::metadata(&target).unwrap();
 		let mut destination = CloneDestination::new(&target, true);
 		let staging = destination.start().unwrap();

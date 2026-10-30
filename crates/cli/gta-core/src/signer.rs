@@ -5,7 +5,10 @@
 //! same config git uses — `gpg.ssh.program` for SSH and `gpg.openpgp.program` (or the legacy
 //! `gpg.program`) for OpenPGP — so gitana runs whatever binary the repo is already configured for.
 //! Subprocesses are awaited through `tokio::process` so they never block the runtime (see
-//! `docs/conventions.md`).
+//! `docs/conventions.md`). Cancellation and early I/O errors request termination through
+//! `kill_on_drop`, without awaiting exit. Execution-owned resource guards can then be released, and
+//! the caller can drop the signer and its retained handles before termination completes. This is
+//! best-effort cleanup, not retention through confirmed child exit.
 
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Component, Path, PathBuf};
@@ -50,6 +53,9 @@ async fn run_signer(
 		.stderr(Stdio::piped())
 		.spawn()
 		.with_context(|| format!("spawning `{what}` (is it installed?)"))?;
+	// The signer retains its own `cwd_directory`, so this duplicate is unnecessary on the normal
+	// path through the child wait. Cancellation or early error only requests termination; the caller
+	// may then drop the signer before exit is confirmed (see the module-level cleanup limitation).
 	drop(cwd_guard);
 
 	// Feed the payload on stdin; closing it (drop) signals EOF so the program finishes.
@@ -447,11 +453,11 @@ impl SignerProgram {
 		let Some(file) = file else {
 			return Ok((command, Vec::new()));
 		};
-		let (command, _, guard) =
+		let (_, child_path, guard) =
 			configure_retained_process_file(command, Arc::new(file), path.clone())
 				.await
 				.with_context(|| format!("retaining signing program {}", path.display()))?;
-		Ok((command, vec![guard]))
+		Ok((StdCommand::new(child_path), vec![guard]))
 	}
 }
 
@@ -459,8 +465,8 @@ impl SignerProgram {
 ///
 /// Unix cannot portably execute an already-open descriptor, so path-bearing relative programs fail
 /// closed there. On Windows the resolved executable is opened without write or delete sharing and
-/// retained until `CreateProcess` has consumed its absolute path. Bare names intentionally retain
-/// PATH lookup and absolute programs retain their spelling.
+/// retained while the child runs, and the child is launched by the executable's own final path.
+/// Bare names intentionally retain PATH lookup and absolute programs retain their spelling.
 async fn signer_program(program: &str, cwd: &Path, cwd_directory: &Dir) -> Result<SignerProgram> {
 	let program_path = Path::new(program);
 	validate_windows_absolute_prefix(program_path)?;
@@ -552,7 +558,7 @@ fn select_windows_signer_program(directory: &Dir, requested: &Path) -> std::io::
 	}
 }
 
-#[cfg(any(test, not(all(unix, not(target_os = "fuchsia")))))]
+#[cfg(any(test, not(any(windows, all(unix, not(target_os = "fuchsia"))))))]
 fn resolve_signer_program(
 	program: &str,
 	cwd: &Path,

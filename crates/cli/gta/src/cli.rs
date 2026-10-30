@@ -1278,7 +1278,10 @@ impl Cli {
 				}
 			}
 		};
-		context.scope(dispatch).await
+		// Keep the command future behind a pointer before the nested task-local scopes wrap it.
+		// Moving its largest variant through each scope otherwise exhausts Windows' main stack in
+		// unoptimized builds, even when the selected command itself needs little stack space.
+		context.scope(Box::pin(dispatch)).await
 	}
 }
 

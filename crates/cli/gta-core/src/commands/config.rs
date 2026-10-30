@@ -155,7 +155,7 @@ impl RepoCommand for ConfigCmd {
 /// both target the scope's single file. A missing file matches git's asymmetry: a `--list` fatals,
 /// but a keyed read (or a write) treats it as empty.
 async fn run_ambient(scope: ConfigScope, args: ConfigArgs) -> Result<()> {
-	let path = git_config::write_path(scope)?;
+	let path = git_config::write_path(scope).await?;
 	match read_or_write(&args)? {
 		Some((op, name, section, subsection, var)) => {
 			let mut config = git_config::read_file(&path).await?;

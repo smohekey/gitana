@@ -200,9 +200,8 @@ fn append_trailing_starstar(mut pattern: String) -> String {
 
 /// Match a `gitdir[/i]:` pattern against `ctx.gitdir`.
 ///
-/// gitdir matching assumes git's slash-form (`/`-separated) paths, as the Unix/wasm drivers supply.
-/// Windows path normalization (backslash separators, verbatim `\\?\` prefixes) is a deferred
-/// follow-up.
+/// Native paths are rendered in Git's slash form only for matching; filesystem paths and
+/// user-written glob escapes remain unchanged.
 fn gitdir_matches(
 	pattern: &str,
 	dir: &Path,
@@ -282,7 +281,7 @@ fn prepare_gitdir_pattern(
 		}
 		prefix = base.len();
 		pattern = format!("{base}{rest}");
-	} else if !pattern.starts_with('/') {
+	} else if !gitdir_pattern_is_absolute(&pattern) {
 		// Any other non-absolute pattern is anchored with `**/` (so `foo` becomes `**/foo`), matching
 		// git — which prepends `**/` to every relative, non-`./` pattern, not only slash-free ones.
 		pattern = format!("**/{pattern}");
@@ -700,7 +699,39 @@ fn bytes_eq(a: &[u8], b: &[u8], icase: bool) -> bool {
 /// Render a path as a string for pattern matching. Non-UTF-8 native paths degrade lossily here;
 /// slice 1 documents that the driver supplies real, UTF-8 gitdir/home paths (see the HLD).
 fn path_to_string(path: &Path) -> String {
-	path.to_string_lossy().into_owned()
+	let text = path.to_string_lossy().into_owned();
+	#[cfg(windows)]
+	{
+		windows_gitdir_text(&text)
+	}
+	#[cfg(not(windows))]
+	text
+}
+
+#[cfg(any(windows, test))]
+fn windows_gitdir_text(text: &str) -> String {
+	let text = text.replace('\\', "/");
+	if let Some(rest) = text.strip_prefix("//?/") {
+		if rest
+			.get(..4)
+			.is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC/"))
+		{
+			return format!("//{}", &rest[4..]);
+		}
+		if rest.as_bytes().get(1) == Some(&b':') {
+			return rest.to_owned();
+		}
+	}
+	text
+}
+
+fn gitdir_pattern_is_absolute(pattern: &str) -> bool {
+	#[cfg(windows)]
+	{
+		pattern.starts_with(['/', '\\']) || pattern.chars().nth(1) == Some(':')
+	}
+	#[cfg(not(windows))]
+	pattern.starts_with('/')
 }
 
 #[cfg(test)]
@@ -1184,6 +1215,110 @@ mod tests {
 			&resolver,
 		);
 		assert!(no_gitdir.get_string("user", None, "email").is_none());
+	}
+
+	#[test]
+	fn windows_native_matching_text() {
+		for (native, expected) in [
+			(r"C:\Users\Me\repo\.git", "C:/Users/Me/repo/.git"),
+			(r"\\?\C:\Users\Me\repo\.git", "C:/Users/Me/repo/.git"),
+			(r"\\server\share\repo\.git", "//server/share/repo/.git"),
+			(
+				r"\\?\UNC\server\share\repo\.git",
+				"//server/share/repo/.git",
+			),
+		] {
+			assert_eq!(super::windows_gitdir_text(native), expected);
+		}
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_gitdir_conditions_normalize_all_native_inputs() {
+		let home = Path::new(r"C:\Users\Me");
+		let real = Path::new(r"\\?\C:\Users\Me\repo\.git");
+		let logical = Path::new(r"C:\alias\repo\.git");
+		let context = IncludeContext {
+			home: Some(home),
+			gitdir: Some(real),
+			gitdir_absolute: Some(logical),
+			branch: None,
+			remote_urls: None,
+		};
+		for pattern in ["~/", "C:/Users/Me/", "./repo/", "C:/alias/"] {
+			assert!(
+				gitdir_matches(pattern, home, &context, false, false),
+				"{pattern}"
+			);
+		}
+		assert!(!gitdir_matches(
+			"C:/users/me/",
+			home,
+			&context,
+			false,
+			false
+		));
+		assert!(gitdir_matches("C:/users/me/", home, &context, true, false));
+		assert!(!gitdir_matches(
+			"D:/Users/Me/",
+			home,
+			&context,
+			false,
+			false
+		));
+		assert!(!gitdir_matches(
+			r"C:\Users\Me/",
+			home,
+			&context,
+			false,
+			false
+		));
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_unc_and_literal_directory_conditions() {
+		let dir = Path::new(r"\\?\UNC\server\share\config[1]");
+		let gitdir = Path::new(r"\\server\share\config[1]\repo\.git");
+		let context = ctx(None, Some(gitdir));
+		assert!(gitdir_matches("./repo/", dir, &context, false, false));
+		assert!(gitdir_matches(
+			"//server/share/**/.git",
+			dir,
+			&context,
+			false,
+			false
+		));
+		assert!(!gitdir_matches("./repo/.git/", dir, &context, false, false));
+		assert!(!gitdir_matches(
+			"//other/share/",
+			dir,
+			&context,
+			false,
+			false
+		));
+		assert!(!gitdir_matches("./repo/", dir, &context, false, true));
+	}
+
+	#[cfg(not(windows))]
+	#[test]
+	fn unix_native_backslashes_remain_literal() {
+		let gitdir = Path::new(r"/repo\name/.git");
+		let context = ctx(None, Some(gitdir));
+		assert!(gitdir_matches(
+			r"/repo\\name/",
+			Path::new("/etc"),
+			&context,
+			false,
+			false
+		));
+		assert!(!gitdir_matches(
+			"/repo/name/",
+			Path::new("/etc"),
+			&context,
+			false,
+			false
+		));
 	}
 
 	// --- gitdir_matches unit tests ---
@@ -1813,8 +1948,13 @@ mod tests {
 	#[test]
 	fn command_scope_expands_an_absolute_include() {
 		// git still expands an absolute `include.path` given in command-scope config, so this does too.
-		let resolver = MapResolver::default().with("/abs/inc.cfg", "[user]\n\temail = c@x\n");
-		let mut config = GitConfigSource::parse("[include]\n\tpath = /abs/inc.cfg\n").unwrap();
+		let path = if cfg!(windows) {
+			"C:/abs/inc.cfg"
+		} else {
+			"/abs/inc.cfg"
+		};
+		let resolver = MapResolver::default().with(path, "[user]\n\temail = c@x\n");
+		let mut config = GitConfigSource::parse(&format!("[include]\n\tpath = {path}\n")).unwrap();
 		block_on(config.expand_includes_command_scope(&ctx(None, None), &resolver)).unwrap();
 		assert_eq!(config.get_string("user", None, "email"), Some("c@x"));
 	}

@@ -789,10 +789,10 @@ impl Backend for CapBackend {
 				.read(true)
 				.write(true)
 				.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-			return self
+			self
 				.dir
 				.open_with(if path.is_empty() { "." } else { path }, &options)?
-				.sync_all();
+				.sync_all()
 		}
 
 		#[cfg(not(windows))]

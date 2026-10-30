@@ -1,7 +1,7 @@
 //! Audited Windows namespace operations that are not available through Rust's safe filesystem API.
 //!
 //! Every operation starts from retained directory and entry handles. Names are passed to
-//! `SetFileInformationByHandle` relative to the retained destination directory, so an ambient path
+//! `NtSetInformationFile` relative to the retained destination directory, so an ambient path
 //! replacement cannot redirect publication.
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
@@ -11,13 +11,21 @@ use std::io::{Error, ErrorKind, Result};
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::AsRawHandle as _;
 use std::sync::atomic::{AtomicU64, Ordering};
-use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
-use windows_sys::Win32::Storage::FileSystem::{
-	DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-	FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
-	FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-	FILE_SHARE_WRITE, FileDispositionInfoEx, FileRenameInfoEx, SetFileInformationByHandle,
+use windows_sys::{
+	Wdk::Storage::FileSystem::{
+		FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+	},
+	Win32::{
+		Foundation::{HANDLE, RtlNtStatusToDosError},
+		Globalization::{CSTR_EQUAL, CompareStringOrdinal},
+		Storage::FileSystem::{
+			DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+			FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
+			FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+			FILE_SHARE_WRITE, FileDispositionInfoEx, SetFileInformationByHandle,
+		},
+		System::IO::IO_STATUS_BLOCK,
+	},
 };
 
 use crate::{EntryIdentity, file_identity};
@@ -237,20 +245,27 @@ fn rename_handle(source: &File, destination: &Dir, destination_name: &OsStr) -> 
 				"Windows destination name is too long",
 			)
 		})?;
-	let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-	let bytes = header.checked_add(name_bytes as usize).ok_or_else(|| {
-		Error::new(
-			ErrorKind::InvalidInput,
-			"Windows destination name is too long",
-		)
-	})?;
-	let words = bytes.div_ceil(std::mem::size_of::<usize>());
+	let header = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+	let bytes = header
+		.checked_add(name_bytes as usize)
+		.map(|bytes| bytes.max(std::mem::size_of::<FILE_RENAME_INFORMATION>()))
+		.and_then(|bytes| u32::try_from(bytes).ok())
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"Windows destination name is too long",
+			)
+		})?;
+	let words = (bytes as usize).div_ceil(std::mem::size_of::<usize>());
 	let mut storage = vec![0usize; words];
-	let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-	// SAFETY: `storage` is word-aligned and sized for the fixed header plus exactly `name_bytes`.
-	// `destination` and `source` stay alive for the call, and the API copies the supplied name.
+	let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+	let mut io_status = IO_STATUS_BLOCK::default();
+	// SAFETY: `storage` is aligned for FILE_RENAME_INFORMATION and contains its entire fixed
+	// layout and checked UTF-16 tail. Both handles stay alive through this synchronous call;
+	// open_rename_handle never requests FILE_FLAG_OVERLAPPED. The kernel resolves the simple
+	// destination name relative to the retained directory, and FALSE forbids replacement.
 	unsafe {
-		(*information).Anonymous.Flags = 0;
+		(*information).Anonymous.ReplaceIfExists = false;
 		(*information).RootDirectory = destination.as_raw_handle() as HANDLE;
 		(*information).FileNameLength = name_bytes;
 		std::ptr::copy_nonoverlapping(
@@ -258,14 +273,17 @@ fn rename_handle(source: &File, destination: &Dir, destination_name: &OsStr) -> 
 			(*information).FileName.as_mut_ptr(),
 			name.len(),
 		);
-		if SetFileInformationByHandle(
+		let status = NtSetInformationFile(
 			source.as_raw_handle() as HANDLE,
-			FileRenameInfoEx,
+			&mut io_status,
 			information.cast(),
-			bytes as u32,
-		) == 0
-		{
-			return Err(Error::last_os_error());
+			bytes,
+			FileRenameInformation,
+		);
+		if status < 0 {
+			return Err(Error::from_raw_os_error(
+				RtlNtStatusToDosError(status) as i32
+			));
 		}
 	}
 	Ok(())
@@ -301,4 +319,23 @@ fn private_backup_name() -> OsString {
 		sequence
 	)
 	.into()
+}
+
+/// Query Windows' system directory without consulting environment variables.
+/// This synchronous native query performs no filesystem traversal.
+pub fn system_directory() -> std::io::Result<std::path::PathBuf> {
+	use std::os::windows::ffi::OsStringExt;
+	use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+	let mut buffer = vec![0u16; 32768];
+	// SAFETY: buffer owns the writable storage and the supplied length matches its capacity.
+	let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+	if length == 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	if length >= buffer.len() {
+		return Err(std::io::Error::other(
+			"system directory exceeds native path limit",
+		));
+	}
+	Ok(std::ffi::OsString::from_wide(&buffer[..length]).into())
 }

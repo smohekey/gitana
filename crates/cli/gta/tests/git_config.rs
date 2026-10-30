@@ -2190,7 +2190,7 @@ fn symlinked_bare_gitdir_condition_matches_via_pwd_like_git() {
 /// value comes only from the config files under test — never from the runner's identity env or its
 /// real `~/.gitconfig` / system config. Tests re-supply exactly what they want (`HOME`,
 /// `GIT_CONFIG_GLOBAL`, …).
-const ISOLATION_ENV: [&str; 11] = [
+const ISOLATION_ENV: [&str; 14] = [
 	"GIT_AUTHOR_NAME",
 	"GIT_AUTHOR_EMAIL",
 	"GIT_COMMITTER_NAME",
@@ -2204,6 +2204,9 @@ const ISOLATION_ENV: [&str; 11] = [
 	// Cleared so a test's global discovery is driven only by what it re-supplies (HOME or
 	// GIT_CONFIG_GLOBAL), never the runner's real home.
 	"HOME",
+	"USERPROFILE",
+	"HOMEDRIVE",
+	"HOMEPATH",
 ];
 
 /// Run `gta` with the config/identity environment cleared and `envs` applied, so config files (not
@@ -2305,4 +2308,214 @@ fn git_supports_sha256() -> bool {
 		let _ = std::fs::remove_dir_all(&probe);
 		ok
 	})
+}
+
+/// A normal Windows profile must supply identity without HOME or a config override.
+#[cfg(windows)]
+#[test]
+fn windows_home_profile_reads_writes_and_includes() {
+	assert!(git_supports_sha256(), "Windows oracle requires SHA-256 Git");
+	let home = unique_tmp("gta-windows-home ü");
+	std::fs::create_dir_all(home.join(".config/git")).unwrap();
+	std::fs::write(
+		home.join(".gitconfig"),
+		"[user]\nname = Profile\n[include]\npath = ~/identity\n",
+	)
+	.unwrap();
+	std::fs::write(
+		home.join("identity"),
+		"[user]\nemail = profile@example.invalid\n",
+	)
+	.unwrap();
+	std::fs::write(home.join(".config/git/config"), "[user]\nname = Xdg\n").unwrap();
+	let work = init("gta-windows-home-repo");
+	let env = [
+		("USERPROFILE", home.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	for dir in [&home, &work] {
+		for (key, expected) in [
+			("user.name", "Profile"),
+			("user.email", "profile@example.invalid"),
+		] {
+			for out in [
+				gta_env(dir.to_str().unwrap(), &["config", key], &env),
+				git_env(dir.to_str().unwrap(), &["config", key], &env),
+			] {
+				assert_eq!(ok_stdout(out).trim(), expected);
+			}
+		}
+	}
+	ok_stdout(gta_env(
+		work.to_str().unwrap(),
+		&["config", "--global", "user.name", "Written"],
+		&env,
+	));
+	assert_eq!(
+		ok_stdout(git_env(
+			work.to_str().unwrap(),
+			&["config", "--global", "user.name"],
+			&env
+		))
+		.trim(),
+		"Written"
+	);
+	std::fs::remove_dir_all(work).unwrap();
+	std::fs::remove_dir_all(home).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_home_share_precedence_and_unavailable_fallback() {
+	assert!(git_supports_sha256(), "Windows oracle requires SHA-256 Git");
+	let home = unique_tmp("gta-windows-share");
+	let profile = unique_tmp("gta-windows-profile");
+	std::fs::write(home.join(".gitconfig"), "[user]\nname = Share\n").unwrap();
+	std::fs::write(profile.join(".gitconfig"), "[user]\nname = Profile\n").unwrap();
+	let full = home.to_str().unwrap();
+	let drive = &full[..2];
+	let path = &full[2..];
+	for (homepath, expected) in [
+		(path.to_owned(), "Share"),
+		(format!("{path}\\missing"), "Profile"),
+	] {
+		let env = [
+			("HOMEDRIVE", drive),
+			("HOMEPATH", homepath.as_str()),
+			("USERPROFILE", profile.to_str().unwrap()),
+			("GIT_CONFIG_NOSYSTEM", "1"),
+		];
+		for out in [
+			gta_env(profile.to_str().unwrap(), &["config", "user.name"], &env),
+			git_env(profile.to_str().unwrap(), &["config", "user.name"], &env),
+		] {
+			assert_eq!(ok_stdout(out).trim(), expected);
+		}
+	}
+	std::fs::remove_dir_all(home).unwrap();
+	std::fs::remove_dir_all(profile).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_home_explicit_home_and_override_precedence() {
+	assert!(git_supports_sha256(), "Windows oracle requires SHA-256 Git");
+	let home = unique_tmp("gta-explicit-home");
+	let profile = unique_tmp("gta-ignored-profile");
+	std::fs::write(home.join(".gitconfig"), "[user]\nname = Explicit\n").unwrap();
+	std::fs::write(profile.join(".gitconfig"), "[user]\nname = Profile\n").unwrap();
+	let env = [
+		("HOME", home.to_str().unwrap()),
+		("USERPROFILE", profile.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	for out in [
+		gta_env(home.to_str().unwrap(), &["config", "user.name"], &env),
+		git_env(home.to_str().unwrap(), &["config", "user.name"], &env),
+	] {
+		assert_eq!(ok_stdout(out).trim(), "Explicit");
+	}
+	let mut overridden = env.to_vec();
+	overridden.push(("GIT_CONFIG_GLOBAL", ""));
+	assert!(
+		!gta_env(
+			home.to_str().unwrap(),
+			&["config", "user.name"],
+			&overridden
+		)
+		.status
+		.success()
+	);
+	// Deliberately retain Gitana's existing empty-HOME policy; no Windows fallback.
+	let empty = [
+		("HOME", ""),
+		("USERPROFILE", profile.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	assert!(
+		!gta_env(home.to_str().unwrap(), &["config", "user.name"], &empty)
+			.status
+			.success()
+	);
+	std::fs::remove_dir_all(home).unwrap();
+	std::fs::remove_dir_all(profile).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_home_gitdir_include() {
+	assert!(git_supports_sha256(), "Windows oracle requires SHA-256 Git");
+	let home = unique_tmp("gta-conditional-home");
+	let work = home.join("repo");
+	std::fs::create_dir(&work).unwrap();
+	gta(work.to_str().unwrap(), &["init"], b"");
+	std::fs::write(
+		home.join(".gitconfig"),
+		"[includeIf \"gitdir:~/\"]\npath = ~/identity\n",
+	)
+	.unwrap();
+	std::fs::write(home.join("identity"), "[user]\nname = Conditional\n").unwrap();
+	let env = [
+		("USERPROFILE", home.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	for out in [
+		gta_env(work.to_str().unwrap(), &["config", "user.name"], &env),
+		git_env(work.to_str().unwrap(), &["config", "user.name"], &env),
+	] {
+		assert_eq!(ok_stdout(out).trim(), "Conditional");
+	}
+	std::fs::remove_dir_all(home).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_gitdir_pattern_oracle() {
+	assert!(git_supports_sha256(), "Windows oracle requires SHA-256 Git");
+	let home = unique_tmp("gta-windows-patterns");
+	let work = home.join("repo");
+	std::fs::create_dir(&work).unwrap();
+	gta(work.to_str().unwrap(), &["init"], b"");
+	std::fs::write(home.join("identity"), "[user]\nname = Conditional\n").unwrap();
+	let absolute = std::fs::canonicalize(&home)
+		.unwrap()
+		.to_string_lossy()
+		.replace('\\', "/");
+	let absolute = absolute.strip_prefix("//?/").unwrap_or(&absolute);
+	let env = [
+		("USERPROFILE", home.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	for (pattern, expected) in [
+		("~/".to_owned(), true),
+		(format!("{absolute}/"), true),
+		("./repo/".to_owned(), true),
+		("./other/".to_owned(), false),
+	] {
+		std::fs::write(
+			home.join(".gitconfig"),
+			format!("[includeIf \"gitdir:{pattern}\"]\npath = ~/identity\n"),
+		)
+		.unwrap();
+		for (tool, out) in [
+			(
+				"gta",
+				gta_env(work.to_str().unwrap(), &["config", "user.name"], &env),
+			),
+			(
+				"git",
+				git_env(work.to_str().unwrap(), &["config", "user.name"], &env),
+			),
+		] {
+			assert_eq!(out.status.success(), expected, "{tool}: {pattern}: {out:?}");
+			if expected {
+				assert_eq!(
+					String::from_utf8_lossy(&out.stdout).trim(),
+					"Conditional",
+					"{tool}: {pattern}"
+				);
+			}
+		}
+	}
+	std::fs::remove_dir_all(home).unwrap();
 }

@@ -143,21 +143,41 @@ that file handle. On Unix, `ssh-keygen` receives a mode-0400 private snapshot ow
 guard, so closing inherited descriptors cannot discard the selected key and replacing the original
 pathname cannot select new contents. Snapshot creation, copying, permissions, and retained-file
 reads run on blocking workers; uses of the retained file are serialized. On Windows, key and signer
-path retention likewise runs on a blocking worker, and the key handle denies write and delete
-sharing while `ssh-keygen` reopens its path.
+path retention likewise runs on a blocking worker. The key handle denies write and delete sharing
+while `ssh-keygen` reopens it, and `ssh-keygen` receives the key's own final path, without
+junctions.
 Symlink chains that resolve within the retained worktree therefore keep the selected file after a
 namespace move, while a chain that escapes it is rejected before the process is spawned.
 Unix rejects path-bearing relative signer programs because it cannot portably execute an already
 open program descriptor; callers must use a bare `PATH` name or an absolute path. On Windows, a
 path-bearing relative signer executable is canonicalized through the retained command directory,
-made absolute, and opened without write or delete sharing through `CreateProcess`. An omitted
-`.exe` suffix follows Rust's process resolution order: the suffixed entry is selected when present,
-otherwise the literal spelling is retained. Every mutable
-directory component is pinned through process creation as well, preventing junction or symlink
-retargeting. Drive and UNC roots are excluded from that write-denying set. A bare program name
-retains normal `PATH` lookup, while a drive-relative spelling such as `C:tools\\signer.exe` is
+made absolute, opened without write or delete sharing, and launched by its own final path, without
+junctions. An omitted `.exe` suffix follows Rust's process resolution order: the suffixed entry is
+selected when present, otherwise the literal spelling is retained. For resolved final paths, while
+a retained handle is open, Windows refuses to rename or replace the entry or any directory above it,
+so no component of that final path can be retargeted. The signer starts in its retained working
+directory's final path in the same way, and retains that directory through the normal child wait.
+A principal able to write attributes on an empty working directory can still convert it into a
+junction; this is not prevented. A bare program name retains normal `PATH` lookup, while a
+drive-relative spelling such as `C:tools\\signer.exe` is
 rejected because it depends on ambient per-drive process state. The blocking Windows retention runs
 on a blocking worker before the asynchronous signer spawns the process.
+
+On Windows, a final-path lookup returning `ERROR_PATH_NOT_FOUND` permits a compatibility fallback
+for the working directory or retained file, such as on a volume without a DOS mapping. The caller's
+original spelling is used after an identity comparison. This comparison establishes its target only
+at configuration time; an alias in that spelling can still be retargeted before the child uses it.
+All other final-path lookup errors, including access-denied and resource errors, propagate without
+reopening the original spelling. The fallback therefore provides weaker alias protection than a
+successfully resolved final path.
+
+Cancellation and early signer I/O errors use best-effort cleanup. Dropping the Tokio child requests
+termination through `kill_on_drop`, but does not wait for exit or report a failed termination
+request. Execution-owned file/program guards and private key snapshots can be released at that
+point; the caller can also drop the signer and its retained directory/key handles before termination
+completes. Retention through confirmed child exit is therefore guaranteed only on paths that
+actually await exit while retaining those resources. Cancellation does not provide that guarantee.
+
 Absolute and UNC paths retain their normal Git meaning. Parent-relative signer resources are
 rejected before mutation because moving a retained Unix directory to another parent changes the
 meaning of `..`.

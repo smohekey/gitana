@@ -25,3 +25,6 @@ pub use self::path::{lexical_normalize, paths_equivalent, strip_path_prefix};
 pub use self::process::{configure_process_current_dir, configure_process_file, open_process_file};
 pub use self::process_current_dir_guard::ProcessCurrentDirGuard;
 pub use self::process_file_guard::ProcessFileGuard;
+
+#[cfg(windows)]
+pub use self::windows::system_directory;

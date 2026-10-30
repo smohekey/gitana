@@ -60,6 +60,13 @@ value set only via an include was invisible to every config read (notably per-di
     Finally, an explicitly **scoped** single-file read (`git config --global`/`--system`/`--local`) does
     **not** expand includes at all — only a *merged* read does.
 
+## Windows matching paths
+
+Native home, including-directory and gitdir paths use forward slashes for condition matching.
+Verbatim drive and UNC prefixes are rendered as ordinary drive and UNC paths. This conversion
+applies only to matching text: include-file reads retain their native paths, user-written glob
+backslashes remain escapes, and `gitdir/i:` alone enables case folding.
+
 ## Architecture
 
 `gitana-config` is I/O-free and wasm-pure (its only dep is `thiserror`). To keep it so while owning the
@@ -273,8 +280,7 @@ Known git-fidelity gaps left for later slices, each with a code note at its site
   consumer design avoids this — the *writable* source stays raw (unexpanded) and reads use separate expanded
   copies — so a caller must not both expand and mutate include directives on the same source. `expand_includes`
   is idempotent, so re-calling it after an include change is the supported refresh path.
-- **Windows path separators** (backslash, verbatim `\\?\` prefixes) in gitdir matching — matching assumes
-  git's slash-form paths, as the Unix/wasm drivers supply.
+
 - **Escaped separator `\/` after a globstar** is not treated as a path-segment boundary (exotic).
 - **`~user/` include paths** need a passwd lookup the pure crate cannot perform; they fail closed
   (`IncludeUserTildeUnsupported`) and are a native-driver follow-up.

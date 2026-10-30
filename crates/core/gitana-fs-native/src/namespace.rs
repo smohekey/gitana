@@ -625,6 +625,167 @@ mod tests {
 	use std::ffi::OsStr;
 
 	#[test]
+	fn conditional_no_replace_publishes_files_and_directories_between_retained_parents() {
+		for is_directory in [false, true] {
+			let temporary = tempfile::tempdir().unwrap();
+			let root = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+			root.create_dir("source").unwrap();
+			root.create_dir("destination").unwrap();
+			let source = root.open_dir("source").unwrap();
+			let destination = root.open_dir("destination").unwrap();
+			if is_directory {
+				source.create_dir("prepared").unwrap();
+				source.write("prepared/content", b"owned").unwrap();
+			} else {
+				source.write("prepared", b"owned").unwrap();
+			}
+			let expected = entry_identity(&source, OsStr::new("prepared")).unwrap();
+
+			rename_noreplace_if_identity(
+				&source,
+				OsStr::new("prepared"),
+				expected,
+				&destination,
+				OsStr::new("published"),
+			)
+			.unwrap();
+
+			assert!(source.symlink_metadata("prepared").is_err());
+			assert_eq!(
+				entry_identity(&destination, OsStr::new("published")).unwrap(),
+				expected
+			);
+			let content = if is_directory {
+				"published/content"
+			} else {
+				"published"
+			};
+			assert_eq!(destination.read(content).unwrap(), b"owned");
+		}
+	}
+
+	#[test]
+	fn conditional_replace_publishes_the_prepared_file_and_retires_the_old_target() {
+		for check_prepared in [false, true] {
+			let temporary = tempfile::tempdir().unwrap();
+			let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+			directory.write("prepared", b"new").unwrap();
+			directory.write("target", b"old").unwrap();
+			let prepared = entry_identity(&directory, OsStr::new("prepared")).unwrap();
+			let target = entry_identity(&directory, OsStr::new("target")).unwrap();
+
+			if check_prepared {
+				replace_if_identities(
+					&directory,
+					OsStr::new("prepared"),
+					prepared,
+					OsStr::new("target"),
+					target,
+				)
+				.unwrap();
+			} else {
+				replace_if_identity(
+					&directory,
+					OsStr::new("prepared"),
+					OsStr::new("target"),
+					target,
+				)
+				.unwrap();
+			}
+
+			assert_eq!(directory.read("target").unwrap(), b"new");
+			assert_eq!(
+				entry_identity(&directory, OsStr::new("target")).unwrap(),
+				prepared
+			);
+			assert!(directory.symlink_metadata("prepared").is_err());
+			assert!(directory.entries().unwrap().all(|entry| {
+				!entry
+					.unwrap()
+					.file_name()
+					.to_string_lossy()
+					.starts_with(".gitana-namespace-backup.")
+			}));
+		}
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn publication_follows_the_retained_destination_after_its_name_is_replaced() {
+		use std::os::windows::fs::OpenOptionsExt as _;
+		use windows_sys::Win32::Storage::FileSystem::{
+			FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+			FILE_SHARE_READ, FILE_SHARE_WRITE,
+		};
+		let temporary = tempfile::tempdir().unwrap();
+		let root = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		root.create_dir("destination").unwrap();
+		root.write("prepared", b"owned").unwrap();
+		let handle = std::fs::OpenOptions::new()
+			.access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+			.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+			.custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+			.open(temporary.path().join("destination"))
+			.unwrap();
+		let destination = Dir::from_std_file(handle);
+		root.rename("destination", &root, "retained").unwrap();
+		root.create_dir("destination").unwrap();
+		let expected = entry_identity(&root, OsStr::new("prepared")).unwrap();
+
+		rename_noreplace_if_identity(
+			&root,
+			OsStr::new("prepared"),
+			expected,
+			&destination,
+			OsStr::new("published"),
+		)
+		.unwrap();
+
+		assert_eq!(root.read("retained/published").unwrap(), b"owned");
+		assert!(root.symlink_metadata("destination/published").is_err());
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn conditional_replace_rolls_back_when_a_prepared_directory_cannot_be_renamed() {
+		use std::os::windows::fs::OpenOptionsExt as _;
+		use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+		let temporary = tempfile::tempdir().unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		directory.create_dir("prepared").unwrap();
+		directory.write("prepared/held", b"held").unwrap();
+		directory.write("target", b"old").unwrap();
+		let prepared = entry_identity(&directory, OsStr::new("prepared")).unwrap();
+		let target = entry_identity(&directory, OsStr::new("target")).unwrap();
+		let held = std::fs::OpenOptions::new()
+			.read(true)
+			.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+			.open(temporary.path().join("prepared/held"))
+			.unwrap();
+
+		let result = replace_if_identities(
+			&directory,
+			OsStr::new("prepared"),
+			prepared,
+			OsStr::new("target"),
+			target,
+		);
+
+		assert!(result.is_err());
+		assert_eq!(
+			entry_identity(&directory, OsStr::new("target")).unwrap(),
+			target
+		);
+		assert_eq!(directory.read("target").unwrap(), b"old");
+		assert_eq!(
+			entry_identity(&directory, OsStr::new("prepared")).unwrap(),
+			prepared
+		);
+		assert_eq!(directory.entries().unwrap().count(), 2);
+		drop(held);
+	}
+
+	#[test]
 	fn no_replace_preserves_a_raced_file() {
 		let temporary = tempfile::tempdir().unwrap();
 		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
@@ -775,6 +936,9 @@ mod tests {
 		directory.create_dir("target").unwrap();
 		let opened = directory.open_dir("target").unwrap();
 		let expected = directory_identity(&opened).unwrap();
+		// Only the identity token is passed to removal. Release the lookup handle so Windows can
+		// rename the original; keeping it at `old` prevents identity reuse during replacement.
+		drop(opened);
 		directory.rename("target", &directory, "old").unwrap();
 		directory.create_dir("target").unwrap();
 		directory.write("target/keep", b"foreign").unwrap();

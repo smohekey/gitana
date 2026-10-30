@@ -354,6 +354,11 @@ exercising the native implementation where possible.
 
 ## Development notes
 
+- The Windows `gta` executable reserves an 8 MiB main stack, committed on demand. The generated
+  command parser and unoptimized async command frames can exceed the linker's default 1 MiB.
+  Command dispatch boxes its future before entering nested task-local context scopes to keep those
+  wrappers from multiplying stack usage. The stack linker setting applies only to `gta`, not to
+  libraries or test executables.
 - The workspace uses Rust 2024 and forbids unsafe code at the workspace lint
   level.
 - Gitana supports both the SHA-1 and SHA-256 object formats. The object layer is

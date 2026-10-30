@@ -80,6 +80,11 @@ jobs:
       # flush the writable directory handles used by the durability barrier.
       - run: cargo test -p gitana-file-store-local -p gitana-linked-worktree --lib
 
+      # Home discovery and the Git oracle must execute on native Windows.
+      - run: cargo test -p gitana-config -p gitana-config-native -p gitana-fs-native
+      - run: cargo test -p gta --test startup
+      - run: cargo test -p gta --test git_config windows_
+
   msrv:
     name: msrv (1.96.0)
     runs-on: ubuntu-latest

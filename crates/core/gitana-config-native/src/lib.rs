@@ -6,6 +6,10 @@
 //! `/etc/gitconfig`. Layering those in is a frontend concern (ambient path I/O), so it lives here
 //! rather than in the pure, wasm-portable [`gitana_config`] crate.
 //!
+//! On Windows, absent `HOME` is resolved using the Windows home-share/profile environment,
+//! including Git-compatible unavailable-share and system-directory handling. A present empty
+//! `HOME` retains the no-home policy. Scoped [`write_path`] selection is asynchronous.
+//!
 //! [`from_repo`] assembles git's full precedence stack — system, then global (XDG then
 //! `~/.gitconfig`, or a single `$GIT_CONFIG_GLOBAL`), then repo-local — into one layered
 //! [`GitConfig`]. Reads resolve across every layer (git's last-writer-wins); writes stay directed at
@@ -19,6 +23,9 @@
 //! *scoped* single-file read (`--global`/`--system`/`--local`) does **not** expand includes, matching
 //! git.
 
+mod home_directory;
+
+use self::home_directory::discover_home;
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::io::{ErrorKind, Read as _, Write as _};
@@ -104,10 +111,11 @@ pub enum ConfigScope {
 /// discovered layout's `git_dir`/`common_dir`.
 pub async fn from_repo(git_dir: &Path, common: &Path) -> Result<GitConfig> {
 	let guard = ConfigInputGuard::default();
+	let home = home_dir().await?;
 	let gitdir = canonical_gitdir(git_dir).await;
 	let gitdir_absolute = logical_gitdir(&gitdir).await;
 	let branch = head_branch(git_dir).await;
-	let mut base = global_and_system_layers(&guard).await?;
+	let mut base = global_and_system_layers(&guard, home.as_deref()).await?;
 	let repository_start = base.len();
 	base.push(local_layer(common, &guard).await?);
 	assemble_merged(
@@ -116,6 +124,7 @@ pub async fn from_repo(git_dir: &Path, common: &Path) -> Result<GitConfig> {
 		Some(&gitdir),
 		gitdir_absolute.as_deref(),
 		branch.as_deref(),
+		home.as_deref(),
 		&guard,
 	)
 	.await
@@ -136,6 +145,7 @@ pub async fn from_repo(git_dir: &Path, common: &Path) -> Result<GitConfig> {
 /// gap. `extensions.worktreeConfig` itself is read from the *unexpanded* local file, as git reads it.
 pub async fn for_worktree(common: &Path, git_dir: &Path) -> Result<GitConfig> {
 	let guard = ConfigInputGuard::default();
+	let home = home_dir().await?;
 	let gitdir = canonical_gitdir(git_dir).await;
 	let branch = head_branch(git_dir).await;
 	let local = local_layer(common, &guard).await?;
@@ -147,7 +157,7 @@ pub async fn for_worktree(common: &Path, git_dir: &Path) -> Result<GitConfig> {
 		.source
 		.get_bool_validated("extensions", None, "worktreeconfig")?
 		.unwrap_or(false);
-	let mut base = global_and_system_layers(&guard).await?;
+	let mut base = global_and_system_layers(&guard, home.as_deref()).await?;
 	let repository_start = base.len();
 	base.push(local);
 	if worktree_config
@@ -162,6 +172,7 @@ pub async fn for_worktree(common: &Path, git_dir: &Path) -> Result<GitConfig> {
 		Some(&gitdir),
 		gitdir_absolute.as_deref(),
 		branch.as_deref(),
+		home.as_deref(),
 		&guard,
 	)
 	.await
@@ -208,6 +219,7 @@ async fn for_worktree_at_with_guard(
 	git_dir_path: &Path,
 	guard: ConfigInputGuard,
 ) -> Result<GitConfig> {
+	let home = home_dir().await?;
 	let branch = head_branch_at(&git_dir);
 	let local = local_layer_at(
 		common.try_clone()?,
@@ -220,7 +232,7 @@ async fn for_worktree_at_with_guard(
 		.source
 		.get_bool_validated("extensions", None, "worktreeconfig")?
 		.unwrap_or(false);
-	let mut base = global_and_system_layers(&guard).await?;
+	let mut base = global_and_system_layers(&guard, home.as_deref()).await?;
 	let repository_start = base.len();
 	base.push(local);
 	if worktree_config
@@ -242,6 +254,7 @@ async fn for_worktree_at_with_guard(
 		Some(&gitdir),
 		gitdir_absolute.as_deref(),
 		branch.as_deref(),
+		home.as_deref(),
 		&guard,
 	)
 	.await
@@ -289,12 +302,14 @@ pub fn validate_command_config(entries: &[String]) -> Result<()> {
 /// global/system remote URL.
 pub async fn from_ambient() -> Result<GitConfig> {
 	let guard = ConfigInputGuard::default();
+	let home = home_dir().await?;
 	assemble_merged(
-		global_and_system_layers(&guard).await?,
+		global_and_system_layers(&guard, home.as_deref()).await?,
 		None,
 		None,
 		None,
 		None,
+		home.as_deref(),
 		&guard,
 	)
 	.await
@@ -303,10 +318,17 @@ pub async fn from_ambient() -> Result<GitConfig> {
 /// The single file an explicit `config --global` / `--system` operation reads and writes (git scopes
 /// to one file, unlike the merged read). `Global` is [`global_scope_path`]; `System` is
 /// [`system_path`].
-pub fn write_path(scope: ConfigScope) -> Result<PathBuf> {
+pub async fn write_path(scope: ConfigScope) -> Result<PathBuf> {
 	match scope {
 		ConfigScope::Local => Err(anyhow!("local config is written through the repository")),
-		ConfigScope::Global => global_scope_path(),
+		ConfigScope::Global => {
+			if let Some(path) = env_override_path("GIT_CONFIG_GLOBAL") {
+				return Ok(path);
+			}
+			let home = home_dir().await?;
+			let xdg = xdg_config_home(home.as_deref());
+			tokio::task::spawn_blocking(move || global_scope_path(home.as_deref(), xdg)).await?
+		}
 		ConfigScope::System => Ok(system_path()),
 	}
 }
@@ -2353,6 +2375,7 @@ async fn assemble_merged(
 	gitdir: Option<&Path>,
 	gitdir_absolute: Option<&Path>,
 	branch: Option<&str>,
+	home: Option<&Path>,
 	guard: &ConfigInputGuard,
 ) -> Result<GitConfig> {
 	let base_len = base.len();
@@ -2367,7 +2390,7 @@ async fn assemble_merged(
 			fileless: true,
 		});
 	}
-	expand_layers(&mut base, gitdir, gitdir_absolute, branch, guard).await?;
+	expand_layers(&mut base, gitdir, gitdir_absolute, branch, home, guard).await?;
 	let mut sources = sources_of(base);
 	// Peel the command-scope source(s) back off the top so they overlay (highest precedence for reads)
 	// while `from_sources_or_empty` keeps the writable source on the base's last layer (the local file).
@@ -2383,12 +2406,15 @@ async fn assemble_merged(
 /// first): system, then the global file(s). The system layer is suppressed here — the merged read —
 /// when `$GIT_CONFIG_NOSYSTEM` is set; an explicit `--system` scope still targets the file (see
 /// [`system_path`]), matching git.
-async fn global_and_system_layers(guard: &ConfigInputGuard) -> Result<Vec<ConfigLayer>> {
+async fn global_and_system_layers(
+	guard: &ConfigInputGuard,
+	home: Option<&Path>,
+) -> Result<Vec<ConfigLayer>> {
 	let mut paths = Vec::new();
 	if !env_bool("GIT_CONFIG_NOSYSTEM")? {
 		paths.push(system_path());
 	}
-	paths.extend(global_paths());
+	paths.extend(global_paths(home));
 	let mut layers = Vec::new();
 	for path in paths {
 		if let Some(layer) = read_layer(&path, guard).await? {
@@ -2666,15 +2692,15 @@ async fn expand_layers(
 	gitdir: Option<&Path>,
 	gitdir_absolute: Option<&Path>,
 	branch: Option<&str>,
+	home: Option<&Path>,
 	guard: &ConfigInputGuard,
 ) -> Result<()> {
-	let home = home_dir();
 	let resolver = FsIncludeResolver {
 		guard: guard.clone(),
 	};
 	// Pre-scan: hasconfig is forced true inside the scan, so it consults no remote URLs itself.
 	let prescan_ctx = IncludeContext {
-		home: home.as_deref(),
+		home,
 		gitdir,
 		gitdir_absolute,
 		branch,
@@ -2706,7 +2732,7 @@ async fn expand_layers(
 	}
 	let url_refs: Vec<&str> = urls.iter().map(String::as_str).collect();
 	let ctx = IncludeContext {
-		home: home.as_deref(),
+		home,
 		gitdir,
 		gitdir_absolute,
 		branch,
@@ -2810,15 +2836,15 @@ fn system_path() -> PathBuf {
 /// (e.g. `/dev/null` to disable) names exactly one file — even when *empty*, which git honours as "no
 /// global config" rather than falling back; otherwise git reads the XDG file
 /// (`$XDG_CONFIG_HOME/git/config` or `~/.config/git/config`) then `~/.gitconfig`, the latter winning.
-fn global_paths() -> Vec<PathBuf> {
+fn global_paths(home: Option<&Path>) -> Vec<PathBuf> {
 	if let Some(path) = env_override_path("GIT_CONFIG_GLOBAL") {
 		return vec![path];
 	}
 	let mut paths = Vec::new();
-	if let Some(xdg) = xdg_config_home() {
+	if let Some(xdg) = xdg_config_home(home) {
 		paths.push(xdg.join("git").join("config"));
 	}
-	if let Some(home) = home_dir() {
+	if let Some(home) = home {
 		paths.push(home.join(".gitconfig"));
 	}
 	paths
@@ -2829,19 +2855,16 @@ fn global_paths() -> Vec<PathBuf> {
 /// git does); else an existing `~/.gitconfig`, then an existing XDG file, else `~/.gitconfig`
 /// (created on write, read as empty when absent). Mirrors git, which resolves `--global` to
 /// `~/.gitconfig` unless only the XDG file exists — distinct from the merged read (see [`global_paths`]).
-fn global_scope_path() -> Result<PathBuf> {
-	if let Some(path) = env_override_path("GIT_CONFIG_GLOBAL") {
-		return Ok(path);
-	}
-	// An explicit `--global` requires HOME, even when an XDG file exists — git fatals with
+fn global_scope_path(home: Option<&Path>, xdg: Option<PathBuf>) -> Result<PathBuf> {
+	// An explicit `--global` requires a resolved home, even when an XDG file exists — git fatals with
 	// "$HOME not set" rather than falling back to the XDG path for a named-scope operation.
-	let home = home_dir()
+	let home = home
 		.ok_or_else(|| anyhow!("$HOME not set"))?
 		.join(".gitconfig");
 	if home.exists() {
 		return Ok(home);
 	}
-	if let Some(xdg) = xdg_config_home().map(|x| x.join("git").join("config"))
+	if let Some(xdg) = xdg.map(|x| x.join("git").join("config"))
 		&& xdg.exists()
 	{
 		return Ok(xdg);
@@ -2850,16 +2873,16 @@ fn global_scope_path() -> Result<PathBuf> {
 }
 
 /// `$XDG_CONFIG_HOME`, or `~/.config` when it is unset or empty.
-fn xdg_config_home() -> Option<PathBuf> {
-	env_path("XDG_CONFIG_HOME").or_else(|| home_dir().map(|h| h.join(".config")))
+fn xdg_config_home(home: Option<&Path>) -> Option<PathBuf> {
+	env_path("XDG_CONFIG_HOME").or_else(|| home.map(|h| h.join(".config")))
 }
 
-/// The user's home directory (`$HOME`).
-fn home_dir() -> Option<PathBuf> {
-	env_path("HOME")
+/// Resolve once per load, without changing the process environment.
+async fn home_dir() -> Result<Option<PathBuf>> {
+	Ok(discover_home().await?.map(resolve_command_relative))
 }
 
-/// A non-empty environment path, or `None` — for discovery inputs (`$HOME`, `$XDG_CONFIG_HOME`) where
+/// A non-empty environment path, or `None` — for discovery inputs (`$XDG_CONFIG_HOME`) where
 /// git treats an empty value as unset and falls back. A relative value resolves against the command's
 /// working directory (git resolves these config roots after applying `-C`).
 fn env_path(name: &str) -> Option<PathBuf> {

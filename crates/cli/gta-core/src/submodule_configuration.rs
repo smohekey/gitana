@@ -66,13 +66,13 @@ impl WorktreeConfiguration {
 		}
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, unix))]
 	fn with_apply_init_pause(mut self, entered: Arc<AtomicBool>, release: Arc<AtomicBool>) -> Self {
 		self.apply_init_pause = Some((entered, release));
 		self
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, unix))]
 	fn with_marker_target_pause(
 		mut self,
 		entered: Arc<AtomicBool>,
@@ -82,7 +82,7 @@ impl WorktreeConfiguration {
 		self
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, unix))]
 	fn with_module_deinit_publication_pause(
 		mut self,
 		entered: Arc<AtomicBool>,
@@ -92,7 +92,7 @@ impl WorktreeConfiguration {
 		self
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, unix))]
 	fn with_set_url_root_validation_pause(
 		mut self,
 		entered: Arc<AtomicBool>,
@@ -102,7 +102,7 @@ impl WorktreeConfiguration {
 		self
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, unix))]
 	fn with_set_url_module_publication_pause(
 		mut self,
 		entered: Arc<AtomicBool>,
@@ -112,7 +112,7 @@ impl WorktreeConfiguration {
 		self
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, unix))]
 	fn with_sync_declaration_validation_pause(
 		mut self,
 		entered: Arc<AtomicBool>,
@@ -2079,7 +2079,7 @@ fn module_worktree_values_lexically_equivalent(
 	paths_equivalent(&lexical_normalize(&left), &lexical_normalize(&right))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn module_worktrees_equivalent(module_git_dir: &Path, left: &str, right: &str) -> bool {
 	let module_git_dir = module_git_dir.to_owned();
 	let left = left.to_owned();
