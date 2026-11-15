@@ -252,6 +252,160 @@ fn reset_rejects_mode_flags_with_paths() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// A merge left in conflict on `a.txt` in `work`, made with stock git.
+fn conflicted_merge(work: &std::path::Path) {
+	let w = work.to_str().unwrap();
+	git(w, &["switch", "-q", "-c", "side"]);
+	std::fs::write(work.join("a.txt"), b"side\n").unwrap();
+	git(w, &["add", "."]);
+	commit(w, "side");
+	git(w, &["switch", "-q", "main"]);
+	std::fs::write(work.join("a.txt"), b"main\n").unwrap();
+	git(w, &["add", "."]);
+	commit(w, "main");
+	let _ = Command::new("git")
+		.args([
+			"-C",
+			w,
+			"-c",
+			"user.name=T",
+			"-c",
+			"user.email=t@e",
+			"-c",
+			"core.hooksPath=/dev/null",
+			"merge",
+			"side",
+		])
+		.output()
+		.unwrap();
+	assert!(work.join(".git/MERGE_HEAD").exists());
+}
+
+#[test]
+fn reset_abandons_a_merge_as_git_does_and_soft_refuses_one() {
+	if !git_supports_sha256() {
+		return;
+	}
+	// The same merge, reset by gta and by git: the same state afterwards.
+	let mut after = Vec::new();
+	for (tool, tag) in [("gta", "gta-reset-merge"), ("git", "git-reset-merge")] {
+		let work = unique_tmp(tag);
+		let w = work.to_str().unwrap();
+		git(w, &["init", "--object-format=sha256", "-q", "-b", "main"]);
+		std::fs::write(work.join("a.txt"), b"base\n").unwrap();
+		git(w, &["add", "."]);
+		commit(w, "base");
+		conflicted_merge(&work);
+		let soft = match tool {
+			"gta" => assert_cmd::Command::cargo_bin("gta")
+				.unwrap()
+				.args(["-C", w, "reset", "--soft", "HEAD"])
+				.output()
+				.unwrap(),
+			_ => Command::new("git")
+				.args(["-C", w, "reset", "--soft", "HEAD"])
+				.output()
+				.unwrap(),
+		};
+		assert!(
+			!soft.status.success(),
+			"{tool}'s soft reset mid-merge succeeded"
+		);
+		match tool {
+			"gta" => {
+				gta(w, &["reset", "HEAD"], b"");
+			}
+			_ => {
+				git(w, &["reset", "-q", "HEAD"]);
+			}
+		}
+		let state: Vec<bool> = ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "AUTO_MERGE"]
+			.iter()
+			.map(|name| work.join(".git").join(name).exists())
+			.collect();
+		after.push((state, porcelain(w)));
+		std::fs::remove_dir_all(&work).ok();
+	}
+	assert_eq!(after[0], after[1]);
+	assert_eq!(after[0].0, [false, false, false, false]);
+}
+
+/// A merge's autostash is saved as a stash entry when gta's reset abandons the merge, and gta says so
+/// on stderr in git's words.
+#[test]
+fn reset_saves_a_merge_s_autostash_and_says_so_as_git_does() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let mut said = Vec::new();
+	for (tool, tag) in [
+		("gta", "gta-reset-autostash"),
+		("git", "git-reset-autostash"),
+	] {
+		let work = unique_tmp(tag);
+		let w = work.to_str().unwrap();
+		git(w, &["init", "--object-format=sha256", "-q", "-b", "main"]);
+		std::fs::write(work.join("a.txt"), b"base\n").unwrap();
+		std::fs::write(work.join("b.txt"), b"base\n").unwrap();
+		git(w, &["add", "."]);
+		commit(w, "base");
+		git(w, &["switch", "-q", "-c", "side"]);
+		std::fs::write(work.join("a.txt"), b"side\n").unwrap();
+		git(w, &["add", "."]);
+		commit(w, "side");
+		git(w, &["switch", "-q", "main"]);
+		std::fs::write(work.join("a.txt"), b"main\n").unwrap();
+		git(w, &["add", "."]);
+		commit(w, "main");
+		std::fs::write(work.join("b.txt"), b"my edit\n").unwrap();
+		let _ = Command::new("git")
+			.args([
+				"-C",
+				w,
+				"-c",
+				"user.name=T",
+				"-c",
+				"user.email=t@e",
+				"-c",
+				"core.hooksPath=/dev/null",
+				"merge",
+				"--autostash",
+				"side",
+			])
+			.output()
+			.unwrap();
+		assert!(work.join(".git/MERGE_AUTOSTASH").exists());
+		let out = match tool {
+			"gta" => assert_cmd::Command::cargo_bin("gta")
+				.unwrap()
+				.args(["-C", w, "reset", "--hard"])
+				.output()
+				.unwrap(),
+			_ => Command::new("git")
+				.args([
+					"-C",
+					w,
+					"-c",
+					"user.name=T",
+					"-c",
+					"user.email=t@e",
+					"reset",
+					"--hard",
+				])
+				.output()
+				.unwrap(),
+		};
+		assert!(out.status.success(), "{tool}");
+		said.push((
+			String::from_utf8(out.stderr).unwrap(),
+			git(w, &["stash", "list", "--format=%gs"]),
+		));
+		std::fs::remove_dir_all(&work).ok();
+	}
+	assert_eq!(said[0], said[1]);
+	assert_eq!(said[0].1, "autostash\n");
+}
+
 fn porcelain(w: &str) -> String {
 	let mut lines: Vec<String> = git(w, &["status", "--porcelain"])
 		.lines()

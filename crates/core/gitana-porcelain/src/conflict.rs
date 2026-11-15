@@ -54,28 +54,12 @@ impl std::error::Error for ConflictOverwriteError {}
 pub async fn operation_in_progress<F: FileStore, H: HashAlgorithm>(
 	repository: &Repository<F, H>,
 ) -> Result<Option<&'static str>> {
-	if repository.merge_head().await?.is_some() {
-		return Ok(Some("merge"));
-	}
-	if repository.cherry_pick_head().await?.is_some() {
-		return Ok(Some("cherry-pick"));
-	}
-	if repository.revert_head().await?.is_some() {
-		return Ok(Some("revert"));
-	}
-	if repository.rebase_in_progress().await? {
-		return Ok(Some("rebase"));
-	}
-	// A rebase started by *stock git* keeps its state under `rebase-merge/` (interactive/merge backend) or
-	// `rebase-apply/` (am backend), not gitana's flat `REBASE_*` files — and once its conflicts are staged
-	// the index has no unmerged entries, so neither `rebase_in_progress` nor an unmerged-index check would
-	// notice it. git refuses to move HEAD while such a rebase is live (probed vs git 2.55: "cannot switch
-	// branch while rebasing"), so detect both layout directories directly.
-	let store = repository.objects().file_store();
-	if store.is_dir("rebase-merge").await? || store.is_dir("rebase-apply").await? {
-		return Ok(Some("rebase"));
-	}
-	Ok(None)
+	Ok(
+		repository
+			.operation_in_progress()
+			.await?
+			.map(|operation| operation.as_str()),
+	)
 }
 
 /// Write the merged result to the work tree (conflicted files carry markers) and record the conflict

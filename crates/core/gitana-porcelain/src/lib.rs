@@ -11,7 +11,6 @@ use anyhow::Result;
 
 mod cherry_pick;
 mod commit;
-mod commit_error;
 pub mod conflict;
 mod merge;
 mod prepared_clone;
@@ -24,10 +23,10 @@ mod tag;
 mod trust;
 
 pub use cherry_pick::{PickOutcome, abort_cherry_pick, cherry_pick, continue_cherry_pick};
-pub use commit::{commit, commit_signed};
-pub use commit_error::CommitError;
+pub use commit::commit_signed;
 pub use conflict::ConflictOverwriteError;
 pub use gitana_git_http::Deepen;
+pub use gitana_worktree::CommitError;
 pub use merge::{
 	MergeOutcome, abort_merge, continue_merge, merge, merge_with_excludes, merge_with_excludes_loader,
 };
@@ -47,20 +46,9 @@ pub use trust::{
 	trust_set_policy, trust_sync,
 };
 
-/// Resolves the git identity lines (`Name <email> seconds ±hhmm`) for operations that record commits.
-/// The engine never reads process env / config directly; the CLI adapter implements this over its
-/// resolution. Methods are async so resolution stays lazy — an operation asks only once it is certain
-/// to record a commit (e.g. after the empty-index guard).
-pub trait Identity {
-	/// The author line; errors if no identity is configured.
-	async fn author(&self) -> Result<String>;
-	/// The committer line; errors if no identity is configured.
-	async fn committer(&self) -> Result<String>;
-	/// The committer line for a reflog entry, defaulting a *missing* identity to a placeholder rather
-	/// than failing — git records these (fast-forward, abort) without a configured identity. It still
-	/// errors if the configuration itself cannot be loaded, so a malformed config aborts the operation.
-	async fn committer_or_default(&self) -> Result<String>;
-}
+/// The identity an operation records commits and reflog entries with; it lives in
+/// `gitana-identity`, beside the working-tree operations that take it too.
+pub use gitana_identity::Identity;
 
 /// Produces a git-format SSH signature (an `SSHSIG` armor block, git's `git` namespace) over given
 /// bytes. Like [`Identity`], the engine holds this capability rather than loading keys or invoking
@@ -220,9 +208,7 @@ pub(crate) mod test_support {
 	) -> ObjectId<Sha256> {
 		std::fs::write(dir.join(path), content).unwrap();
 		wt.add(&[path], "", false, None).await.unwrap();
-		crate::commit(wt, &format!("add {path}"), identity)
-			.await
-			.unwrap()
+		wt.commit(&format!("add {path}"), identity).await.unwrap()
 	}
 
 	/// An off-branch commit of a single file (a sibling/child not on `main`), for divergent histories.

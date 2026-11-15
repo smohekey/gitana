@@ -129,7 +129,7 @@ impl WorkTreeCommand for Commit<'_> {
 			Some(signer) => {
 				gitana_porcelain::commit_signed(&worktree, self.message, &identity, signer).await?
 			}
-			None => gitana_porcelain::commit(&worktree, self.message, &identity).await?,
+			None => worktree.commit(self.message, &identity).await?,
 		};
 		println!("{id}");
 		Ok(())

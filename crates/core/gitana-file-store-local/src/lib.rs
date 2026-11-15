@@ -34,6 +34,7 @@ use gitana_file_store::{
 	ByteReader, DeleteOutcome, DurabilityTarget, FileStore, FileStoreError, PathLock, Result,
 	Version, WriteOutcome, split_prefix,
 };
+use gitana_path::{GitPath, GitPathComponent};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
@@ -243,6 +244,25 @@ impl FileStore for LocalFileStore {
 		let path = self.resolve(path)?.to_owned();
 		let fs = Arc::clone(&self.backend);
 		blocking(move || fs.read(&path).map_err(read_err)).await
+	}
+
+	// A `GitPath` has no empty, `.`, `..` or NUL component, as `resolve` requires of a `&str` path.
+	async fn read_path_bytes(&self, path: &GitPath) -> Result<Vec<u8>> {
+		let path = path.clone();
+		let fs = Arc::clone(&self.backend);
+		blocking(move || fs.read_native(&path).map_err(read_err)).await
+	}
+
+	async fn is_dir_bytes(&self, path: &GitPath) -> Result<bool> {
+		let path = path.clone();
+		let fs = Arc::clone(&self.backend);
+		blocking(move || fs.is_dir_native(&path).map_err(read_err)).await
+	}
+
+	async fn list_prefix_bytes(&self, prefix: &GitPath) -> Result<Vec<GitPathComponent>> {
+		let dir = prefix.clone();
+		let fs = Arc::clone(&self.backend);
+		blocking(move || list_names_in(&*fs, &dir)).await
 	}
 
 	async fn read_path_versioned(&self, path: &str) -> Result<(Vec<u8>, Version)> {
@@ -628,6 +648,63 @@ trait Backend: Send + Sync + 'static {
 	fn sync_file(&self, path: &str) -> std::io::Result<()>;
 	/// Flush one directory's namespace metadata to stable storage (`""` is the store root).
 	fn sync_dir(&self, path: &str) -> std::io::Result<()>;
+	/// [`Self::read`] for a path whose components need not be UTF-8. The default reads only UTF-8
+	/// paths; a backend that can name other bytes overrides it.
+	fn read_native(&self, path: &GitPath) -> std::io::Result<Vec<u8>> {
+		self.read(utf8_only(path)?)
+	}
+	/// [`Self::list_names`] as path components, which need not be UTF-8. The default lists only a
+	/// UTF-8 folder and fails on a name that isn't UTF-8; a backend that can name other bytes
+	/// overrides it.
+	fn list_names_native(&self, dir: &GitPath) -> std::io::Result<Vec<GitPathComponent>> {
+		self
+			.list_names(utf8_only(dir)?)?
+			.into_iter()
+			.map(|name| {
+				GitPathComponent::from_utf8(&name)
+					.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+			})
+			.collect()
+	}
+	/// [`Self::kind`] for a path whose components need not be UTF-8, as [`Self::read_native`].
+	fn kind_native(&self, path: &GitPath) -> std::io::Result<FileKind> {
+		self.kind(utf8_only(path)?)
+	}
+	/// [`Self::is_dir`] for a path whose components need not be UTF-8, as [`Self::read_native`].
+	fn is_dir_native(&self, path: &GitPath) -> std::io::Result<bool> {
+		self.is_dir(utf8_only(path)?)
+	}
+}
+
+/// `path` as UTF-8, for a backend that names only UTF-8 paths.
+fn utf8_only(path: &GitPath) -> std::io::Result<&str> {
+	path.as_utf8().ok_or_else(|| {
+		std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"Git path is not representable on this platform",
+		)
+	})
+}
+
+/// `path` as a native path, its bytes exactly: Unix names any non-NUL bytes.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+fn native_path(path: &GitPath) -> &std::path::Path {
+	use std::os::unix::ffi::OsStrExt as _;
+	std::path::Path::new(std::ffi::OsStr::from_bytes(path.as_bytes()))
+}
+
+/// What a native file type is, as the store classifies it.
+#[cfg(not(target_arch = "wasm32"))]
+fn kind_of(file_type: cap_std::fs::FileType) -> FileKind {
+	if file_type.is_file() {
+		FileKind::File
+	} else if file_type.is_dir() {
+		FileKind::Dir
+	} else if file_type.is_symlink() {
+		FileKind::Symlink
+	} else {
+		FileKind::Other
+	}
 }
 
 /// Native backend: every operation goes through a [`cap_std::fs::Dir`] capability.
@@ -756,16 +833,49 @@ impl Backend for CapBackend {
 	}
 
 	fn kind(&self, path: &str) -> std::io::Result<FileKind> {
-		let file_type = self.dir.symlink_metadata(path)?.file_type();
-		Ok(if file_type.is_file() {
-			FileKind::File
-		} else if file_type.is_dir() {
-			FileKind::Dir
-		} else if file_type.is_symlink() {
-			FileKind::Symlink
+		Ok(kind_of(self.dir.symlink_metadata(path)?.file_type()))
+	}
+
+	#[cfg(unix)]
+	fn read_native(&self, path: &GitPath) -> std::io::Result<Vec<u8>> {
+		self.dir.read(native_path(path))
+	}
+
+	#[cfg(unix)]
+	fn list_names_native(&self, dir: &GitPath) -> std::io::Result<Vec<GitPathComponent>> {
+		use std::os::unix::ffi::OsStrExt as _;
+		let entries = if dir.is_root() {
+			self.dir.entries()
 		} else {
-			FileKind::Other
-		})
+			self.dir.read_dir(native_path(dir))
+		};
+		let entries = match entries {
+			Ok(entries) => entries,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+			Err(error) => return Err(error),
+		};
+		entries
+			.map(|entry| {
+				GitPathComponent::from_bytes(entry?.file_name().as_bytes().to_vec())
+					.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+			})
+			.collect()
+	}
+
+	#[cfg(unix)]
+	fn is_dir_native(&self, path: &GitPath) -> std::io::Result<bool> {
+		match self.dir.metadata(native_path(path)) {
+			Ok(meta) => Ok(meta.is_dir()),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+			Err(error) => Err(error),
+		}
+	}
+
+	#[cfg(unix)]
+	fn kind_native(&self, path: &GitPath) -> std::io::Result<FileKind> {
+		Ok(kind_of(
+			self.dir.symlink_metadata(native_path(path))?.file_type(),
+		))
 	}
 
 	fn sync_file(&self, path: &str) -> std::io::Result<()> {
@@ -1117,6 +1227,25 @@ fn exists_at(fs: &dyn Backend, path: &str) -> Result<bool> {
 	fs.exists(path).map_err(backend_err)
 }
 
+/// The names in the folder `dir`, as [`list_prefix_in`] lists them: the backend's own regular lock
+/// and temp files left out, every other entry kept.
+fn list_names_in(fs: &dyn Backend, dir: &GitPath) -> Result<Vec<GitPathComponent>> {
+	let mut out = Vec::new();
+	for name in fs.list_names_native(dir).map_err(backend_err)? {
+		let bytes = name.as_bytes();
+		if bytes.ends_with(b".lock") || bytes.starts_with(b".tmp.") {
+			match fs.kind_native(&dir.join(&name)) {
+				Ok(FileKind::File) => continue,
+				Ok(_) => {}
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+				Err(error) => return Err(backend_err(error)),
+			}
+		}
+		out.push(name);
+	}
+	Ok(out)
+}
+
 fn list_prefix_in(
 	fs: &dyn Backend,
 	dir_part: &str,
@@ -1311,6 +1440,75 @@ fn read_err(error: std::io::Error) -> FileStoreError {
 		// packed-ref fallback resolve the child, diverging from git's unknown-revision result.
 		std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory => FileStoreError::NotFound,
 		_ => FileStoreError::Backend(error.to_string()),
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod byte_path_tests {
+	use std::ffi::OsStr;
+	use std::os::unix::ffi::OsStrExt as _;
+
+	use cap_std::{ambient_authority, fs::Dir};
+	use gitana_file_store::FileStore;
+	use gitana_path::{GitPath, GitPathComponent};
+
+	use super::LocalFileStore;
+
+	/// A name that isn't UTF-8 is listed and read by its bytes, where the `&str` methods can't name
+	/// it; the store's own lock files stay out of the listing, as `list_prefix` leaves them out. The
+	/// same through the worker keepalive wrapper the CLI's stores use.
+	#[tokio::test]
+	async fn lists_and_reads_names_that_are_not_utf8() {
+		for wrapped in [false, true] {
+			lists_and_reads_names_that_are_not_utf8_in(wrapped).await;
+		}
+	}
+
+	async fn lists_and_reads_names_that_are_not_utf8_in(wrapped: bool) {
+		let temporary = tempfile::tempdir().unwrap();
+		let worktrees = temporary.path().join("worktrees");
+		let raw = worktrees.join(OsStr::from_bytes(b"wt-\xff"));
+		std::fs::create_dir_all(&raw).unwrap();
+		std::fs::write(raw.join("HEAD"), b"ref: refs/heads/side\n").unwrap();
+		std::fs::create_dir_all(worktrees.join("plain")).unwrap();
+		std::fs::write(worktrees.join("stale.lock"), b"").unwrap();
+		let mut store = LocalFileStore::from_dir(
+			Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap(),
+		);
+		if wrapped {
+			store = store.with_worker_keepalive(std::sync::Arc::new(()));
+		}
+		assert!(
+			store
+				.is_dir_bytes(&GitPath::from_bytes(b"worktrees/wt-\xff".to_vec()).unwrap())
+				.await
+				.unwrap()
+		);
+
+		let mut names: Vec<Vec<u8>> = store
+			.list_prefix_bytes(&GitPath::from_utf8("worktrees").unwrap())
+			.await
+			.unwrap()
+			.into_iter()
+			.map(GitPathComponent::into_bytes)
+			.collect();
+		names.sort();
+		assert_eq!(names, vec![b"plain".to_vec(), b"wt-\xff".to_vec()]);
+		let head = GitPath::from_bytes(b"worktrees/wt-\xff/HEAD".to_vec()).unwrap();
+		assert_eq!(
+			store.read_path_bytes(&head).await.unwrap(),
+			b"ref: refs/heads/side\n"
+		);
+		assert!(store.list_prefix("worktrees/").await.is_err());
+		// A lock file inside a folder whose name isn't UTF-8 is left out too.
+		std::fs::write(raw.join("HEAD.lock"), b"").unwrap();
+		assert_eq!(
+			store
+				.list_prefix_bytes(&GitPath::from_bytes(b"worktrees/wt-\xff".to_vec()).unwrap())
+				.await
+				.unwrap(),
+			vec![GitPathComponent::from_utf8("HEAD").unwrap()]
+		);
 	}
 }
 

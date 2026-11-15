@@ -74,9 +74,9 @@ pub(crate) fn worktree_error(error: WorktreeError) -> RepoError {
 		WorktreeError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported => {
 			RepoError::UnsupportedFormat(error.to_string())
 		}
-		WorktreeError::Conflict(_) | WorktreeError::UntrackedOverwrite(_) => {
-			RepoError::Conflict(rendered)
-		}
+		WorktreeError::Conflict(_)
+		| WorktreeError::UntrackedOverwrite(_)
+		| WorktreeError::IgnoredOverwrite(_) => RepoError::Conflict(rendered),
 		WorktreeError::ChecksumMismatch => RepoError::Corruption("index checksum mismatch".to_owned()),
 		WorktreeError::Malformed(_)
 		| WorktreeError::UnsafePath(_)
@@ -100,6 +100,8 @@ pub(crate) fn worktree_error(error: WorktreeError) -> RepoError {
 		| WorktreeError::SubmodulePathIsSymlink(_)
 		| WorktreeError::NullGitlinkOid(_)
 		| WorktreeError::UnsupportedFileType(_)
+		// A nested repository `add` won't stage is the caller's to deal with, like a submodule's.
+		| WorktreeError::EmbeddedRepository(_)
 		| WorktreeError::Config(_) => RepoError::Invalid(rendered),
 		_ => RepoError::Backend(rendered),
 	}

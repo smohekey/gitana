@@ -6,8 +6,13 @@
 //! `GIT_<role>_NAME` / `GIT_<role>_EMAIL`) and the timestamp — reading the process environment and the
 //! clock is a frontend concern, kept out of the engine.
 
+#![allow(async_fn_in_trait)]
+
 use anyhow::{Context, Result};
 use gitana_config::GitConfig;
+
+mod identity;
+pub use self::identity::Identity;
 
 /// Build a `role` (`AUTHOR` / `COMMITTER`) identity line: the `name`/`email` override (from git's
 /// `GIT_<role>_*` environment) else `user.name` / `user.email` from `config`, formatted with `when`

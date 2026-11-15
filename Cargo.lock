@@ -1679,6 +1679,7 @@ version = "0.1.0"
 name = "gitana-file-store"
 version = "0.1.0"
 dependencies = [
+ "gitana-path",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -1688,6 +1689,7 @@ name = "gitana-file-store-conformance"
 version = "0.1.0"
 dependencies = [
  "gitana-file-store",
+ "gitana-path",
  "tokio",
 ]
 
@@ -1714,6 +1716,7 @@ version = "0.1.0"
 dependencies = [
  "gitana-file-store",
  "gitana-file-store-conformance",
+ "gitana-path",
  "tokio",
 ]
 
@@ -1823,6 +1826,7 @@ dependencies = [
  "gitana-file-store",
  "gitana-file-store-local",
  "gitana-git-http",
+ "gitana-identity",
  "gitana-object",
  "gitana-object-store",
  "gitana-path",
@@ -1897,12 +1901,14 @@ dependencies = [
 name = "gitana-repository"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cap-std 4.0.2",
  "gitana-config",
  "gitana-diff",
  "gitana-file-store",
  "gitana-file-store-local",
  "gitana-file-store-memory",
+ "gitana-identity",
  "gitana-object",
  "gitana-object-store",
  "gitana-path",
@@ -1967,11 +1973,13 @@ dependencies = [
 name = "gitana-worktree"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cap-std 4.0.2",
  "gitana-config",
  "gitana-file-store",
  "gitana-file-store-local",
  "gitana-fs-native",
+ "gitana-identity",
  "gitana-object",
  "gitana-object-store",
  "gitana-path",

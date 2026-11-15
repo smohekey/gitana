@@ -7,6 +7,7 @@ use cap_std::fs::Dir;
 use gitana_file_store::{
 	ByteReader, DeleteOutcome, DurabilityTarget, FileStore, PathLock, Result, Version, WriteOutcome,
 };
+use gitana_path::{GitPath, GitPathComponent};
 
 use crate::{FileKind, LocalFileStore};
 
@@ -92,10 +93,19 @@ impl WorktreeFileStore {
 		self.worktree.as_ref()
 	}
 
+	/// The underlying store that owns `path`, given as a [`GitPath`]: routed by the same rules.
+	fn store_for(&self, path: &GitPath) -> &LocalFileStore {
+		if is_per_worktree(path.as_bytes()) {
+			&self.worktree
+		} else {
+			&self.common
+		}
+	}
+
 	/// The underlying store that owns `path`: the per-worktree store for git's per-worktree files,
 	/// the common store otherwise.
 	fn store(&self, path: &str) -> &LocalFileStore {
-		if is_per_worktree(path) {
+		if is_per_worktree(path.as_bytes()) {
 			&self.worktree
 		} else {
 			&self.common
@@ -107,8 +117,9 @@ impl WorktreeFileStore {
 /// rather than in the shared common dir. Follows git's worktree layout for the paths gitana touches:
 /// `HEAD` (and its ref-transaction `HEAD.lock`), `index` (and its `index.lock`), the in-progress
 /// operation state (`MERGE_HEAD`/`MERGE_MSG`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, and gitana's
-/// `REBASE_*` files), the per-worktree ref namespaces, and `modules/` (submodule repositories owned
-/// by this checkout). gitana's other refs (`refs/heads`, `refs/tags`, `refs/remotes`) are shared.
+/// `REBASE_*` files), the per-worktree ref namespaces, `commondir`, `gitdir`, and `modules/` (submodule
+/// repositories owned by this checkout). gitana's other refs (`refs/heads`, `refs/tags`,
+/// `refs/remotes`) are shared.
 ///
 /// Routing the operation state per-worktree is critical: otherwise a rebase/cherry-pick/revert
 /// started in one linked worktree would be visible — and `--abort`/`--continue`-able — from another,
@@ -117,8 +128,8 @@ impl WorktreeFileStore {
 /// `HEAD.lock`, `ORIG_HEAD.lock`, `index.lock`, etc. follow their targets, while a shared ref's lock
 /// (`refs/heads/main.lock`) stays shared. Refs cannot themselves end in `.lock` (git forbids it), so
 /// stripping the suffix is unambiguous.
-fn is_per_worktree(path: &str) -> bool {
-	if let Some(base) = path.strip_suffix(".lock") {
+fn is_per_worktree(path: &[u8]) -> bool {
+	if let Some(base) = path.strip_suffix(b".lock") {
 		return is_per_worktree(base);
 	}
 	// A one-level **pseudoref** — `HEAD`, `ORIG_HEAD`, `FETCH_HEAD`, `MERGE_HEAD`, a custom `CUSTOM_REF`, … —
@@ -130,38 +141,44 @@ fn is_per_worktree(path: &str) -> bool {
 	if is_pseudoref(path) {
 		return true;
 	}
-	path == "index"
-		|| path == "config.worktree"
-		|| path == "logs/HEAD"
+	path == b"index"
+		|| path == b"config.worktree"
+		|| path == b"logs/HEAD"
 		// Submodule repositories created from a linked worktree belong to that checkout and live under
 		// `<common>/worktrees/<id>/modules/`, rather than the shared `<common>/modules/` namespace.
 		// Route the root as well as every descendant so reads, writes, locks, and durability barriers
 		// all use the same owning directory.
-		|| path == "modules"
-		|| path.starts_with("modules/")
+		|| path == b"modules"
+		|| path.starts_with(b"modules/")
 		// `info/sparse-checkout` is per-worktree (git stores it under `worktrees/<name>/info/`, and enabling
 		// sparse-checkout sets a per-worktree `core.sparseCheckout` via `extensions.worktreeConfig`) — unlike
 		// `info/exclude`, which stays shared in the common dir.
-		|| path == "info/sparse-checkout"
-		|| path.starts_with("REBASE_")
+		|| path == b"info/sparse-checkout"
+		// `commondir` exists only in a linked worktree's own git dir (it names the shared one), so reading
+		// it there is how git, and gitana's switch, tell a linked worktree from the main one.
+		|| path == b"commondir"
+		// `gitdir` likewise exists only in a linked worktree's own git dir (it names the checkout's
+		// `.git`), so a worktree with no native path can tell its own admin entry by it.
+		|| path == b"gitdir"
+		|| path.starts_with(b"REBASE_")
 		// Stock git keeps an in-progress rebase's state per-worktree under `rebase-merge/` (interactive/merge
 		// backend) or `rebase-apply/` (am backend) — like gitana's flat `REBASE_*` files, they must route to
 		// the worktree's own git dir, so a guard checking for a live rebase (or a rebase reading its state)
 		// inspects `.git/worktrees/<name>/`, not the shared common dir.
-		|| path == "rebase-merge"
-		|| path.starts_with("rebase-merge/")
-		|| path == "rebase-apply"
-		|| path.starts_with("rebase-apply/")
-		|| path == "refs/worktree"
-		|| path.starts_with("refs/worktree/")
-		|| path == "refs/bisect"
-		|| path.starts_with("refs/bisect/")
-		|| path == "refs/rewritten"
-		|| path.starts_with("refs/rewritten/")
+		|| path == b"rebase-merge"
+		|| path.starts_with(b"rebase-merge/")
+		|| path == b"rebase-apply"
+		|| path.starts_with(b"rebase-apply/")
+		|| path == b"refs/worktree"
+		|| path.starts_with(b"refs/worktree/")
+		|| path == b"refs/bisect"
+		|| path.starts_with(b"refs/bisect/")
+		|| path == b"refs/rewritten"
+		|| path.starts_with(b"refs/rewritten/")
 		// `sharedindex.<oid>` — a split index's shared base — lives beside the per-worktree `index` in the
 		// worktree's own git dir, and `config.worktree` holds a linked worktree's `extensions.worktreeConfig`
 		// overrides. Both are private to the checkout, not shared.
-		|| path.starts_with("sharedindex.")
+		|| path.starts_with(b"sharedindex.")
 }
 
 /// Whether `path` is a git **pseudoref**: a top-level name of only ASCII **uppercase letters, `_`, and `-`** —
@@ -170,11 +187,11 @@ fn is_per_worktree(path: &str) -> bool {
 /// Pseudorefs (`HEAD`, `ORIG_HEAD`, `MERGE_HEAD`, and any custom `SOME-REF`) live per-worktree, so they must
 /// resolve against the worktree's own git dir. `REBASE_*` state files also match this shape (correct — they
 /// are per-worktree too).
-fn is_pseudoref(path: &str) -> bool {
+fn is_pseudoref(path: &[u8]) -> bool {
 	!path.is_empty()
 		&& path
-			.bytes()
-			.all(|b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
+			.iter()
+			.all(|&b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
 }
 
 impl FileStore for WorktreeFileStore {
@@ -203,7 +220,7 @@ impl FileStore for WorktreeFileStore {
 			if split {
 				common.push(split_target(&self.common, target).await?);
 				worktree.push(split_target(&self.worktree, target).await?);
-			} else if is_per_worktree(target.path()) {
+			} else if is_per_worktree(target.path().as_bytes()) {
 				worktree.push(target.clone());
 			} else {
 				common.push(target.clone());
@@ -220,6 +237,10 @@ impl FileStore for WorktreeFileStore {
 
 	fn read_path(&self, path: &str) -> impl Future<Output = Result<Vec<u8>>> {
 		self.store(path).read_path(path)
+	}
+
+	fn read_shared_path(&self, path: &str) -> impl Future<Output = Result<Vec<u8>>> {
+		self.common.read_path(path)
 	}
 
 	fn read_path_versioned(&self, path: &str) -> impl Future<Output = Result<(Vec<u8>, Version)>> {
@@ -281,6 +302,21 @@ impl FileStore for WorktreeFileStore {
 
 	fn list_prefix(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> {
 		self.store(prefix).list_prefix(prefix)
+	}
+
+	fn read_path_bytes(&self, path: &GitPath) -> impl Future<Output = Result<Vec<u8>>> {
+		self.store_for(path).read_path_bytes(path)
+	}
+
+	fn is_dir_bytes(&self, path: &GitPath) -> impl Future<Output = Result<bool>> {
+		self.store_for(path).is_dir_bytes(path)
+	}
+
+	fn list_prefix_bytes(
+		&self,
+		prefix: &GitPath,
+	) -> impl Future<Output = Result<Vec<GitPathComponent>>> {
+		self.store_for(prefix).list_prefix_bytes(prefix)
 	}
 
 	fn list_prefix_bounded(
@@ -372,6 +408,14 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn routes_paths_that_are_not_utf8_by_the_same_rules() {
+		assert!(is_per_worktree(b"modules/m-\xff/HEAD"));
+		assert!(is_per_worktree(b"refs/worktree/w-\xff"));
+		assert!(!is_per_worktree(b"worktrees/wt-\xff/HEAD"));
+		assert!(!is_per_worktree(b"refs/heads/b-\xff"));
+	}
+
+	#[test]
 	fn classifies_per_worktree_vs_shared_paths() {
 		// Private to one checkout → the worktree dir: HEAD/index and the in-progress operation state
 		// (merge, cherry-pick, revert, rebase), which must never be visible to another worktree.
@@ -389,6 +433,8 @@ mod tests {
 			"REBASE_TODO",
 			"COMMIT_EDITMSG",
 			"index",
+			"commondir",
+			"gitdir",
 			"modules",
 			"modules/one/HEAD",
 			"modules/nested/one/config",
@@ -415,7 +461,10 @@ mod tests {
 			"CUSTOM-REF.lock",
 			"BISECT_EXPECTED_REV",
 		] {
-			assert!(is_per_worktree(path), "{path} should be per-worktree");
+			assert!(
+				is_per_worktree(path.as_bytes()),
+				"{path} should be per-worktree"
+			);
 		}
 		// Shared across linked worktrees → the common dir (including a shared ref's `.lock`). A top-level name
 		// that is *not* pseudoref-shaped stays shared: lowercase / mixed-case, a `.`, or — matching git — a digit.
@@ -435,7 +484,7 @@ mod tests {
 			"CUSTOM1",    // git's grammar excludes digits → shared
 			"SHA256",     // digits → shared
 		] {
-			assert!(!is_per_worktree(path), "{path} should be shared");
+			assert!(!is_per_worktree(path.as_bytes()), "{path} should be shared");
 		}
 	}
 
@@ -485,6 +534,23 @@ mod tests {
 		// The router reads them back through the same routing.
 		assert!(store.exists("HEAD").await.unwrap());
 		assert!(store.exists("refs/heads/main").await.unwrap());
+		// By bytes too: a per-worktree path from the worktree store, a shared one from the common one.
+		let path = |text: &str| gitana_path::GitPath::from_utf8(text).unwrap();
+		assert_eq!(
+			store.read_path_bytes(&path("HEAD")).await.unwrap(),
+			b"ref: refs/heads/main\n"
+		);
+		assert_eq!(
+			store
+				.read_path_bytes(&path("refs/heads/main"))
+				.await
+				.unwrap(),
+			b"oid\n"
+		);
+		assert_eq!(
+			store.list_prefix_bytes(&path("refs/heads")).await.unwrap(),
+			vec![gitana_path::GitPathComponent::from_utf8("main").unwrap()]
+		);
 
 		let _ = std::fs::remove_dir_all(&dir);
 	}

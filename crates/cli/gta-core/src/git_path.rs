@@ -56,6 +56,29 @@ pub fn render_error(error: &anyhow::Error, mode: ResultPathMode) -> String {
 			rendered.push(conflict.render_with_paths(|path| render_result_path(path, mode)));
 			break;
 		}
+		// The operation errors wrap a checkout's or repository's error transparently, so it isn't a
+		// link of its own in the chain: each renders it itself.
+		if let Some(switch) = cause.downcast_ref::<gitana_worktree::SwitchError>() {
+			rendered.push(switch.render_with_paths(
+				|path| render_result_path(path, mode),
+				|pathspec| render_result_pathspec(pathspec, mode),
+			));
+			break;
+		}
+		if let Some(reset) = cause.downcast_ref::<gitana_worktree::ResetError>() {
+			rendered.push(reset.render_with_paths(
+				|path| render_result_path(path, mode),
+				|pathspec| render_result_pathspec(pathspec, mode),
+			));
+			break;
+		}
+		if let Some(branch) = cause.downcast_ref::<gitana_repository::BranchError>() {
+			rendered.push(branch.render_with_paths(
+				|path| render_result_path(path, mode),
+				|pathspec| render_result_pathspec(pathspec, mode),
+			));
+			break;
+		}
 		if let Some(worktree) = cause.downcast_ref::<gitana_worktree::WorktreeError>() {
 			rendered.push(worktree.render_with_paths(
 				|path| render_result_path(path, mode),
@@ -134,6 +157,62 @@ mod tests {
 			render_error(&raw, ResultPathMode::Reversible),
 			render_error(&literal, ResultPathMode::Reversible)
 		);
+	}
+
+	/// Switch's, reset's and branch's errors wrap a checkout's or repository's error transparently;
+	/// rendered in the reversible mode, two of them over paths that display alike still differ.
+	#[test]
+	fn operation_errors_use_the_frontend_path_mode() {
+		let raw = GitPath::from_bytes(b"raw-\xff".to_vec()).unwrap();
+		let literal = GitPath::from_utf8("\"raw-\\377\"").unwrap();
+		let pairs: Vec<(anyhow::Error, anyhow::Error)> = vec![
+			(
+				gitana_worktree::SwitchError::Worktree(gitana_worktree::WorktreeError::UntrackedOverwrite(
+					raw.clone(),
+				))
+				.into(),
+				gitana_worktree::SwitchError::Worktree(gitana_worktree::WorktreeError::UntrackedOverwrite(
+					literal.clone(),
+				))
+				.into(),
+			),
+			(
+				gitana_worktree::ResetError::Worktree(gitana_worktree::WorktreeError::UntrackedOverwrite(
+					raw.clone(),
+				))
+				.into(),
+				gitana_worktree::ResetError::Worktree(gitana_worktree::WorktreeError::UntrackedOverwrite(
+					literal.clone(),
+				))
+				.into(),
+			),
+			(
+				gitana_repository::BranchError::Repository(
+					gitana_repository::RepositoryError::MissingTreePath {
+						path: raw.clone(),
+						base: "HEAD".to_owned(),
+					},
+				)
+				.into(),
+				gitana_repository::BranchError::Repository(
+					gitana_repository::RepositoryError::MissingTreePath {
+						path: literal.clone(),
+						base: "HEAD".to_owned(),
+					},
+				)
+				.into(),
+			),
+		];
+		for (raw, literal) in pairs {
+			assert_eq!(
+				render_error(&raw, ResultPathMode::Human),
+				render_error(&literal, ResultPathMode::Human)
+			);
+			assert_ne!(
+				render_error(&raw, ResultPathMode::Reversible),
+				render_error(&literal, ResultPathMode::Reversible)
+			);
+		}
 	}
 
 	#[test]

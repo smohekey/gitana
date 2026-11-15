@@ -10,9 +10,11 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
 gitana-config.workspace = true
 gitana-diff.workspace = true
 gitana-file-store.workspace = true
+gitana-identity.workspace = true
 gitana-object.workspace = true
 gitana-object-store.workspace = true
 gitana-path.workspace = true

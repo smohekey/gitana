@@ -861,40 +861,6 @@ pub async fn discover_worktree_with_prefix(
 	Ok((found, start, prefix))
 }
 
-/// If `branch` (a full ref like `refs/heads/main`) is checked out in a *different* worktree of this
-/// repository, return that worktree's working directory. git forbids checking out one branch in two
-/// worktrees at once: the branch ref is shared, so the two checkouts would race when committing.
-///
-/// `git_dir` is the current checkout's per-worktree git directory, excluded from the scan (switching
-/// to the branch this worktree is already on is not a conflict). Errors if `git_dir`'s `commondir` is
-/// corrupt (rather than silently treating the repository as self-contained).
-pub async fn branch_checked_out_elsewhere(git_dir: &Path, branch: &str) -> Result<Option<PathBuf>> {
-	let common_dir = gitana_repository_layout::common_dir_of(git_dir).await?;
-	Ok(branch_checkout_location(&common_dir, branch, Some(git_dir)))
-}
-
-/// The working directory of a worktree (the main one, or a linked one under `common_dir`) whose
-/// `HEAD` is the symbolic ref `branch`, skipping `exclude` (a git directory to ignore — typically the
-/// caller's own). git shares a branch ref across a repository's worktrees, so a branch may be checked
-/// out in at most one at a time; this locates that one.
-///
-/// Unlike [`branch_checked_out_elsewhere`], `common_dir` is passed directly, so this works before the
-/// caller's own git directory exists (as `worktree add` needs, checking a not-yet-created worktree).
-pub(crate) fn branch_checkout_location(
-	common_dir: &Path,
-	branch: &str,
-	exclude: Option<&Path>,
-) -> Option<PathBuf> {
-	let exclude = exclude.map(canonical);
-	worktree_git_dirs(common_dir, is_bare(common_dir))
-		.into_iter()
-		.find(|candidate| {
-			exclude.as_ref() != Some(&canonical(candidate))
-				&& head_symbolic_target(candidate).as_deref() == Some(branch)
-		})
-		.map(|candidate| worktree_path_of(&candidate))
-}
-
 /// Every branch checked out in a worktree of this repository — the main one and each linked one —
 /// paired with that worktree's working directory. This is the set a plain `fetch` (or `pull`) must
 /// refuse to update: git shares a branch ref across a repository's worktrees, so fetching directly into
@@ -1000,10 +966,6 @@ pub(crate) fn is_bare(common_dir: &Path) -> bool {
 		.and_then(|text| gitana_config::GitConfig::parse(&text).ok())
 		.and_then(|config| config.get_bool("core", None, "bare").ok().flatten())
 		.unwrap_or(false)
-}
-
-fn canonical(path: &Path) -> PathBuf {
-	std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(all(test, any(unix, windows)))]

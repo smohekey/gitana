@@ -11,7 +11,52 @@ use crate::fsmeta::{effective_mode, join_rel, mode_of, push_gitignore, stat_of};
 use crate::ignore::{self, DirIgnore};
 use crate::index_lock::IndexLock;
 use crate::sparse::{SparseCheckout, SparseReapply, SparseSet};
-use crate::{Index, IndexEntry, Status, WorktreeError};
+use crate::{Index, IndexEntry, ResetError, Status, SwitchError, WorktreeError};
+
+/// A commit ready to record, from [`WorkTree::prepare_commit`]: the staged tree, the resolved author
+/// and committer lines, and the message with its final newline.
+pub struct PreparedCommit<H: HashAlgorithm> {
+	pub tree: ObjectId<H>,
+	pub author: String,
+	pub committer: String,
+	pub message: String,
+}
+
+/// How [`WorkTree::switch_branch`] switches.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SwitchOptions<'a> {
+	/// Make the branch first (`switch -c`), at this start point, or `HEAD` if `None`.
+	pub create: Option<Option<&'a str>>,
+	/// Make the working tree and index the branch's authoritatively, discarding local changes
+	/// (`switch --force`).
+	pub force: bool,
+	/// Overwrite or remove untracked ignored files in the way, as git does by default; when false,
+	/// refuse instead (`--no-overwrite-ignore`).
+	pub overwrite_ignored: bool,
+	/// `core.excludesFile`'s content, as checkout takes it.
+	pub excludes_file: Option<&'a [u8]>,
+}
+
+/// [`WorkTree::reset`]'s mode, as git's: what besides the branch is reset to the commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetMode {
+	/// Only the branch (`--soft`).
+	Soft,
+	/// The branch and the index (`--mixed`, git's default).
+	Mixed,
+	/// The branch, the index and the working tree, discarding local changes (`--hard`).
+	Hard,
+}
+
+/// What [`WorkTree::reset`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResetOutcome<H: HashAlgorithm> {
+	/// The commit the branch (or a detached `HEAD`) now points at.
+	pub commit: ObjectId<H>,
+	/// A merge's autostash (git's `merge --autostash`), saved as the newest stash entry, as git's
+	/// reset saves it; git tells the user so.
+	pub autostash: Option<ObjectId<H>>,
+}
 
 /// A working directory paired with its repository.
 ///
@@ -1497,6 +1542,31 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		self.stage_file(index, path, sparse, fold).await
 	}
 
+	/// The outermost folder on `path`'s way (below the work tree's root) that holds a `.git` of its
+	/// own and isn't a submodule in `index`, if any. A path inside a submodule is the submodule's own
+	/// refusal, left to `stage_file`.
+	fn nested_repository(
+		&self,
+		index: &Index<H>,
+		path: &GitPath,
+		fold: bool,
+	) -> Result<Option<GitPath>, WorktreeError> {
+		let dot_git = gitana_path::GitPathComponent::from_utf8(".git")
+			.map_err(|error| WorktreeError::InvalidPath(error.to_string()))?;
+		for ancestor in path.strict_ancestors() {
+			if ancestor.is_root() {
+				continue;
+			}
+			if has_gitlink_stage(index, &ancestor, fold) {
+				return Ok(None);
+			}
+			if self.work().lstat(&ancestor.join(&dot_git))?.is_some() {
+				return Ok(Some(ancestor));
+			}
+		}
+		Ok(None)
+	}
+
 	async fn stage_file(
 		&self,
 		index: &mut Index<H>,
@@ -1514,6 +1584,17 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		// A path INSIDE a tracked submodule mount is the submodule's to manage, not the superproject's:
 		// `add` must never descend into a gitlink and stage its contents, which would replace the `160000`
 		// gitlink with a `100644` subtree and silently corrupt the submodule on the next commit.
+		// A new file inside a nested repository (a folder below the work tree's root with a `.git` of its
+		// own, not a submodule in the index) is that repository's: staging it would record another
+		// repository's files here, where git would add a gitlink instead. Refused, naming the repository,
+		// before the index is saved, so nothing is staged. Every path `add` stages comes here, walked or
+		// named. A file the index has in any form, a conflict's stages included, isn't new: staging it
+		// updates or resolves it, as git does.
+		if !index.entries.iter().any(|entry| &entry.path == path)
+			&& let Some(nested) = self.nested_repository(index, path, fold)?
+		{
+			return Err(WorktreeError::EmbeddedRepository(nested));
+		}
 		if ancestor_is_gitlink(index, path, fold) {
 			return Ok(());
 		}
@@ -1820,6 +1901,58 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// of `git reset --mixed`). The working tree is left untouched, and `HEAD` is not moved.
 	pub async fn reset_index(&self, tree: ObjectId<H>) -> Result<(), WorktreeError> {
 		crate::reset::run(self, tree).await
+	}
+
+	/// Record a commit from the staged index on the current branch, with `message`, returning its
+	/// id. Refused, before anything else, while a merge, cherry-pick, revert or rebase is in progress;
+	/// then, as git does and before `identity` is asked, with an unmerged, empty or unchanged index.
+	/// `identity` is asked for the author and committer only once a commit will be made.
+	pub async fn commit(
+		&self,
+		message: &str,
+		identity: &impl gitana_identity::Identity,
+	) -> Result<ObjectId<H>, crate::CommitError> {
+		crate::commit::run(self, message, identity).await
+	}
+
+	/// [`commit`](Self::commit)'s refusals and preparation, without recording: the tree to commit,
+	/// the identity lines and the message. For a caller that records the commit its own way (signed,
+	/// in porcelain).
+	pub async fn prepare_commit(
+		&self,
+		message: &str,
+		identity: &impl gitana_identity::Identity,
+	) -> Result<PreparedCommit<H>, crate::CommitError> {
+		crate::commit::prepare(self, message, identity).await
+	}
+
+	/// Switch the working tree, index and `HEAD` to the local branch `name` (made first with
+	/// `options.create`), as git's `switch`: a two-tree merge from `HEAD` carrying local work that
+	/// doesn't conflict, or with `options.force` an authoritative checkout. Refused while an
+	/// operation is in progress, or where the branch is checked out in another worktree. The reflog
+	/// entries' committer comes from `identity`, a missing one defaulted as git does.
+	pub async fn switch_branch(
+		&self,
+		name: &gitana_repository::BranchName,
+		options: &SwitchOptions<'_>,
+		identity: &impl gitana_identity::Identity,
+	) -> Result<(), SwitchError> {
+		crate::switch::run(self, name, options, identity).await
+	}
+
+	/// Move the current branch (or a detached `HEAD`) to the commit `target` names, resetting the
+	/// index and working tree as `mode` says, as git's `reset <commit>` does: a soft reset is refused
+	/// in the middle of a merge, and afterwards an in-progress merge, cherry-pick or revert is
+	/// abandoned, a merge's autostash saved as a stash entry. The reflog entry's committer comes from
+	/// `identity`. The commit reset to, and the autostash saved, if there was one.
+	pub async fn reset(
+		&self,
+		target: &str,
+		mode: ResetMode,
+		identity: &impl gitana_identity::Identity,
+		excludes_file: Option<&[u8]>,
+	) -> Result<ResetOutcome<H>, ResetError> {
+		crate::head_reset::run(self, target, mode, identity, excludes_file).await
 	}
 
 	/// Rebuild the index from `tree` **only if `.git/index` is missing**, atomically under the index lock —

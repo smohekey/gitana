@@ -4,6 +4,7 @@ mod path_lock;
 pub use durability_target::DurabilityTarget;
 pub use path_lock::PathLock;
 
+use gitana_path::{GitPath, GitPathComponent};
 use tokio::io::AsyncRead;
 
 /// An owned, type-erased async byte reader (a streaming read, or a write source).
@@ -104,6 +105,69 @@ pub trait FileStore: Send + Sync {
 
 	/// Read the bytes stored at `path` within `repo`.
 	fn read_path(&self, path: &str) -> impl Future<Output = Result<Vec<u8>>> + Send;
+
+	/// Read the bytes stored at `path` in the repository's **shared** (common) directory, even where
+	/// [`read_path`](Self::read_path) would route `path` to one worktree's own files: the main
+	/// worktree's `HEAD`, read from a linked worktree, say. A store with one directory for both reads it
+	/// as `read_path` does, which is the default.
+	fn read_shared_path(&self, path: &str) -> impl Future<Output = Result<Vec<u8>>> + Send {
+		self.read_path(path)
+	}
+
+	/// Read the bytes stored at `path`, a [`GitPath`] whose components need not be UTF-8: a path
+	/// joined from names [`list_prefix_bytes`](Self::list_prefix_bytes) listed, say. The default
+	/// reads through [`read_path`](Self::read_path), so a store without byte paths fails on a path
+	/// that isn't UTF-8, with [`FileStoreError::Backend`] (never `NotFound`).
+	fn read_path_bytes(&self, path: &GitPath) -> impl Future<Output = Result<Vec<u8>>> + Send {
+		async move {
+			match path.as_utf8() {
+				Some(text) => self.read_path(text).await,
+				None => Err(not_utf8(path)),
+			}
+		}
+	}
+
+	/// Whether `path`, a [`GitPath`] whose components need not be UTF-8, is a folder, as
+	/// [`is_dir`](Self::is_dir) says for a `&str` path (`false` when it's absent). The default asks
+	/// `is_dir`, so a store without byte paths fails on a path that isn't UTF-8, with
+	/// [`FileStoreError::Backend`].
+	fn is_dir_bytes(&self, path: &GitPath) -> impl Future<Output = Result<bool>> + Send {
+		async move {
+			match path.as_utf8() {
+				Some(text) => self.is_dir(text).await,
+				None => Err(not_utf8(path)),
+			}
+		}
+	}
+
+	/// The names of the entries directly inside the folder `prefix` names (the store's root, for the
+	/// empty path), as [`list_prefix`](Self::list_prefix) lists `"<prefix>/"`, but each as a
+	/// [`GitPathComponent`], so a name that isn't UTF-8 is listed as its bytes rather than failing
+	/// the listing. An absent folder lists nothing. The default lists through `list_prefix`, so a
+	/// store without byte paths fails on a name or path that isn't UTF-8, with
+	/// [`FileStoreError::Backend`].
+	fn list_prefix_bytes(
+		&self,
+		prefix: &GitPath,
+	) -> impl Future<Output = Result<Vec<GitPathComponent>>> + Send {
+		async move {
+			let dir = prefix.as_utf8().ok_or_else(|| not_utf8(prefix))?;
+			let listing = if dir.is_empty() {
+				String::new()
+			} else {
+				format!("{dir}/")
+			};
+			self
+				.list_prefix(&listing)
+				.await?
+				.iter()
+				.map(|name| {
+					GitPathComponent::from_utf8(name.strip_prefix(&listing).unwrap_or(name))
+						.map_err(|error| FileStoreError::Backend(format!("{name:?}: {error}")))
+				})
+				.collect()
+		}
+	}
 
 	/// Read the bytes at `path` together with their current [`Version`].
 	fn read_path_versioned(
@@ -277,4 +341,11 @@ pub trait FileStore: Send + Sync {
 		bytes: &[u8],
 		lock_path: &str,
 	) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// The error a store without byte paths gives for a path that isn't UTF-8.
+fn not_utf8(path: &GitPath) -> FileStoreError {
+	FileStoreError::Backend(format!(
+		"{path:?} isn't UTF-8, and this store reads only UTF-8 paths"
+	))
 }

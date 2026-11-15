@@ -1,12 +1,13 @@
-//! The typed failure of [`commit`](super::commit).
+//! The typed failure of [`WorkTree::commit`](crate::WorkTree::commit).
 
 use std::error::Error;
 use std::fmt;
 
-use gitana_repository::RepositoryError;
-use gitana_worktree::WorktreeError;
+use gitana_repository::{Operation, RepositoryError};
 
-/// Why a [`commit`](super::commit) did not record a commit.
+use crate::WorktreeError;
+
+/// Why a [`WorkTree::commit`](crate::WorkTree::commit) did not record a commit.
 ///
 /// The three refusal variants are *invalid-input* conditions git reports before touching the object
 /// store (an unmerged, empty, or unchanged index); the remaining variants carry the typed underlying
@@ -17,6 +18,9 @@ use gitana_worktree::WorktreeError;
 /// impl), so its CLI message is unchanged.
 #[derive(Debug)]
 pub enum CommitError {
+	/// A merge, cherry-pick, revert or rebase is in progress: a plain commit would record it as an
+	/// ordinary one-parent commit and leave its state behind, so it's concluded or aborted first.
+	InProgress(Operation),
 	/// The index has unmerged (conflicted) paths; they must be resolved first.
 	Unmerged,
 	/// Nothing is staged — the index is empty.
@@ -36,6 +40,10 @@ pub enum CommitError {
 impl fmt::Display for CommitError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
+			CommitError::InProgress(operation) => write!(
+				f,
+				"a {operation} is in progress; conclude or abort it before committing"
+			),
 			CommitError::Unmerged => f.write_str(
 				"committing is not possible because you have unmerged files; resolve them and mark \
 				 resolution with `gta add`/`gta rm`",

@@ -129,6 +129,11 @@ fn switch_refuses_a_branch_checked_out_in_another_worktree() {
 		git(wt_s, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
 		"feature"
 	);
+	// Nor with `core.bare` set on the command line: gitana reads `core.bare` from the repository's own
+	// config only (docs/plans/core-config-global-aware.md), where stock git would take it and switch.
+	assert!(
+		gta_fail(wt_s, &["-c", "core.bare=true", "switch", "main"]).contains("already checked out")
+	);
 
 	assert!(gta_fail(main_s, &["switch", "feature"]).contains("already checked out"));
 	assert_eq!(
@@ -141,6 +146,50 @@ fn switch_refuses_a_branch_checked_out_in_another_worktree() {
 	assert_eq!(
 		git(wt_s, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
 		"fresh"
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// On Linux a linked worktree's admin folder can be named in bytes that aren't UTF-8 (git names it
+/// after the worktree's folder): gta's switch, through the CLI's own store, still switches, and still
+/// refuses the branch that worktree holds.
+#[cfg(target_os = "linux")]
+#[test]
+fn switch_with_a_linked_worktree_whose_name_is_not_utf8() {
+	use std::ffi::OsStr;
+	use std::os::unix::ffi::OsStrExt as _;
+
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let base = unique_tmp("gta-worktree-raw-name");
+	let main = base.join("main");
+	let main_s = main.to_str().unwrap();
+	std::fs::create_dir_all(&main).unwrap();
+	git(
+		main_s,
+		&["init", "-q", "-b", "main", "--object-format=sha256", "."],
+	);
+	git(main_s, &["config", "user.name", "T"]);
+	git(main_s, &["config", "user.email", "t@e"]);
+	std::fs::write(main.join("f.txt"), "base\n").unwrap();
+	git(main_s, &["add", "."]);
+	git(main_s, &["commit", "-q", "-m", "base"]);
+	git(main_s, &["branch", "free"]);
+	let added = Command::new("git")
+		.args(["-C", main_s, "worktree", "add", "-q", "-b", "taken"])
+		.arg(base.join(OsStr::from_bytes(b"wt-\xff")))
+		.status()
+		.unwrap();
+	assert!(added.success());
+
+	assert!(gta_fail(main_s, &["switch", "taken"]).contains("already checked out"));
+	gta(main_s, &["switch", "free"], b"");
+	assert_eq!(
+		git(main_s, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+		"free"
 	);
 
 	std::fs::remove_dir_all(&base).ok();
@@ -186,6 +235,220 @@ fn switch_allows_the_branch_named_by_a_bare_repo_head() {
 		"main"
 	);
 
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// With `extensions.worktreeConfig`, a linked worktree can set `core.bare=false` for itself. The bare
+/// main worktree's branch is still free when the main worktree's own `config.worktree` says it's
+/// bare, as git decides; without that, git counts the main worktree's `HEAD` as a checkout, and so
+/// does gta.
+#[test]
+fn switch_reads_the_main_worktree_s_own_bareness_as_git_does() {
+	for main_says_bare in [true, false] {
+		let mut switched = Vec::new();
+		for tool in ["git", "gta"] {
+			let base = unique_tmp("gta-worktree-bare-config");
+			let seed = base.join("seed");
+			let bare = base.join("bare.git");
+			let wt = base.join("wt");
+			let base_s = base.to_str().unwrap();
+			let seed_s = seed.to_str().unwrap();
+			let bare_s = bare.to_str().unwrap();
+			let wt_s = wt.to_str().unwrap();
+			std::fs::create_dir_all(&seed).unwrap();
+			git(seed_s, &["init", "-q", "-b", "main", "."]);
+			git(seed_s, &["config", "user.name", "T"]);
+			git(seed_s, &["config", "user.email", "t@e"]);
+			std::fs::write(seed.join("f.txt"), "base\n").unwrap();
+			git(seed_s, &["add", "."]);
+			git(seed_s, &["commit", "-q", "-m", "base"]);
+			git(base_s, &["clone", "-q", "--bare", seed_s, "bare.git"]);
+			git(bare_s, &["config", "extensions.worktreeConfig", "true"]);
+			if main_says_bare {
+				git(bare_s, &["config", "--worktree", "core.bare", "true"]);
+			}
+			git(bare_s, &["branch", "feature", "main"]);
+			git(bare_s, &["worktree", "add", "-q", wt_s, "feature"]);
+			git(wt_s, &["config", "--worktree", "core.bare", "false"]);
+			let ok = match tool {
+				"git" => Command::new("git")
+					.args(["-C", wt_s, "switch", "-q", "main"])
+					.output()
+					.unwrap()
+					.status
+					.success(),
+				_ => assert_cmd::Command::cargo_bin("gta")
+					.unwrap()
+					.args(["-C", wt_s, "switch", "main"])
+					.output()
+					.unwrap()
+					.status
+					.success(),
+			};
+			switched.push(ok);
+			std::fs::remove_dir_all(&base).ok();
+		}
+		assert_eq!(switched[1], switched[0], "main says bare: {main_says_bare}");
+		assert_eq!(switched[0], main_says_bare);
+	}
+}
+
+/// A main worktree's `config.worktree` left behind while `extensions.worktreeConfig` is off doesn't
+/// count: config ignores it, so a `core.bare=true` there doesn't free the branch the main worktree
+/// has checked out. git reads it anyway and lets the linked worktree switch, putting two worktrees
+/// on one branch; gta refuses, as it did before it read that file at all.
+#[test]
+fn switch_ignores_a_leftover_main_config_worktree() {
+	let base = unique_tmp("gta-worktree-leftover-config");
+	let main = base.join("main");
+	let wt = base.join("wt");
+	let main_s = main.to_str().unwrap();
+	let wt_s = wt.to_str().unwrap();
+	std::fs::create_dir_all(&main).unwrap();
+	git(main_s, &["init", "-q", "-b", "main", "."]);
+	git(main_s, &["config", "user.name", "T"]);
+	git(main_s, &["config", "user.email", "t@e"]);
+	std::fs::write(main.join("f.txt"), "base\n").unwrap();
+	git(main_s, &["add", "."]);
+	git(main_s, &["commit", "-q", "-m", "base"]);
+	git(main_s, &["worktree", "add", "-q", "-b", "side", wt_s]);
+	std::fs::write(main.join(".git/config.worktree"), "[core]\n\tbare = true\n").unwrap();
+
+	assert!(gta_fail(wt_s, &["switch", "main"]).contains("already checked out"));
+	assert_eq!(
+		git(wt_s, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+		"side"
+	);
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// A value in the main worktree's `config.worktree` that isn't UTF-8 (a path, say) doesn't stop a linked
+/// worktree's switch: git takes such values, and only `core.bare` is read from that file.
+#[test]
+fn switch_reads_a_main_config_worktree_whose_values_are_not_utf8() {
+	let base = unique_tmp("gta-worktree-raw-config");
+	let main = base.join("main");
+	let wt = base.join("wt");
+	let main_s = main.to_str().unwrap();
+	let wt_s = wt.to_str().unwrap();
+	std::fs::create_dir_all(&main).unwrap();
+	git(main_s, &["init", "-q", "-b", "main", "."]);
+	git(main_s, &["config", "user.name", "T"]);
+	git(main_s, &["config", "user.email", "t@e"]);
+	std::fs::write(main.join("f.txt"), "base\n").unwrap();
+	git(main_s, &["add", "."]);
+	git(main_s, &["commit", "-q", "-m", "base"]);
+	git(main_s, &["branch", "free"]);
+	git(main_s, &["worktree", "add", "-q", "-b", "side", wt_s]);
+	git(main_s, &["config", "extensions.worktreeConfig", "true"]);
+	std::fs::write(
+		main.join(".git/config.worktree"),
+		b"[core]\n\tbare = false\n[custom]\n\tpath = /tmp/caf\xe9\n",
+	)
+	.unwrap();
+
+	gta(wt_s, &["switch", "free"], b"");
+	assert_eq!(
+		git(wt_s, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+		"free"
+	);
+	// The main worktree's branch is still held: its config.worktree doesn't say it's bare.
+	assert!(gta_fail(wt_s, &["switch", "main"]).contains("already checked out"));
+
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// A non-bare repository with `main` checked out in its main worktree, a linked worktree on `side`, a
+/// branch `free`, and `extensions.worktreeConfig` on. Its main worktree's folder and the linked one's.
+fn main_and_linked(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+	let base = unique_tmp(tag);
+	let main = base.join("main");
+	let wt = base.join("wt");
+	let main_s = main.to_str().unwrap();
+	std::fs::create_dir_all(&main).unwrap();
+	git(main_s, &["init", "-q", "-b", "main", "."]);
+	git(main_s, &["config", "user.name", "T"]);
+	git(main_s, &["config", "user.email", "t@e"]);
+	std::fs::write(main.join("f.txt"), "base\n").unwrap();
+	git(main_s, &["add", "."]);
+	git(main_s, &["commit", "-q", "-m", "base"]);
+	git(main_s, &["branch", "free"]);
+	git(
+		main_s,
+		&["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()],
+	);
+	git(main_s, &["config", "extensions.worktreeConfig", "true"]);
+	(base, main, wt)
+}
+
+/// A linked worktree whose own `config.worktree` says `core.bare=true` doesn't speak for the main
+/// worktree: in a non-bare repository the main worktree's branch is still held. git refuses there too
+/// (the linked worktree is then bare itself).
+#[test]
+fn switch_doesnt_let_a_linked_worktree_s_own_bareness_free_the_main_s_branch() {
+	let (base, _main, wt) = main_and_linked("gta-worktree-linked-bare");
+	let wt_s = wt.to_str().unwrap();
+	git(wt_s, &["config", "--worktree", "core.bare", "true"]);
+	assert!(gta_fail(wt_s, &["switch", "main"]).contains("already checked out"));
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// The main worktree's `config.worktree` saying `core.bare=true` doesn't free its branch when the file
+/// also has an include, which could set `core.bare` back. git's check ignores includes and lets the
+/// linked worktree switch onto the branch the main worktree holds; gta refuses.
+#[test]
+fn switch_doesnt_trust_a_main_config_worktree_with_an_include() {
+	let (base, main, wt) = main_and_linked("gta-worktree-include-config");
+	let wt_s = wt.to_str().unwrap();
+	let override_file = base.join("override");
+	std::fs::write(&override_file, "[core]\n\tbare = false\n").unwrap();
+	std::fs::write(
+		main.join(".git/config.worktree"),
+		format!(
+			"[core]\n\tbare = true\n[include]\n\tpath = {}\n",
+			override_file.display()
+		),
+	)
+	.unwrap();
+	assert!(gta_fail(wt_s, &["switch", "main"]).contains("already checked out"));
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// A main worktree's `config.worktree` that's a symlink out of the git folder, which the store can't
+/// follow, doesn't stop a switch to another branch, and the main worktree's own branch is still
+/// refused, as git does when that file doesn't say the main worktree is bare.
+#[cfg(unix)]
+#[test]
+fn switch_with_a_main_config_worktree_symlinked_outside() {
+	let (base, main, wt) = main_and_linked("gta-worktree-symlinked-config");
+	let wt_s = wt.to_str().unwrap();
+	let outside = base.join("outside");
+	std::fs::write(&outside, "[core]\n\tbare = false\n").unwrap();
+	std::os::unix::fs::symlink(&outside, main.join(".git/config.worktree")).unwrap();
+	for tool in ["git", "gta"] {
+		let ok = |branch: &str| match tool {
+			"git" => Command::new("git")
+				.args(["-C", wt_s, "switch", "-q", branch])
+				.output()
+				.unwrap()
+				.status
+				.success(),
+			_ => assert_cmd::Command::cargo_bin("gta")
+				.unwrap()
+				.args(["-C", wt_s, "switch", branch])
+				.output()
+				.unwrap()
+				.status
+				.success(),
+		};
+		assert!(!ok("main"), "{tool}: main switched to");
+		if tool == "gta" {
+			assert!(gta_fail(wt_s, &["switch", "main"]).contains("already checked out"));
+		}
+		assert!(ok("free"), "{tool}: free refused");
+		assert!(ok("side"), "{tool}: side refused");
+	}
 	std::fs::remove_dir_all(&base).ok();
 }
 

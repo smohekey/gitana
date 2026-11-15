@@ -4,6 +4,7 @@
 //! backend is held to the same contract.
 
 use gitana_file_store::{DeleteOutcome, DurabilityTarget, FileStore, FileStoreError, WriteOutcome};
+use gitana_path::{GitPath, GitPathComponent};
 
 /// Run the full [`FileStore`] contract against `store`. Panics on any violation.
 pub async fn check_file_store<S: FileStore>(store: &S) {
@@ -15,6 +16,7 @@ pub async fn check_file_store<S: FileStore>(store: &S) {
 	check_unlocked_deletes(store).await;
 	check_is_dir(store).await;
 	check_listing(store).await;
+	check_byte_paths(store).await;
 	check_streaming(store).await;
 	store
 		.durability_barrier(&[
@@ -245,6 +247,61 @@ async fn check_listing(store: &impl FileStore) {
 		.expect("bounded listing");
 	bounded.sort();
 	assert_eq!(bounded, got);
+}
+
+/// The byte-path methods, on UTF-8 names (every store holds those): the same entries and values as
+/// the `&str` methods. Run after [`check_listing`], whose files it lists.
+async fn check_byte_paths(store: &impl FileStore) {
+	let path = |text: &str| GitPath::from_utf8(text).expect("a valid path");
+	let mut names = store
+		.list_prefix_bytes(&path("objects/pack"))
+		.await
+		.expect("list pack dir by bytes");
+	names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+	assert_eq!(
+		names,
+		vec![
+			GitPathComponent::from_utf8("pack-a.pack").expect("a valid name"),
+			GitPathComponent::from_utf8("pack-b.pack").expect("a valid name"),
+		],
+		"list_prefix_bytes must list the folder's entries as list_prefix does"
+	);
+	assert!(
+		store
+			.list_prefix_bytes(&path("objects/absent"))
+			.await
+			.expect("list an absent folder")
+			.is_empty(),
+		"an absent folder lists nothing"
+	);
+	assert_eq!(
+		store
+			.read_path_bytes(&path("objects/pack/pack-a.pack"))
+			.await
+			.expect("read by bytes"),
+		b"a"
+	);
+	assert!(
+		matches!(
+			store.read_path_bytes(&path("objects/pack/absent")).await,
+			Err(FileStoreError::NotFound)
+		),
+		"reading an absent path by bytes must return NotFound"
+	);
+	for (name, is_dir) in [
+		("objects/pack", true),
+		("objects/pack/pack-a.pack", false),
+		("objects/absent", false),
+	] {
+		assert_eq!(
+			store
+				.is_dir_bytes(&path(name))
+				.await
+				.expect("is_dir by bytes"),
+			is_dir,
+			"is_dir_bytes({name}) must agree with is_dir"
+		);
+	}
 }
 
 async fn check_immutable_writes(store: &impl FileStore) {

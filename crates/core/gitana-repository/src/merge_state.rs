@@ -11,6 +11,25 @@ const MERGE_HEAD: &str = "MERGE_HEAD";
 const MERGE_MSG: &str = "MERGE_MSG";
 const CHERRY_PICK_HEAD: &str = "CHERRY_PICK_HEAD";
 const REVERT_HEAD: &str = "REVERT_HEAD";
+/// The state files stock git leaves for a merge beside `MERGE_HEAD` and `MERGE_MSG`, which its
+/// reset removes too.
+const MERGE_EXTRAS: [&str; 3] = ["MERGE_MODE", "AUTO_MERGE", "SQUASH_MSG"];
+/// The stash commit git's `merge --autostash` holds while its merge is in progress.
+const MERGE_AUTOSTASH: &str = "MERGE_AUTOSTASH";
+
+/// The stash commit a `git merge --autostash` in progress holds, or `None`.
+pub(crate) async fn merge_autostash<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+) -> Result<Option<ObjectId<H>>, RepositoryError> {
+	read_oid_file(repo, MERGE_AUTOSTASH).await
+}
+
+/// Remove `MERGE_AUTOSTASH`, once its commit is kept elsewhere.
+pub(crate) async fn clear_merge_autostash<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+) -> Result<(), RepositoryError> {
+	delete_if_present(repo, MERGE_AUTOSTASH).await
+}
 
 /// Record an in-progress merge: `MERGE_HEAD` (the commit being merged) and `MERGE_MSG` (the prepared
 /// commit message).
@@ -113,6 +132,20 @@ pub(crate) async fn merge_msg<H: HashAlgorithm>(
 }
 
 /// Clear the in-progress merge state (`MERGE_HEAD`, `MERGE_MSG`).
+/// Abandon any merge, cherry-pick or revert in progress, as git's reset does: their state files, and
+/// git's merge extras, removed. A rebase's state is left to its own abort.
+pub(crate) async fn abandon_operations<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+) -> Result<(), RepositoryError> {
+	clear_merge(repo).await?;
+	clear_cherry_pick(repo).await?;
+	clear_revert(repo).await?;
+	for name in MERGE_EXTRAS {
+		delete_if_present(repo, name).await?;
+	}
+	Ok(())
+}
+
 pub(crate) async fn clear_merge<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 ) -> Result<(), RepositoryError> {

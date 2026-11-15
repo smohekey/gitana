@@ -5,7 +5,7 @@ use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::{
 	HeadLock, HeadResetPlan, HeadState, HeadTransaction, HistoryMutationLease, Precondition, RefOp,
-	RepositoryError,
+	RepositoryError, is_valid_refname,
 };
 
 /// The maximum symbolic-ref chain depth to follow (git's limit), a guard against a cycle.
@@ -795,11 +795,45 @@ where
 		policy: Option<ReflogPolicy>,
 		preconditions: &[Precondition],
 	) -> Result<(), (String, RepositoryError)> {
-		let anon = |error| (String::new(), error);
 		let history_owner = ops.first().map(|op| op.name.clone()).unwrap_or_default();
 		let _history_lease = HistoryMutationLease::acquire(self.files)
 			.await
 			.map_err(|error| (history_owner, error))?;
+		self.transact_leased(ops, policy, preconditions).await
+	}
+
+	/// Store `commit` as the newest stash entry, as `git stash store -m <message>` does: `refs/stash`
+	/// moved to it, with a reflog entry, the stash's reflog created whatever `core.logAllRefUpdates`
+	/// says (git forces it: `git stash list` lists the reflog). For a caller that already holds the
+	/// history lease.
+	pub(crate) async fn store_stash_leased(
+		&self,
+		commit: ObjectId<H>,
+		committer: &str,
+		message: &str,
+	) -> Result<(), RepositoryError> {
+		let current = self.resolve("refs/stash").await?;
+		let op = RefOp {
+			name: "refs/stash".to_owned(),
+			expected: current,
+			new: Some(commit),
+			reflog: ReflogIntent::Log { committer, message },
+		};
+		self
+			.transact_leased(&[op], Some(ReflogPolicy::Always), &[])
+			.await
+			.map_err(|(_, error)| error)
+	}
+
+	/// The transaction [`Self::transact_inline`] runs, for a caller that already holds the history
+	/// lease.
+	async fn transact_leased(
+		&self,
+		ops: &[RefOp<'_, H>],
+		policy: Option<ReflogPolicy>,
+		preconditions: &[Precondition],
+	) -> Result<(), (String, RepositoryError)> {
+		let anon = |error| (String::new(), error);
 		let policy = match policy {
 			Some(policy) => policy,
 			None => self.reflog_policy().await.map_err(anon)?,
@@ -1633,10 +1667,25 @@ where
 	pub async fn lock_head_transaction(
 		&self,
 	) -> Result<HeadTransaction<F::Shared, H>, RepositoryError> {
+		let history_lease = HistoryMutationLease::acquire(self.files).await?;
+		self.lock_head_transaction_with(Some(history_lease)).await
+	}
+
+	/// [`Self::lock_head_transaction`] for a caller that already holds the history lease: the
+	/// transaction takes `HEAD`'s ref locks only.
+	pub(crate) async fn lock_head_transaction_leased(
+		&self,
+	) -> Result<HeadTransaction<F::Shared, H>, RepositoryError> {
+		self.lock_head_transaction_with(None).await
+	}
+
+	async fn lock_head_transaction_with(
+		&self,
+		history_lease: Option<HistoryMutationLease>,
+	) -> Result<HeadTransaction<F::Shared, H>, RepositoryError> {
 		let files = self.files.shared_handle();
 		let effective = self.effective.cloned();
 		let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
-		let history_lease = HistoryMutationLease::acquire(&files).await?;
 		let state = store.read_head().await?;
 		let planned = store.symbolic_ref_resolution("HEAD").await?;
 		let mut names = planned.chain.clone();
@@ -1682,7 +1731,7 @@ where
 		Ok(HeadTransaction {
 			files,
 			effective,
-			history_lease: Some(history_lease),
+			history_lease,
 			locks,
 			lock_names: names,
 			state,
@@ -2648,29 +2697,6 @@ fn parse_oid<H: HashAlgorithm>(name: &str, bytes: &[u8]) -> Result<ObjectId<H>, 
 		.map_err(|_| RepositoryError::InvalidRef(name.to_owned()))?
 		.trim();
 	ObjectId::from_hex(text).map_err(|_| RepositoryError::InvalidRef(format!("{name}: {text}")))
-}
-
-/// Whether a name obeys Git's refname rules, including valid one-level symbolic-ref targets.
-fn is_valid_refname(name: &str) -> bool {
-	if name.is_empty() || name == "@" {
-		return false;
-	}
-	if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
-		return false;
-	}
-	if name.contains("..") || name.contains("@{") || name.ends_with('.') {
-		return false;
-	}
-	if name.bytes().any(|byte| {
-		byte < 0x20
-			|| byte == 0x7f
-			|| matches!(byte, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
-	}) {
-		return false;
-	}
-	name
-		.split('/')
-		.all(|component| !component.starts_with('.') && !component.ends_with(".lock"))
 }
 
 fn split_packed_ref(line: &[u8]) -> Option<(&[u8], &[u8])> {

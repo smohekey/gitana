@@ -11,6 +11,7 @@ gitana-file-store.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
+gitana-path.workspace = true
 gitana-file-store-conformance.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 

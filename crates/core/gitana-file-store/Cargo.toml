@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 [dependencies]
+gitana-path.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 

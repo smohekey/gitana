@@ -17,7 +17,9 @@ mod native {
 	use gitana_config::GitConfig;
 	use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 	use gitana_object_store::ObjectStore;
-	use gitana_repository::{HeadState, HistoryMutationLease, RefOp, ReflogIntent, Repository};
+	use gitana_repository::{
+		BranchName, HeadState, HistoryMutationLease, RefOp, ReflogIntent, Repository,
+	};
 	use gitana_worktree::{Index, WorkTree};
 
 	use crate::admin_cleanup::{deregister_admin, path_absent, remove_directory_tree};
@@ -27,7 +29,7 @@ mod native {
 		CrossPointerHealth, DestinationKind, Registration, RequestedBranch, inspect,
 	};
 	use crate::object_id::IntoWorktreeObjectId;
-	use crate::pointers::{is_valid_refname, write_file_atomic};
+	use crate::pointers::write_file_atomic;
 	use crate::query::WorktreeQuery;
 	use crate::registration_lock::RegistrationLock;
 	use crate::repo_id::{detect_kind, open_store_raw, open_work_dir};
@@ -466,8 +468,8 @@ mod native {
 		requested_checked_out_elsewhere(&inspection.requested_branch)
 	}
 
-	/// Validate a branch/orphan target's name with git's `check-ref-format --branch` rules: a valid
-	/// `refs/heads/<name>` refname that additionally does not start with `-` and is not `HEAD`.
+	/// Validate a branch/orphan target's name with git's `check-ref-format --branch` rules, as
+	/// gitana-repository's [`BranchName::parse`] checks them.
 	fn validate_target_name(target: &CheckoutTarget) -> Result<(), CreateError> {
 		let name = match target {
 			CheckoutTarget::NewBranch { name, .. }
@@ -476,12 +478,9 @@ mod native {
 			CheckoutTarget::Detached { .. } => return Ok(()),
 		};
 		let short = name.short();
-		let valid = !short.starts_with('-') && short != "HEAD" && is_valid_refname(&name.refname());
-		if valid {
-			Ok(())
-		} else {
-			Err(CreateError::InvalidBranchName(short.to_owned()))
-		}
+		BranchName::parse(short)
+			.map(|_| ())
+			.map_err(|_| CreateError::InvalidBranchName(short.to_owned()))
 	}
 
 	/// Write the branch (when creating), the admin layout, and the checkout for `request`.

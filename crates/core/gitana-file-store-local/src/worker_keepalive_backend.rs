@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use gitana_file_store::Result;
+use gitana_path::{GitPath, GitPathComponent};
 
 use crate::{Backend, FileKind};
 
@@ -87,6 +88,22 @@ impl Backend for WorkerKeepaliveBackend {
 
 	fn sync_dir(&self, path: &str) -> std::io::Result<()> {
 		self.inner.sync_dir(path)
+	}
+
+	fn read_native(&self, path: &GitPath) -> std::io::Result<Vec<u8>> {
+		self.inner.read_native(path)
+	}
+
+	fn list_names_native(&self, dir: &GitPath) -> std::io::Result<Vec<GitPathComponent>> {
+		self.inner.list_names_native(dir)
+	}
+
+	fn kind_native(&self, path: &GitPath) -> std::io::Result<FileKind> {
+		self.inner.kind_native(path)
+	}
+
+	fn is_dir_native(&self, path: &GitPath) -> std::io::Result<bool> {
+		self.inner.is_dir_native(path)
 	}
 }
 

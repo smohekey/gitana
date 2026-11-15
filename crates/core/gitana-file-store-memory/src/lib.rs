@@ -389,8 +389,25 @@ impl FileStore for MemoryFileStore {
 #[cfg(test)]
 mod tests {
 	use gitana_file_store::{FileStore, FileStoreError};
+	use gitana_path::GitPath;
 
 	use super::MemoryFileStore;
+
+	/// A store without byte paths (this one, through the trait's defaults) can't name a path that
+	/// isn't UTF-8: an error, never `NotFound`, so a caller can't take it for an absent file.
+	#[tokio::test]
+	async fn a_path_that_is_not_utf8_is_an_error_not_a_miss() {
+		let store = MemoryFileStore::new();
+		let raw = GitPath::from_bytes(b"worktrees/wt-\xff".to_vec()).unwrap();
+		assert!(matches!(
+			store.read_path_bytes(&raw).await,
+			Err(FileStoreError::Backend(_))
+		));
+		assert!(matches!(
+			store.list_prefix_bytes(&raw).await,
+			Err(FileStoreError::Backend(_))
+		));
+	}
 
 	#[tokio::test]
 	async fn bounded_listing_uses_the_immediate_directory_index() {

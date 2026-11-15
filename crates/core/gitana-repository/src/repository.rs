@@ -4,8 +4,8 @@ use gitana_object_store::ObjectStore;
 
 use crate::tree::{FlatEntry, RawFlatEntry, build_tree};
 use crate::{
-	Config, HeadState, HistoryMutationLease, InitialCommitTransaction, RefStore, ReflogIntent,
-	RepositoryError, TreeBuildEntry,
+	Config, HeadState, HistoryMutationLease, InitialCommitTransaction, PreparedReset, RefStore,
+	ReflogIntent, RepositoryError, TreeBuildEntry,
 };
 
 /// A git repository: the object graph plus refs, over one repo-scoped store.
@@ -79,7 +79,7 @@ where
 	}
 
 	#[cfg(not(target_arch = "wasm32"))]
-	fn shared_repository(&self) -> Repository<F::Shared, H> {
+	pub(crate) fn shared_repository(&self) -> Repository<F::Shared, H> {
 		let mut repository =
 			Repository::new(ObjectStore::new(self.objects.file_store().shared_handle()));
 		repository.effective = self.effective.clone();
@@ -509,6 +509,75 @@ where
 		crate::merge_state::merge_msg(self).await
 	}
 
+	/// Move `HEAD` to `commit` as [`Self::reset_head`] does, then abandon any merge, cherry-pick or
+	/// revert in progress, as git's reset does: [`Self::prepare_reset_abandoning_operations`] then
+	/// [`PreparedReset::finish`], for a reset that changes neither the index nor the working tree.
+	/// It all runs as one task that finishes even if this future is dropped. The merge's autostash
+	/// saved, if there was one.
+	pub async fn reset_head_abandoning_operations(
+		&self,
+		commit: ObjectId<H>,
+		committer: &str,
+		message: &str,
+	) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let repository = self.shared_repository();
+			let committer = committer.to_owned();
+			let message = message.to_owned();
+			retained_repository_task(async move {
+				repository
+					.prepare_reset_abandoning_operations(commit, &committer, &message)
+					.await?
+					.finish()
+					.await
+			})
+			.await
+		}
+		#[cfg(target_arch = "wasm32")]
+		self
+			.prepare_reset_abandoning_operations(commit, committer, message)
+			.await?
+			.finish()
+			.await
+	}
+
+	/// Prepare a reset to `commit` that abandons any merge, cherry-pick or revert in progress, as
+	/// git's reset does: the history lease taken, a merge's autostash (git's `merge --autostash`, in
+	/// `MERGE_AUTOSTASH`) saved as the newest stash entry, "autostash", and `HEAD`'s ref locks taken
+	/// and its move validated, before the caller changes the index or working tree. Nothing can move
+	/// `HEAD` meanwhile. [`PreparedReset::finish`] then moves it and clears the state. A failure here
+	/// changes nothing, but for an autostash already saved, which is then in both `MERGE_AUTOSTASH`
+	/// and the stash list.
+	pub async fn prepare_reset_abandoning_operations(
+		&self,
+		commit: ObjectId<H>,
+		committer: &str,
+		message: &str,
+	) -> Result<PreparedReset<'_, F, H>, RepositoryError> {
+		#[cfg(not(target_arch = "wasm32"))]
+		let (history_lease, autostash) = {
+			let repository = self.shared_repository();
+			let committer = committer.to_owned();
+			retained_repository_task(
+				async move { lease_and_save_autostash(&repository, &committer).await },
+			)
+			.await?
+		};
+		#[cfg(target_arch = "wasm32")]
+		let (history_lease, autostash) = lease_and_save_autostash(self, committer).await?;
+		let mut transaction = self.refs().lock_head_transaction_leased().await?;
+		transaction
+			.prepare_reset(commit, ReflogIntent::Log { committer, message })
+			.await?;
+		Ok(PreparedReset {
+			repository: self,
+			transaction,
+			history_lease,
+			autostash,
+		})
+	}
+
 	/// Clear the in-progress merge state (`MERGE_HEAD`, `MERGE_MSG`).
 	pub async fn clear_merge(&self) -> Result<(), RepositoryError> {
 		#[cfg(not(target_arch = "wasm32"))]
@@ -601,6 +670,11 @@ where
 		crate::merge_state::revert_head(self).await
 	}
 
+	/// The stash commit a `git merge --autostash` in progress holds (`MERGE_AUTOSTASH`), or `None`.
+	pub async fn merge_autostash(&self) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		crate::merge_state::merge_autostash(self).await
+	}
+
 	/// Clear the in-progress revert state (`REVERT_HEAD`, `MERGE_MSG`).
 	pub async fn clear_revert(&self) -> Result<(), RepositoryError> {
 		#[cfg(not(target_arch = "wasm32"))]
@@ -651,6 +725,75 @@ where
 	/// Whether a rebase is in progress.
 	pub async fn rebase_in_progress(&self) -> Result<bool, RepositoryError> {
 		crate::rebase_state::rebase_in_progress(self).await
+	}
+
+	/// The operation left in progress in this worktree, if any: a merge, cherry-pick or revert (by
+	/// its `*_HEAD`), or a rebase, gitana's own or one stock git started (`rebase-merge/` for its
+	/// interactive and merge backends, `rebase-apply/` for its am backend; once such a rebase's
+	/// conflicts are staged nothing else shows it).
+	pub async fn operation_in_progress(&self) -> Result<Option<crate::Operation>, RepositoryError> {
+		if self.merge_head().await?.is_some() {
+			return Ok(Some(crate::Operation::Merge));
+		}
+		if self.cherry_pick_head().await?.is_some() {
+			return Ok(Some(crate::Operation::CherryPick));
+		}
+		if self.revert_head().await?.is_some() {
+			return Ok(Some(crate::Operation::Revert));
+		}
+		if self.rebase_in_progress().await? {
+			return Ok(Some(crate::Operation::Rebase));
+		}
+		let store = self.objects().file_store();
+		if store.is_dir("rebase-merge").await? || store.is_dir("rebase-apply").await? {
+			return Ok(Some(crate::Operation::Rebase));
+		}
+		Ok(None)
+	}
+
+	/// Make the branch `name` at `start` (a revision, peeled to its commit; `HEAD` if none), without
+	/// switching to it, recording `branch: Created from <start>` in its reflog as git does (the
+	/// current branch's name, or `HEAD` when detached, if no start was named). The committer for that
+	/// entry comes from `identity`, defaulting a missing one as git does for reflogs. The commit the
+	/// branch was made at, or why not: one of that name exists already (a branch made meanwhile is
+	/// refused at the write, never overwritten).
+	pub async fn create_branch(
+		&self,
+		name: &crate::BranchName,
+		start: Option<&str>,
+		identity: &impl gitana_identity::Identity,
+	) -> Result<ObjectId<H>, crate::BranchError> {
+		let full = name.full();
+		if self.refs().resolve(&full).await?.is_some() {
+			return Err(crate::BranchError::Exists(name.clone()));
+		}
+		let target = self.rev_parse(start.unwrap_or("HEAD")).await?;
+		let target = self.peel_to_commit(target).await?;
+		let from = match start {
+			Some(start) => start.to_owned(),
+			None => match self.refs().read_symbolic("HEAD").await? {
+				Some(head) => head.strip_prefix("refs/heads/").unwrap_or(&head).to_owned(),
+				None => "HEAD".to_owned(),
+			},
+		};
+		let committer = identity
+			.committer_or_default()
+			.await
+			.map_err(crate::BranchError::Identity)?;
+		let message = format!("branch: Created from {from}");
+		self
+			.refs()
+			.update_ref(
+				&full,
+				target,
+				None,
+				crate::ReflogIntent::Log {
+					committer: &committer,
+					message: &message,
+				},
+			)
+			.await?;
+		Ok(target)
 	}
 
 	/// Replace the rebase's remaining-commit list (oldest-first; current step first).
@@ -771,8 +914,31 @@ where
 	}
 }
 
+/// The first half of [`Repository::prepare_reset_abandoning_operations`], run where it's called:
+/// the history lease, and a merge's autostash read and saved as the newest stash entry.
+async fn lease_and_save_autostash<F, H>(
+	repository: &Repository<F, H>,
+	committer: &str,
+) -> Result<(HistoryMutationLease, Option<ObjectId<H>>), RepositoryError>
+where
+	F: FileStore,
+	H: HashAlgorithm,
+{
+	let history_lease = repository.lock_history_mutation().await?;
+	// Read before anything moves, so an unreadable one stops the reset with nothing changed.
+	let autostash = crate::merge_state::merge_autostash(repository).await?;
+	// Saved before `HEAD` moves, so a failure to save stops the reset with nothing changed.
+	if let Some(autostash) = autostash {
+		repository
+			.refs()
+			.store_stash_leased(autostash, committer, "autostash")
+			.await?;
+	}
+	Ok((history_lease, autostash))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
-async fn retained_repository_task<T>(
+pub(crate) async fn retained_repository_task<T>(
 	future: impl std::future::Future<Output = Result<T, RepositoryError>> + Send + 'static,
 ) -> Result<T, RepositoryError>
 where
@@ -791,6 +957,118 @@ mod tests {
 	use gitana_object_store::ObjectStore;
 
 	use crate::{Repository, RepositoryError};
+
+	/// Dropped while it moves `HEAD`, a reset still finishes: the branch moved and the cherry-pick in
+	/// progress abandoned, its state and git's merge extras all removed, none left half-cleared.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn a_cancelled_reset_still_moves_head_and_abandons_the_operation() {
+		use std::future::Future;
+		use std::task::{Context, Poll, Waker};
+
+		use gitana_file_store::FileStore;
+
+		const IDENTITY: &str = "A U Thor <author@example.com> 1700000000 +0000";
+		let files = crate::GatedFileStore::new();
+		let repository = Repository::<_, Sha256>::new(ObjectStore::new(files.shared_handle()));
+		repository.init().await.unwrap();
+		let tree = repository.write_tree(&[]).await.unwrap();
+		let one = repository
+			.create_commit(tree, Vec::new(), IDENTITY, IDENTITY, "one\n")
+			.await
+			.unwrap();
+		let two = repository
+			.create_commit(tree, vec![one], IDENTITY, IDENTITY, "two\n")
+			.await
+			.unwrap();
+		// `main` at `one`, with a cherry-pick in progress: written past the gate, which pauses
+		// replacing writes only.
+		for (path, bytes) in [
+			("refs/heads/main", format!("{one}\n")),
+			("CHERRY_PICK_HEAD", format!("{two}\n")),
+			("MERGE_MSG", "pick\n".to_owned()),
+			("AUTO_MERGE", format!("{tree}\n")),
+		] {
+			files
+				.write_path_if_absent(path, bytes.as_bytes())
+				.await
+				.unwrap();
+		}
+
+		let mut reset =
+			Box::pin(repository.reset_head_abandoning_operations(two, IDENTITY, "reset: moving to two"));
+		let mut context = Context::from_waker(Waker::noop());
+		assert!(matches!(reset.as_mut().poll(&mut context), Poll::Pending));
+		files.wait_until_blocked().await;
+		drop(reset);
+		files.release();
+		for _ in 0..1000 {
+			tokio::task::yield_now().await;
+			if !files.exists("AUTO_MERGE").await.unwrap()
+				&& !files.exists("gitana-history.lock").await.unwrap()
+			{
+				break;
+			}
+		}
+		assert_eq!(
+			repository.refs().resolve("refs/heads/main").await.unwrap(),
+			Some(two)
+		);
+		for path in ["CHERRY_PICK_HEAD", "MERGE_MSG", "AUTO_MERGE"] {
+			assert!(!files.exists(path).await.unwrap(), "{path} left behind");
+		}
+	}
+
+	/// A reset takes the repository's history lease once, from before `HEAD` moves until the operation
+	/// state is gone, so no other writer can start a merge in between for the cleanup to remove.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn a_reset_holds_one_history_lease_from_head_to_cleanup() {
+		use gitana_file_store::FileStore;
+
+		const IDENTITY: &str = "A U Thor <author@example.com> 1700000000 +0000";
+		let files = crate::GatedFileStore::new();
+		files.release();
+		let repository = Repository::<_, Sha256>::new(ObjectStore::new(files.shared_handle()));
+		repository.init().await.unwrap();
+		let tree = repository.write_tree(&[]).await.unwrap();
+		let one = repository
+			.create_commit(tree, Vec::new(), IDENTITY, IDENTITY, "one\n")
+			.await
+			.unwrap();
+		let two = repository
+			.create_commit(tree, vec![one], IDENTITY, IDENTITY, "two\n")
+			.await
+			.unwrap();
+		for (path, bytes) in [
+			("refs/heads/main", format!("{one}\n")),
+			("MERGE_HEAD", format!("{two}\n")),
+			("MERGE_MSG", "merge\n".to_owned()),
+		] {
+			files
+				.write_path_if_absent(path, bytes.as_bytes())
+				.await
+				.unwrap();
+		}
+		let before = files.history_locks_taken();
+		repository
+			.reset_head_abandoning_operations(two, IDENTITY, "reset: moving to two")
+			.await
+			.unwrap();
+		assert_eq!(files.history_locks_taken() - before, 1);
+		assert_eq!(files.deletes_without_history_lock(), 0);
+		assert_eq!(
+			repository.refs().resolve("refs/heads/main").await.unwrap(),
+			Some(two)
+		);
+		assert_eq!(
+			repository.refs().resolve("ORIG_HEAD").await.unwrap(),
+			Some(one)
+		);
+		for path in ["MERGE_HEAD", "MERGE_MSG"] {
+			assert!(!files.exists(path).await.unwrap(), "{path} left behind");
+		}
+	}
 
 	#[tokio::test]
 	async fn update_config_preserves_independent_edits() {

@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use crate::Backend;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use gitana_object::HashAlgorithm;
-use gitana_repository::{ReflogIntent, Repository};
+use gitana_repository::{BranchName, Repository};
 
 use crate::dispatch::{self, RepoCommand};
-use crate::identity::signature_or_default;
+use crate::identity::CliIdentity;
 
 /// List branches, or create `name` at `start` (default `HEAD`).
 pub async fn run(cwd: &Path, name: Option<String>, start: Option<String>) -> Result<()> {
@@ -50,45 +50,9 @@ async fn create<H: HashAlgorithm>(
 	name: &str,
 	start: Option<&str>,
 ) -> Result<()> {
-	let full = format!("refs/heads/{name}");
-	if repo.refs().resolve(&full).await?.is_some() {
-		bail!("a branch named '{name}' already exists");
-	}
-	let target = repo.rev_parse(start.unwrap_or("HEAD")).await?;
-	// git's reflog records the start point as the user named it, defaulting to the current branch's
-	// short name (its full object id when HEAD is detached) when none was given.
-	let from = match start {
-		Some(start) => start.to_owned(),
-		None => start_from_head(repo).await?,
-	};
-	let committer = signature_or_default(repo, "COMMITTER").await?;
-	let message = format!("branch: Created from {from}");
+	let name = BranchName::parse(name)?;
 	repo
-		.refs()
-		.update_ref(
-			&full,
-			target,
-			None,
-			ReflogIntent::Log {
-				committer: &committer,
-				message: &message,
-			},
-		)
+		.create_branch(&name, start, &CliIdentity::new(repo))
 		.await?;
 	Ok(())
-}
-
-/// The reflog "Created from" description of `HEAD` when no start point is named: the current branch's
-/// short name, or the literal `HEAD` when it is detached (git records `HEAD`, not the object id,
-/// for a branch created off a detached HEAD).
-async fn start_from_head<H: HashAlgorithm>(repo: &Repository<Backend, H>) -> Result<String> {
-	match repo.refs().read_symbolic("HEAD").await? {
-		Some(target) => Ok(
-			target
-				.strip_prefix("refs/heads/")
-				.unwrap_or(&target)
-				.to_owned(),
-		),
-		None => Ok("HEAD".to_owned()),
-	}
 }

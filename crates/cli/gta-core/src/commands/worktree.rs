@@ -259,7 +259,7 @@ enum Label {
 /// - no `commit_ish` → the basename branch: checked out if it exists, orphaned in an empty repo, else created.
 ///
 /// The branch-exists / branch-in-use / destination checks are the library `create`'s (mapped by the caller);
-/// only the DWIM shape and the name/commit-ish resolution (`validate_branch_name`, `resolve_commit`) are here.
+/// only the DWIM shape and the name/commit-ish resolution (`BranchName::parse`, `resolve_commit`) are here.
 async fn plan_checkout<H: HashAlgorithm>(
 	repo: &Repository<Backend, H>,
 	target: &Path,
@@ -281,7 +281,9 @@ async fn plan_checkout<H: HashAlgorithm>(
 	}
 
 	if let Some(name) = branch {
-		validate_branch_name(name)?;
+		// Checked before any ref or admin layout is written, so a name like `wt space` never becomes the
+		// broken ref `refs/heads/wt space`, which stock git rejects.
+		gitana_repository::BranchName::parse(name)?;
 		// Strict `-b <name>` where the branch already **exists** refuses "already exists" *before* any
 		// use-conflict check — git reports the existence first, even if the branch is also checked out
 		// elsewhere. (Only `-B`/`force_branch` proceeds, letting the library refuse an in-use branch as a
@@ -347,7 +349,7 @@ async fn plan_checkout<H: HashAlgorithm>(
 				.file_name()
 				.and_then(|name| name.to_str())
 				.ok_or_else(|| anyhow!("invalid worktree path: '{}'", target.display()))?;
-			validate_branch_name(name)?;
+			gitana_repository::BranchName::parse(name)?;
 			let refname = format!("refs/heads/{name}");
 			if repo.refs().resolve(&refname).await?.is_some() {
 				Ok((
@@ -406,33 +408,6 @@ async fn is_empty_repo<H: HashAlgorithm>(repo: &Repository<Backend, H>) -> Resul
 	)
 }
 
-/// Reject a branch name git's `check-ref-format --branch` would reject, before any ref or admin
-/// layout is written (a path-derived DWIM name or an explicit `-b`/`-B` name). Otherwise a name like
-/// `wt space` would be written as the broken ref `refs/heads/wt space`, which stock git then rejects.
-fn validate_branch_name(name: &str) -> Result<()> {
-	let bad = name.is_empty()
-		// `HEAD` is reserved (git `check-ref-format --branch` rejects it); `@` alone is permitted.
-		|| name == "HEAD"
-		|| name.starts_with('-')
-		|| name.starts_with('/')
-		|| name.ends_with('/')
-		|| name.ends_with('.')
-		|| name.contains("..")
-		|| name.contains("//")
-		|| name.contains("@{")
-		|| name
-			.chars()
-			.any(|c| c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
-		// Each `/`-separated component: non-empty, not `.`-led, not `.lock`-tailed.
-		|| name
-			.split('/')
-			.any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"));
-	if bad {
-		bail!("'{name}' is not a valid branch name");
-	}
-	Ok(())
-}
-
 /// Emit git's `Preparing worktree …` stderr line for a successful add, from the resolved
 /// [`CheckoutTarget`] (for the detached-HEAD short id).
 fn report_add(label: &Label, target: &CheckoutTarget) {
@@ -485,7 +460,7 @@ fn map_create_error(error: CreateError, path: &Path, target: &CheckoutTarget) ->
 		CreateError::BranchExists(name) => bail!("a branch named '{name}' already exists"),
 		// An `ExistingBranch` whose ref vanished (a race) — git says "invalid reference".
 		CreateError::BranchNotFound(name) => bail!("invalid reference: {name}"),
-		// Defensive: `plan_checkout`'s `validate_branch_name` catches this first.
+		// Defensive: `plan_checkout`'s `BranchName::parse` catches this first.
 		CreateError::InvalidBranchName(name) => bail!("'{name}' is not a valid branch name"),
 		CreateError::UnsupportedSymbolicBranchReset(name) => {
 			bail!("cannot reset symbolic-ref branch '{name}'; reset its terminal branch directly")

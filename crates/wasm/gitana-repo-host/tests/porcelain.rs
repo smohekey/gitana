@@ -283,6 +283,40 @@ async fn wasi_worktree_rejects_unrepresentable_git_path_bytes() -> Result<()> {
 	Ok(())
 }
 
+/// `add` reaching a nested repository is refused as `invalid`, the caller's to deal with, naming it;
+/// not as a backend failure.
+#[tokio::test]
+async fn wasi_add_refuses_a_nested_repository_as_invalid() -> Result<()> {
+	use gitana_repo_host::exports::gitana::repo::porcelain::{GitPath, RepoError};
+
+	let git = tempfile::tempdir()?;
+	seed_repo::<Sha256>(git.path()).await?;
+	let work = tempfile::tempdir()?;
+	std::fs::create_dir_all(work.path().join("nested/.git"))?;
+	std::fs::write(work.path().join("nested/file"), b"x\n")?;
+	let mut session = Session::open_worktree(git.path(), git.path(), work.path()).await?;
+	let result = session
+		.repo
+		.gitana_repo_porcelain()
+		.repository()
+		.call_add(
+			&mut session.store,
+			session.handle,
+			&[GitPath::Utf8("nested/file".to_owned())],
+			&GitPath::Utf8(String::new()),
+			false,
+		)
+		.await?;
+	match result {
+		Err(RepoError::Invalid(message)) => assert_eq!(
+			message,
+			"nested is a git repository of its own; it isn't staged"
+		),
+		other => anyhow::bail!("expected the nested repository refused as invalid, got {other:?}"),
+	}
+	Ok(())
+}
+
 #[tokio::test]
 async fn wasi_force_checkout_preflights_unrepresentable_tree_paths() -> Result<()> {
 	use gitana_repo_host::exports::gitana::repo::porcelain::RepoError;

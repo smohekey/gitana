@@ -4,10 +4,10 @@ use crate::Backend;
 use anyhow::{Result, bail};
 use gitana_object::HashAlgorithm;
 use gitana_path::GitPathspec;
-use gitana_worktree::WorkTree;
+use gitana_worktree::{ResetMode, WorkTree};
 
 use crate::dispatch::{self, WorkTreeCommand};
-use crate::identity;
+use crate::identity::CliIdentity;
 
 /// `reset` in its two forms.
 ///
@@ -85,36 +85,41 @@ impl WorkTreeCommand for Reset {
 			return Ok(());
 		}
 
-		let target = repo.rev_parse(rev).await?;
-		let commit = repo.peel_to_commit(target).await?;
-
-		// Materialise the index/working tree before moving the branch, so a failure (e.g. an unsafe
-		// tree path) leaves `HEAD` where it was — the same order `switch` checks out before moving.
-		if self.hard {
-			// Reset the index and the working tree to the commit, discarding local changes. The forced
-			// checkout skips the overwrite guard, but git still validates `core.excludesFile` (a directory
-			// is fatal) even under force, so resolve and pass it.
-			let tree = repo.commit_tree(commit).await?;
+		let mode = if self.hard {
+			ResetMode::Hard
+		} else if self.soft {
+			ResetMode::Soft
+		} else {
+			ResetMode::Mixed
+		};
+		// git still validates `core.excludesFile` (a directory is fatal) for a hard reset, though the
+		// forced checkout skips the overwrite guard, so it's resolved and passed.
+		let excludes_file = if self.hard {
 			let config = repo.effective_config().await?;
-			let excludes_file =
-				crate::excludes::resolve_excludes_file(&config, &self.cwd, &prefix).await?;
-			worktree
-				.checkout(tree, true, excludes_file.as_deref())
-				.await?;
-		} else if !self.soft {
-			// `--mixed` (the default): reset the index only.
-			let tree = repo.commit_tree(commit).await?;
-			worktree.reset_index(tree).await?;
-		}
-
-		let committer = identity::signature_or_default(repo, "COMMITTER").await?;
+			crate::excludes::resolve_excludes_file(&config, &self.cwd, &prefix).await?
+		} else {
+			None
+		};
+		// The revision as named, for the reflog; one whose name isn't UTF-8 is resolved to its id
+		// first, as the reset takes a name.
 		let rev = match std::str::from_utf8(rev) {
 			Ok(rev) => rev.to_owned(),
-			Err(_) => gitana_path::quote_bytes(rev),
+			Err(_) => repo.rev_parse(rev).await?.to_hex(),
 		};
-		repo
-			.reset_head(commit, &committer, &format!("reset: moving to {rev}"))
+		let outcome = worktree
+			.reset(
+				&rev,
+				mode,
+				&CliIdentity::new(repo),
+				excludes_file.as_deref(),
+			)
 			.await?;
+		// As git tells it when its reset saves a merge's autostash.
+		if outcome.autostash.is_some() {
+			eprintln!("Autostash exists; creating a new stash entry.");
+			eprintln!("Your changes are safe in the stash.");
+			eprintln!("You can run \"git stash pop\" or \"git stash drop\" at any time.");
+		}
 		Ok(())
 	}
 }

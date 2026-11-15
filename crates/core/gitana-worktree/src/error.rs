@@ -34,6 +34,15 @@ pub enum WorktreeError {
 	/// A checkout would overwrite or remove an untracked working-tree file (without `--force`).
 	#[error("untracked working tree file would be overwritten by checkout: {0}")]
 	UntrackedOverwrite(GitPath),
+	/// A switch told not to (`--no-overwrite-ignore`) would overwrite or remove an untracked, ignored
+	/// working-tree file.
+	#[error("ignored working tree file would be overwritten by switch: {0}")]
+	IgnoredOverwrite(GitPath),
+	/// `add` reached a nested repository (a folder with its own `.git`) that isn't a submodule
+	/// already in the index: staging its files would record another repository's contents, and git
+	/// would add it as a gitlink. Nothing is staged.
+	#[error("{0} is a git repository of its own; it isn't staged")]
+	EmbeddedRepository(GitPath),
 	/// A tree entry's path is unsafe (traversal, `.git`, or a symlinked ancestor).
 	#[error("unsafe path: {0}")]
 	UnsafePath(GitPath),
@@ -172,6 +181,14 @@ impl WorktreeError {
 				"untracked working tree file would be overwritten by checkout: {}",
 				render_path(path)
 			),
+			Self::IgnoredOverwrite(path) => format!(
+				"ignored working tree file would be overwritten by switch: {}",
+				render_path(path)
+			),
+			Self::EmbeddedRepository(path) => format!(
+				"{} is a git repository of its own; it isn't staged",
+				render_path(path)
+			),
 			Self::UnsafePath(path) => format!("unsafe path: {}", render_path(path)),
 			Self::UnsafePathspec(pathspec) => {
 				format!("unsafe path: {}", render_pathspec(pathspec))
@@ -301,6 +318,19 @@ mod tests {
 			error.render_with_paths(|path| path.quote_with_affixes(b"", b""), GitPathspec::quote)
 		};
 		assert_ne!(render(&raw_error), render(&literal_error));
+		for (raw_error, literal_error) in [
+			(
+				WorktreeError::IgnoredOverwrite(raw.clone()),
+				WorktreeError::IgnoredOverwrite(literal.clone()),
+			),
+			(
+				WorktreeError::EmbeddedRepository(raw.clone()),
+				WorktreeError::EmbeddedRepository(literal.clone()),
+			),
+		] {
+			assert_eq!(raw_error.to_string(), literal_error.to_string());
+			assert_ne!(render(&raw_error), render(&literal_error));
+		}
 
 		let raw_spec = GitPathspec::from_bytes(raw.as_bytes().to_vec()).unwrap();
 		let literal_spec = GitPathspec::from_bytes(literal.as_bytes().to_vec()).unwrap();

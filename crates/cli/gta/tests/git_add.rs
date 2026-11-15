@@ -442,3 +442,25 @@ fn git(dir: &Path, args: &[&str]) -> String {
 	);
 	String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
+
+#[test]
+fn add_refuses_a_nested_repository_naming_it_and_stages_nothing() {
+	// Where git adds a gitlink (and warns), gta refuses: staging another repository a command could
+	// have made would leave git going into it from then on.
+	let work = unique_tmp("nested");
+	git(&work, &["init", "-q", "-b", "main"]);
+	let nested = work.join("nested");
+	std::fs::create_dir_all(&nested).unwrap();
+	git(&nested, &["init", "-q"]);
+	std::fs::write(nested.join("file"), b"x\n").unwrap();
+	std::fs::write(work.join("beside.txt"), b"y\n").unwrap();
+	let out = gta_raw(&work, &["add", "."]);
+	assert!(!out.status.success());
+	assert!(
+		String::from_utf8_lossy(&out.stderr).contains("nested is a git repository of its own"),
+		"{}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	assert_eq!(git(&work, &["diff", "--cached", "--name-only"]), "");
+	std::fs::remove_dir_all(&work).ok();
+}

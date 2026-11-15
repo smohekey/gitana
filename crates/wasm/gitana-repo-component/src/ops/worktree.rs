@@ -82,13 +82,11 @@ pub(crate) async fn commit<H: HashAlgorithm>(
 	author: &str,
 	committer: &str,
 ) -> Result<String, RepoError> {
-	// Reuse `gitana_porcelain::commit` (the unmerged/empty/unchanged guards, tree write, and commit),
+	// Reuse `WorkTree::commit` (the in-progress/unmerged/empty/unchanged guards, tree write, and commit),
 	// supplying identity as the host-passed lines. `CommitError` keeps the refusals distinct from a
 	// store failure, so they map to `invalid` vs `backend` at the boundary.
 	let identity = HostIdentity { author, committer };
-	let id = gitana_porcelain::commit(wt, message, &identity)
-		.await
-		.map_err(commit_error)?;
+	let id = wt.commit(message, &identity).await.map_err(commit_error)?;
 	Ok(id.to_hex())
 }
 
@@ -287,7 +285,7 @@ fn sparse_outcome(outcome: SparseReapply) -> WitSparseOutcome {
 	}
 }
 
-/// Map a [`gitana_porcelain::CommitError`] to the boundary error. The three refusals are invalid
+/// Map a [`gitana_porcelain::CommitError`] to the boundary error. The refusals are invalid
 /// input; the underlying index/repository failures defer to the shared mappings so precise variants
 /// (`corruption`, `ref-moved`, …) survive the boundary rather than collapsing to `backend`.
 fn commit_error(error: gitana_porcelain::CommitError) -> RepoError {
@@ -300,8 +298,9 @@ fn commit_error(error: gitana_porcelain::CommitError) -> RepoError {
 		CommitError::Identity(error) | CommitError::Signing(error) => {
 			RepoError::Invalid(format!("{error:#}"))
 		}
-		refusal @ (CommitError::Unmerged | CommitError::Empty | CommitError::NothingToCommit) => {
-			RepoError::Invalid(refusal.to_string())
-		}
+		refusal @ (CommitError::InProgress(_)
+		| CommitError::Unmerged
+		| CommitError::Empty
+		| CommitError::NothingToCommit) => RepoError::Invalid(refusal.to_string()),
 	}
 }

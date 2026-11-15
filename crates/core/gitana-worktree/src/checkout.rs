@@ -37,6 +37,24 @@ where
 	W: WorkDirFs,
 	H: HashAlgorithm,
 {
+	run_with(wt, tree, mode, excludes_file, false).await
+}
+
+/// [`run`], and, with `protect_ignored`, a two-tree merge that refuses to overwrite or remove an
+/// ignored file (switch's `--no-overwrite-ignore`): checked once the index lock is held, against the
+/// index the checkout itself loads, so nothing can change in between.
+pub(crate) async fn run_with<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	tree: ObjectId<H>,
+	mode: CheckoutMode<H>,
+	excludes_file: Option<&[u8]>,
+	protect_ignored: bool,
+) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
 	// The two-tree merge is a distinct reconciliation (it preserves local divergences on paths the switch
 	// does not touch); dispatch to it before the authoritative Reset/Overlay body below. A *missing* index,
 	// though, has no staged state to preserve — git rebuilds it from the target like a full checkout — so
@@ -44,7 +62,7 @@ where
 	if let CheckoutMode::Merge { head } = mode
 		&& wt.index_exists().await?
 	{
-		return merge_apply(wt, head, tree, excludes_file).await;
+		return merge_apply(wt, head, tree, excludes_file, protect_ignored).await;
 	}
 	let force = matches!(mode, CheckoutMode::Reset);
 	let target = wt.repository().read_tree(tree).await?;
@@ -60,6 +78,9 @@ where
 	// `index.lock` (the working tree still matches the index); the apply phase marks mutation and commits.
 	let lock = wt.lock_index().await?;
 	let mut index = wt.load_index().await?;
+	if protect_ignored && matches!(mode, CheckoutMode::Merge { .. }) {
+		crate::switch::refuse_ignored(wt, tree, excludes_file, &index).await?;
+	}
 	let current: HashMap<GitPath, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
@@ -792,6 +813,7 @@ async fn merge_apply<F, W, H>(
 	head: ObjectId<H>,
 	target: ObjectId<H>,
 	excludes_file: Option<&[u8]>,
+	protect_ignored: bool,
 ) -> Result<(), WorktreeError>
 where
 	F: FileStore,
@@ -1290,6 +1312,22 @@ where
 			} else {
 				removals.push(path);
 			}
+		}
+		// Told not to overwrite ignored files (switch's `--no-overwrite-ignore`), check exactly the
+		// paths this plan writes, before anything changes.
+		if protect_ignored {
+			crate::switch::refuse_ignored_writes(
+				wt,
+				writes.iter().map(|path| {
+					(
+						*path,
+						to.get(*path).is_some_and(|(mode, _)| mode == "160000"),
+					)
+				}),
+				excludes_file,
+				&index,
+			)
+			.await?;
 		}
 		// Validate every path the apply phase will touch BEFORE it mutates — writes, plain removals, AND the
 		// D/F-collision removals. `df_removals` in particular must be here: a crafted stage-0 path (`p/.git/x`
@@ -1952,7 +1990,7 @@ fn fold_key(path: &GitPath, fold: bool) -> Vec<u8> {
 /// only the leaf would miss a `foo/`-style rule over `foo/bar` and wrongly refuse a checkout git allows
 /// (probed vs git 2.55: checking out a tree that adds `foo/bar` overwrites an untracked `foo/bar` when
 /// `foo/` is ignored).
-fn path_ignored<W: WorkDirFs>(
+pub(crate) fn path_ignored<W: WorkDirFs>(
 	work: &W,
 	path: &GitPath,
 	base: &[DirIgnore],
@@ -2032,17 +2070,26 @@ fn first_untracked_under<W: WorkDirFs>(
 	stack: &mut Vec<DirIgnore>,
 	fold: bool,
 ) -> Result<Option<GitPath>, WorktreeError> {
-	// A wholly-ignored directory is expendable — git doesn't descend into it.
-	if ignore::is_ignored_fold(dir_rel, true, stack, fold) {
+	// A wholly-ignored directory is expendable — git doesn't descend into it — and so is one inside an
+	// ignored directory, whose contents are ignored too (as `path_ignored` judges a single file).
+	if ignore::is_ignored_fold(dir_rel, true, stack, fold)
+		|| dir_rel
+			.strict_ancestors()
+			.into_iter()
+			.any(|ancestor| ignore::is_ignored_fold(&ancestor, true, stack, fold))
+	{
 		return Ok(None);
 	}
 	let pushed = push_gitignore(work, dir_rel, stack)?;
 	let mut found = None;
 	for entry in work.read_dir(dir_rel)? {
-		if entry.name == ".git" {
-			continue;
-		}
 		let rel = join_rel(dir_rel, &entry.name);
+		// A nested repository's `.git` is untracked content no rule ignores, its history with it: git
+		// won't lose it ("would lose untracked files in them"), so neither does this.
+		if entry.name == ".git" {
+			found = Some(rel);
+			break;
+		}
 		let is_dir = entry.kind.is_dir();
 		if ignore::is_ignored_fold(&rel, is_dir, stack, fold) {
 			continue; // ignored content is expendable

@@ -1822,7 +1822,8 @@ mod tests {
 		let mut index = Index::new();
 		stage(&mut index, "f.txt", blob);
 		worktree.save_index(&index).await.unwrap();
-		crate::commit(&worktree, "root", &TestIdentity::default())
+		worktree
+			.commit("root", &TestIdentity::default())
 			.await
 			.unwrap();
 
@@ -1895,7 +1896,8 @@ mod tests {
 		let mut index = Index::new();
 		stage(&mut index, "main.txt", blob);
 		worktree.save_index(&index).await.unwrap();
-		crate::commit(&worktree, "main", &TestIdentity::default())
+		worktree
+			.commit("main", &TestIdentity::default())
 			.await
 			.unwrap();
 		let other =
@@ -1972,7 +1974,8 @@ mod tests {
 		let mut index = Index::new();
 		stage(&mut index, "main.txt", blob);
 		worktree.save_index(&index).await.unwrap();
-		crate::commit(&worktree, "main", &TestIdentity::default())
+		worktree
+			.commit("main", &TestIdentity::default())
 			.await
 			.unwrap();
 		let main = worktree
@@ -2048,7 +2051,8 @@ mod tests {
 		let mut index = Index::new();
 		stage(&mut index, "main.txt", blob);
 		worktree.save_index(&index).await.unwrap();
-		crate::commit(&worktree, "main", &TestIdentity::default())
+		worktree
+			.commit("main", &TestIdentity::default())
 			.await
 			.unwrap();
 		let main = worktree
@@ -2153,7 +2157,8 @@ mod tests {
 		let mut index = Index::new();
 		stage(&mut index, "initial.txt", blob);
 		worktree.save_index(&index).await.unwrap();
-		crate::commit(&worktree, "initial", &TestIdentity::default())
+		worktree
+			.commit("initial", &TestIdentity::default())
 			.await
 			.unwrap();
 		let initial = worktree
@@ -2455,9 +2460,7 @@ mod tests {
 		let mut index = Index::new();
 		stage(&mut index, "f.txt", blob);
 		wt.save_index(&index).await.unwrap();
-		let tip = crate::commit(&wt, "root", &TestIdentity::default())
-			.await
-			.unwrap();
+		let tip = wt.commit("root", &TestIdentity::default()).await.unwrap();
 
 		// A server advertisement that offers push-cert (a nonce) and has no `refs/heads/main` yet, so
 		// the push is a create — always a fast-forward, no objects to reconcile.
@@ -2526,7 +2529,8 @@ mod tests {
 		let mut index = Index::new();
 		stage(&mut index, "f.txt", blob);
 		server.save_index(&index).await.unwrap();
-		let server_tip = crate::commit(&server, "srv", &TestIdentity::default())
+		let server_tip = server
+			.commit("srv", &TestIdentity::default())
 			.await
 			.unwrap();
 		let nonce = make_nonce(b"secret", "acme/app", 1_700_000_000, b"\x01\x02\x03\x04");
@@ -2594,9 +2598,7 @@ mod tests {
 		let mut index = Index::new();
 		stage(&mut index, "f.txt", blob);
 		wt.save_index(&index).await.unwrap();
-		crate::commit(&wt, "root", &TestIdentity::default())
-			.await
-			.unwrap();
+		wt.commit("root", &TestIdentity::default()).await.unwrap();
 
 		let (_server_dir, server) = fixture().await;
 		let advertisement = advertise(
@@ -2641,9 +2643,7 @@ mod tests {
 		let mut index = Index::new();
 		stage(&mut index, "f.txt", blob);
 		wt.save_index(&index).await.unwrap();
-		crate::commit(&wt, "root", &TestIdentity::default())
-			.await
-			.unwrap();
+		wt.commit("root", &TestIdentity::default()).await.unwrap();
 		let tip = wt
 			.repository()
 			.refs()

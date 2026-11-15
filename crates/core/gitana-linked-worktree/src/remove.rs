@@ -19,6 +19,8 @@
 mod native {
 	use std::path::Path;
 
+	use gitana_repository::RefName;
+
 	use crate::admin_cleanup::{deregister_admin, path_absent};
 	use crate::facts::{HeadKind, LockState};
 	use crate::head::{read_lock_reason, structural_head_branch};
@@ -609,7 +611,7 @@ mod native {
 	/// no-object-store filesystem check: a loose ref file `<common>/<refname>`, or an entry in
 	/// `<common>/packed-refs`. Used so an **unborn** branch (HEAD names it, but no ref exists yet) is not
 	/// misreported as retained, honouring [`RemoveOutcome`]'s contract. `refname` is a caller-validated
-	/// (`is_valid_refname`) `refs/heads/*`, so `<common>/<refname>` cannot escape the repository.
+	/// (a [`RefName`]) `refs/heads/*`, so `<common>/<refname>` cannot escape the repository.
 	fn shared_branch_exists(common: &Path, refname: &str) -> bool {
 		// A **file** loose ref is the branch. `std::fs::metadata` FOLLOWS symlinks, so a legacy *symlinked* loose
 		// ref (resolving to a real ref file) correctly counts as existing, while a *directory* at
@@ -882,7 +884,7 @@ mod native {
 		let retained_branch = recheck
 			.head_terminal
 			.as_deref()
-			.filter(|b| b.starts_with("refs/heads/") && crate::pointers::is_valid_refname(b))
+			.filter(|b| b.starts_with("refs/heads/") && RefName::parse(b).is_ok())
 			.filter(|b| shared_branch_exists(common, b))
 			.map(str::to_owned);
 		perform_remove(request, &action, &admin).await?;

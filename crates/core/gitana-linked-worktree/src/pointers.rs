@@ -7,6 +7,8 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use gitana_repository::RefName;
+
 use crate::LinkedWorktreeError;
 
 /// The raw admin entries directly under `<common>/worktrees/` (every child, no symlink policy applied).
@@ -598,32 +600,6 @@ fn read_ref_symref(path: &Path) -> Result<Option<String>, LinkedWorktreeError> {
 /// git gives up with "too many levels of symbolic references".
 pub(crate) const SYMREF_MAXDEPTH: usize = 5;
 
-/// Whether `name` obeys git's `check-ref-format` rules (verified against `git check-ref-format`): no
-/// component beginning with `.` or ending with `.lock`, no `..`, no `//` / leading / trailing slash, no
-/// control chars / space / `~^:?*[\`, no `@{`, not a bare `@`, no trailing `.`. This both matches git
-/// (a HEAD naming an *invalid* ref is rejected, never reported as a healthy unborn branch) **and**
-/// preserves the security property — `..`, absolute paths, and `\` are refused, so `base.join(name)`
-/// cannot escape the repository.
-pub(crate) fn is_valid_refname(name: &str) -> bool {
-	if name.is_empty() || name == "@" {
-		return false;
-	}
-	if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
-		return false;
-	}
-	if name.contains("..") || name.contains("@{") || name.ends_with('.') {
-		return false;
-	}
-	if name.bytes().any(|b| {
-		b < 0x20 || b == 0x7f || matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
-	}) {
-		return false;
-	}
-	name
-		.split('/')
-		.all(|comp| !comp.starts_with('.') && !comp.ends_with(".lock"))
-}
-
 /// A ref that lives in the *per-worktree* namespace (read from the worktree git dir) rather than the
 /// shared common dir — git's per-worktree refs.
 fn is_per_worktree_ref(name: &str) -> bool {
@@ -742,7 +718,7 @@ pub(crate) fn resolve_ref_terminal(
 		// bar` as a repository, verified). A symref *chain* may then pass through a one-level pseudoref
 		// terminal (`HEAD -> refs/heads/alias -> CUSTOM_REF`, verified), so the `refs/` requirement applies
 		// only to the first name. Every hop must obey `check-ref-format` (which also blocks escaping the repo).
-		if (first && !name.starts_with("refs/")) || !is_valid_refname(&name) {
+		if (first && !name.starts_with("refs/")) || RefName::parse(&name).is_err() {
 			return Err(malformed(first));
 		}
 		let first_hop = first;

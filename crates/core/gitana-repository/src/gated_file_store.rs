@@ -1,5 +1,5 @@
 use std::future::poll_fn;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
 
@@ -12,6 +12,8 @@ struct WriteGate {
 	started: AtomicBool,
 	released: AtomicBool,
 	fail_packed_reads: AtomicBool,
+	history_locks: AtomicUsize,
+	deletes_without_history_lock: AtomicUsize,
 	waker: Mutex<Option<Waker>>,
 }
 
@@ -29,9 +31,24 @@ impl GatedFileStore {
 				started: AtomicBool::new(false),
 				released: AtomicBool::new(false),
 				fail_packed_reads: AtomicBool::new(false),
+				history_locks: AtomicUsize::new(0),
+				deletes_without_history_lock: AtomicUsize::new(0),
 				waker: Mutex::new(None),
 			}),
 		}
+	}
+
+	/// How many times the repository's history lock has been taken through this store.
+	pub(crate) fn history_locks_taken(&self) -> usize {
+		self.gate.history_locks.load(Ordering::Acquire)
+	}
+
+	/// How many paths other than lock files were deleted while the history lock wasn't held.
+	pub(crate) fn deletes_without_history_lock(&self) -> usize {
+		self
+			.gate
+			.deletes_without_history_lock
+			.load(Ordering::Acquire)
 	}
 
 	pub(crate) fn fail_packed_reads(&self) {
@@ -106,8 +123,12 @@ impl FileStore for GatedFileStore {
 		self.inner.write_path_if_absent(path, bytes)
 	}
 
-	fn try_lock_path(&self, path: &str) -> impl Future<Output = Result<Option<PathLock>>> {
-		self.inner.try_lock_path(path)
+	async fn try_lock_path(&self, path: &str) -> Result<Option<PathLock>> {
+		let lock = self.inner.try_lock_path(path).await?;
+		if path == "gitana-history.lock" && lock.is_some() {
+			self.gate.history_locks.fetch_add(1, Ordering::AcqRel);
+		}
+		Ok(lock)
 	}
 
 	async fn write_path_cas(
@@ -125,12 +146,14 @@ impl FileStore for GatedFileStore {
 		self.inner.write_path_replace(path, bytes).await
 	}
 
-	fn delete_path(
-		&self,
-		path: &str,
-		expected: Option<&Version>,
-	) -> impl Future<Output = Result<DeleteOutcome>> {
-		self.inner.delete_path(path, expected)
+	async fn delete_path(&self, path: &str, expected: Option<&Version>) -> Result<DeleteOutcome> {
+		if !path.ends_with(".lock") && !self.inner.exists("gitana-history.lock").await? {
+			self
+				.gate
+				.deletes_without_history_lock
+				.fetch_add(1, Ordering::AcqRel);
+		}
+		self.inner.delete_path(path, expected).await
 	}
 
 	fn delete_path_unlocked(&self, path: &str) -> impl Future<Output = Result<DeleteOutcome>> {
