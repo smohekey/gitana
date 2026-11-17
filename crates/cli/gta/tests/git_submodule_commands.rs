@@ -1078,6 +1078,7 @@ fn deinit_finds_a_modules_relative_attributes_file_as_git_does() {
 
 /// A module's `core.attributesFile` that's a symlink in its checkout to a file outside it is followed,
 /// as git opens the path: deinit sees the module clean, as git does.
+#[cfg(unix)]
 #[test]
 fn deinit_follows_a_modules_symlinked_attributes_file_as_git_does() {
 	let by_gta = Fixture::new("deinit-symlinked-attributes-gta");
@@ -1116,6 +1117,7 @@ fn deinit_follows_a_modules_symlinked_attributes_file_as_git_does() {
 }
 
 /// A module's `core.attributesFile` that can't be read adds nothing, with git's warning in git's words.
+#[cfg(unix)]
 #[test]
 fn deinit_warns_of_an_unreadable_module_attributes_file_as_git_does() {
 	use std::os::unix::fs::PermissionsExt;
