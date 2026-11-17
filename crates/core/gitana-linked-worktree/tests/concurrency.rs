@@ -8,7 +8,7 @@ mod common;
 use common::*;
 use gitana_linked_worktree::{
 	CheckoutTarget, CreateError, CreateRequest, LinkedWorktreeError, RemovePolicy, RemoveRequest,
-	RepositoryId, WorktreeObjectId, create, remove,
+	RepositoryId, Setup, WorktreeObjectId, create, remove,
 };
 
 fn detached(start: WorktreeObjectId) -> CheckoutTarget {
@@ -22,6 +22,8 @@ fn create_req(repo: RepositoryId, dest: &std::path::Path, target: CheckoutTarget
 		target,
 		committer: None,
 		reflog_start: None,
+		worktree_config: None,
+		sparse_checkout: None,
 	}
 }
 
@@ -53,7 +55,11 @@ async fn concurrent_creates_do_not_duplicate_the_registration() {
 			.map(|_| {
 				let (repo, dest, start) = (repo.clone(), dest.clone(), start.clone());
 				std::thread::spawn(move || {
-					block_on(create(&create_req(repo, &dest, detached(start)), None))
+					block_on(create(
+						&create_req(repo, &dest, detached(start)),
+						&Setup::default(),
+						&Setup::default(),
+					))
 				})
 			})
 			.collect();
@@ -116,7 +122,11 @@ async fn same_runtime_contention_makes_progress_without_stalling() {
 
 		let req_a = create_req(repo.clone(), &dest, detached(start.clone()));
 		let req_b = create_req(repo.clone(), &dest, detached(start.clone()));
-		let (ra, rb) = tokio::join!(create(&req_a, None), create(&req_b, None));
+		let setup = Setup::default();
+		let (ra, rb) = tokio::join!(
+			create(&req_a, &setup, &setup),
+			create(&req_b, &setup, &setup)
+		);
 
 		assert!(
 			ra.is_ok() && rb.is_ok(),
@@ -150,7 +160,8 @@ async fn a_held_registration_lock_surfaces_as_a_retryable_conflict() {
 		std::fs::write(&lock, b"").unwrap();
 		let err = create(
 			&create_req(repo.clone(), &dest, detached(start.clone())),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap_err();
@@ -176,9 +187,13 @@ async fn a_held_registration_lock_surfaces_as_a_retryable_conflict() {
 
 		// Releasing the lock lets the same request succeed — the conflict is retryable.
 		std::fs::remove_file(&lock).unwrap();
-		create(&create_req(repo, &dest, detached(start)), None)
-			.await
-			.unwrap();
+		create(
+			&create_req(repo, &dest, detached(start)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert_eq!(
 			git(&["-C", dest.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
 			head
@@ -207,24 +222,34 @@ async fn concurrent_create_and_remove_reach_a_consistent_state() {
 		// Establish the worktree, then race a second create against a remove of the same destination.
 		create(
 			&create_req(repo.clone(), &dest, detached(start.clone())),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap();
 
 		let creater = {
 			let (repo, dest, start) = (repo.clone(), dest.clone(), start.clone());
-			std::thread::spawn(move || block_on(create(&create_req(repo, &dest, detached(start)), None)))
+			std::thread::spawn(move || {
+				block_on(create(
+					&create_req(repo, &dest, detached(start)),
+					&Setup::default(),
+					&Setup::default(),
+				))
+			})
 		};
 		let remover = {
 			let (repo, dest) = (repo.clone(), dest.clone());
 			std::thread::spawn(move || {
-				block_on(remove(&RemoveRequest {
-					repo,
-					destination: dest,
-					expected_branch: None,
-					policy: RemovePolicy::Conservative,
-				}))
+				block_on(remove(
+					&RemoveRequest {
+						repo,
+						destination: dest,
+						expected_branch: None,
+						policy: RemovePolicy::Conservative,
+					},
+					&Setup::default(),
+				))
 			})
 		};
 		let create_res = creater.join().unwrap();

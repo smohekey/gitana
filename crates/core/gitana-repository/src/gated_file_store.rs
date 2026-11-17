@@ -115,6 +115,10 @@ impl FileStore for GatedFileStore {
 		self.inner.read_path_versioned(path)
 	}
 
+	fn modified(&self, path: &str) -> impl Future<Output = Result<Option<std::time::SystemTime>>> {
+		self.inner.modified(path)
+	}
+
 	fn write_path_if_absent(
 		&self,
 		path: &str,

@@ -22,6 +22,8 @@ mod native {
 	};
 	use gitana_worktree::{Index, WorkTree};
 
+	use crate::{NewWorktreeSetup, Setup};
+
 	use crate::admin_cleanup::{deregister_admin, path_absent, remove_directory_tree};
 	use crate::create_error::CreateError;
 	use crate::facts::{HeadKind, LockState};
@@ -46,15 +48,18 @@ mod native {
 
 	/// Establish the linked worktree described by `request`, reconciling against its current state.
 	///
-	/// `effective` is the merged config to honour for the committer identity (every reflog line) and
-	/// `core.logAllRefUpdates` reflog gating — `None` uses the repository-local config alone. Returns the
-	/// resulting [`WorktreeInspection`] on success (including an idempotent no-op when it already existed
-	/// exactly); every refusal/failure is a [`CreateError`].
-	pub async fn create(
+	/// `setup` is the caller's: its config is the merged config to honour for the committer identity
+	/// (every reflog line) and `core.logAllRefUpdates` reflog gating — `None` uses the repository-local
+	/// config alone. The new worktree's checkout (line endings, attributes files) follows the setup
+	/// `new_worktree` gives once the worktree's git folder and `HEAD` exist, as git's child checkout
+	/// resolves its own. Returns the resulting [`WorktreeInspection`] on success (including an
+	/// idempotent no-op when it already existed exactly); every refusal/failure is a [`CreateError`].
+	pub async fn create<P: NewWorktreeSetup + Clone + 'static>(
 		request: &CreateRequest,
-		effective: Option<&GitConfig>,
+		setup: &Setup,
+		new_worktree: &P,
 	) -> Result<WorktreeInspection, CreateError> {
-		retained_create(request, effective, false).await
+		retained_create(request, setup, new_worktree, false).await
 	}
 
 	/// Establish a worktree while authorizing cleanup of the exact checkout-missing partial left by
@@ -66,23 +71,26 @@ mod native {
 	/// `expected_start`, and discards the partial only when the retained admin `HEAD`, shared branch,
 	/// repository, destination, and baseline all match that request. The checkout must still lack its
 	/// final `.git` marker. Every mismatch follows ordinary fail-closed create behavior.
-	pub async fn recover_prepared_create(
+	pub async fn recover_prepared_create<P: NewWorktreeSetup + Clone + 'static>(
 		request: &CreateRequest,
-		effective: Option<&GitConfig>,
+		setup: &Setup,
+		new_worktree: &P,
 	) -> Result<WorktreeInspection, CreateError> {
-		retained_create(request, effective, true).await
+		retained_create(request, setup, new_worktree, true).await
 	}
 
-	async fn retained_create(
+	async fn retained_create<P: NewWorktreeSetup + Clone + 'static>(
 		request: &CreateRequest,
-		effective: Option<&GitConfig>,
+		setup: &Setup,
+		new_worktree: &P,
 		recover_prepared: bool,
 	) -> Result<WorktreeInspection, CreateError> {
 		let request = request.clone();
-		let effective = effective.cloned();
-		match tokio::spawn(
-			async move { create_inner(&request, effective.as_ref(), recover_prepared).await },
-		)
+		let setup = setup.clone();
+		let new_worktree = new_worktree.clone();
+		match tokio::spawn(async move {
+			create_inner(&request, &setup, &new_worktree, recover_prepared).await
+		})
 		.await
 		{
 			Ok(result) => result,
@@ -90,9 +98,10 @@ mod native {
 		}
 	}
 
-	async fn create_inner(
+	async fn create_inner<P: NewWorktreeSetup>(
 		request: &CreateRequest,
-		effective: Option<&GitConfig>,
+		setup: &Setup,
+		new_worktree: &P,
 		recover_prepared: bool,
 	) -> Result<WorktreeInspection, CreateError> {
 		if !request.destination.is_absolute() {
@@ -107,10 +116,10 @@ mod native {
 		let _lock = RegistrationLock::acquire(request.repo.common_dir()).await?;
 
 		let query = request_query(request);
-		let mut inspection = inspect(&query).await?;
+		let mut inspection = inspect(&query, setup).await?;
 		if recover_prepared && let Some(admin) = prepared_partial_admin(request, &inspection) {
-			discard_prepared_partial(request, &inspection, &admin).await?;
-			inspection = inspect(&query).await?;
+			discard_prepared_partial(request, &inspection, &admin, setup).await?;
+			inspection = inspect(&query, setup).await?;
 		}
 
 		let _history_lease = match decide(&inspection, &request.target)? {
@@ -119,8 +128,12 @@ mod native {
 				let common = request.repo.common_dir();
 				let store = open_store_raw(common, common)?;
 				match detect_kind(&store).await? {
-					HashKind::Sha1 => write_worktree::<Sha1>(request, effective, create_branch).await?,
-					HashKind::Sha256 => write_worktree::<Sha256>(request, effective, create_branch).await?,
+					HashKind::Sha1 => {
+						write_worktree::<Sha1, P>(request, setup, new_worktree, create_branch).await?
+					}
+					HashKind::Sha256 => {
+						write_worktree::<Sha256, P>(request, setup, new_worktree, create_branch).await?
+					}
 				}
 			}
 		};
@@ -132,7 +145,7 @@ mod native {
 		// means a race changed the state out from under us, so it is one `NotEstablished` lost-race error
 		// carrying the observed post-state, never a preflight-style refusal or a false success. (A genuine
 		// I/O failure during the re-inspect still propagates as `Failed` via `?`.)
-		let established = inspect(&query).await?;
+		let established = inspect(&query, setup).await?;
 		match decide(&established, &request.target) {
 			Ok(Action::AlreadyThere) => Ok(established),
 			Ok(Action::Write { .. }) | Err(_) => Err(CreateError::NotEstablished(Box::new(established))),
@@ -197,9 +210,10 @@ mod native {
 		request: &CreateRequest,
 		observed: &WorktreeInspection,
 		admin: &Path,
+		setup: &Setup,
 	) -> Result<(), CreateError> {
 		let query = request_query(request);
-		let recheck = inspect(&query).await?;
+		let recheck = inspect(&query, setup).await?;
 		if prepared_partial_admin(request, &recheck).as_deref() != Some(admin) || &recheck != observed {
 			return Err(CreateError::NotEstablished(Box::new(recheck)));
 		}
@@ -214,7 +228,7 @@ mod native {
 		}
 		if !path_absent(&request.destination) {
 			return Err(CreateError::NotEstablished(Box::new(
-				inspect(&query).await?,
+				inspect(&query, setup).await?,
 			)));
 		}
 
@@ -225,7 +239,7 @@ mod native {
 		)
 		.await?;
 
-		let cleared = inspect(&query).await?;
+		let cleared = inspect(&query, setup).await?;
 		if cleared.registration != Registration::None
 			|| cleared.destination_kind != DestinationKind::Absent
 		{
@@ -484,9 +498,10 @@ mod native {
 	}
 
 	/// Write the branch (when creating), the admin layout, and the checkout for `request`.
-	async fn write_worktree<H: HashAlgorithm>(
+	async fn write_worktree<H: HashAlgorithm, P: NewWorktreeSetup>(
 		request: &CreateRequest,
-		effective: Option<&GitConfig>,
+		setup: &Setup,
+		new_worktree: &P,
 		create_branch: bool,
 	) -> Result<HistoryMutationLease, CreateError>
 	where
@@ -497,7 +512,7 @@ mod native {
 
 		// The shared repository: source of the branch ref, the committer identity, and the reflog policy.
 		let mut repo = Repository::<_, H>::new(ObjectStore::new(open_store_raw(common, common)?));
-		if let Some(config) = effective {
+		if let Some(config) = &setup.config {
 			repo.set_effective_config(config.clone());
 		}
 		let config = repo
@@ -671,13 +686,46 @@ mod native {
 		// `core.logAllRefUpdates` is *explicitly* disabled (not the host's bare default of off).
 		let log_head = head_reflog_enabled(&config);
 		let admin = write_admin_layout(&admin, destination, &head, start, &committer, log_head)?;
+		// git copies the invoking worktree's `config.worktree` into the new one, before the checkout, when
+		// per-worktree config is on: all but `core.bare` (when true) and `core.worktree`.
+		if let Some(bytes) = &request.worktree_config
+			&& repo
+				.read_config()
+				.await
+				.map_err(LinkedWorktreeError::Repository)?
+				.get_bool("extensions", None, "worktreeconfig")
+				.ok()
+				.flatten()
+				== Some(true)
+			&& let Some(filtered) = filtered_worktree_config(bytes)
+		{
+			write_file_atomic(&admin.join("config.worktree"), filtered.as_bytes())?;
+		}
+		// And its sparse patterns, when it has sparse checkout on, so the checkout below honours them.
+		if let Some(patterns) = &request.sparse_checkout {
+			let info = admin.join("info");
+			std::fs::create_dir_all(&info)
+				.map_err(|e| LinkedWorktreeError::io("creating admin info dir", &info, e))?;
+			write_file_atomic(&info.join("sparse-checkout"), patterns)?;
+		}
 
 		// Materialise the checkout (index + files) in the new worktree's namespace, *then* write the
 		// checkout's `.git` gitfile last — the commit point that makes the registration live. An orphan has
 		// no start, so it gets a valid zero-entry index and an empty checkout (as git does).
-		let new_repo = Repository::<_, H>::new(ObjectStore::new(open_store_raw(&admin, common)?));
+		// Its files are written out as the new worktree's own setup says (its config's line endings, and
+		// the attributes files), resolved now that its git folder and `HEAD` exist, as git's child checkout
+		// resolves them in the new worktree.
+		let checkout_setup = new_worktree
+			.setup_for(&admin, destination)
+			.await
+			.map_err(LinkedWorktreeError::NewWorktreeSetup)?;
+		let mut new_repo = Repository::<_, H>::new(ObjectStore::new(open_store_raw(&admin, common)?));
+		if let Some(config) = checkout_setup.config {
+			new_repo.set_effective_config(config);
+		}
 		let work = open_work_dir(destination)?;
-		let worktree = WorkTree::new(new_repo, work, admin.clone());
+		let worktree = WorkTree::new(new_repo, work, admin.clone())
+			.with_outside_attributes(checkout_setup.attributes);
 		match tree {
 			Some(tree) => worktree
 				.checkout(tree, false, None)
@@ -830,6 +878,18 @@ mod native {
 	/// Write git's admin layout for the new worktree — the admin's `gitdir` back-pointer, `commondir`,
 	/// `HEAD`, and (for a non-orphan) `ORIG_HEAD` plus a seeded `logs/HEAD` — returning the canonical admin
 	/// path. The **checkout's** `.git` gitfile is *not* written here (see [`write_checkout_gitfile`]).
+	/// A worktree's `config.worktree` as git copies it into a new worktree: without `core.bare` when
+	/// it's true, and without `core.worktree`. `None` for a file that isn't UTF-8 config, which isn't
+	/// copied.
+	fn filtered_worktree_config(bytes: &[u8]) -> Option<String> {
+		let mut config = GitConfig::parse(std::str::from_utf8(bytes).ok()?).ok()?;
+		if config.get_bool("core", None, "bare").ok().flatten() == Some(true) {
+			config.unset("core", None, "bare");
+		}
+		config.unset("core", None, "worktree");
+		Some(config.render())
+	}
+
 	fn write_admin_layout<H: HashAlgorithm>(
 		admin: &Path,
 		destination: &Path,
@@ -984,6 +1044,31 @@ mod native {
 			assert_eq!(san(b"x.LOCK"), "x.LOCK"); // case-sensitive
 			assert_eq!(san(b"x.locked"), "x.locked"); // only a whole trailing '.lock'
 			assert_eq!(san(b"x.git"), "x.git"); // '.git' is fine
+		}
+	}
+
+	#[cfg(test)]
+	mod worktree_config_tests {
+		use super::filtered_worktree_config;
+
+		/// git's filter: `core.bare` goes when true, `core.worktree` always; the rest is copied.
+		#[test]
+		fn copies_a_worktree_config_as_git_does() {
+			let filtered =
+				filtered_worktree_config(b"[core]\n\tbare = true\n\tworktree = /x\n\tautocrlf = true\n")
+					.unwrap();
+			let config = gitana_config::GitConfig::parse(&filtered).unwrap();
+			assert_eq!(config.get_string("core", None, "bare"), None);
+			assert_eq!(config.get_string("core", None, "worktree"), None);
+			assert_eq!(config.get_string("core", None, "autocrlf"), Some("true"));
+			let kept = filtered_worktree_config(b"[core]\n\tbare = false\n").unwrap();
+			assert_eq!(
+				gitana_config::GitConfig::parse(&kept)
+					.unwrap()
+					.get_string("core", None, "bare"),
+				Some("false")
+			);
+			assert_eq!(filtered_worktree_config(b"[core\xff"), None);
 		}
 	}
 

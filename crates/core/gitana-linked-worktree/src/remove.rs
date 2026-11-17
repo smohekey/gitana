@@ -39,7 +39,7 @@ mod native {
 	use crate::remove_outcome::RemoveOutcome;
 	use crate::remove_request::RemoveRequest;
 	use crate::repo_id::{detect_kind, open_store_raw, reject_unsupported_repository_format};
-	use crate::{LinkedWorktreeError, ProtectionReason, RemovePolicy, WorktreeClassification};
+	use crate::{LinkedWorktreeError, ProtectionReason, RemovePolicy, Setup, WorktreeClassification};
 
 	/// What a removal should do, decided from the inspection.
 	#[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,11 +69,18 @@ mod native {
 	/// Returns [`RemoveOutcome::Removed`] on success (retaining the branch and its commits) or
 	/// [`RemoveOutcome::AlreadyAbsent`] when the exact worktree is already gone (idempotent). Every
 	/// refusal/failure is a [`RemoveError`].
-	pub async fn remove(request: &RemoveRequest) -> Result<RemoveOutcome, RemoveError> {
+	///
+	/// The safety check compares files with the index as `setup` says they'd be stored.
+	pub async fn remove(
+		request: &RemoveRequest,
+		setup: &Setup,
+	) -> Result<RemoveOutcome, RemoveError> {
 		match request.policy {
-			RemovePolicy::GitCompat { force } if force >= 1 => remove_git_forced(request, force).await,
+			RemovePolicy::GitCompat { force } if force >= 1 => {
+				remove_git_forced(request, force, setup).await
+			}
 			// `Conservative` or `GitCompat { force: 0 }` — the safe, force-free path.
-			_ => remove_conservative(request).await,
+			_ => remove_conservative(request, setup).await,
 		}
 	}
 
@@ -84,7 +91,10 @@ mod native {
 	/// Returns [`RemoveOutcome::Removed`] on success (retaining the branch and its commits) or
 	/// [`RemoveOutcome::AlreadyAbsent`] when the exact worktree is already gone (idempotent). Every
 	/// refusal/failure is a [`RemoveError`].
-	async fn remove_conservative(request: &RemoveRequest) -> Result<RemoveOutcome, RemoveError> {
+	async fn remove_conservative(
+		request: &RemoveRequest,
+		setup: &Setup,
+	) -> Result<RemoveOutcome, RemoveError> {
 		if !request.destination.is_absolute() {
 			return Err(LinkedWorktreeError::RelativePath(request.destination.clone()).into());
 		}
@@ -128,7 +138,7 @@ mod native {
 		// malformed index still returns its structured refusal — git's lock-first behaviour — rather than a
 		// `Failed` from the status computation. Only when the preflight would proceed to a destructive action
 		// do we run the status-bearing inspection that the dirty/residual gate needs.
-		let preflight = inspect(&remove_query(request, false)).await?;
+		let preflight = inspect(&remove_query(request, false), setup).await?;
 		match decide_remove(
 			&preflight,
 			is_primary_worktree(&preflight, common)?,
@@ -144,7 +154,7 @@ mod native {
 			Err(e) => return Err(e),
 		}
 
-		let inspection = inspect(&query).await?;
+		let inspection = inspect(&query, setup).await?;
 		let action = decide_remove(
 			&inspection,
 			is_primary_worktree(&inspection, common)?,
@@ -165,7 +175,7 @@ mod native {
 		// re-check). A race that changed the state aborts without deleting: if it is now refused (dirty, locked,
 		// a re-appeared conflict) surface that refusal; if it is already gone report the idempotent no-op; if it
 		// became a *different* removable shape do not delete a moved target — report it for re-inspection.
-		let recheck = inspect(&query).await?;
+		let recheck = inspect(&query, setup).await?;
 		match decide_remove(
 			&recheck,
 			is_primary_worktree(&recheck, common)?,
@@ -194,7 +204,7 @@ mod native {
 			.filter(|h| h.state == HeadKind::Symbolic)
 			.and_then(|h| h.branch.clone())
 			.filter(|b| b.starts_with("refs/heads/"));
-		perform_remove(request, &action, &admin).await?;
+		perform_remove(request, &action, &admin, setup).await?;
 		Ok(RemoveOutcome::Removed {
 			destination: request.destination.clone(),
 			retained_branch,
@@ -462,6 +472,7 @@ mod native {
 		request: &RemoveRequest,
 		action: &RemoveAction,
 		admin: &Path,
+		setup: &Setup,
 	) -> Result<(), RemoveError> {
 		// Defence-in-depth against deleting *through* a leaf symlink: a destination that is itself a symlink —
 		// including the `.../wt-link/` trailing-separator spelling that hides one from a naive stat — must never
@@ -469,7 +480,7 @@ mod native {
 		// worktree) and leave a dangling link, falsely reporting `Removed`. Inspection already classifies such a
 		// destination as `OtherFsObject` (refused), so this only guards a symlink swapped in after that check.
 		if is_leaf_symlink(&request.destination) {
-			let post = inspect(&remove_query(request, false)).await?;
+			let post = inspect(&remove_query(request, false), setup).await?;
 			return Err(RemoveError::Incomplete(Box::new(post)));
 		}
 		// Resolve the destination to its real path **before** deleting anything. A caller may pass a valid but
@@ -496,7 +507,7 @@ mod native {
 		// Drop the admin **only once the checkout is confirmed gone** — a still-present checkout keeps its
 		// registration (repairable), never an orphaned checkout pointing at a deleted admin.
 		if !path_absent(&destination) {
-			let post = inspect(&remove_query(request, false)).await?;
+			let post = inspect(&remove_query(request, false), setup).await?;
 			return Err(RemoveError::Incomplete(Box::new(post)));
 		}
 
@@ -512,7 +523,7 @@ mod native {
 		match deregister_admin(admin) {
 			Ok(()) => Ok(()),
 			Err(_) => {
-				let post = inspect(&remove_query(request, false)).await?;
+				let post = inspect(&remove_query(request, false), setup).await?;
 				Err(RemoveError::Incomplete(Box::new(post)))
 			}
 		}
@@ -825,6 +836,7 @@ mod native {
 	async fn remove_git_forced(
 		request: &RemoveRequest,
 		force: u8,
+		setup: &Setup,
 	) -> Result<RemoveOutcome, RemoveError> {
 		if !request.destination.is_absolute() {
 			return Err(LinkedWorktreeError::RelativePath(request.destination.clone()).into());
@@ -870,7 +882,7 @@ mod native {
 				});
 			}
 			Ok(_) => {
-				let post = inspect(&remove_query(request, false)).await?;
+				let post = inspect(&remove_query(request, false), setup).await?;
 				return Err(RemoveError::Incomplete(Box::new(post)));
 			}
 			Err(e) => return Err(e),
@@ -887,7 +899,7 @@ mod native {
 			.filter(|b| b.starts_with("refs/heads/") && RefName::parse(b).is_ok())
 			.filter(|b| shared_branch_exists(common, b))
 			.map(str::to_owned);
-		perform_remove(request, &action, &admin).await?;
+		perform_remove(request, &action, &admin, setup).await?;
 		Ok(RemoveOutcome::Removed {
 			destination: request.destination.clone(),
 			retained_branch,

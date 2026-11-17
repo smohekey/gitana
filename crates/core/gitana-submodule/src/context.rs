@@ -9,7 +9,7 @@ use gitana_object::{HashAlgorithm, HashKind, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
 use gitana_repository_layout::RepositoryLayout;
-use gitana_worktree::{PathspecSet, WorkTree};
+use gitana_worktree::{OutsideAttributes, PathspecSet, WorkTree};
 
 use crate::{
 	ConfigViews, ConfigurationProvider, InitConfigResult, InitConfigUpdate, InitNotice, InitOutcome,
@@ -27,6 +27,7 @@ pub struct SubmoduleContext {
 	pub(crate) configs: ConfigViews,
 	pub(crate) prefix: String,
 	pub(crate) hash_kind: HashKind,
+	pub(crate) outside_attributes: OutsideAttributes,
 }
 
 pub(crate) struct RelativeUrlBase {
@@ -55,7 +56,15 @@ impl SubmoduleContext {
 			configs,
 			prefix,
 			hash_kind,
+			outside_attributes: OutsideAttributes::default(),
 		})
+	}
+
+	/// This context, its working trees (the superproject's and each submodule's) reading the
+	/// attributes files from outside the repository too.
+	pub fn with_outside_attributes(mut self, attributes: OutsideAttributes) -> Self {
+		self.outside_attributes = attributes;
+		self
 	}
 
 	pub fn layout(&self) -> &RepositoryLayout {
@@ -711,12 +720,15 @@ impl SubmoduleContext {
 		let mut repository = Repository::new(ObjectStore::new(self.file_store()?));
 		repository.set_effective_config(self.configs.superproject.clone());
 		let work = CapWorkDir::from_dir(self.clone_dir(&self.work, self.worktree_root())?);
-		Ok(WorkTree::new_located(
-			repository,
-			work,
-			self.layout.git_dir.clone(),
-			self.worktree_root().to_owned(),
-		))
+		Ok(
+			WorkTree::new_located(
+				repository,
+				work,
+				self.layout.git_dir.clone(),
+				self.worktree_root().to_owned(),
+			)
+			.with_outside_attributes(self.outside_attributes.clone()),
+		)
 	}
 
 	pub(crate) fn file_store(&self) -> Result<WorktreeFileStore, SubmoduleError> {

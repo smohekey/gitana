@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::{Backend, ResultPathMode};
 use anyhow::Result;
 use gitana_object::HashAlgorithm;
-use gitana_path::GitPathspec;
-use gitana_worktree::{WorkTree, WorktreeError};
+use gitana_path::{GitPath, GitPathspec};
+use gitana_worktree::{LineEndingChange, WorkTree, WorktreeError};
 
 use crate::dispatch::{self, WorkTreeCommand};
 use crate::error::AddAdvisory;
@@ -64,6 +65,15 @@ impl WorkTreeCommand for Add<'_> {
 		} else {
 			crate::excludes::resolve_excludes_file(&config, &self.cwd, &prefix).await?
 		};
+		// The paths the index has before staging: git warns of their line endings before its ignored-path
+		// advisory, and of new files' after it.
+		let tracked: HashSet<GitPath> = worktree
+			.load_index()
+			.await?
+			.entries
+			.into_iter()
+			.map(|entry| entry.path)
+			.collect();
 		match worktree
 			.add_pathspecs(
 				self.pathspecs,
@@ -73,10 +83,21 @@ impl WorkTreeCommand for Add<'_> {
 			)
 			.await
 		{
-			Ok(()) => Ok(()),
+			Ok(outcome) => {
+				report_line_endings(&outcome.line_ending_warnings, self.result_path_mode);
+				Ok(())
+			}
 			// git stages everything it can, then exits non-zero rendering the sparse block (for out-of-cone
-			// pathspecs) and/or the ignored block (for ignored pathspecs). The staged work is already saved.
-			Err(WorktreeError::PathspecAdvisory { sparse, ignored }) => {
+			// pathspecs) and/or the ignored block (for ignored pathspecs). The staged work is already saved,
+			// and its line-ending warnings go where git prints them while staging.
+			Err(WorktreeError::PathspecAdvisory {
+				sparse,
+				ignored,
+				line_ending_warnings: warnings,
+			}) => {
+				let (tracked_warnings, new_warnings): (Vec<_>, Vec<_>) = warnings
+					.into_iter()
+					.partition(|(path, _)| tracked.contains(path));
 				let sparse = sparse
 					.iter()
 					.map(|path| crate::git_path::render_result_pathspec(path, self.result_path_mode))
@@ -85,9 +106,43 @@ impl WorkTreeCommand for Add<'_> {
 					.iter()
 					.map(|path| crate::git_path::render_result_path(path, self.result_path_mode))
 					.collect();
-				Err(AddAdvisory::new(sparse, ignored, show_sparse_hints, show_ignored_hints).into())
+				Err(
+					AddAdvisory::new(sparse, ignored, show_sparse_hints, show_ignored_hints)
+						.with_line_ending_warnings(
+							line_ending_warnings(&tracked_warnings, self.result_path_mode),
+							line_ending_warnings(&new_warnings, self.result_path_mode),
+						)
+						.into(),
+				)
 			}
 			Err(other) => Err(other.into()),
 		}
 	}
+}
+
+/// Warn, as git's `core.safecrlf=warn` (its default) does, of each staged file whose line endings
+/// the next checkout will change.
+fn report_line_endings(warnings: &[(GitPath, LineEndingChange)], result_path_mode: ResultPathMode) {
+	for warning in line_ending_warnings(warnings, result_path_mode) {
+		eprintln!("{warning}");
+	}
+}
+
+fn line_ending_warnings(
+	warnings: &[(GitPath, LineEndingChange)],
+	result_path_mode: ResultPathMode,
+) -> Vec<String> {
+	warnings
+		.iter()
+		.map(|(path, change)| {
+			let path = crate::git_path::render_result_path(path, result_path_mode);
+			let (from, to) = match change {
+				LineEndingChange::CrlfToLf => ("CRLF", "LF"),
+				LineEndingChange::LfToCrlf => ("LF", "CRLF"),
+			};
+			format!(
+				"warning: in the working copy of '{path}', {from} will be replaced by {to} the next time Git touches it"
+			)
+		})
+		.collect()
 }

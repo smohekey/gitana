@@ -118,6 +118,19 @@ impl Backend for DescriptorBackend {
 		}
 	}
 
+	fn modified(&self, path: &str) -> std::io::Result<std::time::SystemTime> {
+		let stat = self
+			.dir
+			.stat_at(PathFlags::SYMLINK_FOLLOW, path)
+			.map_err(io_error)?;
+		match stat.data_modification_timestamp {
+			Some(time) => {
+				Ok(std::time::UNIX_EPOCH + std::time::Duration::new(time.seconds, time.nanoseconds))
+			}
+			None => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+		}
+	}
+
 	fn size(&self, path: &str) -> std::io::Result<u64> {
 		let stat = self
 			.dir

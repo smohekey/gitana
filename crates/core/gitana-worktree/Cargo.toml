@@ -22,7 +22,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 gitana-object-store.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 gitana-fs-native.workspace = true

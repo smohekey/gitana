@@ -242,6 +242,8 @@ async fn clone_into<H: HashAlgorithm>(
 		None,
 		persist_url,
 		false,
+		// A headless clone reads no user setup: no system or global attributes files.
+		gitana_worktree::OutsideAttributes::default(),
 	)
 	.await
 	.map_err(|source| CloneError::Clone {

@@ -9,7 +9,7 @@ use crate::admin_cleanup::{open_directory_nofollow, path_absent, remove_empty_di
 use crate::create::{matches_target, request_query};
 use crate::{
 	CreateError, CreateRequest, CrossPointerHealth, DestinationKind, LinkedWorktreeError,
-	Registration, RemoveError, RemoveRequest, WorktreeInspection, WorktreeQuery, inspect,
+	Registration, RemoveError, RemoveRequest, Setup, WorktreeInspection, WorktreeQuery, inspect,
 };
 
 /// Flush a complete created worktree's checkout and administration before a caller records its
@@ -23,7 +23,7 @@ pub async fn durability_barrier_created(
 	request: &CreateRequest,
 ) -> Result<WorktreeInspection, CreateError> {
 	let query = request_query(request);
-	let before = inspect(&query).await?;
+	let before = inspect(&query, &Setup::default()).await?;
 	require_created(request, &before)?;
 	let admin = before
 		.git_dir
@@ -49,7 +49,7 @@ pub async fn durability_barrier_created(
 	.await?;
 	sync_directory(request.repo.common_dir(), "syncing repository namespace").await?;
 
-	let after = inspect(&query).await?;
+	let after = inspect(&query, &Setup::default()).await?;
 	require_created(request, &after)?;
 	if before == after {
 		Ok(after)
@@ -71,7 +71,7 @@ pub async fn durability_barrier_removed(request: &RemoveRequest) -> Result<(), R
 		start: None,
 		with_status: false,
 	};
-	let before = inspect(&query).await?;
+	let before = inspect(&query, &Setup::default()).await?;
 	if before.registration != Registration::None {
 		return Err(RemoveError::Incomplete(Box::new(before)));
 	}
@@ -84,7 +84,9 @@ pub async fn durability_barrier_removed(request: &RemoveRequest) -> Result<(), R
 		_ => return Err(RemoveError::Incomplete(Box::new(before))),
 	}
 	if !path_absent(&destination) {
-		return Err(RemoveError::Incomplete(Box::new(inspect(&query).await?)));
+		return Err(RemoveError::Incomplete(Box::new(
+			inspect(&query, &Setup::default()).await?,
+		)));
 	}
 
 	let worktrees = request.repo.common_dir().join("worktrees");
@@ -121,7 +123,7 @@ pub async fn durability_barrier_removed(request: &RemoveRequest) -> Result<(), R
 	.await?;
 	sync_directory(request.repo.common_dir(), "syncing repository namespace").await?;
 
-	let after = inspect(&query).await?;
+	let after = inspect(&query, &Setup::default()).await?;
 	if after.registration == Registration::None && after.destination_kind == DestinationKind::Absent {
 		Ok(())
 	} else {

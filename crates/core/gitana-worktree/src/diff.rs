@@ -7,14 +7,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gitana_file_store::FileStore;
 use gitana_file_store_local::{Meta, WorkDirFs};
-use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_object::{HashAlgorithm, ObjectId, ObjectKind};
 use gitana_path::{GitPath, GitTreePath};
 use gitana_repository::Repository;
 
-use crate::fsmeta::{blob_of, effective_mode};
+use crate::fsmeta::effective_mode;
 use crate::submodule_head_oid;
-use crate::worktree::stat_matches;
-use crate::{WorkTree, WorktreeError};
+use crate::{Converter, WorkTree, WorktreeError};
 
 /// git's mode bits for a submodule (gitlink) entry.
 const GITLINK_MODE: u32 = 0o160000;
@@ -45,7 +44,10 @@ pub struct FileDiff {
 pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
 ) -> Result<Vec<FileDiff>, WorktreeError> {
+	let index_time = wt.index_time().await?;
 	let index = wt.load_index().await?;
+	// Working files are compared, and shown, as they'd be stored, as git diffs them.
+	let mut checkin = Converter::check_in(wt, &index, index_time).await?;
 	let mut out = Vec::new();
 	for entry in index.entries.iter().filter(|e| e.stage == 0) {
 		if entry.mode == GITLINK_MODE {
@@ -80,7 +82,10 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 				// (`FileKind::Other`) is NOT read (reading a pipe blocks forever) — it falls to the arm below,
 				// which resolves nothing and emits no hunk (git exits "unsupported file type").
 				Some(meta) if meta.kind.is_file() => {
-					let new = read_worktree(wt.work(), &entry.path, &meta)?;
+					let new = checkin
+						.stored_form(&entry.path, &meta, None)
+						.await?
+						.unwrap_or_default();
 					out.push(FileDiff {
 						path: entry.path.clone().into(),
 						old: Some((gitlink_content(&entry.oid), entry.mode)),
@@ -123,15 +128,23 @@ pub(crate) async fn unstaged<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			});
 			continue;
 		};
-		if stat_matches(entry, &meta) {
+		if checkin.trusts_stat(entry, &meta) {
 			continue;
 		}
-		// Re-hash to decide if the content really changed (mtime alone can lie).
-		match blob_of(wt.work(), &entry.path, &meta)? {
-			Some((oid, _)) if oid == entry.oid && effective_mode(&meta, entry.mode) == entry.mode => {}
+		// Re-hash to decide if the content really changed (mtime alone can lie). A file gitana can't convert
+		// is shown as it is.
+		let stored = checkin.stored_form(&entry.path, &meta, Some(entry)).await?;
+		match stored
+			.as_ref()
+			.map(|stored| ObjectId::<H>::compute(ObjectKind::Blob, stored))
+		{
+			Some(oid) if oid == entry.oid && effective_mode(&meta, entry.mode) == entry.mode => {}
 			_ => {
 				let old = wt.repository().read_blob(entry.oid).await?;
-				let new = read_worktree(wt.work(), &entry.path, &meta)?;
+				let new = match stored {
+					Some(stored) => stored,
+					None => read_worktree(wt.work(), &entry.path, &meta)?,
+				};
 				out.push(FileDiff {
 					path: entry.path.clone().into(),
 					old: Some((old, entry.mode)),

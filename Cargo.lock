@@ -1633,6 +1633,7 @@ dependencies = [
  "gitana-porcelain",
  "gitana-remote",
  "gitana-repository",
+ "gitana-worktree",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

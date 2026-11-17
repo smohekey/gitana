@@ -1,5 +1,7 @@
 use gitana_path::{GitPath, GitPathspec};
 
+use crate::LineEndingChange;
+
 /// Errors from working-tree / index operations.
 #[derive(Debug, thiserror::Error)]
 pub enum WorktreeError {
@@ -38,6 +40,17 @@ pub enum WorktreeError {
 	/// working-tree file.
 	#[error("ignored working tree file would be overwritten by switch: {0}")]
 	IgnoredOverwrite(GitPath),
+	/// The file's attributes ask for a conversion gitana won't do: a filter program (`filter=`
+	/// with a driver configured, or one `required`), `working-tree-encoding`, or `ident`. Nothing
+	/// is staged or written. `attribute` is as written.
+	#[error("{path}: its attributes ask for {attribute}, which gitana doesn't do")]
+	UnsupportedAttribute { path: GitPath, attribute: String },
+	/// `core.safecrlf=true` and staging the file would change its line endings irreversibly.
+	#[error("{} in {path}", crlf_refusal(*change))]
+	IrreversibleLineEndings {
+		path: GitPath,
+		change: LineEndingChange,
+	},
 	/// `add` reached a nested repository (a folder with its own `.git`) that isn't a submodule
 	/// already in the index: staging its files would record another repository's contents, and git
 	/// would add it as a gitlink. Nothing is staged.
@@ -95,6 +108,8 @@ pub enum WorktreeError {
 	/// definition (git's `--sparse` advice, in argument/discovery order); `ignored` are the reported
 	/// ignored paths (git's `-f` advice, collapsed to where each rule matched and sorted lexicographically).
 	/// Either or both may be non-empty; a front-end renders git's corresponding block(s).
+	/// `line_ending_warnings` are those of the files that were staged, as [`crate::AddOutcome`]'s, which
+	/// git prints before the advisory.
 	#[error(
 		"some pathspecs could not be staged — outside the sparse-checkout: [{}]; ignored (use -f to add): [{}]",
 		join_display(.sparse),
@@ -103,6 +118,7 @@ pub enum WorktreeError {
 	PathspecAdvisory {
 		sparse: Vec<GitPathspec>,
 		ignored: Vec<GitPath>,
+		line_ending_warnings: Vec<(GitPath, LineEndingChange)>,
 	},
 	/// An empty pathspec (`""`) was given.
 	#[error("empty string is not a valid pathspec")]
@@ -189,6 +205,13 @@ impl WorktreeError {
 				"{} is a git repository of its own; it isn't staged",
 				render_path(path)
 			),
+			Self::UnsupportedAttribute { path, attribute } => format!(
+				"{}: its attributes ask for {attribute}, which gitana doesn't do",
+				render_path(path)
+			),
+			Self::IrreversibleLineEndings { path, change } => {
+				format!("{} in {}", crlf_refusal(*change), render_path(path))
+			}
 			Self::UnsafePath(path) => format!("unsafe path: {}", render_path(path)),
 			Self::UnsafePathspec(pathspec) => {
 				format!("unsafe path: {}", render_pathspec(pathspec))
@@ -219,7 +242,9 @@ impl WorktreeError {
 				"'{}' is outside the sparse-checkout; disable or modify the sparsity rules to update it in the index",
 				render_path(path)
 			),
-			Self::PathspecAdvisory { sparse, ignored } => format!(
+			Self::PathspecAdvisory {
+				sparse, ignored, ..
+			} => format!(
 				"some pathspecs could not be staged — outside the sparse-checkout: [{}]; ignored (use -f to add): [{}]",
 				sparse
 					.iter()
@@ -291,6 +316,14 @@ impl WorktreeError {
 			Self::Repository(error) => error.render_with_paths(&render_path, &render_pathspec),
 			_ => self.to_string(),
 		}
+	}
+}
+
+/// git's words for a `core.safecrlf=true` refusal, before the path.
+fn crlf_refusal(change: LineEndingChange) -> &'static str {
+	match change {
+		LineEndingChange::CrlfToLf => "CRLF would be replaced by LF",
+		LineEndingChange::LfToCrlf => "LF would be replaced by CRLF",
 	}
 }
 

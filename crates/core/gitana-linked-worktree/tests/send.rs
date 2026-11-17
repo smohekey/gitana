@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use gitana_linked_worktree::{
-	BranchName, CheckoutTarget, CreateRequest, RemovePolicy, RemoveRequest, RepositoryId,
+	BranchName, CheckoutTarget, CreateRequest, RemovePolicy, RemoveRequest, RepositoryId, Setup,
 	WorktreeContext, WorktreeQuery, create, enumerate, inspect, remove, status,
 };
 
@@ -31,6 +31,8 @@ fn public_op_futures_are_send() {
 		},
 		committer: None,
 		reflog_start: None,
+		worktree_config: None,
+		sparse_checkout: None,
 	};
 	let remove_request = RemoveRequest {
 		repo: repo.clone(),
@@ -47,9 +49,17 @@ fn public_op_futures_are_send() {
 	};
 	let context = WorktreeContext::new(repo.clone());
 
-	assert_send(&create(&create_request, None));
-	assert_send(&remove(&remove_request));
-	assert_send(&inspect(&query));
+	assert_send(&create(
+		&create_request,
+		&Setup::default(),
+		&Setup::default(),
+	));
+	assert_send(&remove(&remove_request, &Setup::default()));
+	assert_send(&inspect(&query, &Setup::default()));
 	assert_send(&enumerate(&context));
-	assert_send(&status(&repo, Path::new("/nonexistent/wt")));
+	assert_send(&status(
+		&repo,
+		Path::new("/nonexistent/wt"),
+		&Setup::default(),
+	));
 }

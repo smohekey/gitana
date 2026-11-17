@@ -993,6 +993,274 @@ fn update_init_materializes_the_recorded_commit_in_a_detached_worktree() {
 	assert_mount_points_at_per_worktree_repository(&fixture.consumer);
 }
 
+/// A module's `core.attributesFile` that leaves its checkout (`../attrs`) is read from the module's
+/// root by path, as git reads it.
+#[test]
+fn update_init_reads_an_attributes_file_outside_the_module_as_git_does() {
+	let by_gta = Fixture::new("update-parent-attributes-gta");
+	let by_git = Fixture::new("update-parent-attributes-git");
+	for fixture in [&by_gta, &by_git] {
+		std::fs::create_dir_all(fixture.consumer.join("modules")).unwrap();
+		std::fs::write(
+			fixture.consumer.join("modules/attrs"),
+			b"*.txt text eol=crlf\n",
+		)
+		.unwrap();
+	}
+	let setting = "core.attributesFile=../attrs";
+	git_ok(
+		&by_git.consumer,
+		&[
+			"-c",
+			"protocol.file.allow=always",
+			"-c",
+			setting,
+			"submodule",
+			"update",
+			"--init",
+		],
+	);
+	assert_success(
+		&gta_with_configs(
+			&by_gta.consumer,
+			&["protocol.file.allow=always", setting],
+			&["submodule", "update", "--init"],
+		),
+		"submodule update --init",
+	);
+	assert_eq!(
+		std::fs::read(by_gta.consumer.join("modules/one/file.txt")).unwrap(),
+		std::fs::read(by_git.consumer.join("modules/one/file.txt")).unwrap()
+	);
+	assert_eq!(
+		std::fs::read(by_gta.consumer.join("modules/one/file.txt")).unwrap(),
+		b"old\r\n"
+	);
+}
+
+/// A module's worktree-relative `core.attributesFile` is still found after deinit has moved the
+/// checkout aside, so a clean module isn't refused, as git doesn't refuse it.
+#[test]
+fn deinit_finds_a_modules_relative_attributes_file_as_git_does() {
+	let by_gta = Fixture::new("deinit-relative-attributes-gta");
+	let by_git = Fixture::new("deinit-relative-attributes-git");
+	assert_success(
+		&gta(&by_gta.consumer, true, &["submodule", "update", "--init"]),
+		"submodule update --init",
+	);
+	git_ok(
+		&by_git.consumer,
+		&[
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"update",
+			"--init",
+		],
+	);
+	for fixture in [&by_gta, &by_git] {
+		let module = fixture.consumer.join("modules/one");
+		git_ok(&module, &["config", "core.attributesFile", "attrs"]);
+		std::fs::write(module.join("attrs"), b"file.txt text eol=crlf\n").unwrap();
+		// The module's own exclude keeps `attrs` out of its status.
+		let module_git = PathBuf::from(git(&module, &["rev-parse", "--absolute-git-dir"]).trim());
+		std::fs::create_dir_all(module_git.join("info")).unwrap();
+		std::fs::write(module_git.join("info/exclude"), b"attrs\n").unwrap();
+		// Written with CRLF and staged, so the index records its size and the blob stays LF.
+		std::fs::write(module.join("file.txt"), b"old\r\n").unwrap();
+		git_ok(&module, &["add", "file.txt"]);
+		assert_eq!(git(&module, &["status", "--porcelain"]), "", "clean");
+	}
+	git_ok(&by_git.consumer, &["submodule", "deinit", "--all"]);
+	let deinit = gta(&by_gta.consumer, false, &["submodule", "deinit", "--all"]);
+	assert_success(&deinit, "submodule deinit --all");
+}
+
+/// A module's `core.attributesFile` that's a symlink in its checkout to a file outside it is followed,
+/// as git opens the path: deinit sees the module clean, as git does.
+#[test]
+fn deinit_follows_a_modules_symlinked_attributes_file_as_git_does() {
+	let by_gta = Fixture::new("deinit-symlinked-attributes-gta");
+	let by_git = Fixture::new("deinit-symlinked-attributes-git");
+	assert_success(
+		&gta(&by_gta.consumer, true, &["submodule", "update", "--init"]),
+		"submodule update --init",
+	);
+	git_ok(
+		&by_git.consumer,
+		&[
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"update",
+			"--init",
+		],
+	);
+	for fixture in [&by_gta, &by_git] {
+		let module = fixture.consumer.join("modules/one");
+		let outside = fixture.root.join("outside-attrs");
+		std::fs::write(&outside, b"file.txt text eol=crlf\n").unwrap();
+		std::os::unix::fs::symlink(&outside, module.join("attrs")).unwrap();
+		git_ok(&module, &["config", "core.attributesFile", "attrs"]);
+		let module_git = PathBuf::from(git(&module, &["rev-parse", "--absolute-git-dir"]).trim());
+		std::fs::create_dir_all(module_git.join("info")).unwrap();
+		std::fs::write(module_git.join("info/exclude"), b"attrs\n").unwrap();
+		// Written with CRLF and staged, so the index records its size and the blob stays LF.
+		std::fs::write(module.join("file.txt"), b"old\r\n").unwrap();
+		git_ok(&module, &["add", "file.txt"]);
+		assert_eq!(git(&module, &["status", "--porcelain"]), "", "clean");
+	}
+	git_ok(&by_git.consumer, &["submodule", "deinit", "--all"]);
+	let deinit = gta(&by_gta.consumer, false, &["submodule", "deinit", "--all"]);
+	assert_success(&deinit, "submodule deinit --all");
+}
+
+/// A module's `core.attributesFile` that can't be read adds nothing, with git's warning in git's words.
+#[test]
+fn deinit_warns_of_an_unreadable_module_attributes_file_as_git_does() {
+	use std::os::unix::fs::PermissionsExt;
+	let by_gta = Fixture::new("deinit-unreadable-attributes-gta");
+	let by_git = Fixture::new("deinit-unreadable-attributes-git");
+	assert_success(
+		&gta(&by_gta.consumer, true, &["submodule", "update", "--init"]),
+		"submodule update --init",
+	);
+	git_ok(
+		&by_git.consumer,
+		&[
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"update",
+			"--init",
+		],
+	);
+	for fixture in [&by_gta, &by_git] {
+		let module = fixture.consumer.join("modules/one");
+		git_ok(&module, &["config", "core.attributesFile", "attrs"]);
+		let attrs = module.join("attrs");
+		std::fs::write(&attrs, b"file.txt text eol=crlf\n").unwrap();
+		let module_git = PathBuf::from(git(&module, &["rev-parse", "--absolute-git-dir"]).trim());
+		std::fs::create_dir_all(module_git.join("info")).unwrap();
+		std::fs::write(module_git.join("info/exclude"), b"attrs\n").unwrap();
+		std::fs::set_permissions(&attrs, std::fs::Permissions::from_mode(0o000)).unwrap();
+	}
+	// Where the file stays readable (as root), there's nothing to warn of.
+	if std::fs::read(by_gta.consumer.join("modules/one/attrs")).is_ok() {
+		return;
+	}
+	let git = Command::new("git")
+		.args([
+			"-C",
+			by_git.consumer.to_str().unwrap(),
+			"submodule",
+			"deinit",
+			"--all",
+		])
+		.output()
+		.unwrap();
+	let gta = gta(&by_gta.consumer, false, &["submodule", "deinit", "--all"]);
+	let warning = |stderr: &[u8]| {
+		String::from_utf8_lossy(stderr)
+			.lines()
+			.find(|line| line.starts_with("warning: unable to access"))
+			.map(|line| line.rsplit_once("': ").unwrap().1.to_owned())
+	};
+	assert_eq!(warning(&gta.stderr), warning(&git.stderr));
+	assert_eq!(warning(&git.stderr).as_deref(), Some("Permission denied"));
+}
+
+/// A superproject's own `core.attributesFile` doesn't govern its submodules: deinit's check sees a
+/// module's LF→CRLF edit as the module's own config does, and refuses, as git does.
+#[test]
+fn deinit_judges_a_module_by_its_own_attributes_as_git_does() {
+	let by_gta = Fixture::new("deinit-attributes-gta");
+	let by_git = Fixture::new("deinit-attributes-git");
+	assert_success(
+		&gta(&by_gta.consumer, true, &["submodule", "update", "--init"]),
+		"submodule update --init",
+	);
+	git_ok(
+		&by_git.consumer,
+		&[
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"update",
+			"--init",
+		],
+	);
+	for fixture in [&by_gta, &by_git] {
+		let attributes = fixture.root.join("attributes");
+		std::fs::write(&attributes, b"*.txt text eol=lf\n").unwrap();
+		git_ok(
+			&fixture.consumer,
+			&[
+				"config",
+				"core.attributesFile",
+				attributes.to_str().unwrap(),
+			],
+		);
+		std::fs::write(fixture.consumer.join("modules/one/file.txt"), b"old\r\n").unwrap();
+	}
+	let git = Command::new("git")
+		.args([
+			"-C",
+			by_git.consumer.to_str().unwrap(),
+			"submodule",
+			"deinit",
+			"--all",
+		])
+		.output()
+		.unwrap();
+	assert!(!git.status.success(), "git refuses");
+	let deinit = gta(&by_gta.consumer, false, &["submodule", "deinit", "--all"]);
+	assert!(!deinit.status.success(), "gta refuses: {}", stderr(&deinit));
+	assert_eq!(
+		std::fs::read(by_gta.consumer.join("modules/one/file.txt")).unwrap(),
+		b"old\r\n",
+		"the edit is kept"
+	);
+}
+
+/// A submodule's checkout reads the attributes files from outside the repository too, as git's does.
+#[test]
+fn update_init_writes_the_module_by_the_global_attributes_file_as_git_does() {
+	let by_gta = Fixture::new("update-attributes-gta");
+	let by_git = Fixture::new("update-attributes-git");
+	let attributes = by_gta.root.join("attributes");
+	std::fs::write(&attributes, b"*.txt text eol=crlf\n").unwrap();
+	let setting = format!("core.attributesFile={}", attributes.display());
+	assert_success(
+		&gta_with_configs(
+			&by_gta.consumer,
+			&["protocol.file.allow=always", &setting],
+			&["submodule", "update", "--init"],
+		),
+		"submodule update --init",
+	);
+	git_ok(
+		&by_git.consumer,
+		&[
+			"-c",
+			"protocol.file.allow=always",
+			"-c",
+			&setting,
+			"submodule",
+			"update",
+			"--init",
+		],
+	);
+	assert_eq!(
+		std::fs::read(by_git.consumer.join("modules/one/file.txt")).unwrap(),
+		b"old\r\n"
+	);
+	assert_eq!(
+		std::fs::read(by_gta.consumer.join("modules/one/file.txt")).unwrap(),
+		b"old\r\n"
+	);
+}
+
 #[test]
 fn submodule_update_depth_honors_file_urls_and_updates_existing_repositories() {
 	let shallow = Fixture::new("submodule-update-file-depth");

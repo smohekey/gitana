@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use gitana_linked_worktree::checkout_safety;
+use gitana_linked_worktree::{Setup, checkout_safety};
 
 #[tokio::test]
 async fn a_clean_checkout_holds_no_local_only_state() {
@@ -15,7 +15,7 @@ async fn a_clean_checkout_holds_no_local_only_state() {
 		init_repo(&work, fmt);
 		commit_file(&work, "keep.txt", "k\n", "init");
 
-		let safety = checkout_safety(&rid_at(&work), &canonical(&work))
+		let safety = checkout_safety(&rid_at(&work), &canonical(&work), &Setup::default())
 			.await
 			.unwrap();
 
@@ -41,7 +41,7 @@ async fn working_tree_changes_are_reported() {
 		std::fs::write(work.join("mod.txt"), b"m changed\n").unwrap();
 		std::fs::write(work.join("untracked.txt"), b"u\n").unwrap();
 
-		let safety = checkout_safety(&rid_at(&work), &canonical(&work))
+		let safety = checkout_safety(&rid_at(&work), &canonical(&work), &Setup::default())
 			.await
 			.unwrap();
 
@@ -65,7 +65,7 @@ async fn ignored_files_do_not_count_as_working_changes() {
 		std::fs::create_dir(work.join("target")).unwrap();
 		std::fs::write(work.join("target").join("build.out"), b"artifact\n").unwrap();
 
-		let safety = checkout_safety(&rid_at(&work), &canonical(&work))
+		let safety = checkout_safety(&rid_at(&work), &canonical(&work), &Setup::default())
 			.await
 			.unwrap();
 
@@ -97,7 +97,7 @@ async fn a_stash_entry_is_reported_even_when_the_tree_is_clean() {
 		std::fs::write(work.join("mod.txt"), b"m changed\n").unwrap();
 		git(&["-C", w, "stash"]);
 
-		let safety = checkout_safety(&rid_at(&work), &canonical(&work))
+		let safety = checkout_safety(&rid_at(&work), &canonical(&work), &Setup::default())
 			.await
 			.unwrap();
 
@@ -136,7 +136,7 @@ async fn an_in_progress_merge_is_reported() {
 		git(&["-C", w, "commit", "-q", "-am", "main"]);
 		let _ = git_try(&["-C", w, "merge", "side"]); // conflicts, leaving MERGE_HEAD
 
-		let safety = checkout_safety(&rid_at(&work), &canonical(&work))
+		let safety = checkout_safety(&rid_at(&work), &canonical(&work), &Setup::default())
 			.await
 			.unwrap();
 
@@ -162,7 +162,7 @@ async fn a_non_worktree_destination_is_an_error() {
 
 		// A path that is not a worktree of the repository is a hard error, never a silently-clean readout.
 		assert!(
-			checkout_safety(&rid_at(&work), &canonical(&elsewhere))
+			checkout_safety(&rid_at(&work), &canonical(&elsewhere), &Setup::default())
 				.await
 				.is_err()
 		);

@@ -118,7 +118,7 @@ pub(crate) fn is_ignored_fold(
 			} else {
 				rel.rsplit(|byte| *byte == b'/').next().unwrap_or(rel)
 			};
-			if glob_match(&pattern.glob, subject, fold, true) {
+			if pattern_match(&pattern.glob, subject, fold) {
 				ignored = !pattern.negated;
 			}
 		}
@@ -190,10 +190,10 @@ fn matches_subject(pattern: &Pattern, subject: &[u8], is_dir: bool, fold: bool) 
 			.next()
 			.unwrap_or(subject)
 	};
-	glob_match(&pattern.glob, glob_subject, fold, true)
+	pattern_match(&pattern.glob, glob_subject, fold)
 }
 
-fn strip_dir<'a>(path: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
+pub(crate) fn strip_dir<'a>(path: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
 	if dir.is_empty() {
 		Some(path)
 	} else {
@@ -222,12 +222,33 @@ pub(crate) fn glob_match(pat: &[u8], text: &[u8], fold: bool, pathname: bool) ->
 	glob_match_inner(pat, text, fold, pathname, false, &mut memo)
 }
 
-/// Memo of `(remaining pattern length, remaining text length, wild_in_component)` states already known to
-/// *not* match. Every recursive call matches a **suffix** of the original pattern against a suffix of the
-/// original text, so those two lengths (with `fold`/`pathname` fixed for the whole match) identify the
-/// state uniquely — caching failures turns the otherwise-exponential star backtracking into O(len²) and
-/// defeats adversarial patterns like `(*a){28}b` against a long all-`a` name (git stays linear too).
-type Memo = std::collections::HashSet<(usize, usize, bool)>;
+/// Match `text` against a pattern from a `.gitignore`, `.gitattributes` or sparse-checkout file, as git
+/// matches those (FNM_PATHNAME): like [`glob_match`] in pathname mode, except that `**` spans folders
+/// only as a whole path component (`**/b`, `a/**/b`, `a/**`). After a literal in the same component
+/// (`foo**/bar`, `x**y`) it's a plain `*`, unlike a `:(glob)` pathspec, where git strips the literal
+/// prefix first (both measured against git 2.55).
+pub(crate) fn pattern_match(pat: &[u8], text: &[u8], fold: bool) -> bool {
+	let mut memo = Memo {
+		whole_component: true,
+		..Memo::default()
+	};
+	glob_match_inner(pat, text, fold, true, false, &mut memo)
+}
+
+/// The states already known *not* to match, and the `**` rule the whole match uses.
+#[derive(Default)]
+struct Memo {
+	/// `(remaining pattern length, remaining text length, wild_in_component)` states already known to
+	/// *not* match. Every recursive call matches a **suffix** of the original pattern against a suffix of
+	/// the original text, so those two lengths (with `fold`/`pathname` fixed for the whole match) identify
+	/// the state uniquely — caching failures turns the otherwise-exponential star backtracking into
+	/// O(len²) and defeats adversarial patterns like `(*a){28}b` against a long all-`a` name (git stays
+	/// linear too).
+	failed: std::collections::HashSet<(usize, usize, bool)>,
+	/// [`pattern_match`]'s rule: any byte earlier in the component, a literal too, keeps a `**` from
+	/// spanning folders.
+	whole_component: bool,
+}
 
 /// The recursive core of [`glob_match`], wrapping [`glob_match_body`] with the failure memo.
 fn glob_match_inner(
@@ -243,18 +264,19 @@ fn glob_match_inner(
 		return text.is_empty();
 	}
 	let key = (pat.len(), text.len(), wild_in_component);
-	if memo.contains(&key) {
+	if memo.failed.contains(&key) {
 		return false;
 	}
 	let matched = glob_match_body(pat, text, fold, pathname, wild_in_component, memo);
 	if !matched {
-		memo.insert(key);
+		memo.failed.insert(key);
 	}
 	matched
 }
 
 /// The match logic. `wild_in_component` records whether any wildcard (`*`, `?`, or a `[…]` class) has
-/// already appeared **in the current path component** — reset to `false` at every `/`. This only matters
+/// already appeared **in the current path component** — reset to `false` at every `/`; under
+/// [`pattern_match`]'s rule a literal counts too. This only matters
 /// for a `**` run in pathname mode: git treats `**` as a path-spanning globstar solely when it is a whole
 /// component preceded only by literals, so `a**` / `ba**` cross `/` but `?**`, `[x]**`, and `*a**` (a
 /// wildcard earlier in the same component) collapse to an ordinary within-component `*` (probed vs git
@@ -330,29 +352,23 @@ fn glob_match_body(
 		// caller's separate literal pass handles the exact spelling.
 		Some(b'\\') => match pat.get(1) {
 			Some(&escaped) => match text.first() {
-				// An escaped byte is a literal; it carries `wild_in_component` forward, resetting at a `/`.
-				Some(&t) if byte_eq(t, escaped, fold) => glob_match_inner(
-					&pat[2..],
-					&text[1..],
-					fold,
-					pathname,
-					wild_in_component && escaped != b'/',
-					memo,
-				),
+				// An escaped byte is a literal; it carries `wild_in_component` forward (sets it, under
+				// `pattern_match`'s rule), resetting at a `/`.
+				Some(&t) if byte_eq(t, escaped, fold) => {
+					let wild = (wild_in_component || memo.whole_component) && escaped != b'/';
+					glob_match_inner(&pat[2..], &text[1..], fold, pathname, wild, memo)
+				}
 				_ => false,
 			},
 			None => false,
 		},
 		Some(&c) => match text.first() {
-			// A literal byte carries `wild_in_component` forward, but a `/` ends the component and resets it.
-			Some(&t) if byte_eq(t, c, fold) => glob_match_inner(
-				&pat[1..],
-				&text[1..],
-				fold,
-				pathname,
-				wild_in_component && c != b'/',
-				memo,
-			),
+			// A literal byte carries `wild_in_component` forward (sets it, under `pattern_match`'s rule),
+			// but a `/` ends the component and resets it.
+			Some(&t) if byte_eq(t, c, fold) => {
+				let wild = (wild_in_component || memo.whole_component) && c != b'/';
+				glob_match_inner(&pat[1..], &text[1..], fold, pathname, wild, memo)
+			}
 			_ => false,
 		},
 	}
@@ -539,6 +555,24 @@ mod tests {
 		// With pathname mode `**` spans zero+ directories, so both match.
 		assert!(glob_match(b"src/**/*.rs", b"src/sub/b.rs", false, true));
 		assert!(glob_match(b"src/**/*.rs", b"src/a.rs", false, true));
+	}
+
+	/// `.gitignore`, `.gitattributes` and sparse patterns: `**` spans folders only as a whole path
+	/// component (measured against git 2.55), unlike the same spelling as a `:(glob)` pathspec.
+	#[test]
+	fn pattern_globstar_spans_only_whole_components() {
+		assert!(pattern_match(b"foo**/bar", b"foox/bar", false));
+		assert!(pattern_match(b"foo**/bar", b"foo/bar", false));
+		assert!(!pattern_match(b"foo**/bar", b"foo/nested/bar", false));
+		assert!(pattern_match(b"x**y", b"xay", false));
+		assert!(!pattern_match(b"x**y", b"x/y", false));
+		assert!(pattern_match(b"a/**b", b"a/xb", false));
+		assert!(!pattern_match(b"a/**b", b"a/z/b", false));
+		assert!(pattern_match(b"a/**/b", b"a/z/q/b", false));
+		assert!(pattern_match(b"**/b", b"z/q/b", false));
+		assert!(pattern_match(b"a/**", b"a/z/q", false));
+		// As a `:(glob)` pathspec, git strips the literal `foo` first, so `**` spans.
+		assert!(glob_match(b"foo**/bar", b"foo/nested/bar", false, true));
 	}
 
 	#[test]

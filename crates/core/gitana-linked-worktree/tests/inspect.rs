@@ -7,7 +7,7 @@ use std::os::unix::fs::symlink;
 
 use common::*;
 use gitana_linked_worktree::{
-	BranchName, DestinationKind, HeadKind, IdentityConflict, Registration, RequestedBranch,
+	BranchName, DestinationKind, HeadKind, IdentityConflict, Registration, RequestedBranch, Setup,
 	WorktreeClassification, WorktreeObjectId, WorktreeQuery, classify, inspect, status,
 };
 
@@ -67,7 +67,7 @@ async fn absent_destination_is_safe_to_create() {
 		commit_file(&work, "a.txt", "1\n", "init");
 
 		let dest = base.join("wt"); // does not exist
-		let insp = inspect(&query(rid_at(&work), &dest, "feature"))
+		let insp = inspect(&query(rid_at(&work), &dest, "feature"), &Setup::default())
 			.await
 			.unwrap();
 
@@ -104,9 +104,12 @@ async fn a_created_branch_without_a_worktree_is_interrupted_completable() {
 
 		let dest = base.join("wt");
 		let start = WorktreeObjectId::parse(kind, &start_hex).unwrap();
-		let insp = inspect(&query_with_start(rid_at(&work), &dest, "feature", start))
-			.await
-			.unwrap();
+		let insp = inspect(
+			&query_with_start(rid_at(&work), &dest, "feature", start),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert!(matches!(
 			insp.requested_branch,
 			RequestedBranch::Exists { .. }
@@ -143,12 +146,10 @@ async fn an_exact_matching_worktree_is_complete_and_idempotent() {
 		let feat = git(&["-C", w, "rev-parse", "feature"]).trim().to_owned();
 
 		let start = WorktreeObjectId::parse(kind, &feat).unwrap();
-		let insp = inspect(&query_with_start(
-			rid_at(&work),
-			&wt,
-			"feature",
-			start.clone(),
-		))
+		let insp = inspect(
+			&query_with_start(rid_at(&work), &wt, "feature", start.clone()),
+			&Setup::default(),
+		)
 		.await
 		.unwrap();
 		assert!(matches!(insp.registration, Registration::Present { .. }));
@@ -162,9 +163,12 @@ async fn an_exact_matching_worktree_is_complete_and_idempotent() {
 			WorktreeClassification::CompleteIdempotent { .. }
 		));
 		// Re-inspection is stable (idempotent).
-		let again = inspect(&query_with_start(rid_at(&work), &wt, "feature", start))
-			.await
-			.unwrap();
+		let again = inspect(
+			&query_with_start(rid_at(&work), &wt, "feature", start),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert_eq!(insp, again);
 		let _ = std::fs::remove_dir_all(&base);
 	}
@@ -190,7 +194,7 @@ async fn a_registration_whose_checkout_is_gone_is_partial_registered() {
 		]);
 		std::fs::remove_dir_all(&wt).unwrap(); // checkout gone, registration retained
 
-		let insp = inspect(&query(rid_at(&work), &wt, "feature"))
+		let insp = inspect(&query(rid_at(&work), &wt, "feature"), &Setup::default())
 			.await
 			.unwrap();
 		assert!(matches!(
@@ -235,7 +239,7 @@ async fn disagreeing_cross_pointers_are_an_identity_conflict_and_not_repaired() 
 		let bogus = "/nonexistent/elsewhere/.git\n";
 		std::fs::write(&admin_gitdir, bogus).unwrap();
 
-		let insp = inspect(&query(rid_at(&work), &wt, "feature"))
+		let insp = inspect(&query(rid_at(&work), &wt, "feature"), &Setup::default())
 			.await
 			.unwrap();
 		assert!(matches!(
@@ -278,7 +282,7 @@ async fn a_branch_checked_out_elsewhere_is_a_branch_use_conflict() {
 		]);
 
 		let wt2 = base.join("wt2"); // different, absent destination
-		let insp = inspect(&query(rid_at(&work), &wt2, "feature"))
+		let insp = inspect(&query(rid_at(&work), &wt2, "feature"), &Setup::default())
 			.await
 			.unwrap();
 		match classify(&insp) {
@@ -303,14 +307,18 @@ async fn non_directory_and_unrelated_destinations_are_destination_conflicts() {
 		// A plain file.
 		let file = base.join("as-file");
 		std::fs::write(&file, b"x").unwrap();
-		let insp = inspect(&query(rid(), &file, "feature")).await.unwrap();
+		let insp = inspect(&query(rid(), &file, "feature"), &Setup::default())
+			.await
+			.unwrap();
 		assert_eq!(insp.destination_kind, DestinationKind::OtherFsObject);
 
 		// A non-empty directory with no `.git`.
 		let dir = base.join("unrelated");
 		std::fs::create_dir_all(&dir).unwrap();
 		std::fs::write(dir.join("stuff"), b"x").unwrap();
-		let insp = inspect(&query(rid(), &dir, "feature")).await.unwrap();
+		let insp = inspect(&query(rid(), &dir, "feature"), &Setup::default())
+			.await
+			.unwrap();
 		assert_eq!(insp.destination_kind, DestinationKind::UnrelatedContent);
 		assert!(matches!(
 			classify(&insp),
@@ -320,14 +328,18 @@ async fn non_directory_and_unrelated_destinations_are_destination_conflicts() {
 		// A symlink at the destination is a non-directory — never followed.
 		let link = base.join("as-link");
 		symlink(&work, &link).unwrap();
-		let insp = inspect(&query(rid(), &link, "feature")).await.unwrap();
+		let insp = inspect(&query(rid(), &link, "feature"), &Setup::default())
+			.await
+			.unwrap();
 		assert_eq!(insp.destination_kind, DestinationKind::OtherFsObject);
 
 		// A directory whose `.git` is a *symlink* is unrelated content — the symlink is not followed.
 		let sneaky = base.join("sneaky");
 		std::fs::create_dir_all(&sneaky).unwrap();
 		symlink(work.join(".git"), sneaky.join(".git")).unwrap();
-		let insp = inspect(&query(rid(), &sneaky, "feature")).await.unwrap();
+		let insp = inspect(&query(rid(), &sneaky, "feature"), &Setup::default())
+			.await
+			.unwrap();
 		assert_eq!(insp.destination_kind, DestinationKind::UnrelatedContent);
 
 		let _ = std::fs::remove_dir_all(&base);
@@ -356,7 +368,7 @@ async fn a_checkout_replaced_by_an_empty_dir_is_partial_registered() {
 		std::fs::remove_dir_all(&wt).unwrap();
 		std::fs::create_dir_all(&wt).unwrap();
 
-		let insp = inspect(&query(rid_at(&work), &wt, "feature"))
+		let insp = inspect(&query(rid_at(&work), &wt, "feature"), &Setup::default())
 			.await
 			.unwrap();
 		assert!(
@@ -402,9 +414,12 @@ async fn a_destination_owned_by_another_repository_is_an_identity_conflict() {
 		]);
 
 		// Inspect the other repo's worktree against *our* repository identity.
-		let insp = inspect(&query(rid_at(&ours), &foreign_wt, "feature"))
-			.await
-			.unwrap();
+		let insp = inspect(
+			&query(rid_at(&ours), &foreign_wt, "feature"),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		match &insp.identity_conflict {
 			Some(IdentityConflict::DestinationBelongsToOtherWorktree { .. }) => {}
 			other => panic!("{fmt}: expected DestinationBelongsToOtherWorktree, got {other:?}"),
@@ -452,7 +467,7 @@ async fn a_symlink_destination_to_a_checkout_is_a_conflict_not_a_worktree() {
 		let alias = base.join("alias");
 		symlink(&wt, &alias).unwrap();
 
-		let insp = inspect(&query(rid_at(&work), &alias, "feature"))
+		let insp = inspect(&query(rid_at(&work), &alias, "feature"), &Setup::default())
 			.await
 			.unwrap();
 		assert_eq!(insp.destination_kind, DestinationKind::OtherFsObject);
@@ -475,7 +490,9 @@ async fn a_symlink_destination_to_a_checkout_is_a_conflict_not_a_worktree() {
 		));
 		// Status must refuse the symlink alias.
 		assert!(
-			status(&rid_at(&work), &alias).await.is_err(),
+			status(&rid_at(&work), &alias, &Setup::default())
+				.await
+				.is_err(),
 			"{fmt}: status must refuse a symlink destination"
 		);
 		let _ = std::fs::remove_dir_all(&base);
@@ -503,9 +520,12 @@ async fn a_requested_legacy_symlink_symref_branch_exists() {
 			"{fmt}: git resolves the symlink symref"
 		);
 
-		let insp = inspect(&query(rid_at(&work), &base.join("wt"), "alias"))
-			.await
-			.unwrap();
+		let insp = inspect(
+			&query(rid_at(&work), &base.join("wt"), "alias"),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		match &insp.requested_branch {
 			RequestedBranch::Exists { object, .. } => assert_eq!(object.to_hex(), feat),
 			other => panic!("{fmt}: a symlink-symref branch must exist, got {other:?}"),
@@ -526,7 +546,7 @@ async fn a_start_of_the_wrong_hash_kind_is_rejected() {
 		WorktreeObjectId::parse(gitana_object::HashKind::Sha256, &"a".repeat(64)).unwrap();
 	let q = query_with_start(rid_at(&work), &base.join("wt"), "feature", sha256_start);
 	assert!(
-		inspect(&q).await.is_err(),
+		inspect(&q, &Setup::default()).await.is_err(),
 		"a sha256 start against a sha1 repository must be rejected"
 	);
 	let _ = std::fs::remove_dir_all(&base);
@@ -561,7 +581,7 @@ async fn a_symlinked_external_admin_is_not_a_registration_and_leaks_no_lock() {
 		symlink(&external, &admin).unwrap();
 		std::fs::write(external.join("locked"), b"TOP SECRET").unwrap();
 
-		let insp = inspect(&query(rid_at(&work), &wt, "feature"))
+		let insp = inspect(&query(rid_at(&work), &wt, "feature"), &Setup::default())
 			.await
 			.unwrap();
 		assert!(
@@ -608,9 +628,12 @@ async fn a_stray_main_gitdir_does_not_hide_a_primary_branch_conflict() {
 		let _ = std::fs::remove_dir_all(&wt2); // clean the failed worktree attempt
 
 		let start = WorktreeObjectId::parse(kind, &start_hex).unwrap();
-		let insp = inspect(&query_with_start(rid_at(&work), &wt2, "feature", start))
-			.await
-			.unwrap();
+		let insp = inspect(
+			&query_with_start(rid_at(&work), &wt2, "feature", start),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		match classify(&insp) {
 			WorktreeClassification::BranchUseConflict { other_checkout } => {
 				assert_eq!(canonical(&other_checkout), canonical(&work));
@@ -664,9 +687,12 @@ async fn a_commondir_mismatched_worktree_still_occupies_its_branch() {
 		);
 
 		// Inspecting a *new* destination for `feat` must report the branch-use conflict at wt.
-		let insp = inspect(&query(rid_at(&ours), &base.join("wt3"), "feat"))
-			.await
-			.unwrap();
+		let insp = inspect(
+			&query(rid_at(&ours), &base.join("wt3"), "feat"),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		match classify(&insp) {
 			WorktreeClassification::BranchUseConflict { other_checkout } => {
 				assert_eq!(canonical(&other_checkout), canonical(&wt));
@@ -705,9 +731,12 @@ async fn a_symlinked_admin_conflict_does_not_leak_its_gitdir() {
 		symlink(&external, &admin).unwrap();
 		std::fs::write(external.join("gitdir"), b"/secret/leaked/path/.git\n").unwrap();
 
-		let insp = inspect(&query(rid_at(&work), &base.join("wt3"), "feat"))
-			.await
-			.unwrap();
+		let insp = inspect(
+			&query(rid_at(&work), &base.join("wt3"), "feat"),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		match classify(&insp) {
 			WorktreeClassification::BranchUseConflict { other_checkout } => {
 				assert!(
@@ -765,9 +794,12 @@ async fn a_symlinked_admin_still_occupies_its_branch() {
 			"{fmt}: git still refuses the second checkout through the symlinked admin"
 		);
 
-		let insp = inspect(&query(rid_at(&work), &base.join("wt3"), "feat"))
-			.await
-			.unwrap();
+		let insp = inspect(
+			&query(rid_at(&work), &base.join("wt3"), "feat"),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert!(
 			matches!(
 				classify(&insp),
@@ -812,7 +844,11 @@ async fn a_malformed_head_behind_a_symlinked_admin_is_not_disclosed() {
 
 		// Branch-use over the symlinked admin hits the malformed HEAD. Whether it surfaces as an `Err` or is
 		// absorbed, the secret must never appear in any rendered diagnostic.
-		let result = inspect(&query(rid_at(&work), &base.join("dest"), "feat")).await;
+		let result = inspect(
+			&query(rid_at(&work), &base.join("dest"), "feat"),
+			&Setup::default(),
+		)
+		.await;
 		let rendered = match &result {
 			Err(e) => format!("{e}"),
 			Ok(insp) => format!("{insp:?}"),
@@ -838,9 +874,12 @@ async fn an_invalid_requested_branch_is_not_blamed_on_head() {
 		commit_file(&work, "a.txt", "1\n", "init");
 		// A branch name with a space is not a valid ref (`refs/heads/bad name` fails check-ref-format), yet
 		// HEAD is perfectly healthy.
-		let err = inspect(&query(rid_at(&work), &base.join("dest"), "bad name"))
-			.await
-			.expect_err(&format!("{fmt}: an invalid requested branch must error"));
+		let err = inspect(
+			&query(rid_at(&work), &base.join("dest"), "bad name"),
+			&Setup::default(),
+		)
+		.await
+		.expect_err(&format!("{fmt}: an invalid requested branch must error"));
 		assert!(
 			matches!(&err, LinkedWorktreeError::InvalidRequestedBranch(name) if name == "bad name"),
 			"{fmt}: expected InvalidRequestedBranch(\"bad name\"), got {err:?}"
@@ -885,7 +924,11 @@ async fn an_unreadable_head_target_behind_a_symlinked_admin_is_not_disclosed() {
 		let secret = format!("SECRET_{}", "z".repeat(300));
 		std::fs::write(external.join("HEAD"), format!("ref: refs/heads/{secret}\n")).unwrap();
 
-		let result = inspect(&query(rid_at(&work), &base.join("dest"), "feat")).await;
+		let result = inspect(
+			&query(rid_at(&work), &base.join("dest"), "feat"),
+			&Setup::default(),
+		)
+		.await;
 		let rendered = match &result {
 			Err(e) => format!("{e}"),
 			Ok(insp) => format!("{insp:?}"),
@@ -928,9 +971,12 @@ async fn a_valid_branch_with_a_corrupt_symref_is_repo_corruption_not_caller_erro
 		)
 		.unwrap();
 
-		let err = inspect(&query(rid_at(&work), &base.join("dest"), "alias"))
-			.await
-			.expect_err(&format!("{fmt}: a corrupt symref chain must error"));
+		let err = inspect(
+			&query(rid_at(&work), &base.join("dest"), "alias"),
+			&Setup::default(),
+		)
+		.await
+		.expect_err(&format!("{fmt}: a corrupt symref chain must error"));
 		assert!(
 			matches!(
 				&err,
@@ -993,11 +1039,14 @@ async fn a_corrupt_requested_branch_that_is_checked_out_is_classified_by_the_bra
 		)
 		.unwrap();
 
-		let err = inspect(&query(rid_at(&work), &base.join("dest"), "alias"))
-			.await
-			.expect_err(&format!(
-				"{fmt}: a corrupt checked-out requested branch must error"
-			));
+		let err = inspect(
+			&query(rid_at(&work), &base.join("dest"), "alias"),
+			&Setup::default(),
+		)
+		.await
+		.expect_err(&format!(
+			"{fmt}: a corrupt checked-out requested branch must error"
+		));
 		assert!(
 			matches!(
 				&err,
@@ -1052,7 +1101,7 @@ async fn an_admin_whose_commondir_points_elsewhere_is_not_our_registration() {
 
 		// Anchored on *ours*, the admin is foreign (its `commondir` names another repo). It must be reported
 		// as an identity conflict, its HEAD never read (no fabricated facts) — not our registration.
-		let insp = inspect(&query(rid_at(&ours), &wt, "feature"))
+		let insp = inspect(&query(rid_at(&ours), &wt, "feature"), &Setup::default())
 			.await
 			.unwrap();
 		assert_eq!(
@@ -1080,7 +1129,9 @@ async fn an_admin_whose_commondir_points_elsewhere_is_not_our_registration() {
 		));
 		// Status must refuse rather than open our object store against the wrong worktree.
 		assert!(
-			status(&rid_at(&ours), &canonical(&wt)).await.is_err(),
+			status(&rid_at(&ours), &canonical(&wt), &Setup::default())
+				.await
+				.is_err(),
 			"{fmt}: status of a foreign-owned checkout must be a hard error"
 		);
 		let _ = std::fs::remove_dir_all(&base);
@@ -1109,7 +1160,7 @@ async fn a_symbolic_branch_ref_resolves_instead_of_erroring() {
 		]);
 
 		let dest = base.join("wt");
-		let insp = inspect(&query(rid_at(&work), &dest, "alias"))
+		let insp = inspect(&query(rid_at(&work), &dest, "alias"), &Setup::default())
 			.await
 			.unwrap();
 		match &insp.requested_branch {
@@ -1151,7 +1202,7 @@ async fn a_branch_forced_into_two_worktrees_still_conflicts_from_the_first() {
 		]);
 
 		// Inspecting wt1 must still report the *other* checkout (wt2), not "no conflict".
-		let insp = inspect(&query(rid_at(&work), &wt1, "feature"))
+		let insp = inspect(&query(rid_at(&work), &wt1, "feature"), &Setup::default())
 			.await
 			.unwrap();
 		match &insp.requested_branch {
@@ -1178,9 +1229,12 @@ async fn an_unsupported_object_format_maps_to_the_documented_variant() {
 	text.push_str("[extensions]\n\tobjectformat = sha999\n");
 	std::fs::write(&config, text).unwrap();
 
-	let err = inspect(&query(rid_at(&work), &base.join("wt"), "feature"))
-		.await
-		.unwrap_err();
+	let err = inspect(
+		&query(rid_at(&work), &base.join("wt"), "feature"),
+		&Setup::default(),
+	)
+	.await
+	.unwrap_err();
 	assert!(
 		matches!(
 			err,
@@ -1221,7 +1275,7 @@ async fn duplicate_registrations_for_one_destination_are_an_identity_conflict() 
 		)
 		.unwrap();
 
-		let insp = inspect(&query(rid_at(&work), &wt, "feature"))
+		let insp = inspect(&query(rid_at(&work), &wt, "feature"), &Setup::default())
 			.await
 			.unwrap();
 		assert!(
@@ -1272,9 +1326,12 @@ async fn a_requested_alias_does_not_conflict_with_a_worktree_on_its_target() {
 
 		// Requesting `alias` at a new destination: `feature` is checked out at wt1, but the request is for
 		// `alias` — no branch-use conflict, matching git.
-		let insp = inspect(&query(rid_at(&work), &base.join("wt2"), "alias"))
-			.await
-			.unwrap();
+		let insp = inspect(
+			&query(rid_at(&work), &base.join("wt2"), "alias"),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		match &insp.requested_branch {
 			RequestedBranch::Exists {
 				checked_out_elsewhere,
@@ -1329,7 +1386,9 @@ async fn an_unborn_branch_checked_out_elsewhere_still_conflicts() {
 		);
 
 		let wt2 = base.join("wt2"); // a second, absent destination requesting the same branch
-		let insp = inspect(&query(rid_at(&work), &wt2, "fresh")).await.unwrap();
+		let insp = inspect(&query(rid_at(&work), &wt2, "fresh"), &Setup::default())
+			.await
+			.unwrap();
 		match &insp.requested_branch {
 			RequestedBranch::Absent {
 				checked_out_elsewhere: Some(other),
@@ -1389,9 +1448,12 @@ async fn a_case_variant_destination_matches_on_a_case_insensitive_filesystem() {
 		// Query the *same* worktree by a case-variant path; it must be recognized as the registered checkout.
 		let variant = base.join("WT");
 		let start = WorktreeObjectId::parse(kind, &feat).unwrap();
-		let insp = inspect(&query_with_start(rid_at(&work), &variant, "feature", start))
-			.await
-			.unwrap();
+		let insp = inspect(
+			&query_with_start(rid_at(&work), &variant, "feature", start),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert!(
 			matches!(insp.registration, Registration::Present { .. }),
 			"{fmt}: a case-variant path must match the registered worktree, got {:?}",
@@ -1440,9 +1502,12 @@ async fn a_deleted_registered_checkout_queried_case_variant_is_partial_registere
 		std::fs::remove_dir_all(&cased).unwrap();
 		let variant = base.join("casewt");
 
-		let insp = inspect(&query(rid_at(&work), &variant, "feature"))
-			.await
-			.unwrap();
+		let insp = inspect(
+			&query(rid_at(&work), &variant, "feature"),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert!(
 			matches!(
 				insp.registration,
@@ -1492,9 +1557,12 @@ async fn a_symlink_direct_ref_branch_is_its_own_occupied_branch() {
 		]);
 
 		// Requesting `alias` at a *new* destination must see the occupied branch (wt1).
-		let insp = inspect(&query(rid_at(&work), &base.join("wt2"), "alias"))
-			.await
-			.unwrap();
+		let insp = inspect(
+			&query(rid_at(&work), &base.join("wt2"), "alias"),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		match classify(&insp) {
 			WorktreeClassification::BranchUseConflict { other_checkout } => {
 				assert_eq!(canonical(&other_checkout), canonical(&wt1));
@@ -1513,9 +1581,12 @@ async fn a_symlink_direct_ref_branch_is_its_own_occupied_branch() {
 			]),
 			"{fmt}: git must refuse a second `alias` checkout"
 		);
-		let insp_feature = inspect(&query(rid_at(&work), &base.join("wt4"), "feature"))
-			.await
-			.unwrap();
+		let insp_feature = inspect(
+			&query(rid_at(&work), &base.join("wt4"), "feature"),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert!(
 			!matches!(
 				classify(&insp_feature),
@@ -1581,7 +1652,9 @@ async fn a_healthy_detached_worktree_is_complete_present_not_conflicting() {
 			.trim()
 			.to_owned();
 
-		let insp = inspect(&query_no_branch(rid_at(&work), &wt)).await.unwrap();
+		let insp = inspect(&query_no_branch(rid_at(&work), &wt), &Setup::default())
+			.await
+			.unwrap();
 		assert!(matches!(insp.registration, Registration::Present { .. }));
 		match classify(&insp) {
 			WorktreeClassification::CompletePresent {
@@ -1623,7 +1696,9 @@ async fn a_healthy_orphan_worktree_is_complete_present_not_conflicting() {
 			continue; // git too old for --orphan
 		}
 
-		let insp = inspect(&query_no_branch(rid_at(&work), &wt)).await.unwrap();
+		let insp = inspect(&query_no_branch(rid_at(&work), &wt), &Setup::default())
+			.await
+			.unwrap();
 		assert!(matches!(insp.registration, Registration::Present { .. }));
 		match classify(&insp) {
 			WorktreeClassification::CompletePresent {
@@ -1932,7 +2007,7 @@ async fn a_malformed_gitfile_is_a_hard_error() {
 		std::fs::write(&gitfile, admin.replace("gitdir: ", "gitdir:")).unwrap();
 
 		assert!(
-			inspect(&query(rid_at(&work), &wt, "feature"))
+			inspect(&query(rid_at(&work), &wt, "feature"), &Setup::default())
 				.await
 				.is_err(),
 			"{fmt}: a malformed .git gitfile must be a hard error"
@@ -1973,7 +2048,7 @@ async fn a_gitfile_with_trailing_data_does_not_silently_match() {
 			"{fmt}: git does not resolve a gitfile whose path carries trailing data"
 		);
 
-		let insp = inspect(&query(rid_at(&work), &wt, "feature"))
+		let insp = inspect(&query(rid_at(&work), &wt, "feature"), &Setup::default())
 			.await
 			.unwrap();
 		assert!(
@@ -2023,7 +2098,7 @@ async fn a_head_with_no_space_after_ref_resolves() {
 			"git resolves the no-space HEAD: {porcelain}"
 		);
 
-		let insp = inspect(&query(rid_at(&work), &wt, "feature"))
+		let insp = inspect(&query(rid_at(&work), &wt, "feature"), &Setup::default())
 			.await
 			.unwrap();
 		let head = insp.head.expect("a HEAD");
@@ -2057,7 +2132,7 @@ async fn a_symlinked_lock_marker_does_not_leak_its_target() {
 		let marker = work.join(".git/worktrees/wt/locked");
 		symlink(&secret, &marker).unwrap();
 
-		let insp = inspect(&query(rid_at(&work), &wt, "feature"))
+		let insp = inspect(&query(rid_at(&work), &wt, "feature"), &Setup::default())
 			.await
 			.unwrap();
 		assert_eq!(
@@ -2095,7 +2170,11 @@ async fn a_symref_that_escapes_the_repository_is_rejected() {
 		.unwrap();
 
 		// Inspecting another destination for `feature` scans worktree HEADs, hitting the escaping one.
-		let insp = inspect(&query(rid_at(&work), &base.join("wt2"), "feature")).await;
+		let insp = inspect(
+			&query(rid_at(&work), &base.join("wt2"), "feature"),
+			&Setup::default(),
+		)
+		.await;
 		assert!(
 			insp.is_err(),
 			"{fmt}: an escaping symref target must be a hard error"
@@ -2128,7 +2207,7 @@ async fn a_relative_destination_is_rejected() {
 			with_status: false,
 		};
 		assert!(
-			inspect(&q).await.is_err(),
+			inspect(&q, &Setup::default()).await.is_err(),
 			"a relative destination must be rejected"
 		);
 		let _ = std::fs::remove_dir_all(&base);
@@ -2160,9 +2239,12 @@ async fn an_advanced_branch_matches_without_reset() {
 		assert_ne!(start_hex, advanced_hex);
 
 		let start = WorktreeObjectId::parse(kind, &start_hex).unwrap();
-		let insp = inspect(&query_with_start(rid_at(&work), &wt, "feature", start))
-			.await
-			.unwrap();
+		let insp = inspect(
+			&query_with_start(rid_at(&work), &wt, "feature", start),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		match classify(&insp) {
 			WorktreeClassification::MatchingAdvanced { object, .. } => {
 				assert_eq!(
@@ -2210,9 +2292,12 @@ async fn a_diverged_branch_is_a_conflict_not_advanced() {
 
 		// Request start = B; the worktree is on feature at C, which diverges from B.
 		let start = WorktreeObjectId::parse(kind, &b_hex).unwrap();
-		let insp = inspect(&query_with_start(rid_at(&work), &wt, "feature", start))
-			.await
-			.unwrap();
+		let insp = inspect(
+			&query_with_start(rid_at(&work), &wt, "feature", start),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert_eq!(
 			insp.start_relation,
 			Some(gitana_linked_worktree::StartRelation::Diverged)

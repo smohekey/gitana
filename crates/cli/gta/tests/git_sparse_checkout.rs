@@ -124,6 +124,42 @@ fn noncone_set_requires_the_toplevel() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// A non-cone pattern's `**` spans folders only as a whole path component, as git matches it:
+/// `/foo**/bar` keeps `foo/bar` and `foox/bar` but not `foo/nested/bar`.
+#[test]
+fn noncone_globstar_spans_whole_components_only_as_git_does() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let mut listed = Vec::new();
+	for tool in ["git", "gta"] {
+		let work = unique_tmp(&format!("gta-sparse-globstar-{tool}"));
+		let w = work.to_str().unwrap();
+		if tool == "gta" {
+			gta(w, &["init"], b"");
+		} else {
+			git(w, &["init", "-q"]);
+		}
+		for file in ["foo/nested/bar", "foox/bar", "foo/bar", "top"] {
+			let path = work.join(file);
+			std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+			std::fs::write(path, b"x\n").unwrap();
+		}
+		git(w, &["add", "."]);
+		commit(w, "base");
+		let set = ["sparse-checkout", "set", "--no-cone", "/top", "/foo**/bar"];
+		if tool == "gta" {
+			gta(w, &set, b"");
+		} else {
+			git(w, &set);
+		}
+		listed.push(git(w, &["ls-files", "-t"]));
+		std::fs::remove_dir_all(&work).ok();
+	}
+	assert_eq!(listed[1], listed[0]);
+	assert!(listed[0].contains("S foo/nested/bar"), "{}", listed[0]);
+}
+
 fn commit(dir: &str, msg: &str) {
 	git(
 		dir,

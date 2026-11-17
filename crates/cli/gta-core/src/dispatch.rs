@@ -203,6 +203,7 @@ async fn on_discovered_worktree<C: WorkTreeCommand>(
 	access: ConfigAccess,
 ) -> Result<()> {
 	let worktree_root = found.worktree_root.clone().expect("discovered work tree");
+	let root = worktree_root.clone();
 	let (history_guard, setup, common, git, work) = if matches!(access, ConfigAccess::HistoryMutation)
 	{
 		let (guard, setup, common, git, work) =
@@ -246,6 +247,7 @@ async fn on_discovered_worktree<C: WorkTreeCommand>(
 					found.git_dir,
 					worktree_root,
 				);
+				let wt = crate::attributes::with_outside_attributes(wt, &root).await?;
 				run_with_config_lease(
 					setup,
 					retain_config_lease,
@@ -267,6 +269,7 @@ async fn on_discovered_worktree<C: WorkTreeCommand>(
 					found.git_dir,
 					worktree_root,
 				);
+				let wt = crate::attributes::with_outside_attributes(wt, &root).await?;
 				run_with_config_lease(
 					setup,
 					retain_config_lease,

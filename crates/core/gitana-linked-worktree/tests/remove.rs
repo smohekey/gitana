@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use gitana_linked_worktree::{
 	BranchName, DestinationKind, IdentityConflict, ProtectionReason, RemoveError, RemoveOutcome,
-	RemovePolicy, RemoveRequest, WorktreeClassification, WorktreeQuery, classify,
+	RemovePolicy, RemoveRequest, Setup, WorktreeClassification, WorktreeQuery, classify,
 	durability_barrier_removed, inspect, remove,
 };
 
@@ -47,7 +47,7 @@ async fn classify_at(
 		start: None,
 		with_status,
 	};
-	classify(&inspect(&q).await.unwrap())
+	classify(&inspect(&q, &Setup::default()).await.unwrap())
 }
 
 /// A read of the destination's classification (no status), for asserting the partial-state vocabulary.
@@ -72,7 +72,7 @@ async fn removed_worktree_barrier_flushes_namespaces_and_clears_an_empty_leftove
 		let wt = base.join("wt");
 		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
 		let request = rreq(&work, &wt, Some("feature"));
-		remove(&request).await.unwrap();
+		remove(&request, &Setup::default()).await.unwrap();
 
 		// A safe, unrelated empty directory can appear after idempotent removal. The explicit durability
 		// boundary removes that otherwise-ambiguous namespace before flushing the deletion.
@@ -105,7 +105,7 @@ async fn removes_a_worktree_addressed_by_a_dot_segment_alias() {
 		let alias = wt.join("sub").join(".."); // .../wt/sub/.. — canonically .../wt
 
 		let request = rreq(&work, &alias, Some("feature"));
-		let out = remove(&request).await.unwrap();
+		let out = remove(&request, &Setup::default()).await.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: expected Removed via a dot-segment alias, got {out:?}"
@@ -143,7 +143,9 @@ async fn removes_a_clean_worktree_and_retains_its_branch() {
 			git(&["-C", w, "worktree", "list", "--porcelain"]).contains("branch refs/heads/feature")
 		);
 
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		match out {
 			RemoveOutcome::Removed {
 				destination,
@@ -191,7 +193,7 @@ async fn preserves_a_worktree_holding_ignored_files() {
 		// git considers the worktree clean (ignored files omitted) — but we still preserve it.
 		assert!(git(&["-C", wt.to_str().unwrap(), "status", "--porcelain"]).is_empty());
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		let RemoveError::Refused(WorktreeClassification::ProtectedWithReason {
@@ -218,7 +220,7 @@ async fn preserves_a_worktree_holding_ignored_files() {
 			"{fmt}: ignored content preserved"
 		);
 
-		// `classify(inspect(with_status))` agrees with the removal decision — it also reports ResidualContent,
+		// `classify(inspect(with_status, &Setup::default()))` agrees with the removal decision — it also reports ResidualContent,
 		// not a `Complete*` reading (which would disagree with what `remove` does).
 		assert!(
 			matches!(
@@ -233,7 +235,9 @@ async fn preserves_a_worktree_holding_ignored_files() {
 		// After the caller clears the residual content, removal proceeds (only tracked files remain).
 		std::fs::remove_file(wt.join("run.log")).unwrap();
 		std::fs::remove_dir_all(wt.join("build")).unwrap();
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: expected Removed once pristine, got {out:?}"
@@ -271,7 +275,7 @@ async fn a_non_component_double_star_ignore_does_not_hide_an_untracked_file() {
 			wt.to_str().unwrap()
 		]));
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		let RemoveError::Refused(WorktreeClassification::ProtectedWithReason {
@@ -309,7 +313,9 @@ async fn removes_a_clean_worktree_under_core_filemode_false() {
 		// Sanity: git considers the worktree clean under fileMode=false.
 		assert!(git(&["-C", wt.to_str().unwrap(), "status", "--porcelain"]).is_empty());
 
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: expected Removed under fileMode=false, got {out:?}"
@@ -342,7 +348,9 @@ async fn removes_a_linked_worktree_using_a_split_index() {
 			"{fmt}: sanity clean"
 		);
 
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: expected Removed for a split-index linked worktree, got {out:?}"
@@ -378,7 +386,7 @@ async fn a_worktree_config_filemode_override_refuses_a_dirty_checkout() {
 			"{fmt}: git should see the exec-bit change as modified under the worktree override"
 		);
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		assert!(
@@ -416,7 +424,9 @@ async fn removes_a_worktree_with_a_skip_worktree_entry() {
 		// Sanity: git ignores the omitted skip-worktree file.
 		assert!(git(&["-C", wts, "status", "--porcelain"]).is_empty());
 
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: expected Removed with a skip-worktree entry, got {out:?}"
@@ -449,7 +459,7 @@ async fn preserves_a_present_modified_skip_worktree_file() {
 			"{fmt}: git status hides a skip-worktree edit"
 		);
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		assert!(
@@ -485,7 +495,9 @@ async fn removes_a_worktree_with_a_present_unmodified_skip_worktree_file() {
 		git(&["-C", wts, "update-index", "--skip-worktree", "a.txt"]); // present, unchanged
 		assert!(git(&["-C", wts, "status", "--porcelain"]).is_empty());
 
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: a present, unmodified skip-worktree file must not block removal, got {out:?}"
@@ -530,7 +542,7 @@ async fn refuses_a_sparse_index_worktree_honestly() {
 			"{fmt}: a cone sparse-index checkout is clean to git"
 		);
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		assert!(
@@ -557,7 +569,9 @@ async fn removes_a_detached_worktree() {
 		let wt = base.join("wt");
 		git_add_worktree(&work, &wt, &["--detach"], &[&head]);
 
-		let out = remove(&rreq(&work, &wt, None)).await.unwrap();
+		let out = remove(&rreq(&work, &wt, None), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(
 				out,
@@ -608,7 +622,9 @@ async fn refuses_a_detached_worktree_with_unreachable_commits() {
 			"{fmt}: sanity clean"
 		);
 
-		let err = remove(&rreq(&work, &wt, None)).await.unwrap_err();
+		let err = remove(&rreq(&work, &wt, None), &Setup::default())
+			.await
+			.unwrap_err();
 		assert!(
 			matches!(
 				&err,
@@ -622,7 +638,9 @@ async fn refuses_a_detached_worktree_with_unreachable_commits() {
 
 		// Once the caller anchors the commit with a branch, its commit is reachable → removal proceeds.
 		git(&["-C", work.to_str().unwrap(), "branch", "saved", &head2]);
-		let out = remove(&rreq(&work, &wt, None)).await.unwrap();
+		let out = remove(&rreq(&work, &wt, None), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: removable once the commit is anchored by a ref, got {out:?}"
@@ -677,7 +695,7 @@ async fn refuses_a_worktree_with_a_per_worktree_ref_anchoring_an_unreachable_com
 		)
 		.unwrap();
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		assert!(
@@ -693,7 +711,9 @@ async fn refuses_a_worktree_with_a_per_worktree_ref_anchoring_an_unreachable_com
 
 		// Once that commit is anchored by a shared branch, removal proceeds.
 		git(&["-C", w, "branch", "saved", &head2]);
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: removable once the per-worktree-ref commit is anchored by a shared ref, got {out:?}"
@@ -747,7 +767,7 @@ async fn refuses_a_worktree_with_a_symbolic_per_worktree_ref_anchor() {
 		)
 		.unwrap();
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		assert!(
@@ -804,7 +824,9 @@ async fn removes_a_detached_worktree_anchored_by_a_symbolic_ref() {
 		)
 		.unwrap();
 
-		let out = remove(&rreq(&work, &wt, None)).await.unwrap();
+		let out = remove(&rreq(&work, &wt, None), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: a commit reachable via a symbolic shared ref must be removable, got {out:?}"
@@ -858,7 +880,9 @@ async fn refuses_cleaning_a_partial_whose_detached_head_is_unreachable() {
 		std::fs::remove_dir_all(&wt).unwrap();
 		assert!(!wt.exists());
 
-		let err = remove(&rreq(&work, &wt, None)).await.unwrap_err();
+		let err = remove(&rreq(&work, &wt, None), &Setup::default())
+			.await
+			.unwrap_err();
 		assert!(
 			matches!(
 				&err,
@@ -872,7 +896,9 @@ async fn refuses_cleaning_a_partial_whose_detached_head_is_unreachable() {
 		assert!(git(&["-C", work.to_str().unwrap(), "cat-file", "-e", &head2]).is_empty());
 
 		git(&["-C", work.to_str().unwrap(), "branch", "saved", &head2]);
-		let out = remove(&rreq(&work, &wt, None)).await.unwrap();
+		let out = remove(&rreq(&work, &wt, None), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: the partial cleans once the commit is anchored, got {out:?}"
@@ -936,7 +962,9 @@ async fn refuses_a_worktree_whose_head_is_symbolic_to_a_per_worktree_ref() {
 		assert_eq!(git(&["-C", wts, "rev-parse", "HEAD"]).trim(), head2);
 		assert!(git(&["-C", wts, "status", "--porcelain"]).is_empty());
 
-		let err = remove(&rreq(&work, &wt, None)).await.unwrap_err();
+		let err = remove(&rreq(&work, &wt, None), &Setup::default())
+			.await
+			.unwrap_err();
 		assert!(
 			matches!(
 				&err,
@@ -971,7 +999,7 @@ async fn refuses_cleaning_a_partial_with_staged_index_changes() {
 		// The checkout directory vanishes (external tool / crash), leaving the admin registration + its index.
 		std::fs::remove_dir_all(&wt).unwrap();
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		assert!(
@@ -1015,7 +1043,9 @@ async fn cleans_a_partial_whose_index_was_never_materialised() {
 		let admin = work.join(".git").join("worktrees").join("wt");
 		std::fs::remove_file(admin.join("index")).unwrap();
 
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: a recoverable partial with no index must clean, not refuse, got {out:?}"
@@ -1045,9 +1075,12 @@ async fn refuses_a_trailing_slash_symlink_destination() {
 		// The destination is the symlink spelled with a trailing separator.
 		let with_slash = std::path::PathBuf::from(format!("{}/", link.to_str().unwrap()));
 
-		let err = remove(&rreq(&work, &with_slash, Some("feature")))
-			.await
-			.unwrap_err();
+		let err = remove(
+			&rreq(&work, &with_slash, Some("feature")),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
 			matches!(
 				&err,
@@ -1109,7 +1142,9 @@ async fn removes_a_clean_worktree_with_a_case_variant_git_pointer() {
 			"{fmt}: sanity — git resolves the case-variant pointer and sees a clean tree"
 		);
 
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: a case-variant `.GIT` pointer must not read as residual content, got {out:?}"
@@ -1135,7 +1170,7 @@ async fn preserves_an_untracked_hardlink_to_the_gitfile() {
 		// An untracked hard link to the checkout's `.git` gitfile — same inode, different (non-`.git`) name.
 		std::fs::hard_link(wt.join(".git"), wt.join("gitfile-backup")).unwrap();
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		let RemoveError::Refused(WorktreeClassification::ProtectedWithReason {
@@ -1179,7 +1214,9 @@ async fn removal_succeeds_despite_stale_trash_remnants() {
 			std::fs::write(remnant.join("cruft"), b"x").unwrap(); // non-empty → rename onto it would fail
 		}
 
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: removal must succeed despite stale trash remnants, got {out:?}"
@@ -1228,7 +1265,9 @@ async fn removing_an_unborn_orphan_worktree_retains_no_branch() {
 			continue;
 		}
 
-		let out = remove(&rreq(&work, &wt, Some("topic"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("topic")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(
 				out,
@@ -1271,12 +1310,15 @@ async fn removing_from_a_bare_repository() {
 			"topic",
 		]);
 
-		let out = remove(&RemoveRequest {
-			repo: rid_bare(&bare),
-			destination: wt.clone(),
-			expected_branch: Some(BranchName::new("topic")),
-			policy: RemovePolicy::Conservative,
-		})
+		let out = remove(
+			&RemoveRequest {
+				repo: rid_bare(&bare),
+				destination: wt.clone(),
+				expected_branch: Some(BranchName::new("topic")),
+				policy: RemovePolicy::Conservative,
+			},
+			&Setup::default(),
+		)
 		.await
 		.unwrap();
 		assert!(
@@ -1313,7 +1355,7 @@ async fn refuses_a_worktree_with_untracked_files() {
 			"remove",
 			wt.to_str().unwrap()
 		]));
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		// An untracked file is residual content (no *tracked* changes), reported with its path.
@@ -1345,7 +1387,9 @@ async fn refuses_a_worktree_with_modified_tracked_files() {
 		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
 		std::fs::write(wt.join("a.txt"), "changed\n").unwrap();
 
-		let err = remove(&rreq(&work, &wt, None)).await.unwrap_err();
+		let err = remove(&rreq(&work, &wt, None), &Setup::default())
+			.await
+			.unwrap_err();
 		let RemoveError::Refused(WorktreeClassification::ProtectedWithReason {
 			reason: ProtectionReason::Dirty(report),
 		}) = err
@@ -1380,7 +1424,7 @@ async fn refuses_a_conflicted_worktree() {
 		assert!(!git_ok(&["-C", wts, "merge", "main"]));
 		assert!(git(&["-C", wts, "status", "--porcelain"]).contains("UU"));
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		let RemoveError::Refused(WorktreeClassification::ProtectedWithReason {
@@ -1417,7 +1461,7 @@ async fn refuses_a_locked_worktree_reporting_the_reason() {
 			wt.to_str().unwrap(),
 		]);
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		assert!(
@@ -1462,7 +1506,7 @@ async fn a_locked_worktree_refuses_before_reading_a_broken_index() {
 		std::fs::write(admin.join("index"), b"not a valid index").unwrap();
 		std::fs::write(admin.join("HEAD"), b"\x00 not a ref or oid\n").unwrap();
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		assert!(
@@ -1487,7 +1531,9 @@ async fn refuses_the_primary_worktree() {
 		init_repo(&work, fmt);
 		commit_file(&work, "a.txt", "1\n", "init");
 
-		let err = remove(&rreq(&work, &work, None)).await.unwrap_err();
+		let err = remove(&rreq(&work, &work, None), &Setup::default())
+			.await
+			.unwrap_err();
 		assert!(
 			matches!(err, RemoveError::IsPrimaryWorktree(ref p) if p == &work),
 			"{fmt}: expected IsPrimaryWorktree, got {err:?}"
@@ -1508,7 +1554,9 @@ async fn refuses_an_identity_mismatch_on_the_pinned_branch() {
 		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
 
 		// The caller expects `other`, but the worktree carries `feature` → identity mismatch, refused.
-		let err = remove(&rreq(&work, &wt, Some("other"))).await.unwrap_err();
+		let err = remove(&rreq(&work, &wt, Some("other")), &Setup::default())
+			.await
+			.unwrap_err();
 		assert!(
 			matches!(
 				err,
@@ -1535,7 +1583,9 @@ async fn a_non_directory_destination_is_a_destination_conflict_not_a_failure() {
 		let dest = base.join("afile");
 		std::fs::write(&dest, "i am a file\n").unwrap();
 
-		let err = remove(&rreq(&work, &dest, None)).await.unwrap_err();
+		let err = remove(&rreq(&work, &dest, None), &Setup::default())
+			.await
+			.unwrap_err();
 		assert!(
 			matches!(
 				err,
@@ -1579,7 +1629,9 @@ async fn removes_a_worktree_with_a_near_name_max_admin_name() {
 			continue;
 		}
 
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: expected Removed for a long admin name, got {out:?}"
@@ -1600,7 +1652,9 @@ async fn refuses_unrelated_content_it_does_not_own() {
 		std::fs::create_dir_all(&dest).unwrap();
 		std::fs::write(dest.join("mine.txt"), "keep\n").unwrap();
 
-		let err = remove(&rreq(&work, &dest, None)).await.unwrap_err();
+		let err = remove(&rreq(&work, &dest, None), &Setup::default())
+			.await
+			.unwrap_err();
 		assert!(
 			matches!(
 				err,
@@ -1633,11 +1687,15 @@ async fn removal_is_idempotent() {
 		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
 
 		assert!(matches!(
-			remove(&rreq(&work, &wt, Some("feature"))).await.unwrap(),
+			remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+				.await
+				.unwrap(),
 			RemoveOutcome::Removed { .. }
 		));
 		// A second removal after it is gone is a no-op, not a failure — the branch is still retained.
-		let again = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let again = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(again, RemoveOutcome::AlreadyAbsent { .. }),
 			"{fmt}: expected AlreadyAbsent, got {again:?}"
@@ -1658,7 +1716,9 @@ async fn an_absent_destination_with_a_retained_branch_is_already_absent() {
 		git(&["-C", w, "branch", "feature", &head]);
 		let wt = base.join("wt");
 
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::AlreadyAbsent { .. }),
 			"{fmt}: expected AlreadyAbsent, got {out:?}"
@@ -1682,7 +1742,9 @@ async fn removing_one_worktree_leaves_another_untouched() {
 		git_add_worktree(&work, &wt1, &["-b", "one"], &[]);
 		git_add_worktree(&work, &wt2, &["-b", "two"], &[]);
 
-		remove(&rreq(&work, &wt1, Some("one"))).await.unwrap();
+		remove(&rreq(&work, &wt1, Some("one")), &Setup::default())
+			.await
+			.unwrap();
 
 		// The other worktree's administration is intact and git still operates in it.
 		assert!(wt2.exists());
@@ -1725,7 +1787,9 @@ async fn cleans_a_recoverable_partial_and_unblocks_retry() {
 			"{fmt}: expected PartialRegistered classification"
 		);
 
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: {out:?}"
@@ -1735,7 +1799,9 @@ async fn cleans_a_recoverable_partial_and_unblocks_retry() {
 		assert_eq!(git(&["-C", w, "rev-parse", "feature"]).trim(), head);
 		assert!(git(&["-C", w, "worktree", "prune", "-n"]).is_empty());
 		// A retry now sees an absent destination (unblocked), not a lingering conflict.
-		let again = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let again = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(again, RemoveOutcome::AlreadyAbsent { .. }),
 			"{fmt}: {again:?}"
@@ -1757,7 +1823,9 @@ async fn removes_a_partial_whose_checkout_dir_is_gone() {
 		// The whole checkout directory is gone; only the admin registration remains.
 		std::fs::remove_dir_all(&wt).unwrap();
 
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: {out:?}"
@@ -1792,7 +1860,9 @@ async fn a_stale_registration_naming_the_primary_never_deletes_it() {
 		std::fs::write(admin.join("commondir"), "../..\n").unwrap();
 		std::fs::write(admin.join("HEAD"), "ref: refs/heads/main\n").unwrap();
 
-		let err = remove(&rreq(&work, &work, None)).await.unwrap_err();
+		let err = remove(&rreq(&work, &work, None), &Setup::default())
+			.await
+			.unwrap_err();
 		assert!(
 			matches!(err, RemoveError::IsPrimaryWorktree(_)),
 			"{fmt}: expected IsPrimaryWorktree, got {err:?}"
@@ -1828,7 +1898,7 @@ async fn a_partial_path_reused_for_unknown_content_is_preserved() {
 		std::fs::remove_file(wt.join("a.txt")).unwrap();
 		std::fs::write(wt.join("my-notes.txt"), "important\n").unwrap();
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		assert!(
@@ -1863,7 +1933,7 @@ async fn a_git_created_prunable_with_leftover_content_is_not_auto_cleaned() {
 		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
 		std::fs::remove_file(wt.join(".git")).unwrap(); // now a git-style "prunable", no gitana marker
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		assert!(
@@ -1908,7 +1978,7 @@ async fn a_partial_whose_branch_is_checked_out_elsewhere_is_a_branch_use_conflic
 			start: None,
 			with_status: false,
 		};
-		let classification = classify(&inspect(&q).await.unwrap());
+		let classification = classify(&inspect(&q, &Setup::default()).await.unwrap());
 		assert!(
 			matches!(
 				classification,
@@ -1946,7 +2016,9 @@ async fn an_undeletable_admin_child_still_deregisters_the_worktree() {
 		);
 		std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-		let out = remove(&rreq(&work, &wt, Some("feature"))).await.unwrap();
+		let out = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: expected Removed (atomic de-register despite undeletable child), got {out:?}"
@@ -1960,7 +2032,9 @@ async fn an_undeletable_admin_child_still_deregisters_the_worktree() {
 		assert_eq!(git(&["-C", w, "rev-parse", "feature"]).trim(), head);
 		// Idempotent: a repeat sees the worktree already absent.
 		assert!(matches!(
-			remove(&rreq(&work, &wt, Some("feature"))).await.unwrap(),
+			remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+				.await
+				.unwrap(),
 			RemoveOutcome::AlreadyAbsent { .. }
 		));
 
@@ -2026,7 +2100,7 @@ async fn a_worktree_enclosing_the_common_dir_is_never_recursively_deleted() {
 			expected_branch: Some(BranchName::new("feature")),
 			policy: RemovePolicy::Conservative,
 		};
-		let err = remove(&req).await.unwrap_err();
+		let err = remove(&req, &Setup::default()).await.unwrap_err();
 		assert!(
 			matches!(err, RemoveError::EnclosesRepository(_)),
 			"{fmt}: expected EnclosesRepository, got {err:?}"
@@ -2078,11 +2152,18 @@ async fn force_removes_a_dirty_worktree() {
 		std::fs::write(wt.join("a.txt"), "changed\n").unwrap();
 
 		// Conservative refuses (as git does without --force).
-		assert!(remove(&rreq(&work, &wt, Some("feature"))).await.is_err());
+		assert!(
+			remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+				.await
+				.is_err()
+		);
 		// GitCompat force 1 removes it, like `git worktree remove -f`.
-		let out = remove(&force_req(&work, &wt, Some("feature"), 1))
-			.await
-			.unwrap();
+		let out = remove(
+			&force_req(&work, &wt, Some("feature"), 1),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert!(matches!(out, RemoveOutcome::Removed { .. }));
 		assert!(!wt.exists(), "{fmt}: the dirty worktree was removed");
 		assert!(git_ok(&[
@@ -2109,8 +2190,14 @@ async fn force_removes_an_untracked_worktree() {
 		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
 		std::fs::write(wt.join("untracked.txt"), "x\n").unwrap();
 
-		assert!(remove(&rreq(&work, &wt, None)).await.is_err());
-		let out = remove(&force_req(&work, &wt, None, 1)).await.unwrap();
+		assert!(
+			remove(&rreq(&work, &wt, None), &Setup::default())
+				.await
+				.is_err()
+		);
+		let out = remove(&force_req(&work, &wt, None, 1), &Setup::default())
+			.await
+			.unwrap();
 		assert!(matches!(out, RemoveOutcome::Removed { .. }));
 		assert!(!wt.exists(), "{fmt}: worktree + untracked file removed");
 		let _ = std::fs::remove_dir_all(&base);
@@ -2140,9 +2227,12 @@ async fn a_locked_worktree_needs_double_force() {
 		]);
 
 		// One `-f` still refuses the lock.
-		let err = remove(&force_req(&work, &wt, Some("feature"), 1))
-			.await
-			.unwrap_err();
+		let err = remove(
+			&force_req(&work, &wt, Some("feature"), 1),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
 			matches!(
 				err,
@@ -2154,9 +2244,12 @@ async fn a_locked_worktree_needs_double_force() {
 		);
 		assert!(wt.exists());
 		// `-f -f` removes it.
-		let out = remove(&force_req(&work, &wt, Some("feature"), 2))
-			.await
-			.unwrap();
+		let out = remove(
+			&force_req(&work, &wt, Some("feature"), 2),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert!(matches!(out, RemoveOutcome::Removed { .. }));
 		assert!(!wt.exists(), "{fmt}: -f -f removes a locked worktree");
 		let _ = std::fs::remove_dir_all(&base);
@@ -2183,9 +2276,12 @@ async fn git_compat_force_zero_removes_an_ignored_only_worktree() {
 		// git considers it clean (ignored files omitted) — plain `git worktree remove` would delete it.
 		assert!(git(&["-C", wt.to_str().unwrap(), "status", "--porcelain"]).is_empty());
 
-		let out = remove(&force_req(&work, &wt, Some("feature"), 0))
-			.await
-			.unwrap();
+		let out = remove(
+			&force_req(&work, &wt, Some("feature"), 0),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: GitCompat{{0}} removes an ignored-only worktree, got {out:?}"
@@ -2221,9 +2317,12 @@ async fn git_compat_force_zero_refuses_a_real_untracked_worktree() {
 			git(&["-C", wt.to_str().unwrap(), "status", "--porcelain"]).contains("?? untracked.txt")
 		);
 
-		let err = remove(&force_req(&work, &wt, Some("feature"), 0))
-			.await
-			.unwrap_err();
+		let err = remove(
+			&force_req(&work, &wt, Some("feature"), 0),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
 			matches!(
 				err,
@@ -2257,7 +2356,7 @@ async fn conservative_still_refuses_an_ignored_only_worktree() {
 		std::fs::write(wt.join("target/out.o"), "obj\n").unwrap();
 		assert!(git(&["-C", wt.to_str().unwrap(), "status", "--porcelain"]).is_empty());
 
-		let err = remove(&rreq(&work, &wt, Some("feature")))
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
 			.await
 			.unwrap_err();
 		assert!(
@@ -2301,7 +2400,7 @@ async fn double_force_still_refuses_a_branch_identity_mismatch() {
 		]);
 
 		// The worktree is on `feature`, but the request pins `wrong`. Even `-f -f` must refuse and not delete.
-		let err = remove(&force_req(&work, &wt, Some("wrong"), 2))
+		let err = remove(&force_req(&work, &wt, Some("wrong"), 2), &Setup::default())
 			.await
 			.unwrap_err();
 		assert!(
@@ -2345,9 +2444,12 @@ async fn double_force_refuses_a_nonempty_reused_partial_destination() {
 		std::fs::remove_file(wt.join("a.txt")).unwrap();
 		std::fs::write(wt.join("unrelated.txt"), "keep me\n").unwrap();
 
-		let err = remove(&force_req(&work, &wt, Some("feature"), 2))
-			.await
-			.unwrap_err();
+		let err = remove(
+			&force_req(&work, &wt, Some("feature"), 2),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		// The overridden lock does not mask the real refusal: the reused non-empty destination surfaces as a
 		// DestinationConflict, not the already-overridden lock.
 		assert!(
@@ -2394,13 +2496,18 @@ async fn force_cleans_an_absent_partial_with_an_unreadable_index() {
 
 		// Conservative reads the index for its staged-work check and fails on the corruption.
 		assert!(
-			remove(&rreq(&work, &wt, Some("feature"))).await.is_err(),
+			remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+				.await
+				.is_err(),
 			"{fmt}: Conservative fails on the unreadable index"
 		);
 		// GitCompat force 1 does not read it — it cleans the stale admin, as `git worktree remove` would.
-		let out = remove(&force_req(&work, &wt, Some("feature"), 1))
-			.await
-			.unwrap();
+		let out = remove(
+			&force_req(&work, &wt, Some("feature"), 1),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: {out:?}"
@@ -2432,9 +2539,12 @@ async fn force_refuses_a_present_empty_dir_partial() {
 		assert!(wt.is_dir() && std::fs::read_dir(&wt).unwrap().next().is_none());
 
 		// Even a second force refuses — the present (empty) directory has no valid `.git` to validate.
-		let err = remove(&force_req(&work, &wt, Some("feature"), 2))
-			.await
-			.unwrap_err();
+		let err = remove(
+			&force_req(&work, &wt, Some("feature"), 2),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
 			matches!(
 				err,
@@ -2482,7 +2592,7 @@ async fn force_refuses_a_worktree_with_a_missing_admin_head() {
 			"{fmt}: probe — git refuses a missing-admin-HEAD worktree even with --force --force"
 		);
 		// `None` expected-branch so the refusal is the HEAD-existence gate, not an identity mismatch.
-		let out = remove(&force_req(&work, &wt, None, 2)).await;
+		let out = remove(&force_req(&work, &wt, None, 2), &Setup::default()).await;
 		assert!(
 			out.is_err(),
 			"{fmt}: a missing admin HEAD must not be force-deleted, got {out:?}"
@@ -2517,13 +2627,18 @@ async fn force_removes_a_live_worktree_with_a_corrupt_index() {
 
 		// Conservative reads the index for its status scan and fails.
 		assert!(
-			remove(&rreq(&work, &wt, Some("feature"))).await.is_err(),
+			remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+				.await
+				.is_err(),
 			"{fmt}: Conservative fails on the corrupt index"
 		);
 		// GitCompat force 1 removes it (status-free — never reads the index), as `git worktree remove -f` does.
-		let out = remove(&force_req(&work, &wt, Some("feature"), 1))
-			.await
-			.unwrap();
+		let out = remove(
+			&force_req(&work, &wt, Some("feature"), 1),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: {out:?}"
@@ -2559,7 +2674,9 @@ async fn force_removes_a_worktree_with_a_legacy_symlink_head() {
 		std::fs::remove_file(admin.join("HEAD")).unwrap();
 		std::os::unix::fs::symlink(work.join(".git/refs/heads/feature"), admin.join("HEAD")).unwrap();
 
-		let out = remove(&force_req(&work, &wt, None, 1)).await.unwrap();
+		let out = remove(&force_req(&work, &wt, None, 1), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: {out:?}"
@@ -2594,7 +2711,7 @@ async fn force_refuses_a_worktree_with_a_directory_admin_head() {
 		std::fs::create_dir(admin.join("HEAD")).unwrap();
 
 		// `None` expected-branch so the refusal is the HEAD-existence gate, not identity.
-		let out = remove(&force_req(&work, &wt, None, 2)).await;
+		let out = remove(&force_req(&work, &wt, None, 2), &Setup::default()).await;
 		assert!(
 			out.is_err(),
 			"{fmt}: a directory admin HEAD must not be force-deleted, got {out:?}"
@@ -2626,7 +2743,9 @@ async fn force_removes_a_worktree_with_a_garbage_admin_head() {
 		// A garbage HEAD: not `ref:`, not a hex object id — but a present file. git removes it under -f -f.
 		std::fs::write(admin.join("HEAD"), b"not a valid head\n").unwrap();
 
-		let out = remove(&force_req(&work, &wt, None, 1)).await.unwrap();
+		let out = remove(&force_req(&work, &wt, None, 1), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(
 				out,
@@ -2665,7 +2784,9 @@ async fn force_cleans_an_absent_partial_with_a_missing_head() {
 		assert!(!wt.exists());
 
 		// `None` expected-branch — a missing HEAD carries no branch, so a pin would (correctly) be a mismatch.
-		let out = remove(&force_req(&work, &wt, None, 1)).await.unwrap();
+		let out = remove(&force_req(&work, &wt, None, 1), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(out, RemoveOutcome::Removed { .. }),
 			"{fmt}: {out:?}"
@@ -2706,7 +2827,9 @@ async fn force_removing_an_unborn_branch_worktree_retains_no_branch() {
 			"refs/heads/ghost"
 		]));
 
-		let out = remove(&force_req(&work, &wt, None, 1)).await.unwrap();
+		let out = remove(&force_req(&work, &wt, None, 1), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(
 				out,
@@ -2748,7 +2871,9 @@ async fn force_refuses_a_worktree_whose_admin_gitdir_points_at_a_different_file(
 		std::fs::write(admin.join("gitdir"), format!("{}/other\n", wt.display())).unwrap();
 
 		// `None` expected-branch so the structural (not identity) refusal is exercised.
-		let err = remove(&force_req(&work, &wt, None, 2)).await.unwrap_err();
+		let err = remove(&force_req(&work, &wt, None, 2), &Setup::default())
+			.await
+			.unwrap_err();
 		assert!(
 			matches!(
 				err,
@@ -2782,7 +2907,9 @@ async fn force_removes_a_whitespace_padded_detached_head() {
 		// A real object id, padded with spaces — a present file HEAD git still force-removes.
 		std::fs::write(admin.join("HEAD"), format!("  {head}  \n")).unwrap();
 
-		let out = remove(&force_req(&work, &wt, None, 2)).await.unwrap();
+		let out = remove(&force_req(&work, &wt, None, 2), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(
 				out,
@@ -2826,9 +2953,12 @@ async fn force_resolves_a_symbolic_head_alias_for_identity_and_retained_branch()
 
 		// Pinning `feature` must MATCH via the terminal (not mis-refuse on the direct `alias`), and the retained
 		// branch is reported as the terminal `refs/heads/feature`, not the alias.
-		let out = remove(&force_req(&work, &wt, Some("feature"), 1))
-			.await
-			.unwrap();
+		let out = remove(
+			&force_req(&work, &wt, Some("feature"), 1),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert!(
 			matches!(
 				&out,
@@ -2865,7 +2995,9 @@ async fn force_does_not_retain_a_branch_that_is_only_a_ref_namespace_directory()
 		std::fs::write(work.join(".git/refs/heads/foo/bar"), format!("{head}\n")).unwrap();
 		std::fs::write(admin.join("HEAD"), "ref: refs/heads/foo\n").unwrap();
 
-		let out = remove(&force_req(&work, &wt, None, 1)).await.unwrap();
+		let out = remove(&force_req(&work, &wt, None, 1), &Setup::default())
+			.await
+			.unwrap();
 		assert!(
 			matches!(
 				out,
@@ -2913,7 +3045,11 @@ async fn force_refuses_a_worktree_with_an_unknown_repository_extension() {
 			"{fmt}: probe — git aborts a forced remove on an unknown repository extension"
 		);
 
-		let out = remove(&force_req(&work, &wt, Some("feature"), 2)).await;
+		let out = remove(
+			&force_req(&work, &wt, Some("feature"), 2),
+			&Setup::default(),
+		)
+		.await;
 		assert!(
 			out.is_err(),
 			"{fmt}: an unknown repository extension must refuse forced removal, got {out:?}"

@@ -201,6 +201,7 @@ pub async fn run(
 		prefix.clone(),
 		hash_kind,
 	)?;
+	let context = crate::attributes::for_submodules(context).await?;
 
 	match action {
 		Action::Status {
@@ -741,6 +742,7 @@ async fn resume_set_url_level(
 		String::new(),
 		hash_kind,
 	)?;
+	let context = crate::attributes::for_submodules(context).await?;
 	context.resume_pending_set_url(&configuration).await?;
 	Ok(())
 }
@@ -767,6 +769,7 @@ async fn sync_level(
 		query_prefix.to_owned(),
 		hash_kind,
 	)?;
+	let context = crate::attributes::for_submodules(context).await?;
 	match context.sync(&SyncRequest { query }, &configuration).await {
 		Ok(report) => {
 			render_sync(prefix, level_prefix, &report);
@@ -892,6 +895,7 @@ async fn sync_recovery_modules_level(
 		query_prefix.to_owned(),
 		hash_kind,
 	)?;
+	let context = crate::attributes::for_submodules(context).await?;
 	let pending_owner = if include_pending_owner {
 		context.pending_set_url_query()?
 	} else {
@@ -1031,6 +1035,7 @@ async fn status_level(
 		query_prefix.to_owned(),
 		hash_kind,
 	)?;
+	let context = crate::attributes::for_submodules(context).await?;
 	let pending_update_owner = if include_pending_update_owner {
 		context.pending_update_query()?
 	} else {
@@ -1083,6 +1088,7 @@ async fn resume_update_level(
 		String::new(),
 		hash_kind,
 	)?;
+	let context = crate::attributes::for_submodules(context).await?;
 	let transfer = SubmoduleTransfer::new(frontend.command, root, module_base, None);
 	match Box::pin(context.resume_pending_update(
 		&configuration,
@@ -1143,6 +1149,7 @@ async fn update_level(
 		query_prefix.to_owned(),
 		hash_kind,
 	)?;
+	let context = crate::attributes::for_submodules(context).await?;
 	request.reflog_committer = Some(committer(&superproject));
 	let transfer = SubmoduleTransfer::new(frontend.command, root, module_base, credential_url_base);
 	match Box::pin(context.update(

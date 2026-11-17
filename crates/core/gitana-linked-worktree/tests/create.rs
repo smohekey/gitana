@@ -8,9 +8,9 @@ use std::os::unix::fs::symlink;
 
 use common::*;
 use gitana_linked_worktree::{
-	BranchName, CheckoutTarget, CreateError, CreateRequest, Registration, RemovePolicy,
-	RemoveRequest, RepositoryId, WorktreeClassification, WorktreeObjectId, create,
-	durability_barrier_created, recover_prepared_create, remove,
+	BranchName, CheckoutTarget, CreateError, CreateRequest, LinkedWorktreeError, NewWorktreeSetup,
+	Registration, RemovePolicy, RemoveRequest, RepositoryId, Setup, WorktreeClassification,
+	WorktreeObjectId, create, durability_barrier_created, recover_prepared_create, remove,
 };
 
 fn req(work: &std::path::Path, dest: &std::path::Path, target: CheckoutTarget) -> CreateRequest {
@@ -20,6 +20,8 @@ fn req(work: &std::path::Path, dest: &std::path::Path, target: CheckoutTarget) -
 		target,
 		committer: None,
 		reflog_start: None,
+		worktree_config: None,
+		sparse_checkout: None,
 	}
 }
 
@@ -34,6 +36,8 @@ fn req_bare(
 		target,
 		committer: None,
 		reflog_start: None,
+		worktree_config: None,
+		sparse_checkout: None,
 	}
 }
 
@@ -71,9 +75,13 @@ async fn creates_a_new_branch_worktree_that_git_accepts() {
 		let wt = base.join("wt");
 		let start = WorktreeObjectId::parse(kind, &head).unwrap();
 
-		let insp = create(&req(&work, &wt, new_branch("feature", start)), None)
-			.await
-			.unwrap();
+		let insp = create(
+			&req(&work, &wt, new_branch("feature", start)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert!(matches!(insp.registration, Registration::Present { .. }));
 
 		let wts = wt.to_str().unwrap();
@@ -112,8 +120,12 @@ async fn records_the_supplied_committer_and_start_token_in_reflogs() {
 			target: new_branch("feature", start),
 			committer: Some(committer.to_owned()),
 			reflog_start: Some("HEAD".to_owned()),
+			worktree_config: None,
+			sparse_checkout: None,
 		};
-		create(&request, None).await.unwrap();
+		create(&request, &Setup::default(), &Setup::default())
+			.await
+			.unwrap();
 
 		// The branch-creation reflog records the supplied committer and the start TOKEN (`HEAD`), not the hash.
 		let branch_reflog = std::fs::read_to_string(work.join(".git/logs/refs/heads/feature")).unwrap();
@@ -152,9 +164,13 @@ async fn checks_out_an_existing_branch() {
 		git(&["-C", w, "branch", "feature", &head]);
 		let wt = base.join("wt");
 
-		create(&req(&work, &wt, existing_branch("feature", None)), None)
-			.await
-			.unwrap();
+		create(
+			&req(&work, &wt, existing_branch("feature", None)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		let wts = wt.to_str().unwrap();
 		assert_eq!(
 			git(&["-C", wts, "symbolic-ref", "HEAD"]).trim(),
@@ -174,7 +190,8 @@ async fn checking_out_a_missing_branch_is_branch_not_found() {
 		commit_file(&work, "a.txt", "1\n", "init");
 		let err = create(
 			&req(&work, &base.join("wt"), existing_branch("nope", None)),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap_err();
@@ -202,7 +219,8 @@ async fn new_branch_that_already_exists_elsewhere_is_branch_exists() {
 		let start = WorktreeObjectId::parse(kind, &second).unwrap();
 		let err = create(
 			&req(&work, &base.join("wt"), new_branch("feature", start)),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap_err();
@@ -225,7 +243,13 @@ async fn creates_a_detached_worktree() {
 		let target = CheckoutTarget::Detached {
 			start: WorktreeObjectId::parse(kind, &head).unwrap(),
 		};
-		create(&req(&work, &wt, target), None).await.unwrap();
+		create(
+			&req(&work, &wt, target),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		let wts = wt.to_str().unwrap();
 		assert_eq!(git(&["-C", wts, "rev-parse", "HEAD"]).trim(), head);
 		assert!(
@@ -247,7 +271,13 @@ async fn creates_an_orphan_worktree() {
 		let target = CheckoutTarget::Orphan {
 			name: BranchName::new("fresh"),
 		};
-		create(&req(&work, &wt, target), None).await.unwrap();
+		create(
+			&req(&work, &wt, target),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		let wts = wt.to_str().unwrap();
 		assert_eq!(
 			git(&["-C", wts, "symbolic-ref", "HEAD"]).trim(),
@@ -275,7 +305,8 @@ async fn orphan_of_an_existing_branch_is_branch_exists() {
 					name: BranchName::new("existing"),
 				},
 			),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap_err();
@@ -297,12 +328,20 @@ async fn re_creating_the_exact_worktree_is_idempotent() {
 		let wt = base.join("wt");
 		let start = WorktreeObjectId::parse(kind, &head).unwrap();
 
-		let first = create(&req(&work, &wt, new_branch("feature", start.clone())), None)
-			.await
-			.unwrap();
-		let second = create(&req(&work, &wt, new_branch("feature", start)), None)
-			.await
-			.unwrap();
+		let first = create(
+			&req(&work, &wt, new_branch("feature", start.clone())),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
+		let second = create(
+			&req(&work, &wt, new_branch("feature", start)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert_eq!(first, second, "{fmt}: re-create is idempotent");
 		let _ = std::fs::remove_dir_all(&base);
 	}
@@ -322,7 +361,8 @@ async fn new_branch_is_strict_when_the_branch_exists() {
 		let start = WorktreeObjectId::parse(kind, &head).unwrap();
 		let err = create(
 			&req(&work, &base.join("wt"), new_branch("feature", start)),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap_err();
@@ -352,9 +392,13 @@ async fn force_reset_moves_an_existing_branch() {
 		let wt = base.join("wt");
 		let wts = wt.to_str().unwrap();
 		let start = WorktreeObjectId::parse(kind, &second).unwrap();
-		let insp = create(&req(&work, &wt, reset_branch("feature", start)), None)
-			.await
-			.unwrap();
+		let insp = create(
+			&req(&work, &wt, reset_branch("feature", start)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		assert!(matches!(insp.registration, Registration::Present { .. }));
 
 		// The branch was reset to the second commit and checked out on it — git agrees, and the checkout is clean.
@@ -398,9 +442,13 @@ async fn force_reset_refuses_a_symbolic_branch() {
 
 		let wt = base.join("wt");
 		let start = WorktreeObjectId::parse(kind, &second).unwrap();
-		let err = create(&req(&work, &wt, reset_branch("alias", start)), None)
-			.await
-			.unwrap_err();
+		let err = create(
+			&req(&work, &wt, reset_branch("alias", start)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
 			matches!(err, CreateError::UnsupportedSymbolicBranchReset(ref n) if n == "refs/heads/alias"),
 			"{fmt}: expected a symbolic-ref refusal, got {err:?}"
@@ -433,9 +481,13 @@ async fn force_reset_refuses_a_no_space_symref_branch() {
 
 		let wt = base.join("wt");
 		let start = WorktreeObjectId::parse(kind, &second).unwrap();
-		let err = create(&req(&work, &wt, reset_branch("alias", start)), None)
-			.await
-			.unwrap_err();
+		let err = create(
+			&req(&work, &wt, reset_branch("alias", start)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
 			matches!(err, CreateError::UnsupportedSymbolicBranchReset(ref n) if n == "refs/heads/alias"),
 			"{fmt}: a no-space `ref:` symref must yield the matchable refusal, got {err:?}"
@@ -465,9 +517,13 @@ async fn force_reset_refuses_a_symlinked_branch() {
 
 		let wt = base.join("wt");
 		let start = WorktreeObjectId::parse(kind, &second).unwrap();
-		let err = create(&req(&work, &wt, reset_branch("alias", start)), None)
-			.await
-			.unwrap_err();
+		let err = create(
+			&req(&work, &wt, reset_branch("alias", start)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
 			matches!(err, CreateError::UnsupportedSymbolicBranchReset(ref n) if n == "refs/heads/alias"),
 			"{fmt}: expected a symbolic-ref refusal for a legacy symlink, got {err:?}"
@@ -491,9 +547,13 @@ async fn existing_branch_completes_an_interrupted_attempt() {
 		let reflog_before = std::fs::read_to_string(work.join(".git/logs/refs/heads/feature")).ok();
 
 		let wt = base.join("wt");
-		create(&req(&work, &wt, existing_branch("feature", None)), None)
-			.await
-			.unwrap();
+		create(
+			&req(&work, &wt, existing_branch("feature", None)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 
 		let wts = wt.to_str().unwrap();
 		assert_eq!(
@@ -516,9 +576,13 @@ async fn prepared_recovery_recreates_an_exact_nonempty_checkout_missing_partial(
 		let head = commit_file(&work, "a.txt", "1\n", "init");
 		let wt = base.join("wt");
 		let start = WorktreeObjectId::parse(kind, &head).unwrap();
-		create(&req(&work, &wt, new_branch("feature", start.clone())), None)
-			.await
-			.unwrap();
+		create(
+			&req(&work, &wt, new_branch("feature", start.clone())),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 
 		// Reproduce the exact commit order's interruption: admin, index, and checkout exist, but the final
 		// checkout `.git` marker never became visible.
@@ -526,7 +590,9 @@ async fn prepared_recovery_recreates_an_exact_nonempty_checkout_missing_partial(
 		assert!(wt.join("a.txt").is_file(), "{fmt}: partial is non-empty");
 		let recovery = req(&work, &wt, existing_branch("feature", Some(start.clone())));
 
-		let ordinary = create(&recovery, None).await.unwrap_err();
+		let ordinary = create(&recovery, &Setup::default(), &Setup::default())
+			.await
+			.unwrap_err();
 		assert!(
 			matches!(
 				ordinary,
@@ -535,7 +601,9 @@ async fn prepared_recovery_recreates_an_exact_nonempty_checkout_missing_partial(
 			"{fmt}: ordinary create must still preserve unknown non-empty partials, got {ordinary:?}"
 		);
 
-		let inspection = recover_prepared_create(&recovery, None).await.unwrap();
+		let inspection = recover_prepared_create(&recovery, &Setup::default(), &Setup::default())
+			.await
+			.unwrap();
 		assert!(matches!(
 			inspection.registration,
 			Registration::Present { .. }
@@ -559,9 +627,13 @@ async fn cancelling_prepared_recovery_does_not_abandon_the_owned_partial() {
 		let head = commit_file(&work, "a.txt", "1\n", "init");
 		let wt = base.join("wt");
 		let start = WorktreeObjectId::parse(kind, &head).unwrap();
-		create(&req(&work, &wt, new_branch("feature", start.clone())), None)
-			.await
-			.unwrap();
+		create(
+			&req(&work, &wt, new_branch("feature", start.clone())),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		std::fs::remove_file(wt.join(".git")).unwrap();
 
 		let lock = work.join(".git/worktrees.lock");
@@ -572,8 +644,9 @@ async fn cancelling_prepared_recovery_does_not_abandon_the_owned_partial() {
 			.unwrap();
 		let recovery = req(&work, &wt, existing_branch("feature", Some(start)));
 		let retained_request = recovery.clone();
-		let caller =
-			tokio::spawn(async move { recover_prepared_create(&retained_request, None).await });
+		let caller = tokio::spawn(async move {
+			recover_prepared_create(&retained_request, &Setup::default(), &Setup::default()).await
+		});
 		for _ in 0..8 {
 			tokio::task::yield_now().await;
 		}
@@ -625,7 +698,10 @@ async fn cancelling_create_does_not_release_or_abandon_history_gated_publication
 
 		let request = req(&work, &wt, CheckoutTarget::Detached { start });
 		let retained_request = request.clone();
-		let caller = tokio::spawn(async move { create(&retained_request, None).await });
+		let caller =
+			tokio::spawn(
+				async move { create(&retained_request, &Setup::default(), &Setup::default()).await },
+			);
 		for _ in 0..8 {
 			tokio::task::yield_now().await;
 		}
@@ -673,16 +749,21 @@ async fn prepared_recovery_preserves_a_partial_when_the_baseline_does_not_match(
 		let first = commit_file(&work, "a.txt", "1\n", "first");
 		let wt = base.join("wt");
 		let start = WorktreeObjectId::parse(kind, &first).unwrap();
-		create(&req(&work, &wt, new_branch("feature", start)), None)
-			.await
-			.unwrap();
+		create(
+			&req(&work, &wt, new_branch("feature", start)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		std::fs::remove_file(wt.join(".git")).unwrap();
 		let second = commit_file(&work, "b.txt", "2\n", "second");
 		let wrong = WorktreeObjectId::parse(kind, &second).unwrap();
 
 		let error = recover_prepared_create(
 			&req(&work, &wt, existing_branch("feature", Some(wrong))),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap_err();
@@ -729,9 +810,13 @@ async fn a_worktree_from_a_bare_host_still_gets_its_head_reflog() {
 
 		let wt = base.join("wt");
 		let start = WorktreeObjectId::parse(kind, &head).unwrap();
-		create(&req_bare(&bare, &wt, new_branch("feature", start)), None)
-			.await
-			.unwrap();
+		create(
+			&req_bare(&bare, &wt, new_branch("feature", start)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		// The linked worktree's admin gets a HEAD reflog (non-bare default) ...
 		assert!(
 			bare.join("worktrees/wt/logs/HEAD").exists(),
@@ -768,7 +853,8 @@ async fn refuses_a_branch_checked_out_elsewhere() {
 		let start = WorktreeObjectId::parse(kind, &head).unwrap();
 		let err = create(
 			&req(&work, &base.join("wt2"), new_branch("feature", start)),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap_err();
@@ -821,7 +907,8 @@ async fn an_unborn_branch_elsewhere_blocks_a_born_create_but_not_an_orphan() {
 		let start = WorktreeObjectId::parse(kind, &head).unwrap();
 		let born_err = create(
 			&req(&work, &base.join("born"), new_branch("orph", start)),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap_err();
@@ -842,7 +929,8 @@ async fn an_unborn_branch_elsewhere_blocks_a_born_create_but_not_an_orphan() {
 					name: BranchName::new("orph"),
 				},
 			),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap();
@@ -861,9 +949,13 @@ async fn refuses_an_occupied_destination() {
 		let dest = base.join("occupied");
 		std::fs::create_dir_all(&dest).unwrap();
 		std::fs::write(dest.join("stuff"), b"x").unwrap();
-		let err = create(&req(&work, &dest, new_branch("feature", start)), None)
-			.await
-			.unwrap_err();
+		let err = create(
+			&req(&work, &dest, new_branch("feature", start)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
 			matches!(
 				err,
@@ -900,7 +992,13 @@ async fn a_present_worktree_that_differs_is_a_mismatch() {
 		let target = CheckoutTarget::Detached {
 			start: WorktreeObjectId::parse(kind, &b).unwrap(),
 		};
-		let err = create(&req(&work, &wt, target), None).await.unwrap_err();
+		let err = create(
+			&req(&work, &wt, target),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
 			matches!(err, CreateError::ExistingWorktreeMismatch(_)),
 			"{fmt}: a present worktree at a different commit is a mismatch, got {err:?}"
@@ -922,9 +1020,13 @@ async fn rejects_an_invalid_branch_name() {
 			"git rejects branch name {bad:?}"
 		);
 		let start = WorktreeObjectId::parse(gitana_object::HashKind::Sha1, &head).unwrap();
-		let err = create(&req(&work, &base.join("wt"), new_branch(bad, start)), None)
-			.await
-			.unwrap_err();
+		let err = create(
+			&req(&work, &base.join("wt"), new_branch(bad, start)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
 			matches!(err, CreateError::InvalidBranchName(_)),
 			"expected InvalidBranchName for {bad:?}, got {err:?}"
@@ -949,7 +1051,8 @@ async fn a_bogus_start_commit_writes_nothing() {
 		let start = WorktreeObjectId::parse(kind, &bogus).unwrap();
 		let err = create(
 			&req(&work, &base.join("wt"), new_branch("feature", start)),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap_err();
@@ -986,8 +1089,14 @@ async fn refuses_a_relative_destination() {
 		target: new_branch("feature", start),
 		committer: None,
 		reflog_start: None,
+		worktree_config: None,
+		sparse_checkout: None,
 	};
-	assert!(create(&request, None).await.is_err());
+	assert!(
+		create(&request, &Setup::default(), &Setup::default())
+			.await
+			.is_err()
+	);
 	let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -1009,7 +1118,8 @@ async fn an_orphan_gets_a_zero_entry_index() {
 					name: BranchName::new("fresh"),
 				},
 			),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap();
@@ -1041,16 +1151,24 @@ async fn re_creating_after_the_branch_diverges_is_a_mismatch() {
 		let wt = base.join("wt");
 		let b_id = WorktreeObjectId::parse(kind, &b).unwrap();
 
-		create(&req(&work, &wt, new_branch("feature", b_id.clone())), None)
-			.await
-			.unwrap();
+		create(
+			&req(&work, &wt, new_branch("feature", b_id.clone())),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		// Rewind `feature` in its worktree to `a` — the requested start `b` is now unreachable from HEAD.
 		let wts = wt.to_str().unwrap();
 		git(&["-C", wts, "reset", "--hard", &a]);
 
-		let err = create(&req(&work, &wt, new_branch("feature", b_id)), None)
-			.await
-			.unwrap_err();
+		let err = create(
+			&req(&work, &wt, new_branch("feature", b_id)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
 			matches!(err, CreateError::ExistingWorktreeMismatch(_)),
 			"{fmt}: a diverged branch is a mismatch, got {err:?}"
@@ -1076,7 +1194,8 @@ async fn existing_branch_reconciles_an_advanced_expected_start() {
 
 		create(
 			&req(&work, &wt, existing_branch("feature", Some(a_id))),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap();
@@ -1106,7 +1225,8 @@ async fn existing_branch_refuses_a_diverged_expected_start() {
 				&base.join("wt"),
 				existing_branch("feature", Some(b_id)),
 			),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap_err();
@@ -1139,9 +1259,13 @@ async fn a_force_duplicated_branch_is_a_branch_use_conflict_not_idempotent() {
 		let wt = base.join("wt");
 		let start = WorktreeObjectId::parse(kind, &head).unwrap();
 
-		create(&req(&work, &wt, new_branch("feature", start.clone())), None)
-			.await
-			.unwrap();
+		create(
+			&req(&work, &wt, new_branch("feature", start.clone())),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
 		// Force a second checkout of the same branch elsewhere.
 		let wt2 = base.join("wt2");
 		git(&[
@@ -1154,9 +1278,13 @@ async fn a_force_duplicated_branch_is_a_branch_use_conflict_not_idempotent() {
 			"feature",
 		]);
 
-		let err = create(&req(&work, &wt, new_branch("feature", start)), None)
-			.await
-			.unwrap_err();
+		let err = create(
+			&req(&work, &wt, new_branch("feature", start)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
 			matches!(
 				err,
@@ -1217,7 +1345,8 @@ async fn sanitizes_a_pathological_basename_like_git() {
 		let start = WorktreeObjectId::parse(kind, &head).unwrap();
 		create(
 			&req(&work_ours, &dest_ours, new_branch("feat", start)),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.unwrap();
@@ -1266,7 +1395,8 @@ async fn accepts_a_non_utf8_destination_and_round_trips() {
 		// Create is accepted (not refused on UTF-8 grounds) and reports the worktree present.
 		let inspection = create(
 			&req(&work, &dest, new_branch("feature", start.clone())),
-			None,
+			&Setup::default(),
+			&Setup::default(),
 		)
 		.await
 		.expect("non-UTF-8 destination accepted");
@@ -1291,9 +1421,13 @@ async fn accepts_a_non_utf8_destination_and_round_trips() {
 		// admin `gitdir` and the checkout `.git` back — and stock git can operate in the worktree, resolving
 		// its non-UTF-8 gitfile/admin path.
 		assert!(
-			create(&req(&work, &dest, new_branch("feature", start)), None)
-				.await
-				.is_ok(),
+			create(
+				&req(&work, &dest, new_branch("feature", start)),
+				&Setup::default(),
+				&Setup::default()
+			)
+			.await
+			.is_ok(),
 			"{fmt}: idempotent re-create over the non-UTF-8 pointers"
 		);
 		let out = std::process::Command::new("git")
@@ -1309,12 +1443,15 @@ async fn accepts_a_non_utf8_destination_and_round_trips() {
 		assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), head);
 
 		// And safe removal round-trips the same non-UTF-8 identity.
-		remove(&RemoveRequest {
-			repo: rid_at(&work),
-			destination: dest.clone(),
-			expected_branch: None,
-			policy: RemovePolicy::Conservative,
-		})
+		remove(
+			&RemoveRequest {
+				repo: rid_at(&work),
+				destination: dest.clone(),
+				expected_branch: None,
+				policy: RemovePolicy::Conservative,
+			},
+			&Setup::default(),
+		)
 		.await
 		.expect("non-UTF-8 worktree removed");
 		assert!(!dest.exists(), "{fmt}: checkout gone after remove");
@@ -1333,10 +1470,157 @@ async fn refuses_a_symlink_destination() {
 		let start = WorktreeObjectId::parse(kind, &head).unwrap();
 		let target = base.join("as-link");
 		symlink(&work, &target).unwrap();
-		let err = create(&req(&work, &target, new_branch("feature", start)), None)
-			.await
-			.unwrap_err();
+		let err = create(
+			&req(&work, &target, new_branch("feature", start)),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(matches!(err, CreateError::Refused(_)), "{fmt}: got {err:?}");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+/// The checkout writes its files as the caller's setup says (its merged config, and the attributes
+/// files from outside the repository), and a removal judges them the same way: told nothing of the
+/// setup, it sees each converted file as changed and keeps the worktree.
+#[tokio::test]
+async fn writes_and_removes_by_the_callers_setup() {
+	type SetupFor = fn(&std::path::Path) -> Setup;
+	let setups: [(&str, SetupFor); 2] = [
+		("config", |work| Setup {
+			config: Some(
+				gitana_config::GitConfig::parse(&format!(
+					"{}[core]\n\tautocrlf = true\n",
+					std::fs::read_to_string(work.join(".git/config")).unwrap()
+				))
+				.unwrap(),
+			),
+			attributes: gitana_worktree::OutsideAttributes::default(),
+		}),
+		("attributes", |_| Setup {
+			config: None,
+			attributes: gitana_worktree::OutsideAttributes {
+				system: None,
+				global: Some(b"*.txt text eol=crlf\n".to_vec()),
+			},
+		}),
+	];
+	for (fmt, kind) in formats() {
+		for (name, setup) in &setups {
+			let base = unique_tmp(&format!("create-setup-{name}-{fmt}"));
+			let work = base.join("repo");
+			init_repo(&work, fmt);
+			let head = commit_file(&work, "a.txt", "1\n", "init");
+			let wt = base.join("wt");
+			let start = WorktreeObjectId::parse(kind, &head).unwrap();
+			let setup = setup(&work);
+
+			create(
+				&req(&work, &wt, new_branch("feature", start)),
+				&setup,
+				&setup,
+			)
+			.await
+			.unwrap();
+			assert_eq!(std::fs::read(wt.join("a.txt")).unwrap(), b"1\r\n", "{name}");
+
+			let request = RemoveRequest {
+				repo: rid_at(&work),
+				destination: wt.clone(),
+				expected_branch: Some(BranchName::new("feature")),
+				policy: RemovePolicy::Conservative,
+			};
+			// Rewritten, the file's stat no longer vouches for it; its content decides.
+			std::thread::sleep(std::time::Duration::from_millis(20));
+			std::fs::write(wt.join("a.txt"), b"1\r\n").unwrap();
+			assert!(
+				remove(&request, &Setup::default()).await.is_err(),
+				"{name}: kept, told nothing"
+			);
+			assert!(wt.exists(), "{name}");
+			remove(&request, &setup).await.unwrap();
+			assert!(!wt.exists(), "{name}: removed");
+			let _ = std::fs::remove_dir_all(&base);
+		}
+	}
+}
+
+/// What [`create`] asked a [`NewWorktreeSetup`] for: the git folder, and whether its `HEAD` was written.
+#[derive(Clone, Default)]
+struct Recorder {
+	asked: std::sync::Arc<std::sync::Mutex<Option<(std::path::PathBuf, bool)>>>,
+	fail: bool,
+}
+
+impl NewWorktreeSetup for Recorder {
+	fn setup_for(
+		&self,
+		git_dir: &std::path::Path,
+		_worktree: &std::path::Path,
+	) -> impl std::future::Future<Output = Result<Setup, Box<dyn std::error::Error + Send + Sync>>> + Send
+	{
+		*self.asked.lock().unwrap() = Some((git_dir.to_owned(), git_dir.join("HEAD").is_file()));
+		let result = if self.fail {
+			Err("no setup here".into())
+		} else {
+			Ok(Setup::default())
+		};
+		std::future::ready(result)
+	}
+}
+
+/// The new worktree's checkout asks for its setup with the worktree's own git folder, once its `HEAD`
+/// is written; a setup that fails is reported as such.
+#[tokio::test]
+async fn the_checkout_asks_for_the_new_worktrees_setup() {
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-new-setup-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+
+		let recorder = Recorder::default();
+		create(
+			&req(
+				&work,
+				&base.join("wt"),
+				new_branch("feature", start.clone()),
+			),
+			&Setup::default(),
+			&recorder,
+		)
+		.await
+		.unwrap();
+		let (git_dir, had_head) = recorder.asked.lock().unwrap().clone().unwrap();
+		assert_eq!(
+			git_dir.canonicalize().unwrap(),
+			work.join(".git/worktrees/wt").canonicalize().unwrap(),
+			"{fmt}"
+		);
+		assert!(had_head, "{fmt}: HEAD is written first");
+
+		let failing = Recorder {
+			fail: true,
+			..Recorder::default()
+		};
+		let err = create(
+			&req(&work, &base.join("wt2"), new_branch("other", start)),
+			&Setup::default(),
+			&failing,
+		)
+		.await
+		.unwrap_err();
+		assert!(
+			matches!(
+				err,
+				CreateError::Failed(LinkedWorktreeError::NewWorktreeSetup(ref cause))
+					if cause.to_string() == "no setup here"
+			),
+			"{fmt}: got {err:?}"
+		);
 		let _ = std::fs::remove_dir_all(&base);
 	}
 }

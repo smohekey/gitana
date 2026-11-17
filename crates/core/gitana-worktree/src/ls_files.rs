@@ -17,7 +17,7 @@ use crate::ignore::{self, DirIgnore};
 use crate::pathspec::PathspecSet;
 use crate::status::worktree_change;
 use crate::submodule_head_oid;
-use crate::{IndexEntry, LsFilesOptions, WorkTree, WorktreeError};
+use crate::{Converter, IndexEntry, LsFilesOptions, WorkTree, WorktreeError};
 
 /// The rendered output plus, when `--error-unmatch` is set, the first pathspec that matched nothing
 /// shown. git prints the matched entries *and then* exits non-zero, so the caller writes `text`
@@ -53,7 +53,10 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 ) -> Result<LsFilesOutput, WorktreeError> {
 	let quote_path = config.quote_path;
 	let excludes_file = config.excludes_file;
+	let index_time = wt.index_time().await?;
 	let index = wt.load_index().await?;
+	// `-m` compares working files with the index as they'd be stored, as git does.
+	let mut checkin = Converter::check_in(wt, &index, index_time).await?;
 
 	// The effective pathspec set. When it has no *positive* pathspec — none given, or only
 	// `:(exclude)` ones — git still scopes the listing to the current subtree, so synthesize the
@@ -251,7 +254,9 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 					}
 				} else {
 					// Present → `M` or ` `; a read failure (e.g. an unreadable file) counts as modified.
-					worktree_change(wt.work(), entry, &entry.path, config.file_mode).unwrap_or('M')
+					worktree_change(&mut checkin, entry, &entry.path, config.file_mode)
+						.await
+						.unwrap_or('M')
 				};
 				// An absent file (`D`) is reported by both `-d` and `-m`. A present, diverged file (`M`) is
 				// reported only by `-m` (assume-valid already collapsed to ` ` above).

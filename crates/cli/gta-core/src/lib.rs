@@ -3,6 +3,7 @@
 //! for `gta`, named for `gta-mcp`) and call into the `commands` here, which drive the
 //! gitana engine and working tree in-process and print their results to stdout.
 
+mod attributes;
 mod clone_destination;
 mod command_context;
 pub mod commands;
@@ -14,6 +15,7 @@ mod git_config;
 mod git_path;
 mod http_headers;
 mod identity;
+mod new_worktree_at;
 mod prompt;
 mod repo;
 mod repository_layout_identity;

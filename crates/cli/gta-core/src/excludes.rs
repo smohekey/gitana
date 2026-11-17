@@ -98,7 +98,10 @@ pub(crate) async fn resolve_excludes_file_at(
 /// directory (notably `/private/var` and `/var` on macOS). After deinit displaces the checkout the
 /// file itself is absent at the public name, so resolve the nearest existing ancestor and append the
 /// unresolved suffix rather than requiring the final file to remain ambiently reachable.
-async fn absolute_path_in_worktree(path: &Path, worktree_root: &Path) -> Option<PathBuf> {
+pub(crate) async fn absolute_path_in_worktree(
+	path: &Path,
+	worktree_root: &Path,
+) -> Option<PathBuf> {
 	if let Ok(relative) = path.strip_prefix(worktree_root) {
 		return Some(relative.to_owned());
 	}
@@ -209,11 +212,16 @@ async fn read_excludes_file(configured: Option<&str>, root: &Path) -> Result<Opt
 /// Expand a leading `~` / `~/…` against `$HOME` (git's excludes-file tilde handling); `~user` is not
 /// supported and yields an error. A path without a leading `~` is returned as-is.
 fn expand_tilde(path: &str) -> Result<PathBuf> {
+	expand_tilde_in("core.excludesFile", path)
+}
+
+/// [`expand_tilde`] for the setting `key`, which an error names.
+pub(crate) fn expand_tilde_in(key: &str, path: &str) -> Result<PathBuf> {
 	let Some(rest) = path.strip_prefix('~') else {
 		return Ok(PathBuf::from(path));
 	};
 	if !rest.is_empty() && !rest.starts_with('/') {
-		anyhow::bail!("unsupported `~user` in core.excludesFile: {path}");
+		anyhow::bail!("unsupported `~user` in {key}: {path}");
 	}
 	// Only an *unset* `HOME` is fatal. Concatenate `HOME` with the remainder git-style (string append, not
 	// path-join), keeping the leading separator: an empty `HOME` expands `~/foo` to the absolute `/foo` (and
@@ -231,7 +239,7 @@ fn expand_tilde(path: &str) -> Result<PathBuf> {
 /// best-effort gap versus git, which resolves it against the repository — a pathological configuration.
 /// An **empty** `HOME` (as sanitized/container environments often set) is treated as unset, so the
 /// default excludes path is not silently resolved relative to the process directory (`.config/git/ignore`).
-fn xdg_config_home() -> Option<PathBuf> {
+pub(crate) fn xdg_config_home() -> Option<PathBuf> {
 	if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
 		&& !xdg.is_empty()
 	{

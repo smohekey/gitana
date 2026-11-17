@@ -102,6 +102,10 @@ pub(crate) fn worktree_error(error: WorktreeError) -> RepoError {
 		| WorktreeError::UnsupportedFileType(_)
 		// A nested repository `add` won't stage is the caller's to deal with, like a submodule's.
 		| WorktreeError::EmbeddedRepository(_)
+		// A file whose attributes ask for a conversion gitana won't do, or whose line endings
+		// `core.safecrlf=true` won't let change, is refused by the repository's own settings.
+		| WorktreeError::UnsupportedAttribute { .. }
+		| WorktreeError::IrreversibleLineEndings { .. }
 		| WorktreeError::Config(_) => RepoError::Invalid(rendered),
 		_ => RepoError::Backend(rendered),
 	}

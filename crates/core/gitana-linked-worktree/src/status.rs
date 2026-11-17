@@ -157,17 +157,32 @@ mod native {
 		main_checkout_identifies_common,
 	};
 	use crate::repo_id::{detect_kind, open_store_raw, open_work_dir};
-	use crate::{LinkedWorktreeError, RepositoryId};
+	use crate::{LinkedWorktreeError, RepositoryId, Setup};
+
+	/// `repo`, reading `setup`'s merged config when it has one.
+	fn set_up<F: FileStore, H: HashAlgorithm>(
+		mut repo: Repository<F, H>,
+		setup: &Setup,
+	) -> Repository<F, H> {
+		if let Some(config) = &setup.config {
+			repo.set_effective_config(config.clone());
+		}
+		repo
+	}
 
 	/// Compute the working-tree status of the worktree at `destination` in repository `repo`. The
 	/// destination must be a worktree of `repo` (its main worktree or a registered linked worktree);
 	/// otherwise this is a hard error (a status cannot be attributed to a non-worktree path).
+	///
+	/// Files are compared with the index as `setup` says they'd be stored (its config's line endings and
+	/// the attributes files).
 	pub async fn status(
 		repo: &RepositoryId,
 		destination: &Path,
+		setup: &Setup,
 	) -> Result<WorktreeStatusReport, LinkedWorktreeError> {
 		let git_dir = resolve_live_worktree_git_dir(repo, destination)?;
-		status_at(&git_dir, repo.common_dir(), destination).await
+		status_at(&git_dir, repo.common_dir(), destination, setup).await
 	}
 
 	/// Resolve the per-worktree git dir for `destination`, requiring it to be a live worktree of `repo`
@@ -229,12 +244,15 @@ mod native {
 	/// entry, and any in-progress rebase/merge/cherry-pick/revert — in one readout. The destination must
 	/// be a live worktree of `repo` (its main worktree or a registered linked worktree); otherwise this
 	/// is a hard error, never a silently-clean readout. See [`CheckoutSafety`].
+	///
+	/// Files are compared with the index as `setup` says they'd be stored.
 	pub async fn checkout_safety(
 		repo: &RepositoryId,
 		destination: &Path,
+		setup: &Setup,
 	) -> Result<CheckoutSafety, LinkedWorktreeError> {
 		let git_dir = resolve_live_worktree_git_dir(repo, destination)?;
-		safety_at(&git_dir, repo.common_dir(), destination).await
+		safety_at(&git_dir, repo.common_dir(), destination, setup).await
 	}
 
 	/// The local refs of `repo` whose commit no remote-tracking ref contains — the *remote* half of the
@@ -338,12 +356,13 @@ mod native {
 		git_dir: &Path,
 		common: &Path,
 		destination: &Path,
+		setup: &Setup,
 	) -> Result<CheckoutSafety, LinkedWorktreeError> {
 		let store = open_store_raw(git_dir, common)?;
 		let work = open_work_dir(destination)?;
 		let (status, has_stash, operation_in_progress) = match detect_kind(&store).await? {
 			HashKind::Sha1 => {
-				let repo = Repository::<_, Sha1>::new(ObjectStore::new(store));
+				let repo = set_up(Repository::<_, Sha1>::new(ObjectStore::new(store)), setup);
 				let has_stash = repo.refs().resolve("refs/stash").await?.is_some();
 				let operation_in_progress = repo.rebase_in_progress().await?
 					|| repo.merge_head().await?.is_some()
@@ -351,12 +370,13 @@ mod native {
 					|| repo.revert_head().await?.is_some();
 				let status =
 					WorkTree::new_located(repo, work, git_dir.to_path_buf(), destination.to_path_buf())
+						.with_outside_attributes(setup.attributes.clone())
 						.status(None)
 						.await?;
 				(status, has_stash, operation_in_progress)
 			}
 			HashKind::Sha256 => {
-				let repo = Repository::<_, Sha256>::new(ObjectStore::new(store));
+				let repo = set_up(Repository::<_, Sha256>::new(ObjectStore::new(store)), setup);
 				let has_stash = repo.refs().resolve("refs/stash").await?.is_some();
 				let operation_in_progress = repo.rebase_in_progress().await?
 					|| repo.merge_head().await?.is_some()
@@ -364,6 +384,7 @@ mod native {
 					|| repo.revert_head().await?.is_some();
 				let status =
 					WorkTree::new_located(repo, work, git_dir.to_path_buf(), destination.to_path_buf())
+						.with_outside_attributes(setup.attributes.clone())
 						.status(None)
 						.await?;
 				(status, has_stash, operation_in_progress)
@@ -388,19 +409,22 @@ mod native {
 		git_dir: &Path,
 		common: &Path,
 		destination: &Path,
+		setup: &Setup,
 	) -> Result<WorktreeStatusReport, LinkedWorktreeError> {
 		let store = open_store_raw(git_dir, common)?;
 		let work = open_work_dir(destination)?;
 		let status = match detect_kind(&store).await? {
 			HashKind::Sha1 => {
-				let repo = Repository::<_, Sha1>::new(ObjectStore::new(store));
+				let repo = set_up(Repository::<_, Sha1>::new(ObjectStore::new(store)), setup);
 				WorkTree::new_located(repo, work, git_dir.to_path_buf(), destination.to_path_buf())
+					.with_outside_attributes(setup.attributes.clone())
 					.status(None)
 					.await?
 			}
 			HashKind::Sha256 => {
-				let repo = Repository::<_, Sha256>::new(ObjectStore::new(store));
+				let repo = set_up(Repository::<_, Sha256>::new(ObjectStore::new(store)), setup);
 				WorkTree::new_located(repo, work, git_dir.to_path_buf(), destination.to_path_buf())
+					.with_outside_attributes(setup.attributes.clone())
 					.status(None)
 					.await?
 			}
@@ -422,25 +446,28 @@ mod native {
 		git_dir: &Path,
 		common: &Path,
 		destination: &Path,
+		setup: &Setup,
 	) -> Result<Vec<gitana_path::GitPath>, LinkedWorktreeError> {
 		let store = open_store_raw(git_dir, common)?;
 		let work = open_work_dir(destination)?;
 		let paths = match detect_kind(&store).await? {
 			HashKind::Sha1 => {
 				WorkTree::new(
-					Repository::<_, Sha1>::new(ObjectStore::new(store)),
+					set_up(Repository::<_, Sha1>::new(ObjectStore::new(store)), setup),
 					work,
 					git_dir.to_path_buf(),
 				)
+				.with_outside_attributes(setup.attributes.clone())
 				.diverged_tracked_content_paths()
 				.await?
 			}
 			HashKind::Sha256 => {
 				WorkTree::new(
-					Repository::<_, Sha256>::new(ObjectStore::new(store)),
+					set_up(Repository::<_, Sha256>::new(ObjectStore::new(store)), setup),
 					work,
 					git_dir.to_path_buf(),
 				)
+				.with_outside_attributes(setup.attributes.clone())
 				.diverged_tracked_content_paths()
 				.await?
 			}

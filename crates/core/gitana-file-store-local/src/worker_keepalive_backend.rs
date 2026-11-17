@@ -25,6 +25,10 @@ impl Backend for WorkerKeepaliveBackend {
 		self.inner.read(path)
 	}
 
+	fn modified(&self, path: &str) -> std::io::Result<std::time::SystemTime> {
+		self.inner.modified(path)
+	}
+
 	fn read_range(&self, path: &str, offset: u64, length: u64) -> std::io::Result<Vec<u8>> {
 		self.inner.read_range(path, offset, length)
 	}

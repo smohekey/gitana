@@ -243,6 +243,10 @@ impl FileStore for WorktreeFileStore {
 		self.common.read_path(path)
 	}
 
+	fn modified(&self, path: &str) -> impl Future<Output = Result<Option<std::time::SystemTime>>> {
+		self.store(path).modified(path)
+	}
+
 	fn read_path_versioned(&self, path: &str) -> impl Future<Output = Result<(Vec<u8>, Version)>> {
 		self.store(path).read_path_versioned(path)
 	}
@@ -493,6 +497,46 @@ mod tests {
 	fn open_dir(path: &std::path::Path) -> Dir {
 		std::fs::create_dir_all(path).unwrap();
 		Dir::open_ambient_dir(path, cap_std::ambient_authority()).unwrap()
+	}
+
+	/// A file's modification time comes from the folder that holds it: the index from the
+	/// worktree's own, the config from the shared one; a missing file is `NotFound`.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn tells_when_a_file_was_modified_where_it_lives() {
+		let dir = std::env::temp_dir().join(format!("wfs-modified-{}", std::process::id()));
+		let common = dir.join("common");
+		let worktree = dir.join("wt");
+		let _ = std::fs::remove_dir_all(&dir);
+		let store = WorktreeFileStore::new(open_dir(&common), open_dir(&worktree));
+		std::fs::write(worktree.join("index"), b"i").unwrap();
+		std::fs::write(common.join("index"), b"i").unwrap();
+		std::fs::write(common.join("config"), b"c").unwrap();
+		let set = |path: &std::path::Path, time: &str| {
+			let status = std::process::Command::new("touch")
+				.args(["-t", time])
+				.arg(path)
+				.status()
+				.unwrap();
+			assert!(status.success());
+		};
+		set(&worktree.join("index"), "202001020304");
+		set(&common.join("index"), "202101020304");
+		set(&common.join("config"), "202201020304");
+		let at = |path: &std::path::Path| std::fs::metadata(path).unwrap().modified().unwrap();
+		assert_eq!(
+			store.modified("index").await.unwrap(),
+			Some(at(&worktree.join("index")))
+		);
+		assert_eq!(
+			store.modified("config").await.unwrap(),
+			Some(at(&common.join("config")))
+		);
+		assert!(matches!(
+			store.modified("absent").await,
+			Err(gitana_file_store::FileStoreError::NotFound)
+		));
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 
 	#[tokio::test]

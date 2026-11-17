@@ -370,6 +370,17 @@ impl ConfigurationProvider for WorktreeConfiguration {
 			.map_err(|error| SubmoduleError::Configuration(format!("{error:#}")))
 	}
 
+	async fn load_module_attributes_at(
+		&self,
+		config: &GitConfig,
+		worktree: Dir,
+		worktree_root: &Path,
+	) -> Result<gitana_worktree::OutsideAttributes, SubmoduleError> {
+		crate::attributes::outside_attributes_at(config, worktree, worktree_root)
+			.await
+			.map_err(|error| SubmoduleError::Configuration(format!("{error:#}")))
+	}
+
 	async fn set_module_worktree(
 		&self,
 		git_dir: Dir,

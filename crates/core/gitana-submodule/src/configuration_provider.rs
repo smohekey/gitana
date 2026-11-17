@@ -5,6 +5,8 @@ use cap_std::fs::Dir;
 use gitana_config::GitConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use gitana_object::HashKind;
+#[cfg(not(target_arch = "wasm32"))]
+use gitana_worktree::OutsideAttributes;
 
 use crate::{
 	DeinitConfigPublication, DeinitConfigTransition, MarkerTargetResolver, SubmoduleError,
@@ -96,6 +98,22 @@ pub trait ConfigurationProvider: MarkerTargetResolver {
 		worktree: Dir,
 		worktree_root: &Path,
 	) -> Result<Option<Vec<u8>>, SubmoduleError>;
+
+	/// The attributes files from outside the repository that a module's worktree reads, as the
+	/// module's own effective `config` finds them (a superproject's local `core.attributesFile` isn't
+	/// the module's). `worktree` is the module's checkout, open, whose root folder was
+	/// `worktree_root`: a file inside it is read through it, including after deinit has moved the
+	/// checkout aside, as [`Self::load_module_excludes_at`] does. The default reads none.
+	#[cfg(not(target_arch = "wasm32"))]
+	async fn load_module_attributes_at(
+		&self,
+		config: &GitConfig,
+		worktree: Dir,
+		worktree_root: &Path,
+	) -> Result<OutsideAttributes, SubmoduleError> {
+		let _ = (config, worktree, worktree_root);
+		Ok(OutsideAttributes::default())
+	}
 
 	/// Atomically update the module's repository-local `core.worktree` while preserving config
 	/// symlinks and the target file's permissions. `git_dir` is the already-open module directory;

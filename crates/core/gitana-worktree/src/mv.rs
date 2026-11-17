@@ -7,7 +7,7 @@
 //! validated before anything moves; then, like `rm`, the index lock is taken before the first
 //! filesystem change so a held lock or a bad plan never leaves a half-applied move.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
@@ -15,9 +15,9 @@ use gitana_object::HashAlgorithm;
 use gitana_path::{GitPath, GitPathspec};
 
 use crate::checkout::validate_path;
-use crate::fsmeta::{blob_of, stat_of};
+use crate::fsmeta::stat_of;
 use crate::pathspec::normalize;
-use crate::{IndexEntry, Stat, WorkTree, WorktreeError};
+use crate::{Converter, IndexEntry, Stat, WorkTree, WorktreeError};
 
 pub(crate) async fn run<F, W, H>(
 	wt: &WorkTree<F, W, H>,
@@ -133,44 +133,52 @@ where
 		return Ok(moves);
 	}
 
+	// The conversion settings the stat refresh reads are read and checked now (`core.*`, and every
+	// filter's `required`, which git reads at its first content check), so a bad one fails before
+	// anything moves rather than after, as git's own `mv` fails.
+	Converter::check_in(wt, &index, None)
+		.await?
+		.check_filter_settings()?;
 	// Lock the index before the first rename, so a held lock aborts before any file moves.
 	let lock = wt.lock_index().await?;
+	let mut moved = Vec::new();
 	for (src_norm, dst) in &moves {
 		let step = wt
 			.work()
 			.rename(src_norm, dst)
-			.map_err(WorktreeError::from)
-			.and_then(|()| reindex(wt, &mut index, src_norm, dst));
+			.map(|()| reindex(&mut index, src_norm, dst, &mut moved));
 		// On a mid-move failure, release the lock so it is not left stale; the moves already
 		// applied stay (git's `mv` is likewise not atomic across a rename failure).
 		if let Err(error) = step {
 			wt.release_index_lock(lock).await;
-			return Err(error);
+			return Err(error.into());
 		}
 	}
+	// The files have moved: a cancellation during the stat refresh or the index write (both await) must
+	// keep `index.lock` rather than release it over a half-applied tree.
+	if !moves.is_empty() {
+		lock.mark_mutation_started();
+	}
+	refresh_moved(wt, &mut index, &moved).await;
 	wt.commit_index(lock, &index).await?;
 	Ok(moves)
 }
 
 /// Move `src`'s index entries to `dst`: a single file entry, or every entry under `src/` with its
-/// path re-prefixed. The blob id and mode are kept (the content did not change); see [`remap`] for
-/// how the stat cache is handled.
-fn reindex<F, W, H>(
-	wt: &WorkTree<F, W, H>,
+/// path re-prefixed, adding each new path to `moved`. The blob id and mode are kept (the content did
+/// not change); [`refresh_moved`] then settles each one's stat cache.
+fn reindex<H: HashAlgorithm>(
 	index: &mut crate::Index<H>,
 	src: &GitPath,
 	dst: &GitPath,
-) -> Result<(), WorktreeError>
-where
-	F: FileStore,
-	W: WorkDirFs,
-	H: HashAlgorithm,
-{
-	if let Some(entry) = index.entry(src).cloned() {
-		let moved = remap(wt, entry, dst)?;
+	moved: &mut Vec<GitPath>,
+) {
+	if let Some(mut entry) = index.entry(src).cloned() {
 		index.remove(src);
-		index.upsert(moved);
-		return Ok(());
+		entry.path = dst.to_owned();
+		index.upsert(entry);
+		moved.push(dst.to_owned());
+		return;
 	}
 
 	let entries: Vec<IndexEntry<H>> = index
@@ -179,44 +187,76 @@ where
 		.filter(|e| e.stage == 0 && e.path.is_below(src))
 		.cloned()
 		.collect();
-	for entry in entries {
+	for mut entry in entries {
 		let tail = entry.path.relative_to(src).expect("selected descendant");
 		let new_path = dst.join_path(&tail);
-		let old_path = entry.path.clone();
-		let moved = remap(wt, entry, &new_path)?;
-		index.remove(&old_path);
-		index.upsert(moved);
+		index.remove(&entry.path);
+		entry.path = new_path.clone();
+		index.upsert(entry);
+		moved.push(new_path);
 	}
-	Ok(())
 }
 
-/// Clone `entry` to live at `new_path`. The blob id and mode are kept (the content moved
-/// unchanged). The stat cache is refreshed from the moved file only if its content still matches
+/// Settle the stat cache of each `moved` entry, once every move is done: refreshed from the moved
+/// file only if its content, as it would be stored by the attributes that now apply, still matches
 /// the staged blob; otherwise a default stat is left, so a moved-but-dirty file is not hidden — it
-/// cannot match the cache, forcing `status` to re-hash and report the unstaged modification.
-fn remap<F, W, H>(
+/// cannot match the cache, forcing `status` to re-hash and report the unstaged modification. It
+/// never fails the command once files have moved: an entry it can't compare (an unreadable file)
+/// gets the default stat too, as git's `mv` carries on past one.
+async fn refresh_moved<F, W, H>(
 	wt: &WorkTree<F, W, H>,
-	mut entry: IndexEntry<H>,
-	new_path: &GitPath,
-) -> Result<IndexEntry<H>, WorktreeError>
+	index: &mut crate::Index<H>,
+	moved: &[GitPath],
+) where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	// The index on disk is still the one the moved entries' stats were recorded against.
+	let mut checkin = match wt.index_time().await {
+		Ok(index_time) => Converter::check_in(wt, index, index_time).await.ok(),
+		Err(_) => None,
+	};
+	let moved: HashSet<&GitPath> = moved.iter().collect();
+	for entry in index
+		.entries
+		.iter_mut()
+		.filter(|entry| entry.stage == 0 && moved.contains(&entry.path))
+	{
+		let stat = match checkin.as_mut() {
+			Some(checkin) => settled_stat(checkin, entry).await.unwrap_or_default(),
+			None => Stat::default(),
+		};
+		entry.stat = stat;
+	}
+}
+
+/// The stat to record for the moved `entry`: its file's, when the file's content as stored still
+/// matches the staged blob; otherwise the default, so status re-reads it.
+async fn settled_stat<F, W, H>(
+	checkin: &mut Converter<'_, F, W, H>,
+	entry: &IndexEntry<H>,
+) -> Result<Stat, WorktreeError>
 where
 	F: FileStore,
 	W: WorkDirFs,
 	H: HashAlgorithm,
 {
-	let meta = wt
-		.work()
-		.lstat(new_path)?
-		.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "moved entry is missing"))?;
+	let Some(meta) = checkin.worktree().work().lstat(&entry.path)? else {
+		return Ok(Stat::default());
+	};
+	// A file gitana can't convert at its new path gets no recorded stat either, so the next `add` reads
+	// it and refuses rather than trusting it (git re-reads it too: the rename changed its ctime).
+	if meta.kind.is_file() && !checkin.can_convert(&entry.path).await? {
+		return Ok(Stat::default());
+	}
 	let clean = matches!(
-		blob_of(wt.work(), new_path, &meta)?,
+		checkin.blob_of(&entry.path, &meta, Some(entry)).await?,
 		Some((oid, mode)) if oid == entry.oid && mode == entry.mode
 	);
-	entry.stat = if clean {
+	Ok(if clean {
 		stat_of(&meta)
 	} else {
 		Stat::default()
-	};
-	entry.path = new_path.to_owned();
-	Ok(entry)
+	})
 }

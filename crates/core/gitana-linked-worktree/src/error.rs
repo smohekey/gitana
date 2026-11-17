@@ -120,6 +120,11 @@ pub enum LinkedWorktreeError {
 	/// while cleanup is still running; this variant preserves a join failure as an explicit error.
 	#[error("retained worktree task failed: {0}")]
 	RetainedTask(String),
+
+	/// The caller's [`NewWorktreeSetup`](crate::NewWorktreeSetup) couldn't resolve the setup for the
+	/// worktree being made; its cause is kept as the source.
+	#[error("resolving the new worktree's setup: {0}")]
+	NewWorktreeSetup(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl LinkedWorktreeError {

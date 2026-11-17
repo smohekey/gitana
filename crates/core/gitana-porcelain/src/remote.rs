@@ -16,7 +16,7 @@ use gitana_remote::{
 	effective_fetch_refspecs, validate_remote_name,
 };
 use gitana_repository::{HeadState, ReflogIntent, Repository};
-use gitana_worktree::WorkTree;
+use gitana_worktree::{OutsideAttributes, WorkTree};
 
 use crate::{PreparedClone, Signer};
 
@@ -827,6 +827,9 @@ async fn fetch_object_inner<F: FileStore, H: HashAlgorithm>(
 /// pre-`insteadOf` argument, and the CLI redacts any password). `reflog` supplies the committer and
 /// verbatim source URL for the `clone: from <url>` entries git records on `HEAD` and the checked-out
 /// branch; `None` (the in-component clone, with no configured identity) writes no reflog.
+/// `attributes` are the attributes files from outside the repository, which the checkout reads too;
+/// line endings follow `repo`'s merged config.
+#[allow(clippy::too_many_arguments)]
 pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	connection: &mut impl Connection,
 	repo: Repository<F, H>,
@@ -835,12 +838,13 @@ pub async fn clone<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	reflog: Option<CloneReflog<'_>>,
 	persist_url: &str,
 	sparse: bool,
+	attributes: OutsideAttributes,
 ) -> Result<()> {
 	let prepared = prepare_clone(connection, &repo, deepen, reflog, persist_url).await?;
 
 	// The `git_dir` a `WorkTree` carries is inert — the index and all git-dir files route through the
 	// `FileStore` — so a placeholder path suffices, as elsewhere in the worktree layer.
-	let worktree = WorkTree::new(repo, work, "");
+	let worktree = WorkTree::new(repo, work, "").with_outside_attributes(attributes);
 	// `--sparse` must establish its config before the first checkout so excluded paths are never written.
 	if sparse {
 		worktree

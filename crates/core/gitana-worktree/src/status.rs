@@ -10,11 +10,10 @@ use gitana_object::{HashAlgorithm, ObjectId, ObjectKind};
 use gitana_path::{GitPath, GitPathComponent};
 
 use crate::excludes::StandardExcludes;
-use crate::fsmeta::{blob_of, effective_mode, join_rel, push_gitignore};
+use crate::fsmeta::{effective_mode, join_rel, push_gitignore};
 use crate::ignore::{self, DirIgnore};
 use crate::submodule_head_oid;
-use crate::worktree::stat_matches;
-use crate::{Conflict, IndexEntry, WorkTree, WorktreeError};
+use crate::{Conflict, Converter, IndexEntry, WorkTree, WorktreeError};
 
 /// One path's status: an index (staged-vs-HEAD) code and a worktree
 /// (unstaged-vs-index) code, using git's letters (` `, `A`, `M`, `D`, `?`).
@@ -87,7 +86,10 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	// `config`; unset defaults to `true` (honour the bit). Getting this wrong toward "clean" would let removal
 	// delete a genuinely-modified checkout, so the default and the override both fail safe toward `true`.
 	let file_mode = worktree_file_mode(wt).await;
+	let index_time = wt.index_time().await?;
 	let index = wt.load_index().await?;
+	// Working files are compared with the index as they'd be stored, as git compares them.
+	let mut checkin = Converter::check_in(wt, &index, index_time).await?;
 	let index_map: HashMap<GitPath, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
@@ -206,7 +208,7 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 				}
 			}
 		} else {
-			worktree_change(wt.work(), entry, &entry.path, file_mode)?
+			worktree_change(&mut checkin, entry, &entry.path, file_mode).await?
 		};
 		if code != ' ' {
 			at(&mut merged, &entry.path).worktree = code;
@@ -268,10 +270,12 @@ pub(crate) async fn diverged_tracked_content<F: FileStore, W: WorkDirFs, H: Hash
 ) -> Result<Vec<GitPath>, WorktreeError> {
 	let file_mode = worktree_file_mode(wt).await;
 	let index = wt.load_index().await?;
+	// Never trusts a stat (it hashes), so the index's time doesn't matter.
+	let mut checkin = Converter::check_in(wt, &index, None).await?;
 	let mut out = Vec::new();
 	for entry in index.entries.iter().filter(|e| e.stage == 0) {
 		if matches!(
-			worktree_content_state(wt, entry, file_mode).await?,
+			worktree_content_state(&mut checkin, entry, file_mode).await?,
 			WorktreeContent::Diverged
 		) {
 			out.push(entry.path.clone());
@@ -299,10 +303,11 @@ pub(crate) enum WorktreeContent {
 /// to a verified stored blob → `Reconstructable`; otherwise → `Diverged`. Always hashes the present
 /// file, so a stat-preserving or coarse-timestamp edit is caught.
 pub(crate) async fn worktree_content_state<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
-	wt: &WorkTree<F, W, H>,
+	checkin: &mut Converter<'_, F, W, H>,
 	entry: &IndexEntry<H>,
 	file_mode: bool,
 ) -> Result<WorktreeContent, WorktreeError> {
+	let wt = checkin.worktree();
 	let Some(meta) = wt.work().lstat(&entry.path)? else {
 		return Ok(WorktreeContent::Absent);
 	};
@@ -327,8 +332,12 @@ pub(crate) async fn worktree_content_state<F: FileStore, W: WorkDirFs, H: HashAl
 			WorktreeContent::Diverged
 		});
 	}
-	// Deliberately *no* `stat_matches` shortcut: hash the working file and compare oid + mode directly.
-	let diverged = match blob_of::<W, H>(wt.work(), &entry.path, &meta)? {
+	// Deliberately *no* `stat_matches` shortcut: hash the working file (as it would be stored) and compare
+	// oid + mode directly. A file gitana can't convert counts as diverged unless its bytes are the blob's.
+	let diverged = match checkin
+		.hashed_blob_of(&entry.path, &meta, Some(entry))
+		.await?
+	{
 		Some((oid, _))
 			if oid == entry.oid
 				&& modes_equivalent(effective_mode(&meta, entry.mode), entry.mode, file_mode) =>
@@ -642,19 +651,24 @@ fn fold_key(path: &GitPath, fold: bool) -> Vec<u8> {
 	}
 }
 
-pub(crate) fn worktree_change<W: WorkDirFs, H: HashAlgorithm>(
-	work: &W,
+/// The worktree column for the tracked `entry`, whose file is at `path`: `D` when it's gone, `M` when
+/// its content as stored (by `checkin`) or its mode differs, else ` `.
+pub(crate) async fn worktree_change<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	checkin: &mut Converter<'_, F, W, H>,
 	entry: &IndexEntry<H>,
 	path: &GitPath,
 	file_mode: bool,
 ) -> Result<char, WorktreeError> {
-	let Some(meta) = work.lstat(path)? else {
+	let Some(meta) = checkin.worktree().work().lstat(path)? else {
 		return Ok('D');
 	};
-	if stat_matches(entry, &meta) {
+	if checkin.trusts_stat(entry, &meta) {
 		return Ok(' ');
 	}
-	match blob_of(work, path, &meta)? {
+	if crate::worktree::size_changed(entry, &meta) {
+		return Ok('M');
+	}
+	match checkin.blob_of(path, &meta, Some(entry)).await? {
 		Some((oid, _))
 			if oid == entry.oid
 				&& modes_equivalent(effective_mode(&meta, entry.mode), entry.mode, file_mode) =>
@@ -782,8 +796,11 @@ mod tests {
 		};
 
 		// The fast path is fooled — stat matches, so it reports the file unchanged.
+		let mut checkin = Converter::check_in(&wt, &Index::new(), None).await.unwrap();
 		assert_eq!(
-			worktree_change(wt.work(), &entry, &path, true).unwrap(),
+			worktree_change(&mut checkin, &entry, &path, true)
+				.await
+				.unwrap(),
 			' ',
 			"the stat-cache fast path reports the diverged file as clean (the hole)"
 		);
@@ -862,6 +879,178 @@ mod tests {
 			"a hash-matching file whose object is missing is the sole copy — must be flagged, not deletable"
 		);
 
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	/// git's racy-timestamp rule, both halves. On read: an entry whose stat matches its file but was
+	/// recorded no earlier than the index file was written can't vouch for the file, so status reads
+	/// it; recorded earlier, the stat is trusted (as git trusts it). On write: such an entry, carried
+	/// over into a new index, has its size zeroed when its content changed, so the newer index can't
+	/// make it look clean. The times are set exactly, whatever the filesystem's granularity.
+	#[cfg(all(unix, not(target_arch = "wasm32")))]
+	#[tokio::test]
+	async fn a_racily_clean_entry_is_read_and_smudged_as_git_does() {
+		use std::sync::atomic::{AtomicU32, Ordering};
+
+		use cap_std::ambient_authority;
+		use cap_std::fs::Dir;
+		use gitana_file_store_local::{CapWorkDir, LocalFileStore};
+		use gitana_object_store::ObjectStore;
+		use gitana_repository::Repository;
+
+		use crate::IndexEntry;
+		use crate::fsmeta::{mode_of, stat_of};
+
+		/// Set `path`'s modification time to `seconds` and `nanos` past the epoch.
+		fn at(seconds: u64, nanos: u32, path: &std::path::Path) {
+			std::fs::File::options()
+				.write(true)
+				.open(path)
+				.unwrap()
+				.set_modified(std::time::UNIX_EPOCH + std::time::Duration::new(seconds, nanos))
+				.unwrap();
+		}
+		// 2020-01-01, 2020-01-02 and 2020-01-03, UTC.
+		const DAY_1: u64 = 1_577_836_800;
+		const DAY_2: u64 = 1_577_923_200;
+		const DAY_3: u64 = 1_578_009_600;
+
+		static SEQ: AtomicU32 = AtomicU32::new(0);
+		let root = std::env::temp_dir().join(format!(
+			"gitana-racy-{}-{}",
+			std::process::id(),
+			SEQ.fetch_add(1, Ordering::Relaxed)
+		));
+		let git_dir = root.join(".git");
+		std::fs::create_dir_all(&git_dir).unwrap();
+		std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+		std::fs::write(root.join("a.txt"), b"AAAA").unwrap();
+		std::fs::write(root.join("b.txt"), b"BBBB").unwrap();
+		for file in ["a.txt", "b.txt"] {
+			at(DAY_2, 100_000_000, &root.join(file));
+		}
+		let wt = WorkTree::new(
+			Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+				Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap(),
+			))),
+			CapWorkDir::from_dir(Dir::open_ambient_dir(&root, ambient_authority()).unwrap()),
+			&git_dir,
+		);
+		// `a.txt`'s entry has the file's stat but another content's blob, as a same-size edit within the
+		// timestamp leaves it; `b.txt`'s is right.
+		let entry = |name: &str, content: &[u8]| {
+			let path = GitPath::from_utf8(name).unwrap();
+			let meta = wt.work().lstat(&path).unwrap().unwrap();
+			IndexEntry::<Sha256> {
+				stat: stat_of(&meta),
+				mode: mode_of(&meta),
+				oid: ObjectId::<Sha256>::compute(ObjectKind::Blob, content),
+				stage: 0,
+				assume_valid: false,
+				skip_worktree: false,
+				intent_to_add: false,
+				path,
+			}
+		};
+		let mut index = Index::new();
+		index.entries.push(entry("a.txt", b"edited"));
+		index.entries.push(entry("b.txt", b"BBBB"));
+		wt.save_index(&index).await.unwrap();
+		let changed = async || {
+			compute(&wt, None)
+				.await
+				.unwrap()
+				.changed
+				.into_iter()
+				.filter(|entry| entry.worktree != ' ')
+				.map(|entry| entry.path.to_string())
+				.collect::<Vec<_>>()
+		};
+
+		// Written in a later second than the entries: trusted, as git trusts them.
+		at(DAY_3, 0, &git_dir.join("index"));
+		assert_eq!(changed().await, Vec::<String>::new(), "trusted");
+
+		// Written later in the same second: racy, as git compares whole seconds, so read.
+		at(DAY_2, 900_000_000, &git_dir.join("index"));
+		assert_eq!(changed().await, ["a.txt"], "racy, later in the same second");
+
+		// Written at the same time: racy.
+		at(DAY_2, 100_000_000, &git_dir.join("index"));
+		assert_eq!(changed().await, ["a.txt"], "racy, the same time");
+
+		// Written before the entries: racy.
+		at(DAY_1, 0, &git_dir.join("index"));
+		assert_eq!(changed().await, ["a.txt"], "racy");
+
+		// Carried into a newer index: `a.txt` is smudged, `b.txt` (unchanged) isn't.
+		wt.save_index(&wt.load_index().await.unwrap())
+			.await
+			.unwrap();
+		let saved = wt.load_index().await.unwrap();
+		assert_eq!(saved.entries[0].stat.size, 0, "a.txt smudged");
+		assert_eq!(saved.entries[1].stat.size, 4, "b.txt kept");
+		assert_eq!(
+			changed().await,
+			["a.txt"],
+			"still read after the newer index"
+		);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	/// The index writer's smudge never fails the write: with a conversion setting it can't read, it
+	/// zeroes a racy carried-over entry unread rather than leave an operation half-applied.
+	#[cfg(all(unix, not(target_arch = "wasm32")))]
+	#[tokio::test]
+	async fn a_racy_entry_is_smudged_when_it_cannot_be_compared() {
+		use cap_std::ambient_authority;
+		use cap_std::fs::Dir;
+		use gitana_file_store_local::{CapWorkDir, LocalFileStore};
+		use gitana_object_store::ObjectStore;
+		use gitana_repository::Repository;
+
+		use crate::IndexEntry;
+		use crate::fsmeta::{mode_of, stat_of};
+
+		let root = std::env::temp_dir().join(format!("gitana-racy-unread-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		let git_dir = root.join(".git");
+		std::fs::create_dir_all(&git_dir).unwrap();
+		std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+		std::fs::write(git_dir.join("config"), b"[core]\n\tautocrlf = maybe\n").unwrap();
+		std::fs::write(root.join("a.txt"), b"AAAA").unwrap();
+		let wt = WorkTree::new(
+			Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+				Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap(),
+			))),
+			CapWorkDir::from_dir(Dir::open_ambient_dir(&root, ambient_authority()).unwrap()),
+			&git_dir,
+		);
+		let path = GitPath::from_utf8("a.txt").unwrap();
+		let meta = wt.work().lstat(&path).unwrap().unwrap();
+		let mut index = Index::new();
+		index.entries.push(IndexEntry::<Sha256> {
+			stat: stat_of(&meta),
+			mode: mode_of(&meta),
+			oid: ObjectId::<Sha256>::compute(ObjectKind::Blob, b"AAAA"),
+			stage: 0,
+			assume_valid: false,
+			skip_worktree: false,
+			intent_to_add: false,
+			path,
+		});
+		wt.save_index(&index).await.unwrap();
+		// The index is no newer than the entry: racy. Written again, it's smudged, unread.
+		std::fs::File::options()
+			.write(true)
+			.open(git_dir.join("index"))
+			.unwrap()
+			.set_modified(std::time::UNIX_EPOCH)
+			.unwrap();
+		wt.save_index(&wt.load_index().await.unwrap())
+			.await
+			.unwrap();
+		assert_eq!(wt.load_index().await.unwrap().entries[0].stat.size, 0);
 		let _ = std::fs::remove_dir_all(&root);
 	}
 }

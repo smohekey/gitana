@@ -275,7 +275,6 @@ mod native {
 	use gitana_object_store::ObjectStore;
 	use gitana_repository::{HeadState, Repository};
 
-	use crate::LinkedWorktreeError;
 	use crate::head::{read_head, read_lock_reason, structural_head_branch_for_move};
 	use crate::object_id::IntoWorktreeObjectId;
 	use crate::pointers::{
@@ -285,11 +284,18 @@ mod native {
 	};
 	use crate::query::WorktreeQuery;
 	use crate::repo_id::{detect_kind, open_store_raw};
+	use crate::{LinkedWorktreeError, Setup};
 
 	/// Inspect one destination. Opens the repository store (native mint), detects the object format, and
 	/// dispatches to the monomorphized body.
-	pub async fn inspect(query: &WorktreeQuery) -> Result<WorktreeInspection, LinkedWorktreeError> {
-		inspect_impl(query, true).await
+	///
+	/// A status, when the query asks for one, compares files with the index as `setup` says they'd be
+	/// stored.
+	pub async fn inspect(
+		query: &WorktreeQuery,
+		setup: &Setup,
+	) -> Result<WorktreeInspection, LinkedWorktreeError> {
+		inspect_impl(query, true, setup).await
 	}
 
 	/// Like [`inspect`] but reads HEAD **structurally** — the branch HEAD directly names, without following the
@@ -301,7 +307,7 @@ mod native {
 	pub(crate) async fn inspect_structural_head(
 		query: &WorktreeQuery,
 	) -> Result<WorktreeInspection, LinkedWorktreeError> {
-		inspect_impl(query, false).await
+		inspect_impl(query, false, &Setup::default()).await
 	}
 
 	/// The shared inspection. `resolve_head` selects the resolving (default, via [`inspect`]) or structural
@@ -310,6 +316,7 @@ mod native {
 	async fn inspect_impl(
 		query: &WorktreeQuery,
 		resolve_head: bool,
+		setup: &Setup,
 	) -> Result<WorktreeInspection, LinkedWorktreeError> {
 		// Identity paths must be absolute — a relative destination would resolve against the process CWD.
 		if !query.destination.is_absolute() {
@@ -338,6 +345,7 @@ mod native {
 					Repository::new(ObjectStore::new(store)),
 					query,
 					resolve_head,
+					setup,
 				)
 				.await
 			}
@@ -346,6 +354,7 @@ mod native {
 					Repository::new(ObjectStore::new(store)),
 					query,
 					resolve_head,
+					setup,
 				)
 				.await
 			}
@@ -356,6 +365,7 @@ mod native {
 		repo: Repository<gitana_file_store_local::WorktreeFileStore, H>,
 		query: &WorktreeQuery,
 		resolve_head: bool,
+		setup: &Setup,
 	) -> Result<WorktreeInspection, LinkedWorktreeError>
 	where
 		ObjectId<H>: IntoWorktreeObjectId,
@@ -612,10 +622,10 @@ mod native {
 			// content re-verification of every present tracked file (hashing, not the stat cache — catches edits
 			// `status` can miss and skip-worktree edits it omits), and whether the index is a sparse index (whose
 			// collapsed directory entries make that status unreliable).
-			let status = crate::status::status_at(admin, common, destination).await?;
+			let status = crate::status::status_at(admin, common, destination, setup).await?;
 			let residual = crate::status::residual_untracked_paths(admin, common, destination).await?;
 			let diverged =
-				crate::status::diverged_tracked_content_paths(admin, common, destination).await?;
+				crate::status::diverged_tracked_content_paths(admin, common, destination, setup).await?;
 			let sparse = crate::status::is_sparse_index(admin, common, destination).await?;
 			(Some(status), Some(residual), Some(diverged), Some(sparse))
 		} else {

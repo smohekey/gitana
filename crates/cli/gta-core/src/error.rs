@@ -47,13 +47,17 @@ impl std::error::Error for SilentExit {}
 /// without terminating the process. `sparse` are the out-of-cone pathspecs (git's `--sparse` block, in
 /// argument order); `ignored` are the reported ignored paths (git's `-f` block, sorted). Either or both
 /// may be non-empty. `show_sparse_hints` / `show_ignored_hints` reflect `advice.updateSparsePath` /
-/// `advice.addIgnoredFile` (git suppresses each block's `hint:` lines when its advice is false).
+/// `advice.addIgnoredFile` (git suppresses each block's `hint:` lines when its advice is false). The
+/// line-ending warnings of what was staged go where git prints them: the files the index already had
+/// before the ignored block, new files after it.
 #[derive(Debug)]
 pub struct AddAdvisory {
 	sparse: Vec<String>,
 	ignored: Vec<String>,
 	show_sparse_hints: bool,
 	show_ignored_hints: bool,
+	tracked_warnings: Vec<String>,
+	new_warnings: Vec<String>,
 }
 
 impl AddAdvisory {
@@ -68,7 +72,17 @@ impl AddAdvisory {
 			ignored,
 			show_sparse_hints,
 			show_ignored_hints,
+			tracked_warnings: Vec::new(),
+			new_warnings: Vec::new(),
 		}
+	}
+
+	/// This advisory, with git's line-ending warnings for the files staged: `tracked` for those the
+	/// index already had, `new` for the rest.
+	pub fn with_line_ending_warnings(mut self, tracked: Vec<String>, new: Vec<String>) -> Self {
+		self.tracked_warnings = tracked;
+		self.new_warnings = new;
+		self
 	}
 }
 
@@ -91,6 +105,7 @@ impl fmt::Display for AddAdvisory {
 					.push("hint: Disable this message with \"git config set advice.updateSparsePath false\"");
 			}
 		}
+		lines.extend(self.tracked_warnings.iter().map(String::as_str));
 		if !self.ignored.is_empty() {
 			lines.push("The following paths are ignored by one of your .gitignore files:");
 			lines.extend(self.ignored.iter().map(String::as_str));
@@ -100,6 +115,7 @@ impl fmt::Display for AddAdvisory {
 					.push("hint: Disable this message with \"git config set advice.addIgnoredFile false\"");
 			}
 		}
+		lines.extend(self.new_warnings.iter().map(String::as_str));
 		write!(f, "{}", lines.join("\n"))
 	}
 }

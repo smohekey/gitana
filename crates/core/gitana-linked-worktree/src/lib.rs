@@ -29,6 +29,7 @@ mod enumerate;
 mod error;
 mod facts;
 mod inspect;
+mod new_worktree_setup;
 mod object_id;
 mod query;
 mod relocate_error;
@@ -40,6 +41,7 @@ mod remove_policy;
 mod remove_request;
 mod repo_id;
 mod request;
+mod setup;
 mod status;
 mod worktree_context;
 
@@ -71,6 +73,7 @@ pub use inspect::{
 	CrossPointerHealth, DestinationKind, HeadFacts, IdentityConflict, Registration, RequestedBranch,
 	StartRelation, WorktreeInspection,
 };
+pub use new_worktree_setup::NewWorktreeSetup;
 pub use object_id::WorktreeObjectId;
 pub use query::{BranchName, WorktreeQuery};
 pub use relocate_error::RelocateError;
@@ -82,6 +85,7 @@ pub use remove_policy::RemovePolicy;
 pub use remove_request::RemoveRequest;
 pub use repo_id::RepositoryId;
 pub use request::{CheckoutTarget, CreateRequest};
+pub use setup::Setup;
 pub use status::{CheckoutSafety, UnpushedRef, WorktreeStatusReport};
 pub use worktree_context::WorktreeContext;
 

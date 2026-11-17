@@ -318,6 +318,8 @@ pub(crate) async fn clone<H: HashAlgorithm>(
 		&origin.persisted_url(),
 		// Sparse clone is not exposed through the component surface yet (a later slice).
 		false,
+		// The sandbox has no system or global attributes files.
+		gitana_worktree::OutsideAttributes::default(),
 	)
 	.await
 	.map_err(remote_error)
@@ -386,6 +388,8 @@ pub(crate) async fn clone_ssh<H: HashAlgorithm>(
 		&gitana_remote::redact_password(url),
 		// Sparse clone is not exposed through the component surface yet (a later slice).
 		false,
+		// The sandbox has no system or global attributes files.
+		gitana_worktree::OutsideAttributes::default(),
 	)
 	.await
 	.map_err(remote_error)

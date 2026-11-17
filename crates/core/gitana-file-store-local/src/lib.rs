@@ -411,6 +411,17 @@ impl FileStore for LocalFileStore {
 		blocking(move || exists_at(&*fs, &path)).await
 	}
 
+	async fn modified(&self, path: &str) -> Result<Option<std::time::SystemTime>> {
+		let path = self.resolve(path)?.to_owned();
+		let fs = Arc::clone(&self.backend);
+		blocking(move || match fs.modified(&path) {
+			Ok(time) => Ok(Some(time)),
+			Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(None),
+			Err(error) => Err(read_err(error)),
+		})
+		.await
+	}
+
 	async fn is_dir(&self, path: &str) -> Result<bool> {
 		let path = self.resolve(path)?.to_owned();
 		let fs = Arc::clone(&self.backend);
@@ -644,6 +655,11 @@ trait Backend: Send + Sync + 'static {
 	}
 	/// Classify `path` without following a final symbolic link.
 	fn kind(&self, path: &str) -> std::io::Result<FileKind>;
+	/// When `path` was last modified; `Unsupported` where the backend can't tell, the default.
+	fn modified(&self, path: &str) -> std::io::Result<std::time::SystemTime> {
+		let _ = path;
+		Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+	}
 	/// Flush one regular file's data and metadata to stable storage.
 	fn sync_file(&self, path: &str) -> std::io::Result<()>;
 	/// Flush one directory's namespace metadata to stable storage (`""` is the store root).
@@ -717,6 +733,10 @@ struct CapBackend {
 impl Backend for CapBackend {
 	fn read(&self, path: &str) -> std::io::Result<Vec<u8>> {
 		self.dir.read(path)
+	}
+
+	fn modified(&self, path: &str) -> std::io::Result<std::time::SystemTime> {
+		Ok(self.dir.metadata(path)?.modified()?.into_std())
 	}
 
 	fn read_range(&self, path: &str, offset: u64, length: u64) -> std::io::Result<Vec<u8>> {

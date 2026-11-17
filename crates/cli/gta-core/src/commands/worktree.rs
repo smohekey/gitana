@@ -13,7 +13,7 @@ use anyhow::{Result, anyhow, bail};
 use gitana_linked_worktree::{
 	BranchName, CheckoutTarget, CreateError, CreateRequest, LockState, ProtectionReason,
 	RelocateError, RelocateOutcome, RelocateRequest, RemoveError, RemoveOutcome, RemovePolicy,
-	RemoveRequest, RepositoryId, WorktreeClassification, WorktreeContext, WorktreeEntry,
+	RemoveRequest, RepositoryId, Setup, WorktreeClassification, WorktreeContext, WorktreeEntry,
 	WorktreeObjectId, WorktreeRole, relocate,
 };
 use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
@@ -212,9 +212,37 @@ async fn add(
 	// `core.logAllRefUpdates` gating (git's full precedence stack), as `list` injects it; `committer` carries
 	// the env-aware identity, and `reflog_start` the user's start-point spelling for a new branch's reflog
 	// message (git records the token as named — `branch: Created from HEAD` — not the resolved hash).
+	// This worktree's stack, per-worktree layer included: git copies this worktree's `config.worktree`
+	// into the new one before checking it out.
 	let (config_common, config_git, _) = repo::revalidate_repository_layout(&found, identity).await?;
+	// This worktree's own `config.worktree` (when per-worktree config is on), and its sparse patterns
+	// (when it has sparse checkout on), which git copies into the new one.
+	let own = config_git
+		.try_clone()
+		.map_err(|error| anyhow!("opening {}: {error}", found.git_dir.display()))?;
+	let patterns = config_git
+		.try_clone()
+		.map_err(|error| anyhow!("opening {}: {error}", found.git_dir.display()))?;
+	let repository_config = config_common
+		.try_clone()
+		.map_err(|error| anyhow!("opening {}: {error}", common.display()))?;
 	let effective =
 		crate::git_config::for_worktree_at(config_common, config_git, common, &found.git_dir).await?;
+	// git uses `config.worktree` only when the repository's own config turns per-worktree config on; an
+	// inactive one isn't read at all (whatever is at that path).
+	let worktree_config = if worktree_config_on(repository_config, common).await? {
+		read_own(own, "config.worktree", &found.git_dir).await?
+	} else {
+		None
+	};
+	let sparse_checkout = if effective
+		.get_bool("core", None, "sparsecheckout")?
+		.unwrap_or(false)
+	{
+		read_own(patterns, "info/sparse-checkout", &found.git_dir).await?
+	} else {
+		None
+	};
 	let reflog_start = matches!(checkout_target, CheckoutTarget::NewBranch { .. })
 		.then(|| commit_ish.unwrap_or("HEAD").to_owned());
 	let request = CreateRequest {
@@ -223,11 +251,24 @@ async fn add(
 		target: checkout_target.clone(),
 		committer: Some(committer),
 		reflog_start,
+		worktree_config,
+		sparse_checkout,
+	};
+	// This worktree's setup, for what git resolves in the caller (the committer, reflog gating); the new
+	// worktree's checkout resolves its own once its git folder exists, as git's child checkout does.
+	let attributes = crate::attributes::outside_attributes(&effective, &target).await?;
+	let worktree_setup = Setup {
+		config: Some(effective),
+		attributes,
 	};
 	repo::revalidate_repository_layout(&found, identity).await?;
 	match with_setup_lease(
 		setup,
-		gitana_linked_worktree::create(&request, Some(&effective)),
+		gitana_linked_worktree::create(
+			&request,
+			&worktree_setup,
+			&crate::new_worktree_at::NewWorktreeAt::new(common),
+		),
 	)
 	.await
 	{
@@ -679,6 +720,36 @@ fn render_porcelain(entries: &[WorktreeInfo]) -> String {
 	out
 }
 
+/// Whether the repository's own config (`config` in `common`, open as `dir`) turns per-worktree
+/// config on (`extensions.worktreeConfig`), as git decides it: from that file alone, without
+/// following its includes.
+async fn worktree_config_on(dir: cap_std::fs::Dir, common: &Path) -> Result<bool> {
+	let path = common.join("config");
+	let Some(bytes) = crate::git_config::read_file_at(dir, Path::new("config"), &path).await? else {
+		return Ok(false);
+	};
+	let text =
+		std::str::from_utf8(&bytes).map_err(|error| anyhow!("reading {}: {error}", path.display()))?;
+	let config = gitana_config::GitConfig::parse(text)
+		.map_err(|error| anyhow!("reading {}: {error}", path.display()))?;
+	Ok(
+		config
+			.get_bool("extensions", None, "worktreeconfig")?
+			.unwrap_or(false),
+	)
+}
+
+/// The file at `name` in this worktree's git folder (`git_dir`, open as `dir`), or `None` when
+/// there's none: read as gta reads config, a supported symlink (to a file outside the git folder,
+/// say) followed and revalidated.
+async fn read_own(
+	dir: cap_std::fs::Dir,
+	name: &'static str,
+	git_dir: &Path,
+) -> Result<Option<Vec<u8>>> {
+	crate::git_config::read_file_at(dir, Path::new(name), &git_dir.join(name)).await
+}
+
 // ---------------------------------------------------------------------------
 // remove
 // ---------------------------------------------------------------------------
@@ -713,10 +784,32 @@ async fn remove(cwd: &Path, path: &Path, force: u8) -> Result<()> {
 		policy: RemovePolicy::GitCompat { force },
 	};
 	let setup = destructive_setup_lease(&found, identity).await?;
-	repo::revalidate_repository_layout(&found, identity).await?;
+	let (config_common, _, _) = repo::revalidate_repository_layout(&found, identity).await?;
+	// The safety check compares the worktree's files with its index as its own merged config (its
+	// `config.worktree`, not this worktree's) and the attributes files from outside the repository say
+	// they'd be stored. A forced removal checks no status, so it reads none of them: a damaged
+	// worktree's config can't stand in the way of cleaning it up.
+	let worktree_setup = if force >= 1 {
+		Setup::default()
+	} else {
+		let admin_dir = cap_std::fs::Dir::open_ambient_dir(&admin, cap_std::ambient_authority())
+			.map_err(|error| anyhow!("opening {}: {error}", admin.display()))?;
+		let config =
+			crate::git_config::for_worktree_at(config_common, admin_dir, common, &admin).await?;
+		let attributes = crate::attributes::outside_attributes(&config, &target).await?;
+		Setup {
+			config: Some(config),
+			attributes,
+		}
+	};
 	use ProtectionReason as P;
 	use WorktreeClassification as C;
-	match with_setup_lease(setup, gitana_linked_worktree::remove(&request)).await {
+	match with_setup_lease(
+		setup,
+		gitana_linked_worktree::remove(&request, &worktree_setup),
+	)
+	.await
+	{
 		// Removed, or already gone (idempotent) — git prints nothing on a successful remove.
 		Ok(RemoveOutcome::Removed { .. } | RemoveOutcome::AlreadyAbsent { .. }) => Ok(()),
 		// A locked worktree needs a second `-f`; carry git's lock-reason message when one is recorded.

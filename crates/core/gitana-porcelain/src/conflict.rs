@@ -123,6 +123,10 @@ pub(crate) async fn write_conflicted_state_with_excludes<
 	if !clobbered.is_empty() {
 		return Err(ConflictOverwriteError::new(clobbered.into_iter().cloned().collect()).into());
 	}
+	// The conflicted paths are materialised after the checkout below has saved the merge, so a refusal
+	// there (a path not representable here, a blob gitana can't convert) must come now, before anything
+	// changes.
+	wt.check_materialise(merged_tree, conflicts).await?;
 
 	// Two-tree merge from HEAD's tree (`ours_tree`) to the merged result (conflict markers included): the
 	// index equals HEAD here (each caller guarantees a clean index before recording conflict stages below),

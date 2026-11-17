@@ -78,4 +78,13 @@ pub struct CreateRequest {
 	/// resolved hash. `None` (the Code-Henge default) records the start commit's hex, unchanged. Ignored for
 	/// non-`NewBranch` targets (they write no branch-creation reflog).
 	pub reflog_start: Option<String>,
+	/// The invoking worktree's own `config.worktree`, as the caller read it. With
+	/// `extensions.worktreeConfig` on, git copies it into the new worktree before checking it out
+	/// (all but `core.bare` when true, and `core.worktree`), and so does `create`. `None` copies
+	/// nothing.
+	pub worktree_config: Option<Vec<u8>>,
+	/// The invoking worktree's `info/sparse-checkout`, which git copies into the new worktree when
+	/// the invoking one has sparse checkout on, so the new one is checked out with the same patterns;
+	/// the caller passes it only then. `None` copies nothing.
+	pub sparse_checkout: Option<Vec<u8>>,
 }

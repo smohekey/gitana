@@ -1194,6 +1194,21 @@ impl SubmoduleContext {
 				CapWorkDir::from_dir(work_directory),
 				self.layout.git_dir.join(&module_relative),
 				module_worktree_root.clone(),
+			)
+			.with_outside_attributes(
+				configuration
+					.load_module_attributes_at(
+						&config,
+						mount
+							.directory
+							.try_clone()
+							.map_err(|source| SubmoduleError::Io {
+								path: module_worktree_root.clone(),
+								source,
+							})?,
+						&module_worktree_root,
+					)
+					.await?,
 			);
 			let worker_context = retained_merge_context(self)?;
 			let worker_entry = entry.clone();
@@ -1305,12 +1320,27 @@ impl SubmoduleContext {
 				source,
 			})?;
 		let work = CapWorkDir::from_dir(work_directory);
+		let module_worktree_root = self.worktree_root().join(&entry.declaration.path);
+		let attributes = configuration
+			.load_module_attributes_at(
+				&config,
+				mount
+					.directory
+					.try_clone()
+					.map_err(|source| SubmoduleError::Io {
+						path: module_worktree_root.clone(),
+						source,
+					})?,
+				&module_worktree_root,
+			)
+			.await?;
 		let worktree = WorkTree::new_located(
 			repository,
 			work,
 			self.layout.git_dir.join(&module_relative),
-			self.worktree_root().join(&entry.declaration.path),
-		);
+			module_worktree_root,
+		)
+		.with_outside_attributes(attributes);
 		if completion_required {
 			worktree.populate(target_tree).await?;
 		} else if let Some(current) = current {
@@ -2674,14 +2704,17 @@ fn module_repository_with_worker_keepalive<H: HashAlgorithm>(
 }
 
 fn retained_merge_context(context: &SubmoduleContext) -> Result<SubmoduleContext, SubmoduleError> {
-	SubmoduleContext::new(
-		context.layout.clone(),
-		context.clone_dir(&context.common, &context.layout.common_dir)?,
-		context.clone_dir(&context.git, &context.layout.git_dir)?,
-		context.clone_dir(&context.work, context.worktree_root())?,
-		context.configs.clone(),
-		context.prefix.clone(),
-		context.hash_kind,
+	Ok(
+		SubmoduleContext::new(
+			context.layout.clone(),
+			context.clone_dir(&context.common, &context.layout.common_dir)?,
+			context.clone_dir(&context.git, &context.layout.git_dir)?,
+			context.clone_dir(&context.work, context.worktree_root())?,
+			context.configs.clone(),
+			context.prefix.clone(),
+			context.hash_kind,
+		)?
+		.with_outside_attributes(context.outside_attributes.clone()),
 	)
 }
 

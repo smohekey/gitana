@@ -9,7 +9,7 @@ use gitana_object::Sha256;
 use gitana_object_store::ObjectStore;
 use gitana_path::GitPath;
 use gitana_repository::Repository;
-use gitana_worktree::{IndexEntry, Stat, WorkTree, WorktreeError};
+use gitana_worktree::{AddOutcome, IndexEntry, Stat, WorkTree, WorktreeError};
 
 fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
 	cap_std::fs::Dir::open_ambient_dir(path.as_ref(), cap_std::ambient_authority()).unwrap()
@@ -790,7 +790,7 @@ async fn add_ignored_advisory_is_pathspec_level() {
 		)));
 		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
 	};
-	let is_ign_advisory = |result: &Result<(), WorktreeError>| matches!(result, Err(WorktreeError::PathspecAdvisory { ignored, .. }) if paths_equal(ignored, &[b"ign"]));
+	let is_ign_advisory = |result: &Result<AddOutcome, WorktreeError>| matches!(result, Err(WorktreeError::PathspecAdvisory { ignored, .. }) if paths_equal(ignored, &[b"ign"]));
 
 	// Excluded by `:!.` — still advises.
 	let excluded = open().add(&["ign/new", ":!."], "", false, None).await;
@@ -934,7 +934,7 @@ async fn add_ignored_advisory_glob_and_icase_magic() {
 		)));
 		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
 	};
-	let advises_ign = |result: &Result<(), WorktreeError>| matches!(result, Err(WorktreeError::PathspecAdvisory { ignored, .. }) if paths_equal(ignored, &[b"ign"]));
+	let advises_ign = |result: &Result<AddOutcome, WorktreeError>| matches!(result, Err(WorktreeError::PathspecAdvisory { ignored, .. }) if paths_equal(ignored, &[b"ign"]));
 
 	// `:(glob)ign/new`: a glob whose only candidate is untracked+ignored — git's "did not match".
 	let glob_new = open().add(&[":(glob)ign/new"], "", false, None).await;
@@ -1013,7 +1013,7 @@ async fn add_ignored_advisory_ancestor_corners() {
 		)));
 		WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
 	};
-	let reports = |result: &Result<(), WorktreeError>, want: &str| matches!(result, Err(WorktreeError::PathspecAdvisory { ignored, .. }) if paths_equal(ignored, &[want.as_bytes()]));
+	let reports = |result: &Result<AddOutcome, WorktreeError>, want: &str| matches!(result, Err(WorktreeError::PathspecAdvisory { ignored, .. }) if paths_equal(ignored, &[want.as_bytes()]));
 
 	// R4#1: an ignored regular-file ancestor is reported; the positive `keep` still stages.
 	let file_ancestor = open().add(&["keep", ":!file/sub"], "", false, None).await;

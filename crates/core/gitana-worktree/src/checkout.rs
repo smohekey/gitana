@@ -5,17 +5,18 @@
 //! overwrite uncommitted local changes. Paths are validated against traversal,
 //! `.git`, and symlinked ancestors (the git checkout CVE class).
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use gitana_file_store::FileStore;
 use gitana_file_store_local::{PopulationEntry, WorkDirFs};
-use gitana_object::{HashAlgorithm, ObjectId};
+use gitana_object::{HashAlgorithm, ObjectId, ObjectKind};
 use gitana_path::GitPath;
 
 use crate::CheckoutMode;
 use crate::fsmeta::{blob_of, effective_mode, join_rel, push_gitignore, stat_of};
 use crate::ignore::{self, DirIgnore};
-use crate::{IndexEntry, SparseCheckout, WorkTree, WorktreeError};
+use crate::{Converter, IndexEntry, SparseCheckout, WorkTree, WorktreeError};
 
 /// A borrowed stage-0 index entry: its `(octal-mode, oid)` pair.
 type EntryRef<'a, H> = &'a (String, ObjectId<H>);
@@ -77,10 +78,14 @@ where
 	// writes back this snapshot. A pre-mutation refuse below drops `lock`, and its `Drop` releases
 	// `index.lock` (the working tree still matches the index); the apply phase marks mutation and commits.
 	let lock = wt.lock_index().await?;
+	let index_time = wt.index_time().await?;
 	let mut index = wt.load_index().await?;
 	if protect_ignored && matches!(mode, CheckoutMode::Merge { .. }) {
 		crate::switch::refuse_ignored(wt, tree, excludes_file, &index).await?;
 	}
+	// The guard compares working files with the index as git does: as they'd be stored.
+	let mut checkin = Converter::check_in(wt, &index, index_time).await?;
+	let entries = entry_map(&index);
 	let current: HashMap<GitPath, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
@@ -301,7 +306,7 @@ where
 				if differs {
 					for (cp, ce) in &checks {
 						if ce.is_some() {
-							ensure_no_overwrite(wt, cp, *ce, &base, fold)?;
+							ensure_no_overwrite(wt, &mut checkin, &entries, cp, *ce, &base, fold).await?;
 						}
 					}
 				}
@@ -325,7 +330,7 @@ where
 					}
 					_ => {
 						for (cp, ce) in &checks {
-							ensure_no_overwrite(wt, cp, *ce, &base, fold)?;
+							ensure_no_overwrite(wt, &mut checkin, &entries, cp, *ce, &base, fold).await?;
 						}
 						// On a case-*sensitive* filesystem a case-rename's target spelling can be a *distinct*
 						// file beside the tracked one (an untracked or recased `foo` next to `Foo`); the write
@@ -334,7 +339,7 @@ where
 						// passes). Only when it is not already among the checks above.
 						if !checks.iter().any(|(cp, _)| cp == path) {
 							let entry = checks.first().and_then(|(_, ce)| *ce);
-							ensure_no_overwrite(wt, path, entry, &base, fold)?;
+							ensure_no_overwrite(wt, &mut checkin, &entries, path, entry, &base, fold).await?;
 						}
 					}
 				}
@@ -356,7 +361,7 @@ where
 			// a target lacking the fold-key refuses, naming every entry the file diverges from). Consulting the
 			// arbitrarily-kept folded entry instead made that verdict nondeterministic under `HashMap` ordering.
 			if !target_fold.contains(&fold_key(path, fold)) {
-				ensure_no_overwrite(wt, path, Some(entry), &base, fold)?;
+				ensure_no_overwrite(wt, &mut checkin, &entries, path, Some(entry), &base, fold).await?;
 			}
 		}
 	}
@@ -433,6 +438,40 @@ where
 		// checkout will materialise before removing anything, aborting with the tree untouched, as git
 		// validates the target objects before mutating. A preserved, unchanged, or sparse-excluded path
 		// writes no file, so it needs no blob.
+		// Blobs are written out converted as the attributes of the index this checkout makes say: the
+		// target's entries, and the staged ones it keeps (a preserved case-rename, a collision).
+		let kept: HashSet<&GitPath> = collision.iter().chain(&preserved).collect();
+		let mut checkout = Converter::check_out(
+			wt,
+			target
+				.iter()
+				.filter(|(path, _, _)| !preserve_folds.contains(&fold_key(path, fold)))
+				.map(|(path, mode, oid)| (path, u32::from_str_radix(mode, 8).unwrap_or(0), *oid))
+				.chain(
+					index
+						.entries
+						.iter()
+						.filter(|entry| entry.stage == 0 && kept.contains(&entry.path))
+						.map(|entry| (&entry.path, entry.mode, entry.oid)),
+				),
+		)
+		.await?;
+		// A `.gitattributes` this checkout removes is gone before git writes anything, so it governs nothing.
+		for path in stray.iter().chain(&renamed_away) {
+			checkout.forget_worktree(path);
+		}
+		// Nor does one the target replaces with a submodule: a gitlink's entry isn't an attributes file,
+		// and git has removed the old file before it writes the rest.
+		for (path, mode, _) in &target {
+			if mode == "160000" {
+				checkout.forget_worktree(path);
+			}
+		}
+		// A forced checkout leaves alone a file the index already holds at the target's version while its
+		// stat still matches the entry, as git's does: it isn't rewritten, and no conversion runs for it.
+		let mut clean: HashSet<&GitPath> = HashSet::new();
+		let mut unskip: HashSet<GitPath> = HashSet::new();
+		let entries = entry_map(&index);
 		for (path, mode, oid) in &target {
 			// A null-OID gitlink target is never valid — reject it before any skip below (even `force`, and
 			// regardless of sparsity), matching git's "cache entry has null sha1" abort that leaves HEAD/index
@@ -483,11 +522,30 @@ where
 			if excluded {
 				continue;
 			}
+			if force
+				&& current
+					.get(path)
+					.is_some_and(|(cm, co)| cm == mode && co == oid)
+				&& let Some(entry) = entries.get(path)
+				&& matches!(
+					wt.work().lstat(path)?,
+					Some(meta) if crate::worktree::stat_trusted(entry, &meta, index_time)
+				) {
+				clean.insert(path);
+				// Left as it is, but the patterns include it: git's sparse pass still clears a stray
+				// skip-worktree bit (one set by hand), as rewriting it would have.
+				if entry.skip_worktree {
+					unskip.insert(path.clone());
+				}
+				continue;
+			}
 			// The incoming gitlink has no blob to validate (handled above); an ordinary target's blob does.
 			if mode == "160000" {
 				continue;
 			}
 			wt.repository().read_blob(*oid).await?;
+			// A blob gitana can't convert is refused here, before anything is written.
+			checkout.check_write(path, mode).await?;
 		}
 		// A case-colliding staged entry (`foo` beside a retained `Foo`, a *distinct* blob from a
 		// case-sensitive-FS commit) is left ENTIRELY untouched — its working file (the retained path's inode)
@@ -526,11 +584,31 @@ where
 			{
 				continue;
 			}
-			write_entry(wt, path, mode, *oid, &mut index, sparse.as_ref(), force).await?;
+			if clean.contains(path) {
+				continue;
+			}
+			write_entry(
+				wt,
+				&mut checkout,
+				path,
+				mode,
+				*oid,
+				&mut index,
+				sparse.as_ref(),
+				force,
+			)
+			.await?;
 		}
 		// `remove_worktree_path` re-validates and declines to follow a symlinked ancestor (after a
 		// directory→symlink switch the stale child under the old directory is already gone), so the
 		// removal never escapes the work tree.
+		if !unskip.is_empty() {
+			for entry in index.entries.iter_mut() {
+				if entry.stage == 0 && unskip.contains(&entry.path) {
+					entry.skip_worktree = false;
+				}
+			}
+		}
 		for path in &stray {
 			// A gitlink at ANY index stage (a modify/delete abort has only conflict stages, no stage-0 entry)
 			// means the empty mount materialised for the conflict must be rmdir'd, not left behind. But choose
@@ -615,6 +693,24 @@ where
 		.filter(|entry| entry.stage == 0)
 		.map(|entry| (entry.path.clone(), entry.clone()))
 		.collect();
+	let is_excluded = |path: &GitPath| match sparse.as_ref() {
+		Some(matcher) => !matcher.includes(path),
+		None => prior.get(path).is_some_and(|entry| entry.skip_worktree),
+	};
+	// Blobs are written out converted as the target's attributes say; one gitana can't convert is
+	// refused before anything is written.
+	let mut checkout = Converter::check_out(
+		wt,
+		target
+			.iter()
+			.map(|(path, mode, oid)| (path, u32::from_str_radix(mode, 8).unwrap_or(0), *oid)),
+	)
+	.await?;
+	for (path, mode, _) in &target {
+		if !is_excluded(path) {
+			checkout.check_write(path, mode).await?;
+		}
+	}
 	index.entries.clear();
 
 	let mut expected = HashMap::new();
@@ -622,15 +718,12 @@ where
 	let mut opaque = HashSet::new();
 	let result = async {
 		for (path, mode, oid) in &target {
+			let excluded = is_excluded(path);
 			let prior = prior.get(path);
-			let excluded = match sparse.as_ref() {
-				Some(matcher) => !matcher.includes(path),
-				None => prior.is_some_and(|entry| entry.skip_worktree),
-			};
 			let stat = if excluded {
 				crate::Stat::default()
 			} else {
-				populate_entry(wt, path, mode, *oid).await?;
+				let written = populate_entry(wt, &mut checkout, path, mode, *oid).await?;
 				let meta = wt.work().lstat(path)?.ok_or_else(|| {
 					std::io::Error::new(std::io::ErrorKind::NotFound, "populated entry is missing")
 				})?;
@@ -641,7 +734,7 @@ where
 					directories.insert(path.clone());
 					opaque.insert(path.clone());
 				} else {
-					expected.insert(path.clone(), (mode.clone(), *oid));
+					expected.insert(path.clone(), (mode.clone(), written));
 				}
 				stat_of(&meta)
 			};
@@ -657,6 +750,7 @@ where
 			});
 		}
 
+		// Each file is checked against the bytes population wrote: the blob, converted.
 		verify_population(wt, &GitPath::root(), &expected, &directories, &opaque)?;
 		for (path, (mode, oid)) in &expected {
 			if !population_entry_matches(wt, path, mode, *oid)? {
@@ -683,12 +777,15 @@ where
 	}
 }
 
+/// Add `path`'s entry to the working tree, unless the same bytes are already there. Returns the id of
+/// the bytes now at `path` (a file's blob converted as `conv` says), or `oid` for a gitlink's mount.
 async fn populate_entry<F, W, H>(
 	wt: &WorkTree<F, W, H>,
+	conv: &mut Converter<'_, F, W, H>,
 	path: &GitPath,
 	mode: &str,
 	oid: ObjectId<H>,
-) -> Result<(), WorktreeError>
+) -> Result<ObjectId<H>, WorktreeError>
 where
 	F: FileStore,
 	W: WorkDirFs,
@@ -696,13 +793,13 @@ where
 {
 	if mode == "160000" {
 		match wt.work().lstat(path)? {
-			Some(meta) if meta.kind.is_dir() => return Ok(()),
+			Some(meta) if meta.kind.is_dir() => return Ok(oid),
 			Some(_) => return Err(WorktreeError::UntrackedOverwrite(path.to_owned())),
 			None => match wt.work().populate_new(path, PopulationEntry::Directory)? {
-				true => return Ok(()),
+				true => return Ok(oid),
 				false => {
 					if matches!(wt.work().lstat(path)?, Some(meta) if meta.kind.is_dir()) {
-						return Ok(());
+						return Ok(oid);
 					}
 					return Err(WorktreeError::UntrackedOverwrite(path.to_owned()));
 				}
@@ -710,14 +807,20 @@ where
 		}
 	}
 
+	let blob = wt.repository().read_blob(oid).await?;
+	let content = if mode == "120000" {
+		Cow::Borrowed(blob.as_slice())
+	} else {
+		conv.convert_to_worktree(path, &blob).await?
+	};
+	let written = ObjectId::<H>::compute(ObjectKind::Blob, &content);
 	if wt.work().lstat(path)?.is_some() {
-		return if population_entry_matches(wt, path, mode, oid)? {
-			Ok(())
+		return if population_entry_matches(wt, path, mode, written)? {
+			Ok(written)
 		} else {
 			Err(WorktreeError::UntrackedOverwrite(path.to_owned()))
 		};
 	}
-	let content = wt.repository().read_blob(oid).await?;
 	let entry = if mode == "120000" {
 		PopulationEntry::Symlink(&content)
 	} else {
@@ -727,11 +830,13 @@ where
 		}
 	};
 	match wt.work().populate_new(path, entry)? {
-		true => Ok(()),
+		true => Ok(written),
 		false => Err(WorktreeError::UntrackedOverwrite(path.to_owned())),
 	}
 }
 
+/// Whether `path` holds an entry of `mode` whose bytes (a file's content, a symlink's target) hash to
+/// `oid`, as they are, unconverted.
 fn population_entry_matches<F, W, H>(
 	wt: &WorkTree<F, W, H>,
 	path: &GitPath,
@@ -841,6 +946,7 @@ where
 	// phase early return drops `lock` before any worktree write, so its `Drop` releases `index.lock` (the
 	// working tree still matches the index); the apply phase marks mutation and commits/releases explicitly.
 	let lock = wt.lock_index().await?;
+	let index_time = wt.index_time().await?;
 	let mut index = wt.load_index().await?;
 	// A two-tree merge must not move `HEAD` while conflicts are unresolved — git refuses ("you need to
 	// resolve your current index first" / "cannot switch branch while merging"), because the unmerged stages
@@ -849,6 +955,9 @@ where
 	if index.has_conflicts() {
 		return Err(WorktreeError::Unmerged);
 	}
+	// The refuse phase compares working files with the index as git does: as they'd be stored.
+	let mut checkin = Converter::check_in(wt, &index, index_time).await?;
+	let entries = entry_map(&index);
 	let staged: HashMap<GitPath, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
@@ -1026,7 +1135,7 @@ where
 		// `foo`, HEAD `Foo`, target deletes the key, working `foo` edited). Check the shared inode against the
 		// staged alias's blob rather than exempting it outright.
 		if let Some(alias) = staged_fold.get(&fold_key(path, fold)) {
-			if !is_clean(wt, path, Some(*alias), &base, fold)? {
+			if !is_clean(wt, &mut checkin, &entries, path, Some(*alias), &base, fold).await? {
 				return Err(WorktreeError::Conflict(path.clone()));
 			}
 			continue;
@@ -1098,7 +1207,19 @@ where
 				|| under_any(path, &write_paths)
 				|| removed_ancestor_dirs.contains(path)
 				|| under_any(path, &removed_from);
-			if in_df && staged.contains_key(path) && !is_clean(wt, path, staged.get(path), &base, fold)? {
+			if in_df
+				&& staged.contains_key(path)
+				&& !is_clean(
+					wt,
+					&mut checkin,
+					&entries,
+					path,
+					staged.get(path),
+					&base,
+					fold,
+				)
+				.await?
+			{
 				return Err(WorktreeError::Conflict(path.clone()));
 			}
 			continue;
@@ -1230,7 +1351,7 @@ where
 					{
 						return Err(WorktreeError::UntrackedOverwrite(untracked));
 					}
-				} else if !is_clean(wt, path, owner, &base, fold)? {
+				} else if !is_clean(wt, &mut checkin, &entries, path, owner, &base, fold).await? {
 					return Err(WorktreeError::Conflict(path.clone()));
 				}
 			}
@@ -1261,7 +1382,7 @@ where
 		if matches!(wt.work().lstat(sp)?, Some(m) if m.kind.is_dir()) {
 			continue;
 		}
-		if !is_clean(wt, sp, staged.get(sp), &base, fold)? {
+		if !is_clean(wt, &mut checkin, &entries, sp, staged.get(sp), &base, fold).await? {
 			return Err(WorktreeError::Conflict(sp.clone()));
 		}
 	}
@@ -1269,7 +1390,7 @@ where
 	// (git aborts "local changes would be overwritten"). An absent working file (the common preserve case)
 	// is clean.
 	for sp in &df_preserved {
-		if !is_clean(wt, sp, staged.get(sp), &base, fold)? {
+		if !is_clean(wt, &mut checkin, &entries, sp, staged.get(sp), &base, fold).await? {
 			return Err(WorktreeError::Conflict(sp.clone()));
 		}
 	}
@@ -1338,6 +1459,37 @@ where
 			validate_path(path)?;
 			wt.work().validate_path_representable(path)?;
 		}
+		// Blobs are written out converted as the attributes of the index this merge makes say: the staged
+		// entries, less those removed, with the written paths at the target's.
+		let replaced: HashSet<&GitPath> = removals
+			.iter()
+			.chain(&df_removals)
+			.chain(&writes)
+			.copied()
+			.collect();
+		let mut checkout = Converter::check_out(
+			wt,
+			staged
+				.iter()
+				.filter(|(path, _)| !replaced.contains(path))
+				.map(|(path, (mode, oid))| (path, u32::from_str_radix(mode, 8).unwrap_or(0), *oid))
+				.chain(writes.iter().filter_map(|path| {
+					to.get(*path)
+						.map(|(mode, oid)| (*path, u32::from_str_radix(mode, 8).unwrap_or(0), *oid))
+				})),
+		)
+		.await?;
+		// A `.gitattributes` this switch removes is gone before git writes anything, so it governs nothing.
+		for path in removals.iter().chain(&df_removals) {
+			checkout.forget_worktree(path);
+		}
+		// Nor does one the switch replaces with a submodule: a gitlink's entry isn't an attributes file,
+		// and git has removed the old file before it writes the rest.
+		for path in &writes {
+			if to.get(*path).is_some_and(|(mode, _)| mode == "160000") {
+				checkout.forget_worktree(path);
+			}
+		}
 		// Validate every pending write's blob BEFORE removing anything, so a missing/corrupt blob aborts with
 		// the working tree untouched rather than after a case-rename source has been removed. A sparse-excluded
 		// write materialises no file, but its blob is validated here too: a two-tree merge that moves an
@@ -1368,6 +1520,15 @@ where
 				continue;
 			}
 			wt.repository().read_blob(*oid).await?;
+			// A blob gitana can't convert is refused here, before anything is written, unless it's left out
+			// of the working tree.
+			let excluded = match sparse.as_ref() {
+				Some(matcher) => !matcher.includes(path),
+				None => index.entry(path).is_some_and(|entry| entry.skip_worktree),
+			};
+			if !excluded {
+				checkout.check_write(path, mode).await?;
+			}
 		}
 		// A D/F-collision removal drops a staged entry and deletes its (clean-by-hash) working file, so its
 		// staged blob must exist before we destroy that file: if the blob is missing/corrupt while the working
@@ -1445,7 +1606,7 @@ where
 						out.push((entry.path.clone(), state));
 						continue;
 					}
-					let state = crate::status::worktree_content_state(wt, entry, file_mode).await?;
+					let state = crate::status::worktree_content_state(&mut checkin, entry, file_mode).await?;
 					out.push((entry.path.clone(), state));
 				}
 				out
@@ -1485,7 +1646,17 @@ where
 			let (mode, oid) = to
 				.get(path)
 				.expect("a write path is present in the to-tree");
-			write_entry(wt, path, mode, *oid, &mut index, sparse.as_ref(), false).await?;
+			write_entry(
+				wt,
+				&mut checkout,
+				path,
+				mode,
+				*oid,
+				&mut index,
+				sparse.as_ref(),
+				false,
+			)
+			.await?;
 		}
 		// Re-apply sparsity to CARRIED staged paths — those unchanged between the two trees, hence absent from
 		// `changed` and never written/removed above. git applies the sparse patterns to the whole switched
@@ -1561,6 +1732,42 @@ fn strict_ancestor_dirs<'a>(paths: impl Iterator<Item = &'a GitPath>) -> HashSet
 	dirs
 }
 
+/// The index's stage-0 entries by path.
+type EntryMap<'a, H> = HashMap<&'a GitPath, &'a IndexEntry<H>>;
+
+fn entry_map<H: HashAlgorithm>(index: &crate::Index<H>) -> EntryMap<'_, H> {
+	index
+		.entries
+		.iter()
+		.filter(|entry| entry.stage == 0)
+		.map(|entry| (&entry.path, entry))
+		.collect()
+}
+
+/// The index entry `current` is, to compare the working file at `path` with: the index's own at
+/// `path`, or, for an entry under another spelling (a case-folded alias), one with no stat, so the
+/// file's content alone decides.
+fn entry_for<'e, H: HashAlgorithm>(
+	entries: &EntryMap<'e, H>,
+	path: &GitPath,
+	(mode, oid): &(String, ObjectId<H>),
+) -> Cow<'e, IndexEntry<H>> {
+	let mode = u32::from_str_radix(mode, 8).unwrap_or(0);
+	match entries.get(path) {
+		Some(entry) if entry.mode == mode && entry.oid == *oid => Cow::Borrowed(*entry),
+		_ => Cow::Owned(IndexEntry {
+			stat: crate::Stat::default(),
+			mode,
+			oid: *oid,
+			stage: 0,
+			assume_valid: false,
+			skip_worktree: false,
+			intent_to_add: false,
+			path: path.clone(),
+		}),
+	}
+}
+
 /// A recursive tree listing as `path -> (mode, oid)`.
 fn tree_map<H: HashAlgorithm>(
 	entries: Vec<(GitPath, String, ObjectId<H>)>,
@@ -1575,8 +1782,11 @@ fn tree_map<H: HashAlgorithm>(
 /// (`current`), an added path has no untracked file in the way (unless `.gitignore`d), and an absent
 /// file is always fine. The index-vs-`HEAD` (staged) check is the caller's. Mirrors
 /// [`ensure_no_overwrite`] but as a boolean for the two-tree merge's batch check.
-fn is_clean<F, W, H>(
+#[allow(clippy::too_many_arguments)]
+async fn is_clean<F, W, H>(
 	wt: &WorkTree<F, W, H>,
+	checkin: &mut Converter<'_, F, W, H>,
+	entries: &EntryMap<'_, H>,
 	path: &GitPath,
 	current: Option<&(String, ObjectId<H>)>,
 	base: &[DirIgnore],
@@ -1592,10 +1802,15 @@ where
 		return Ok(true);
 	};
 	match current {
-		Some((mode, oid)) => {
+		Some(current) => {
+			let (mode, oid) = current;
 			let expected = u32::from_str_radix(mode, 8).unwrap_or(0);
+			let entry = entry_for(entries, path, current);
+			if crate::worktree::size_changed(&entry, &meta) {
+				return Ok(false);
+			}
 			Ok(matches!(
-				blob_of(wt.work(), path, &meta)?,
+				checkin.blob_of(path, &meta, Some(&entry)).await?,
 				Some((woid, _)) if woid == *oid && effective_mode(&meta, expected) == expected
 			))
 		}
@@ -1606,8 +1821,10 @@ where
 
 /// Write `path`'s blob into the working tree and record it in the index. Combines a
 /// working-tree write with the matching index upsert; used to materialise a whole tree.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_entry<F, W, H>(
 	wt: &WorkTree<F, W, H>,
+	conv: &mut Converter<'_, F, W, H>,
 	path: &GitPath,
 	mode: &str,
 	oid: ObjectId<H>,
@@ -1675,7 +1892,7 @@ where
 		return Ok(());
 	}
 
-	write_worktree_file(wt, path, mode, oid).await?;
+	write_worktree_file(wt, conv, path, mode, oid).await?;
 	let meta = wt.work().lstat(path)?.ok_or_else(|| {
 		std::io::Error::new(
 			std::io::ErrorKind::NotFound,
@@ -1700,6 +1917,7 @@ where
 /// destination (a file, symlink, or directory).
 pub(crate) async fn write_worktree_file<F, W, H>(
 	wt: &WorkTree<F, W, H>,
+	conv: &mut Converter<'_, F, W, H>,
 	path: &GitPath,
 	mode: &str,
 	oid: ObjectId<H>,
@@ -1745,6 +1963,7 @@ where
 			Some(meta) if !meta.kind.is_file() => wt.work().remove_file(path)?,
 			_ => {}
 		}
+		let content = conv.convert_to_worktree(path, &content).await?;
 		wt.work().write(path, &content, mode == "100755")?;
 	}
 	Ok(())
@@ -1911,8 +2130,11 @@ fn is_submodule_checkout<W: WorkDirFs>(work: &W, path: &GitPath) -> bool {
 	matches!(work.lstat(path), Ok(Some(meta)) if meta.kind.is_dir())
 }
 
-fn ensure_no_overwrite<F, W, H>(
+#[allow(clippy::too_many_arguments)]
+async fn ensure_no_overwrite<F, W, H>(
 	wt: &WorkTree<F, W, H>,
+	checkin: &mut Converter<'_, F, W, H>,
+	entries: &EntryMap<'_, H>,
 	path: &GitPath,
 	current: Option<&(String, ObjectId<H>)>,
 	base: &[DirIgnore],
@@ -1937,9 +2159,14 @@ where
 	};
 	match current {
 		// Tracked: a conflict only if the working file is dirty vs the index.
-		Some((mode, oid)) => {
+		Some(current) => {
+			let (mode, oid) = current;
 			let expected = u32::from_str_radix(mode, 8).unwrap_or(0);
-			match blob_of(wt.work(), path, &meta)? {
+			let entry = entry_for(entries, path, current);
+			if crate::worktree::size_changed(&entry, &meta) {
+				return Err(WorktreeError::Conflict(path.clone()));
+			}
+			match checkin.blob_of(path, &meta, Some(&entry)).await? {
 				Some((woid, _)) if woid == *oid && effective_mode(&meta, expected) == expected => Ok(()),
 				_ => Err(WorktreeError::Conflict(path.clone())),
 			}

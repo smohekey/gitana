@@ -339,6 +339,8 @@ async fn clone_as<H: HashAlgorithm>(
 	let repo = repo::open_generic::<H>(git_dir, git_dir).await?;
 	// The committer falls back to a placeholder when unconfigured, as git's reflog writes do.
 	let committer = CliIdentity::new(&repo).committer_or_default().await?;
+	let attributes =
+		crate::attributes::outside_attributes(&repo.effective_config().await?, target).await?;
 	gitana_porcelain::clone(
 		connection,
 		repo,
@@ -350,6 +352,7 @@ async fn clone_as<H: HashAlgorithm>(
 		}),
 		persist_url,
 		sparse,
+		attributes,
 	)
 	.await
 }

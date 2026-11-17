@@ -19,11 +19,9 @@ use gitana_object::HashAlgorithm;
 use gitana_path::{GitPath, GitPathspec};
 
 use crate::checkout::{remove_worktree_file, validate_path};
-use crate::fsmeta::blob_of;
 use crate::pathspec::PathspecSet;
 use crate::status::head_entries;
-use crate::worktree::stat_matches;
-use crate::{WorkTree, WorktreeError};
+use crate::{Converter, WorkTree, WorktreeError};
 
 /// The outcome of [`crate::WorkTree::rm`]: the paths removed (from the index, and from the working
 /// tree unless `cached` — or those that *would* be removed, under `dry_run`), and the first
@@ -49,6 +47,7 @@ where
 	W: WorkDirFs,
 	H: HashAlgorithm,
 {
+	let index_time = wt.index_time().await?;
 	let mut index = wt.load_index().await?;
 	// Tracked = stage-0 entries plus unmerged paths (which have only stage 1/2/3 entries); removing
 	// an unmerged path is a valid way to resolve its conflict. An **out-of-cone** entry is excluded from
@@ -161,6 +160,8 @@ where
 
 	if !force {
 		let head = head_entries(wt).await?;
+		// Working files are compared with the index as they'd be stored, as git compares them.
+		let mut checkin = Converter::check_in(wt, &index, index_time).await?;
 		for &path in &selected {
 			// An unmerged path (no stage-0 entry) is always removable — the removal resolves the
 			// conflict, as `git rm` allows without `--force`.
@@ -188,10 +189,12 @@ where
 				} else {
 					true
 				}
-			} else if stat_matches(entry, &meta) {
+			} else if checkin.trusts_stat(entry, &meta) {
 				false
+			} else if crate::worktree::size_changed(entry, &meta) {
+				true
 			} else {
-				match blob_of(wt.work(), path, &meta)? {
+				match checkin.blob_of(path, &meta, Some(entry)).await? {
 					Some((oid, mode)) => oid != entry.oid || mode != entry.mode,
 					None => true,
 				}
@@ -275,6 +278,11 @@ where
 		}
 		index.remove(path);
 		removed.push(path.clone());
+	}
+	// Files are gone from the working tree: a cancellation during the index write (which awaits) must
+	// keep `index.lock` rather than release it over a half-applied tree.
+	if !cached && !removed.is_empty() {
+		lock.mark_mutation_started();
 	}
 	wt.commit_index(lock, &index).await?;
 	Ok(RmOutcome { removed, failure })

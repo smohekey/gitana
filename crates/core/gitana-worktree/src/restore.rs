@@ -11,7 +11,7 @@
 //! paths — that is the operation's purpose — so there is no dirty-file guard here (that guard
 //! belongs to branch switching, not path restore).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
@@ -23,7 +23,8 @@ use crate::checkout::{
 };
 use crate::fsmeta::stat_of;
 use crate::pathspec::PathspecSet;
-use crate::{IndexEntry, Stat, WorkTree, WorktreeError};
+use crate::worktree::stat_trusted;
+use crate::{Converter, IndexEntry, Stat, WorkTree, WorktreeError};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run<F, W, H>(
@@ -41,6 +42,7 @@ where
 	W: WorkDirFs,
 	H: HashAlgorithm,
 {
+	let index_time = wt.index_time().await?;
 	let mut index = wt.load_index().await?;
 
 	// The `(path, mode, oid)` content a selected path is restored from: the source tree, or the
@@ -147,14 +149,54 @@ where
 	// anything, so a missing/corrupt blob aborts with an untouched tree and a cleanly released
 	// lock rather than after a partial restore (`write_worktree_file` reads the blob itself, so a
 	// missing blob on the first path would otherwise fail AFTER its mark and strand `index.lock`).
+	let source_map: HashMap<&GitPath, (&str, ObjectId<H>)> = source_entries
+		.iter()
+		.map(|(path, mode, oid)| (path, (mode.as_str(), *oid)))
+		.collect();
+	// Blobs are written out converted as the attributes of the index git makes for a restore say: the
+	// index, with each selected path at the source's version (or gone, when the source lacks it).
+	let mut checkout = Converter::check_out(
+		wt,
+		crate::converter::attribute_entries(&index)
+			.filter(|(path, _, _)| !selected.contains(path))
+			.chain(selected.iter().filter_map(|path| {
+				source_map
+					.get(*path)
+					.map(|(mode, oid)| (*path, u32::from_str_radix(mode, 8).unwrap_or(0), *oid))
+			})),
+	)
+	.await?;
+	// Unlike a checkout, git's restore writes before it removes, so a `.gitattributes` it removes still
+	// governs what it writes (measured against git 2.55): it stays readable from the working tree.
+	// A file the index already holds at the source's version is left alone while its stat still matches
+	// the entry, as git leaves it: it isn't rewritten, and no conversion runs for it. (From a tree, git
+	// rewrites a skip-worktree entry's file regardless.)
+	let mut clean: HashSet<&GitPath> = HashSet::new();
 	if worktree {
+		let entries: HashMap<&GitPath, &IndexEntry<H>> = index
+			.entries
+			.iter()
+			.filter(|entry| entry.stage == 0)
+			.map(|entry| (&entry.path, entry))
+			.collect();
 		for &path in &selected {
 			// A gitlink names a submodule COMMIT, not a blob — skip the blob preflight (as `checkout` does);
 			// `write_worktree_file` creates the empty mount directory without reading an object.
-			if let Some((_, mode, oid)) = source_entries.iter().find(|(p, _, _)| p == path)
-				&& mode != "160000"
+			if let Some((mode, oid)) = source_map.get(path)
+				&& *mode != "160000"
 			{
+				if let Some(entry) = entries.get(path)
+					&& entry.oid == *oid
+					&& format!("{:o}", entry.mode) == *mode
+					&& (source.is_none() || !entry.skip_worktree)
+					&& matches!(wt.work().lstat(path)?, Some(meta) if stat_trusted(entry, &meta, index_time))
+				{
+					clean.insert(path);
+					continue;
+				}
 				wt.repository().read_blob(*oid).await?;
+				// A blob gitana can't convert is refused here, before anything is written.
+				checkout.check_write(path, mode).await?;
 			}
 		}
 	}
@@ -196,9 +238,22 @@ where
 						// `git add` rewrites the index for a type change.
 						index.remove_type_conflicts(path);
 					}
-					if worktree {
+					if worktree && !clean.contains(path) {
 						lock.mark_mutation_started();
-						write_worktree_file(wt, path, mode, *oid).await?;
+						write_worktree_file(wt, &mut checkout, path, mode, *oid).await?;
+						// From the index, git records the written file's stat in its entry, so a file written
+						// converted isn't reported changed by its new size; from a tree it leaves the index
+						// alone (both measured against git 2.55).
+						if source.is_none()
+							&& !staged
+							&& let Some(meta) = wt.work().lstat(path)?
+							&& let Some(entry) = index
+								.entries
+								.iter_mut()
+								.find(|entry| entry.stage == 0 && &entry.path == path)
+						{
+							entry.stat = stat_of(&meta);
+						}
 					}
 					if staged {
 						// A staged-only restore leaves no fresh working-tree file to stat, so use a

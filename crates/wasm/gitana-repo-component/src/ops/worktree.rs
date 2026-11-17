@@ -60,8 +60,10 @@ pub(crate) async fn add<H: HashAlgorithm>(
 	let prefix = into_worktree_text(prefix)?;
 	let specs: Vec<&str> = pathspecs.iter().map(String::as_str).collect();
 	// No global excludes file in the sandbox; `core.ignoreCase` and `.git/info/exclude` are read internally.
+	// The WIT `add` has no way to return git's line-ending warnings, so they're dropped.
 	wt.add(&specs, &prefix, force, None)
 		.await
+		.map(|_| ())
 		.map_err(worktree_error)
 }
 

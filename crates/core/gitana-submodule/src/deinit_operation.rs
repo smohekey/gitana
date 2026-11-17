@@ -2512,6 +2512,16 @@ impl SubmoduleContext {
 				source,
 			})?);
 		let mut repository = Repository::<_, H>::new(ObjectStore::new(files));
+		let attributes = configuration
+			.load_module_attributes_at(
+				&config,
+				mount.try_clone().map_err(|source| SubmoduleError::Io {
+					path: mount_path.clone(),
+					source,
+				})?,
+				&mount_path,
+			)
+			.await?;
 		repository.set_effective_config(config);
 		if repository.refs().resolve_head().await? != Some(recorded) {
 			return Err(SubmoduleError::LocalModifications(declaration.path.clone()));
@@ -2521,7 +2531,8 @@ impl SubmoduleContext {
 			CapWorkDir::from_dir(mount),
 			module_path,
 			mount_path,
-		);
+		)
+		.with_outside_attributes(attributes);
 		let status = worktree.status(excludes.as_deref()).await?;
 		let diverged = worktree.diverged_tracked_content_paths().await?;
 		if !status.changed.is_empty() || !status.untracked.is_empty() || !diverged.is_empty() {

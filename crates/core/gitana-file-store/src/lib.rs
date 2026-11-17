@@ -240,6 +240,17 @@ pub trait FileStore: Send + Sync {
 	/// Whether a value exists at `path` within `repo`.
 	fn exists(&self, path: &str) -> impl Future<Output = Result<bool>> + Send;
 
+	/// When the value at `path` was last modified, if the store can tell; `NotFound` when there's
+	/// none. git compares the index file's time with its entries' to tell which a matching stat
+	/// can't vouch for. The default can't tell.
+	fn modified(
+		&self,
+		path: &str,
+	) -> impl Future<Output = Result<Option<std::time::SystemTime>>> + Send {
+		let _ = path;
+		async { Ok(None) }
+	}
+
 	/// Whether `path` is a directory (as opposed to a value or absent).
 	///
 	/// Lets a caller preflight a directory/file conflict before writing a value at `path` — e.g. a ref

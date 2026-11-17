@@ -464,3 +464,42 @@ fn add_refuses_a_nested_repository_naming_it_and_stages_nothing() {
 	assert_eq!(git(&work, &["diff", "--cached", "--name-only"]), "");
 	std::fs::remove_dir_all(&work).ok();
 }
+
+/// `**` in a `.gitignore` pattern spans folders only as a whole path component, as git matches it:
+/// `foo**/bar` ignores `foox/bar` but not `foo/nested/bar`.
+#[test]
+fn add_matches_globstars_in_gitignore_as_git_does() {
+	let cases: &[&[&str]] = &[&["add", "foo/nested/bar"], &["add", "foox/bar"]];
+	for case in cases {
+		let g = unique_tmp("add-globstar-git");
+		let t = unique_tmp("add-globstar-gta");
+		for (dir, init) in [(&g, git_init as fn(&Path)), (&t, gta_init)] {
+			init(dir);
+			std::fs::write(dir.join(".gitignore"), b"foo**/bar\n").unwrap();
+			for file in ["foo/nested/bar", "foox/bar"] {
+				let path = dir.join(file);
+				std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+				std::fs::write(path, b"x\n").unwrap();
+			}
+		}
+		let git_out = git_raw(&g, case);
+		let gta_out = gta_raw(&t, case);
+		assert_eq!(
+			String::from_utf8_lossy(&gta_out.stderr),
+			String::from_utf8_lossy(&git_out.stderr),
+			"stderr mismatch for {case:?}"
+		);
+		assert_eq!(
+			gta_out.status.code(),
+			git_out.status.code(),
+			"exit code for {case:?}"
+		);
+		assert_eq!(
+			git(&t, &["diff", "--cached", "--name-only"]),
+			git(&g, &["diff", "--cached", "--name-only"]),
+			"staged set mismatch for {case:?}"
+		);
+		std::fs::remove_dir_all(&g).ok();
+		std::fs::remove_dir_all(&t).ok();
+	}
+}

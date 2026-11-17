@@ -239,6 +239,7 @@ async fn pull_into<H: HashAlgorithm>(
 		found.git_dir.clone(),
 		work.clone(),
 	);
+	let worktree = crate::attributes::with_outside_attributes(worktree, &work).await?;
 
 	// Every branch checked out in a worktree. `update_head_ok` below exempts only *this* worktree's
 	// branch (advanced by the merge); a branch checked out in another worktree is still refused, since
@@ -358,13 +359,14 @@ async fn open_merge_worktree<H: HashAlgorithm>(
 		setup,
 	)
 	.await?;
+	let worktree = WorkTree::new_located(
+		repository,
+		WorkDir::from_dir(work_dir),
+		found.git_dir.clone(),
+		work.to_owned(),
+	);
 	Ok((
-		WorkTree::new_located(
-			repository,
-			WorkDir::from_dir(work_dir),
-			found.git_dir.clone(),
-			work.to_owned(),
-		),
+		crate::attributes::with_outside_attributes(worktree, work).await?,
 		command_path,
 		cwd_directory,
 		guard,
