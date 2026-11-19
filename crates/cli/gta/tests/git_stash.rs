@@ -833,9 +833,10 @@ fn refuses_a_drop_whose_log_is_immutable_as_git_does() {
 	}
 }
 
-/// Untracked files that can't be removed (a read-only folder): the stash is saved, the others
-/// removed, a warning given for each left, from the top and from a folder, and the tracked files
-/// left as they are, with a failure, as git does.
+/// Untracked files that can't be removed (read-only folders): the stash is saved, the others
+/// removed, a warning given for each left, in git's order (by name, a folder walked in the order the
+/// filesystem lists it), from the top and from a folder, and the tracked files left as they are,
+/// with a failure, as git does.
 #[cfg(unix)]
 #[test]
 fn reports_untracked_files_it_cannot_remove_as_git_does() {
@@ -843,15 +844,29 @@ fn reports_untracked_files_it_cannot_remove_as_git_does() {
 	for from in ["", "d"] {
 		let (base, by_git, by_gta) = twins(&format!("unremovable{}", from.len()), |dir| {
 			write(dir, "a.txt", b"one!\n");
-			write(dir, "locked/u.txt", b"u\n");
-			write(dir, "locked/sub/v.txt", b"v\n");
+			// Files and folders mixed, so the order a folder is walked in shows.
+			for name in [
+				"u.txt",
+				"a.txt",
+				"m.txt",
+				"sub/v.txt",
+				"zsub/w.txt",
+				"b/x.txt",
+			] {
+				write(dir, &format!("locked/{name}"), b"x\n");
+			}
+			write(dir, "also-locked/y.txt", b"y\n");
+			// A file on its own in a tracked folder, listed by name among the folders.
+			write(dir, "d/loose.txt", b"z\n");
 			write(dir, "free/w.txt", b"w\n");
 		});
 		// Gone afterwards where permissions don't hold (as root, both remove everything).
 		let locked = |dir: &Path, mode| {
-			if dir.join("locked").exists() {
-				std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(mode))
-					.unwrap();
+			for folder in ["locked", "also-locked", "d"] {
+				if dir.join(folder).exists() {
+					std::fs::set_permissions(dir.join(folder), std::fs::Permissions::from_mode(mode))
+						.unwrap();
+				}
 			}
 		};
 		locked(&by_git, 0o555);

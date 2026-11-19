@@ -780,10 +780,12 @@ pub(crate) fn subject(message: &str) -> String {
 	lines.join(" ")
 }
 
-/// Remove the untracked `files` put away, then any untracked folder left empty, as git's stash does
-/// with `git clean -d`: within `scope` when given (the push's pathspecs), never a folder an index
-/// entry lies under, a nested repository, or `.git`. Each file or folder that can't be removed is
-/// passed over and returned, with why, as git's `clean` warns and goes on.
+/// Remove the untracked `files` put away, and the untracked folders left with nothing, as git's stash
+/// does with `git clean -d`: within `scope` when given (the push's pathspecs), never a folder an index
+/// entry lies under, a nested repository, or `.git`. In git's order too: each folder that goes whole
+/// (everything under it put away) and each other file, by name (a folder as `name/`), a folder walked
+/// in the order the filesystem lists it. Each file or folder that can't be removed is passed over and
+/// returned, with why, as git's `clean` warns and goes on.
 fn clean<F, W, H>(
 	wt: &WorkTree<F, W, H>,
 	files: &[GitPath],
@@ -795,8 +797,44 @@ where
 	W: WorkDirFs,
 	H: HashAlgorithm,
 {
+	let saved: HashSet<&GitPath> = files.iter().collect();
+	let mut wholes = Vec::new();
+	plan_wholes(
+		wt,
+		&GitPath::root(),
+		&saved,
+		tracked_folders,
+		scope,
+		&mut wholes,
+	)?;
+	let whole_set: HashSet<&GitPath> = wholes.iter().collect();
+	// Git's list: the folders that go whole, and the files outside them, by name.
+	let mut entries: Vec<(Vec<u8>, &GitPath, bool)> = wholes
+		.iter()
+		.map(|folder| {
+			let mut key = folder.as_bytes().to_vec();
+			key.push(b'/');
+			(key, folder, true)
+		})
+		.collect();
+	entries.extend(
+		files
+			.iter()
+			.filter(|path| {
+				!path
+					.strict_ancestors()
+					.iter()
+					.any(|folder| whole_set.contains(folder))
+			})
+			.map(|path| (path.as_bytes().to_vec(), path, false)),
+	);
+	entries.sort_by(|a, b| a.0.cmp(&b.0));
 	let mut not_removed = Vec::new();
-	for path in files {
+	for (_, path, folder) in entries {
+		if folder {
+			remove_whole(wt, path, &saved, &mut not_removed)?;
+			continue;
+		}
 		crate::checkout::validate_path(path)?;
 		// Not through a symlinked folder: what it reaches isn't the file put away.
 		if crate::checkout::has_symlinked_ancestor(wt.work(), path) {
@@ -808,24 +846,20 @@ where
 			Err(error) => not_removed.push((path.clone(), error)),
 		}
 	}
-	prune_empty(
-		wt,
-		&GitPath::root(),
-		tracked_folders,
-		scope,
-		&mut not_removed,
-	)?;
 	Ok(not_removed)
 }
 
-/// Remove the empty untracked folders under `dir`, deepest first; whether `dir` is now empty. A
-/// folder that can't be removed is added to `not_removed`, with why, and counts as not empty.
-fn prune_empty<F, W, H>(
+/// The top-most folders under `dir` the clean-up removes whole, added to `wholes`: untracked, in
+/// scope, not a nested repository (nor under one that isn't), with every file under it put away and
+/// every folder under it the same (an empty one included). Whether `dir` itself is such a folder's
+/// contents, everything in it going.
+fn plan_wholes<F, W, H>(
 	wt: &WorkTree<F, W, H>,
 	dir: &GitPath,
+	saved: &HashSet<&GitPath>,
 	tracked_folders: &HashSet<GitPath>,
 	scope: Option<&PathspecSet>,
-	not_removed: &mut Vec<(GitPath, std::io::Error)>,
+	wholes: &mut Vec<GitPath>,
 ) -> Result<bool, WorktreeError>
 where
 	F: FileStore,
@@ -835,33 +869,111 @@ where
 	let Ok(entries) = wt.work().read_dir(dir) else {
 		return Ok(false);
 	};
-	let mut empty = true;
+	let mut all_go = true;
+	let mut inner = Vec::new();
 	for entry in entries {
 		if dir.is_root() && entry.name.as_bytes() == b".git" {
-			empty = false;
+			all_go = false;
 			continue;
 		}
 		let path = dir.join(&entry.name);
 		if !entry.kind.is_dir() {
-			empty = false;
+			all_go &= saved.contains(&path);
 			continue;
 		}
-		let nested = wt
-			.work()
-			.lstat(&path.join(&gitana_path::GitPathComponent::from_utf8(".git").expect(".git")))?
-			.is_some();
-		let removable = !nested
-			&& !tracked_folders.contains(&path)
+		let candidate = !tracked_folders.contains(&path)
 			&& scope.is_none_or(|scope| scope.matches_directory(&path))
-			&& prune_empty(wt, &path, tracked_folders, scope, not_removed)?;
-		if !removable {
-			empty = false;
-		} else if let Err(error) = wt.work().remove_dir(&path) {
-			not_removed.push((path, error));
-			empty = false;
+			&& !is_nested_repository(wt, &path)?;
+		if candidate && plan_wholes(wt, &path, saved, tracked_folders, scope, &mut inner)? {
+			inner.push(path);
+		} else {
+			all_go = false;
 		}
 	}
-	Ok(empty)
+	if all_go && !dir.is_root() {
+		// The caller lists this folder instead of what's in it.
+		return Ok(true);
+	}
+	wholes.extend(inner);
+	Ok(false)
+}
+
+/// Whether `path` holds a `.git` of its own (a nested repository, left alone).
+fn is_nested_repository<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	path: &GitPath,
+) -> Result<bool, WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	Ok(
+		wt.work()
+			.lstat(&path.join(&gitana_path::GitPathComponent::from_utf8(".git").expect(".git")))?
+			.is_some(),
+	)
+}
+
+/// Remove `folder` and what's in it, as git's `remove_dirs` does: its entries in the order the
+/// filesystem lists them, each folder before itself, then the folder once everything in it has gone.
+/// Only files put away are removed (anything else found there, and a nested repository, stays, and
+/// so does the folder); each one that can't be is added to `not_removed`, and so are the folders it
+/// leaves. Whether the folder went.
+fn remove_whole<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	folder: &GitPath,
+	saved: &HashSet<&GitPath>,
+	not_removed: &mut Vec<(GitPath, std::io::Error)>,
+) -> Result<bool, WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	let entries = match wt.work().read_dir(folder) {
+		Ok(entries) => entries,
+		// An unreadable folder may still be removable when empty, as git tries.
+		Err(_) => {
+			return match wt.work().remove_dir(folder) {
+				Ok(()) => Ok(true),
+				Err(error) => {
+					not_removed.push((folder.clone(), error));
+					Ok(false)
+				}
+			};
+		}
+	};
+	let mut gone = true;
+	for entry in entries {
+		let path = folder.join(&entry.name);
+		if entry.kind.is_dir() {
+			gone &= !is_nested_repository(wt, &path)? && remove_whole(wt, &path, saved, not_removed)?;
+			continue;
+		}
+		if !saved.contains(&path) {
+			gone = false;
+			continue;
+		}
+		match wt.work().remove_file(&path) {
+			Ok(()) => {}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => {
+				not_removed.push((path, error));
+				gone = false;
+			}
+		}
+	}
+	if !gone {
+		return Ok(false);
+	}
+	match wt.work().remove_dir(folder) {
+		Ok(()) => Ok(true),
+		Err(error) => {
+			not_removed.push((folder.clone(), error));
+			Ok(false)
+		}
+	}
 }
 
 /// [`WorkTree::stash_apply`].
