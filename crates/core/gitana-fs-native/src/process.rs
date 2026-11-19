@@ -405,6 +405,18 @@ mod windows_tests {
 			.output()
 			.unwrap();
 		assert!(restricted.status.success());
+		// Some machines give a new folder explicit full control for Administrators (GitHub's runner
+		// does, and its account is one), which removing the inherited entries leaves in place: an
+		// explicit deny, which Windows applies before any allow, makes it read-only for them too.
+		// Adding files and folders is denied, not icacls's generic `W`, whose SYNCHRONIZE every open
+		// asks for.
+		let denied = Command::new("icacls")
+			.arg(&read_only)
+			.arg("/deny")
+			.arg(format!("{user}:(OI)(CI)(WD,AD)"))
+			.output()
+			.unwrap();
+		assert!(denied.status.success());
 		assert!(
 			std::fs::write(read_only.join("probe"), b"").is_err(),
 			"the read-only fixture must deny new files"
