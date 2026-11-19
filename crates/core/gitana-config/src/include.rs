@@ -48,6 +48,11 @@ pub struct IncludeContext<'a> {
 	/// `$HOME`, used to expand a leading `~/` in an include path or a `gitdir:` pattern. `None`
 	/// skips a `~/` include and makes a `~/` pattern non-matching.
 	pub home: Option<&'a Path>,
+	/// `home` resolved to its real path (symlinks, and on Windows short names, followed), used for a
+	/// leading `~` in a `gitdir:`/`gitdir/i:` pattern: git expands it with the real home so the
+	/// pattern can match the real gitdir. `None` (no home, or one that can't be resolved) falls back
+	/// to `home`. Include paths keep `home` as written, as git keeps them.
+	pub real_home: Option<&'a Path>,
 	/// The real (driver-resolved, absolute) gitdir, matched by `gitdir:`/`gitdir/i:` conditions.
 	/// `None` makes every `gitdir:` condition non-matching.
 	pub gitdir: Option<&'a Path>,
@@ -209,7 +214,9 @@ fn gitdir_matches(
 	icase: bool,
 	fileless: bool,
 ) -> bool {
-	let Some((pattern, prefix)) = prepare_gitdir_pattern(pattern, dir, ctx.home, fileless) else {
+	// `~` expands with the real home, as git's `interpolate_path(.., real_home = 1)` does here.
+	let home = ctx.real_home.or(ctx.home);
+	let Some((pattern, prefix)) = prepare_gitdir_pattern(pattern, dir, home, fileless) else {
 		return false;
 	};
 	// git prepares the pattern once and matches it against each gitdir candidate in turn (its `again:`
@@ -769,6 +776,7 @@ mod tests {
 	fn ctx<'a>(home: Option<&'a Path>, gitdir: Option<&'a Path>) -> IncludeContext<'a> {
 		IncludeContext {
 			home,
+			real_home: None,
 			gitdir,
 			gitdir_absolute: None,
 			branch: None,
@@ -1186,6 +1194,33 @@ mod tests {
 
 	// --- includeIf gitdir matching (through expand_includes) ---
 
+	/// `~` in a `gitdir:` pattern expands with the real home when there is one (git resolves the home
+	/// there), so a home reached through a link matches the real gitdir; without one, `home` as
+	/// written.
+	#[test]
+	fn gitdir_tilde_expands_with_the_real_home() {
+		let home = PathBuf::from("/link/home");
+		let real_home = PathBuf::from("/real/home");
+		let gitdir = PathBuf::from("/real/home/repo/.git");
+		let mut context = ctx(Some(&home), Some(&gitdir));
+		assert!(!gitdir_matches(
+			"~/",
+			Path::new("/"),
+			&context,
+			false,
+			false
+		));
+		context.real_home = Some(&real_home);
+		assert!(gitdir_matches("~/", Path::new("/"), &context, false, false));
+		assert!(!gitdir_matches(
+			"/link/home/",
+			Path::new("/"),
+			&context,
+			false,
+			false
+		));
+	}
+
 	#[test]
 	fn includeif_gitdir_applies_only_on_match() {
 		let gitdir = PathBuf::from("/home/me/work/proj/.git");
@@ -1240,6 +1275,7 @@ mod tests {
 		let logical = Path::new(r"C:\alias\repo\.git");
 		let context = IncludeContext {
 			home: Some(home),
+			real_home: None,
 			gitdir: Some(real),
 			gitdir_absolute: Some(logical),
 			branch: None,
@@ -1383,6 +1419,7 @@ mod tests {
 	fn onbranch(pattern: &str, branch: Option<&str>) -> bool {
 		let c = IncludeContext {
 			home: None,
+			real_home: None,
 			gitdir: None,
 			gitdir_absolute: None,
 			branch,
@@ -1422,6 +1459,7 @@ mod tests {
 		let source = "[includeIf \"onbranch:feature/*\"]\n\tpath = branch.cfg\n";
 		let on = IncludeContext {
 			home: None,
+			real_home: None,
 			gitdir: None,
 			gitdir_absolute: None,
 			branch: Some("feature/x"),
@@ -1448,6 +1486,7 @@ mod tests {
 	fn hasconfig(glob: &str, urls: Option<&[&str]>) -> bool {
 		let c = IncludeContext {
 			home: None,
+			real_home: None,
 			gitdir: None,
 			gitdir_absolute: None,
 			branch: None,
@@ -1492,6 +1531,7 @@ mod tests {
 		let urls: &[&str] = &["https://github.com/example/repo.git"];
 		let c = IncludeContext {
 			home: None,
+			real_home: None,
 			gitdir: None,
 			gitdir_absolute: None,
 			branch: None,
@@ -1512,6 +1552,7 @@ mod tests {
 		let source = "[includeIf \"hasconfig:remote.*.url:https://github.com/**\"]\n\tpath = id.cfg\n";
 		let c = IncludeContext {
 			home: None,
+			real_home: None,
 			gitdir: None,
 			gitdir_absolute: None,
 			branch: None,
@@ -1601,6 +1642,7 @@ mod tests {
 
 		let on = IncludeContext {
 			home: None,
+			real_home: None,
 			gitdir: None,
 			gitdir_absolute: None,
 			branch: Some("main"),
@@ -1699,6 +1741,7 @@ mod tests {
 		let source = "[includeIf \"hasconfig:remote.*.url:https://github.com/**\"]\n\tpath = id.cfg\n";
 		let c = IncludeContext {
 			home: None,
+			real_home: None,
 			gitdir: None,
 			gitdir_absolute: None,
 			branch: None,
@@ -1909,6 +1952,7 @@ mod tests {
 		let logical = PathBuf::from("/link/repo/.git");
 		let both = IncludeContext {
 			home: None,
+			real_home: None,
 			gitdir: Some(real.as_path()),
 			gitdir_absolute: Some(logical.as_path()),
 			branch: None,
@@ -1924,6 +1968,7 @@ mod tests {
 		// With no absolute candidate, only the realpath matches (the symlink spelling does not).
 		let realpath_only = IncludeContext {
 			home: None,
+			real_home: None,
 			gitdir: Some(real.as_path()),
 			gitdir_absolute: None,
 			branch: None,

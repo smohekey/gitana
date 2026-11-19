@@ -2390,7 +2390,21 @@ async fn assemble_merged(
 			fileless: true,
 		});
 	}
-	expand_layers(&mut base, gitdir, gitdir_absolute, branch, home, guard).await?;
+	// The real home, for `~` in `gitdir:` patterns (git resolves it there, not in include paths).
+	let real_home = match home {
+		Some(home) => tokio::fs::canonicalize(home).await.ok(),
+		None => None,
+	};
+	expand_layers(
+		&mut base,
+		gitdir,
+		gitdir_absolute,
+		branch,
+		home,
+		real_home.as_deref(),
+		guard,
+	)
+	.await?;
 	let mut sources = sources_of(base);
 	// Peel the command-scope source(s) back off the top so they overlay (highest precedence for reads)
 	// while `from_sources_or_empty` keeps the writable source on the base's last layer (the local file).
@@ -2693,6 +2707,7 @@ async fn expand_layers(
 	gitdir_absolute: Option<&Path>,
 	branch: Option<&str>,
 	home: Option<&Path>,
+	real_home: Option<&Path>,
 	guard: &ConfigInputGuard,
 ) -> Result<()> {
 	let resolver = FsIncludeResolver {
@@ -2701,6 +2716,7 @@ async fn expand_layers(
 	// Pre-scan: hasconfig is forced true inside the scan, so it consults no remote URLs itself.
 	let prescan_ctx = IncludeContext {
 		home,
+		real_home,
 		gitdir,
 		gitdir_absolute,
 		branch,
@@ -2733,6 +2749,7 @@ async fn expand_layers(
 	let url_refs: Vec<&str> = urls.iter().map(String::as_str).collect();
 	let ctx = IncludeContext {
 		home,
+		real_home,
 		gitdir,
 		gitdir_absolute,
 		branch,

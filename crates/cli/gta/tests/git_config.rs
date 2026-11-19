@@ -2468,6 +2468,48 @@ fn windows_home_gitdir_include() {
 	std::fs::remove_dir_all(home).unwrap();
 }
 
+/// A home reached through a symlink: git expands `~` in a `gitdir:` pattern with the home's real
+/// path, so `gitdir:~/` applies to a repository under it, as it does for gta.
+#[cfg(unix)]
+#[test]
+fn gitdir_tilde_matches_under_a_symlinked_home_as_git_does() {
+	let base = unique_tmp("gta-symlinked-home");
+	let real = base.join("real");
+	std::fs::create_dir_all(real.join("repo")).unwrap();
+	std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+	let home = base.join("link");
+	let work = home.join("repo");
+	gta(work.to_str().unwrap(), &["init"], b"");
+	std::fs::write(home.join("identity"), "[user]\nname = Conditional\n").unwrap();
+	std::fs::write(
+		home.join(".gitconfig"),
+		"[includeIf \"gitdir:~/\"]\npath = ~/identity\n",
+	)
+	.unwrap();
+	let env = [
+		("HOME", home.to_str().unwrap()),
+		("GIT_CONFIG_NOSYSTEM", "1"),
+	];
+	for (tool, out) in [
+		(
+			"gta",
+			gta_env(work.to_str().unwrap(), &["config", "user.name"], &env),
+		),
+		(
+			"git",
+			git_env(work.to_str().unwrap(), &["config", "user.name"], &env),
+		),
+	] {
+		assert!(out.status.success(), "{tool}: {out:?}");
+		assert_eq!(
+			String::from_utf8_lossy(&out.stdout).trim(),
+			"Conditional",
+			"{tool}"
+		);
+	}
+	std::fs::remove_dir_all(&base).ok();
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_gitdir_pattern_oracle() {

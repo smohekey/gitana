@@ -201,14 +201,16 @@ async fn parse_config(
 	}
 }
 
-/// The include context the component drives expansion with: `onbranch:` from HEAD; no `$HOME`, gitdir
-/// path, or `$PWD` (so `gitdir:` never matches and there is no `gitdir_absolute` candidate).
+/// The include context the component drives expansion with: `onbranch:` from HEAD; no `$HOME` (real
+/// or not), gitdir path, or `$PWD` (so `gitdir:` never matches and there is no `gitdir_absolute`
+/// candidate).
 fn include_context<'a>(
 	branch: Option<&'a str>,
 	remote_urls: Option<&'a [&'a str]>,
 ) -> IncludeContext<'a> {
 	IncludeContext {
 		home: None,
+		real_home: None,
 		gitdir: None,
 		gitdir_absolute: None,
 		branch,
