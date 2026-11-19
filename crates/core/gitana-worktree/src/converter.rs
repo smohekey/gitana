@@ -38,6 +38,10 @@ pub(crate) struct Converter<'a, F, W, H: HashAlgorithm> {
 	config: GitConfig,
 	/// Each staged file's line-ending warning, and whether the index already had the file.
 	warnings: Vec<(bool, GitPath, LineEndingChange)>,
+	/// `core.fileMode`: whether a file's executable bit is staged from disk.
+	file_mode: bool,
+	/// `core.symlinks`: whether a tracked symlink's plain-file placeholder is a file of its own.
+	symlinks: bool,
 }
 
 impl<'a, F, W, H> Converter<'a, F, W, H>
@@ -81,6 +85,12 @@ where
 			Err(error) => return Err(error.into()),
 		};
 		let eol = EolConfig::read(&config)?;
+		let file_mode = crate::status::worktree_file_mode(wt).await;
+		let symlinks = config
+			.get_bool("core", None, "symlinks")
+			.ok()
+			.flatten()
+			.unwrap_or(true);
 		Ok(Converter {
 			wt,
 			attributes,
@@ -89,7 +99,22 @@ where
 			eol,
 			config,
 			warnings: Vec::new(),
+			file_mode,
+			symlinks,
 		})
+	}
+
+	/// The mode to stage a regular file at `path` as, given the index's `existing` mode and the mode
+	/// on disk (`actual`), as git's `ce_mode_from_stat`: under `core.symlinks=false` a tracked
+	/// symlink's plain-file placeholder stays a symlink; under `core.fileMode=false` a tracked
+	/// regular file keeps its executable bit, a new one `100644`.
+	pub(crate) fn staged_file_mode(&self, existing: Option<u32>, actual: u32) -> u32 {
+		match existing {
+			Some(0o120000) if !self.symlinks => 0o120000,
+			Some(mode @ (0o100644 | 0o100755)) if !self.file_mode => mode,
+			_ if !self.file_mode => 0o100644,
+			_ => actual,
+		}
 	}
 
 	/// Stop reading the index's `.gitattributes` at `path`: one this operation stages as deleted, as

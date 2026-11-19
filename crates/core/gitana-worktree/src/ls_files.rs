@@ -17,7 +17,7 @@ use crate::ignore::{self, DirIgnore};
 use crate::pathspec::PathspecSet;
 use crate::status::worktree_change;
 use crate::submodule_head_oid;
-use crate::{Converter, IndexEntry, LsFilesOptions, WorkTree, WorktreeError};
+use crate::{Converter, Index, IndexEntry, LsFilesOptions, WorkTree, WorktreeError};
 
 /// The rendered output plus, when `--error-unmatch` is set, the first pathspec that matched nothing
 /// shown. git prints the matched entries *and then* exits non-zero, so the caller writes `text`
@@ -98,77 +98,14 @@ pub(crate) async fn run<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	// Block 1 — others (untracked). git prints these first, as one sorted block, always plain (never
 	// stage-formatted, even under `-s`).
 	if opts.others {
-		// Under `core.ignoreCase` git matches a working-tree entry to a tracked index path case-folded, so a
-		// disk `foo` counts as the tracked `Foo` (untracked detection is ASCII-case-insensitive). Fold the
-		// membership keys — and the lookups in `collect_others` — the same way.
-		let fold_key = |path: &GitPath| {
-			if config.ignore_case {
-				path.ascii_folded()
-			} else {
-				path.as_bytes().to_vec()
-			}
-		};
-		let tracked: HashSet<Vec<u8>> = index.entries.iter().map(|e| fold_key(&e.path)).collect();
-		// Gitlink (submodule) paths — mode `160000`. git never lists a tracked gitlink directory under
-		// `-o`; an ordinary tracked file whose path is now a directory (a file→dir replacement) is *not* a
-		// gitlink, so it is still descended into.
-		// Exclude a gitlink path that ALSO has tracked children (a mixed subtree-vs-gitlink conflict): the
-		// on-disk directory holds tracked files, so `-o` descends into it and reports `sub/new`, as status
-		// does — not an opaque submodule mount.
-		// Fold-aware (matches `fold_key`): a mixed `160000 Sub` + `sub/f` conflict compares by fold-key.
-		let has_tracked_child = |path: &GitPath| {
-			let mut prefix = fold_key(path);
-			prefix.push(b'/');
-			index
-				.entries
-				.iter()
-				.any(|e| fold_key(&e.path).starts_with(&prefix))
-		};
-		let gitlinks: HashSet<Vec<u8>> = index
-			.entries
-			.iter()
-			.filter(|e| e.mode == 0o160000 && !has_tracked_child(&e.path))
-			.map(|e| fold_key(&e.path))
-			.collect();
-		let mut stack: Vec<DirIgnore> = Vec::new();
-		// `--exclude-standard` adds git's standard excludes below the per-directory `.gitignore` files:
-		// the global excludes file (lowest priority) then `.git/info/exclude`, so a later per-directory
-		// rule overrides them (git's precedence, evaluated last-match-wins in the stack).
-		if opts.exclude_standard {
-			if let Some(text) = excludes_file {
-				stack.push(ignore::parse(text, b""));
-			}
-			if let Some(text) = crate::excludes::read_info_exclude(wt).await? {
-				stack.push(ignore::parse(&text, b""));
-			}
-		}
-		let mut others = Vec::new();
-		let walk = OthersWalk {
-			tracked: &tracked,
-			gitlinks: &gitlinks,
-			exclude_standard: opts.exclude_standard,
-			ignore_case: config.ignore_case,
-		};
-		collect_others(wt.work(), &GitPath::root(), &walk, &mut stack, &mut others)?;
-		// Git orders the names it serializes, so an opaque directory's presentation-only `/`
-		// participates in the comparison (`foo.` sorts before `foo/`). Keep the domain path
-		// canonical while comparing the raw presented byte streams without allocating.
-		others.sort_by(|left, right| {
-			left
-				.path
-				.as_bytes()
-				.iter()
-				.copied()
-				.chain(left.directory.then_some(b'/'))
-				.cmp(
-					right
-						.path
-						.as_bytes()
-						.iter()
-						.copied()
-						.chain(right.directory.then_some(b'/')),
-				)
-		});
+		let others = others(
+			wt,
+			&index,
+			opts.exclude_standard,
+			config.ignore_case,
+			excludes_file,
+		)
+		.await?;
 		for entry in &others {
 			if matches_presented_path(&set, &entry.path, entry.directory) {
 				emit(
@@ -362,6 +299,109 @@ fn render<H: HashAlgorithm>(
 	}
 }
 
+/// The working-tree files the index doesn't have (at any stage), path-sorted as git sorts them, as
+/// `ls-files -o` lists them: each file on its own, but an untracked nested repository as one opaque
+/// folder entry. With `exclude_standard`, ignored ones are left out (the per-folder `.gitignore`
+/// files, `info/exclude` and `excludes_file`, case-folded under `ignore_case`).
+pub(crate) async fn others<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+	index: &Index<H>,
+	exclude_standard: bool,
+	ignore_case: bool,
+	excludes_file: Option<&[u8]>,
+) -> Result<Vec<OtherEntry>, WorktreeError> {
+	// Under `core.ignoreCase` git matches a working-tree entry to a tracked index path case-folded, so a
+	// disk `foo` counts as the tracked `Foo` (untracked detection is ASCII-case-insensitive). Fold the
+	// membership keys — and the lookups in `collect_others` — the same way.
+	let fold_key = |path: &GitPath| {
+		if ignore_case {
+			path.ascii_folded()
+		} else {
+			path.as_bytes().to_vec()
+		}
+	};
+	let tracked: HashSet<Vec<u8>> = index.entries.iter().map(|e| fold_key(&e.path)).collect();
+	// Gitlink (submodule) paths — mode `160000`. git never lists a tracked gitlink directory under
+	// `-o`; an ordinary tracked file whose path is now a directory (a file→dir replacement) is *not* a
+	// gitlink, so it is still descended into.
+	// Exclude a gitlink path that ALSO has tracked children (a mixed subtree-vs-gitlink conflict): the
+	// on-disk directory holds tracked files, so `-o` descends into it and reports `sub/new`, as status
+	// does — not an opaque submodule mount.
+	// Fold-aware (matches `fold_key`): a mixed `160000 Sub` + `sub/f` conflict compares by fold-key.
+	let has_tracked_child = |path: &GitPath| {
+		let mut prefix = fold_key(path);
+		prefix.push(b'/');
+		index
+			.entries
+			.iter()
+			.any(|e| fold_key(&e.path).starts_with(&prefix))
+	};
+	let gitlinks: HashSet<Vec<u8>> = index
+		.entries
+		.iter()
+		.filter(|e| e.mode == 0o160000 && !has_tracked_child(&e.path))
+		.map(|e| fold_key(&e.path))
+		.collect();
+	let mut stack: Vec<DirIgnore> = Vec::new();
+	// `--exclude-standard` adds git's standard excludes below the per-directory `.gitignore` files:
+	// the global excludes file (lowest priority) then `.git/info/exclude`, so a later per-directory
+	// rule overrides them (git's precedence, evaluated last-match-wins in the stack).
+	if exclude_standard {
+		if let Some(text) = excludes_file {
+			stack.push(ignore::parse(text, b""));
+		}
+		if let Some(text) = crate::excludes::read_info_exclude(wt).await? {
+			stack.push(ignore::parse(&text, b""));
+		}
+	}
+	let mut others = Vec::new();
+	let walk = OthersWalk {
+		tracked: &tracked,
+		gitlinks: &gitlinks,
+		exclude_standard,
+		ignore_case,
+	};
+	collect_others(wt.work(), &GitPath::root(), &walk, &mut stack, &mut others)?;
+	// A folder whose `.git` is a gitfile is a repository of its own when the path it names is one,
+	// as git checks: where that lies in this repository's git folder (a linked worktree's admin
+	// folder), gitana checks it too, and walks into the folder when it isn't; elsewhere (a
+	// `--separate-git-dir` checkout, say) it can't be reached, and the folder counts as one.
+	let mut not_repositories = Vec::new();
+	for entry in &others {
+		if let Some(target) = &entry.gitfile
+			&& let Some(inside) = target_in_git_dir(wt, &entry.path, target)
+			&& !is_git_dir_in_store(wt, &inside).await?
+		{
+			not_repositories.push(entry.path.clone());
+		}
+	}
+	others.retain(|entry| !entry.directory || !not_repositories.contains(&entry.path));
+	for dir in &not_repositories {
+		let mut folder_stack = crate::checkout::ignore_prefix(wt.work(), dir, &stack)?;
+		collect_others(wt.work(), dir, &walk, &mut folder_stack, &mut others)?;
+	}
+	// Git orders the names it serializes, so an opaque directory's presentation-only `/`
+	// participates in the comparison (`foo.` sorts before `foo/`). Keep the domain path
+	// canonical while comparing the raw presented byte streams without allocating.
+	others.sort_by(|left, right| {
+		left
+			.path
+			.as_bytes()
+			.iter()
+			.copied()
+			.chain(left.directory.then_some(b'/'))
+			.cmp(
+				right
+					.path
+					.as_bytes()
+					.iter()
+					.copied()
+					.chain(right.directory.then_some(b'/')),
+			)
+	});
+	Ok(others)
+}
+
 /// The read-only context of the `-o` working-tree walk — everything that stays constant across the
 /// recursion: the tracked / gitlink path sets (keys already folded per `core.ignoreCase`), whether
 /// `--exclude-standard` is applying the ignore stack, and the `core.ignoreCase` fold flag.
@@ -372,10 +412,13 @@ struct OthersWalk<'a> {
 	ignore_case: bool,
 }
 
+/// One of [`others`]' entries: a file, or (`directory`) an untracked nested repository's folder.
 #[derive(Eq, PartialEq)]
-struct OtherEntry {
-	path: GitPath,
-	directory: bool,
+pub(crate) struct OtherEntry {
+	pub(crate) path: GitPath,
+	pub(crate) directory: bool,
+	/// For a folder whose `.git` is a gitfile, the path it names, until [`others`] has checked it.
+	pub(crate) gitfile: Option<Vec<u8>>,
 }
 
 /// Recursively collect the working-tree files not present in the index (at any stage). With
@@ -429,6 +472,14 @@ fn collect_others<W: WorkDirFs>(
 				out.push(OtherEntry {
 					path: rel,
 					directory: true,
+					gitfile: None,
+				});
+			} else if let Some(target) = gitfile_target(work, &rel) {
+				// A gitfile's target is checked afterwards, where gitana can reach it.
+				out.push(OtherEntry {
+					path: rel,
+					directory: true,
+					gitfile: Some(target),
 				});
 			} else {
 				collect_others(work, &rel, walk, stack, out)?;
@@ -440,6 +491,7 @@ fn collect_others<W: WorkDirFs>(
 			out.push(OtherEntry {
 				path: rel,
 				directory: false,
+				gitfile: None,
 			});
 		}
 	}
@@ -452,9 +504,9 @@ fn collect_others<W: WorkDirFs>(
 
 /// Whether `dir` (worktree-relative) is a valid untracked embedded git repository — a `.git`
 /// *directory* that is itself a git directory (holding `HEAD`, `objects`, and `refs`). git lists such
-/// a directory opaquely under `-o`. An empty or malformed `.git`, or a `.git` gitfile (whose target
-/// may lie outside the worktree capability), is not recognised here — git validates the marker, so an
-/// unrecognised one is descended into like any ordinary directory.
+/// a directory opaquely under `-o`. An empty or malformed `.git` is not recognised — git validates the
+/// marker, so an unrecognised one is descended into like any ordinary directory. A `.git` gitfile is
+/// [`gitfile_target`]'s, checked by [`others`] where gitana can reach its target.
 pub(crate) fn is_embedded_repo<W: WorkDirFs>(work: &W, dir: &GitPath) -> bool {
 	let git = dir.join(&GitPathComponent::from_utf8(".git").expect("valid marker"));
 	// `.git` must be a directory; any `lstat` failure (e.g. an unreadable directory) leaves it
@@ -491,6 +543,89 @@ fn placeholder_matches<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 }
 
 /// The commit id a checked-out submodule at `path` currently points at (its `HEAD`), or `None` when it
+/// The path a `.git` gitfile in `dir` names (`gitdir: <path>`, as git's `read_gitfile_gently` reads
+/// it, trailing whitespace aside): a linked worktree's or a `--separate-git-dir` checkout's.
+fn gitfile_target<W: WorkDirFs>(work: &W, dir: &GitPath) -> Option<Vec<u8>> {
+	let git = dir.join(&GitPathComponent::from_utf8(".git").expect("valid marker"));
+	if !matches!(work.lstat(&git), Ok(Some(meta)) if meta.kind.is_file()) {
+		return None;
+	}
+	let bytes = work.read(&git).ok()?;
+	let path = bytes.strip_prefix(b"gitdir: ")?.trim_ascii();
+	(!path.is_empty()).then(|| path.to_vec())
+}
+
+/// Where the gitfile `target` in the folder `dir` points, as a path in the repository's git folder,
+/// when it lies there (absolute, or relative to `dir`, resolved without following links); `None`
+/// when it lies elsewhere, out of gitana's reach.
+fn target_in_git_dir<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+	dir: &GitPath,
+	target: &[u8],
+) -> Option<String> {
+	let target = std::path::PathBuf::from(String::from_utf8(target.to_vec()).ok()?);
+	let git_dir = wt.git_dir();
+	let absolute = if target.is_absolute() {
+		target
+	} else {
+		let root = wt
+			.worktree_root()
+			.map(std::path::Path::to_path_buf)
+			.or_else(|| {
+				(git_dir.file_name()? == ".git")
+					.then(|| git_dir.parent())
+					.flatten()
+					.map(std::path::Path::to_path_buf)
+			})?;
+		let mut base = root;
+		for part in dir.as_bytes().split(|&byte| byte == b'/') {
+			base.push(std::str::from_utf8(part).ok()?);
+		}
+		base.join(target)
+	};
+	let mut normal = std::path::PathBuf::new();
+	for part in absolute.components() {
+		match part {
+			std::path::Component::ParentDir => {
+				normal.pop();
+			}
+			std::path::Component::CurDir => {}
+			other => normal.push(other),
+		}
+	}
+	let inside = normal.strip_prefix(git_dir).ok()?;
+	let parts: Vec<&str> = inside
+		.components()
+		.map(|part| part.as_os_str().to_str())
+		.collect::<Option<_>>()?;
+	Some(parts.join("/"))
+}
+
+/// Whether `dir` in the repository's git folder (`""` for the folder itself) is a git directory, as
+/// git's `is_git_directory` tells: a valid `HEAD`, and its objects (or a `commondir` naming them).
+async fn is_git_dir_in_store<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+	dir: &str,
+) -> Result<bool, WorktreeError> {
+	let at = |name: &str| {
+		if dir.is_empty() {
+			name.to_owned()
+		} else {
+			format!("{dir}/{name}")
+		}
+	};
+	let files = wt.repository().objects().file_store();
+	let head = match files.read_path(&at("HEAD")).await {
+		Ok(head) => head,
+		Err(gitana_file_store::FileStoreError::NotFound) => return Ok(false),
+		Err(error) => return Err(error.into()),
+	};
+	if !is_valid_head(&head) {
+		return Ok(false);
+	}
+	Ok(files.exists(&at("commondir")).await? || files.is_dir(&at("objects")).await?)
+}
+
 /// Whether `bytes` is a valid `HEAD`: a `ref:` symbolic ref pointing under `refs/`, or a bare object
 /// id (40 hex for SHA-1, 64 for SHA-256). Mirrors git's `validate_headref` closely enough to tell a
 /// real repository from a directory with a garbage `HEAD` — git rejects a symref target that is not a

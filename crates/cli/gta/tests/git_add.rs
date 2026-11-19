@@ -503,3 +503,98 @@ fn add_matches_globstars_in_gitignore_as_git_does() {
 		std::fs::remove_dir_all(&t).ok();
 	}
 }
+
+/// `core.symlinks=false` and `core.fileMode=false`, as git's `add` takes them: a tracked symlink's
+/// plain-file placeholder stays a symlink (its text the target), a tracked file's executable bit stays
+/// as recorded, and a new file is `100644` whatever its bit on disk.
+#[test]
+fn add_keeps_recorded_modes_where_config_says_as_git_does() {
+	use std::os::unix::fs::PermissionsExt;
+	let base = unique_tmp("add-modes");
+	let (by_git, by_gta) = (base.join("git"), base.join("gta"));
+	for dir in [&by_git, &by_gta] {
+		std::fs::create_dir_all(dir).unwrap();
+		git_ok(dir, &["init", "-q", "-b", "main"]);
+		std::fs::write(dir.join("a.txt"), b"a\n").unwrap();
+		std::fs::write(dir.join("run.sh"), b"r\n").unwrap();
+		std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+		std::os::unix::fs::symlink("a.txt", dir.join("link")).unwrap();
+		git_ok(dir, &["add", "."]);
+		git_ok(
+			dir,
+			&[
+				"-c",
+				"user.name=T",
+				"-c",
+				"user.email=t@e",
+				"commit",
+				"-q",
+				"-m",
+				"base",
+			],
+		);
+		git_ok(dir, &["config", "core.symlinks", "false"]);
+		git_ok(dir, &["config", "core.fileMode", "false"]);
+		std::fs::remove_file(dir.join("link")).unwrap();
+		std::fs::write(dir.join("link"), b"b.txt").unwrap();
+		std::fs::write(dir.join("a.txt"), b"a!\n").unwrap();
+		std::fs::write(dir.join("new.sh"), b"n\n").unwrap();
+		for path in ["a.txt", "new.sh"] {
+			std::fs::set_permissions(dir.join(path), std::fs::Permissions::from_mode(0o755)).unwrap();
+		}
+		// A tracked executable edited and no longer executable on disk keeps `100755`.
+		std::fs::write(dir.join("run.sh"), b"r!\n").unwrap();
+		std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o644)).unwrap();
+	}
+	git_ok(&by_git, &["add", "link", "a.txt", "new.sh", "run.sh"]);
+	let out = gta_raw(&by_gta, &["add", "link", "a.txt", "new.sh", "run.sh"]);
+	assert!(
+		out.status.success(),
+		"{}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	let index = |dir: &Path| String::from_utf8(git_raw(dir, &["ls-files", "-s"]).stdout).unwrap();
+	assert_eq!(index(&by_gta), index(&by_git));
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// A command-line `-c core.fileMode=true` takes precedence over a local `core.fileMode=false`, as
+/// in git: the executable bit is staged from disk.
+#[test]
+fn add_honours_a_command_line_file_mode_as_git_does() {
+	use std::os::unix::fs::PermissionsExt;
+	let base = unique_tmp("add-filemode-override");
+	let (by_git, by_gta) = (base.join("git"), base.join("gta"));
+	for dir in [&by_git, &by_gta] {
+		std::fs::create_dir_all(dir).unwrap();
+		git_ok(dir, &["init", "-q", "-b", "main"]);
+		std::fs::write(dir.join("a.txt"), b"a\n").unwrap();
+		git_ok(dir, &["add", "."]);
+		git_ok(
+			dir,
+			&[
+				"-c",
+				"user.name=T",
+				"-c",
+				"user.email=t@e",
+				"commit",
+				"-q",
+				"-m",
+				"base",
+			],
+		);
+		git_ok(dir, &["config", "core.fileMode", "false"]);
+		std::fs::write(dir.join("a.txt"), b"a!\n").unwrap();
+		std::fs::set_permissions(dir.join("a.txt"), std::fs::Permissions::from_mode(0o755)).unwrap();
+	}
+	git_ok(&by_git, &["-c", "core.fileMode=true", "add", "a.txt"]);
+	let out = gta_raw(&by_gta, &["-c", "core.fileMode=true", "add", "a.txt"]);
+	assert!(
+		out.status.success(),
+		"{}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	let index = |dir: &Path| String::from_utf8(git_raw(dir, &["ls-files", "-s"]).stdout).unwrap();
+	assert_eq!(index(&by_gta), index(&by_git));
+	std::fs::remove_dir_all(&base).ok();
+}

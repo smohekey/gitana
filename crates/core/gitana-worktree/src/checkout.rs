@@ -16,6 +16,7 @@ use gitana_path::GitPath;
 use crate::CheckoutMode;
 use crate::fsmeta::{blob_of, effective_mode, join_rel, push_gitignore, stat_of};
 use crate::ignore::{self, DirIgnore};
+use crate::index_lock::IndexLock;
 use crate::{Converter, IndexEntry, SparseCheckout, WorkTree, WorktreeError};
 
 /// A borrowed stage-0 index entry: its `(octal-mode, oid)` pair.
@@ -65,27 +66,119 @@ where
 	{
 		return merge_apply(wt, head, tree, excludes_file, protect_ignored).await;
 	}
-	let force = matches!(mode, CheckoutMode::Reset);
 	let target = wt.repository().read_tree(tree).await?;
+	let sparse = wt.sparse_checkout().await?;
+	// Take the index lock BEFORE reading the index (and hold it across the operation), so a concurrent index
+	// writer completing between the read and a later lock cannot have its update discarded when the commit
+	// writes back this snapshot. A pre-mutation refusal releases `index.lock` (the working tree still
+	// matches the index); the apply phase marks mutation, and the index is committed.
+	let lock = wt.lock_index().await?;
+	let index_time = wt.index_time().await?;
+	let mut index = wt.load_index().await?;
+	let result = apply_locked(
+		wt,
+		&lock,
+		index_time,
+		&mut index,
+		Target {
+			tree,
+			entries: target,
+			sparse,
+		},
+		mode,
+		excludes_file,
+		protect_ignored,
+		std::future::ready(Ok(())),
+	)
+	.await;
+	match result {
+		Ok(()) => wt.commit_index(lock, &index).await,
+		Err(error) => {
+			wt.release_index_lock(lock).await;
+			Err(error)
+		}
+	}
+}
+
+/// [`run`]'s authoritative checkout (`Reset` or `Overlay`) under an index lock the caller holds, on the
+/// index it loaded (`index_time` read before it): every refusal first, then `ready` awaited, then the
+/// writes, the lock marked before the first. The caller commits the index, or releases the lock.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_locked<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	lock: &IndexLock<'_, F>,
+	index_time: Option<std::time::SystemTime>,
+	index: &mut crate::Index<H>,
+	tree: ObjectId<H>,
+	mode: CheckoutMode<H>,
+	excludes_file: Option<&[u8]>,
+	ready: impl Future<Output = Result<(), WorktreeError>>,
+) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	let target = Target {
+		tree,
+		entries: wt.repository().read_tree(tree).await?,
+		sparse: wt.sparse_checkout().await?,
+	};
+	apply_locked(
+		wt,
+		lock,
+		index_time,
+		index,
+		target,
+		mode,
+		excludes_file,
+		false,
+		ready,
+	)
+	.await
+}
+
+/// The tree a checkout writes, read before the index lock is taken.
+struct Target<H: HashAlgorithm> {
+	tree: ObjectId<H>,
+	entries: Vec<(GitPath, String, ObjectId<H>)>,
+	sparse: Option<SparseCheckout>,
+}
+
+/// The authoritative checkout's body, for [`run_with`] and [`run_locked`].
+#[allow(clippy::too_many_arguments)]
+async fn apply_locked<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	lock: &IndexLock<'_, F>,
+	index_time: Option<std::time::SystemTime>,
+	index: &mut crate::Index<H>,
+	target: Target<H>,
+	mode: CheckoutMode<H>,
+	excludes_file: Option<&[u8]>,
+	protect_ignored: bool,
+	ready: impl Future<Output = Result<(), WorktreeError>>,
+) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	let Target {
+		tree,
+		entries: target,
+		sparse,
+	} = target;
+	let force = matches!(mode, CheckoutMode::Reset);
 	let target_paths: HashMap<&GitPath, (&str, ObjectId<H>)> = target
 		.iter()
 		.map(|(path, mode, oid)| (path, (mode.as_str(), *oid)))
 		.collect();
-
-	let sparse = wt.sparse_checkout().await?;
-	// Take the index lock BEFORE reading the index (and hold it across the operation), so a concurrent index
-	// writer completing between the read and a later lock cannot have its update discarded when the commit
-	// writes back this snapshot. A pre-mutation refuse below drops `lock`, and its `Drop` releases
-	// `index.lock` (the working tree still matches the index); the apply phase marks mutation and commits.
-	let lock = wt.lock_index().await?;
-	let index_time = wt.index_time().await?;
-	let mut index = wt.load_index().await?;
 	if protect_ignored && matches!(mode, CheckoutMode::Merge { .. }) {
-		crate::switch::refuse_ignored(wt, tree, excludes_file, &index).await?;
+		crate::switch::refuse_ignored(wt, tree, excludes_file, index).await?;
 	}
 	// The guard compares working files with the index as git does: as they'd be stored.
-	let mut checkin = Converter::check_in(wt, &index, index_time).await?;
-	let entries = entry_map(&index);
+	let mut checkin = Converter::check_in(wt, index, index_time).await?;
+	let entries = entry_map(index);
 	let current: HashMap<GitPath, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
@@ -471,7 +564,7 @@ where
 		// stat still matches the entry, as git's does: it isn't rewritten, and no conversion runs for it.
 		let mut clean: HashSet<&GitPath> = HashSet::new();
 		let mut unskip: HashSet<GitPath> = HashSet::new();
-		let entries = entry_map(&index);
+		let entries = entry_map(&*index);
 		for (path, mode, oid) in &target {
 			// A null-OID gitlink target is never valid — reject it before any skip below (even `force`, and
 			// regardless of sparsity), matching git's "cache entry has null sha1" abort that leaves HEAD/index
@@ -527,10 +620,17 @@ where
 					.get(path)
 					.is_some_and(|(cm, co)| cm == mode && co == oid)
 				&& let Some(entry) = entries.get(path)
-				&& matches!(
-					wt.work().lstat(path)?,
-					Some(meta) if crate::worktree::stat_trusted(entry, &meta, index_time)
-				) {
+				&& let Some(meta) = wt.work().lstat(path)?
+				&& (crate::worktree::stat_trusted(entry, &meta, index_time)
+					// Untrusted only because it's racy: read, as git's reset reads it, and left alone
+					// when its content is the entry's.
+					|| (meta.mtime != (0, 0)
+						&& crate::worktree::stat_matches(entry, &meta)
+						&& checkin
+							.blob_of(path, &meta, Some(entry))
+							.await?
+							.is_some_and(|(blob, _)| blob == entry.oid)))
+			{
 				clean.insert(path);
 				// Left as it is, but the patterns include it: git's sparse pass still clears a stray
 				// skip-worktree bit (one set by hand), as rewriting it would have.
@@ -556,6 +656,8 @@ where
 		let _keep_collision_untouched = &collision;
 		// The working tree is about to change: a cancellation from here must NOT release `index.lock` (the
 		// tree would be left half-applied), so fail closed instead.
+		// Every refusal is behind; the caller's step before the first write (a stash's store) runs now.
+		ready.await?;
 		lock.mark_mutation_started();
 		for path in &renamed_away {
 			// Detect a gitlink at ANY index stage (a modify/delete abort has only conflict stages, no
@@ -593,7 +695,7 @@ where
 				path,
 				mode,
 				*oid,
-				&mut index,
+				&mut *index,
 				sparse.as_ref(),
 				force,
 			)
@@ -658,13 +760,7 @@ where
 		Ok(())
 	}
 	.await;
-	match result {
-		Ok(()) => wt.commit_index(lock, &index).await,
-		Err(error) => {
-			wt.release_index_lock(lock).await;
-			Err(error)
-		}
-	}
+	result
 }
 
 /// Authoritatively build an index and materialise `tree` by additions only. This is deliberately
@@ -925,6 +1021,54 @@ where
 	W: WorkDirFs,
 	H: HashAlgorithm,
 {
+	// Take the index lock BEFORE reading the index, and hold it across the whole operation. Otherwise a
+	// concurrent `add` (or any index writer) completing between this read and a later lock could have its
+	// update silently discarded when the commit below writes back the snapshot loaded here. A refusal
+	// comes before any worktree write, so releasing the lock then leaves the working tree matching the
+	// index; once the apply phase has marked the lock, a failure keeps it (fail closed).
+	let lock = wt.lock_index().await?;
+	let index_time = wt.index_time().await?;
+	let mut index = wt.load_index().await?;
+	match merge_apply_locked(
+		wt,
+		&lock,
+		index_time,
+		&mut index,
+		head,
+		target,
+		excludes_file,
+		protect_ignored,
+	)
+	.await
+	{
+		Ok(()) => wt.commit_index(lock, &index).await,
+		Err(error) => {
+			wt.release_index_lock(lock).await;
+			Err(error)
+		}
+	}
+}
+
+/// [`merge_apply`]'s work on `index` under the caller's `lock` (`index_time` read before `index` was
+/// loaded): every refusal before the first working-tree write, which marks `lock`. The caller writes
+/// the index on success, or releases the lock on failure, so it can finish the index first (a stash
+/// apply's conflict stages and unstaging) with one write.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn merge_apply_locked<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	lock: &IndexLock<'_, F>,
+	index_time: Option<std::time::SystemTime>,
+	index: &mut crate::Index<H>,
+	head: ObjectId<H>,
+	target: ObjectId<H>,
+	excludes_file: Option<&[u8]>,
+	protect_ignored: bool,
+) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
 	let from = tree_map(wt.repository().read_tree(head).await?);
 	let to = tree_map(wt.repository().read_tree(target).await?);
 
@@ -940,14 +1084,6 @@ where
 	changed.sort_unstable();
 
 	let sparse = wt.sparse_checkout().await?;
-	// Take the index lock BEFORE reading the index, and hold it across the whole operation. Otherwise a
-	// concurrent `add` (or any index writer) completing between this read and a later lock could have its
-	// update silently discarded when the commit below writes back the snapshot loaded here. Every refuse-
-	// phase early return drops `lock` before any worktree write, so its `Drop` releases `index.lock` (the
-	// working tree still matches the index); the apply phase marks mutation and commits/releases explicitly.
-	let lock = wt.lock_index().await?;
-	let index_time = wt.index_time().await?;
-	let mut index = wt.load_index().await?;
 	// A two-tree merge must not move `HEAD` while conflicts are unresolved — git refuses ("you need to
 	// resolve your current index first" / "cannot switch branch while merging"), because the unmerged stages
 	// would otherwise end up attached to a different branch. Refuse before examining or applying any diff
@@ -956,8 +1092,8 @@ where
 		return Err(WorktreeError::Unmerged);
 	}
 	// The refuse phase compares working files with the index as git does: as they'd be stored.
-	let mut checkin = Converter::check_in(wt, &index, index_time).await?;
-	let entries = entry_map(&index);
+	let mut checkin = Converter::check_in(wt, &*index, index_time).await?;
+	let entries = entry_map(&*index);
 	let staged: HashMap<GitPath, (String, ObjectId<H>)> = index
 		.entries
 		.iter()
@@ -1446,7 +1582,7 @@ where
 					)
 				}),
 				excludes_file,
-				&index,
+				&*index,
 			)
 			.await?;
 		}
@@ -1652,7 +1788,7 @@ where
 				path,
 				mode,
 				*oid,
-				&mut index,
+				&mut *index,
 				sparse.as_ref(),
 				false,
 			)
@@ -1700,13 +1836,7 @@ where
 		Ok(())
 	}
 	.await;
-	match result {
-		Ok(()) => wt.commit_index(lock, &index).await,
-		Err(error) => {
-			wt.release_index_lock(lock).await;
-			Err(error)
-		}
-	}
+	result
 }
 
 /// The nearest strict ancestor of `path` that is a member of `set` (`p` for `p/c` when `p ∈ set`), or
@@ -2396,7 +2526,7 @@ fn clear_dest<W: WorkDirFs>(work: &W, path: &GitPath) -> Result<(), WorktreeErro
 
 /// Prune directories left empty above `path`, from its parent upward, stopping at the first that is
 /// non-empty (or the work-tree root).
-fn remove_empty_parents<W: WorkDirFs>(work: &W, path: &GitPath) {
+pub(crate) fn remove_empty_parents<W: WorkDirFs>(work: &W, path: &GitPath) {
 	for dir in path.strict_ancestors().into_iter().rev() {
 		if work.remove_dir(&dir).is_err() {
 			break;

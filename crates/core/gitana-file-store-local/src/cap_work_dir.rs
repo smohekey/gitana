@@ -5,10 +5,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cap_fs_ext::DirExt;
 use cap_std::fs::{Dir, FileType, Metadata};
-use gitana_fs_native::{EntryIdentity, file_identity, remove_file_if_identity};
+#[cfg(unix)]
+use gitana_fs_native::rename_noreplace;
+use gitana_fs_native::{
+	EntryIdentity, EntrySnapshot, entry_snapshot, file_identity, remove_file_if_identity,
+	remove_file_if_unchanged,
+};
 use gitana_path::{GitPath, GitPathComponent};
 
-use crate::{DirEntry, FileKind, Meta, PopulationEntry, WorkDirFs};
+use crate::{DirEntry, FileKind, Meta, PopulationEntry, WorkDirFs, WorkEntryIdentity};
 
 const POPULATION_TEMP_ATTEMPTS: u64 = 100;
 static POPULATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -119,16 +124,50 @@ impl WorkDirFs for CapWorkDir {
 				Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
 				Err(error) => Err(error),
 			},
-			PopulationEntry::Regular { bytes, executable } => {
+			PopulationEntry::Regular { bytes, executable } => Ok(
 				populate_regular_file(&parent, &name, |file| {
 					file.write_all(bytes)?;
 					set_exec_file(file, executable)
-				})
-			}
+				})?
+				.is_some(),
+			),
 			PopulationEntry::Symlink(target) => {
 				make_population_symlink(&parent, target, Path::new(&name))
 			}
 		}
+	}
+
+	fn populate_new_recorded(
+		&self,
+		path: &GitPath,
+		entry: PopulationEntry<'_>,
+	) -> io::Result<Option<WorkEntryIdentity>> {
+		let native = native_path(path)?;
+		let (parent, name) = population_parent(&self.dir, &native)?;
+		let content = crate::work_entry_identity::population_content(&entry);
+		let snapshot = match entry {
+			PopulationEntry::Directory => match parent.create_dir(&name) {
+				Ok(()) => Some(entry_snapshot(&parent, &name)?),
+				Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+				Err(error) => return Err(error),
+			},
+			PopulationEntry::Regular { bytes, executable } => {
+				populate_regular_file(&parent, &name, |file| {
+					file.write_all(bytes)?;
+					set_exec_file(file, executable)
+				})?
+			}
+			PopulationEntry::Symlink(target) => {
+				populate_recorded_symlink(&parent, target, Path::new(&name))?
+			}
+		};
+		Ok(snapshot.map(|snapshot| {
+			let identity = WorkEntryIdentity::native(snapshot);
+			match content {
+				Some(content) => identity.with_content(content),
+				None => identity,
+			}
+		}))
 	}
 
 	fn symlink(&self, target: &[u8], path: &GitPath) -> io::Result<()> {
@@ -155,6 +194,64 @@ impl WorkDirFs for CapWorkDir {
 
 	fn remove_dir_all(&self, path: &GitPath) -> io::Result<()> {
 		self.dir.remove_dir_all(native_path(path)?)
+	}
+
+	fn entry_identity(&self, path: &GitPath) -> io::Result<Option<WorkEntryIdentity>> {
+		let native = native_path(path)?;
+		let Some((parent, name)) = existing_parent(&self.dir, &native)? else {
+			return Ok(None);
+		};
+		match entry_snapshot(&parent, &name) {
+			Ok(snapshot) => Ok(Some(WorkEntryIdentity::native(snapshot))),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+			Err(error) => Err(error),
+		}
+	}
+
+	fn remove_file_if_identity(
+		&self,
+		path: &GitPath,
+		expected: &WorkEntryIdentity,
+	) -> io::Result<bool> {
+		let Some(snapshot) = expected.as_native() else {
+			return crate::work_entry_identity::remove_if_meta_matches(self, path, expected);
+		};
+		let native = native_path(path)?;
+		let Some((parent, name)) = existing_parent(&self.dir, &native)? else {
+			return Ok(false);
+		};
+		remove_file_if_unchanged(&parent, &name, snapshot, |content| {
+			expected.content_matches(content)
+		})
+	}
+}
+
+/// The leaf's parent through retained no-follow directory handles, as [`population_parent`] but
+/// creating nothing: `None` when a folder on the way is missing or isn't a folder (a symlink in
+/// one's place included), so the leaf named isn't there.
+fn existing_parent(root: &Dir, path: &Path) -> io::Result<Option<(Dir, OsString)>> {
+	let mut components = path.components().peekable();
+	let mut parent = root.try_clone()?;
+	loop {
+		let Some(Component::Normal(component)) = components.next() else {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"invalid working-tree path",
+			));
+		};
+		if components.peek().is_none() {
+			return Ok(Some((parent, component.to_owned())));
+		}
+		parent = match parent.open_dir_nofollow(component) {
+			Ok(child) => child,
+			Err(error) => {
+				return match parent.symlink_metadata(component) {
+					Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
+					Ok(meta) if !meta.is_dir() => Ok(None),
+					_ => Err(error),
+				};
+			}
+		};
 	}
 }
 
@@ -344,6 +441,60 @@ fn make_symlink(dir: &Dir, target: &[u8], path: &std::path::Path) -> io::Result<
 
 #[cfg(not(unix))]
 fn make_population_symlink(dir: &Dir, target: &[u8], path: &Path) -> io::Result<bool> {
+	Ok(populate_regular_file(dir, path, |file| file.write_all(target))?.is_some())
+}
+
+/// A symlink made under a private name, recorded there, then given `path` only if `path` is still
+/// free: `None` when it isn't (the private one removed again).
+#[cfg(unix)]
+fn populate_recorded_symlink(
+	dir: &Dir,
+	target: &[u8],
+	path: &Path,
+) -> io::Result<Option<EntrySnapshot>> {
+	use std::ffi::OsStr;
+	use std::os::unix::ffi::OsStrExt;
+	match dir.symlink_metadata(path) {
+		Ok(_) => return Ok(None),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+		Err(error) => return Err(error),
+	}
+	let mut attempts = 0;
+	let temporary = loop {
+		let sequence = POPULATION_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+		let name = format!(".gitana-populate.{}.{}", std::process::id(), sequence);
+		match dir.symlink(OsStr::from_bytes(target), &name) {
+			Ok(()) => break name,
+			Err(error)
+				if error.kind() == io::ErrorKind::AlreadyExists
+					&& attempts + 1 < POPULATION_TEMP_ATTEMPTS =>
+			{
+				attempts += 1;
+			}
+			Err(error) => return Err(error),
+		}
+	};
+	let snapshot = entry_snapshot(dir, temporary.as_ref())?;
+	match rename_noreplace(dir, temporary.as_ref(), dir, path.as_os_str()) {
+		Ok(()) => Ok(Some(snapshot)),
+		Err(error) => {
+			let _ = remove_file_if_unchanged(dir, temporary.as_ref(), snapshot, |_| Ok(true));
+			if error.kind() == io::ErrorKind::AlreadyExists {
+				Ok(None)
+			} else {
+				Err(error)
+			}
+		}
+	}
+}
+
+/// Without unix symlinks, the target is the file's content, recorded as any file.
+#[cfg(not(unix))]
+fn populate_recorded_symlink(
+	dir: &Dir,
+	target: &[u8],
+	path: &Path,
+) -> io::Result<Option<EntrySnapshot>> {
 	populate_regular_file(dir, path, |file| file.write_all(target))
 }
 
@@ -351,23 +502,25 @@ fn populate_regular_file<P: AsRef<Path>>(
 	dir: &Dir,
 	path: P,
 	initialize: impl FnOnce(&mut cap_std::fs::File) -> io::Result<()>,
-) -> io::Result<bool> {
+) -> io::Result<Option<EntrySnapshot>> {
 	let path = path.as_ref();
 	match dir.symlink_metadata(path) {
-		Ok(_) => return Ok(false),
+		Ok(_) => return Ok(None),
 		Err(error) if error.kind() == io::ErrorKind::NotFound => {}
 		Err(error) => return Err(error),
 	}
 	let (temporary, mut file) = create_population_temp(dir)?;
 	let identity = file_identity(&file)?;
-	match initialize(&mut file) {
-		Ok(()) => {
+	match initialize(&mut file).and_then(|()| file.metadata()) {
+		Ok(written) => {
 			drop(file);
+			// The file as written, recorded before it has the name.
+			let snapshot = EntrySnapshot::from_metadata(&written);
 			match publish_population_file(dir, &temporary, path, identity) {
-				Ok(()) => Ok(true),
+				Ok(()) => Ok(Some(snapshot)),
 				Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
 					remove_failed_population_file(dir, &temporary, identity)?;
-					Ok(false)
+					Ok(None)
 				}
 				Err(source) => {
 					let cleanup = remove_failed_population_file(dir, &temporary, identity);
@@ -585,7 +738,11 @@ mod tests {
 
 		assert_eq!(error.kind(), io::ErrorKind::StorageFull);
 		assert!(!temp.path().join("file").exists());
-		assert!(populate_regular_file(&dir, "file", |file| file.write_all(b"complete")).unwrap());
+		assert!(
+			populate_regular_file(&dir, "file", |file| file.write_all(b"complete"))
+				.unwrap()
+				.is_some()
+		);
 		assert_eq!(
 			std::fs::read(temp.path().join("file")).unwrap(),
 			b"complete"

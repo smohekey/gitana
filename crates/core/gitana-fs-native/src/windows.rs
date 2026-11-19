@@ -21,14 +21,14 @@ use windows_sys::{
 		Storage::FileSystem::{
 			DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
 			FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
-			FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-			FILE_SHARE_WRITE, FileDispositionInfoEx, SetFileInformationByHandle,
+			FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+			FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfoEx, SetFileInformationByHandle,
 		},
 		System::IO::IO_STATUS_BLOCK,
 	},
 };
 
-use crate::{EntryIdentity, file_identity};
+use crate::{EntryIdentity, EntrySnapshot, file_identity};
 
 static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -144,6 +144,36 @@ pub(crate) fn remove_file_if_identity(
 		));
 	}
 	delete_handle(&target)
+}
+
+pub(crate) fn remove_file_if_unchanged(
+	directory: &Dir,
+	target: &OsStr,
+	expected: EntrySnapshot,
+	same_content: impl FnOnce(&mut dyn std::io::Read) -> Result<bool>,
+) -> Result<bool> {
+	let mut options = OpenOptions::new();
+	options
+		.access_mode(DELETE | FILE_READ_ATTRIBUTES | FILE_READ_DATA)
+		.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+		.custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+		.follow(FollowSymlinks::No);
+	let mut target = match directory.open_with(target, &options) {
+		Ok(target) => target,
+		Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+		Err(error) => return Err(error),
+	};
+	let metadata = target.metadata()?;
+	// A directory is never removed here.
+	if metadata.is_dir() || EntrySnapshot::from_metadata(&metadata) != expected {
+		return Ok(false);
+	}
+	// Read through the handle that then deletes it.
+	if !same_content(&mut target)? {
+		return Ok(false);
+	}
+	delete_handle(&target)?;
+	Ok(true)
 }
 
 pub(crate) fn remove_dir_all_if_identity(

@@ -67,9 +67,11 @@ use worker_keepalive_backend::WorkerKeepaliveBackend;
 mod file_kind;
 mod meta;
 mod work_dir_fs;
+mod work_entry_identity;
 pub use file_kind::FileKind;
 pub use meta::Meta;
 pub use work_dir_fs::{DirEntry, PopulationEntry, WorkDirFs};
+pub use work_entry_identity::WorkEntryIdentity;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod cap_work_dir;

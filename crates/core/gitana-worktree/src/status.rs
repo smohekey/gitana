@@ -417,6 +417,18 @@ pub(crate) async fn has_staged_changes<F: FileStore, W: WorkDirFs, H: HashAlgori
 pub(crate) async fn worktree_file_mode<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
 ) -> bool {
+	// The merged view, when the frontend gave one, carries every scope and command-line override
+	// (`-c core.fileMode=…`) in git's precedence; an unreadable or invalid one honours the bit.
+	if wt.repository().has_effective_config() {
+		return match wt.repository().effective_config().await {
+			Ok(config) => config
+				.get_bool("core", None, "filemode")
+				.ok()
+				.flatten()
+				.unwrap_or(true),
+			Err(_) => true,
+		};
+	}
 	let Ok(common) = wt.repository().read_config().await else {
 		return true; // unreadable common config — cannot establish `false`, so honour the exec bit
 	};

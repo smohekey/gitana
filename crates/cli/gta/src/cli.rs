@@ -535,6 +535,14 @@ enum Command {
 		#[command(subcommand)]
 		action: SparseCheckoutAction,
 	},
+	/// Put changes away as a stash (the default, `stash push`), and bring them back.
+	#[command(args_conflicts_with_subcommands = true)]
+	Stash {
+		#[command(subcommand)]
+		action: Option<StashAction>,
+		#[command(flatten)]
+		push: StashPushArgs,
+	},
 }
 
 #[derive(Subcommand)]
@@ -667,6 +675,71 @@ enum SparseCheckoutAction {
 	Disable,
 	/// Re-apply the current sparse-checkout patterns to the working tree.
 	Reapply,
+}
+
+/// `stash push`'s arguments (also `stash`'s own, with no sub-command).
+#[derive(Args)]
+struct StashPushArgs {
+	/// Put untracked files away too (not ignored ones).
+	#[arg(short = 'u', long = "include-untracked")]
+	include_untracked: bool,
+	/// The stash's message.
+	#[arg(short = 'm', long = "message")]
+	message: Option<String>,
+	/// Print nothing on success.
+	#[arg(short = 'q', long = "quiet")]
+	quiet: bool,
+	/// Only these paths.
+	#[arg(value_name = "pathspec")]
+	pathspecs: Vec<OsString>,
+}
+
+/// `stash apply`'s and `stash pop`'s arguments.
+#[derive(Args)]
+struct StashApplyArgs {
+	/// Bring what was staged back staged.
+	#[arg(long = "index")]
+	index: bool,
+	/// Print nothing on success.
+	#[arg(short = 'q', long = "quiet")]
+	quiet: bool,
+	/// The stash: `stash@{N}` or `N` (the newest when absent).
+	#[arg(value_name = "stash")]
+	stash: Option<String>,
+}
+
+/// A `stash` sub-command.
+#[derive(Subcommand)]
+enum StashAction {
+	/// Put the working tree's changes away as a stash.
+	Push(StashPushArgs),
+	/// Bring a stash back, keeping it.
+	Apply(StashApplyArgs),
+	/// Bring a stash back, dropping it unless that leaves conflicts.
+	Pop(StashApplyArgs),
+	/// List the stashes.
+	List,
+	/// Show a stash's files.
+	Show {
+		/// List the files' names (the only form gta shows).
+		#[arg(long = "name-only", required = true)]
+		name_only: bool,
+		/// The untracked files too.
+		#[arg(short = 'u', long = "include-untracked")]
+		include_untracked: bool,
+		/// The stash: `stash@{N}` or `N` (the newest when absent).
+		#[arg(value_name = "stash")]
+		stash: Option<String>,
+	},
+	/// Drop a stash.
+	Drop {
+		/// Print nothing on success.
+		#[arg(short = 'q', long = "quiet")]
+		quiet: bool,
+		/// The stash: `stash@{N}` or `N` (the newest when absent).
+		#[arg(value_name = "stash")]
+		stash: Option<String>,
+	},
 }
 
 /// A `worktree` sub-command.
@@ -1276,6 +1349,14 @@ impl Cli {
 					)
 					.await
 				}
+				Command::Stash { action, push } => {
+					commands::stash::run(
+						&cwd,
+						stash_action(action, push)?,
+						gta_core::ResultPathMode::Human,
+					)
+					.await
+				}
 			}
 		};
 		// Keep the command future behind a pointer before the nested task-local scopes wrap it.
@@ -1344,6 +1425,46 @@ fn sparse_checkout_action(
 		SparseCheckoutAction::List => Action::List,
 		SparseCheckoutAction::Disable => Action::Disable,
 		SparseCheckoutAction::Reapply => Action::Reapply,
+	})
+}
+
+/// Map the clap `stash` sub-command (none means `push`) to the `gta-core` action.
+fn stash_action(
+	action: Option<StashAction>,
+	push: StashPushArgs,
+) -> Result<commands::stash::Action> {
+	use commands::stash::Action;
+	let push_action = |args: StashPushArgs| -> Result<Action> {
+		Ok(Action::Push {
+			pathspecs: native_pathspecs(args.pathspecs)?,
+			message: args.message,
+			include_untracked: args.include_untracked,
+			quiet: args.quiet,
+		})
+	};
+	Ok(match action {
+		None => push_action(push)?,
+		Some(StashAction::Push(args)) => push_action(args)?,
+		Some(StashAction::Apply(args)) => Action::Apply {
+			stash: args.stash,
+			index: args.index,
+			quiet: args.quiet,
+		},
+		Some(StashAction::Pop(args)) => Action::Pop {
+			stash: args.stash,
+			index: args.index,
+			quiet: args.quiet,
+		},
+		Some(StashAction::List) => Action::List,
+		Some(StashAction::Show {
+			include_untracked,
+			stash,
+			..
+		}) => Action::Show {
+			stash,
+			include_untracked,
+		},
+		Some(StashAction::Drop { quiet, stash }) => Action::Drop { stash, quiet },
 	})
 }
 

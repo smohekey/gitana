@@ -432,11 +432,17 @@ fn ls_files_others_malformed_dotgit_is_not_a_repo() {
 	std::fs::write(repo.join("top"), "t\n").unwrap();
 	git_ok(&repo, &["add", "-A"]);
 	git_ok(&repo, &["commit", "-qm", "init"]);
-	// An empty `.git` directory, and a `.git` gitfile pointing nowhere valid.
+	// An empty `.git` directory, and a `.git` gitfile pointing into the repository's git folder at
+	// no repository (gitana checks a target there as git does; one outside its reach, such as
+	// `/nonexistent`, counts as a repository, a logged difference).
 	std::fs::create_dir_all(repo.join("emptygit/.git")).unwrap();
 	std::fs::write(repo.join("emptygit/f"), "f\n").unwrap();
 	std::fs::create_dir_all(repo.join("gitfile")).unwrap();
-	std::fs::write(repo.join("gitfile/.git"), "gitdir: /nonexistent\n").unwrap();
+	std::fs::write(
+		repo.join("gitfile/.git"),
+		"gitdir: ../.git/worktrees/missing\n",
+	)
+	.unwrap();
 	std::fs::write(repo.join("gitfile/f"), "f\n").unwrap();
 
 	assert_same(&repo, "", &["-o"]);

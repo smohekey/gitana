@@ -33,6 +33,12 @@ impl<F: FileStore, H: HashAlgorithm> Identity for CliIdentity<'_, F, H> {
 	async fn committer_or_default(&self) -> Result<String> {
 		signature_or_default(self.repo, "COMMITTER").await
 	}
+	async fn author_or(&self, name: &str, email: &str) -> Result<String> {
+		signature_or(self.repo, "AUTHOR", name, email).await
+	}
+	async fn committer_or(&self, name: &str, email: &str) -> Result<String> {
+		signature_or(self.repo, "COMMITTER", name, email).await
+	}
 }
 
 /// Build a `role` (`AUTHOR` or `COMMITTER`) identity line from the `GIT_<role>_*` environment,
@@ -67,6 +73,26 @@ pub async fn signature_or_default<F: FileStore, H: HashAlgorithm>(
 		env_override(role, "EMAIL"),
 		Some(&config),
 		&when(role),
+	))
+}
+
+/// Like [`signature`], but an unset name or email falls back, each on its own, to `fallback_name` or
+/// `fallback_email`, as git's stash records `git stash <git@stash>`. It still errors if the config
+/// stack itself cannot be read.
+pub async fn signature_or<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	role: &str,
+	fallback_name: &str,
+	fallback_email: &str,
+) -> Result<String> {
+	let config = repo.effective_config().await?;
+	Ok(gitana_identity::signature_or(
+		env_override(role, "NAME"),
+		env_override(role, "EMAIL"),
+		Some(&config),
+		&when(role),
+		fallback_name,
+		fallback_email,
 	))
 }
 

@@ -22,9 +22,10 @@ use crate::checkout::{
 	remove_gitlink_mount, remove_worktree_path, validate_path, write_worktree_file,
 };
 use crate::fsmeta::stat_of;
+use crate::index_lock::IndexLock;
 use crate::pathspec::PathspecSet;
 use crate::worktree::stat_trusted;
-use crate::{Converter, IndexEntry, Stat, WorkTree, WorktreeError};
+use crate::{Converter, Index, IndexEntry, Stat, WorkTree, WorktreeError};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run<F, W, H>(
@@ -44,6 +45,99 @@ where
 {
 	let index_time = wt.index_time().await?;
 	let mut index = wt.load_index().await?;
+	let options = Options {
+		source,
+		worktree,
+		staged,
+		require_match,
+		exclude_sparse,
+	};
+	restore_with(
+		wt,
+		None,
+		index_time,
+		&mut index,
+		&options,
+		pathspecs,
+		prefix,
+		std::future::ready(Ok(())),
+	)
+	.await
+}
+
+/// [`run`] under an index lock the caller holds, on the index it loaded (`index_time` read before
+/// it): every refusal first, then `ready` awaited, then the writes. The caller commits the index, or
+/// releases the lock.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_locked<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	lock: &IndexLock<'_, F>,
+	index_time: Option<std::time::SystemTime>,
+	index: &mut Index<H>,
+	source: Option<ObjectId<H>>,
+	pathspecs: &[GitPathspec],
+	prefix: &GitPath,
+	ready: impl Future<Output = Result<(), WorktreeError>>,
+) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	let options = Options {
+		source,
+		worktree: true,
+		staged: true,
+		require_match: true,
+		exclude_sparse: true,
+	};
+	restore_with(
+		wt,
+		Some(lock),
+		index_time,
+		index,
+		&options,
+		pathspecs,
+		prefix,
+		ready,
+	)
+	.await
+}
+
+/// What a restore writes, and from where (see [`run`]).
+struct Options<H: HashAlgorithm> {
+	source: Option<ObjectId<H>>,
+	worktree: bool,
+	staged: bool,
+	require_match: bool,
+	exclude_sparse: bool,
+}
+
+/// The restore's body, for [`run`] (`held` none: the lock taken before the first write, the index
+/// committed here) and [`run_locked`] (the caller's lock; the caller commits).
+#[allow(clippy::too_many_arguments)]
+async fn restore_with<F, W, H>(
+	wt: &WorkTree<F, W, H>,
+	held: Option<&IndexLock<'_, F>>,
+	index_time: Option<std::time::SystemTime>,
+	index: &mut Index<H>,
+	options: &Options<H>,
+	pathspecs: &[GitPathspec],
+	prefix: &GitPath,
+	ready: impl Future<Output = Result<(), WorktreeError>>,
+) -> Result<(), WorktreeError>
+where
+	F: FileStore,
+	W: WorkDirFs,
+	H: HashAlgorithm,
+{
+	let Options {
+		source,
+		worktree,
+		staged,
+		require_match,
+		exclude_sparse,
+	} = *options;
 
 	// The `(path, mode, oid)` content a selected path is restored from: the source tree, or the
 	// current index when there is no tree source.
@@ -157,7 +251,7 @@ where
 	// index, with each selected path at the source's version (or gone, when the source lacks it).
 	let mut checkout = Converter::check_out(
 		wt,
-		crate::converter::attribute_entries(&index)
+		crate::converter::attribute_entries(&*index)
 			.filter(|(path, _, _)| !selected.contains(path))
 			.chain(selected.iter().filter_map(|path| {
 				source_map
@@ -217,7 +311,15 @@ where
 	// Take the index lock before mutating the working tree, so a held lock aborts before any change
 	// (as `rm`/`checkout` do) rather than after `save_index`. On a mid-apply failure the lock is
 	// released (not orphaned) and the index is left unwritten.
-	let lock = wt.lock_index().await?;
+	// Every refusal is behind; the caller's step before the first write (a stash's store) runs now.
+	ready.await?;
+	let taken = match held {
+		Some(_) => None,
+		None => Some(wt.lock_index().await?),
+	};
+	let Some(lock) = held.or(taken.as_ref()) else {
+		unreachable!("a lock is held or has just been taken");
+	};
 	let result: Result<(), WorktreeError> = async {
 		// A worktree restore writes/removes files; each such mutation marks `lock` right before it
 		// (below), so a cancellation once the tree is half-applied fails closed. Marking per-write, not
@@ -315,8 +417,11 @@ where
 		Ok(())
 	}
 	.await;
+	let Some(lock) = taken else {
+		return result;
+	};
 	match result {
-		Ok(()) => wt.commit_index(lock, &index).await,
+		Ok(()) => wt.commit_index(lock, index).await,
 		Err(error) => {
 			wt.release_index_lock(lock).await;
 			Err(error)

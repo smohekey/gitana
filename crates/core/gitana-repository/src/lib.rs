@@ -31,10 +31,13 @@ mod prepared_reset;
 mod rebase_state;
 mod ref_name;
 mod ref_op;
+mod reflog_entry;
 mod refs;
 mod repository;
 mod revision;
 mod shallow;
+mod stash;
+mod stash_entry;
 mod tree;
 
 pub use self::{
@@ -56,8 +59,10 @@ pub use self::{
 	rebase_state::RebaseState,
 	ref_name::{InvalidRefName, RefName},
 	ref_op::RefOp,
+	reflog_entry::ReflogEntry,
 	refs::{RefStore, ReflogIntent},
 	repository::Repository,
+	stash_entry::StashEntry,
 	tree::{TreeBuildEntry, compute_tree_id},
 };
 

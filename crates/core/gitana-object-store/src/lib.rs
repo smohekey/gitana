@@ -396,8 +396,10 @@ where
 		&self.files
 	}
 
-	/// Write an object loose, returning its id. Idempotent: re-writing identical
-	/// content is a no-op because the content-addressed path already exists.
+	/// Write an object loose, returning its id. Re-writing identical content changes nothing
+	/// when the loose object already there is sound; one that is corrupt (not what its id says) is
+	/// replaced with these bytes, the one right content for its id, so the object is readable
+	/// once this returns.
 	pub async fn write_object(
 		&self,
 		kind: ObjectKind,
@@ -408,7 +410,21 @@ where
 		let bytes = encode_loose(kind, payload);
 		let path = loose_object_path(&id);
 		match self.files.write_path_if_absent(&path, &bytes).await? {
-			WriteOutcome::Written | WriteOutcome::AlreadyExists => Ok(id),
+			WriteOutcome::Written => Ok(id),
+			// Already there: read and checked against its id, since a write is relied on as
+			// stored (a stash's clean-up may remove the only other copy).
+			WriteOutcome::AlreadyExists => {
+				let sound = match self.files.read_path(&path).await {
+					Ok(existing) => decode_loose(&existing)
+						.is_ok_and(|(kind, payload)| ObjectId::<H>::compute(kind, &payload) == id),
+					Err(FileStoreError::NotFound) => false,
+					Err(other) => return Err(other.into()),
+				};
+				if !sound {
+					self.files.write_path_replace(&path, &bytes).await?;
+				}
+				Ok(id)
+			}
 		}
 	}
 
@@ -972,6 +988,38 @@ where
 			}
 		}
 		Ok(None)
+	}
+
+	/// About how many objects are stored, as git's `repo_approximate_object_count` reckons it to
+	/// choose an abbreviation length: the packed objects only (a usable multi-pack-index's, and each
+	/// pack it doesn't cover); loose objects aren't counted.
+	pub async fn approximate_object_count(&self) -> Result<usize, ObjectStoreError> {
+		let pack_paths: Vec<String> = self
+			.files
+			.list_prefix(PACK_PREFIX)
+			.await?
+			.into_iter()
+			.filter(|path| path.ends_with(PACK_SUFFIX))
+			.collect();
+		let mut count = 0;
+		let covered: HashSet<String> = match self.multi_pack_index().await? {
+			Some(midx) => {
+				let on_disk: HashSet<String> = pack_paths.iter().map(|p| midx_pack_name(p)).collect();
+				if midx.pack_names().iter().all(|name| on_disk.contains(name)) {
+					count += midx.object_ids().len();
+					midx.pack_names().iter().cloned().collect()
+				} else {
+					HashSet::new()
+				}
+			}
+			None => HashSet::new(),
+		};
+		for path in &pack_paths {
+			if !covered.contains(&midx_pack_name(path)) {
+				count += self.pack_meta(path).await?.index.entries().len();
+			}
+		}
+		Ok(count)
 	}
 
 	/// Every stored object id whose lowercase-hex rendering begins with `prefix`, across loose and

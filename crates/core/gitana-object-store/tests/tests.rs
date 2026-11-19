@@ -2345,3 +2345,36 @@ async fn commit_reaches_any_without_a_bitmap_walks() {
 			.unwrap()
 	);
 }
+
+/// Writing an object whose loose copy is already there but corrupt (not what its id says) replaces
+/// it with the right bytes, so the object reads back once the write returns; a sound copy is kept.
+#[tokio::test]
+async fn writing_an_object_repairs_a_corrupt_copy_already_there() {
+	let store = ObjectStore::<_, Sha256>::new(MemoryFileStore::new());
+	let id = ObjectId::<Sha256>::compute(ObjectKind::Blob, b"precious\n");
+	let path = loose_object_path(&id);
+	store
+		.file_store()
+		.write_path_replace(&path, b"garbage")
+		.await
+		.unwrap();
+	assert!(store.read_object(&id).await.is_err());
+
+	assert_eq!(
+		store
+			.write_object(ObjectKind::Blob, b"precious\n")
+			.await
+			.unwrap(),
+		id
+	);
+
+	let (kind, payload) = store.read_object(&id).await.unwrap();
+	assert_eq!(kind, ObjectKind::Blob);
+	assert_eq!(payload, b"precious\n");
+	let sound = store.file_store().read_path(&path).await.unwrap();
+	store
+		.write_object(ObjectKind::Blob, b"precious\n")
+		.await
+		.unwrap();
+	assert_eq!(store.file_store().read_path(&path).await.unwrap(), sound);
+}

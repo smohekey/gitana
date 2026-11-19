@@ -41,9 +41,22 @@ pub fn signature_or_default(
 	config: Option<&GitConfig>,
 	when: &str,
 ) -> String {
+	signature_or(name, email, config, when, "unknown", "unknown@localhost")
+}
+
+/// Like [`signature`], but an unset name or email falls back, each on its own, to `fallback_name`
+/// or `fallback_email`: git's stash records `git stash <git@stash>` so, rather than refusing.
+pub fn signature_or(
+	name: Option<String>,
+	email: Option<String>,
+	config: Option<&GitConfig>,
+	when: &str,
+	fallback_name: &str,
+	fallback_email: &str,
+) -> String {
 	let (name, email) = resolve(name, email, config);
-	let name = name.unwrap_or_else(|| "unknown".to_owned());
-	let email = email.unwrap_or_else(|| "unknown@localhost".to_owned());
+	let name = name.unwrap_or_else(|| fallback_name.to_owned());
+	let email = email.unwrap_or_else(|| fallback_email.to_owned());
 	line(&name, &email, when)
 }
 
@@ -119,6 +132,39 @@ mod tests {
 		assert_eq!(
 			signature_or_default(None, None, None, "0 +0000"),
 			"unknown <unknown@localhost> 0 +0000"
+		);
+	}
+
+	/// An unset name or email falls back each on its own, as git's stash records `git stash
+	/// <git@stash>`, or the configured email with the fallback name (measured against git 2.55).
+	#[test]
+	fn falls_back_per_field() {
+		assert_eq!(
+			signature_or(None, None, None, "1 +0000", "git stash", "git@stash"),
+			"git stash <git@stash> 1 +0000"
+		);
+		let email_only = GitConfig::parse("[user]\n\temail = only@e\n").unwrap();
+		assert_eq!(
+			signature_or(
+				None,
+				None,
+				Some(&email_only),
+				"1 +0000",
+				"git stash",
+				"git@stash"
+			),
+			"git stash <only@e> 1 +0000"
+		);
+		assert_eq!(
+			signature_or(
+				None,
+				None,
+				Some(&config()),
+				"1 +0000",
+				"git stash",
+				"git@stash"
+			),
+			"Cfg Name <cfg@example.com> 1 +0000"
 		);
 	}
 }

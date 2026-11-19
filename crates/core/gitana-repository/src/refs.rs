@@ -5,7 +5,7 @@ use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::{
 	HeadLock, HeadResetPlan, HeadState, HeadTransaction, HistoryMutationLease, Precondition, RefOp,
-	RepositoryError, is_valid_refname,
+	ReflogEntry, RepositoryError, is_valid_refname,
 };
 
 /// The maximum symbolic-ref chain depth to follow (git's limit), a guard against a cycle.
@@ -823,6 +823,156 @@ where
 			.transact_leased(&[op], Some(ReflogPolicy::Always), &[])
 			.await
 			.map_err(|(_, error)| error)
+	}
+
+	/// The reflog of `name`, oldest entry first: one [`ReflogEntry`] for each line git could have
+	/// written (any other is skipped). Empty when `name` has no reflog.
+	pub async fn reflog(&self, name: &str) -> Result<Vec<ReflogEntry<H>>, RepositoryError> {
+		match self.files.read_path(&format!("logs/{name}")).await {
+			Ok(bytes) => Ok(
+				bytes
+					.split(|byte| *byte == b'\n')
+					.filter_map(ReflogEntry::parse)
+					.collect(),
+			),
+			Err(FileStoreError::NotFound) => Ok(Vec::new()),
+			Err(other) => Err(other.into()),
+		}
+	}
+
+	/// Store `commit` as the newest stash entry, as `git stash push` and `git stash store` do:
+	/// `refs/stash` moved to it, with a reflog entry whatever `core.logAllRefUpdates` says. The
+	/// message is normalised as git normalises a reflog message: each run of whitespace one space,
+	/// the ends trimmed.
+	pub async fn store_stash(
+		&self,
+		commit: ObjectId<H>,
+		committer: &str,
+		message: &str,
+	) -> Result<(), RepositoryError> {
+		let current = self.resolve("refs/stash").await?;
+		self
+			.update_ref_with_explicit_reflog(
+				"refs/stash",
+				commit,
+				current,
+				committer,
+				&normalized_reflog_message(message),
+			)
+			.await
+	}
+
+	/// Drop the stash entry `index` (0 is the newest), as `git stash drop` does through git's
+	/// `reflog delete --rewrite --updateref`: its line leaves `logs/refs/stash`, each remaining line's
+	/// old id becomes the new id of the line before it (zeros for the first), and `refs/stash` moves
+	/// to the newest remaining entry; dropping the last entry removes `refs/stash` and its log. The
+	/// remaining lines are kept as written. `expected`, when given, is the commit the entry must
+	/// still name ([`RepositoryError::RefMoved`] otherwise). Returns the dropped commit, or `None`
+	/// when there's no such entry. Runs under the history lease and the `refs/stash` and
+	/// `packed-refs` locks, to completion even if the caller stops waiting.
+	pub async fn drop_stash(
+		&self,
+		index: usize,
+		expected: Option<ObjectId<H>>,
+	) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let files = self.files.shared_handle();
+			let effective = self.effective.cloned();
+			match tokio::spawn(async move {
+				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+				store.drop_stash_inline(index, expected).await
+			})
+			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		self.drop_stash_inline(index, expected).await
+	}
+
+	async fn drop_stash_inline(
+		&self,
+		index: usize,
+		expected: Option<ObjectId<H>>,
+	) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		let _history_lease = HistoryMutationLease::acquire(self.files).await?;
+		let acquired = self
+			.lock_all(&["refs/stash".to_owned(), PACKED_REFS.to_owned()])
+			.await
+			.map_err(|(_, error)| error)?;
+		let result = self.drop_stash_locked(index, expected).await;
+		self.release_locks(acquired).await;
+		result
+	}
+
+	async fn drop_stash_locked(
+		&self,
+		index: usize,
+		expected: Option<ObjectId<H>>,
+	) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		let log = "logs/refs/stash";
+		let bytes = match self.files.read_path(log).await {
+			Ok(bytes) => bytes,
+			Err(FileStoreError::NotFound) => return Ok(None),
+			Err(other) => return Err(other.into()),
+		};
+		let mut lines: Vec<(&[u8], ReflogEntry<H>)> = bytes
+			.split(|byte| *byte == b'\n')
+			.filter_map(|line| ReflogEntry::parse(line).map(|entry| (line, entry)))
+			.collect();
+		if index >= lines.len() {
+			return Ok(None);
+		}
+		let (_, entry) = lines.remove(lines.len() - 1 - index);
+		let Some(dropped) = entry.new else {
+			return Err(RepositoryError::InvalidRef(
+				"refs/stash: a stash entry names no commit".to_owned(),
+			));
+		};
+		if expected.is_some_and(|expected| expected != dropped) {
+			return Err(RepositoryError::RefMoved {
+				name: "refs/stash".to_owned(),
+			});
+		}
+		// The log's own lock, as git's `reflog delete` takes it, before anything changes: a log that
+		// can't be rewritten or removed is refused here (git: "Unable to create
+		// '…/logs/refs/stash.lock'"), nothing changed. Held to the end.
+		let _log_lock = self.lock_ref(log).await?;
+		let Some((_, newest)) = lines.last() else {
+			// The log first, then the ref, as below: its failure leaves the ref and its entries.
+			self.files.delete_path_unlocked(log).await?;
+			self.files.delete_path_unlocked("refs/stash").await?;
+			self.remove_from_packed_locked("refs/stash").await?;
+			self.prune_empty_dirs(log).await;
+			return Ok(Some(dropped));
+		};
+		let Some(top) = newest.new else {
+			return Err(RepositoryError::InvalidRef(
+				"refs/stash: a stash entry names no commit".to_owned(),
+			));
+		};
+		// git's `--rewrite`: each line's old id is the kept line before it's new id.
+		let hex = H::RAW_LEN * 2;
+		let mut rewritten = Vec::with_capacity(bytes.len());
+		let mut previous: Option<ObjectId<H>> = None;
+		for (line, entry) in &lines {
+			let old = previous.map_or_else(|| "0".repeat(hex), |id| id.to_hex());
+			rewritten.extend_from_slice(old.as_bytes());
+			rewritten.extend_from_slice(&line[hex..]);
+			rewritten.push(b'\n');
+			previous = entry.new;
+		}
+		// The log first, then the ref, as git writes them.
+		self.files.write_path_replace(log, &rewritten).await?;
+		self
+			.files
+			.write_path_replace("refs/stash", format!("{top}\n").as_bytes())
+			.await?;
+		Ok(Some(dropped))
 	}
 
 	/// The transaction [`Self::transact_inline`] runs, for a caller that already holds the history
@@ -2681,6 +2831,23 @@ fn reflog_line<H: HashAlgorithm>(
 	} else {
 		format!("{old} {new} {committer}\t{message}\n").into_bytes()
 	}
+}
+
+/// `message` as git writes it into a reflog (`copy_reflog_msg`): leading whitespace dropped, each
+/// later run of whitespace (git's: space, tab, newline, carriage return) one space, the end trimmed.
+fn normalized_reflog_message(message: &str) -> String {
+	let mut out = String::with_capacity(message.len());
+	let mut after_space = true;
+	for c in message.chars() {
+		let space = matches!(c, ' ' | '\t' | '\n' | '\r');
+		if after_space && space {
+			continue;
+		}
+		after_space = space;
+		out.push(if space { ' ' } else { c });
+	}
+	out.truncate(out.trim_end_matches(' ').len());
+	out
 }
 
 /// Whether `name` is in a namespace git logs by default under `core.logAllRefUpdates=true`:

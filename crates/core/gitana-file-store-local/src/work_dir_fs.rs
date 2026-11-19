@@ -2,7 +2,7 @@ use std::io;
 
 use gitana_path::{GitPath, GitPathComponent};
 
-use crate::{FileKind, Meta};
+use crate::{FileKind, Meta, WorkEntryIdentity};
 
 /// One entry of a directory listing: its name (a single path component) and its kind, from an
 /// `lstat` that does not follow symlinks (so a symlinked subdirectory reads as [`FileKind::Symlink`],
@@ -90,6 +90,33 @@ pub trait WorkDirFs: Send + Sync + 'static {
 	/// platform has no identity-conditioned unlink.
 	fn populate_new(&self, path: &GitPath, entry: PopulationEntry<'_>) -> io::Result<bool>;
 
+	/// [`Self::populate_new`], recording the entry created, and a digest of what it wrote, for a
+	/// later [`Self::remove_file_if_identity`]: `Ok(Some(identity))` when created, `Ok(None)` when
+	/// the name is already occupied. The native backend records a file or symlink as it prepared it,
+	/// before giving it the name, so the identity is the entry created whatever happens at the name
+	/// afterwards (a directory is read from its name). The default creates and then reads the
+	/// name, leaving an instant in which another entry put there would be recorded instead.
+	fn populate_new_recorded(
+		&self,
+		path: &GitPath,
+		entry: PopulationEntry<'_>,
+	) -> io::Result<Option<WorkEntryIdentity>> {
+		let content = crate::work_entry_identity::population_content(&entry);
+		if !self.populate_new(path, entry)? {
+			return Ok(None);
+		}
+		let identity = self.entry_identity(path)?.ok_or_else(|| {
+			io::Error::new(
+				io::ErrorKind::NotFound,
+				"the entry created was removed before it could be recorded",
+			)
+		})?;
+		Ok(Some(match content {
+			Some(content) => identity.with_content(content),
+			None => identity,
+		}))
+	}
+
 	/// Create a symlink at `path` pointing at `target` (raw bytes, as stored in the blob).
 	fn symlink(&self, target: &[u8], path: &GitPath) -> io::Result<()>;
 
@@ -107,4 +134,30 @@ pub trait WorkDirFs: Send + Sync + 'static {
 
 	/// Remove the directory at `path` and everything under it.
 	fn remove_dir_all(&self, path: &GitPath) -> io::Result<()>;
+
+	/// Record which entry `path` holds now (not following a final symlink), and as it is, for a
+	/// later [`Self::remove_file_if_identity`]; `Ok(None)` when nothing is there. The default is an
+	/// `lstat` snapshot ([`WorkEntryIdentity::from_meta`]).
+	fn entry_identity(&self, path: &GitPath) -> io::Result<Option<WorkEntryIdentity>> {
+		Ok(
+			self
+				.lstat(path)?
+				.map(|meta| WorkEntryIdentity::from_meta(&meta)),
+		)
+	}
+
+	/// Remove the file or symlink at `path` only while it still holds the entry `expected`
+	/// recorded, unchanged (and with the content written, when [`Self::populate_new_recorded`]
+	/// recorded it): `Ok(true)` when removed, `Ok(false)` when nothing is there or something else
+	/// is, which is left as it is. The native backend renames the entry to a private name in
+	/// its folder, checks it there (renaming it back when it differs) and then removes it, so an
+	/// entry another program puts at `path` meanwhile is never removed. The default compares an
+	/// `lstat` and then removes, leaving an instant between the two.
+	fn remove_file_if_identity(
+		&self,
+		path: &GitPath,
+		expected: &WorkEntryIdentity,
+	) -> io::Result<bool> {
+		crate::work_entry_identity::remove_if_meta_matches(self, path, expected)
+	}
 }

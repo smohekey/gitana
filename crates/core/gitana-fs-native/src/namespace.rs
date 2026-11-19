@@ -13,7 +13,7 @@ use std::io::Result;
 ))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::EntryIdentity;
+use crate::{EntryIdentity, EntrySnapshot};
 
 #[cfg(any(
 	target_os = "android",
@@ -366,6 +366,161 @@ pub fn remove_file_if_identity(
 	crate::windows::remove_file_if_identity(directory, target, expected)
 }
 
+/// Remove a file or symlink only while its name still holds the entry `expected` recorded,
+/// unchanged: `Ok(true)` when removed, `Ok(false)` when the name is absent or holds another entry,
+/// which is left as it is.
+///
+/// The entry is renamed to a private name in the same directory, checked there (renamed back when
+/// it differs) and then unlinked, so an entry another writer puts at `target` meanwhile is never
+/// removed. Checked there means its snapshot, and then its content through `same_content`, given a
+/// reader of the content (a file's bytes, a symlink's target), which says whether it's the content
+/// the caller wrote; a content check that can't tell (`|_| Ok(true)`) leaves only the snapshot.
+/// Unlike [`remove_file_if_identity`], nothing is left under the private name; the price is that a
+/// writer replacing that private name itself in the instant before the unlink would lose its
+/// entry.
+#[cfg(any(
+	target_os = "android",
+	target_os = "ios",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "redox",
+	target_os = "tvos",
+	target_os = "visionos",
+	target_os = "watchos"
+))]
+pub fn remove_file_if_unchanged(
+	directory: &Dir,
+	target: &OsStr,
+	expected: EntrySnapshot,
+	same_content: impl FnOnce(&mut dyn std::io::Read) -> Result<bool>,
+) -> Result<bool> {
+	use crate::entry_snapshot;
+	use rustix::fs::{RenameFlags, renameat_with};
+
+	// A directory is never removed here, nor moved aside.
+	match directory.symlink_metadata(target) {
+		Ok(metadata) if metadata.is_dir() => return Ok(false),
+		Ok(_) => {}
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+		Err(error) => return Err(error),
+	}
+	let quarantine = loop {
+		let quarantine = private_absent_name(directory, "remove")?;
+		match renameat_with(
+			directory,
+			target,
+			directory,
+			&quarantine,
+			RenameFlags::NOREPLACE,
+		) {
+			Ok(()) => break quarantine,
+			Err(error) => {
+				let error = std::io::Error::from_raw_os_error(error.raw_os_error());
+				match error.kind() {
+					std::io::ErrorKind::NotFound => return Ok(false),
+					// The private name taken meanwhile: another, while the target is still the one.
+					std::io::ErrorKind::AlreadyExists
+						if entry_snapshot(directory, target).is_ok_and(|now| now == expected) =>
+					{
+						continue;
+					}
+					std::io::ErrorKind::AlreadyExists => return Ok(false),
+					_ => return Err(error),
+				}
+			}
+		}
+	};
+	// Put back under its name, keeping it: on a mismatch, a directory, or an unlink that fails.
+	let restore = || match renameat_with(
+		directory,
+		&quarantine,
+		directory,
+		target,
+		RenameFlags::NOREPLACE,
+	) {
+		Ok(()) => Ok(()),
+		Err(restore) => Err(std::io::Error::new(
+			std::io::ErrorKind::AlreadyExists,
+			format!(
+				"removal target changed; preserved it as '{}' because restoring its name failed: {restore}",
+				quarantine.to_string_lossy()
+			),
+		)),
+	};
+	let displaced = directory.symlink_metadata(&quarantine)?;
+	if displaced.is_dir() || crate::EntrySnapshot::from_metadata(&displaced) != expected {
+		restore()?;
+		return Ok(false);
+	}
+	// Its content, read under the private name.
+	let same = if displaced.is_symlink() {
+		use std::os::unix::ffi::OsStrExt as _;
+		directory
+			.read_link_contents(&quarantine)
+			.and_then(|link| same_content(&mut link.as_os_str().as_bytes()))
+	} else {
+		use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+		let mut options = cap_std::fs::OpenOptions::new();
+		options.read(true).follow(FollowSymlinks::No);
+		directory
+			.open_with(&quarantine, &options)
+			.and_then(|mut file| same_content(&mut file))
+	};
+	match same {
+		Ok(true) => {}
+		Ok(false) => {
+			restore()?;
+			return Ok(false);
+		}
+		Err(error) => {
+			restore()?;
+			return Err(error);
+		}
+	}
+	if let Err(error) = directory.remove_file(&quarantine) {
+		restore()?;
+		return Err(error);
+	}
+	Ok(true)
+}
+
+/// Remove a file or symlink only while its name still holds the entry `expected` recorded,
+/// unchanged (its snapshot, then its content through `same_content`), through a delete handle
+/// checked before deleting.
+#[cfg(windows)]
+pub fn remove_file_if_unchanged(
+	directory: &Dir,
+	target: &OsStr,
+	expected: EntrySnapshot,
+	same_content: impl FnOnce(&mut dyn std::io::Read) -> Result<bool>,
+) -> Result<bool> {
+	crate::windows::remove_file_if_unchanged(directory, target, expected, same_content)
+}
+
+/// Fail closed where an entry-conditioned file removal is unavailable.
+#[cfg(not(any(
+	target_os = "android",
+	target_os = "ios",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "redox",
+	target_os = "tvos",
+	target_os = "visionos",
+	target_os = "watchos",
+	windows
+)))]
+pub fn remove_file_if_unchanged(
+	_directory: &Dir,
+	_target: &OsStr,
+	_expected: EntrySnapshot,
+	_same_content: impl FnOnce(&mut dyn std::io::Read) -> Result<bool>,
+) -> Result<bool> {
+	Err(std::io::Error::new(
+		std::io::ErrorKind::Unsupported,
+		"entry-conditioned file removal is unavailable on this platform",
+	))
+}
+
 /// Recursively remove a directory only while its entry still has `expected` identity.
 #[cfg(any(
 	target_os = "android",
@@ -617,10 +772,10 @@ pub fn replace_if_identities(
 #[cfg(test)]
 mod tests {
 	use super::{
-		remove_dir_all_if_identity, remove_file_if_identity, rename_noreplace,
-		rename_noreplace_if_identity, replace_if_identities, replace_if_identity,
+		remove_dir_all_if_identity, remove_file_if_identity, remove_file_if_unchanged,
+		rename_noreplace, rename_noreplace_if_identity, replace_if_identities, replace_if_identity,
 	};
-	use crate::{directory_identity, entry_identity};
+	use crate::{directory_identity, entry_identity, entry_snapshot};
 	use cap_std::{ambient_authority, fs::Dir};
 	use std::ffi::OsStr;
 
@@ -945,5 +1100,139 @@ mod tests {
 
 		assert!(remove_dir_all_if_identity(&directory, OsStr::new("target"), expected).is_err());
 		assert_eq!(directory.read("target/keep").unwrap(), b"foreign");
+	}
+
+	#[test]
+	fn unchanged_removal_deletes_the_recorded_file_and_leaves_nothing_behind() {
+		let temporary = tempfile::tempdir().unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		directory.write("target", b"ours").unwrap();
+		let expected = entry_snapshot(&directory, OsStr::new("target")).unwrap();
+
+		assert!(
+			remove_file_if_unchanged(&directory, OsStr::new("target"), expected, |_| Ok(true)).unwrap()
+		);
+
+		assert_eq!(directory.entries().unwrap().count(), 0);
+		assert!(
+			!remove_file_if_unchanged(&directory, OsStr::new("target"), expected, |_| Ok(true)).unwrap()
+		);
+	}
+
+	#[test]
+	fn unchanged_removal_keeps_a_replacement_or_a_rewrite_and_leaves_nothing_behind() {
+		for case in ["replaced", "rewritten", "retimed"] {
+			let temporary = tempfile::tempdir().unwrap();
+			let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+			directory.write("target", b"ours").unwrap();
+			let expected = entry_snapshot(&directory, OsStr::new("target")).unwrap();
+			let theirs: &[u8] = match case {
+				"replaced" => {
+					directory.write("prepared", b"theirs").unwrap();
+					directory.rename("prepared", &directory, "target").unwrap();
+					b"theirs"
+				}
+				"rewritten" => {
+					directory.write("target", b"theirs!").unwrap();
+					b"theirs!"
+				}
+				_ => {
+					// The same length, so only the modification time tells.
+					let file = std::fs::OpenOptions::new()
+						.write(true)
+						.open(temporary.path().join("target"))
+						.unwrap();
+					std::io::Write::write_all(&mut &file, b"THEM").unwrap();
+					file
+						.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))
+						.unwrap();
+					b"THEM"
+				}
+			};
+
+			assert!(
+				!remove_file_if_unchanged(&directory, OsStr::new("target"), expected, |_| Ok(true))
+					.unwrap(),
+				"{case}"
+			);
+
+			assert_eq!(directory.read("target").unwrap(), theirs, "{case}");
+			assert_eq!(directory.entries().unwrap().count(), 1, "{case}");
+		}
+	}
+
+	#[test]
+	fn unchanged_removal_checks_the_content_it_reads() {
+		for same in [true, false] {
+			let temporary = tempfile::tempdir().unwrap();
+			let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+			directory.write("target", b"ours").unwrap();
+			let expected = entry_snapshot(&directory, OsStr::new("target")).unwrap();
+
+			let removed =
+				remove_file_if_unchanged(&directory, OsStr::new("target"), expected, |content| {
+					let mut read = Vec::new();
+					content.read_to_end(&mut read)?;
+					assert_eq!(read, b"ours");
+					Ok(same)
+				})
+				.unwrap();
+
+			assert_eq!(removed, same);
+			assert_eq!(directory.entries().unwrap().count(), usize::from(!same));
+			if !same {
+				assert_eq!(directory.read("target").unwrap(), b"ours");
+			}
+		}
+	}
+
+	#[test]
+	fn unchanged_removal_leaves_a_directory_in_place() {
+		let temporary = tempfile::tempdir().unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		directory.create_dir("target").unwrap();
+		directory.write("target/content", b"kept").unwrap();
+		let expected = entry_snapshot(&directory, OsStr::new("target")).unwrap();
+		// Never moved aside, even briefly: a rename would change its status-change time.
+		#[cfg(unix)]
+		let changed = || {
+			use std::os::unix::fs::MetadataExt as _;
+			let metadata = std::fs::symlink_metadata(temporary.path().join("target")).unwrap();
+			(metadata.ctime(), metadata.ctime_nsec())
+		};
+		#[cfg(unix)]
+		let before = changed();
+
+		assert!(
+			!remove_file_if_unchanged(&directory, OsStr::new("target"), expected, |_| Ok(true)).unwrap()
+		);
+
+		assert_eq!(directory.read("target/content").unwrap(), b"kept");
+		assert_eq!(directory.entries().unwrap().count(), 1);
+		#[cfg(unix)]
+		assert_eq!(changed(), before);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn unchanged_removal_removes_a_symlink_not_its_target() {
+		let temporary = tempfile::tempdir().unwrap();
+		let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+		directory.write("kept", b"kept").unwrap();
+		directory.symlink("kept", "link").unwrap();
+		let expected = entry_snapshot(&directory, OsStr::new("link")).unwrap();
+
+		assert!(
+			remove_file_if_unchanged(&directory, OsStr::new("link"), expected, |content| {
+				let mut read = Vec::new();
+				content.read_to_end(&mut read)?;
+				Ok(read == b"kept")
+			})
+			.unwrap()
+		);
+
+		assert!(directory.symlink_metadata("link").is_err());
+		assert_eq!(directory.read("kept").unwrap(), b"kept");
+		assert_eq!(directory.entries().unwrap().count(), 1);
 	}
 }

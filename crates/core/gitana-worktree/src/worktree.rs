@@ -26,6 +26,50 @@ pub struct PreparedCommit<H: HashAlgorithm> {
 	pub message: String,
 }
 
+/// What [`WorkTree::stash_push`] puts away, as `git stash push` takes it.
+#[derive(Clone, Debug)]
+pub struct StashPush {
+	/// Only the paths these select (tracked ones, and untracked ones with `include_untracked`);
+	/// none means everything.
+	pub pathspecs: Vec<GitPathspec>,
+	/// The folder the pathspecs are relative to (the caller's, from the working tree's root).
+	pub prefix: GitPath,
+	/// The stash's message (`On <branch>: <message>`); `None` or empty for git's
+	/// `WIP on <branch>: <commit> <subject>`.
+	pub message: Option<String>,
+	/// Untracked files too (not ignored ones), as `--include-untracked` puts them away.
+	pub include_untracked: bool,
+	/// `core.excludesFile`'s contents, which tell ignored untracked files apart.
+	pub excludes_file: Option<Vec<u8>>,
+}
+
+/// Which stash [`WorkTree::stash_apply`] and [`WorkTree::stash_pop`] bring back, and how.
+#[derive(Clone, Debug, Default)]
+pub struct StashApply {
+	/// The stash: `stash@{index}`, 0 the newest.
+	pub index: usize,
+	/// What was staged comes back staged, as `--index` brings it back.
+	pub restore_index: bool,
+	/// `core.excludesFile`'s contents, which tell ignored files (which may be overwritten) apart.
+	pub excludes_file: Option<Vec<u8>>,
+}
+
+/// What [`WorkTree::stash_push`] put away.
+#[derive(Clone, Debug)]
+pub struct StashPushed<H: HashAlgorithm> {
+	/// The new stash, `stash@{0}`.
+	pub entry: gitana_repository::StashEntry<H>,
+	/// The line-ending changes git warns of while putting the files away, as `add`'s.
+	pub line_ending_warnings: Vec<(GitPath, crate::LineEndingChange)>,
+	/// With untracked files, the nested repositories left out, in path order (git: "Ignoring path
+	/// <path>/").
+	pub skipped_repositories: Vec<GitPath>,
+	/// With pathspecs, those that reached only paths outside the sparse checkout, as given, in
+	/// order: put away, but left as they are in the index and working tree (git prints its sparse
+	/// advisory and exits 1).
+	pub sparse_pathspecs: Vec<GitPathspec>,
+}
+
 /// How [`WorkTree::switch_branch`] switches.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SwitchOptions<'a> {
@@ -1870,7 +1914,7 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		Ok(None)
 	}
 
-	async fn stage_file(
+	pub(crate) async fn stage_file(
 		&self,
 		index: &mut Index<H>,
 		path: &GitPath,
@@ -1917,6 +1961,18 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 				index.remove_type_conflicts(path);
 				index.upsert(entry(path, 0o120000, oid, &meta));
 			}
+			Some(meta)
+				if meta.kind.is_file()
+					&& conv.staged_file_mode(index.entry(path).map(|existing| existing.mode), 0o100644)
+						== 0o120000 =>
+			{
+				// A tracked symlink's plain-file placeholder (`core.symlinks=false`): its text is the
+				// link's target, staged unconverted as a symlink, as git stages it.
+				let target = self.work().read(path)?;
+				let oid = self.repo.write_blob(&target).await?;
+				index.remove_type_conflicts(path);
+				index.upsert(entry(path, 0o120000, oid, &meta));
+			}
 			Some(meta) if meta.kind.is_file() => {
 				let content = self.work().read(path)?;
 				// As the repository stores it: line endings converted as the attributes and config say,
@@ -1947,8 +2003,13 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 					.entry(path)
 					.map(|existing| existing.mode)
 					.unwrap_or(0o100644);
+				// As git's `ce_mode_from_stat` under `core.fileMode`, then the capability's own limits.
+				let mode = conv.staged_file_mode(
+					index.entry(path).map(|existing| existing.mode),
+					effective_mode(&meta, expected),
+				);
 				index.remove_type_conflicts(path);
-				index.upsert(entry(path, effective_mode(&meta, expected), oid, &meta));
+				index.upsert(entry(path, mode, oid, &meta));
 			}
 			// A tracked gitlink present as its mount directory: stage the submodule's current `HEAD`, so a
 			// moved submodule records its new pointer on `add` the way git does — leaving it unchanged if the
@@ -2107,6 +2168,33 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		config: &crate::LsFilesConfig<'_>,
 	) -> Result<crate::LsFilesOutput, WorktreeError> {
 		crate::ls_files::run(self, pathspecs, prefix, opts, config).await
+	}
+
+	/// Write a merge's conflicted result: `merged_tree` (conflict markers included) into the working
+	/// tree and index from `ours_tree`, which the index must equal, each of `conflicts` materialised
+	/// whatever the sparse patterns and recorded with its stages 1, 2 and 3 from `base_tree`,
+	/// `ours_tree` and `theirs_tree`. Refuses with [`WorktreeError::ConflictOverwrite`], before
+	/// anything changes, when a conflicted path's working file has unstaged changes the write would
+	/// overwrite. `excludes_file` is `core.excludesFile`'s contents, for the obstruction checks.
+	pub async fn write_conflicted_state(
+		&self,
+		merged_tree: ObjectId<H>,
+		base_tree: ObjectId<H>,
+		ours_tree: ObjectId<H>,
+		theirs_tree: ObjectId<H>,
+		conflicts: &[GitPath],
+		excludes_file: Option<&[u8]>,
+	) -> Result<(), WorktreeError> {
+		crate::conflicted_state::write(
+			self,
+			merged_tree,
+			base_tree,
+			ours_tree,
+			theirs_tree,
+			conflicts,
+			excludes_file,
+		)
+		.await
 	}
 
 	/// Stage-0 tracked paths present on disk whose content or mode diverges from the index, verified by
@@ -2271,6 +2359,44 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		identity: &impl gitana_identity::Identity,
 	) -> Result<(), SwitchError> {
 		crate::switch::run(self, name, options, identity).await
+	}
+
+	/// Put the working tree's changes away as a stash, as `git stash push` does: the index and the
+	/// selected working files saved as git's stash commits (`i`, `w`, and `u` for untracked files)
+	/// on `HEAD`, stored as `stash@{0}`, then the working tree put back to `HEAD` (everything, or
+	/// only the selected paths). `None` when there's nothing to put away (git: "No local changes to
+	/// save"). The commits' identity comes from `identity`, falling back to `git stash
+	/// <git@stash>` where it isn't set, as git's does.
+	pub async fn stash_push(
+		&self,
+		request: &StashPush,
+		identity: &impl gitana_identity::Identity,
+	) -> Result<Option<StashPushed<H>>, crate::StashPushError<H>> {
+		crate::stash::push(self, request, identity).await
+	}
+
+	/// Bring a stash back into the working tree, as `git stash apply` does: its changes merged onto
+	/// the current ones (base: the commit it was made on), coming back unstaged except files new to
+	/// the index (or, with `restore_index`, staged as they were), and its untracked files restored.
+	/// Conflicts are left with markers (`Updated upstream` / `Stashed changes`) and stages. Every
+	/// refusal comes before anything changes, an untracked file already present among them. The
+	/// stash stays.
+	pub async fn stash_apply(
+		&self,
+		request: &StashApply,
+	) -> Result<crate::StashApplied<H>, crate::StashApplyError> {
+		crate::stash::apply(self, request).await
+	}
+
+	/// [`Self::stash_apply`], then the stash dropped if it applied without conflicts, as `git stash
+	/// pop` does; kept otherwise.
+	// The error carries what was applied when the drop fails (`StashPopError::Drop`).
+	#[allow(clippy::result_large_err)]
+	pub async fn stash_pop(
+		&self,
+		request: &StashApply,
+	) -> Result<crate::StashApplied<H>, crate::StashPopError<H>> {
+		crate::stash::pop(self, request).await
 	}
 
 	/// Move the current branch (or a detached `HEAD`) to the commit `target` names, resetting the

@@ -26,14 +26,16 @@ pub struct TreeMerge<H: HashAlgorithm> {
 	pub conflicts: Vec<GitPath>,
 }
 
-/// Three-way merge the `ours` and `theirs` trees against their common `base` tree.
+/// Three-way merge the `ours` and `theirs` trees against their common `base` tree, a content conflict's
+/// markers naming the sides `labels` (`<<<<<<< ours`, `>>>>>>> theirs`).
 pub(crate) async fn merge_trees<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	base: ObjectId<H>,
 	ours: ObjectId<H>,
 	theirs: ObjectId<H>,
+	labels: (&str, &str),
 ) -> Result<TreeMerge<H>, RepositoryError> {
-	let (id, mut conflicts) = merge_tree(repo, Some(base), Some(ours), Some(theirs)).await?;
+	let (id, mut conflicts) = merge_tree(repo, Some(base), Some(ours), Some(theirs), labels).await?;
 	conflicts.sort();
 	let tree = match id {
 		Some(id) => id,
@@ -81,6 +83,7 @@ fn merge_tree<'a, H: HashAlgorithm>(
 	base: Option<ObjectId<H>>,
 	ours: Option<ObjectId<H>>,
 	theirs: Option<ObjectId<H>>,
+	labels: (&'a str, &'a str),
 ) -> MergeTreeFuture<'a, H> {
 	Box::pin(async move {
 		let base_entries = read_entries(repo, base).await?;
@@ -120,8 +123,14 @@ fn merge_tree<'a, H: HashAlgorithm>(
 							Side::Tree(entry) => Some(entry.id),
 							_ => None,
 						};
-						let (id, sub_conflicts) =
-							merge_tree(repo, base_sub, Some(ours_sub.id), Some(theirs_sub.id)).await?;
+						let (id, sub_conflicts) = merge_tree(
+							repo,
+							base_sub,
+							Some(ours_sub.id),
+							Some(theirs_sub.id),
+							labels,
+						)
+						.await?;
 						conflicts.extend(
 							sub_conflicts
 								.into_iter()
@@ -143,6 +152,7 @@ fn merge_tree<'a, H: HashAlgorithm>(
 							base_blob,
 							ours_blob,
 							theirs_blob,
+							labels,
 							&mut conflicts,
 						)
 						.await?;
@@ -186,6 +196,7 @@ async fn merge_blobs<H: HashAlgorithm>(
 	base: Option<&TreeEntry<H>>,
 	ours: &TreeEntry<H>,
 	theirs: &TreeEntry<H>,
+	labels: (&str, &str),
 	conflicts: &mut Vec<GitPath>,
 ) -> Result<TreeEntry<H>, RepositoryError> {
 	let base_id = base.map(|entry| entry.id);
@@ -211,8 +222,8 @@ async fn merge_blobs<H: HashAlgorithm>(
 				&base_content,
 				&ours_content,
 				&theirs_content,
-				"ours",
-				"theirs",
+				labels.0,
+				labels.1,
 			);
 			let id = repo
 				.objects()
@@ -361,7 +372,9 @@ mod tests {
 		let ours = tree(&repo, &[("keep.txt", "x\n"), ("a.txt", "a\n")]).await;
 		let theirs = tree(&repo, &[("keep.txt", "x\n"), ("b.txt", "b\n")]).await;
 
-		let merged = merge_trees(&repo, base, ours, theirs).await.unwrap();
+		let merged = merge_trees(&repo, base, ours, theirs, ("ours", "theirs"))
+			.await
+			.unwrap();
 		assert!(merged.conflicts.is_empty());
 		assert_eq!(
 			paths(&repo, merged.tree).await,
@@ -376,7 +389,9 @@ mod tests {
 		let ours = tree(&repo, &[("f.txt", "A\n2\n3\n4\n5\n")]).await;
 		let theirs = tree(&repo, &[("f.txt", "1\n2\n3\n4\nB\n")]).await;
 
-		let merged = merge_trees(&repo, base, ours, theirs).await.unwrap();
+		let merged = merge_trees(&repo, base, ours, theirs, ("ours", "theirs"))
+			.await
+			.unwrap();
 		assert!(merged.conflicts.is_empty());
 		assert_eq!(
 			file(&repo, merged.tree, "f.txt").await.unwrap(),
@@ -391,7 +406,9 @@ mod tests {
 		let ours = tree(&repo, &[("f.txt", "1\nX\n3\n")]).await;
 		let theirs = tree(&repo, &[("f.txt", "1\nY\n3\n")]).await;
 
-		let merged = merge_trees(&repo, base, ours, theirs).await.unwrap();
+		let merged = merge_trees(&repo, base, ours, theirs, ("ours", "theirs"))
+			.await
+			.unwrap();
 		assert_eq!(merged.conflicts, ["f.txt"]);
 		let content = file(&repo, merged.tree, "f.txt").await.unwrap();
 		assert!(content.contains("<<<<<<< ours") && content.contains(">>>>>>> theirs"));
@@ -404,7 +421,9 @@ mod tests {
 		let ours = tree(&repo, &[("f.txt", "1\nMODIFIED\n3\n")]).await;
 		let theirs = tree(&repo, &[]).await; // theirs deleted f.txt
 
-		let merged = merge_trees(&repo, base, ours, theirs).await.unwrap();
+		let merged = merge_trees(&repo, base, ours, theirs, ("ours", "theirs"))
+			.await
+			.unwrap();
 		assert_eq!(merged.conflicts, ["f.txt"]);
 		assert_eq!(
 			file(&repo, merged.tree, "f.txt").await.unwrap(),
@@ -419,7 +438,9 @@ mod tests {
 		let ours = tree(&repo, &[("dir/keep.txt", "x\n"), ("dir/a.txt", "a\n")]).await;
 		let theirs = tree(&repo, &[("dir/keep.txt", "x\n"), ("dir/b.txt", "b\n")]).await;
 
-		let merged = merge_trees(&repo, base, ours, theirs).await.unwrap();
+		let merged = merge_trees(&repo, base, ours, theirs, ("ours", "theirs"))
+			.await
+			.unwrap();
 		assert!(merged.conflicts.is_empty());
 		assert_eq!(
 			paths(&repo, merged.tree).await,
@@ -434,7 +455,9 @@ mod tests {
 		let ours = bin_tree(&repo, b"A\0OURS\n").await;
 		let theirs = bin_tree(&repo, b"A\0THEIRS\n").await;
 
-		let merged = merge_trees(&repo, base, ours, theirs).await.unwrap();
+		let merged = merge_trees(&repo, base, ours, theirs, ("ours", "theirs"))
+			.await
+			.unwrap();
 		assert_eq!(merged.conflicts, ["f.bin"]);
 		// The binary payload is kept as ours, not rewritten with conflict markers.
 		let (_, _, id) = repo
@@ -455,7 +478,9 @@ mod tests {
 		let ours = file_tree(&repo, FileMode::Executable, b"A\0base\n").await;
 		let theirs = file_tree(&repo, FileMode::Regular, b"A\0THEIRS\n").await;
 
-		let merged = merge_trees(&repo, base, ours, theirs).await.unwrap();
+		let merged = merge_trees(&repo, base, ours, theirs, ("ours", "theirs"))
+			.await
+			.unwrap();
 		assert!(
 			merged.conflicts.is_empty(),
 			"unexpected: {:?}",

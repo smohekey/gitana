@@ -1,6 +1,6 @@
 use gitana_path::{GitPath, GitPathspec};
 
-use crate::LineEndingChange;
+use crate::{ConflictOverwriteError, LineEndingChange};
 
 /// Errors from working-tree / index operations.
 #[derive(Debug, thiserror::Error)]
@@ -14,6 +14,9 @@ pub enum WorktreeError {
 	/// `.git/index.lock` already exists — another process holds the index.
 	#[error("index is locked (.git/index.lock exists)")]
 	IndexLocked,
+	/// A merge-like operation would overwrite unstaged changes at conflicted paths.
+	#[error("{0}")]
+	ConflictOverwrite(ConflictOverwriteError),
 	/// A filesystem error.
 	#[error("io error: {0}")]
 	Io(#[from] std::io::Error),

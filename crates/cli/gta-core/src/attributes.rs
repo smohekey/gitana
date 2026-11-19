@@ -192,7 +192,7 @@ fn taken(result: std::io::Result<Vec<u8>>, path: &Path) -> Option<Vec<u8>> {
 }
 
 /// `error`'s message as C's `strerror` gives it, without Rust's ` (os error N)`.
-fn strerror(error: &std::io::Error) -> String {
+pub(crate) fn strerror(error: &std::io::Error) -> String {
 	let message = error.to_string();
 	match error.raw_os_error() {
 		Some(code) => message

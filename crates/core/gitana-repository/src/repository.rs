@@ -575,6 +575,39 @@ where
 			transaction,
 			history_lease,
 			autostash,
+			deferred_autostash: None,
+		})
+	}
+
+	/// [`Self::prepare_reset_abandoning_operations`] for a reset to the commit `HEAD` names now,
+	/// `expected`, refused ([`RepositoryError::RefMoved`], nothing changed) unless `HEAD` still names
+	/// it: the history lease and `HEAD`'s ref locks taken now and held, so nothing moves `HEAD` while
+	/// the caller changes the index and working tree, and a merge's autostash saved only when
+	/// [`PreparedReset::finish`] publishes. For a caller that stores its own stash entry first (git's
+	/// stash push, whose reset leaves the autostash on top). Dropped unfinished, it releases
+	/// everything with nothing written.
+	pub async fn prepare_reset_to_head(
+		&self,
+		expected: ObjectId<H>,
+		committer: &str,
+		message: &str,
+	) -> Result<PreparedReset<'_, F, H>, RepositoryError> {
+		let history_lease = self.lock_history_mutation().await?;
+		let mut transaction = self.refs().lock_head_transaction_leased().await?;
+		if transaction.tip != Some(expected) {
+			return Err(RepositoryError::RefMoved {
+				name: "HEAD".to_owned(),
+			});
+		}
+		transaction
+			.prepare_reset(expected, ReflogIntent::Log { committer, message })
+			.await?;
+		Ok(PreparedReset {
+			repository: self,
+			transaction,
+			history_lease,
+			autostash: None,
+			deferred_autostash: Some(committer.to_owned()),
 		})
 	}
 
@@ -668,6 +701,47 @@ where
 	/// The commit recorded in `REVERT_HEAD`, or `None` when no revert is in progress.
 	pub async fn revert_head(&self) -> Result<Option<ObjectId<H>>, RepositoryError> {
 		crate::merge_state::revert_head(self).await
+	}
+
+	/// The stashes, newest first (`stash@{0}`), as `git stash list` lists them.
+	pub async fn stash_list(&self) -> Result<Vec<crate::StashEntry<H>>, RepositoryError> {
+		crate::stash::list(self).await
+	}
+
+	/// Store `commit` as the newest stash, as [`RefStore::store_stash`] does.
+	pub async fn store_stash(
+		&self,
+		commit: ObjectId<H>,
+		committer: &str,
+		message: &str,
+	) -> Result<(), RepositoryError> {
+		self.refs().store_stash(commit, committer, message).await
+	}
+
+	/// Drop the stash `stash@{index}`, as [`RefStore::drop_stash`] does: the dropped commit, or
+	/// `None` when there's no such stash.
+	pub async fn drop_stash(
+		&self,
+		index: usize,
+		expected: Option<ObjectId<H>>,
+	) -> Result<Option<ObjectId<H>>, RepositoryError> {
+		self.refs().drop_stash(index, expected).await
+	}
+
+	/// The files `stash@{index}` holds, as `git stash show --name-only` lists them (with
+	/// `include_untracked`, `--include-untracked`'s too), or `None` when there's no such stash.
+	pub async fn stash_files(
+		&self,
+		index: usize,
+		include_untracked: bool,
+	) -> Result<Option<Vec<gitana_path::GitPath>>, RepositoryError> {
+		crate::stash::files(self, index, include_untracked).await
+	}
+
+	/// `id` abbreviated as git abbreviates it: `core.abbrev`, or git's automatic length (at least 7,
+	/// longer in a repository of many objects), then longer until it's unique.
+	pub async fn abbreviate(&self, id: ObjectId<H>) -> Result<String, RepositoryError> {
+		crate::stash::abbreviate(self, id).await
 	}
 
 	/// The stash commit a `git merge --autostash` in progress holds (`MERGE_AUTOSTASH`), or `None`.
@@ -895,7 +969,20 @@ where
 		ours: ObjectId<H>,
 		theirs: ObjectId<H>,
 	) -> Result<crate::TreeMerge<H>, RepositoryError> {
-		crate::merge::merge_trees(self, base, ours, theirs).await
+		crate::merge::merge_trees(self, base, ours, theirs, ("ours", "theirs")).await
+	}
+
+	/// [`Self::merge_trees`], a content conflict's markers naming the sides `ours_label` and
+	/// `theirs_label` (git's stash: `Updated upstream` and `Stashed changes`).
+	pub async fn merge_trees_labelled(
+		&self,
+		base: ObjectId<H>,
+		ours: ObjectId<H>,
+		theirs: ObjectId<H>,
+		ours_label: &str,
+		theirs_label: &str,
+	) -> Result<crate::TreeMerge<H>, RepositoryError> {
+		crate::merge::merge_trees(self, base, ours, theirs, (ours_label, theirs_label)).await
 	}
 
 	/// Read and validate the repository config, requiring its object format to match the
