@@ -83,7 +83,26 @@ impl WorkDirFs for CapWorkDir {
 	}
 
 	fn read(&self, path: &GitPath) -> io::Result<Vec<u8>> {
-		self.dir.read(native_path(path)?)
+		let path = native_path(path)?;
+		let mut options = cap_std::fs::OpenOptions::new();
+		options.read(true);
+		// Opened without waiting, so a named pipe (or a device) where a file was expected can't hold
+		// the read up for ever; then only a regular file is read.
+		#[cfg(unix)]
+		{
+			use cap_std::fs::OpenOptionsExt;
+			options.custom_flags(libc::O_NONBLOCK);
+		}
+		let mut file = self.dir.open_with(&path, &options)?;
+		if !file.metadata()?.is_file() {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				format!("{} isn't a regular file", path.display()),
+			));
+		}
+		let mut out = Vec::new();
+		io::Read::read_to_end(&mut file, &mut out)?;
+		Ok(out)
 	}
 
 	fn read_link(&self, path: &GitPath) -> io::Result<Vec<u8>> {
@@ -665,6 +684,31 @@ mod tests {
 	use cap_std::ambient_authority;
 
 	use super::*;
+
+	/// A named pipe where a file was expected is refused at once, not waited on for a writer.
+	#[test]
+	fn a_named_pipe_read_is_refused_not_waited_on() {
+		let temp = tempfile::tempdir().unwrap();
+		let pipe = temp.path().join(".gitignore");
+		let made = std::process::Command::new("mkfifo")
+			.arg(&pipe)
+			.status()
+			.unwrap();
+		assert!(made.success());
+		let work =
+			CapWorkDir::from_dir(Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap());
+		let (sender, receiver) = std::sync::mpsc::channel();
+		std::thread::spawn(move || {
+			let read = work.read(&GitPath::from_utf8(".gitignore").unwrap());
+			let _ = sender.send(read.map_err(|error| error.kind()));
+		});
+		let Ok(read) = receiver.recv_timeout(std::time::Duration::from_secs(10)) else {
+			// Let the waiting read go on, so the test can end.
+			let _ = std::fs::OpenOptions::new().write(true).open(&pipe);
+			panic!("the read waited on the pipe");
+		};
+		assert_eq!(read, Err(io::ErrorKind::InvalidInput));
+	}
 
 	#[test]
 	fn population_refuses_a_symlinked_parent() {
