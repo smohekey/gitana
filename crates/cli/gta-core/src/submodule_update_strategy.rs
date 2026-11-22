@@ -14,11 +14,45 @@ use crate::identity::CliIdentity;
 use crate::signer;
 
 /// Native history integration for submodule updates.
-#[derive(Clone, Copy)]
-pub(crate) struct SubmoduleUpdateStrategy(pub(crate) crate::ResultPathMode);
+#[derive(Clone)]
+pub(crate) struct SubmoduleUpdateStrategy {
+	result_path_mode: crate::ResultPathMode,
+	/// The environment override in force where the strategy was made, if any: its merges run on a
+	/// task of their own, which doesn't inherit it.
+	environment: Option<gitana_config_native::Environment>,
+}
+
+impl SubmoduleUpdateStrategy {
+	/// The strategy writing paths as `result_path_mode` says, its merges under the environment
+	/// override in force here, if there is one.
+	pub(crate) fn new(result_path_mode: crate::ResultPathMode) -> Self {
+		Self {
+			result_path_mode,
+			environment: gitana_config_native::current_environment(),
+		}
+	}
+}
 
 impl UpdateStrategyExecutor for SubmoduleUpdateStrategy {
 	async fn merge<H: HashAlgorithm>(
+		self,
+		name: String,
+		worktree: WorkTree<LocalFileStore, CapWorkDir, H>,
+		worktree_root: PathBuf,
+		worktree_directory: Dir,
+		target: ObjectId<H>,
+	) -> Result<UpdateMergeResult, SubmoduleError> {
+		let environment = self.environment.clone();
+		let merging = self.merging(name, worktree, worktree_root, worktree_directory, target);
+		match environment {
+			Some(environment) => gitana_config_native::with_environment(environment, merging).await,
+			None => merging.await,
+		}
+	}
+}
+
+impl SubmoduleUpdateStrategy {
+	async fn merging<H: HashAlgorithm>(
 		self,
 		_name: String,
 		worktree: WorkTree<LocalFileStore, CapWorkDir, H>,
@@ -66,7 +100,7 @@ impl UpdateStrategyExecutor for SubmoduleUpdateStrategy {
 			MergeOutcome::WouldOverwrite { paths } => {
 				return Err(SubmoduleError::Merge(
 					gitana_porcelain::conflict::ConflictOverwriteError::new(paths)
-						.render_with_paths(|path| render_result_path(path, self.0)),
+						.render_with_paths(|path| render_result_path(path, self.result_path_mode)),
 				));
 			}
 			MergeOutcome::Conflict { paths } => UpdateMergeResult::Conflict { paths },

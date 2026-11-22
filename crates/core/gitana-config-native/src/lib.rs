@@ -23,7 +23,14 @@
 //! *scoped* single-file read (`--global`/`--system`/`--local`) does **not** expand includes, matching
 //! git.
 
+mod attributes_files;
+mod environment;
+mod excludes_file;
 mod home_directory;
+
+pub use self::attributes_files::{AttributesFiles, attributes_files, attributes_files_at};
+pub use self::environment::{Environment, current_environment, with_environment};
+pub use self::excludes_file::{excludes_file, excludes_file_at, validate_excludes_file_setting};
 
 use self::home_directory::discover_home;
 use std::ffi::{OsStr, OsString};
@@ -2777,7 +2784,7 @@ async fn expand_layers(
 fn env_config_source() -> Result<Option<GitConfigSource>> {
 	let mut source = GitConfigSource::new();
 	let mut any = false;
-	match std::env::var("GIT_CONFIG_COUNT") {
+	match crate::environment::var("GIT_CONFIG_COUNT") {
 		// Only the exact empty string is "unset"; any other value (including whitespace like `" 1 "` or
 		// `"   "`) is parsed strictly, so git's "bogus count" surfaces rather than being trimmed away.
 		Ok(value) if value.is_empty() => {}
@@ -2786,9 +2793,9 @@ fn env_config_source() -> Result<Option<GitConfigSource>> {
 				.parse::<usize>()
 				.map_err(|_| anyhow!("bogus count in GIT_CONFIG_COUNT: {value}"))?;
 			for n in 0..count {
-				let key = std::env::var(format!("GIT_CONFIG_KEY_{n}"))
+				let key = crate::environment::var(&format!("GIT_CONFIG_KEY_{n}"))
 					.map_err(|_| anyhow!("missing GIT_CONFIG_KEY_{n}"))?;
-				let value = std::env::var(format!("GIT_CONFIG_VALUE_{n}"))
+				let value = crate::environment::var(&format!("GIT_CONFIG_VALUE_{n}"))
 					.map_err(|_| anyhow!("missing GIT_CONFIG_VALUE_{n}"))?;
 				let (section, subsection, name) = parse_env_key(&key)?;
 				source.append(section, subsection, name, Some(&value));
@@ -2903,7 +2910,7 @@ async fn home_dir() -> Result<Option<PathBuf>> {
 /// git treats an empty value as unset and falls back. A relative value resolves against the command's
 /// working directory (git resolves these config roots after applying `-C`).
 fn env_path(name: &str) -> Option<PathBuf> {
-	let raw = std::env::var_os(name)?;
+	let raw = crate::environment::var_os(name)?;
 	if raw.is_empty() {
 		return None;
 	}
@@ -2915,9 +2922,9 @@ fn env_path(name: &str) -> Option<PathBuf> {
 /// unset, so it never falls back to the discovered default. A relative path is resolved against the
 /// command's working directory (see [`COMMAND_CWD`]). `None` only when the variable is absent.
 fn env_override_path(name: &str) -> Option<PathBuf> {
-	Some(resolve_command_relative(PathBuf::from(std::env::var_os(
-		name,
-	)?)))
+	Some(resolve_command_relative(PathBuf::from(
+		crate::environment::var_os(name)?,
+	)))
 }
 
 /// Resolve `path` against the command's working directory ([`COMMAND_CWD`]) when it is relative, so
@@ -2935,7 +2942,7 @@ fn resolve_command_relative(path: PathBuf) -> PathBuf {
 /// true and `0` is false); unset → false. Anything else is an error, as git aborts on a bad boolean
 /// environment value. Used for `$GIT_CONFIG_NOSYSTEM`.
 fn env_bool(name: &str) -> Result<bool> {
-	match std::env::var(name) {
+	match crate::environment::var(name) {
 		Err(_) => Ok(false),
 		Ok(value) => parse_git_bool(&value)
 			.ok_or_else(|| anyhow!("bad boolean environment value '{value}' for '{name}'")),

@@ -1,17 +1,17 @@
 //! Native home selection. Explicit HOME retains the existing empty-value policy.
-use std::{env, path::PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
 
 pub(super) async fn discover_home() -> Result<Option<PathBuf>> {
-	if let Some(home) = env::var_os("HOME") {
+	if let Some(home) = crate::environment::var_os("HOME") {
 		return Ok((!home.is_empty()).then(|| PathBuf::from(home)));
 	}
 	#[cfg(windows)]
 	{
-		let drive = env::var_os("HOMEDRIVE");
-		let path = env::var_os("HOMEPATH");
-		let profile = env::var_os("USERPROFILE");
+		let drive = crate::environment::var_os("HOMEDRIVE");
+		let path = crate::environment::var_os("HOMEPATH");
+		let profile = crate::environment::var_os("USERPROFILE");
 		Ok(
 			tokio::task::spawn_blocking(move || {
 				select_windows_home(drive, path, profile, |path| {

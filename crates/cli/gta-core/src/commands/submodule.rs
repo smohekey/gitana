@@ -276,7 +276,7 @@ pub async fn run(
 				&request,
 				&configuration,
 				&transfer,
-				&SubmoduleUpdateStrategy(result_path_mode),
+				&SubmoduleUpdateStrategy::new(result_path_mode),
 			))
 			.await
 			{
@@ -1093,7 +1093,7 @@ async fn resume_update_level(
 	match Box::pin(context.resume_pending_update(
 		&configuration,
 		&transfer,
-		&SubmoduleUpdateStrategy(frontend.result_path_mode),
+		&SubmoduleUpdateStrategy::new(frontend.result_path_mode),
 		Some(committer(&superproject)),
 		depth,
 		recommend_shallow,
@@ -1156,7 +1156,7 @@ async fn update_level(
 		&request,
 		&configuration,
 		&transfer,
-		&SubmoduleUpdateStrategy(frontend.result_path_mode),
+		&SubmoduleUpdateStrategy::new(frontend.result_path_mode),
 	))
 	.await
 	{
@@ -1448,6 +1448,98 @@ mod tests {
 
 	use super::{open_level, render_relative, validate_recursive_level_layout, with_setup_lease};
 	use crate::repo;
+
+	/// Under an environment override, an update by merge reads the override's ignore file, though the
+	/// merge runs on a task of its own: an ignored file in the fast-forward's way is overwritten, as
+	/// git overwrites ignored files. (The process's own ignore file isn't expected to name
+	/// `obstruction`.)
+	#[tokio::test]
+	async fn an_update_by_merge_reads_the_override_s_ignore_file() {
+		let temporary = tempfile::tempdir().unwrap();
+		let top = temporary.path().canonicalize().unwrap();
+		let global = top.join("global");
+		std::fs::write(&global, "").unwrap();
+		let git = |dir: &std::path::Path, args: &[&str]| {
+			let output = Command::new("git")
+				.env("GIT_CONFIG_GLOBAL", &global)
+				.env("GIT_CONFIG_NOSYSTEM", "1")
+				.args([
+					"-c",
+					"user.name=T",
+					"-c",
+					"user.email=t@t",
+					"-c",
+					"init.defaultBranch=main",
+				])
+				.args(["-c", "protocol.file.allow=always", "-C"])
+				.arg(dir)
+				.args(args)
+				.output()
+				.unwrap();
+			assert!(
+				output.status.success(),
+				"{args:?}: {}",
+				String::from_utf8_lossy(&output.stderr)
+			);
+			String::from_utf8_lossy(&output.stdout).trim().to_owned()
+		};
+		let source = top.join("source");
+		std::fs::create_dir(&source).unwrap();
+		git(&source, &["init", "-q"]);
+		std::fs::write(source.join("s"), "s\n").unwrap();
+		git(&source, &["add", "s"]);
+		git(&source, &["commit", "-q", "-m", "A"]);
+		let a = git(&source, &["rev-parse", "HEAD"]);
+		std::fs::write(source.join("obstruction"), "theirs\n").unwrap();
+		git(&source, &["add", "obstruction"]);
+		git(&source, &["commit", "-q", "-m", "B"]);
+		let b = git(&source, &["rev-parse", "HEAD"]);
+		let parent = top.join("parent");
+		std::fs::create_dir(&parent).unwrap();
+		git(&parent, &["init", "-q"]);
+		git(
+			&parent,
+			&["submodule", "add", "-q", source.to_str().unwrap(), "sub"],
+		);
+		git(&parent, &["commit", "-q", "-m", "Sub at B"]);
+		// The superproject records B; the submodule's checkout is back at A, with a file of its own
+		// where B adds one, which only the override's ignore file names.
+		let sub = parent.join("sub");
+		git(&sub, &["checkout", "-q", &a]);
+		std::fs::write(sub.join("obstruction"), "mine\n").unwrap();
+		let xdg = top.join("xdg");
+		std::fs::create_dir_all(xdg.join("git")).unwrap();
+		std::fs::write(xdg.join("git").join("ignore"), "obstruction\n").unwrap();
+		let environment = gitana_config_native::Environment {
+			home: Some(top.join("home")),
+			xdg_config_home: Some(xdg),
+			config_global: Some(global.clone()),
+			config_nosystem: true,
+			attr_nosystem: true,
+		};
+		let command = crate::CommandContext::from_env(parent.clone(), Vec::new());
+		let action = super::Action::Update {
+			init: false,
+			depth: None,
+			recommend_shallow: false,
+			remote: false,
+			fetch: false,
+			strategy: Some(gitana_submodule::UpdateStrategy::Merge),
+			recursive: false,
+			paths: Vec::new(),
+		};
+		gitana_config_native::with_environment(
+			environment,
+			super::run(&parent, &command, action, crate::ResultPathMode::Human),
+		)
+		.await
+		.unwrap();
+		assert_eq!(git(&sub, &["rev-parse", "HEAD"]), b);
+		assert_eq!(
+			std::fs::read_to_string(sub.join("obstruction")).unwrap(),
+			"theirs\n"
+		);
+	}
 
 	#[tokio::test]
 	async fn setup_lease_is_retained_until_status_completes() {
