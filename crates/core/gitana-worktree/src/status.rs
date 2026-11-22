@@ -157,6 +157,15 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	)?;
 
 	let mut merged: BTreeMap<GitPath, StatusEntry> = BTreeMap::new();
+	// Paths only meant to be added (`git add -N`): nothing of theirs is staged, so their entry counts
+	// as absent against HEAD (a staged deletion of HEAD's version still shows, `DA`), and the Y column
+	// says ` A` (or ` D` once the file is gone). Probed vs git 2.55.
+	let intended: HashSet<&GitPath> = index
+		.entries
+		.iter()
+		.filter(|entry| entry.stage == 0 && entry.intent_to_add)
+		.map(|entry| &entry.path)
+		.collect();
 
 	// Index vs HEAD (the X column); unmerged paths are handled separately.
 	let all: BTreeSet<&GitPath> = index_map.keys().chain(head_map.keys()).collect();
@@ -164,7 +173,12 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		if unmerged.contains_key(path) {
 			continue;
 		}
-		let code = match (index_map.get(path), head_map.get(path)) {
+		let staged = if intended.contains(path) {
+			None
+		} else {
+			index_map.get(path)
+		};
+		let code = match (staged, head_map.get(path)) {
 			(Some(i), Some(h)) if i != h => 'M',
 			(Some(_), Some(_)) => ' ',
 			(Some(_), None) => 'A',
@@ -184,7 +198,13 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		if entry.skip_worktree && wt.work().lstat(&entry.path)?.is_none() {
 			continue;
 		}
-		let code = if entry.mode == 0o160000 {
+		let code = if entry.intent_to_add {
+			if wt.work().lstat(&entry.path)?.is_none() {
+				'D'
+			} else {
+				'A'
+			}
+		} else if entry.mode == 0o160000 {
 			// A submodule (gitlink) entry is compared by the path's kind first (probed vs git 2.55): an absent
 			// mount is ` D sub` (deleted), a mount replaced by a file/symlink is ` T sub` (type change), and a
 			// present directory is ` M` iff its checked-out `HEAD` differs from the recorded commit. git ignores

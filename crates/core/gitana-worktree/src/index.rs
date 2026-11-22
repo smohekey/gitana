@@ -149,13 +149,24 @@ impl<H: HashAlgorithm> Index<H> {
 		Self::default()
 	}
 
-	/// The stage-0 entries as tree-build entries — the content a commit captures. Conflicted
-	/// (stage > 0) entries have no stage-0 slot and are skipped, so resolve them first.
+	/// The stage-0 entries as tree-build entries. Conflicted (stage > 0) entries have no stage-0 slot
+	/// and are skipped, so resolve them first. Intent-to-add entries stay in, as empty files: a merge
+	/// or stash comparing this with HEAD then sees the index changed and refuses, as git does.
 	pub fn tree_entries(&self) -> Vec<TreeBuildEntry<H>> {
+		self.entries_where(|_| true)
+	}
+
+	/// [`tree_entries`](Self::tree_entries) without the intent-to-add entries (`git add -N`): the
+	/// content a commit captures, as git's leaves them out (their content was never staged).
+	pub(crate) fn committed_entries(&self) -> Vec<TreeBuildEntry<H>> {
+		self.entries_where(|entry| !entry.intent_to_add)
+	}
+
+	fn entries_where(&self, keep: impl Fn(&IndexEntry<H>) -> bool) -> Vec<TreeBuildEntry<H>> {
 		self
 			.entries
 			.iter()
-			.filter(|entry| entry.stage == 0)
+			.filter(|entry| entry.stage == 0 && keep(entry))
 			.map(|entry| TreeBuildEntry {
 				path: entry.path.clone(),
 				mode: file_mode(entry.mode),

@@ -349,6 +349,32 @@ fn merge_abort_restores_pre_merge_state() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// A file only meant to be added (`git add -N`) leaves the index changed from HEAD, so a merge is
+/// refused, as git refuses it, and the file and its unstaged content stay as they were.
+#[test]
+fn a_merge_with_an_intent_to_add_file_is_refused_and_the_file_kept() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = init("gta-merge-intent");
+	let w = work.to_str().unwrap();
+	let (main_tip, _) = setup_content_conflict(&work, w);
+	write(&work, "new.txt", "my unstaged work\n");
+	git(w, &["add", "-N", "new.txt"]);
+
+	gta_out_fail(w, &["merge", "feature"]);
+
+	assert_eq!(gta(w, &["rev-parse", "HEAD"], b"").trim(), main_tip);
+	assert!(!work.join(".git/MERGE_HEAD").exists());
+	assert_eq!(
+		std::fs::read_to_string(work.join("new.txt")).unwrap(),
+		"my unstaged work\n"
+	);
+	assert_eq!(git(w, &["status", "--porcelain"]), " A new.txt\n");
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 #[test]
 fn merge_continue_creates_a_two_parent_commit() {
 	if !git_supports_sha256() {

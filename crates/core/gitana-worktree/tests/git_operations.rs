@@ -113,6 +113,80 @@ async fn commit_records_what_is_staged_and_refuses_while_a_merge_is_in_progress(
 	assert!(work.join(".git/MERGE_HEAD").exists());
 }
 
+/// As git: a file only meant to be added (`git add -N`) shows in the work-tree column alone, ` A`
+/// whether or not it's been edited since, and ` D` once it's gone; one that HEAD has, taken out of
+/// the index and meant to be added again, is a staged deletion too, `DA`.
+#[tokio::test]
+async fn status_shows_intent_to_add_files_as_git_does() {
+	let Some((work, w)) = repository("status-intent") else {
+		return;
+	};
+	for (name, text) in [("new.txt", "N\n"), ("edit.txt", "E\n"), ("gone.txt", "G\n")] {
+		std::fs::write(work.join(name), text).unwrap();
+	}
+	git(&["-C", &w, "add", "-N", "new.txt", "edit.txt", "gone.txt"]);
+	git(&["-C", &w, "rm", "-q", "--cached", "a.txt"]);
+	git(&["-C", &w, "add", "-N", "a.txt"]);
+	std::fs::write(work.join("edit.txt"), b"E2\n").unwrap();
+	std::fs::remove_file(work.join("gone.txt")).unwrap();
+	let status = make_repo(&work).status(None).await.unwrap();
+	let shown: Vec<String> = status
+		.changed
+		.iter()
+		.map(|entry| format!("{}{} {}", entry.index, entry.worktree, entry.path))
+		.collect();
+	assert_eq!(
+		shown,
+		["DA a.txt", " A edit.txt", " D gone.txt", " A new.txt"]
+	);
+	assert_eq!(
+		git(&["-C", &w, "status", "--porcelain"]),
+		"DA a.txt\n A edit.txt\n D gone.txt\n A new.txt\n"
+	);
+}
+
+/// As git: a commit leaves an intent-to-add entry out (its content was never staged), so with only
+/// one there's nothing to commit; a commit deleting every file makes an empty tree; and an unborn
+/// branch with an empty index has nothing to commit.
+#[tokio::test]
+async fn commit_leaves_intent_to_add_out_and_can_delete_every_file() {
+	let Some((work, w)) = repository("commit-intent") else {
+		return;
+	};
+	std::fs::write(work.join("new.txt"), b"N\n").unwrap();
+	git(&["-C", &w, "add", "-N", "new.txt"]);
+	let wt = make_repo(&work);
+	assert!(matches!(
+		wt.commit("Only intended", &TestIdentity).await,
+		Err(CommitError::NothingToCommit)
+	));
+	std::fs::write(work.join("a.txt"), b"A2\n").unwrap();
+	git(&["-C", &w, "add", "a.txt"]);
+	let wt = make_repo(&work);
+	wt.commit("Two", &TestIdentity).await.unwrap();
+	assert_eq!(
+		git(&["-C", &w, "ls-tree", "--name-only", "HEAD"]).trim(),
+		"a.txt"
+	);
+	git(&["-C", &w, "rm", "-q", "--cached", "new.txt"]);
+	git(&["-C", &w, "rm", "-q", "a.txt"]);
+	let wt = make_repo(&work);
+	let gone = wt.commit("Gone", &TestIdentity).await.unwrap();
+	assert_eq!(git(&["-C", &w, "rev-parse", "HEAD"]).trim(), gone.to_hex());
+	assert_eq!(git(&["-C", &w, "ls-tree", "HEAD"]).trim(), "");
+	assert!(matches!(
+		wt.commit("Again", &TestIdentity).await,
+		Err(CommitError::NothingToCommit)
+	));
+	let unborn = unique_tmp("commit-unborn");
+	let u = unborn.to_str().unwrap().to_owned();
+	git(&["init", "--object-format=sha256", "-q", "-b", "main", &u]);
+	assert!(matches!(
+		make_repo(&unborn).commit("Nothing", &TestIdentity).await,
+		Err(CommitError::Empty)
+	));
+}
+
 #[tokio::test]
 async fn reset_moves_the_branch_and_resets_as_its_mode_says() {
 	let Some((work, w)) = repository("reset-modes") else {

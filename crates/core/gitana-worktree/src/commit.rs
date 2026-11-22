@@ -7,9 +7,9 @@ use gitana_object::{HashAlgorithm, ObjectId};
 
 use crate::{CommitError, PreparedCommit, WorkTree};
 
-/// Refuse while an operation is in progress, then an unmerged, empty, or unchanged index (as git
-/// does, *before* resolving identity), build the staged tree, then resolve the author/committer and
-/// normalise the message. Shared by the plain commit and porcelain's signed one, so the guard order
+/// Refuse while an operation is in progress, then an unmerged index, an empty one on an unborn
+/// branch, or one unchanged from HEAD (as git does, *before* resolving identity), build the staged
+/// tree, then resolve the author/committer and normalise the message. Shared by the plain commit and porcelain's signed one, so the guard order
 /// and lazy-identity behaviour are identical.
 pub(crate) async fn prepare<F, W, H>(
 	wt: &WorkTree<F, W, H>,
@@ -38,8 +38,15 @@ where
 	if index.has_conflicts() {
 		return Err(CommitError::Unmerged);
 	}
-	let entries = index.tree_entries();
-	if entries.is_empty() {
+	let entries = index.committed_entries();
+	let head = repo
+		.refs()
+		.resolve_head()
+		.await
+		.map_err(CommitError::Repository)?;
+	// On an unborn branch an empty index is nothing to commit. With a HEAD, an empty tree is a commit
+	// like another (every file deleted), refused below only if HEAD's tree is empty too.
+	if head.is_none() && entries.is_empty() {
 		return Err(CommitError::Empty);
 	}
 	let tree = repo
@@ -49,11 +56,7 @@ where
 	// Refuse a commit that would not change the tree — git's "nothing to commit, working tree clean".
 	// The initial commit (unborn HEAD) has no parent tree to match, so it is always allowed. Checked
 	// before resolving identity, so a no-op reports "nothing to commit" rather than an identity error.
-	if let Some(head) = repo
-		.refs()
-		.resolve_head()
-		.await
-		.map_err(CommitError::Repository)?
+	if let Some(head) = head
 		&& repo
 			.commit_tree(head)
 			.await
