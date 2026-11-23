@@ -96,6 +96,7 @@ pub(crate) fn worktree_error(error: WorktreeError) -> RepoError {
 		// into a submodule, an unresolvable/no-HEAD or null-OID gitlink, or a symlink/special node at a
 		// mount slot. `backend` is reserved for underlying file-store faults, so surface these as `invalid`.
 		| WorktreeError::PathspecInSubmodule { .. }
+		| WorktreeError::PathspecBeyondSymlink(_)
 		| WorktreeError::SubmoduleNoCommit(_)
 		| WorktreeError::SubmodulePathIsSymlink(_)
 		| WorktreeError::NullGitlinkOid(_)

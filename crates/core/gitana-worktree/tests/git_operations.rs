@@ -113,6 +113,73 @@ async fn commit_records_what_is_staged_and_refuses_while_a_merge_is_in_progress(
 	assert!(work.join(".git/MERGE_HEAD").exists());
 }
 
+/// As git: a path through a symlink in the work tree (here one to `.git`) is "beyond a symbolic
+/// link", and nothing is staged (measured: git 2.55 refuses it with exit 128); the link itself is
+/// staged as a link.
+#[cfg(unix)]
+#[tokio::test]
+async fn add_refuses_a_path_through_a_symlink_as_git_does() {
+	let Some((work, w)) = repository("add-beyond-link") else {
+		return;
+	};
+	std::os::unix::fs::symlink(".git", work.join("alias")).unwrap();
+	let wt = make_repo(&work);
+	let error = wt.add(&["alias/HEAD"], "", false, None).await.unwrap_err();
+	assert!(
+		matches!(error, WorktreeError::PathspecBeyondSymlink(_)),
+		"{error}"
+	);
+	assert_eq!(
+		error.to_string(),
+		"pathspec 'alias/HEAD' is beyond a symbolic link"
+	);
+	assert_eq!(git(&["-C", &w, "diff", "--cached", "--name-only"]), "");
+	let error = wt.add(&["alias/"], "", false, None).await.unwrap_err();
+	assert!(
+		matches!(error, WorktreeError::PathspecBeyondSymlink(_)),
+		"{error}"
+	);
+	wt.add(&["alias"], "", false, None).await.unwrap();
+	assert_eq!(
+		git(&["-C", &w, "diff", "--cached", "--name-only"]),
+		"alias\n"
+	);
+	// A glob whose fixed part stops at its wildcard names no folder: it matches the link, as git's
+	// does (measured: `add ':(glob)a**/'` stages a link `a`).
+	git(&["-C", &w, "reset", "-q"]);
+	let wt = make_repo(&work);
+	wt.add(&[":(glob)alias**/"], "", false, None).await.unwrap();
+	assert_eq!(
+		git(&["-C", &w, "diff", "--cached", "--name-only"]),
+		"alias\n"
+	);
+	// A literal path is taken whole, `[` and `*` in it plain: a real folder `alias[` beside the link is
+	// staged, and a link further along one is still found (measured: git stages `alias[/f`, and
+	// refuses `:(literal)dir[1]/link/HEAD` as beyond a symbolic link).
+	git(&["-C", &w, "reset", "-q"]);
+	std::fs::create_dir(work.join("alias[")).unwrap();
+	std::fs::write(work.join("alias[/f"), b"F\n").unwrap();
+	let wt = make_repo(&work);
+	wt.add(&["alias[/"], "", false, None).await.unwrap();
+	assert_eq!(
+		git(&["-C", &w, "diff", "--cached", "--name-only"]),
+		"alias[/f\n"
+	);
+	git(&["-C", &w, "reset", "-q"]);
+	std::fs::create_dir(work.join("dir[1]")).unwrap();
+	std::os::unix::fs::symlink("../.git", work.join("dir[1]/link")).unwrap();
+	let wt = make_repo(&work);
+	let error = wt
+		.add(&[":(literal)dir[1]/link/HEAD"], "", false, None)
+		.await
+		.unwrap_err();
+	assert!(
+		matches!(error, WorktreeError::PathspecBeyondSymlink(_)),
+		"{error}"
+	);
+	assert_eq!(git(&["-C", &w, "diff", "--cached", "--name-only"]), "");
+}
+
 /// As git: a file only meant to be added (`git add -N`) shows in the work-tree column alone, ` A`
 /// whether or not it's been edited since, and ` D` once it's gone; one that HEAD has, taken out of
 /// the index and meant to be added again, is a staged deletion too, `DA`.

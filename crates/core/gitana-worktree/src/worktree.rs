@@ -1050,6 +1050,43 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			.await
 	}
 
+	/// Whether a folder on the way to `pathspec`'s path (its last one too, when a literal path ends in a
+	/// slash) is a symlink in the work tree, as git's `has_symlink_leading_path` asks. A literal path is
+	/// taken whole, `*` and `[` in it being plain characters; a glob's fixed part stops at its first
+	/// wildcard, so only the folders that part spells out whole count.
+	fn beyond_symlink(&self, pathspec: &crate::pathspec::Pathspec) -> Result<bool, WorktreeError> {
+		let path = if pathspec.is_literal() {
+			pathspec.as_bytes()
+		} else {
+			pathspec.rooted_prefix()
+		};
+		let mut ends: Vec<usize> = path
+			.iter()
+			.enumerate()
+			.filter(|(_, byte)| **byte == b'/')
+			.map(|(at, _)| at)
+			.collect();
+		if pathspec.is_literal() && pathspec.dir_only() && !path.is_empty() && !path.ends_with(b"/") {
+			ends.push(path.len());
+		}
+		for end in ends {
+			if end == 0 {
+				continue;
+			}
+			let Ok(leading) = GitPath::from_bytes(path[..end].to_vec()) else {
+				continue;
+			};
+			if self
+				.work()
+				.lstat(&leading)?
+				.is_some_and(|meta| meta.kind.is_symlink())
+			{
+				return Ok(true);
+			}
+		}
+		Ok(false)
+	}
+
 	/// Byte-preserving counterpart of [`Self::add`] for native and protocol
 	/// boundaries that can carry non-UTF-8 Git pathspecs.
 	pub async fn add_pathspecs(
@@ -1116,6 +1153,13 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		// A `:(exclude)` pathspec subtracts from what the positives stage; a set with only negatives stages
 		// the whole tree minus them, exactly like `add .` with the exclusions applied.
 		let set = crate::pathspec::PathspecSet::parse(pathspecs, prefix)?;
+		// A path reaching through a symlink is git's "beyond a symbolic link": git doesn't follow a link
+		// into what it points at (probed vs git 2.55), which could be `.git` itself.
+		for (spec, pathspec) in set.positives() {
+			if self.beyond_symlink(pathspec)? {
+				return Err(WorktreeError::PathspecBeyondSymlink(spec.clone()));
+			}
+		}
 		// A tracked `.gitattributes` this add stages as gone, or as something other than a file, no longer
 		// governs the files it stages: git's index has dropped the old file by the time it converts them.
 		// That covers an unmerged one's stage 2, the version the attributes fall back to mid-merge. One

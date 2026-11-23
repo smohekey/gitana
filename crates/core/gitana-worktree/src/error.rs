@@ -71,6 +71,10 @@ pub enum WorktreeError {
 	/// A pathspec matched no entries in the restore source.
 	#[error("pathspec did not match any file(s): {0}")]
 	PathspecMatch(GitPathspec),
+	/// A pathspec reaching through a symlink in the work tree (git's fatal "is beyond a symbolic link",
+	/// exit 128): git doesn't follow a link into what it points at, which could be `.git` itself.
+	#[error("pathspec '{0}' is beyond a symbolic link")]
+	PathspecBeyondSymlink(GitPathspec),
 	/// An explicitly-named pathspec points inside a tracked submodule (git's fatal, exit 128): the
 	/// superproject cannot add a submodule's own contents.
 	#[error("Pathspec '{path}' is in submodule '{submodule}'")]
@@ -221,6 +225,10 @@ impl WorktreeError {
 			}
 			Self::PathspecMatch(pathspec) => format!(
 				"pathspec did not match any file(s): {}",
+				render_pathspec(pathspec)
+			),
+			Self::PathspecBeyondSymlink(pathspec) => format!(
+				"pathspec '{}' is beyond a symbolic link",
 				render_pathspec(pathspec)
 			),
 			Self::PathspecInSubmodule { path, submodule } => format!(
