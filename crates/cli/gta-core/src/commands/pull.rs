@@ -97,8 +97,13 @@ pub async fn run(cwd: &Path, result_path_mode: crate::ResultPathMode) -> Result<
 			};
 			let source_layout = repo::inspect_root(&source).await?;
 			let source_identity = repo::capture_repository_layout_identity(&source_layout)?;
-			let (source_setup, common, git) =
-				repo::revalidated_local_source_setup(&source_layout, source_identity, None).await?;
+			let (source_setup, common, git) = repo::revalidated_local_source_setup(
+				&source_layout,
+				source_identity,
+				None,
+				repo::Inspection::Root,
+			)
+			.await?;
 			match dispatch::detect_algorithm_at(&common, &source_layout.common_dir).await? {
 				HashKind::Sha1 => {
 					let second_common = common.try_clone()?;
@@ -348,6 +353,7 @@ async fn open_merge_worktree<H: HashAlgorithm>(
 		common,
 		git,
 		Some(work_dir),
+		repo::CommandNeeds::WorkTree,
 	)
 	.await?;
 	let work_dir = worktree.expect("pull supplied the worktree directory");

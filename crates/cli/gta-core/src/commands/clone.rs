@@ -162,7 +162,8 @@ pub async fn run(
 			}
 			RemoteUrl::Local(path) => {
 				let source = local_path(&command_cwd, &path);
-				let found = repo::inspect_root(&source).await?;
+				let inspection = repo::local_clone_inspection(&rewritten_url);
+				let found = repo::inspect_as(&source, inspection).await?;
 				let source_identity = repo::capture_repository_layout_identity(&found)?;
 				let (local_reflog_url, local_persist_url) =
 					if rewritten_url == url && Path::new(&path).is_relative() {
@@ -177,7 +178,7 @@ pub async fn run(
 					Deepen::default()
 				};
 				let (source_setup, common, git) =
-					repo::revalidated_local_source_setup(&found, source_identity, None).await?;
+					repo::revalidated_local_source_setup(&found, source_identity, None, inspection).await?;
 				let kind = crate::dispatch::detect_algorithm_at(&common, &found.common_dir).await?;
 				match kind {
 					HashKind::Sha1 => {

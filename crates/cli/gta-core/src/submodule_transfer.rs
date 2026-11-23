@@ -241,11 +241,17 @@ impl<'a> SubmoduleTransfer<'a> {
 			}
 			RemoteUrl::Local(path) => {
 				let source_path = resolve_local_path(self.worktree_root, &path);
-				let source_layout = repo::inspect_root(&source_path).await?;
+				// A module's first clone, read as git's clone reads its source.
+				let inspection = repo::local_clone_inspection(&rewritten);
+				let source_layout = repo::inspect_as(&source_path, inspection).await?;
 				let source_identity = repo::capture_repository_layout_identity(&source_layout)?;
-				let (source_setup, common, git) =
-					repo::revalidated_local_source_setup(&source_layout, source_identity, Some(&lease))
-						.await?;
+				let (source_setup, common, git) = repo::revalidated_local_source_setup(
+					&source_layout,
+					source_identity,
+					Some(&lease),
+					inspection,
+				)
+				.await?;
 				let persist_url = if Path::new(&path).is_relative() || rewritten != request.source_url {
 					repo::local_source_url(&source_layout)?
 				} else {
@@ -526,9 +532,13 @@ impl<'a> SubmoduleTransfer<'a> {
 				let source_path = resolve_local_path(&worktree_dir, &path);
 				let source_layout = repo::inspect_root(&source_path).await?;
 				let source_identity = repo::capture_repository_layout_identity(&source_layout)?;
-				let (source_setup, common, git) =
-					repo::revalidated_local_source_setup(&source_layout, source_identity, Some(&lease))
-						.await?;
+				let (source_setup, common, git) = repo::revalidated_local_source_setup(
+					&source_layout,
+					source_identity,
+					Some(&lease),
+					repo::Inspection::Root,
+				)
+				.await?;
 				let source_kind = dispatch::detect_algorithm_at(&common, &source_layout.common_dir).await?;
 				gitana_remote::ensure_same_format(kind::<H>(), source_kind)?;
 				let second_common = common.try_clone()?;

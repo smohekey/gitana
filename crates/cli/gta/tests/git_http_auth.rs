@@ -253,6 +253,65 @@ async fn fetch_reauthenticates_with_saved_username_and_askpass() {
 	);
 }
 
+/// `trust sync` runs a relative `GIT_ASKPASS` from where a fetch runs, as git's would: started where
+/// `.git` is, `core.worktree` putting the work tree elsewhere, that's beside the `.git`, not the work
+/// tree. Each probe records that it ran; whether the sync then finds a trust root doesn't matter here.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trust_sync_runs_a_relative_askpass_from_where_a_fetch_runs() {
+	use std::os::unix::fs::PermissionsExt;
+	let work = unique_tmp("auth-trust-relative-askpass");
+	let git_dir = work.join("srv.git");
+	seed(&git_dir).await;
+	let url = serve_gitana_basic_auth(git_dir, ServerHash::Sha256, "alice", "s3cr3t").await;
+	let checkout = work.join("c");
+	let out = gta_iso(
+		&[
+			"clone",
+			&with_userinfo(&url, "alice:s3cr3t"),
+			checkout.to_str().unwrap(),
+		],
+		&[],
+	)
+	.await;
+	assert!(
+		out.status.success(),
+		"seed clone failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	let elsewhere = work.join("separate/work");
+	std::fs::create_dir_all(&elsewhere).unwrap();
+	std::fs::rename(checkout.join("hello.txt"), elsewhere.join("hello.txt")).unwrap();
+	let config = checkout.join(".git/config");
+	let mut text = std::fs::read_to_string(&config).unwrap();
+	text.push_str("[core]\n\tworktree = ../../separate/work\n");
+	std::fs::write(&config, text).unwrap();
+	let ran = work.join("ran");
+	for (folder, name) in [(&checkout, "beside .git"), (&elsewhere, "in the work tree")] {
+		let probe = folder.join("askpass.sh");
+		std::fs::write(
+			&probe,
+			format!(
+				"#!/bin/sh\necho '{name}' >> '{}'\necho s3cr3t\n",
+				ran.display()
+			),
+		)
+		.unwrap();
+		std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+	}
+	let _ = gta_iso(
+		&["-C", checkout.to_str().unwrap(), "trust", "sync"],
+		&[("GIT_ASKPASS", "./askpass.sh")],
+	)
+	.await;
+	let which = std::fs::read_to_string(&ran).unwrap_or_default();
+	assert!(which.contains("beside .git"), "askpass that ran: {which:?}");
+	assert!(
+		!which.contains("in the work tree"),
+		"askpass that ran: {which:?}"
+	);
+}
+
 /// A wrong password fails the clone: the server rejects it and — with no way to prompt
 /// (`GIT_TERMINAL_PROMPT=0`, no askpass) — the credential provider declines, so the 401 stands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

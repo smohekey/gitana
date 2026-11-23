@@ -85,7 +85,41 @@ pub enum DiscoveryError {
 		source: std::io::Error,
 	},
 
+	/// The git directory's `config` (read for `core.worktree` and `core.bare`) could not be read.
+	#[error("reading {}", .path.display())]
+	UnreadableConfig {
+		/// The `config` file.
+		path: PathBuf,
+		/// The underlying I/O error.
+		source: std::io::Error,
+	},
+
+	/// The git directory's `config` (or `config.worktree`) isn't valid git config, or its
+	/// `core.worktree` can't name a path here.
+	#[error("bad config file {}", .path.display())]
+	MalformedConfig {
+		/// The `config` file.
+		path: PathBuf,
+	},
+
+	/// The work tree `core.worktree` names is missing or inaccessible.
+	#[error("invalid path {}: the work tree core.worktree names is missing or inaccessible", .path.display())]
+	MissingWorktree {
+		/// The work tree's path, as `core.worktree` resolves.
+		path: PathBuf,
+		/// The underlying I/O error.
+		source: std::io::Error,
+	},
+
 	/// A path that exists could not be canonicalized.
+	/// The work tree `core.worktree` names is the repository's git (or common) folder or inside it,
+	/// where the repository's own files would be taken for work-tree files. git takes it, and a
+	/// restore there overwrites its `HEAD` (probed vs git 2.55); refused here.
+	#[error(
+		"invalid path {}: the work tree core.worktree names is the repository's git folder or inside it, where its files would be taken for work-tree files",
+		.path.display()
+	)]
+	WorktreeInGitDir { path: PathBuf },
 	#[error("canonicalizing {}", .path.display())]
 	Canonicalize {
 		/// The path being canonicalized.

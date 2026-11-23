@@ -123,8 +123,16 @@ async fn on_discovered_repo<C: RepoCommand>(
 		common,
 		git,
 		worktree: _,
-	} = repo::revalidated_command_directory(&found, command_directory, &setup, common, git, worktree)
-		.await?;
+	} = repo::revalidated_command_directory(
+		&found,
+		command_directory,
+		&setup,
+		common,
+		git,
+		worktree,
+		repo::CommandNeeds::Repository,
+	)
+	.await?;
 	command.set_command_directory(command_path, cwd_directory);
 	if matches!(access, ConfigAccess::Mutation) {
 		repo::ensure_no_pending_deinit_at(&found, &common, &git)?;
@@ -222,8 +230,16 @@ async fn on_discovered_worktree<C: WorkTreeCommand>(
 		common,
 		git,
 		worktree: work,
-	} = repo::revalidated_command_directory(&found, command_directory, &setup, common, git, work)
-		.await?;
+	} = repo::revalidated_command_directory(
+		&found,
+		command_directory,
+		&setup,
+		common,
+		git,
+		work,
+		repo::CommandNeeds::WorkTree,
+	)
+	.await?;
 	let work = work.ok_or_else(|| anyhow!("this operation must be run in a work tree"))?;
 	command.set_command_directory(command_path, cwd_directory);
 	if matches!(access, ConfigAccess::Mutation) {
@@ -559,6 +575,63 @@ mod worktree_tests {
 			self.entered.store(true, Ordering::SeqCst);
 			Ok(())
 		}
+	}
+
+	/// A repository command started in a folder below where `.git` is, with no work tree (`core.bare`),
+	/// stays there; that folder replaced while it waits is refused, as in a work tree.
+	#[tokio::test]
+	async fn repository_dispatch_rejects_a_command_directory_outside_the_work_tree_replaced_while_waiting()
+	 {
+		let temporary = tempfile::tempdir().unwrap();
+		let marker = temporary.path().join("repo");
+		let command_directory = marker.join("nested");
+		let retired = marker.join("nested-retired");
+		let git_dir = marker.join(".git");
+		std::fs::create_dir_all(&command_directory).unwrap();
+		std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+		std::fs::create_dir(git_dir.join("refs")).unwrap();
+		std::fs::write(
+			git_dir.join("config"),
+			"[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+		)
+		.unwrap();
+		std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		let found = repo::inspect_root(&marker).await.unwrap();
+		assert_eq!(found.worktree_root, None);
+		let identity = repo::capture_repository_layout_identity(&found).unwrap();
+		let retained =
+			RetainedCommandDirectory::capture(std::fs::canonicalize(&command_directory).unwrap())
+				.await
+				.unwrap();
+		let common = Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap();
+		let mutation = acquire_submodule_config_mutation_lease(&common, &git_dir).unwrap();
+		let entered = Arc::new(AtomicBool::new(false));
+
+		let operation = on_discovered_repo(
+			found,
+			identity,
+			retained,
+			RecordingRepoCommand {
+				entered: Arc::clone(&entered),
+			},
+			ConfigAccess::Read,
+		);
+		let replace = async {
+			tokio::task::yield_now().await;
+			std::fs::rename(&command_directory, &retired).unwrap();
+			std::fs::create_dir(&command_directory).unwrap();
+			drop(mutation);
+		};
+		let (result, ()) = tokio::join!(operation, replace);
+
+		let error = result.expect_err("dispatch must reject a replaced command directory");
+		assert!(
+			error
+				.to_string()
+				.contains("command working directory changed while waiting"),
+			"unexpected error: {error:#}"
+		);
+		assert!(!entered.load(Ordering::SeqCst));
 	}
 
 	#[tokio::test]

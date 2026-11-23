@@ -16,6 +16,6 @@ mod discovery;
 mod discovery_error;
 mod repository_layout;
 
-pub use self::discovery::{common_dir_of, discover, inspect_root, try_discover};
+pub use self::discovery::{common_dir_of, discover, inspect_root, inspect_source, try_discover};
 pub use self::discovery_error::DiscoveryError;
 pub use self::repository_layout::RepositoryLayout;

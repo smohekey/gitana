@@ -55,6 +55,25 @@ fn signed_repo(tag: &str) -> PathBuf {
 	work
 }
 
+/// As git: a repository command started where `.git` is, `core.worktree` putting the work tree
+/// elsewhere, stays there, so a relative signing key is found beside the `.git`, not in the work tree.
+#[test]
+fn a_relative_signing_key_is_found_where_the_command_started_outside_the_work_tree() {
+	if skip() {
+		return;
+	}
+	let work = signed_repo("tag-relative-key-outside-work-tree");
+	let w = work.to_str().unwrap();
+	let other = unique_tmp("tag-relative-key-other");
+	std::fs::create_dir_all(&other).unwrap();
+	std::fs::rename(work.join("a.txt"), other.join("a.txt")).unwrap();
+	git(w, &["config", "core.worktree", other.to_str().unwrap()]);
+	gta(w, &["tag", "-s", "-m", "m", "v1", "--signing-key", "key"]);
+	assert!(git_verify(w, "v1").contains("Good"));
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&other).ok();
+}
+
 #[test]
 fn signed_tag_verifies_with_git() {
 	if skip() {

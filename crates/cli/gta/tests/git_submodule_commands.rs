@@ -2216,6 +2216,47 @@ fn nested_submodule_status_rejects_a_checkout_retired_while_waiting() {
 	assert!(retained.join("file.txt").is_file());
 }
 
+/// As the retired checkout above, but with another repository put in its place while status waits:
+/// the command doesn't carry on in that one; it refuses, as the setup's own check does.
+#[cfg(unix)]
+#[test]
+fn nested_submodule_status_rejects_another_repository_put_in_place_while_waiting() {
+	let fixture = Fixture::new("nested-status-replaced-while-waiting");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let mount = fixture.consumer.join("modules/one");
+	let retained = fixture.consumer.join("modules/.one-retired");
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let module = Dir::open_ambient_dir(&module_git_dir, ambient_authority()).unwrap();
+	let mutation = acquire_submodule_config_mutation_lease(&module, &module_git_dir).unwrap();
+
+	let child = Command::new(env!("CARGO_BIN_EXE_gta"))
+		.args(["-C", mount.to_str().unwrap()])
+		.args(["submodule", "status"])
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped())
+		.spawn()
+		.expect("start nested status behind the module config guard");
+	std::thread::sleep(std::time::Duration::from_millis(250));
+	std::fs::rename(&mount, &retained).unwrap();
+	std::fs::create_dir(&mount).unwrap();
+	init_repository(&mount, None);
+	drop(mutation);
+
+	let status = child.wait_with_output().unwrap();
+	assert!(
+		!status.status.success(),
+		"nested status must not carry on in the repository put in place"
+	);
+	assert!(
+		stderr(&status).contains("worktree changed while waiting for repository setup"),
+		"unexpected error: {}",
+		stderr(&status)
+	);
+}
+
 #[test]
 fn deinit_clears_the_mount_but_retains_the_repository_for_reattachment() {
 	let fixture = Fixture::new("deinit-reattach");
@@ -3063,6 +3104,144 @@ fn deinit_all_rejects_a_module_include_inside_another_selected_checkout() {
 	assert!(!git_path(&fixture.consumer, "gitana-submodule-deinit").exists());
 }
 
+/// With the work tree inside the folder holding `.git` (`core.worktree` naming a subfolder), a
+/// submodule command run inside the work tree checks the repository again where its `.git` is, and
+/// works: set-url updates `.gitmodules`.
+#[test]
+fn set_url_works_with_the_work_tree_inside_the_folder_holding_git() {
+	let fixture = Fixture::new("work-tree-inside-marker");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let module_git = git_path(&fixture.consumer, "modules/one");
+	let holder = fixture.root.join("holder");
+	std::fs::create_dir_all(&holder).unwrap();
+	std::fs::rename(fixture.consumer.join(".git"), holder.join(".git")).unwrap();
+	let moved_module = holder.join(".git").join(
+		module_git
+			.strip_prefix(fixture.consumer.join(".git"))
+			.unwrap(),
+	);
+	let work = holder.join("work");
+	std::fs::rename(&fixture.consumer, &work).unwrap();
+	let mut config = std::fs::read_to_string(holder.join(".git/config")).unwrap();
+	config.push_str(&format!("[core]\n\tworktree = {}\n", config_value(&work)));
+	std::fs::write(holder.join(".git/config"), config).unwrap();
+	std::fs::write(
+		work.join("modules/one/.git"),
+		format!("gitdir: {}\n", moved_module.display()),
+	)
+	.unwrap();
+	let module_config = moved_module.join("config");
+	let text = std::fs::read_to_string(&module_config).unwrap();
+	let text: String = text
+		.lines()
+		.filter(|line| !line.trim_start().starts_with("worktree"))
+		.map(|line| format!("{line}\n"))
+		.collect();
+	std::fs::write(
+		&module_config,
+		text.replacen(
+			"[core]\n",
+			&format!(
+				"[core]\n\tworktree = {}\n",
+				config_value(&work.join("modules/one"))
+			),
+			1,
+		),
+	)
+	.unwrap();
+	assert_success(
+		&gta(
+			&work,
+			false,
+			&["submodule", "set-url", "modules/one", "/new/url"],
+		),
+		"set-url inside the work tree",
+	);
+	assert!(
+		std::fs::read_to_string(work.join(".gitmodules"))
+			.unwrap()
+			.contains("/new/url")
+	);
+}
+
+/// As git: a source whose `core.worktree` names a missing folder is cloned by plain path (git's local
+/// clone reads only its git folder), a module's first clone too, but not by `file://` (git's
+/// upload-pack changes into the work tree first), measured vs git 2.55.
+#[test]
+fn a_source_whose_work_tree_is_missing_is_cloned_by_plain_path_only() {
+	let fixture = Fixture::new("source-work-tree-missing");
+	let config = fixture.source.join(".git/config");
+	let mut text = std::fs::read_to_string(&config).unwrap();
+	text.push_str("[core]\n\tworktree = ../../gone\n");
+	std::fs::write(&config, text).unwrap();
+	assert_success(
+		&gta(&fixture.root, true, &["clone", "source", "plain"]),
+		"a plain-path clone",
+	);
+	assert_eq!(
+		std::fs::read(fixture.root.join("plain/file.txt")).unwrap(),
+		b"old\n"
+	);
+	let file_url = format!("file://{}", fixture.source.display());
+	let refused = gta(&fixture.root, true, &["clone", &file_url, "by-url"]);
+	assert!(!refused.status.success(), "a file:// clone must refuse");
+	assert!(
+		stderr(&refused).contains("the work tree core.worktree names is missing"),
+		"{}",
+		stderr(&refused)
+	);
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"a module's first clone by plain path",
+	);
+	assert_eq!(
+		std::fs::read(fixture.consumer.join("modules/one/file.txt")).unwrap(),
+		b"old\n"
+	);
+}
+
+/// As git: run from outside the work tree (from where `.git` is, while `core.worktree` puts the work
+/// tree elsewhere), submodule commands refuse ("git-submodule cannot be used without a working
+/// tree", measured), changing nothing.
+#[test]
+fn submodule_commands_refuse_outside_the_work_tree() {
+	let fixture = Fixture::new("outside-work-tree");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	let repo = fixture.root.join("repo");
+	std::fs::create_dir_all(&repo).unwrap();
+	std::fs::rename(fixture.consumer.join(".git"), repo.join(".git")).unwrap();
+	let config = repo.join(".git/config");
+	let mut text = std::fs::read_to_string(&config).unwrap();
+	text.push_str(&format!(
+		"[core]\n\tworktree = {}\n",
+		config_value(&fixture.consumer)
+	));
+	std::fs::write(&config, text).unwrap();
+	let gitmodules = std::fs::read(fixture.consumer.join(".gitmodules")).unwrap();
+	for args in [
+		&["submodule", "status"][..],
+		&["submodule", "set-url", "modules/one", "/new/url"][..],
+	] {
+		let refused = gta(&repo, false, args);
+		assert!(!refused.status.success(), "{args:?} must refuse");
+		assert!(
+			stderr(&refused).contains("submodule cannot be used without a working tree"),
+			"unexpected diagnostic for {args:?}: {}",
+			stderr(&refused),
+		);
+	}
+	assert_eq!(
+		std::fs::read(fixture.consumer.join(".gitmodules")).unwrap(),
+		gitmodules
+	);
+}
+
 #[cfg(unix)]
 #[test]
 fn deinit_rejects_aliased_module_and_superproject_config_targets_before_mutation() {
@@ -3098,9 +3277,12 @@ fn deinit_rejects_aliased_module_and_superproject_config_targets_before_mutation
 		!refused.status.success(),
 		"aliased config targets must fail"
 	);
+	// The shared file carries the module's `core.worktree`, relative to the module's git directory; as
+	// the superproject's config it names a work tree that isn't there, so the superproject is refused
+	// when it's found, as git refuses it (measured: "cannot chdir to '../../../modules/one'"), before
+	// deinit's own check that the two configs are one file.
 	assert!(
-		stderr(&refused)
-			.contains("deinit config targets for module 'one' and superproject resolve to the same file"),
+		stderr(&refused).contains("the work tree core.worktree names is missing or inaccessible"),
 		"unexpected diagnostic: {}",
 		stderr(&refused),
 	);
@@ -4202,6 +4384,73 @@ fn ordinary_submodule_status_restores_a_displaced_module_config_before_validatio
 	assert!(!control.exists());
 	assert!(module_git_dir.join("config").is_file());
 	assert!(retired.join("file.txt").is_file());
+}
+
+/// After a deinit crashed with the superproject's config moved aside, in a repository whose config
+/// decides its layout (`core.bare` here), the first command's discovery restores the config before
+/// reading it, so the command works rather than being refused as changed once the config is back.
+#[cfg(unix)]
+#[test]
+fn the_first_command_after_a_crashed_deinit_reads_the_restored_config() {
+	let fixture = Fixture::new("deinit-displaced-layout-config");
+	assert_success(
+		&gta(&fixture.consumer, true, &["submodule", "update", "--init"]),
+		"initial update",
+	);
+	// A config that decides the layout: bare, so read in the gap it would look like a work tree.
+	git_ok(&fixture.consumer, &["config", "core.bare", "true"]);
+	let module_git_dir = git_path(&fixture.consumer, "modules/one");
+	let parent = fixture.consumer.join("modules");
+	let target = parent.join("one");
+	let prepared_name = ".gitana-submodule-deinit-prepared.displaced-super-config";
+	let retired_name = ".gitana-submodule-deinit-retired.displaced-super-config";
+	let prepared = parent.join(prepared_name);
+	let retired = module_git_dir.join(retired_name);
+	std::fs::create_dir(&prepared).unwrap();
+	let mount_metadata = std::fs::symlink_metadata(&target).unwrap();
+	let prepared_metadata = std::fs::symlink_metadata(&prepared).unwrap();
+	let module_metadata = std::fs::symlink_metadata(&module_git_dir).unwrap();
+	let temporary = parent.join(".deinit-displaced-super-config-exchange");
+	std::fs::rename(&target, &temporary).unwrap();
+	std::fs::rename(&prepared, &target).unwrap();
+	std::fs::rename(&temporary, &prepared).unwrap();
+	std::fs::rename(&prepared, &retired).unwrap();
+	write_deinit_intent_v4(
+		&fixture,
+		"retired",
+		prepared_name,
+		retired_name,
+		&mount_metadata,
+		&prepared_metadata,
+		&module_metadata,
+		None,
+		Some("module_repository"),
+	);
+	let module_publication =
+		publish_deinit_config_for_test(&module_git_dir.join("config"), "module-setup", |config| {
+			config.unset("core", None, "worktree");
+		});
+	let super_config = fixture.consumer.join(".git/config");
+	let super_publication =
+		prepare_displaced_deinit_config_for_test(&super_config, "super-displaced", |config| {
+			config.remove_subsection("submodule", "one");
+		});
+	let control = git_path(&fixture.consumer, "gitana-submodule-deinit");
+	let mut intent: serde_json::Value =
+		serde_json::from_slice(&std::fs::read(control.join("intent.json")).unwrap()).unwrap();
+	intent["phase"] = serde_json::json!("super_config_prepared");
+	intent["module_publication"] = module_publication;
+	intent["super_publication"] = super_publication;
+	std::fs::write(
+		control.join("intent.json"),
+		serde_json::to_vec(&intent).unwrap(),
+	)
+	.unwrap();
+	assert!(!super_config.exists());
+
+	let log = gta(&fixture.consumer, false, &["log"]);
+	assert_success(&log, "the first command after the crashed deinit");
+	assert!(super_config.is_file());
 }
 
 #[cfg(unix)]
@@ -12711,6 +12960,15 @@ fn assert_success(output: &Output, operation: &str) {
 
 fn stdout(output: &Output) -> String {
 	String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// `path` as a config value: its backslashes (a Windows path's) escaped, as git's config reads them.
+fn config_value(path: &Path) -> String {
+	path
+		.display()
+		.to_string()
+		.replace('\\', "\\\\")
+		.replace('"', "\\\"")
 }
 
 fn stderr(output: &Output) -> String {

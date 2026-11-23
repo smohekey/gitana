@@ -593,6 +593,102 @@ fn remote_rename_preserves_source_refs_on_a_destination_conflict() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// A repository at `dir` with one commit of `file`, its message `message`, on `main`.
+fn committed(dir: &std::path::Path, file: &str, message: &str) {
+	std::fs::create_dir_all(dir).unwrap();
+	let d = dir.to_str().unwrap();
+	git(d, &["init", "-q", "-b", "main"]);
+	git(d, &["config", "user.name", "T"]);
+	git(d, &["config", "user.email", "t@e"]);
+	std::fs::write(dir.join(file), "x\n").unwrap();
+	git(d, &["add", file]);
+	git(d, &["commit", "-q", "-m", message]);
+}
+
+/// As git: fetch resolves a relative remote URL from the work tree's top when started inside it,
+/// otherwise from the folder it was started in. So started where `.git` is, `core.worktree` putting
+/// the work tree elsewhere, `../source` is beside the repository, not beside the work tree; and in a
+/// bare repository started from a folder inside it, it's beside that folder. Decoys sit where the
+/// wrong base would lead.
+#[test]
+fn fetch_resolves_a_relative_url_from_where_git_s_fetch_runs() {
+	let base = unique_tmp("fetch-relative-url-base");
+	committed(&base.join("source"), "s.txt", "real");
+	committed(&base.join("separate/source"), "d.txt", "decoy");
+	let repo = base.join("repo");
+	committed(&repo, "a.txt", "a");
+	let r = repo.to_str().unwrap();
+	git(r, &["remote", "add", "origin", "../source"]);
+	std::fs::create_dir_all(base.join("separate/work")).unwrap();
+	std::fs::rename(repo.join("a.txt"), base.join("separate/work/a.txt")).unwrap();
+	git(r, &["config", "core.worktree", "../../separate/work"]);
+	gta(r, &["fetch"], b"");
+	assert_eq!(
+		git(r, &["log", "--format=%s", "-1", "refs/remotes/origin/main"]).trim(),
+		"real"
+	);
+
+	let bare = base.join("b.git");
+	git(
+		base.to_str().unwrap(),
+		&["init", "-q", "--bare", "-b", "main", "b.git"],
+	);
+	let b = bare.to_str().unwrap();
+	git(b, &["remote", "add", "origin", "../source"]);
+	committed(&bare.join("source"), "d.txt", "beside the subfolder");
+	gta(bare.join("refs").to_str().unwrap(), &["fetch"], b"");
+	assert_eq!(
+		git(b, &["log", "--format=%s", "-1", "refs/remotes/origin/main"]).trim(),
+		"beside the subfolder"
+	);
+	std::fs::remove_dir_all(&base).ok();
+}
+
+/// As git: push runs a relative `GIT_SSH_COMMAND` from where git's push runs. Started where `.git` is,
+/// `core.worktree` putting the work tree elsewhere, that's beside the `.git`, not the work tree. Each
+/// probe records that it ran and ends the connection (the push then fails, as it should).
+#[cfg(unix)]
+#[test]
+fn push_runs_a_relative_ssh_command_from_where_git_s_push_runs() {
+	use std::os::unix::fs::PermissionsExt;
+	let base = unique_tmp("push-relative-ssh-command");
+	let repo = base.join("repo");
+	committed(&repo, "a.txt", "a");
+	let r = repo.to_str().unwrap();
+	git(
+		r,
+		&["remote", "add", "origin", "ssh://example.invalid/repo.git"],
+	);
+	let work = base.join("separate/work");
+	std::fs::create_dir_all(&work).unwrap();
+	std::fs::rename(repo.join("a.txt"), work.join("a.txt")).unwrap();
+	git(r, &["config", "core.worktree", "../../separate/work"]);
+	for (folder, name) in [(&repo, "beside .git"), (&work, "in the work tree")] {
+		let probe = folder.join("ssh-probe");
+		std::fs::write(
+			&probe,
+			format!(
+				"#!/bin/sh\necho '{name}' > '{}'\nexit 1\n",
+				base.join("ran").display()
+			),
+		)
+		.unwrap();
+		std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+	}
+	let pushed = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", r, "push"])
+		.env("GIT_SSH_COMMAND", "./ssh-probe")
+		.output()
+		.unwrap();
+	assert!(!pushed.status.success());
+	assert_eq!(
+		std::fs::read_to_string(base.join("ran")).unwrap().trim(),
+		"beside .git"
+	);
+	std::fs::remove_dir_all(&base).ok();
+}
+
 fn gta(dir: &str, args: &[&str], stdin: &[u8]) -> String {
 	let out = assert_cmd::Command::cargo_bin("gta")
 		.unwrap()

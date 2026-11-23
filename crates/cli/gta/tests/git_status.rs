@@ -45,6 +45,211 @@ fn status_does_not_require_writing_the_repository() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// As git: a repository whose `core.worktree` names another folder is worked in there, run from the
+/// folder holding `.git`. A file edited where `.git` is (not the work tree) isn't a change; one edited
+/// in the work tree is.
+#[test]
+fn status_works_in_the_work_tree_core_worktree_names() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-status-core-worktree");
+	let w = work.to_str().unwrap();
+	write(&work, "a.txt", "a\n");
+	commit_all(w, "base");
+	let other = unique_tmp("gta-status-core-worktree-other");
+	std::fs::create_dir_all(&other).unwrap();
+	std::fs::write(other.join("a.txt"), "a\n").unwrap();
+	git(w, &["config", "core.worktree", other.to_str().unwrap()]);
+	write(&work, "a.txt", "edited where .git is\n");
+	assert_eq!(gta(w, &["status"], b""), git(w, &["status", "--porcelain"]));
+	assert_eq!(gta(w, &["status"], b""), "");
+	std::fs::write(other.join("a.txt"), "edited in the work tree\n").unwrap();
+	assert_eq!(gta(w, &["status"], b""), git(w, &["status", "--porcelain"]));
+	assert_eq!(gta(w, &["status"], b""), " M a.txt\n");
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&other).ok();
+}
+
+/// As git: run from where `.git` is, a relative `core.excludesFile` is found in the work tree
+/// `core.worktree` names (git changes into it), so `add` refuses a file it ignores, as git does.
+#[test]
+fn a_relative_excludes_file_is_read_in_the_work_tree_core_worktree_names() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-add-core-worktree-excludes");
+	let w = work.to_str().unwrap();
+	write(&work, "a.txt", "a\n");
+	commit_all(w, "base");
+	let other = unique_tmp("gta-add-core-worktree-excludes-other");
+	std::fs::create_dir_all(&other).unwrap();
+	std::fs::write(other.join("a.txt"), "a\n").unwrap();
+	git(w, &["config", "core.worktree", other.to_str().unwrap()]);
+	git(w, &["config", "core.excludesFile", "excludes"]);
+	std::fs::write(other.join("excludes"), "secret\n").unwrap();
+	std::fs::write(other.join("secret"), "s\n").unwrap();
+	let added = assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", w, "add", "secret"])
+		.output()
+		.unwrap();
+	assert!(
+		!added.status.success(),
+		"gta add of an ignored file must refuse"
+	);
+	assert!(
+		String::from_utf8_lossy(&added.stderr).contains("ignored"),
+		"{}",
+		String::from_utf8_lossy(&added.stderr)
+	);
+	assert_eq!(git(w, &["diff", "--cached", "--name-only"]), "");
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&other).ok();
+}
+
+/// As git: with both `core.bare` and `core.worktree` set, the repository is bare. Run from where
+/// `.git` is, a command that needs no work tree runs there, after git's warning, given once; one that
+/// needs a work tree refuses.
+#[test]
+fn core_bare_and_core_worktree_together_are_bare_with_git_s_warning() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-bare-and-worktree");
+	let w = work.to_str().unwrap();
+	write(&work, "a.txt", "a\n");
+	commit_all(w, "base");
+	git(w, &["config", "core.bare", "true"]);
+	git(w, &["config", "core.worktree", "../../elsewhere"]);
+	let warning = "warning: core.bare and core.worktree do not make sense";
+	for args in [
+		&["log"][..],
+		&["branch"][..],
+		&["config", "--get", "core.bare"][..],
+	] {
+		let ran = gta_output(w, args);
+		let said = String::from_utf8_lossy(&ran.stderr);
+		assert!(ran.status.success(), "gta {args:?}: {said}");
+		assert_eq!(said.matches(warning).count(), 1, "gta {args:?}: {said}");
+	}
+	let refused = gta_output(w, &["status"]);
+	let said = String::from_utf8_lossy(&refused.stderr);
+	assert!(!refused.status.success());
+	assert!(said.contains("must be run in a work tree"), "{said}");
+	assert_eq!(said.matches(warning).count(), 1, "{said}");
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// As git: `core.bare` true alone leaves the folder holding `.git` without a work tree: status and add
+/// refuse there (nothing staged), a command that needs none runs, and there's nothing to warn of.
+#[test]
+fn core_bare_alone_leaves_no_work_tree() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-bare-alone");
+	let w = work.to_str().unwrap();
+	write(&work, "a.txt", "a\n");
+	let head = commit_all(w, "base");
+	git(w, &["config", "core.bare", "true"]);
+	write(&work, "b.txt", "b\n");
+	let index = std::fs::read(work.join(".git/index")).unwrap();
+	for args in [&["status"][..], &["add", "b.txt"][..]] {
+		let refused = gta_output(w, args);
+		let said = String::from_utf8_lossy(&refused.stderr);
+		assert!(!refused.status.success(), "gta {args:?} must refuse");
+		assert!(
+			said.contains("must be run in a work tree"),
+			"gta {args:?}: {said}"
+		);
+	}
+	assert_eq!(std::fs::read(work.join(".git/index")).unwrap(), index);
+	let parsed = gta_output(w, &["rev-parse", "HEAD"]);
+	assert!(parsed.status.success());
+	assert_eq!(String::from_utf8_lossy(&parsed.stdout).trim(), head.trim());
+	assert!(!String::from_utf8_lossy(&parsed.stderr).contains("warning"));
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// An empty `core.worktree` doesn't make the git folder the work tree: gta refuses, as git does,
+/// and a tracked `HEAD` isn't restored over the repository's own.
+#[test]
+fn an_empty_core_worktree_refuses_rather_than_writing_the_git_folder() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-empty-core-worktree");
+	let w = work.to_str().unwrap();
+	write(&work, "HEAD", "tracked\n");
+	commit_all(w, "base");
+	let config = work.join(".git/config");
+	let mut text = std::fs::read_to_string(&config).unwrap();
+	text.push_str("[core]\n\tworktree =\n");
+	std::fs::write(&config, text).unwrap();
+	let head = std::fs::read(work.join(".git/HEAD")).unwrap();
+	let restored = gta_output(w, &["restore", "--", "HEAD"]);
+	assert!(!restored.status.success(), "gta restore must refuse");
+	assert!(
+		String::from_utf8_lossy(&restored.stderr).contains("missing or inaccessible"),
+		"{}",
+		String::from_utf8_lossy(&restored.stderr)
+	);
+	assert_eq!(std::fs::read(work.join(".git/HEAD")).unwrap(), head);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// gta's whole output, run with `-C dir`, success or not.
+fn gta_output(dir: &str, args: &[&str]) -> std::process::Output {
+	assert_cmd::Command::cargo_bin("gta")
+		.unwrap()
+		.args(["-C", dir])
+		.args(args)
+		.output()
+		.unwrap()
+}
+
+/// As git: a work-tree command started inside the git folder, `core.worktree` putting the work tree
+/// elsewhere, runs from the work tree's top, so a relative `core.excludesFile` is read there, not in
+/// the git folder, and `add` refuses the file it ignores.
+#[test]
+fn from_inside_the_git_folder_add_reads_the_work_tree_s_excludes_file() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = init("gta-add-from-git-folder");
+	let w = work.to_str().unwrap();
+	write(&work, "a.txt", "a\n");
+	commit_all(w, "base");
+	let other = unique_tmp("gta-add-from-git-folder-other");
+	std::fs::create_dir_all(&other).unwrap();
+	std::fs::write(other.join("a.txt"), "a\n").unwrap();
+	git(w, &["config", "core.worktree", other.to_str().unwrap()]);
+	git(w, &["config", "core.excludesFile", "excludes"]);
+	std::fs::write(other.join("excludes"), "secret\n").unwrap();
+	std::fs::write(work.join(".git/excludes"), "nothing\n").unwrap();
+	std::fs::write(other.join("secret"), "s\n").unwrap();
+	let added = gta_output(work.join(".git").to_str().unwrap(), &["add", "secret"]);
+	assert!(
+		!added.status.success(),
+		"gta add of an ignored file must refuse"
+	);
+	assert!(
+		String::from_utf8_lossy(&added.stderr).contains("ignored"),
+		"{}",
+		String::from_utf8_lossy(&added.stderr)
+	);
+	assert_eq!(git(w, &["diff", "--cached", "--name-only"]), "");
+	std::fs::remove_dir_all(&work).ok();
+	std::fs::remove_dir_all(&other).ok();
+}
+
 #[test]
 fn changed_entries_precede_untracked() {
 	if !git_supports_sha256() {

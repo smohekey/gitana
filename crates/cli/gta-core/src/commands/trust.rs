@@ -93,11 +93,8 @@ async fn sync(cwd: &Path, expect: Option<String>) -> Result<()> {
 	// `trust sync` transacts over Smart HTTP only (the trust-ref fetch+push composite is HTTP-bound); an
 	// SSH origin is rejected here (`Origin::parse`) rather than silently mis-handled.
 	let origin = Origin::parse(&url_rewrite::resolve_fetch_url(&config, "origin")?)?;
-	// A relative askpass resolves against the worktree root, as git runs it from there (bare: git dir).
-	let askpass_cwd = found
-		.worktree_root
-		.clone()
-		.unwrap_or_else(|| found.common_dir.clone());
+	// A relative askpass resolves from where a fetch runs, as git's would (`trust sync` fetches).
+	let askpass_cwd = repo::repository_command_directory(&found, cwd).await?;
 	let http = transport_for(config, &origin, askpass_cwd)?;
 	let body = transport::fetch_advertisement(&http, &origin, "git-upload-pack").await?;
 

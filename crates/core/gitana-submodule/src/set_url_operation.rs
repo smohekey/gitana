@@ -651,7 +651,9 @@ impl SubmoduleContext {
 			)));
 		}
 		let module_layout = RepositoryLayout {
+			bare_and_worktree: false,
 			worktree_root: Some(self.worktree_root().join(&declaration.path)),
+			marker_root: Some(self.worktree_root().join(&declaration.path)),
 			git_dir: display_path.clone(),
 			common_dir: display_path.clone(),
 		};
@@ -2674,7 +2676,9 @@ mod tests {
 		std::fs::create_dir_all(&linked_path).unwrap();
 		let common = Dir::open_ambient_dir(&common_path, ambient_authority()).unwrap();
 		let layout = RepositoryLayout {
+			bare_and_worktree: false,
 			worktree_root: None,
+			marker_root: None,
 			git_dir: common_path.clone(),
 			common_dir: common_path.clone(),
 		};

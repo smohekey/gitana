@@ -1922,6 +1922,7 @@ dependencies = [
 name = "gitana-repository-layout"
 version = "0.1.0"
 dependencies = [
+ "gitana-config",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

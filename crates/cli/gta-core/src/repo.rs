@@ -37,7 +37,9 @@ use gitana_repository_layout::{
 use crate::submodule_configuration::WorktreeConfiguration;
 use crate::{Backend, RepositoryLayoutIdentity, RetainedCommandDirectory, WorkDir};
 
-pub use gitana_repository_layout::{DiscoveryError, RepositoryLayout, inspect_root};
+pub use gitana_repository_layout::{
+	DiscoveryError, RepositoryLayout, inspect_root, inspect_source,
+};
 
 const SETUP_RECOVERY_BACKOFF_INITIAL: Duration = Duration::from_millis(10);
 const SETUP_RECOVERY_BACKOFF_MAX: Duration = Duration::from_millis(250);
@@ -50,19 +52,188 @@ pub(crate) async fn discover_layout(start: &Path) -> Result<RepositoryLayout, Di
 	discover_layout_impl(start).await
 }
 
+/// `found` looked at again while holding its setup lock, the one command setup waits on
+/// ([`command_setup_lease`]). Discovery reads the config for the work tree (`core.worktree`,
+/// `core.bare`), and a publisher holding the lock may have that config moved aside (a Windows
+/// submodule deinit), so the first look may have read the gap; this waits it out. The same place is
+/// inspected again, as command setup's revalidation inspects it, and taken only if it's still the
+/// same repository (otherwise, or with no lock to take, what was found stands). The repository's
+/// identities are taken before the wait and checked after it, so one put in its place meanwhile is
+/// refused, as command setup refuses it, not taken as the baseline its callers then record.
+///
+/// `start`, the folder the command started in, is checked across the wait too: callers record it
+/// only once this returns, so one put in its place meanwhile would otherwise be their baseline. And
+/// a crashed deinit's config left moved aside is restored first, as command setup restores it, so
+/// the config read is the repository's own, not the gap.
+async fn settled(start: &Path, found: RepositoryLayout) -> Result<RepositoryLayout> {
+	let root = found
+		.marker_root
+		.clone()
+		.unwrap_or_else(|| found.common_dir.clone());
+	let Ok(before) = capture_repository_layout_identity(&found) else {
+		// Not identifiable now: the caller's own capture reports why.
+		return Ok(found);
+	};
+	let started = command_directory_identity(start).ok();
+	let mut recovery_backoff = SETUP_RECOVERY_BACKOFF_INITIAL;
+	let (layout, lease) = loop {
+		let Ok(lease) = acquire_setup_lease_once(&found).await else {
+			break (found.clone(), None);
+		};
+		// The recovery is best-effort here: a probe or restore that fails leaves things as they were,
+		// and command setup, which runs the same recovery, reports it for a command that needs it (a
+		// command that doesn't, as `worktree list`, isn't stopped by it).
+		if let Ok((common, git, worktree)) =
+			revalidate_layout_as(&found, before, Inspection::Root, Compared::Identities).await
+			&& pending_configs_require_restore_at(&found, &common, &git, worktree.as_ref())
+				.await
+				.unwrap_or(false)
+		{
+			drop(lease);
+			match restore_command_setup(&found, common, git, worktree).await {
+				Ok(()) => {
+					recovery_backoff = SETUP_RECOVERY_BACKOFF_INITIAL;
+					continue;
+				}
+				Err(error) if matches!(error.downcast_ref(), Some(SubmoduleError::UpdateLocked)) => {
+					backoff_after_setup_recovery_lock(&mut recovery_backoff).await;
+					continue;
+				}
+				Err(_) => break (found.clone(), None),
+			}
+		}
+		let again = inspect_root(&root).await.ok();
+		let layout = match again {
+			Some(again) if again.git_dir == found.git_dir && again.common_dir == found.common_dir => {
+				again
+			}
+			_ => found.clone(),
+		};
+		break (layout, Some(lease));
+	};
+	let after = capture_repository_layout_identity(&layout);
+	let started_after = started.map(|_| command_directory_identity(start));
+	drop(lease);
+	let subject = if layout.worktree_root.is_some() {
+		"worktree"
+	} else {
+		"repository"
+	};
+	let changed = || {
+		anyhow!(
+			"{subject} changed while waiting for repository setup: {}",
+			root.display()
+		)
+	};
+	let after = after.map_err(|_| changed())?;
+	if after.git != before.git
+		|| after.common != before.common
+		|| (layout.worktree_root == found.worktree_root && after.worktree != before.worktree)
+	{
+		return Err(changed());
+	}
+	if let (Some(started), Some(now)) = (started, started_after)
+		&& now.ok() != Some(started)
+	{
+		bail!(
+			"command working directory changed while waiting for repository setup: {}",
+			start.display()
+		);
+	}
+	Ok(layout)
+}
+
+/// The identity of the folder at `path`, a command's starting folder.
+fn command_directory_identity(path: &Path) -> Result<EntryIdentity> {
+	let directory = open_identity_directory(path, "command working directory")?;
+	directory_identity(&directory)
+		.with_context(|| format!("identifying command working directory {}", path.display()))
+}
+
+/// The folder a command that needs no work tree (fetch, push, `trust sync`) runs from, started in
+/// `cwd`, as git's runs (probed vs git 2.55): the work tree's top when started inside it, otherwise
+/// the folder it was started in (where `.git` is with the work tree elsewhere, inside the git folder,
+/// a bare repository or a folder in it). A relative remote URL, askpass or `GIT_SSH_COMMAND` resolves
+/// from here. (`pull` needs a work tree, so git runs it from the top.)
+pub(crate) async fn repository_command_directory(
+	found: &RepositoryLayout,
+	cwd: &Path,
+) -> Result<PathBuf> {
+	let started = tokio::fs::canonicalize(cwd).await?;
+	Ok(match found.worktree_root.as_deref() {
+		Some(top) if started.starts_with(top) => top.to_path_buf(),
+		_ => started,
+	})
+}
+
+/// git's warning for a repository whose config sets both `core.bare` and `core.worktree` (it takes
+/// it as bare), given on stderr as git gives it, once a command for each repository however often
+/// the command discovers it (probed vs git 2.55).
+fn warn_of_its_config(layout: &RepositoryLayout) {
+	static WARNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+	if !layout.bare_and_worktree {
+		return;
+	}
+	let mut warned = WARNED
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner);
+	if warned.contains(&layout.git_dir) {
+		return;
+	}
+	warned.push(layout.git_dir.clone());
+	eprintln!("warning: core.bare and core.worktree do not make sense");
+}
+
+/// How a repository was inspected, so it's inspected the same way when checked again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Inspection {
+	/// As a repository root ([`inspect_root`]): its work tree too.
+	Root,
+	/// As a local clone's source ([`inspect_source`]): its git folders only, as git's local clone
+	/// reads one (a work tree its config names needn't exist).
+	Source,
+}
+
+/// Inspect exactly `root` as `inspection` says.
+pub(crate) async fn inspect_as(
+	root: &Path,
+	inspection: Inspection,
+) -> Result<RepositoryLayout, DiscoveryError> {
+	match inspection {
+		Inspection::Root => inspect_root(root).await,
+		Inspection::Source => inspect_source(root).await,
+	}
+}
+
+/// How a local source given as `url` is read: a plain path as git's local clone reads it, without
+/// its work tree; a `file://` URL as through git's upload-pack, which needs the work tree (probed vs
+/// git 2.55: a plain-path clone works from a source whose `core.worktree` is missing, a `file://`
+/// one fails).
+pub(crate) fn local_clone_inspection(url: &str) -> Inspection {
+	if url.starts_with("file://") {
+		Inspection::Root
+	} else {
+		Inspection::Source
+	}
+}
+
 /// Discover the containing repository for an ordinary command.
 ///
 /// Callers that read repository configuration must retain [`command_setup_lease`] through those
 /// reads so a concurrent Windows deinit cannot expose its temporary config displacement.
 pub async fn discover(start: &Path) -> Result<RepositoryLayout> {
-	Ok(discover_layout_impl(start).await?)
+	let layout = settled(start, discover_layout_impl(start).await?).await?;
+	warn_of_its_config(&layout);
+	Ok(layout)
 }
 
 /// Like [`discover`], while preserving the outside-repository `None` result.
 pub async fn try_discover(start: &Path) -> Result<Option<RepositoryLayout>> {
-	let Some(layout) = try_discover_layout_impl(start).await? else {
+	let Some(found) = try_discover_layout_impl(start).await? else {
 		return Ok(None);
 	};
+	let layout = settled(start, found).await?;
+	warn_of_its_config(&layout);
 	Ok(Some(layout))
 }
 
@@ -218,13 +389,16 @@ pub(crate) async fn local_source_setup_lease(
 
 /// Wait for source serialization, then bind all subsequent reads to the repository inspected
 /// before the wait.
+/// `inspection` is how `layout` was inspected.
 pub(crate) async fn revalidated_local_source_setup(
 	layout: &RepositoryLayout,
 	expected: RepositoryLayoutIdentity,
 	held: Option<&SubmoduleMutationLease>,
+	inspection: Inspection,
 ) -> Result<(SubmoduleMutationLease, Dir, Dir)> {
 	let lease = local_source_setup_lease(layout, held).await?;
-	let (common, git, _) = revalidate_repository_layout(layout, expected).await?;
+	let (common, git, _) =
+		revalidate_layout_as(layout, expected, inspection, Compared::ReadFrom).await?;
 	lease.validate()?;
 	Ok((lease, common, git))
 }
@@ -503,7 +677,9 @@ async fn restore_command_setup(
 /// avoids resolving the caller's ambient spelling a second time after source capabilities have been
 /// retained, when a symlink in that spelling could already point at a different repository.
 pub(crate) fn local_source_url(layout: &RepositoryLayout) -> Result<String> {
-	let root = layout.worktree_root.as_deref().unwrap_or(&layout.git_dir);
+	// The repository as it's found again (where its `.git` is, or a bare git directory), not its
+	// work tree, which `core.worktree` can put somewhere with no `.git`.
+	let root = layout.marker_root.as_deref().unwrap_or(&layout.git_dir);
 	root
 		.to_str()
 		.map(ToOwned::to_owned)
@@ -557,6 +733,22 @@ pub(crate) fn capture_worktree_layout_identity(
 	capture_repository_layout_identity(layout)
 }
 
+/// Whether `cwd` is under the folder holding `.git` but outside the work tree, the git directory and
+/// the common directory: a repository whose `core.worktree` names another folder, run from where its
+/// `.git` is.
+fn outside_work_tree(layout: &RepositoryLayout, cwd: &Path) -> bool {
+	layout
+		.marker_root
+		.as_deref()
+		.is_some_and(|marker| cwd.starts_with(marker))
+		&& !layout
+			.worktree_root
+			.as_deref()
+			.is_some_and(|root| cwd.starts_with(root))
+		&& !cwd.starts_with(&layout.git_dir)
+		&& !cwd.starts_with(&layout.common_dir)
+}
+
 /// Open the command's effective working directory through the repository capabilities that were
 /// revalidated after setup serialization was acquired.
 ///
@@ -598,6 +790,15 @@ pub(crate) struct RevalidatedCommandDirectory {
 	pub(crate) worktree: Option<Dir>,
 }
 
+/// Whether a command needs a work tree, which decides where it runs when started outside one.
+#[derive(Clone, Copy)]
+pub(crate) enum CommandNeeds {
+	/// A work tree (add, status, pull, …): started outside it, it runs from the work tree's top.
+	WorkTree,
+	/// Only the repository (tag, trust, push, …): it runs where it was started.
+	Repository,
+}
+
 pub(crate) async fn revalidated_command_directory(
 	layout: &RepositoryLayout,
 	retained: RetainedCommandDirectory,
@@ -605,11 +806,51 @@ pub(crate) async fn revalidated_command_directory(
 	common: Dir,
 	git: Dir,
 	worktree: Option<Dir>,
+	needs: CommandNeeds,
 ) -> Result<RevalidatedCommandDirectory> {
 	let layout = layout.clone();
 	let setup = setup.clone();
 	let (path, directory, identity) = retained.into_parts();
 	tokio::task::spawn_blocking(move || {
+		let in_work_tree = layout
+			.worktree_root
+			.as_deref()
+			.is_some_and(|root| path.starts_with(root));
+		// A command that needs a work tree, started outside it (where `.git` is, or inside the git
+		// folder, `core.worktree` putting the work tree elsewhere): git changes into the work tree's
+		// top for it (probed vs git 2.55), so that is its directory; the folder it was started in is
+		// only checked unchanged.
+		if matches!(needs, CommandNeeds::WorkTree)
+			&& !in_work_tree
+			&& let (Some(root), Some(top)) = (layout.worktree_root.clone(), worktree.as_ref())
+		{
+			validate_visible_command_directory(&path, &directory, identity)?;
+			setup.validate()?;
+			let top = top
+				.try_clone()
+				.with_context(|| format!("opening the work tree for {}", path.display()))?;
+			return Ok(RevalidatedCommandDirectory {
+				path: root,
+				directory: top,
+				common,
+				git,
+				worktree,
+			});
+		}
+		// Started in the folder holding `.git`, outside the work tree and the git folders, any other
+		// command stays where it was started, as git's does (a relative signing key is found there):
+		// that folder, checked unchanged against its name opened again.
+		if outside_work_tree(&layout, &path) {
+			validate_visible_command_directory(&path, &directory, identity)?;
+			setup.validate()?;
+			return Ok(RevalidatedCommandDirectory {
+				path,
+				directory,
+				common,
+				git,
+				worktree,
+			});
+		}
 		let visible = retained_command_directory(&layout, &path, &common, &git, worktree.as_ref())?;
 		validate_retained_command_directory(&path, &directory, identity, &visible)?;
 		setup.validate()?;
@@ -623,6 +864,17 @@ pub(crate) async fn revalidated_command_directory(
 	})
 	.await
 	.context("joining command-directory revalidation worker")?
+}
+
+/// The folder a command was started in, outside the repository's folders, checked unchanged: its
+/// name opened again must still be the folder retained when it started.
+fn validate_visible_command_directory(
+	path: &Path,
+	retained: &Dir,
+	identity: EntryIdentity,
+) -> Result<()> {
+	let visible = open_identity_directory(path, "command working directory")?;
+	validate_retained_command_directory(path, retained, identity, &visible)
 }
 
 fn validate_retained_command_directory(
@@ -686,22 +938,55 @@ pub(crate) async fn revalidate_repository_layout(
 	layout: &RepositoryLayout,
 	expected: RepositoryLayoutIdentity,
 ) -> Result<(Dir, Dir, Option<Dir>)> {
-	let root = layout
-		.worktree_root
-		.as_deref()
-		.unwrap_or(&layout.common_dir);
+	revalidate_layout_as(layout, expected, Inspection::Root, Compared::Whole).await
+}
+
+/// What of a layout found again must match the one found first.
+#[derive(Clone, Copy)]
+enum Compared {
+	/// All of it: a command works in its work tree too.
+	Whole,
+	/// What a local source is read from: its git and common folders and where its `.git` is, not the
+	/// parts its config makes (the work tree, `bare_and_worktree`), which a config moved aside while
+	/// it was first looked at (a Windows submodule deinit) can make differ with nothing changed.
+	ReadFrom,
+	/// Only the folders' identities: a layout whose config may still be moved aside, checked before
+	/// it's restored.
+	Identities,
+}
+
+/// [`revalidate_repository_layout`] for a layout found as `inspection` says, compared as `compared`
+/// says.
+async fn revalidate_layout_as(
+	layout: &RepositoryLayout,
+	expected: RepositoryLayoutIdentity,
+	inspection: Inspection,
+	compared: Compared,
+) -> Result<(Dir, Dir, Option<Dir>)> {
+	// Where the `.git` was found, which `core.worktree` can tell apart from the work tree; a git
+	// directory found as itself is re-inspected as itself.
+	let root = layout.marker_root.as_deref().unwrap_or(&layout.common_dir);
 	let subject = if layout.worktree_root.is_some() {
 		"worktree"
 	} else {
 		"repository"
 	};
-	let current = inspect_root(root).await.with_context(|| {
+	let current = inspect_as(root, inspection).await.with_context(|| {
 		format!(
 			"{subject} changed while waiting for repository setup: {}",
 			root.display()
 		)
 	})?;
-	if &current != layout {
+	let same = match compared {
+		Compared::Whole => &current == layout,
+		Compared::ReadFrom => {
+			current.git_dir == layout.git_dir
+				&& current.common_dir == layout.common_dir
+				&& current.marker_root == layout.marker_root
+		}
+		Compared::Identities => true,
+	};
+	if !same {
 		bail!(
 			"{subject} changed while waiting for repository setup: {}",
 			root.display()
@@ -1098,6 +1383,20 @@ mod tests {
 		);
 	}
 
+	/// A source whose `core.worktree` puts its work tree elsewhere is named where its `.git` is, so a
+	/// clone's origin can be found again (the work tree holds no `.git`).
+	#[test]
+	fn local_source_url_names_where_the_git_is_not_the_work_tree() {
+		let layout = RepositoryLayout {
+			bare_and_worktree: false,
+			worktree_root: Some(PathBuf::from("/elsewhere/other")),
+			marker_root: Some(PathBuf::from("/projects/repo")),
+			git_dir: PathBuf::from("/projects/repo/.git"),
+			common_dir: PathBuf::from("/projects/repo/.git"),
+		};
+		assert_eq!(local_source_url(&layout).unwrap(), "/projects/repo");
+	}
+
 	#[tokio::test]
 	async fn local_source_url_stays_bound_to_the_inspected_layout() {
 		let temporary = tempfile::tempdir().unwrap();
@@ -1171,6 +1470,151 @@ mod tests {
 		);
 	}
 
+	/// A command's discovery reads the config under the setup lock: while a publisher holds the lock
+	/// with the config moved aside (as a Windows submodule deinit does), discovery waits, then finds
+	/// the work tree `core.worktree` names, not the folder holding `.git`.
+	#[tokio::test]
+	async fn discovery_waits_for_a_publisher_with_the_config_moved_aside() {
+		let temporary = tempfile::tempdir().unwrap();
+		let repo = temporary.path().join("repo");
+		let other = temporary.path().join("other");
+		std::fs::create_dir_all(repo.join(".git/objects")).unwrap();
+		std::fs::create_dir_all(repo.join(".git/refs")).unwrap();
+		std::fs::create_dir_all(&other).unwrap();
+		std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+		std::fs::write(
+			repo.join(".git/config"),
+			"[core]\n\trepositoryformatversion = 0\n\tworktree = ../../other\n",
+		)
+		.unwrap();
+		let git_dir = std::fs::canonicalize(repo.join(".git")).unwrap();
+		let common = Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap();
+		let mutation = acquire_submodule_config_mutation_lease(&common, &git_dir).unwrap();
+		std::fs::rename(git_dir.join("config"), git_dir.join("config.aside")).unwrap();
+
+		let found = discover(&repo);
+		let publish = async {
+			// Long enough for discovery to read the gap and reach the lock.
+			tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(500)))
+				.await
+				.unwrap();
+			std::fs::rename(git_dir.join("config.aside"), git_dir.join("config")).unwrap();
+			drop(mutation);
+		};
+		let (layout, ()) = tokio::join!(found, publish);
+
+		assert_eq!(
+			layout.unwrap().worktree_root,
+			Some(std::fs::canonicalize(&other).unwrap())
+		);
+	}
+
+	/// A plain repository at `path`, its config reading `config`.
+	fn plain_repository(path: &Path, config: &str) {
+		std::fs::create_dir_all(path.join(".git/objects")).unwrap();
+		std::fs::create_dir_all(path.join(".git/refs")).unwrap();
+		std::fs::write(path.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+		std::fs::write(path.join(".git/config"), config).unwrap();
+	}
+
+	/// A repository put in place of the one found while discovery waits on its lock isn't taken for
+	/// it: discovery refuses, as command setup does.
+	#[tokio::test]
+	async fn discovery_refuses_a_repository_put_in_place_while_it_waits() {
+		let temporary = tempfile::tempdir().unwrap();
+		let repo = temporary.path().join("repo");
+		plain_repository(&repo, "[core]\n\trepositoryformatversion = 0\n");
+		let git_dir = std::fs::canonicalize(repo.join(".git")).unwrap();
+		let common = Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap();
+		let mutation = acquire_submodule_config_mutation_lease(&common, &git_dir).unwrap();
+
+		let found = discover(&repo);
+		let replace = async {
+			tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(500)))
+				.await
+				.unwrap();
+			std::fs::rename(&repo, temporary.path().join("repo-retired")).unwrap();
+			plain_repository(&repo, "[core]\n\trepositoryformatversion = 0\n");
+			drop(mutation);
+		};
+		let (result, ()) = tokio::join!(found, replace);
+
+		let error = result.expect_err("a repository put in place must be refused");
+		assert!(
+			error
+				.to_string()
+				.contains("changed while waiting for repository setup"),
+			"unexpected error: {error:#}"
+		);
+	}
+
+	/// The folder a command started in, put in its place while discovery waits on the lock, isn't taken
+	/// for it: discovery refuses, as command setup does.
+	#[tokio::test]
+	async fn discovery_refuses_a_starting_folder_replaced_while_it_waits() {
+		let temporary = tempfile::tempdir().unwrap();
+		let repo = temporary.path().join("repo");
+		plain_repository(&repo, "[core]\n\trepositoryformatversion = 0\n");
+		let nested = repo.join("nested");
+		std::fs::create_dir(&nested).unwrap();
+		let git_dir = std::fs::canonicalize(repo.join(".git")).unwrap();
+		let common = Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap();
+		let mutation = acquire_submodule_config_mutation_lease(&common, &git_dir).unwrap();
+
+		let found = discover(&nested);
+		let replace = async {
+			tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(500)))
+				.await
+				.unwrap();
+			std::fs::rename(&nested, repo.join("nested-retired")).unwrap();
+			std::fs::create_dir(&nested).unwrap();
+			drop(mutation);
+		};
+		let (result, ()) = tokio::join!(found, replace);
+
+		let error = result.expect_err("a starting folder put in place must be refused");
+		assert!(
+			error
+				.to_string()
+				.contains("command working directory changed while waiting"),
+			"unexpected error: {error:#}"
+		);
+	}
+
+	/// A local source is checked after its lock on what it's read from: a config moved aside while
+	/// it was first looked at (as a Windows submodule deinit does) doesn't fail it once it's back.
+	#[tokio::test]
+	async fn a_source_s_config_gap_doesn_t_fail_its_setup() {
+		let temporary = tempfile::tempdir().unwrap();
+		let repo = temporary.path().join("repo");
+		std::fs::create_dir_all(temporary.path().join("other")).unwrap();
+		plain_repository(
+			&repo,
+			"[core]\n\trepositoryformatversion = 0\n\tworktree = ../../other\n",
+		);
+		let git_dir = std::fs::canonicalize(repo.join(".git")).unwrap();
+		let common = Dir::open_ambient_dir(&git_dir, ambient_authority()).unwrap();
+		let mutation = acquire_submodule_config_mutation_lease(&common, &git_dir).unwrap();
+		std::fs::rename(git_dir.join("config"), git_dir.join("config.aside")).unwrap();
+		let layout = inspect_root(&repo).await.unwrap();
+		assert_eq!(
+			layout.worktree_root,
+			Some(std::fs::canonicalize(&repo).unwrap())
+		);
+		let identity = capture_repository_layout_identity(&layout).unwrap();
+
+		let setup = revalidated_local_source_setup(&layout, identity, None, Inspection::Root);
+		let publish = async {
+			tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(300)))
+				.await
+				.unwrap();
+			std::fs::rename(git_dir.join("config.aside"), git_dir.join("config")).unwrap();
+			drop(mutation);
+		};
+		let (result, ()) = tokio::join!(setup, publish);
+		result.expect("the source is as it was, its config back");
+	}
+
 	#[tokio::test]
 	async fn local_source_setup_rejects_a_repository_replaced_while_waiting() {
 		let temporary = tempfile::tempdir().unwrap();
@@ -1198,7 +1642,7 @@ mod tests {
 		let common = Dir::open_ambient_dir(&layout.common_dir, ambient_authority()).unwrap();
 		let mutation = acquire_submodule_config_mutation_lease(&common, &layout.common_dir).unwrap();
 
-		let operation = revalidated_local_source_setup(&layout, identity, None);
+		let operation = revalidated_local_source_setup(&layout, identity, None, Inspection::Root);
 		let replace = async {
 			tokio::task::yield_now().await;
 			gitana_fs_native::replace_if_identities(

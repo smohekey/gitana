@@ -30,6 +30,9 @@ pub(crate) struct WorktreeConfiguration {
 	git: Dir,
 	common_dir: PathBuf,
 	git_dir: PathBuf,
+	/// Where the superproject's `.git` is, when `core.worktree` puts its work tree elsewhere; `None`
+	/// when the work tree holds it.
+	marker_root: Option<PathBuf>,
 	#[cfg(test)]
 	apply_init_pause: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
 	#[cfg(test)]
@@ -45,8 +48,16 @@ pub(crate) struct WorktreeConfiguration {
 }
 
 impl WorktreeConfiguration {
+	/// The configuration of a superproject whose `.git` is at `marker_root`, as discovery found it
+	/// (`None`: in its work tree).
+	pub(crate) fn with_marker_root(mut self, marker_root: Option<PathBuf>) -> Self {
+		self.marker_root = marker_root;
+		self
+	}
+
 	pub(crate) fn new(common: Dir, git: Dir, common_dir: &Path, git_dir: &Path) -> Self {
 		Self {
+			marker_root: None,
 			common,
 			git,
 			common_dir: common_dir.to_owned(),
@@ -837,7 +848,12 @@ impl SetUrlConfigurationProvider for WorktreeConfiguration {
 			})?,
 		};
 		let layout = gitana_repository_layout::RepositoryLayout {
+			bare_and_worktree: false,
 			worktree_root: Some(worktree_root.to_owned()),
+			marker_root: self
+				.marker_root
+				.clone()
+				.or_else(|| Some(worktree_root.to_owned())),
 			git_dir: self.git_dir.clone(),
 			common_dir: self.common_dir.clone(),
 		};
@@ -2203,7 +2219,9 @@ mod tests {
 		let context = Arc::new(
 			SubmoduleContext::new(
 				RepositoryLayout {
+					bare_and_worktree: false,
 					worktree_root: Some(worktree.clone()),
+					marker_root: Some(worktree.clone()),
 					git_dir: git_dir.clone(),
 					common_dir: git_dir.clone(),
 				},
@@ -2312,7 +2330,9 @@ mod tests {
 		let context = Arc::new(
 			SubmoduleContext::new(
 				RepositoryLayout {
+					bare_and_worktree: false,
 					worktree_root: Some(worktree.clone()),
+					marker_root: Some(worktree.clone()),
 					git_dir: git_dir.clone(),
 					common_dir: git_dir.clone(),
 				},
@@ -2674,7 +2694,9 @@ mod tests {
 		let stale = configuration.reload().await.unwrap();
 		let context = SubmoduleContext::new(
 			RepositoryLayout {
+				bare_and_worktree: false,
 				worktree_root: Some(worktree.clone()),
+				marker_root: Some(worktree.clone()),
 				git_dir: git_dir.clone(),
 				common_dir: git_dir.clone(),
 			},
@@ -2750,7 +2772,9 @@ mod tests {
 		let stale = configuration.reload().await.unwrap();
 		let context = SubmoduleContext::new(
 			RepositoryLayout {
+				bare_and_worktree: false,
 				worktree_root: Some(worktree.clone()),
+				marker_root: Some(worktree.clone()),
 				git_dir: git_dir.clone(),
 				common_dir: git_dir.clone(),
 			},
@@ -2840,7 +2864,9 @@ mod tests {
 		let stale = configuration.reload().await.unwrap();
 		let context = SubmoduleContext::new(
 			RepositoryLayout {
+				bare_and_worktree: false,
 				worktree_root: Some(worktree.clone()),
+				marker_root: Some(worktree.clone()),
 				git_dir: git_dir.clone(),
 				common_dir: git_dir.clone(),
 			},
@@ -2939,7 +2965,9 @@ mod tests {
 		let context = Arc::new(
 			SubmoduleContext::new(
 				RepositoryLayout {
+					bare_and_worktree: false,
 					worktree_root: Some(worktree.clone()),
+					marker_root: Some(worktree.clone()),
 					git_dir: git_dir.clone(),
 					common_dir: git_dir.clone(),
 				},
@@ -3040,7 +3068,9 @@ mod tests {
 		let git = common.try_clone().unwrap();
 		let context = SubmoduleContext::new(
 			RepositoryLayout {
+				bare_and_worktree: false,
 				worktree_root: Some(worktree.clone()),
+				marker_root: Some(worktree.clone()),
 				git_dir: git_dir.clone(),
 				common_dir: git_dir,
 			},
@@ -3109,7 +3139,9 @@ mod tests {
 		let context = Arc::new(
 			SubmoduleContext::new(
 				RepositoryLayout {
+					bare_and_worktree: false,
 					worktree_root: Some(worktree.clone()),
+					marker_root: Some(worktree.clone()),
 					git_dir: git_dir.clone(),
 					common_dir: git_dir.clone(),
 				},

@@ -524,10 +524,13 @@ impl SubmoduleContext {
 				intent.name
 			)));
 		}
+		let mounted = intent
+			.mount_identity
+			.map(|_| self.worktree_root().join(&intent.path));
 		let module_layout = RepositoryLayout {
-			worktree_root: intent
-				.mount_identity
-				.map(|_| self.worktree_root().join(&intent.path)),
+			bare_and_worktree: false,
+			worktree_root: mounted.clone(),
+			marker_root: mounted,
 			git_dir: module_path.clone(),
 			common_dir: module_path.clone(),
 		};
@@ -680,7 +683,9 @@ impl SubmoduleContext {
 						))));
 					}
 					let module_layout = RepositoryLayout {
+						bare_and_worktree: false,
 						worktree_root: mounted.then(|| self.worktree_root().join(&declaration.path)),
+						marker_root: mounted.then(|| self.worktree_root().join(&declaration.path)),
 						git_dir: module_path.clone(),
 						common_dir: module_path.clone(),
 					};
@@ -3816,7 +3821,9 @@ mod tests {
 		symlink(&relocated, common_path.join("worktrees")).unwrap();
 		let common = Dir::open_ambient_dir(&common_path, ambient_authority()).unwrap();
 		let layout = RepositoryLayout {
+			bare_and_worktree: false,
 			worktree_root: Some(temporary.path().join("work")),
+			marker_root: Some(temporary.path().join("work")),
 			git_dir: common_path.clone(),
 			common_dir: common_path,
 		};
@@ -3838,7 +3845,9 @@ mod tests {
 		symlink(&relocated, worktrees.join("linked")).unwrap();
 		let common = Dir::open_ambient_dir(&common_path, ambient_authority()).unwrap();
 		let layout = RepositoryLayout {
+			bare_and_worktree: false,
 			worktree_root: Some(temporary.path().join("work")),
+			marker_root: Some(temporary.path().join("work")),
 			git_dir: common_path.clone(),
 			common_dir: common_path,
 		};
@@ -4173,7 +4182,9 @@ mod tests {
 		let git_dir = std::fs::canonicalize(git_dir).unwrap();
 		let context = SubmoduleContext::new(
 			RepositoryLayout {
+				bare_and_worktree: false,
 				worktree_root: Some(worktree.clone()),
+				marker_root: Some(worktree.clone()),
 				git_dir: git_dir.clone(),
 				common_dir: git_dir.clone(),
 			},

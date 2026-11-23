@@ -63,12 +63,9 @@ pub async fn run(
 	// A credential-free form for the "Fetched from" line — *all* userinfo stripped (a token can occupy
 	// the username field), since the raw `url` is only for the auth-bearing transport parse above.
 	let display = transport::anonymize_url(&url);
-	// A relative askpass (HTTP) / `GIT_SSH_COMMAND` (SSH) resolves against the worktree root, as git runs
-	// it from there (bare: git dir).
-	let askpass_cwd = found
-		.worktree_root
-		.clone()
-		.unwrap_or_else(|| found.common_dir.clone());
+	// A relative remote URL, askpass (HTTP) or `GIT_SSH_COMMAND` (SSH) resolves from where git's fetch
+	// runs.
+	let askpass_cwd = repo::repository_command_directory(&found, cwd).await?;
 	let tags = match (all_tags, no_tags) {
 		(true, _) => TagFetch::All,
 		(_, true) => TagFetch::None,
@@ -119,8 +116,13 @@ pub async fn run(
 			let source = local_path(&askpass_cwd, &path);
 			let source_layout = repo::inspect_root(&source).await?;
 			let source_identity = repo::capture_repository_layout_identity(&source_layout)?;
-			let (source_setup, common, git) =
-				repo::revalidated_local_source_setup(&source_layout, source_identity, None).await?;
+			let (source_setup, common, git) = repo::revalidated_local_source_setup(
+				&source_layout,
+				source_identity,
+				None,
+				repo::Inspection::Root,
+			)
+			.await?;
 			match dispatch::detect_algorithm_at(&common, &source_layout.common_dir).await? {
 				HashKind::Sha1 => {
 					let second_common = common.try_clone()?;

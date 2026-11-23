@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gitana_repository_layout::{
-	DiscoveryError, common_dir_of, discover, inspect_root, try_discover,
+	DiscoveryError, common_dir_of, discover, inspect_root, inspect_source, try_discover,
 };
 use tempfile::TempDir;
 
@@ -486,4 +486,273 @@ async fn stock_git_linked_worktree_resolves_to_shared_common_dir() {
 	assert_ne!(a.git_dir, b.git_dir);
 	assert_eq!(main.common_dir, canon(&repo.join(".git")));
 	assert_eq!(a.worktree_root.as_deref(), Some(canon(&wt_a).as_path()));
+}
+
+/// `path` as a config value: its backslashes (a Windows path's) escaped, as git's config reads them.
+fn config_value(path: &Path) -> String {
+	path
+		.display()
+		.to_string()
+		.replace('\\', "\\\\")
+		.replace('"', "\\\"")
+}
+
+/// A repository whose `.git` directory is at `<base>/repo/.git`, its `config` reading `config`, and an
+/// `other` folder beside it.
+fn repo_with_config(config: &str) -> (TempDir, PathBuf, PathBuf) {
+	let tmp = TempDir::new().unwrap();
+	let repo = tmp.path().join("repo");
+	ordinary_repo(&repo);
+	fs::write(repo.join(".git/config"), config).unwrap();
+	let other = tmp.path().join("other");
+	fs::create_dir_all(&other).unwrap();
+	(tmp, repo, other)
+}
+
+/// As git: `core.worktree`, relative to the git directory, puts the work tree elsewhere; the `.git`
+/// stays where discovery found it, and re-inspecting that folder gives the same layout. Stock git
+/// agrees on the top.
+#[tokio::test]
+async fn core_worktree_puts_the_work_tree_elsewhere() {
+	let (_tmp, repo, other) =
+		repo_with_config("[core]\n\trepositoryformatversion = 0\n\tworktree = ../../other\n");
+	let layout = discover(&repo).await.unwrap();
+	assert_eq!(
+		layout.worktree_root.as_deref(),
+		Some(canon(&other).as_path())
+	);
+	assert_eq!(layout.marker_root.as_deref(), Some(canon(&repo).as_path()));
+	assert_eq!(layout.git_dir, canon(&repo.join(".git")));
+	assert_eq!(inspect_root(&repo).await.unwrap(), layout);
+	let top = Command::new("git")
+		.args(["-C"])
+		.arg(&repo)
+		.args(["rev-parse", "--show-toplevel"])
+		.env("GIT_CONFIG_NOSYSTEM", "1")
+		.env("GIT_CONFIG_GLOBAL", "/dev/null")
+		.output()
+		.unwrap();
+	if top.status.success() {
+		assert_eq!(
+			PathBuf::from(String::from_utf8_lossy(&top.stdout).trim()),
+			canon(&other)
+		);
+	}
+}
+
+#[tokio::test]
+async fn an_absolute_core_worktree_is_taken_as_it_is() {
+	let tmp = TempDir::new().unwrap();
+	let other = tmp.path().join("other");
+	fs::create_dir_all(&other).unwrap();
+	let (_keep, repo, _) = repo_with_config(&format!(
+		"[core]\n\trepositoryformatversion = 0\n\tworktree = {}\n",
+		config_value(&canon(&other))
+	));
+	let layout = discover(&repo).await.unwrap();
+	assert_eq!(
+		layout.worktree_root.as_deref(),
+		Some(canon(&other).as_path())
+	);
+}
+
+/// As git: with `core.bare` true too there is no work tree ("core.bare and core.worktree do not make
+/// sense").
+#[tokio::test]
+async fn core_bare_with_core_worktree_has_no_work_tree() {
+	let (_tmp, repo, _) = repo_with_config(
+		"[core]\n\trepositoryformatversion = 0\n\tbare = true\n\tworktree = ../../other\n",
+	);
+	let layout = discover(&repo).await.unwrap();
+	assert_eq!(layout.worktree_root, None);
+	assert_eq!(layout.marker_root.as_deref(), Some(canon(&repo).as_path()));
+	assert!(layout.bare_and_worktree);
+}
+
+/// As git: `core.bare` true without `core.worktree` means no work tree too, with nothing to warn of;
+/// a config without `core.repositoryformatversion` is set aside, so there the work tree stays.
+#[tokio::test]
+async fn core_bare_alone_means_no_work_tree() {
+	let (_tmp, repo, _) = repo_with_config("[core]\n\trepositoryformatversion = 0\n\tbare = true\n");
+	let layout = discover(&repo).await.unwrap();
+	assert_eq!(layout.worktree_root, None);
+	assert_eq!(layout.marker_root.as_deref(), Some(canon(&repo).as_path()));
+	assert!(!layout.bare_and_worktree);
+	let (_tmp, repo, _) = repo_with_config("[core]\n\tbare = true\n");
+	assert_eq!(
+		discover(&repo).await.unwrap().worktree_root.as_deref(),
+		Some(canon(&repo).as_path())
+	);
+}
+
+/// A source read for a local clone needs no work tree: a missing one `core.worktree` names stops a
+/// command's discovery but not the source's inspection, which gives its git folders only.
+#[tokio::test]
+async fn a_source_is_read_without_its_work_tree() {
+	let (_tmp, repo, _) =
+		repo_with_config("[core]\n\trepositoryformatversion = 0\n\tworktree = ../../nowhere\n");
+	assert!(matches!(
+		inspect_root(&repo).await,
+		Err(DiscoveryError::MissingWorktree { .. })
+	));
+	let layout = inspect_source(&repo).await.unwrap();
+	assert_eq!(layout.worktree_root, None);
+	assert_eq!(layout.marker_root.as_deref(), Some(canon(&repo).as_path()));
+	assert_eq!(layout.git_dir, canon(&repo.join(".git")));
+	assert_eq!(layout.common_dir, canon(&repo.join(".git")));
+}
+
+/// A work tree `core.worktree` names that isn't there is an error, not a quiet fallback.
+#[tokio::test]
+async fn a_missing_core_worktree_is_an_error() {
+	let (_tmp, repo, _) =
+		repo_with_config("[core]\n\trepositoryformatversion = 0\n\tworktree = ../../nowhere\n");
+	assert!(matches!(
+		discover(&repo).await,
+		Err(DiscoveryError::MissingWorktree { .. })
+	));
+}
+
+/// An empty `core.worktree` names no folder: refused as a missing work tree, as git refuses it
+/// ("cannot chdir to ''").
+#[tokio::test]
+async fn an_empty_core_worktree_is_refused() {
+	let (_tmp, repo, _) = repo_with_config("[core]\n\trepositoryformatversion = 0\n\tworktree =\n");
+	assert!(matches!(
+		discover(&repo).await,
+		Err(DiscoveryError::MissingWorktree { .. })
+	));
+}
+
+/// A `core.worktree` naming the git folder itself, or a folder inside it, is refused (git accepts
+/// it, and its commands then take the repository's own files for work-tree files). A source read
+/// for a local clone doesn't look at its work tree, so it's still read.
+#[tokio::test]
+async fn a_core_worktree_in_the_git_folder_is_refused() {
+	for named in [".", "../.git", "refs"] {
+		let (_tmp, repo, _) = repo_with_config(&format!(
+			"[core]\n\trepositoryformatversion = 0\n\tworktree = {named}\n"
+		));
+		assert!(
+			matches!(
+				discover(&repo).await,
+				Err(DiscoveryError::WorktreeInGitDir { .. })
+			),
+			"core.worktree = {named}"
+		);
+		assert!(
+			inspect_source(&repo).await.is_ok(),
+			"core.worktree = {named}"
+		);
+	}
+}
+
+/// Found as itself (from inside the `.git`), the work tree is still `core.worktree`'s, as git's
+/// `--show-toplevel` from there says; there's no `.git` folder for it.
+#[tokio::test]
+async fn core_worktree_holds_from_inside_the_git_directory() {
+	let (_tmp, repo, other) =
+		repo_with_config("[core]\n\trepositoryformatversion = 0\n\tworktree = ../../other\n");
+	let layout = discover(&repo.join(".git")).await.unwrap();
+	assert_eq!(
+		layout.worktree_root.as_deref(),
+		Some(canon(&other).as_path())
+	);
+	assert_eq!(layout.marker_root, None);
+}
+
+/// As git: a linked worktree ignores the shared `core.worktree`, which is the main checkout's.
+#[tokio::test]
+async fn a_linked_worktree_ignores_the_main_core_worktree() {
+	let (tmp, worktree, _admin, main_git) = hand_built_linked_worktree(true, false);
+	let elsewhere = tmp.path().join("elsewhere");
+	fs::create_dir_all(&elsewhere).unwrap();
+	fs::write(
+		main_git.join("config"),
+		format!(
+			"[core]\n\trepositoryformatversion = 0\n\tworktree = {}\n",
+			canon(&elsewhere).display()
+		),
+	)
+	.unwrap();
+	let layout = discover(&worktree).await.unwrap();
+	assert_eq!(
+		layout.worktree_root.as_deref(),
+		Some(canon(&worktree).as_path())
+	);
+	assert_eq!(
+		layout.marker_root.as_deref(),
+		Some(canon(&worktree).as_path())
+	);
+}
+
+/// As git: a config that doesn't say its `core.repositoryformatversion` is set aside, its
+/// `core.worktree` with it (measured: git's top is then the folder holding `.git`).
+#[tokio::test]
+async fn core_worktree_counts_only_with_a_format_version() {
+	let tmp = TempDir::new().unwrap();
+	let repo = tmp.path().join("repo");
+	ordinary_repo(&repo);
+	fs::create_dir_all(tmp.path().join("other")).unwrap();
+	fs::write(
+		repo.join(".git/config"),
+		"[core]\n\tworktree = ../../other\n",
+	)
+	.unwrap();
+	let layout = discover(&repo).await.unwrap();
+	assert_eq!(
+		layout.worktree_root.as_deref(),
+		Some(canon(&repo).as_path())
+	);
+}
+
+/// As git: with `extensions.worktreeConfig`, the checkout's own `config.worktree` overrides the shared
+/// `core.worktree` (measured: shared `../../other`, own `..`, git's top is the checkout).
+#[tokio::test]
+async fn config_worktree_overrides_the_shared_core_worktree() {
+	let (_tmp, repo, _other) = repo_with_config(
+		"[core]\n\trepositoryformatversion = 1\n\tworktree = ../../other\n[extensions]\n\tworktreeConfig = true\n",
+	);
+	fs::write(
+		repo.join(".git/config.worktree"),
+		"[core]\n\tworktree = ..\n",
+	)
+	.unwrap();
+	let layout = discover(&repo).await.unwrap();
+	assert_eq!(
+		layout.worktree_root.as_deref(),
+		Some(canon(&repo).as_path())
+	);
+	let top = Command::new("git")
+		.args(["-C"])
+		.arg(&repo)
+		.args(["rev-parse", "--show-toplevel"])
+		.env("GIT_CONFIG_NOSYSTEM", "1")
+		.env("GIT_CONFIG_GLOBAL", "/dev/null")
+		.output()
+		.unwrap();
+	if top.status.success() {
+		assert_eq!(
+			PathBuf::from(String::from_utf8_lossy(&top.stdout).trim()),
+			canon(&repo)
+		);
+	}
+}
+
+/// A config value that isn't UTF-8 (git's config is bytes) doesn't stop discovery.
+#[tokio::test]
+async fn a_config_value_that_isn_t_utf8_doesn_t_stop_discovery() {
+	let tmp = TempDir::new().unwrap();
+	let repo = tmp.path().join("repo");
+	ordinary_repo(&repo);
+	fs::write(
+		repo.join(".git/config"),
+		b"[core]\n\trepositoryformatversion = 0\n[user]\n\tname = caf\xe9\n",
+	)
+	.unwrap();
+	let layout = discover(&repo).await.unwrap();
+	assert_eq!(
+		layout.worktree_root.as_deref(),
+		Some(canon(&repo).as_path())
+	);
 }

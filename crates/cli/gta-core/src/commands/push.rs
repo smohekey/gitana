@@ -92,12 +92,8 @@ pub async fn run(
 	// token can occupy the username field), so no credential reaches a print or a signed certificate. The
 	// raw `url` is only for the auth-bearing transport parse above.
 	let display = transport::anonymize_url(&url);
-	// A relative askpass (HTTP) / `GIT_SSH_COMMAND` (SSH) resolves against the worktree root, as git runs
-	// it from there (bare: git dir).
-	let askpass_cwd = found
-		.worktree_root
-		.clone()
-		.unwrap_or_else(|| found.common_dir.clone());
+	// A relative askpass (HTTP) / `GIT_SSH_COMMAND` (SSH) resolves from where git's push runs.
+	let askpass_cwd = repo::repository_command_directory(&found, &cwd).await?;
 
 	// Open the receive-pack connection (an HTTP POST endpoint, or the SSH stateful stream), then run the
 	// push over it — one path for both transports.
@@ -303,14 +299,22 @@ async fn revalidated_push_command_directory(
 	worktree: Option<Dir>,
 ) -> Result<repo::RevalidatedCommandDirectory> {
 	let display = command_directory.path().to_owned();
-	repo::revalidated_command_directory(found, command_directory, setup, common, git, worktree)
-		.await
-		.with_context(|| {
-			format!(
-				"push command directory changed during remote negotiation: {}",
-				display.display()
-			)
-		})
+	repo::revalidated_command_directory(
+		found,
+		command_directory,
+		setup,
+		common,
+		git,
+		worktree,
+		repo::CommandNeeds::Repository,
+	)
+	.await
+	.with_context(|| {
+		format!(
+			"push command directory changed during remote negotiation: {}",
+			display.display()
+		)
+	})
 }
 
 /// The pusher identity for a certificate: `Name <email> <unix-ts> +0000`. Always stamped with the

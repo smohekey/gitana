@@ -956,10 +956,13 @@ impl SubmoduleContext {
 				entry.declaration.path
 			)));
 		}
+		let mounted = mount_before_transfer
+			.mounted
+			.then(|| self.worktree_root().join(&entry.declaration.path));
 		let module_layout = gitana_repository_layout::RepositoryLayout {
-			worktree_root: mount_before_transfer
-				.mounted
-				.then(|| self.worktree_root().join(&entry.declaration.path)),
+			bare_and_worktree: false,
+			worktree_root: mounted.clone(),
+			marker_root: mounted,
 			git_dir: module_git_dir.clone(),
 			common_dir: module_git_dir.clone(),
 		};
@@ -5537,7 +5540,9 @@ mod tests {
 		let git_dir = std::fs::canonicalize(git_dir).unwrap();
 		let context = SubmoduleContext::new(
 			RepositoryLayout {
+				bare_and_worktree: false,
 				worktree_root: Some(worktree.clone()),
+				marker_root: Some(worktree.clone()),
 				git_dir: git_dir.clone(),
 				common_dir: git_dir.clone(),
 			},

@@ -31,7 +31,25 @@ pub async fn try_discover(start: &Path) -> Result<Option<RepositoryLayout>, Disc
 /// [`DiscoveryError::NotWorktreeRoot`].
 pub async fn inspect_root(root: &Path) -> Result<RepositoryLayout, DiscoveryError> {
 	let owned = root.to_path_buf();
-	blocking(move || inspect_root_sync(&owned)).await
+	blocking(move || inspect_root_sync(&owned, Worktree::Resolved)).await
+}
+
+/// Like [`inspect_root`], but for a repository to read from (a local clone's source), which needs
+/// only its git and common directories: the layout has no work tree (`worktree_root` is `None`), so
+/// one its config names needn't exist, as git's local clone reads a source without looking at its
+/// work tree (probed vs git 2.55).
+pub async fn inspect_source(root: &Path) -> Result<RepositoryLayout, DiscoveryError> {
+	let owned = root.to_path_buf();
+	blocking(move || inspect_root_sync(&owned, Worktree::Skipped)).await
+}
+
+/// Whether discovery finds the work tree a repository's config names, or leaves it out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Worktree {
+	/// Found, and refused if it's missing (a command's repository).
+	Resolved,
+	/// Left out: the layout has none (a source read only for its objects and refs).
+	Skipped,
 }
 
 /// Resolve a (possibly per-worktree) `git_dir` to its shared common directory: the target of its
@@ -72,7 +90,7 @@ fn try_discover_sync(start: &Path) -> Result<Option<RepositoryLayout>, Discovery
 		source,
 	})?;
 	loop {
-		if let Some(layout) = classify(&dir)? {
+		if let Some(layout) = classify(&dir, Worktree::Resolved)? {
 			return Ok(Some(layout));
 		}
 		if !dir.pop() {
@@ -81,19 +99,24 @@ fn try_discover_sync(start: &Path) -> Result<Option<RepositoryLayout>, Discovery
 	}
 }
 
-fn inspect_root_sync(root: &Path) -> Result<RepositoryLayout, DiscoveryError> {
+fn inspect_root_sync(root: &Path, worktree: Worktree) -> Result<RepositoryLayout, DiscoveryError> {
 	let root = canonicalize(root).map_err(|source| DiscoveryError::InaccessibleStart {
 		path: root.to_path_buf(),
 		source,
 	})?;
-	classify(&root)?.ok_or(DiscoveryError::NotWorktreeRoot { path: root })
+	let mut layout =
+		classify(&root, worktree)?.ok_or(DiscoveryError::NotWorktreeRoot { path: root })?;
+	if worktree == Worktree::Skipped {
+		layout.worktree_root = None;
+	}
+	Ok(layout)
 }
 
 /// Describe `dir` if it is itself a repository root, else `Ok(None)`. `dir` is assumed canonical (the
 /// caller canonicalized it), so `worktree_root`/bare `git_dir` are canonical by construction; the
 /// resolved git and common directories are canonicalized explicitly, which also resolves a symlinked
 /// `.git` and honours a relative `gitdir`/`commondir` pointer.
-fn classify(dir: &Path) -> Result<Option<RepositoryLayout>, DiscoveryError> {
+fn classify(dir: &Path, worktree: Worktree) -> Result<Option<RepositoryLayout>, DiscoveryError> {
 	let git = dir.join(".git");
 	// `is_dir`/`is_file` follow symlinks, so a `.git` symlink to a directory reads as a directory here,
 	// as git treats it.
@@ -107,29 +130,47 @@ fn classify(dir: &Path) -> Result<Option<RepositoryLayout>, DiscoveryError> {
 		// `worktree_root` (the canonical directory we walked from).
 		let git_dir = canonicalize(&git).map_err(|source| git_dir_error(git.clone(), source))?;
 		let common_dir = common_dir_of_sync(&git_dir)?;
-		return Ok(Some(RepositoryLayout {
-			worktree_root: Some(dir.to_path_buf()),
-			git_dir,
-			common_dir,
-		}));
+		return configured(
+			RepositoryLayout {
+				worktree_root: Some(dir.to_path_buf()),
+				marker_root: Some(dir.to_path_buf()),
+				git_dir,
+				common_dir,
+				bare_and_worktree: false,
+			},
+			worktree,
+		)
+		.map(Some);
 	}
 	if git.is_file() {
 		let git_dir = resolve_gitdir_file(&git)?;
 		let common_dir = common_dir_of_sync(&git_dir)?;
-		return Ok(Some(RepositoryLayout {
-			worktree_root: Some(dir.to_path_buf()),
-			git_dir,
-			common_dir,
-		}));
+		return configured(
+			RepositoryLayout {
+				worktree_root: Some(dir.to_path_buf()),
+				marker_root: Some(dir.to_path_buf()),
+				git_dir,
+				common_dir,
+				bare_and_worktree: false,
+			},
+			worktree,
+		)
+		.map(Some);
 	}
 	if is_git_dir(dir) {
 		// A bare/main git directory: `dir` is already canonical (walked from a canonical base) and has
 		// no `commondir`, so it is its own common dir.
-		return Ok(Some(RepositoryLayout {
-			worktree_root: None,
-			git_dir: dir.to_path_buf(),
-			common_dir: dir.to_path_buf(),
-		}));
+		return configured(
+			RepositoryLayout {
+				worktree_root: None,
+				marker_root: None,
+				git_dir: dir.to_path_buf(),
+				common_dir: dir.to_path_buf(),
+				bare_and_worktree: false,
+			},
+			worktree,
+		)
+		.map(Some);
 	}
 	// `.git` is neither a usable directory nor a valid gitdir file. Probe the entry itself with
 	// `symlink_metadata` (which does not follow a symlink) to tell absence from corruption: only a
@@ -148,6 +189,106 @@ fn classify(dir: &Path) -> Result<Option<RepositoryLayout>, DiscoveryError> {
 		Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
 		Err(source) => Err(DiscoveryError::MissingGitDir { path: git, source }),
 	}
+}
+
+/// `layout` with the work tree its git directory's `config` gives, as git's setup reads it (the one
+/// file, no includes; probed vs git 2.55): `core.bare` true means there is none (git refuses a work
+/// tree command there, and runs the rest where it was started), whether or not `core.worktree` is set
+/// too ("core.bare and core.worktree do not make sense", noted in `bare_and_worktree`); otherwise
+/// `core.worktree`, relative to the git directory, puts the work tree there, which must exist unless
+/// `worktree` skips it. Only a config that says its `core.repositoryformatversion` counts: git sets
+/// one without it aside. With `extensions.worktreeConfig`, `config.worktree` overrides both. A linked
+/// worktree's own git directory ignores the shared settings.
+fn configured(
+	mut layout: RepositoryLayout,
+	resolve: Worktree,
+) -> Result<RepositoryLayout, DiscoveryError> {
+	if layout.git_dir != layout.common_dir {
+		return Ok(layout);
+	}
+	let Some(shared) = read_config(&layout.git_dir.join("config"))? else {
+		return Ok(layout);
+	};
+	if shared
+		.get_raw("core", None, "repositoryformatversion")
+		.is_none()
+	{
+		return Ok(layout);
+	}
+	// With `extensions.worktreeConfig`, the checkout's own `config.worktree` wins over the shared
+	// config, as git's setup takes it (probed vs git 2.55).
+	let own = if shared
+		.get_bool("extensions", None, "worktreeconfig")
+		.ok()
+		.flatten()
+		== Some(true)
+	{
+		read_config(&layout.git_dir.join("config.worktree"))?
+	} else {
+		None
+	};
+	let worktree = own
+		.as_ref()
+		.and_then(|config| config.get_raw("core", None, "worktree"))
+		.or_else(|| shared.get_raw("core", None, "worktree"));
+	let bare = own
+		.as_ref()
+		.and_then(|config| config.get_bool("core", None, "bare").ok().flatten())
+		.or_else(|| shared.get_bool("core", None, "bare").ok().flatten());
+	if bare == Some(true) {
+		layout.worktree_root = None;
+		layout.bare_and_worktree = matches!(worktree, Some(Some(_)));
+		return Ok(layout);
+	}
+	let Some(Some(worktree)) = worktree else {
+		return Ok(layout);
+	};
+	if resolve == Worktree::Skipped {
+		return Ok(layout);
+	}
+	let path = layout.git_dir.join("config");
+	let worktree = path_from_bytes(&worktree).ok_or(DiscoveryError::MalformedConfig { path })?;
+	// An empty value names no folder: git refuses every command ("cannot chdir to ''", probed vs
+	// git 2.55), as for a missing work tree.
+	if worktree.as_os_str().is_empty() {
+		return Err(DiscoveryError::MissingWorktree {
+			path: worktree,
+			source: std::io::Error::from(ErrorKind::NotFound),
+		});
+	}
+	let raw = if worktree.is_absolute() {
+		worktree
+	} else {
+		layout.git_dir.join(worktree)
+	};
+	let root =
+		canonicalize(&raw).map_err(|source| DiscoveryError::MissingWorktree { path: raw, source })?;
+	// The git folder itself (`.`, `../.git`) or a folder inside it: its files would be work-tree
+	// files to every command. git accepts it; refused here.
+	if root.starts_with(&layout.git_dir) || root.starts_with(&layout.common_dir) {
+		return Err(DiscoveryError::WorktreeInGitDir { path: root });
+	}
+	layout.worktree_root = Some(root);
+	Ok(layout)
+}
+
+/// The config file at `path`, read byte for byte (a value needn't be UTF-8); `None` if there's none.
+fn read_config(path: &Path) -> Result<Option<gitana_config::GitConfigBytes>, DiscoveryError> {
+	let bytes = match std::fs::read(path) {
+		Ok(bytes) => bytes,
+		Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+		Err(source) => {
+			return Err(DiscoveryError::UnreadableConfig {
+				path: path.to_path_buf(),
+				source,
+			});
+		}
+	};
+	gitana_config::GitConfigBytes::parse(&bytes)
+		.map(Some)
+		.map_err(|_| DiscoveryError::MalformedConfig {
+			path: path.to_path_buf(),
+		})
 }
 
 /// Resolve a linked worktree's `.git` file to its canonical per-worktree git directory. The file holds

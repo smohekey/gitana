@@ -95,7 +95,7 @@ pub async fn run(
 	if matches!(&action, Action::Update { depth: Some(0), .. }) {
 		return Err(anyhow!("--depth must be a positive number of commits"));
 	}
-	let (layout, _command_cwd, prefix) = repo::discover_worktree_with_prefix(cwd).await?;
+	let (layout, command_cwd, prefix) = repo::discover_worktree_with_prefix(cwd).await?;
 	let prefix = prefix
 		.as_utf8()
 		.ok_or_else(|| anyhow!("submodule command prefix is not representable as UTF-8: {prefix}"))?
@@ -105,6 +105,12 @@ pub async fn run(
 		.as_ref()
 		.ok_or_else(|| anyhow!("submodule operations require a working tree"))?
 		.clone();
+	// Run from outside the work tree (from where `.git` is, `core.worktree` putting the work tree
+	// elsewhere), git's submodule commands refuse: "git-submodule cannot be used without a working
+	// tree" (probed vs git 2.55).
+	if !command_cwd.starts_with(&worktree_root) {
+		return Err(anyhow!("submodule cannot be used without a working tree"));
+	}
 	let identity = repo::capture_worktree_layout_identity(&layout)?;
 	if let Action::SetBranch { branch, path } = action {
 		return run_set_branch(&layout, identity, branch, path).await;
@@ -189,7 +195,8 @@ pub async fn run(
 			.map_err(|error| anyhow!("opening {}: {error}", layout.git_dir.display()))?,
 		&layout.common_dir,
 		&layout.git_dir,
-	);
+	)
+	.with_marker_root(layout.marker_root.clone());
 	let superproject = configuration.reload().await?;
 	let hash_kind = configuration.hash_kind().await?;
 	let context = SubmoduleContext::new(
@@ -627,7 +634,8 @@ pub(crate) async fn update_published_clone(
 	.await?;
 	repo::ensure_no_pending_deinit_at(&root_layout, &common, &git)?;
 	let configuration =
-		WorktreeConfiguration::new(common, git, &root_layout.common_dir, &root_layout.git_dir);
+		WorktreeConfiguration::new(common, git, &root_layout.common_dir, &root_layout.git_dir)
+			.with_marker_root(root_layout.marker_root.clone());
 	configuration
 		.apply_init(&[], &active_pathspecs, lease)
 		.await?;
@@ -1214,7 +1222,8 @@ async fn open_level(
 			.map_err(|error| anyhow!("opening {}: {error}", layout.git_dir.display()))?,
 		&layout.common_dir,
 		&layout.git_dir,
-	);
+	)
+	.with_marker_root(layout.marker_root.clone());
 	let superproject = Box::pin(configuration.reload()).await?;
 	let hash_kind = Box::pin(configuration.hash_kind()).await?;
 	setup.validate()?;
@@ -1636,7 +1645,9 @@ mod tests {
 		std::fs::create_dir(&worktree).unwrap();
 		std::fs::create_dir(&module).unwrap();
 		let layout = repo::RepositoryLayout {
+			bare_and_worktree: false,
 			worktree_root: Some(std::fs::canonicalize(&worktree).unwrap()),
+			marker_root: Some(std::fs::canonicalize(&worktree).unwrap()),
 			git_dir: std::fs::canonicalize(&module).unwrap(),
 			common_dir: std::fs::canonicalize(&module).unwrap(),
 		};

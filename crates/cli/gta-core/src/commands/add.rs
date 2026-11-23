@@ -38,6 +38,13 @@ struct Add<'a> {
 }
 
 impl WorkTreeCommand for Add<'_> {
+	/// The directory the command runs in once the repository is held: the work tree's top when run
+	/// from where `.git` is while `core.worktree` puts the work tree elsewhere, as git changes into it,
+	/// so a relative excludes file is found there.
+	fn set_command_directory(&mut self, path: std::path::PathBuf, _directory: cap_std::fs::Dir) {
+		self.cwd = path;
+	}
+
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
