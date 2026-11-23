@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +38,9 @@ impl CapWorkDir {
 		Self { dir }
 	}
 }
+
+/// The number in a write's private file name (`.gitana-write-<pid>-<number>`), taken afresh by each.
+static WRITE_NUMBER: AtomicU64 = AtomicU64::new(0);
 
 impl WorkDirFs for CapWorkDir {
 	fn uses_symlink_placeholders(&self) -> bool {
@@ -128,10 +131,50 @@ impl WorkDirFs for CapWorkDir {
 
 	fn write(&self, path: &GitPath, bytes: &[u8], executable: bool) -> io::Result<()> {
 		let native = native_path(path)?;
-		self.dir.write(&native, bytes)?;
-		// Normalise the mode either way, so replacing an executable file with a plain one (or the
-		// reverse) lands the right bit — mirroring git's checkout. A no-op where modes are absent.
-		set_exec(&self.dir, &native, executable)
+		// A new file renamed over the old, as git's checkout replaces a file rather than writing into
+		// it: a hard link to a file elsewhere is broken, not written through (probed vs git 2.55), a
+		// symlink in its place is replaced, not followed, and the file is never seen half-written.
+		let name = native
+			.file_name()
+			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a file needs a name"))?;
+		let parent = match native.parent() {
+			Some(parent) if !parent.as_os_str().is_empty() => self.dir.open_dir(parent)?,
+			_ => self.dir.try_clone()?,
+		};
+		// A private name of bounded length (not the destination's, which may be near the limit); one
+		// already taken is passed over for the next, never removed: it isn't this write's.
+		let mut options = cap_std::fs::OpenOptions::new();
+		options.write(true).create_new(true);
+		let (temporary, mut file) = loop {
+			let temporary = format!(
+				".gitana-write-{}-{}",
+				std::process::id(),
+				WRITE_NUMBER.fetch_add(1, Ordering::Relaxed)
+			);
+			match parent.open_with(&temporary, &options) {
+				Ok(file) => break (temporary, file),
+				Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+				Err(error) => return Err(error),
+			}
+		};
+		let identity = file_identity(&file)?;
+		let written = file.write_all(bytes).and_then(|()| {
+			// The mode either way, so replacing an executable file with a plain one (or the reverse)
+			// lands the right bit, as git's checkout does. A no-op where modes are absent.
+			set_exec_file(&file, executable)
+		});
+		drop(file);
+		let published = written.and_then(|()| publish_written(&parent, &temporary, name, identity));
+		match published {
+			Ok(()) => Ok(()),
+			Err(source) => match remove_failed_population_file(&parent, &temporary, identity) {
+				Ok(()) => Err(source),
+				Err(cleanup) => Err(io::Error::new(
+					source.kind(),
+					format!("{source}; removing the prepared file failed: {cleanup}"),
+				)),
+			},
+		}
 	}
 
 	fn populate_new(&self, path: &GitPath, entry: PopulationEntry<'_>) -> io::Result<bool> {
@@ -566,6 +609,37 @@ fn populate_regular_file<P: AsRef<Path>>(
 	}
 }
 
+/// Put the private file `temporary` in `dir` (written, with `identity`) at `name`, renamed over what's
+/// there, so the old file stays until the new one replaces it in one step (and stays if that fails):
+/// only while it's still the file written, so one swapped in meanwhile is refused and the old file
+/// kept; and one swapped in the instant between that check and the rename is reported, not taken
+/// for the file written.
+fn publish_written(
+	dir: &Dir,
+	temporary: &str,
+	name: &OsStr,
+	identity: EntryIdentity,
+) -> io::Result<()> {
+	if gitana_fs_native::entry_identity(dir, OsStr::new(temporary))? != identity {
+		return Err(io::Error::new(
+			io::ErrorKind::AlreadyExists,
+			"the file being written was replaced before it was put in place",
+		));
+	}
+	#[cfg(all(test, unix))]
+	if tests::PUBLICATION_FAILS.with(std::cell::Cell::get) {
+		return Err(io::Error::other("publication failed (test)"));
+	}
+	dir.rename(temporary, dir, name)?;
+	if gitana_fs_native::entry_identity(dir, name)? != identity {
+		return Err(io::Error::new(
+			io::ErrorKind::AlreadyExists,
+			"the file put in place was replaced as it was put there, so it isn't the file written",
+		));
+	}
+	Ok(())
+}
+
 fn create_population_temp(dir: &Dir) -> io::Result<(String, cap_std::fs::File)> {
 	for _ in 0..POPULATION_TEMP_ATTEMPTS {
 		let sequence = POPULATION_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -654,22 +728,10 @@ fn remove_failed_population_file(dir: &Dir, path: &str, identity: EntryIdentity)
 }
 
 #[cfg(unix)]
-fn set_exec(dir: &Dir, path: &std::path::Path, executable: bool) -> io::Result<()> {
-	use cap_std::fs::{Permissions, PermissionsExt};
-	let mode = if executable { 0o755 } else { 0o644 };
-	dir.set_permissions(path, Permissions::from_mode(mode))
-}
-
-#[cfg(unix)]
 fn set_exec_file(file: &cap_std::fs::File, executable: bool) -> io::Result<()> {
 	use cap_std::fs::{Permissions, PermissionsExt};
 	let mode = if executable { 0o755 } else { 0o644 };
 	file.set_permissions(Permissions::from_mode(mode))
-}
-
-#[cfg(not(unix))]
-fn set_exec(_dir: &Dir, _path: &std::path::Path, _executable: bool) -> io::Result<()> {
-	Ok(())
 }
 
 #[cfg(not(unix))]
@@ -679,11 +741,113 @@ fn set_exec_file(_file: &cap_std::fs::File, _executable: bool) -> io::Result<()>
 
 #[cfg(all(test, unix))]
 mod tests {
+	std::thread_local! {
+		/// Makes the next publication on this thread fail at the rename, as a filesystem that can't
+		/// do it would.
+		pub(super) static PUBLICATION_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+	}
+
+	/// A write whose publication fails leaves the old file as it was: it's replaced only by the
+	/// rename that puts the new one in place.
+	#[test]
+	fn a_failed_publication_keeps_the_old_file() {
+		let temp = tempfile::tempdir().unwrap();
+		let work =
+			CapWorkDir::from_dir(Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap());
+		std::fs::write(temp.path().join("a.txt"), "old\n").unwrap();
+		PUBLICATION_FAILS.with(|fails| fails.set(true));
+		let failed = work.write(&GitPath::from_utf8("a.txt").unwrap(), b"new\n", false);
+		PUBLICATION_FAILS.with(|fails| fails.set(false));
+		assert!(failed.is_err());
+		assert_eq!(std::fs::read(temp.path().join("a.txt")).unwrap(), b"old\n");
+	}
 	use std::os::unix::fs::symlink;
 
 	use cap_std::ambient_authority;
 
 	use super::*;
+
+	/// A file hard-linked to one outside the work tree is replaced, as git replaces it: the outside
+	/// file keeps its content, and the work-tree file stands alone.
+	#[test]
+	fn a_write_breaks_a_hard_link_rather_than_writing_through_it() {
+		use std::os::unix::fs::MetadataExt;
+		let temp = tempfile::tempdir().unwrap();
+		let work_path = temp.path().join("work");
+		std::fs::create_dir(&work_path).unwrap();
+		let outside = temp.path().join("outside");
+		std::fs::write(&outside, "outside, precious\n").unwrap();
+		std::fs::hard_link(&outside, work_path.join("a.txt")).unwrap();
+		let work =
+			CapWorkDir::from_dir(Dir::open_ambient_dir(&work_path, ambient_authority()).unwrap());
+		work
+			.write(&GitPath::from_utf8("a.txt").unwrap(), b"committed\n", false)
+			.unwrap();
+		assert_eq!(std::fs::read(&outside).unwrap(), b"outside, precious\n");
+		assert_eq!(
+			std::fs::read(work_path.join("a.txt")).unwrap(),
+			b"committed\n"
+		);
+		assert_eq!(
+			std::fs::metadata(work_path.join("a.txt")).unwrap().nlink(),
+			1
+		);
+		let names: Vec<_> = std::fs::read_dir(&work_path)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.collect();
+		assert_eq!(names, ["a.txt"], "no private file left behind");
+	}
+
+	/// A private file swapped for another before it's put in place (as another process could while a
+	/// large file is written) is refused: the swapped-in file isn't published, and the old file stays.
+	#[test]
+	fn a_swapped_private_file_is_not_published() {
+		let temp = tempfile::tempdir().unwrap();
+		let dir = Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap();
+		std::fs::write(temp.path().join("a.txt"), "old\n").unwrap();
+		let mut options = cap_std::fs::OpenOptions::new();
+		options.write(true).create_new(true);
+		let mut file = dir.open_with(".gitana-write-test", &options).unwrap();
+		file.write_all(b"mine\n").unwrap();
+		let identity = file_identity(&file).unwrap();
+		drop(file);
+		// Made while the written file still exists, so it can't take that file's inode.
+		std::fs::write(temp.path().join("swapped"), "swapped\n").unwrap();
+		std::fs::rename(
+			temp.path().join("swapped"),
+			temp.path().join(".gitana-write-test"),
+		)
+		.unwrap();
+		let refused =
+			publish_written(&dir, ".gitana-write-test", OsStr::new("a.txt"), identity).unwrap_err();
+		assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists);
+		assert_eq!(std::fs::read(temp.path().join("a.txt")).unwrap(), b"old\n");
+	}
+
+	/// A file already at the name a write would take for its private file isn't touched (the write
+	/// takes the next), and a destination name near the length limit can still be written.
+	#[test]
+	fn a_write_leaves_others_files_alone_and_takes_long_names() {
+		let temp = tempfile::tempdir().unwrap();
+		let work =
+			CapWorkDir::from_dir(Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap());
+		let next = WRITE_NUMBER.load(Ordering::Relaxed);
+		let decoy = temp
+			.path()
+			.join(format!(".gitana-write-{}-{next}", std::process::id()));
+		std::fs::write(&decoy, "someone else's\n").unwrap();
+		work
+			.write(&GitPath::from_utf8("a.txt").unwrap(), b"mine\n", false)
+			.unwrap();
+		assert_eq!(std::fs::read(&decoy).unwrap(), b"someone else's\n");
+		assert_eq!(std::fs::read(temp.path().join("a.txt")).unwrap(), b"mine\n");
+		let long = "a".repeat(250);
+		work
+			.write(&GitPath::from_utf8(&long).unwrap(), b"long\n", false)
+			.unwrap();
+		assert_eq!(std::fs::read(temp.path().join(&long)).unwrap(), b"long\n");
+	}
 
 	/// A named pipe where a file was expected is refused at once, not waited on for a writer.
 	#[test]
