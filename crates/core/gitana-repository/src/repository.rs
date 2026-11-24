@@ -944,6 +944,29 @@ where
 		crate::revision::rev_list(self, tips).await
 	}
 
+	/// The commits `include` reaches that `exclude` doesn't (`rev-list <include> ^<exclude>`), newest
+	/// first by committer date; the walk stops where only excluded history is left rather than
+	/// visiting all of it.
+	pub async fn rev_list_excluding(
+		&self,
+		include: &[ObjectId<H>],
+		exclude: &[ObjectId<H>],
+	) -> Result<Vec<ObjectId<H>>, RepositoryError> {
+		crate::revision::rev_list_excluding(self, include, exclude).await
+	}
+
+	/// Which of `commits` the `tips` reach, each mapped to the index of the first of `tips` (in
+	/// the order given) that reaches it. One walk over all the tips, stopping below the oldest of
+	/// `commits` (with a margin for skewed dates) rather than visiting all history, so under skewed
+	/// commit clocks a reachable commit can be missed (see the walk's own documentation).
+	pub async fn reachable_among(
+		&self,
+		tips: &[ObjectId<H>],
+		commits: &[ObjectId<H>],
+	) -> Result<std::collections::HashMap<ObjectId<H>, usize>, RepositoryError> {
+		crate::revision::reachable_among(self, tips, commits).await
+	}
+
 	/// The best common ancestor(s) — merge bases — of `commits`; empty if they share no ancestor.
 	pub async fn merge_base(
 		&self,

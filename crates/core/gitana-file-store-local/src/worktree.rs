@@ -121,6 +121,9 @@ impl WorktreeFileStore {
 /// repositories owned by this checkout). gitana's other refs (`refs/heads`, `refs/tags`,
 /// `refs/remotes`) are shared.
 ///
+/// It's the store's own routing rule, public so that a caller holding a worktree's folders finds a
+/// path's file where [`WorktreeFileStore`] keeps it.
+///
 /// Routing the operation state per-worktree is critical: otherwise a rebase/cherry-pick/revert
 /// started in one linked worktree would be visible — and `--abort`/`--continue`-able — from another,
 /// mutating the wrong branch. A `<path>.lock` always routes with `<path>` (a ref transaction or index
@@ -128,7 +131,7 @@ impl WorktreeFileStore {
 /// `HEAD.lock`, `ORIG_HEAD.lock`, `index.lock`, etc. follow their targets, while a shared ref's lock
 /// (`refs/heads/main.lock`) stays shared. Refs cannot themselves end in `.lock` (git forbids it), so
 /// stripping the suffix is unambiguous.
-fn is_per_worktree(path: &[u8]) -> bool {
+pub fn is_per_worktree(path: &[u8]) -> bool {
 	if let Some(base) = path.strip_suffix(b".lock") {
 		return is_per_worktree(base);
 	}

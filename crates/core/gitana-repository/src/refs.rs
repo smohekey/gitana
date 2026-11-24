@@ -280,8 +280,9 @@ where
 
 	/// List refs under `prefix` (e.g. `refs/heads/`), merging `packed-refs` with
 	/// loose ref files (loose wins). Recurses into subdirectories so hierarchical
-	/// names (`refs/heads/feature/x`) are included. Symbolic loose refs are skipped.
-	/// Returns `(full ref name, oid)` pairs sorted by name.
+	/// names (`refs/heads/feature/x`) are included. Symbolic loose refs are skipped, and so are
+	/// names git would reject (`refs/heads/main~`, an editor's backup; a `.lock` file), as git's own
+	/// listings skip them. Returns `(full ref name, oid)` pairs sorted by name.
 	pub async fn list(&self, prefix: &str) -> Result<Vec<(String, ObjectId<H>)>, RepositoryError> {
 		use std::collections::BTreeMap;
 		let mut refs: BTreeMap<String, ObjectId<H>> = BTreeMap::new();
@@ -299,6 +300,9 @@ where
 					let name = std::str::from_utf8(name).map_err(|_| {
 						RepositoryError::InvalidRef(format!("packed ref under {prefix} is not UTF-8"))
 					})?;
+					if !is_valid_refname(name) {
+						continue;
+					}
 					refs.insert(name.to_owned(), parse_oid(name, oid)?);
 				}
 			}
@@ -309,11 +313,16 @@ where
 		while let Some(dir) = stack.pop() {
 			for path in self.files.list_prefix(&dir).await? {
 				match self.files.read_path(&path).await {
+					// A name git would reject isn't a ref (and overrides nothing packed: a packed
+					// entry under it is skipped too).
+					Ok(_) if !is_valid_refname(&path) => {}
 					Ok(bytes) => {
 						let text = std::str::from_utf8(&bytes).map(str::trim).unwrap_or("");
-						if !text.starts_with("ref:")
-							&& let Ok(oid) = ObjectId::from_hex(text)
-						{
+						if text.starts_with("ref:") {
+							// A symbolic ref is skipped, and so is any older packed value under its
+							// name, which the loose file now overrides.
+							refs.remove(&path);
+						} else if let Ok(oid) = ObjectId::from_hex(text) {
 							refs.insert(path, oid);
 						}
 					}
@@ -362,8 +371,11 @@ where
 		Ok(ids)
 	}
 
-	/// Enumerate every loose symbolic ref under `prefix`, including refs whose target is unborn.
-	pub(crate) async fn symbolic_refs(
+	/// Every loose symbolic ref under `prefix` (packed refs can't be symbolic), as `(name, target)`
+	/// in name order, including refs whose target is unborn: what [`Self::list`] leaves out, for a
+	/// caller that needs the names and where they lead (follow a chain with
+	/// [`Self::read_symbolic`]).
+	pub async fn symbolic_refs(
 		&self,
 		prefix: &str,
 	) -> Result<Vec<(String, String)>, RepositoryError> {
@@ -372,6 +384,8 @@ where
 		while let Some(dir) = stack.pop() {
 			for path in self.files.list_prefix(&dir).await? {
 				match self.files.read_path(&path).await {
+					// A name git would reject isn't a ref, as in `list`.
+					Ok(_) if !is_valid_refname(&path) => {}
 					Ok(bytes) => {
 						let text = std::str::from_utf8(&bytes).map(str::trim).unwrap_or("");
 						if let Some(target) = text.strip_prefix("ref:") {
@@ -2543,7 +2557,9 @@ where
 				let text = std::str::from_utf8(&bytes)
 					.map_err(|_| RepositoryError::InvalidRef(name.to_owned()))?
 					.trim();
-				Ok(text.strip_prefix("ref: ").map(|t| t.trim().to_owned()))
+				// `ref:` with or without the space git writes, as git reads it and as this store's own
+				// resolution does.
+				Ok(text.strip_prefix("ref:").map(|t| t.trim().to_owned()))
 			}
 			Err(FileStoreError::NotFound) => Ok(None),
 			Err(other) => Err(other.into()),
@@ -2656,6 +2672,13 @@ where
 				.await?;
 		}
 		Ok(())
+	}
+
+	/// Whether an update of `name` appends a reflog entry, by the rule this store's own writes follow:
+	/// git's `core.logAllRefUpdates` (namespace and bare-repository defaults), or a reflog for `name`
+	/// that already exists (git always appends to one).
+	pub async fn logs_updates_of(&self, name: &str) -> Result<bool, RepositoryError> {
+		self.should_log(name, self.reflog_policy().await?).await
 	}
 
 	/// Whether *creating* a new reflog for `name` is enabled under this repo's `core.logAllRefUpdates`

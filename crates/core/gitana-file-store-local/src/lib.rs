@@ -53,7 +53,7 @@ use tokio::sync::Mutex as AsyncMutex;
 // serves both targets — a component can construct it from two `wasi:filesystem` descriptors; only
 // its cap-std `Dir` convenience constructor is native-only (see `worktree.rs`).
 mod worktree;
-pub use worktree::WorktreeFileStore;
+pub use worktree::{WorktreeFileStore, is_per_worktree};
 
 mod worker_keepalive_backend;
 use worker_keepalive_backend::WorkerKeepaliveBackend;

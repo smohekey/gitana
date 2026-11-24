@@ -4,7 +4,7 @@
 //! (with a search order), `HEAD`/`@`, `~n`, `^n`, `^{type}` — and walks commits in
 //! committer-date order. Abbreviated-oid resolution spans loose and packed objects.
 
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use gitana_file_store::FileStore;
 use gitana_object::{
@@ -176,6 +176,235 @@ pub(crate) async fn rev_list<H: HashAlgorithm>(
 		}
 	}
 	Ok(out)
+}
+
+/// How many more commits a bounded walk ([`rev_list_excluding`], [`reachable_among`]) takes once it
+/// could stop, git's `SLOP`: a margin for commit dates that run backwards (a child dated before its
+/// parent).
+const SLOP: usize = 5;
+
+/// A commit's committer date and parents (none at the shallow boundary), read once.
+async fn date_and_parents<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	id: ObjectId<H>,
+	shallow: &HashSet<ObjectId<H>>,
+) -> Result<(i64, Vec<ObjectId<H>>), RepositoryError> {
+	let commit = read_commit(repo, id).await?;
+	let date = Signature::parse(&commit.committer)?.seconds;
+	let parents = if shallow.contains(&id) {
+		Vec::new()
+	} else {
+		commit.parents
+	};
+	Ok((date, parents))
+}
+
+/// The commits `include` reaches that `exclude` doesn't — git's `rev-list <include> ^<exclude>` —
+/// newest first by committer date, as [`rev_list`] orders them. Unlike [`rev_list`] it doesn't drain
+/// history: it walks both sides in date order and stops as git's `limit_list` does, once every queued
+/// commit is excluded and older than the oldest one listed, plus [`SLOP`] more, so its cost is the
+/// history between them, not all of it. As in git, an excluded commit's exclusion passes at once
+/// through every commit already read (queued or walked) to their parents. Exact while commit dates
+/// don't run backwards further than that margin, as git's is. The shallow boundary is honoured as
+/// [`rev_list`] honours it.
+pub(crate) async fn rev_list_excluding<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	include: &[ObjectId<H>],
+	exclude: &[ObjectId<H>],
+) -> Result<Vec<ObjectId<H>>, RepositoryError> {
+	let shallow = shallow_set(repo).await?;
+	let mut heap: BinaryHeap<(i64, ObjectId<H>)> = BinaryHeap::new();
+	// The parents of every commit read so far, so an exclusion passes through them.
+	let mut parents_of: HashMap<ObjectId<H>, Vec<ObjectId<H>>> = HashMap::new();
+	let mut pending: HashSet<ObjectId<H>> = HashSet::new();
+	let mut hidden: HashSet<ObjectId<H>> = HashSet::new();
+	// Queued commits not (yet) known to be excluded: while there are any, the walk goes on.
+	let mut visible: usize = 0;
+
+	let mut tips = Vec::new();
+	for tip in exclude {
+		let commit = peel_to_commit(repo, *tip).await?;
+		hidden.insert(commit);
+		tips.push(commit);
+	}
+	for tip in include {
+		tips.push(peel_to_commit(repo, *tip).await?);
+	}
+	for commit in tips {
+		if let std::collections::hash_map::Entry::Vacant(entry) = parents_of.entry(commit) {
+			let (date, parents) = date_and_parents(repo, commit, &shallow).await?;
+			entry.insert(parents);
+			pending.insert(commit);
+			if !hidden.contains(&commit) {
+				visible += 1;
+			}
+			heap.push((date, commit));
+		}
+	}
+	// The excluded tips' own parents are excluded too, as soon as they're known.
+	let excluded: Vec<ObjectId<H>> = hidden.iter().copied().collect();
+	for commit in excluded {
+		hide_beyond(commit, &parents_of, &mut hidden, &pending, &mut visible);
+	}
+
+	let mut out = Vec::new();
+	// The date of the oldest commit listed so far: an excluded commit queued at or after it may
+	// still reach one of them.
+	let mut oldest_listed: Option<i64> = None;
+	let mut slop = SLOP;
+	while let Some((date, id)) = heap.pop() {
+		pending.remove(&id);
+		let was_hidden = hidden.contains(&id);
+		if !was_hidden {
+			visible -= 1;
+		}
+		let parents = parents_of.get(&id).cloned().unwrap_or_default();
+		for parent in parents {
+			if let std::collections::hash_map::Entry::Vacant(entry) = parents_of.entry(parent) {
+				let (parent_date, grandparents) = date_and_parents(repo, parent, &shallow).await?;
+				entry.insert(grandparents);
+				pending.insert(parent);
+				if !hidden.contains(&parent) {
+					visible += 1;
+				}
+				heap.push((parent_date, parent));
+				// Reached from an excluded commit: excluded, and what it leads to as far as known.
+				if hidden.contains(&parent) {
+					hide_beyond(parent, &parents_of, &mut hidden, &pending, &mut visible);
+				}
+			}
+		}
+		if was_hidden {
+			hide_beyond(id, &parents_of, &mut hidden, &pending, &mut visible);
+			let newest_queued = heap.peek().map(|(date, _)| *date);
+			let may_reach_listed = matches!(
+				(oldest_listed, newest_queued),
+				(Some(listed), Some(queued)) if listed <= queued
+			);
+			if visible > 0 || may_reach_listed {
+				slop = SLOP;
+				continue;
+			}
+			slop -= 1;
+			if slop == 0 {
+				break;
+			}
+			continue;
+		}
+		oldest_listed = Some(date);
+		out.push(id);
+	}
+	out.retain(|id| !hidden.contains(id));
+	Ok(out)
+}
+
+/// Excludes everything `commit` (excluded) leads to, as far as the commits read so far tell
+/// (`parents_of`), keeping `visible` the count of queued commits not excluded.
+fn hide_beyond<H: HashAlgorithm>(
+	commit: ObjectId<H>,
+	parents_of: &HashMap<ObjectId<H>, Vec<ObjectId<H>>>,
+	hidden: &mut HashSet<ObjectId<H>>,
+	pending: &HashSet<ObjectId<H>>,
+	visible: &mut usize,
+) {
+	let mut stack: Vec<ObjectId<H>> = parents_of.get(&commit).cloned().unwrap_or_default();
+	while let Some(next) = stack.pop() {
+		if hidden.insert(next) {
+			if pending.contains(&next) {
+				*visible -= 1;
+			}
+			if let Some(further) = parents_of.get(&next) {
+				stack.extend(further.iter().copied());
+			}
+		}
+	}
+}
+
+/// Which of `commits` the `tips` reach, and the first of `tips` (in the order given) that reaches
+/// each: a map from each commit reached to that tip's index. One walk over all the tips at once,
+/// newest first by committer date, each commit carrying the earliest tip that reaches it; it stops
+/// once neither the commit just taken nor anything queued is as new as the oldest of them, plus
+/// [`SLOP`] more commits taken, since an older commit can't lead to a newer one. Its cost is the history no older than `commits`, once, however many tips.
+///
+/// It's a bound, not proof: under skewed commit clocks a reachable commit can be missed, where the
+/// path to it runs through commits dated before it and the margin, counted over every commit taken
+/// (a merge's other parents' lines use it up too), runs out first; and the tip named can then be a
+/// later one than the first. Exact where commit dates don't run backwards. git's exact
+/// `--contains` uses generation numbers, which gitana doesn't have. The shallow boundary is
+/// honoured as [`rev_list`] honours it.
+pub(crate) async fn reachable_among<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	tips: &[ObjectId<H>],
+	commits: &[ObjectId<H>],
+) -> Result<HashMap<ObjectId<H>, usize>, RepositoryError> {
+	let mut wanted: HashSet<ObjectId<H>> = HashSet::new();
+	let mut oldest: Option<i64> = None;
+	for commit in commits {
+		let commit = peel_to_commit(repo, *commit).await?;
+		if wanted.insert(commit) {
+			let date = committer_seconds(repo, commit).await?;
+			oldest = Some(oldest.map_or(date, |oldest: i64| oldest.min(date)));
+		}
+	}
+	let Some(oldest) = oldest else {
+		return Ok(HashMap::new());
+	};
+	let shallow = shallow_set(repo).await?;
+	let mut heap: BinaryHeap<(i64, ObjectId<H>)> = BinaryHeap::new();
+	// Every commit read, its parents, and the earliest tip found to reach it.
+	let mut parents_of: HashMap<ObjectId<H>, Vec<ObjectId<H>>> = HashMap::new();
+	let mut first: HashMap<ObjectId<H>, usize> = HashMap::new();
+	for (index, tip) in tips.iter().enumerate() {
+		let commit = peel_to_commit(repo, *tip).await?;
+		if let std::collections::hash_map::Entry::Vacant(entry) = parents_of.entry(commit) {
+			let (date, parents) = date_and_parents(repo, commit, &shallow).await?;
+			entry.insert(parents);
+			first.insert(commit, index);
+			heap.push((date, commit));
+		}
+	}
+	// Taking one of `commits` doesn't settle it: a commit of the same date taken after it can still
+	// bring an earlier tip to it, so the walk goes on through everything no older than them.
+	let mut slop = SLOP;
+	while let Some((date, id)) = heap.pop() {
+		let index = first[&id];
+		for parent in parents_of.get(&id).cloned().unwrap_or_default() {
+			if let std::collections::hash_map::Entry::Vacant(entry) = parents_of.entry(parent) {
+				let (parent_date, grandparents) = date_and_parents(repo, parent, &shallow).await?;
+				entry.insert(grandparents);
+				first.insert(parent, index);
+				heap.push((parent_date, parent));
+			} else {
+				// Reached before by a later tip: this one comes first, and so it does for what that
+				// commit leads to, as far as read.
+				let mut stack = vec![parent];
+				while let Some(next) = stack.pop() {
+					if first.get(&next).is_some_and(|known| *known > index) {
+						first.insert(next, index);
+						if let Some(further) = parents_of.get(&next) {
+							stack.extend(further.iter().copied());
+						}
+					}
+				}
+			}
+		}
+		// Done only once neither the commit just taken nor anything queued (its parents included)
+		// is as new as the oldest one asked about.
+		if date >= oldest || heap.peek().is_some_and(|(queued, _)| *queued >= oldest) {
+			slop = SLOP;
+			continue;
+		}
+		slop -= 1;
+		if slop == 0 {
+			break;
+		}
+	}
+	Ok(
+		first
+			.into_iter()
+			.filter(|(id, _)| wanted.contains(id))
+			.collect(),
+	)
 }
 
 /// The commit's parents, honoring the shallow boundary: a commit in `shallow` is treated as having no
