@@ -1167,7 +1167,7 @@ mod native {
 		fn a_taken_name_moves_to_the_next_suffix_and_is_left_alone() {
 			type Prepare = fn(&Path);
 			type Verify = fn(&Path);
-			let mut cases: Vec<(&str, Prepare, Verify)> = vec![
+			let cases: Vec<(&str, Prepare, Verify)> = vec![
 				(
 					"file",
 					|p| std::fs::write(p, b"not a dir").unwrap(),
@@ -1189,16 +1189,16 @@ mod native {
 						assert_eq!(std::fs::read_dir(p).unwrap().count(), 1);
 					},
 				),
+				#[cfg(unix)]
+				(
+					"dangling-symlink",
+					|p| std::os::unix::fs::symlink(p.with_file_name("nowhere"), p).unwrap(),
+					|p| {
+						assert!(p.symlink_metadata().unwrap().file_type().is_symlink());
+						assert_eq!(std::fs::read_link(p).unwrap(), p.with_file_name("nowhere"));
+					},
+				),
 			];
-			#[cfg(unix)]
-			cases.push((
-				"dangling-symlink",
-				|p| std::os::unix::fs::symlink(p.with_file_name("nowhere"), p).unwrap(),
-				|p| {
-					assert!(p.symlink_metadata().unwrap().file_type().is_symlink());
-					assert_eq!(std::fs::read_link(p).unwrap(), p.with_file_name("nowhere"));
-				},
-			));
 			for (tag, prepare, verify) in cases {
 				let worktrees = fresh_worktrees(tag);
 				let taken = worktrees.join("wt");

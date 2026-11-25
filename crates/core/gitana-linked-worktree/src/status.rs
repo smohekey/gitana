@@ -808,11 +808,11 @@ mod native {
 			.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 	}
 
-	#[cfg(test)]
+	// Its one test needs hard links and a unix temp layout.
+	#[cfg(all(test, unix))]
 	mod tests {
 		use super::gitfile_entry_name;
 
-		#[cfg(unix)]
 		#[test]
 		fn gitfile_entry_name_is_the_pointers_real_name_not_a_hardlink() {
 			use std::sync::atomic::{AtomicU32, Ordering};
