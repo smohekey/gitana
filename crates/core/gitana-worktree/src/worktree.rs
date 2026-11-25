@@ -2382,8 +2382,9 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 
 	/// Replace the last commit, `expected`, with one made from the staged index, with `message`, as
 	/// `git commit --amend -m` does: the same parents (none at the shallow boundary, as git sees
-	/// them), the replaced commit's author and other headers (not its signature, nor its
-	/// `encoding`), `identity` as committer; the ref at the end of `chain` (or `HEAD` itself,
+	/// them), the replaced commit's author (in UTF-8, converted by its `encoding` header as git
+	/// converts it, [`decode_commit`](gitana_object::decode_commit)) and other headers (not its
+	/// signature, nor its `encoding`), `identity` as committer; the ref at the end of `chain` (or `HEAD` itself,
 	/// detached) moved from `expected` by compare-and-set, with git's reflog line
 	/// `commit (amend): <subject>` on it and each symbolic ref on the way.
 	///

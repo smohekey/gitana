@@ -1253,7 +1253,15 @@ async fn a_commit_s_tree_and_history_are_read_whatever_its_text_s_encoding() {
 		repo.peel_to_tree(latin1).await.unwrap().to_hex(),
 		tree.trim()
 	);
+	assert_eq!(
+		repo.rev_parse("HEAD~1^{tree}").await.unwrap().to_hex(),
+		tree.trim()
+	);
 	let three = repo.rev_parse("HEAD").await.unwrap();
+	assert_eq!(
+		repo.merge_base(&[three, latin1]).await.unwrap(),
+		vec![latin1]
+	);
 	let one = repo.rev_parse("HEAD~2").await.unwrap();
 	let listed: Vec<String> = repo
 		.rev_list_excluding(&[three], &[one])

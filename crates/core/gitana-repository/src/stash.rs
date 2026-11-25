@@ -90,7 +90,7 @@ pub(crate) async fn files<F: FileStore, H: HashAlgorithm>(
 	let Some(entry) = list(repo).await?.into_iter().nth(index) else {
 		return Ok(None);
 	};
-	let commit = crate::revision::read_commit(repo, entry.commit).await?;
+	let commit = crate::revision::read_links(repo, entry.commit).await?;
 	let Some(base) = commit.parents.first() else {
 		return Err(RepositoryError::InvalidRef(format!(
 			"{} is not a stash-like commit",

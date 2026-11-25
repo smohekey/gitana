@@ -3,10 +3,11 @@
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
-use gitana_object::{Commit, HashAlgorithm, ObjectId, parse_commit};
+use gitana_object::{Commit, HashAlgorithm, ObjectId, decode_commit};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
 
+use crate::Written;
 use crate::conflict;
 use crate::{Identity, Signer, signing};
 
@@ -14,7 +15,10 @@ use crate::{Identity, Signer, signing};
 #[derive(Debug)]
 pub enum RevertOutcome<H: HashAlgorithm> {
 	/// A new single-parent commit undoing the target (authored by the current user) was recorded.
-	Reverted { commit: ObjectId<H> },
+	/// `repaired`: the reverted commit's subject, which its message quotes, had bytes that aren't
+	/// UTF-8, read as Latin-1, as git reads them and warns of
+	/// ([`Written::repaired`](crate::Written::repaired)).
+	Reverted { commit: ObjectId<H>, repaired: bool },
 	/// The revert conflicted; an in-progress revert has been materialised (`REVERT_HEAD`, `MERGE_MSG`,
 	/// a conflicted index and work tree). The caller renders the paths and signals failure.
 	Conflict { paths: Vec<gitana_path::GitPath> },
@@ -43,7 +47,7 @@ pub async fn revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	let target = repository
 		.rev_parse(&format!("{commit_spec}^{{commit}}"))
 		.await?;
-	let reverted = read_commit(repository, target).await?;
+	let (reverted, repaired) = read_reverted(repository, target).await?;
 	if reverted.parents.len() > 1 {
 		bail!(
 			"commit {commit_spec} is a merge but no mainline was given; reverting a merge is not supported"
@@ -123,22 +127,26 @@ pub async fn revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	repository
 		.record_commit(&branch, Some(head), new_commit, &committer, &message)
 		.await?;
-	Ok(RevertOutcome::Reverted { commit: new_commit })
+	Ok(RevertOutcome::Reverted {
+		commit: new_commit,
+		repaired,
+	})
 }
 
 /// Conclude an in-progress revert: a single-parent commit from the resolved index, authored by the
-/// current user, returning the new commit id. Shared by `revert --continue` (`message_override = None`,
+/// current user, returning the new commit and whether the reverted commit's subject its message
+/// quotes (unless `message_override` replaces it) was repaired. Shared by `revert --continue` (`message_override = None`,
 /// uses `MERGE_MSG`) and `gta commit` during a revert. Refuses while the index has unmerged stages.
 pub async fn continue_revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	wt: &WorkTree<F, W, H>,
 	message_override: Option<String>,
 	identity: &impl Identity,
 	signer: Option<&S>,
-) -> Result<ObjectId<H>> {
+) -> Result<Written<H>> {
 	let repository = wt.repository();
-	if repository.revert_head().await?.is_none() {
+	let Some(target) = repository.revert_head().await? else {
 		bail!("there is no revert in progress (REVERT_HEAD is missing)");
-	}
+	};
 
 	let tree = conflict::resolved_tree(wt).await?;
 	// Resolving back to HEAD's content leaves nothing to commit: git refuses an empty revert (leaving
@@ -150,16 +158,22 @@ pub async fn continue_revert<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Si
 	}
 	let author = identity.author().await?;
 	let committer = identity.committer().await?;
+	let message_override_given = message_override.is_some();
 	let message = match message_override {
 		Some(message) => message,
 		None => repository.merge_msg().await?.unwrap_or_default(),
 	};
 	let message = conflict::ensure_trailing_newline(message);
 
+	// The message comes from the reverted commit's subject (by `MERGE_MSG`) unless overridden.
+	let repaired = !message_override_given && read_reverted(repository, target).await?.1;
 	let new_commit =
 		signing::commit_on_head(repository, tree, &author, &committer, &message, signer).await?;
 	repository.clear_revert().await?;
-	Ok(new_commit)
+	Ok(Written {
+		commit: new_commit,
+		repaired,
+	})
 }
 
 /// Abort an in-progress revert: restore the work tree and index to the (unmoved) `HEAD` and clear the
@@ -182,13 +196,25 @@ fn revert_message<H: HashAlgorithm>(reverted: &Commit<H>, target: ObjectId<H>) -
 	format!("Revert \"{subject}\"\n\nThis reverts commit {target}.\n")
 }
 
-/// Read and parse a commit object.
-async fn read_commit<F: FileStore, H: HashAlgorithm>(
+/// Read the commit a revert undoes, its text in UTF-8 as git carries it ([`decode_commit`]), and
+/// whether its subject, which the revert's message quotes, had to be repaired: bytes that aren't
+/// UTF-8 in its first line, read as Latin-1.
+async fn read_reverted<F: FileStore, H: HashAlgorithm>(
 	repository: &Repository<F, H>,
 	oid: ObjectId<H>,
-) -> Result<Commit<H>> {
+) -> Result<(Commit<H>, bool)> {
 	let (_, payload) = repository.objects().read_object(&oid).await?;
-	Ok(parse_commit::<H>(&payload)?)
+	let decoded = decode_commit::<H>(&payload)?;
+	let message = payload
+		.windows(2)
+		.position(|pair| pair == b"\n\n")
+		.map_or(&[][..], |at| &payload[at + 2..]);
+	let subject = message
+		.split(|&byte| byte == b'\n')
+		.next()
+		.unwrap_or_default();
+	let repaired = decoded.repaired.message && std::str::from_utf8(subject).is_err();
+	Ok((decoded.commit, repaired))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -206,7 +232,7 @@ mod tests {
 		let outcome = revert(&wt, &b.to_hex(), &id, None::<&TestSigner>)
 			.await
 			.unwrap();
-		let RevertOutcome::Reverted { commit } = outcome else {
+		let RevertOutcome::Reverted { commit, .. } = outcome else {
 			panic!("expected a clean revert");
 		};
 		// The revert restores the prior content.

@@ -1,22 +1,26 @@
 //! A commit's tree, parents and committer time, read from its bytes.
 
-use gitana_object::{HashAlgorithm, ObjectError, ObjectId};
+use crate::{HashAlgorithm, ObjectError, ObjectId};
 
 /// What links a commit into history: its tree, its parents and when it was committed.
-pub(crate) struct CommitLinks<H: HashAlgorithm> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitLinks<H: HashAlgorithm> {
+	/// The tree it records.
 	pub tree: ObjectId<H>,
+	/// Its parents, in order.
 	pub parents: Vec<ObjectId<H>>,
-	/// The committer line's time, in seconds since the epoch.
-	pub committer_seconds: i64,
+	/// The committer line's time, in seconds since the epoch; `None` when the line is malformed (as
+	/// [`Signature::parse`](crate::Signature::parse) judges it), which a walk needing only parents or a
+	/// tree passes over and one ordered by date refuses.
+	pub committer_seconds: Option<i64>,
 }
 
 /// A commit's [`CommitLinks`], read from its raw `payload` without decoding its text: its message,
 /// names and other headers needn't be UTF-8 (git's `encoding` header writes them in another), as
-/// [`parse_commit`](gitana_object::parse_commit) requires. The lines are read as `parse_commit`
-/// reads them; a commit without a tree or committer line is malformed.
-pub(crate) fn commit_links<H: HashAlgorithm>(
-	payload: &[u8],
-) -> Result<CommitLinks<H>, ObjectError> {
+/// [`parse_commit`](crate::parse_commit) requires. For a caller that walks history or reads a
+/// commit's tree, and needs nothing of its text. The lines are read as `parse_commit` reads them; a
+/// commit without a tree or committer line, or whose tree or a parent isn't an id, is malformed.
+pub fn commit_links<H: HashAlgorithm>(payload: &[u8]) -> Result<CommitLinks<H>, ObjectError> {
 	let header = match payload.windows(2).position(|pair| pair == b"\n\n") {
 		Some(at) => &payload[..at],
 		None => payload,
@@ -34,7 +38,7 @@ pub(crate) fn commit_links<H: HashAlgorithm>(
 		} else if let Some(rest) = line.strip_prefix(b"parent ") {
 			parents.push(id(rest)?);
 		} else if let Some(rest) = line.strip_prefix(b"committer ") {
-			committer = Some(seconds(rest)?);
+			committer = Some(seconds(rest).ok());
 		}
 	}
 	Ok(CommitLinks {
@@ -45,7 +49,7 @@ pub(crate) fn commit_links<H: HashAlgorithm>(
 }
 
 /// The time in an identity line's bytes (`Name <email> seconds ±hhmm`), checked as
-/// [`Signature::parse`](gitana_object::Signature::parse) checks the line: an email in its last
+/// [`Signature::parse`](crate::Signature::parse) checks the line: an email in its last
 /// `<…>`, then the seconds and a `±hhmm` offset after it. The name is left undecoded.
 fn seconds(identity: &[u8]) -> Result<i64, ObjectError> {
 	let email_end = identity
@@ -75,7 +79,7 @@ fn seconds(identity: &[u8]) -> Result<i64, ObjectError> {
 
 #[cfg(test)]
 mod tests {
-	use gitana_object::Sha1;
+	use crate::Sha1;
 
 	use super::*;
 
@@ -89,14 +93,15 @@ mod tests {
 		commit_links::<Sha1>(&payload)
 	}
 
-	/// Read from bytes, a name or message that isn't UTF-8 is no matter; a committer line is held to
-	/// what `Signature::parse` holds it to, and a missing tree or committer is malformed.
+	/// Read from bytes, a name or message that isn't UTF-8 is no matter; a committer line's time is
+	/// read only if the line is what `Signature::parse` holds it to, its links read either way; a
+	/// missing tree or committer, or a tree that isn't an id, is malformed.
 	#[test]
 	fn a_commit_s_links_are_read_from_its_bytes_as_its_identity_lines_are_checked() {
 		let read = links(b"Andr\xe9 <a@e> 1700000000 +1300").unwrap();
 		assert_eq!(read.tree.to_hex(), TREE);
 		assert_eq!(read.parents.len(), 1);
-		assert_eq!(read.committer_seconds, 1_700_000_000);
+		assert_eq!(read.committer_seconds, Some(1_700_000_000));
 		for wrong in [
 			&b"A a@e> 1700000000 +0000"[..],
 			b"A <a@e>",
@@ -105,9 +110,30 @@ mod tests {
 			b"A <a@e> 1700000000 1300",
 			b"A <a@e> 1700000000 +13",
 		] {
-			assert!(links(wrong).is_err(), "{}", String::from_utf8_lossy(wrong));
+			let read = links(wrong).unwrap();
+			assert_eq!(
+				read.committer_seconds,
+				None,
+				"{}",
+				String::from_utf8_lossy(wrong)
+			);
+			assert_eq!(read.parents.len(), 1);
 		}
+		assert!(commit_links::<Sha1>(b"tree nope\ncommitter A <a@e> 1 +0000\n\nm\n").is_err());
 		assert!(commit_links::<Sha1>(format!("tree {TREE}\n\nmessage\n").as_bytes()).is_err());
 		assert!(commit_links::<Sha1>(b"committer A <a@e> 1 +0000\n\nmessage\n").is_err());
+	}
+
+	/// A pack's enumeration reads a commit in another encoding by its links: its tree and parent.
+	#[test]
+	fn a_commit_in_another_encoding_is_enumerated_by_its_links() {
+		let mut payload = format!("tree {TREE}\nparent {TREE}\n").into_bytes();
+		payload.extend_from_slice(b"author Andr\xe9 <a@e> 1 +0000\ncommitter C <c@e> 1 +0000\n");
+		payload.extend_from_slice(b"encoding ISO-8859-1\n\ncaf\xe9\n");
+		let tree = ObjectId::<Sha1>::from_hex(TREE).unwrap();
+		assert_eq!(
+			crate::referenced_ids::<Sha1>(crate::ObjectKind::Commit, &payload).unwrap(),
+			vec![tree, tree]
+		);
 	}
 }

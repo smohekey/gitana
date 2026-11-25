@@ -6,7 +6,7 @@ use std::pin::Pin;
 use crate::{Backend, PathQuoteMode};
 use anyhow::Result;
 use gitana_object::{
-	HashAlgorithm, ObjectId, ObjectKind, Signature, parse_commit, parse_tag, parse_tree,
+	HashAlgorithm, ObjectId, ObjectKind, Signature, decode_commit, parse_tag, parse_tree,
 };
 use gitana_repository::Repository;
 use gitana_worktree::diff_trees;
@@ -81,7 +81,7 @@ async fn show_commit<H: HashAlgorithm>(
 	payload: &[u8],
 	quote_non_ascii: bool,
 ) -> Result<()> {
-	let commit = parse_commit::<H>(payload)?;
+	let commit = decode_commit::<H>(payload)?.commit;
 	let mut out = Vec::new();
 	out.extend_from_slice(format!("commit {oid}\n").as_bytes());
 	let (ident, date) = split_signature(&commit.author);

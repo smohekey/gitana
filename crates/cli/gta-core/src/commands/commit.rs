@@ -100,25 +100,31 @@ impl WorkTreeCommand for Commit<'_> {
 			return Ok(());
 		}
 		if repo.cherry_pick_head().await?.is_some() {
-			let commit = gitana_porcelain::continue_cherry_pick(
+			let written = gitana_porcelain::continue_cherry_pick(
 				&worktree,
 				Some(self.message.to_owned()),
 				&identity,
 				signer,
 			)
 			.await?;
-			println!("{commit}");
+			if written.repaired {
+				crate::commands::guessed::warn_of_repair();
+			}
+			println!("{}", written.commit);
 			return Ok(());
 		}
 		if repo.revert_head().await?.is_some() {
-			let commit = gitana_porcelain::continue_revert(
+			let written = gitana_porcelain::continue_revert(
 				&worktree,
 				Some(self.message.to_owned()),
 				&identity,
 				signer,
 			)
 			.await?;
-			println!("{commit}");
+			if written.repaired {
+				crate::commands::guessed::warn_of_repair();
+			}
+			println!("{}", written.commit);
 			return Ok(());
 		}
 

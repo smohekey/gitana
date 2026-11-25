@@ -1788,6 +1788,7 @@ dependencies = [
 name = "gitana-object"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "flate2",
  "gitana-path",
  "proptest",

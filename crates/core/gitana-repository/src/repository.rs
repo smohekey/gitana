@@ -282,7 +282,7 @@ where
 			)));
 		}
 		// From its bytes: a commit's text needn't be UTF-8 for its tree to be read.
-		Ok(crate::commit_links::commit_links::<H>(&payload)?.tree)
+		Ok(gitana_object::commit_links::<H>(&payload)?.tree)
 	}
 
 	/// Write a commit object (no ref update), returning its id. `author` and

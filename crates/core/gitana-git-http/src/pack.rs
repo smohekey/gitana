@@ -9,8 +9,8 @@ use std::collections::HashSet;
 
 use gitana_file_store::FileStore;
 use gitana_object::{
-	HashAlgorithm, ObjectId, ObjectKind, PackedObject, encode_pack, encode_pack_with_bases,
-	parse_commit, referenced_ids,
+	HashAlgorithm, ObjectId, ObjectKind, PackedObject, commit_links, encode_pack,
+	encode_pack_with_bases, referenced_ids,
 };
 use gitana_object_store::{ObjectStore, ObjectStoreError};
 use gitana_repository::Repository;
@@ -121,7 +121,7 @@ async fn collect_objects<H: HashAlgorithm>(
 					// The client is shallow at this commit: it has the commit and its tree but NOT its
 					// parents, so the have-walk must stop here — otherwise we would subtract ancestors the
 					// client lacks and omit them from an `--unshallow`/deepen pack.
-					stack.push(parse_commit::<H>(&data)?.tree);
+					stack.push(commit_links::<H>(&data)?.tree);
 				} else {
 					stack.extend(referenced_ids::<H>(kind, &data)?);
 				}
@@ -150,7 +150,7 @@ async fn collect_objects<H: HashAlgorithm>(
 		if kind == ObjectKind::Commit {
 			// A commit's tree is always sent; its parents are followed unless this is a shallow-boundary
 			// commit, whose parents are deliberately withheld so the walk stops here.
-			let commit = parse_commit::<H>(&data)?;
+			let commit = commit_links::<H>(&data)?;
 			stack.push(commit.tree);
 			if !shallow_boundary.contains(&id) {
 				stack.extend(commit.parents.iter().copied());

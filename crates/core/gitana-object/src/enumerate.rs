@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use crate::pack::PackedObject;
 use crate::{
-	HashAlgorithm, ObjectError, ObjectId, ObjectKind, parse_commit, parse_tag, parse_tree,
+	HashAlgorithm, ObjectError, ObjectId, ObjectKind, commit_links, parse_tag, parse_tree,
 };
 
 /// Collect the objects reachable from `wants` but not from `haves`.
@@ -78,7 +78,7 @@ pub fn referenced_ids<H: HashAlgorithm>(
 ) -> Result<Vec<ObjectId<H>>, ObjectError> {
 	let ids = match kind {
 		ObjectKind::Commit => {
-			let commit = parse_commit::<H>(data)?;
+			let commit = commit_links::<H>(data)?;
 			let mut ids = Vec::with_capacity(commit.parents.len() + 1);
 			ids.push(commit.tree);
 			ids.extend(commit.parents);

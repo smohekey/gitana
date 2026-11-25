@@ -10,6 +10,7 @@ pub mod conflict;
 pub mod diff;
 pub mod fetch;
 pub mod gc;
+pub(crate) mod guessed;
 pub mod hash_object;
 pub mod init;
 pub mod log;

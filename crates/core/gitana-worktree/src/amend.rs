@@ -3,7 +3,7 @@
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
 use gitana_identity::Identity;
-use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit, parse_commit};
+use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, decode_commit, encode_commit};
 use gitana_repository::{ReflogIntent, RepositoryError};
 
 use crate::{AmendError, WorkTree};
@@ -63,13 +63,15 @@ where
 			format!("{replaced} is not a commit"),
 		)));
 	}
-	// Its header only: the message is replaced, and needn't be UTF-8 (one under an `encoding`
-	// header needn't be).
+	// Its header only, the message being replaced; its author carried converted to UTF-8 by its
+	// `encoding` header, as git's amend carries it (`decode_commit`).
 	let header = match payload.windows(2).position(|pair| pair == b"\n\n") {
 		Some(at) => &payload[..at + 2],
 		None => &payload[..],
 	};
-	let old = parse_commit::<H>(header).map_err(|error| AmendError::Repository(error.into()))?;
+	let old = decode_commit::<H>(header)
+		.map_err(|error| AmendError::Repository(error.into()))?
+		.commit;
 	// Its parents as git sees them: none at the shallow boundary, where they're deliberately absent
 	// (so git's amend there makes a commit with none).
 	let parents = if repo

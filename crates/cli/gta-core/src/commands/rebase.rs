@@ -9,6 +9,7 @@ use gitana_object::{HashAlgorithm, ObjectId};
 use gitana_porcelain::RebaseOutcome;
 use gitana_worktree::WorkTree;
 
+use crate::commands::guessed;
 use crate::dispatch::{self, WorkTreeCommand};
 use crate::identity::CliIdentity;
 use crate::signer;
@@ -113,7 +114,8 @@ fn render<H: HashAlgorithm>(
 				short(onto)
 			);
 		}
-		RebaseOutcome::Rebased { branch } => {
+		RebaseOutcome::Rebased { branch, repaired } => {
+			guessed::warn_of_repairs(&repaired);
 			println!(
 				"Successfully rebased and updated {}.",
 				branch_short(&branch)
@@ -123,7 +125,9 @@ fn render<H: HashAlgorithm>(
 			commit,
 			subject,
 			paths,
+			repaired,
 		} => {
+			guessed::warn_of_repairs(&repaired);
 			crate::commands::conflict::print_conflicts(&paths, result_path_mode);
 			println!("could not apply {} {}", short(commit), subject);
 			println!(

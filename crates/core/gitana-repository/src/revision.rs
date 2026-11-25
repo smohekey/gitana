@@ -8,14 +8,11 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use gitana_file_store::FileStore;
 use gitana_object::{
-	Commit, HashAlgorithm, ObjectId, ObjectKind, parse_commit, parse_tag, parse_tree,
+	CommitLinks, HashAlgorithm, ObjectId, ObjectKind, commit_links, parse_tag, parse_tree,
 };
 use gitana_path::{GitPath, GitPathspec};
 
-use crate::{
-	Repository, RepositoryError,
-	commit_links::{CommitLinks, commit_links},
-};
+use crate::{Repository, RepositoryError};
 
 enum Op {
 	/// `^n` — the nth parent (`^0` peels to the commit itself).
@@ -194,12 +191,13 @@ async fn date_and_parents<H: HashAlgorithm>(
 	shallow: &HashSet<ObjectId<H>>,
 ) -> Result<(i64, Vec<ObjectId<H>>), RepositoryError> {
 	let links = read_links(repo, id).await?;
+	let date = dated(&links)?;
 	let parents = if shallow.contains(&id) {
 		Vec::new()
 	} else {
 		links.parents
 	};
-	Ok((links.committer_seconds, parents))
+	Ok((date, parents))
 }
 
 /// The commits `include` reaches that `exclude` doesn't — git's `rev-list <include> ^<exclude>` —
@@ -525,7 +523,7 @@ async fn resolve_abbrev<H: HashAlgorithm>(
 
 /// The commit `id`'s tree, parents and committer time, read from its bytes: what the history walks
 /// need, its text not decoded (it needn't be UTF-8).
-async fn read_links<H: HashAlgorithm>(
+pub(crate) async fn read_links<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	id: ObjectId<H>,
 ) -> Result<CommitLinks<H>, RepositoryError> {
@@ -534,17 +532,6 @@ async fn read_links<H: HashAlgorithm>(
 		return Err(RepositoryError::InvalidRef(format!("{id} is not a commit")));
 	}
 	Ok(commit_links::<H>(&payload)?)
-}
-
-pub(crate) async fn read_commit<H: HashAlgorithm>(
-	repo: &Repository<impl FileStore, H>,
-	id: ObjectId<H>,
-) -> Result<Commit<H>, RepositoryError> {
-	let (kind, payload) = repo.objects().read_object(&id).await?;
-	if kind != ObjectKind::Commit {
-		return Err(RepositoryError::InvalidRef(format!("{id} is not a commit")));
-	}
-	Ok(parse_commit::<H>(&payload)?)
 }
 
 pub(crate) async fn peel_to_commit<H: HashAlgorithm>(
@@ -636,7 +623,7 @@ async fn peel_type<H: HashAlgorithm>(
 		"commit" => peel_to_commit(repo, id).await,
 		"tree" => {
 			let commit = peel_to_commit(repo, id).await?;
-			Ok(read_commit(repo, commit).await?.tree)
+			Ok(read_links(repo, commit).await?.tree)
 		}
 		"blob" | "tag" => {
 			let (object_kind, _) = repo.objects().read_object(&id).await?;
@@ -661,7 +648,15 @@ pub(crate) async fn committer_seconds<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	id: ObjectId<H>,
 ) -> Result<i64, RepositoryError> {
-	Ok(read_links(repo, id).await?.committer_seconds)
+	dated(&read_links(repo, id).await?)
+}
+
+/// A commit's committer time, for a walk ordered by date: one whose committer line is malformed is
+/// refused, as it always has been here (the walks needing only parents or a tree pass over it).
+fn dated<H: HashAlgorithm>(links: &CommitLinks<H>) -> Result<i64, RepositoryError> {
+	links.committer_seconds.ok_or(RepositoryError::Object(
+		gitana_object::ObjectError::MalformedHeader,
+	))
 }
 
 fn is_hex(s: &str) -> bool {

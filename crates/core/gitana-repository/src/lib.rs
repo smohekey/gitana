@@ -9,7 +9,6 @@
 
 mod branch_error;
 mod branch_name;
-mod commit_links;
 mod config;
 mod detect;
 mod durability;

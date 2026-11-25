@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
-use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_commit, parse_tag, referenced_ids};
+use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, commit_links, parse_tag, referenced_ids};
 use gitana_object_store::{BitmapReport, ObjectStoreError, PruneReport, RepackReport};
 use gitana_repository::Repository;
 use gitana_worktree::WorkTree;
@@ -226,7 +226,7 @@ pub(crate) async fn reachable_from<F: FileStore, H: HashAlgorithm>(
 			// A shallow-boundary commit is parentless here: enqueue only its tree, not the parents past
 			// the boundary (which may still be on disk).
 			Ok((ObjectKind::Commit, data)) if shallow.contains(&id) => {
-				stack.push(parse_commit::<H>(&data)?.tree);
+				stack.push(commit_links::<H>(&data)?.tree);
 			}
 			Ok((kind, data)) => stack.extend(referenced_ids::<H>(kind, &data)?),
 			Err(ObjectStoreError::NotFound) => {}

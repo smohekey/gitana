@@ -9,6 +9,8 @@
 
 mod bitmap;
 mod commit;
+mod commit_links;
+mod decoded_commit;
 mod delta;
 mod enumerate;
 mod ewah;
@@ -37,6 +39,8 @@ pub use commit::{
 	Commit, commit_signature_and_payload, commit_signed_payload, encode_commit, parse_commit,
 	validate_commit_structure,
 };
+pub use commit_links::{CommitLinks, commit_links};
+pub use decoded_commit::{CommitParts, DecodedCommit, decode_commit};
 pub use delta::{apply_delta, apply_delta_with_limit};
 pub use enumerate::{enumerate_objects, referenced_ids};
 pub use ewah::{EwahBitmap, decode_ewah, decode_ewah_bounded, encode_ewah};

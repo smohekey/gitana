@@ -225,7 +225,7 @@ impl WorkTreeCommand for Stash {
 						if !quiet {
 							let (kind, payload) = repo.objects().read_object(&pushed.entry.commit).await?;
 							let message = match kind {
-								ObjectKind::Commit => gitana_object::parse_commit::<H>(&payload)?.message,
+								ObjectKind::Commit => gitana_object::decode_commit::<H>(&payload)?.commit.message,
 								_ => pushed.entry.message.clone(),
 							};
 							println!("Saved working directory and index state {message}");
@@ -521,22 +521,22 @@ async fn holds_no_tracked_change<F: gitana_file_store::FileStore, H: HashAlgorit
 	else {
 		return Ok(false);
 	};
-	let commit = read_commit(repo, entry.commit).await?;
+	let commit = read_links(repo, entry.commit).await?;
 	let Some(base) = commit.parents.first() else {
 		return Ok(false);
 	};
-	Ok(read_commit(repo, *base).await?.tree == commit.tree)
+	Ok(read_links(repo, *base).await?.tree == commit.tree)
 }
 
-async fn read_commit<F: gitana_file_store::FileStore, H: HashAlgorithm>(
+async fn read_links<F: gitana_file_store::FileStore, H: HashAlgorithm>(
 	repo: &gitana_repository::Repository<F, H>,
 	id: gitana_object::ObjectId<H>,
-) -> Result<gitana_object::Commit<H>> {
+) -> Result<gitana_object::CommitLinks<H>> {
 	let (kind, payload) = repo.objects().read_object(&id).await?;
 	if kind != ObjectKind::Commit {
 		return Err(anyhow!("{id} is not a commit"));
 	}
-	Ok(gitana_object::parse_commit::<H>(&payload)?)
+	Ok(gitana_object::commit_links::<H>(&payload)?)
 }
 
 /// git's lines for a conflicted apply.

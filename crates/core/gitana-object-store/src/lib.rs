@@ -20,11 +20,11 @@ use gitana_file_store::{DurabilityTarget, FileStore, FileStoreError, WriteOutcom
 use gitana_object::{
 	BitmapIndex, EwahBitmap, HashAlgorithm, MAX_OBJECT_SIZE, MidxEntry, MultiPackIndex, ObjectError,
 	ObjectId, ObjectKind, PackEntry, PackIndex, PackedObject, apply_delta, apply_delta_with_limit,
-	build_reachability_bitmaps, decode_loose, decode_loose_with_limit, decode_midx_bitmap,
-	decode_multi_pack_index, decode_object_at, decode_pack_entry, decode_pack_entry_with_limit,
-	decode_pack_index, encode_loose, encode_multi_pack_index,
+	build_reachability_bitmaps, commit_links, decode_loose, decode_loose_with_limit,
+	decode_midx_bitmap, decode_multi_pack_index, decode_object_at, decode_pack_entry,
+	decode_pack_entry_with_limit, decode_pack_index, encode_loose, encode_multi_pack_index,
 	encode_multi_pack_index_with_reverse_index, encode_pack, encode_pack_index, loose_object_path,
-	pack_entry_is_delta, pack_index_entries, parse_commit, referenced_ids,
+	pack_entry_is_delta, pack_index_entries, referenced_ids,
 };
 use tokio::sync::Mutex;
 
@@ -1368,7 +1368,7 @@ where
 			// Read this commit for its parent edges. A missing commit (a peer may name one the store
 			// lacks) or a non-commit contributes nothing.
 			let parents = match self.read_object(&id).await {
-				Ok((ObjectKind::Commit, data)) => parse_commit::<H>(&data)?.parents,
+				Ok((ObjectKind::Commit, data)) => commit_links::<H>(&data)?.parents,
 				Ok(_) | Err(ObjectStoreError::NotFound) => continue,
 				Err(other) => return Err(other),
 			};

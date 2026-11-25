@@ -3,18 +3,21 @@
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
-use gitana_object::{Commit, HashAlgorithm, ObjectId, parse_commit};
+use gitana_object::{DecodedCommit, HashAlgorithm, ObjectId, decode_commit};
 use gitana_repository::{HeadState, Repository};
 use gitana_worktree::WorkTree;
 
+use crate::Written;
 use crate::conflict;
 use crate::{Identity, Signer, signing};
 
 /// The result of starting a [`cherry_pick`].
 #[derive(Debug)]
 pub enum PickOutcome<H: HashAlgorithm> {
-	/// A new single-parent commit (preserving the picked commit's author) was recorded.
-	Picked { commit: ObjectId<H> },
+	/// A new single-parent commit (preserving the picked commit's author) was recorded. `repaired`:
+	/// the author or message it carried had bytes that aren't UTF-8, read as Latin-1, as git reads
+	/// them and warns of ([`Written::repaired`](crate::Written::repaired)).
+	Picked { commit: ObjectId<H>, repaired: bool },
 	/// The pick conflicted; an in-progress cherry-pick has been materialised (`CHERRY_PICK_HEAD`,
 	/// `MERGE_MSG`, a conflicted index and work tree). The caller renders the paths and signals failure.
 	Conflict { paths: Vec<gitana_path::GitPath> },
@@ -43,7 +46,9 @@ pub async fn cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer
 	let pick = repository
 		.rev_parse(&format!("{commit_spec}^{{commit}}"))
 		.await?;
-	let picked = read_commit(repository, pick).await?;
+	let decoded = read_decoded(repository, pick).await?;
+	let repaired = decoded.repaired.author || decoded.repaired.message;
+	let picked = decoded.commit;
 	if picked.parents.len() > 1 {
 		bail!(
 			"commit {commit_spec} is a merge but no mainline was given; cherry-picking a merge is not supported"
@@ -126,11 +131,15 @@ pub async fn cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer
 	repository
 		.record_commit(&branch, Some(head), new_commit, &committer, &message)
 		.await?;
-	Ok(PickOutcome::Picked { commit: new_commit })
+	Ok(PickOutcome::Picked {
+		commit: new_commit,
+		repaired,
+	})
 }
 
 /// Conclude an in-progress cherry-pick: a single-parent commit from the resolved index that preserves
-/// the picked commit's author, returning the new commit id. Shared by `cherry-pick --continue`
+/// the picked commit's author, returning the new commit and whether the text it carried from the
+/// picked commit (its author, and its message unless `message_override` replaces it) was repaired. Shared by `cherry-pick --continue`
 /// (`message_override = None`, uses `MERGE_MSG`) and `gta commit` during a cherry-pick. Refuses while
 /// the index has unmerged stages.
 pub async fn continue_cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
@@ -138,7 +147,7 @@ pub async fn continue_cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm, 
 	message_override: Option<String>,
 	identity: &impl Identity,
 	signer: Option<&S>,
-) -> Result<ObjectId<H>> {
+) -> Result<Written<H>> {
 	let repository = wt.repository();
 	let Some(pick) = repository.cherry_pick_head().await? else {
 		bail!("there is no cherry-pick in progress (CHERRY_PICK_HEAD is missing)");
@@ -152,7 +161,11 @@ pub async fn continue_cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm, 
 	{
 		bail!("the cherry-pick resolved to no change; use `gta cherry-pick --abort` to cancel");
 	}
-	let picked = read_commit(repository, pick).await?;
+	let decoded = read_decoded(repository, pick).await?;
+	// The message comes from the picked commit (by `MERGE_MSG`, written from it) unless overridden.
+	let repaired =
+		decoded.repaired.author || (message_override.is_none() && decoded.repaired.message);
+	let picked = decoded.commit;
 	let committer = identity.committer().await?;
 	let message = match message_override {
 		Some(message) => message,
@@ -173,7 +186,10 @@ pub async fn continue_cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm, 
 	)
 	.await?;
 	repository.clear_cherry_pick().await?;
-	Ok(new_commit)
+	Ok(Written {
+		commit: new_commit,
+		repaired,
+	})
 }
 
 /// Abort an in-progress cherry-pick: restore the work tree and index to the (unmoved) `HEAD` and clear
@@ -190,13 +206,15 @@ pub async fn abort_cherry_pick<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	Ok(())
 }
 
-/// Read and parse a commit object.
-async fn read_commit<F: FileStore, H: HashAlgorithm>(
+/// Read a commit, its text (author, committer, message) in UTF-8 as git carries it into the
+/// commit it makes from it, converted by its `encoding` header, and which parts were repaired
+/// ([`decode_commit`]).
+async fn read_decoded<F: FileStore, H: HashAlgorithm>(
 	repository: &Repository<F, H>,
 	oid: ObjectId<H>,
-) -> Result<Commit<H>> {
+) -> Result<DecodedCommit<H>> {
 	let (_, payload) = repository.objects().read_object(&oid).await?;
-	Ok(parse_commit::<H>(&payload)?)
+	Ok(decode_commit::<H>(&payload)?)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -243,7 +261,7 @@ mod tests {
 		let outcome = cherry_pick(&wt, &pick.to_hex(), &id, None::<&TestSigner>)
 			.await
 			.unwrap();
-		let PickOutcome::Picked { commit } = outcome else {
+		let PickOutcome::Picked { commit, .. } = outcome else {
 			panic!("expected a clean pick");
 		};
 		// The picked author is preserved; the committer is the current identity.

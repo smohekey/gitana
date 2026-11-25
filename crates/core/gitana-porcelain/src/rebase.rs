@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use anyhow::{Result, bail};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::WorkDirFs;
-use gitana_object::{Commit, HashAlgorithm, ObjectId, parse_commit};
+use gitana_object::{Commit, DecodedCommit, HashAlgorithm, ObjectId, decode_commit};
 use gitana_repository::{HeadState, RebaseState, Repository};
 use gitana_worktree::WorkTree;
 
@@ -20,14 +20,22 @@ pub enum RebaseOutcome<H: HashAlgorithm> {
 	UpToDate { branch: String },
 	/// The branch had nothing to replay but was behind the base, so it was fast-forwarded to `onto`.
 	FastForwarded { branch: String, onto: ObjectId<H> },
-	/// Every commit was replayed; the rebase is complete.
-	Rebased { branch: String },
+	/// Every commit was replayed; the rebase is complete. `repaired`: the commits replayed by this
+	/// call whose author or message had bytes that aren't UTF-8, read as Latin-1 in their copies, as
+	/// git reads them and warns of ([`Written::repaired`](crate::Written::repaired)), in the order
+	/// replayed.
+	Rebased {
+		branch: String,
+		repaired: Vec<ObjectId<H>>,
+	},
 	/// A commit could not be applied cleanly; the rebase stopped with a materialised conflict (the
 	/// `REBASE_*` state, a conflicted index and work tree). Resolve and `continue`, `skip`, or `abort`.
 	Conflict {
 		commit: ObjectId<H>,
 		subject: String,
 		paths: Vec<gitana_path::GitPath>,
+		/// As [`Rebased`](Self::Rebased)'s: those replayed by this call before it stopped.
+		repaired: Vec<ObjectId<H>>,
 	},
 }
 
@@ -129,7 +137,7 @@ pub async fn rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 		repository.clear_rebase().await.ok();
 		return Err(error);
 	}
-	replay(wt, identity, signer).await
+	replay(wt, identity, signer, Vec::new()).await
 }
 
 /// Conclude the stopped step (commit the resolved index, preserving the commit's author), then resume.
@@ -143,7 +151,8 @@ pub async fn continue_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Si
 		bail!("no rebase in progress");
 	};
 	let Some(&current) = state.todo.first() else {
-		return replay(wt, identity, signer).await; // nothing pending; let replay finish/clean up
+		// Nothing pending; let replay finish and clean up.
+		return replay(wt, identity, signer, Vec::new()).await;
 	};
 
 	let tree = conflict::resolved_tree(wt).await?; // refuses while the index has conflicts
@@ -155,7 +164,12 @@ pub async fn continue_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Si
 			"no changes - did you forget to `gta add`, or do you want `gta rebase --skip` to drop this commit?"
 		);
 	}
-	let commit = read_commit(repository, current).await?;
+	let decoded = read_decoded(repository, current).await?;
+	let repaired = carries_repaired(&decoded)
+		.then_some(current)
+		.into_iter()
+		.collect();
+	let commit = decoded.commit;
 	let committer = identity.committer().await?;
 	let message = conflict::ensure_trailing_newline(commit.message.clone());
 	signing::commit_on_head(
@@ -168,7 +182,7 @@ pub async fn continue_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Si
 	)
 	.await?;
 	advance_todo(repository, state.todo).await?;
-	replay(wt, identity, signer).await
+	replay(wt, identity, signer, repaired).await
 }
 
 /// Drop the stopped commit and resume.
@@ -182,11 +196,11 @@ pub async fn skip_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer
 		bail!("no rebase in progress");
 	};
 	if state.todo.is_empty() {
-		return replay(wt, identity, signer).await;
+		return replay(wt, identity, signer, Vec::new()).await;
 	}
 	conflict::restore_to_head(wt).await?; // discard the conflicted work tree / index
 	advance_todo(repository, state.todo).await?;
-	replay(wt, identity, signer).await
+	replay(wt, identity, signer, Vec::new()).await
 }
 
 /// Abort the rebase: restore the branch and work tree to the pre-rebase tip.
@@ -208,11 +222,13 @@ pub async fn abort_rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	Ok(())
 }
 
-/// Replay the remaining commits from the persisted state until one conflicts or the list is empty.
+/// Replay the remaining commits from the persisted state until one conflicts or the list is empty,
+/// adding to `repaired` each commit replayed whose copy carried repaired text.
 async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	wt: &WorkTree<F, W, H>,
 	identity: &impl Identity,
 	signer: Option<&S>,
+	mut repaired: Vec<ObjectId<H>>,
 ) -> Result<RebaseOutcome<H>> {
 	let repository = wt.repository();
 	let Some(state) = repository.rebase_state().await? else {
@@ -221,7 +237,9 @@ async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	let mut todo = state.todo;
 
 	while let Some(&current) = todo.first() {
-		let commit = read_commit(repository, current).await?;
+		let decoded = read_decoded(repository, current).await?;
+		let carried_repaired = carries_repaired(&decoded);
+		let commit = decoded.commit;
 		let base_tree = match commit.parents.first() {
 			Some(parent) => repository.commit_tree(*parent).await?,
 			None => repository.write_tree(&[]).await?,
@@ -248,6 +266,9 @@ async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 					signer,
 				)
 				.await?;
+				if carried_repaired {
+					repaired.push(current);
+				}
 			}
 			todo.remove(0);
 			repository.set_rebase_todo(&todo).await?;
@@ -270,6 +291,7 @@ async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 				commit: current,
 				subject: subject(&commit).to_owned(),
 				paths: merge.conflicts,
+				repaired,
 			});
 		}
 
@@ -287,6 +309,9 @@ async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 			signer,
 		)
 		.await?;
+		if carried_repaired {
+			repaired.push(current);
+		}
 		todo.remove(0);
 		repository.set_rebase_todo(&todo).await?;
 	}
@@ -294,6 +319,7 @@ async fn replay<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	repository.clear_rebase().await?;
 	Ok(RebaseOutcome::Rebased {
 		branch: state.head_name,
+		repaired,
 	})
 }
 
@@ -356,13 +382,28 @@ async fn branch_tip<F: FileStore, H: HashAlgorithm>(
 		.ok_or_else(|| anyhow::anyhow!("rebase branch {branch} has no tip"))
 }
 
-/// Read and parse a commit object.
+/// Read a commit, its text (author, committer, message) in UTF-8 as git carries it into the
+/// commit it makes from it, converted by its `encoding` header ([`decode_commit`]).
 async fn read_commit<F: FileStore, H: HashAlgorithm>(
 	repository: &Repository<F, H>,
 	oid: ObjectId<H>,
 ) -> Result<Commit<H>> {
+	Ok(read_decoded(repository, oid).await?.commit)
+}
+
+/// [`read_commit`], with which of its parts were repaired.
+async fn read_decoded<F: FileStore, H: HashAlgorithm>(
+	repository: &Repository<F, H>,
+	oid: ObjectId<H>,
+) -> Result<DecodedCommit<H>> {
 	let (_, payload) = repository.objects().read_object(&oid).await?;
-	Ok(parse_commit::<H>(&payload)?)
+	Ok(decode_commit::<H>(&payload)?)
+}
+
+/// Whether a commit's copy carries repaired text: its author or its message, both of which a
+/// rebase copies.
+fn carries_repaired<H: HashAlgorithm>(decoded: &DecodedCommit<H>) -> bool {
+	decoded.repaired.author || decoded.repaired.message
 }
 
 fn subject<H: HashAlgorithm>(commit: &Commit<H>) -> &str {
@@ -501,6 +542,7 @@ mod tests {
 			commit,
 			subject,
 			paths,
+			..
 		} = outcome
 		else {
 			panic!("expected a conflict");

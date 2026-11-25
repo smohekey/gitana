@@ -10,6 +10,7 @@ use gitana_porcelain::RevertOutcome;
 use gitana_worktree::WorkTree;
 
 use crate::commands::conflict;
+use crate::commands::guessed;
 use crate::dispatch::{self, WorkTreeCommand};
 use crate::identity::CliIdentity;
 use crate::signer;
@@ -80,8 +81,12 @@ impl WorkTreeCommand for Revert {
 		)
 		.await?;
 		if self.continue_ {
-			let commit = gitana_porcelain::continue_revert(&wt, None, &identity, signer.as_ref()).await?;
-			println!("{commit}");
+			let written =
+				gitana_porcelain::continue_revert(&wt, None, &identity, signer.as_ref()).await?;
+			if written.repaired {
+				guessed::warn_of_repair();
+			}
+			println!("{}", written.commit);
 			return Ok(());
 		}
 
@@ -89,7 +94,12 @@ impl WorkTreeCommand for Revert {
 			bail!("revert requires a commit (or --abort/--continue)");
 		};
 		match gitana_porcelain::revert(&wt, &commit, &identity, signer.as_ref()).await? {
-			RevertOutcome::Reverted { commit } => println!("{commit}"),
+			RevertOutcome::Reverted { commit, repaired } => {
+				if repaired {
+					guessed::warn_of_repair();
+				}
+				println!("{commit}");
+			}
 			RevertOutcome::Conflict { paths } => {
 				return Err(conflict::report_conflicts(&paths, self.result_path_mode));
 			}

@@ -21,6 +21,7 @@ mod revert;
 mod signing;
 mod tag;
 mod trust;
+mod written;
 
 pub use cherry_pick::{PickOutcome, abort_cherry_pick, cherry_pick, continue_cherry_pick};
 pub use commit::commit_signed;
@@ -45,6 +46,7 @@ pub use trust::{
 	TRUST_REF, TrustSyncOutcome, trust_add_key, trust_init, trust_list, trust_remove_key,
 	trust_set_policy, trust_sync,
 };
+pub use written::Written;
 
 /// The identity an operation records commits and reflog entries with; it lives in
 /// `gitana-identity`, beside the working-tree operations that take it too.

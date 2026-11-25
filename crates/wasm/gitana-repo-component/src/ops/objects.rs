@@ -1,7 +1,7 @@
 //! Object reads and writes.
 
 use gitana_file_store_local::WorktreeFileStore;
-use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, parse_commit, parse_tag};
+use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, decode_commit, parse_tag};
 use gitana_object_store::ObjectStoreError;
 use gitana_repository::{FileMode, Repository, RepositoryError, TreeBuildEntry};
 
@@ -143,8 +143,10 @@ pub(crate) async fn read_commit<H: HashAlgorithm>(
 			kind.as_str()
 		)));
 	}
-	let commit =
-		parse_commit::<H>(&payload).map_err(|error| repo_error(RepositoryError::Object(error)))?;
+	// Its text in UTF-8, converted by its `encoding` header as git shows it: the interface's strings.
+	let commit = decode_commit::<H>(&payload)
+		.map_err(|error| repo_error(RepositoryError::Object(error)))?
+		.commit;
 	Ok(CommitInfo {
 		id: id.to_hex(),
 		tree: commit.tree.to_hex(),

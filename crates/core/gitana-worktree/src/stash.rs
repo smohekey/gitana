@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 use gitana_file_store::FileStore;
 use gitana_file_store_local::{WorkDirFs, WorkEntryIdentity};
 use gitana_identity::Identity;
-use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, parse_commit};
+use gitana_object::{
+	Commit, CommitLinks, HashAlgorithm, ObjectId, ObjectKind, commit_links, decode_commit,
+};
 use gitana_path::{GitPath, GitPathspec};
 use gitana_repository::{HeadState, Repository, RepositoryError, StashEntry};
 
@@ -433,6 +435,7 @@ where
 		return Err(StashPushError::Unmerged(paths));
 	}
 	let selected = |path: &GitPath| whole || set.matches(path);
+	// Its subject goes in the stash's "WIP on" message, in UTF-8 as git writes it.
 	let head_commit = read_commit(repo, head).await?;
 	let head_entries: HashMap<GitPath, (String, ObjectId<H>)> = repo
 		.read_tree(head_commit.tree)
@@ -751,16 +754,32 @@ where
 	}))
 }
 
-/// The commit `id`.
+/// The commit `id`, its text in UTF-8 as git shows it ([`decode_commit`]).
 async fn read_commit<F: FileStore, H: HashAlgorithm>(
 	repo: &Repository<F, H>,
 	id: ObjectId<H>,
 ) -> Result<Commit<H>, RepositoryError> {
+	Ok(decode_commit::<H>(&commit_payload(repo, id).await?)?.commit)
+}
+
+/// The commit `id`'s tree and parents, its text not read.
+async fn read_links<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	id: ObjectId<H>,
+) -> Result<CommitLinks<H>, RepositoryError> {
+	Ok(commit_links::<H>(&commit_payload(repo, id).await?)?)
+}
+
+/// The commit `id`'s payload.
+async fn commit_payload<F: FileStore, H: HashAlgorithm>(
+	repo: &Repository<F, H>,
+	id: ObjectId<H>,
+) -> Result<Vec<u8>, RepositoryError> {
 	let (kind, payload) = repo.objects().read_object(&id).await?;
 	if kind != ObjectKind::Commit {
 		return Err(RepositoryError::InvalidRef(format!("{id} is not a commit")));
 	}
-	Ok(parse_commit::<H>(&payload)?)
+	Ok(payload)
 }
 
 /// git's subject of `message` (`%s`): its first paragraph, each line's trailing whitespace trimmed,
@@ -998,7 +1017,7 @@ where
 		});
 	};
 	let w = entry.commit;
-	let w_commit = read_commit(repo, w).await?;
+	let w_commit = read_links(repo, w).await?;
 	let [base, staged, rest @ ..] = w_commit.parents.as_slice() else {
 		return Err(StashApplyError::NotStashLike(w.to_hex()));
 	};

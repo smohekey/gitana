@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use gitana_file_store::{DeleteOutcome, DurabilityTarget, FileStore, FileStoreError};
 use gitana_object::{
-	HashAlgorithm, ObjectId, ObjectKind, TreeEntry, parse_commit, parse_tree, referenced_ids,
+	HashAlgorithm, ObjectId, ObjectKind, TreeEntry, commit_links, parse_tree, referenced_ids,
 };
 use gitana_object_store::{ObjectBacking, ObjectReadSession, ObjectStoreError};
 
@@ -302,7 +302,7 @@ where
 		for frontier in frontiers {
 			// A frontier the store cannot supply still bounds the walk exactly.
 			if let Some((ObjectKind::Commit, data)) = read_frontier_object(&mut reader, frontier).await? {
-				frontier_trees.push(parse_commit::<H>(&data)?.tree);
+				frontier_trees.push(commit_links::<H>(&data)?.tree);
 			}
 		}
 		let mut frontier_entries: HashMap<ObjectId<H>, Option<Vec<TreeEntry<H>>>> = HashMap::new();
@@ -320,7 +320,7 @@ where
 			objects.insert(id, backing);
 			match kind {
 				ObjectKind::Commit => {
-					let commit = parse_commit::<H>(&data)?;
+					let commit = commit_links::<H>(&data)?;
 					pending.push((commit.tree, frontier_trees.clone()));
 					if !shallow.contains(&id) {
 						pending.extend(

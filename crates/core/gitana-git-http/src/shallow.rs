@@ -11,7 +11,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use gitana_file_store::FileStore;
-use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, Signature, parse_commit, parse_tag};
+use gitana_object::{CommitLinks, HashAlgorithm, ObjectId, ObjectKind, commit_links, parse_tag};
 use gitana_repository::Repository;
 
 use crate::GitHttpError;
@@ -352,9 +352,9 @@ pub(crate) async fn peel_to_commit<H: HashAlgorithm>(
 pub(crate) async fn read_commit<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	id: ObjectId<H>,
-) -> Result<Option<gitana_object::Commit<H>>, GitHttpError> {
+) -> Result<Option<CommitLinks<H>>, GitHttpError> {
 	match repo.objects().read_object(&id).await {
-		Ok((ObjectKind::Commit, data)) => Ok(Some(parse_commit::<H>(&data)?)),
+		Ok((ObjectKind::Commit, data)) => Ok(Some(commit_links::<H>(&data)?)),
 		Ok(_) => Ok(None),
 		Err(gitana_object_store::ObjectStoreError::NotFound) => Ok(None),
 		Err(other) => Err(other.into()),
@@ -373,9 +373,7 @@ async fn parent_within_since<H: HashAlgorithm>(
 	};
 	match read_commit(repo, parent).await? {
 		Some(commit) => {
-			let seconds = Signature::parse(&commit.committer)
-				.map(|sig| sig.seconds)
-				.unwrap_or(i64::MIN);
+			let seconds = commit.committer_seconds.unwrap_or(i64::MIN);
 			Ok(seconds >= since)
 		}
 		None => Ok(false),
@@ -404,7 +402,7 @@ async fn deepen_not_closure<H: HashAlgorithm>(
 			continue;
 		}
 		match repo.objects().read_object(&id).await {
-			Ok((ObjectKind::Commit, data)) => stack.extend(parse_commit::<H>(&data)?.parents),
+			Ok((ObjectKind::Commit, data)) => stack.extend(commit_links::<H>(&data)?.parents),
 			Ok((ObjectKind::Tag, data)) => stack.push(parse_tag::<H>(&data)?.object),
 			Ok(_) => {}
 			Err(gitana_object_store::ObjectStoreError::NotFound) => {}
@@ -526,6 +524,43 @@ mod tests {
 		let p = plan(&repo, &[c], since(150), &[]).await;
 		assert_eq!(p.included, set(&[c, b]));
 		assert_eq!(p.boundary, set(&[b]));
+	}
+
+	/// A commit whose text is in another encoding is walked like any other; one whose committer time
+	/// can't be read counts as the earliest, so `deepen-since` leaves it out.
+	#[tokio::test]
+	async fn a_commit_in_another_encoding_is_walked_and_an_unreadable_time_is_the_earliest() {
+		let repo = new_repo().await;
+		let a = commit(&repo, &[], 100).await;
+		let tree = repo.write_tree(&[]).await.unwrap();
+		let raw = |parent: ObjectId<Sha256>, committer: &[u8]| {
+			let mut payload = format!("tree {tree}\nparent {parent}\n").into_bytes();
+			payload.extend_from_slice(b"author Andr\xe9 <a@u> 200 +0000\ncommitter ");
+			payload.extend_from_slice(committer);
+			payload.extend_from_slice(b"\nencoding ISO-8859-1\n\ncaf\xe9\n");
+			payload
+		};
+		let b = repo
+			.objects()
+			.write_object(ObjectKind::Commit, &raw(a, b"Andr\xe9 <a@u> 200 +0000"))
+			.await
+			.unwrap();
+		let c = commit(&repo, &[b], 300).await;
+		let p = plan(&repo, &[c], depth(2), &[]).await;
+		assert_eq!(p.included, set(&[c, b]));
+		assert_eq!(p.boundary, set(&[b]));
+		let p = plan(&repo, &[c], since(150), &[]).await;
+		assert_eq!(p.included, set(&[c, b]));
+
+		let untimed = repo
+			.objects()
+			.write_object(ObjectKind::Commit, &raw(a, b"Andr\xe9 <a@u> soon +0000"))
+			.await
+			.unwrap();
+		let d = commit(&repo, &[untimed], 400).await;
+		let p = plan(&repo, &[d], since(1), &[]).await;
+		assert_eq!(p.included, set(&[d]));
+		assert_eq!(p.boundary, set(&[d]));
 	}
 
 	#[tokio::test]

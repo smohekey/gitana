@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::Backend;
 use anyhow::Result;
-use gitana_object::{HashAlgorithm, parse_commit};
+use gitana_object::{HashAlgorithm, decode_commit};
 use gitana_repository::Repository;
 
 use crate::dispatch::{self, RepoCommand};
@@ -21,7 +21,8 @@ impl RepoCommand for Log {
 		};
 		for oid in repo.rev_list(&[head]).await? {
 			let (_, payload) = repo.objects().read_object(&oid).await?;
-			let subject = parse_commit::<H>(&payload)?
+			let subject = decode_commit::<H>(&payload)?
+				.commit
 				.message
 				.lines()
 				.next()

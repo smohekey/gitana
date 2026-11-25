@@ -207,6 +207,43 @@ async fn pushes_everything_as_git_does() {
 	std::fs::remove_dir_all(&base).ok();
 }
 
+/// On a HEAD whose message is in another encoding (git's `encoding` header), the stash's "WIP on"
+/// message quotes its subject in UTF-8, as git writes it: the stash commits are git's, byte for byte.
+#[tokio::test]
+async fn pushes_on_a_head_in_another_encoding_as_git_does() {
+	let (base, by_git, by_gitana) = twins("latin1-head", |dir| {
+		committed(dir);
+		let message = dir.join(".git").join("latin1-message");
+		std::fs::write(&message, b"Caf\xe9 cr\xe8me\n\nbr\xfbl\xe9e\n").unwrap();
+		git(
+			dir,
+			&[
+				"-c",
+				"i18n.commitEncoding=ISO-8859-1",
+				"commit",
+				"-q",
+				"--allow-empty",
+				"-F",
+				message.to_str().unwrap(),
+			],
+		);
+		let raw = git_raw(dir, &["cat-file", "commit", "HEAD"]).stdout;
+		assert!(raw.windows(20).any(|line| line == b"\nencoding ISO-8859-1"));
+		write(dir, "a.txt", b"one!\n");
+	});
+	git(&by_git, &["stash", "-q"]);
+	let message = push(&by_gitana, &request(&[], "", None, false))
+		.await
+		.unwrap();
+	assert_eq!(
+		message.as_deref(),
+		Some(git(&by_git, &["stash", "list", "--format=%gs"]).trim())
+	);
+	assert!(message.unwrap().ends_with("Caf\u{e9} cr\u{e8}me"));
+	assert_eq!(state(&by_gitana), state(&by_git));
+	std::fs::remove_dir_all(&base).ok();
+}
+
 #[tokio::test]
 async fn pushes_with_a_message_and_on_a_detached_head_as_git_does() {
 	for (message, detached) in [

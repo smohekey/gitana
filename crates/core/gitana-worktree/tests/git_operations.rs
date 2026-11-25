@@ -499,6 +499,112 @@ async fn amend_keeps_other_headers_and_replaces_a_message_in_another_encoding() 
 	);
 }
 
+/// A commit whose author is named in another encoding is amended as git amends it: the author
+/// carried converted to UTF-8 by the commit's `encoding` header (ISO-8859-1, Shift_JIS), or, with
+/// none and bytes that aren't UTF-8, read as git reads them when it writes (Latin-1); the `encoding`
+/// header gone. The commit made is git's, byte for byte but for its committer line.
+#[tokio::test]
+async fn amend_carries_an_author_in_another_encoding_as_git_does() {
+	for (tag, encoding, name) in [
+		("latin1", Some("ISO-8859-1"), &b"Andr\xe9"[..]),
+		("sjis", Some("Shift_JIS"), b"\x83\x65\x83\x58"),
+		("none", None, b"Andr\xe9"),
+	] {
+		let Some((work, w)) = repository(&format!("amend-author-{tag}")) else {
+			return;
+		};
+		let tree = git(&["-C", &w, "rev-parse", "HEAD^{tree}"]);
+		let one = git(&["-C", &w, "rev-parse", "HEAD"]);
+		let mut text = format!("tree {}\nparent {}\nauthor ", tree.trim(), one.trim()).into_bytes();
+		text.extend_from_slice(name);
+		text.extend_from_slice(b" <author@example.com> 1700000000 +0000\ncommitter ");
+		text.extend_from_slice(name);
+		text.extend_from_slice(b" <author@example.com> 1700000000 +0000\n");
+		if let Some(encoding) = encoding {
+			text.extend_from_slice(format!("encoding {encoding}\n").as_bytes());
+		}
+		text.extend_from_slice(b"\nold\n");
+		planted(&w, &text);
+		std::fs::write(work.join("b.txt"), b"B\n").unwrap();
+		git(&["-C", &w, "add", "b.txt"]);
+		let copy = work.with_extension("raw-copy");
+		let copied = Command::new("cp")
+			.arg("-R")
+			.arg(&work)
+			.arg(&copy)
+			.status()
+			.unwrap();
+		assert!(copied.success());
+		let c = copy.to_str().unwrap();
+		git(&[
+			"-C",
+			c,
+			"-c",
+			"user.name=C O Mitter",
+			"-c",
+			"user.email=committer@example.com",
+			"commit",
+			"-q",
+			"--amend",
+			"-m",
+			"Now",
+		]);
+		let by_git = raw_head(c);
+		std::fs::remove_dir_all(&copy).unwrap();
+		let wt = make_repo(&work);
+		wt.amend(&chain(&wt).await, head(&wt).await, "Now", &TestIdentity)
+			.await
+			.unwrap();
+		assert_eq!(raw_head(&w), by_git, "{tag}");
+		assert!(!by_git.contains("encoding"), "{tag}: {by_git}");
+	}
+}
+
+/// A switch to a branch whose commit is in another encoding, and a hard reset off one, run as on any
+/// other: neither reads the commit's text.
+#[tokio::test]
+async fn switch_and_hard_reset_run_on_a_commit_in_another_encoding() {
+	let Some((work, w)) = repository("latin1-switch") else {
+		return;
+	};
+	git(&["-C", &w, "branch", "other"]);
+	git(&["-C", &w, "switch", "-q", "other"]);
+	std::fs::write(work.join("b.txt"), b"B\n").unwrap();
+	git(&["-C", &w, "add", "b.txt"]);
+	std::fs::write(work.join(".git/latin1-message"), b"caf\xe9\n").unwrap();
+	git(&[
+		"-C",
+		&w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"-c",
+		"i18n.commitEncoding=ISO-8859-1",
+		"commit",
+		"-q",
+		"-F",
+		".git/latin1-message",
+	]);
+	git(&["-C", &w, "switch", "-q", "main"]);
+	let wt = make_repo(&work);
+	let other = BranchName::parse("other").unwrap();
+	wt.switch_branch(&other, &switch_options(true), &TestIdentity)
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(work.join("b.txt")).unwrap(), b"B\n");
+	std::fs::write(work.join("b.txt"), b"changed\n").unwrap();
+	let wt = make_repo(&work);
+	wt.reset("HEAD", ResetMode::Hard, &TestIdentity, None)
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(work.join("b.txt")).unwrap(), b"B\n");
+	wt.reset("HEAD~1", ResetMode::Hard, &TestIdentity, None)
+		.await
+		.unwrap();
+	assert!(!work.join("b.txt").exists());
+}
+
 /// A commit whose parent's text isn't UTF-8 (a Latin-1 message under git's `encoding` header) is
 /// amended as git amends it: the check for an empty result reads only the parent's tree.
 #[tokio::test]

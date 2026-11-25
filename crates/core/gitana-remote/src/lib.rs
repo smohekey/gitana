@@ -567,7 +567,7 @@ pub(crate) async fn collect_have_commits<H: HashAlgorithm>(
 			match kind {
 				gitana_object::ObjectKind::Commit => {
 					out.push(id);
-					queue.extend(gitana_object::parse_commit::<H>(&data)?.parents);
+					queue.extend(gitana_object::commit_links::<H>(&data)?.parents);
 				}
 				gitana_object::ObjectKind::Tag => {
 					queue.push_back(gitana_object::parse_tag::<H>(&data)?.object);

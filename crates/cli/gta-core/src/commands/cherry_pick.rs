@@ -10,6 +10,7 @@ use gitana_porcelain::PickOutcome;
 use gitana_worktree::WorkTree;
 
 use crate::commands::conflict;
+use crate::commands::guessed;
 use crate::dispatch::{self, WorkTreeCommand};
 use crate::identity::CliIdentity;
 use crate::signer;
@@ -80,9 +81,12 @@ impl WorkTreeCommand for CherryPick {
 		)
 		.await?;
 		if self.continue_ {
-			let commit =
+			let written =
 				gitana_porcelain::continue_cherry_pick(&wt, None, &identity, signer.as_ref()).await?;
-			println!("{commit}");
+			if written.repaired {
+				guessed::warn_of_repair();
+			}
+			println!("{}", written.commit);
 			return Ok(());
 		}
 
@@ -90,7 +94,12 @@ impl WorkTreeCommand for CherryPick {
 			bail!("cherry-pick requires a commit (or --abort/--continue)");
 		};
 		match gitana_porcelain::cherry_pick(&wt, &commit, &identity, signer.as_ref()).await? {
-			PickOutcome::Picked { commit } => println!("{commit}"),
+			PickOutcome::Picked { commit, repaired } => {
+				if repaired {
+					guessed::warn_of_repair();
+				}
+				println!("{commit}");
+			}
 			PickOutcome::Conflict { paths } => {
 				return Err(conflict::report_conflicts(&paths, self.result_path_mode));
 			}
