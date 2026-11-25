@@ -34,6 +34,8 @@ pub struct NativeSubmoduleProbe<H> {
 	config: GitConfig,
 	declarations: OnceCell<Declarations>,
 	warnings: Arc<Mutex<Vec<String>>>,
+	/// Open each submodule with its mount as its work tree, whatever its `core.worktree` says.
+	mounts_as_work_trees: bool,
 	hash: PhantomData<fn() -> H>,
 }
 
@@ -46,8 +48,19 @@ impl<H: HashAlgorithm> NativeSubmoduleProbe<H> {
 			config,
 			declarations: OnceCell::new(),
 			warnings: Arc::new(Mutex::new(Vec::new())),
+			mounts_as_work_trees: false,
 			hash: PhantomData,
 		}
+	}
+
+	/// This probe, opening each submodule (and the submodules inside it) with its mount as its work
+	/// tree, whatever the submodule's `core.worktree` says. For a caller that has moved a work tree
+	/// whose submodules' `core.worktree` still names where it was, as deinit's last check before it
+	/// retires a checkout does. A submodule's `core.worktree` names its mount anyway, unless it's been
+	/// set by hand.
+	pub fn with_mounts_as_work_trees(mut self) -> Self {
+		self.mounts_as_work_trees = true;
+		self
 	}
 
 	/// The warnings git would print during the status, each once, without git's `warning: `
@@ -64,6 +77,7 @@ impl<H: HashAlgorithm> NativeSubmoduleProbe<H> {
 	fn nested(&self, layout: RepositoryLayout, config: GitConfig) -> Self {
 		Self {
 			warnings: Arc::clone(&self.warnings),
+			mounts_as_work_trees: self.mounts_as_work_trees,
 			..Self::new(layout, config)
 		}
 	}
@@ -121,7 +135,7 @@ impl<H: HashAlgorithm> NativeSubmoduleProbe<H> {
 				return Err(error).with_context(|| format!("couldn't look at {}", mount.display()));
 			}
 		}
-		let module = Module::<H>::mounted_at(&mount).await?;
+		let module = Module::<H>::mounted_at(&mount, self.mounts_as_work_trees).await?;
 		// An unborn `HEAD` isn't new commits: git counts the module's staged files as modified
 		// content instead (probed vs git 2.55).
 		report.new_commits = module.head().await?.is_some_and(|head| head != recorded);

@@ -759,7 +759,20 @@ other half of the ownership proof. Without `--force`, status and `HEAD` are also
 checkout must have `HEAD` at the superproject's recorded gitlink commit
 both before displacement and before retirement; a different or missing `HEAD` is a local
 modification unless `--force` was requested. Status includes visible untracked and staged changes,
-while the
+and the submodules inside the checkout as git's deinit counts them: new commits, modified or
+untracked content, at any depth, whatever their ignore settings say (a `SubmoduleProbe` with
+`--ignore-submodules=none` semantics). Both checks open those nested submodules where the checkout
+is at the time, each with its mount as its work tree: after displacement, their `core.worktree`
+still names the public path. A populated nested mount that the probe finds clean no longer blocks
+deinit; it's retired with the rest of the checkout, as git clears it. Before the preflight check,
+the `.git` directory of each nested submodule that has one is absorbed as git's deinit absorbs it,
+depth first: renamed into its parent's `modules/<name>`, with a gitfile and a relative
+`core.worktree` written after the move, in git's order and with git's crash window (unjournaled).
+It's refused, with git's messages, when no declaration names it or the destination isn't empty.
+What was absorbed stays absorbed even if the deinit then refuses. The top-level checkout's own
+`.git` directory is still refused (`ForeignMount`). Gitfiles naming repositories elsewhere aren't
+moved, as git doesn't move them.
+While the
 retirement proof separately hashes tracked content so stat-cache and skip-worktree edits cannot be
 lost. Worktree-relative `core.excludesFile` paths and absolute paths component-wise beneath the known
 worktree root are read through the opened original or displaced checkout rather than re-resolved

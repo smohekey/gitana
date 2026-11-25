@@ -1950,6 +1950,7 @@ dependencies = [
  "gitana-remote",
  "gitana-repository",
  "gitana-repository-layout",
+ "gitana-submodule-probe",
  "gitana-worktree",
  "rustix",
  "serde",

@@ -24,11 +24,20 @@ pub(crate) struct Module<H: HashAlgorithm> {
 impl<H: HashAlgorithm> Module<H> {
 	/// The repository mounted at `mount`, found as git finds it: from the mount's `.git`, a gitfile
 	/// (followed wherever it points) or a directory, without looking above the mount. A `.git` that
-	/// names no repository is an error, as it's fatal to git's status.
-	pub(crate) async fn mounted_at(mount: &Path) -> Result<Self> {
-		let layout = gitana_repository_layout::inspect_root(mount)
-			.await
-			.with_context(|| format!("{} isn't a git repository", mount.display()))?;
+	/// names no repository is an error, as it's fatal to git's status. Its work tree is the one its
+	/// `core.worktree` names, as git takes it, unless `mount_is_work_tree`.
+	pub(crate) async fn mounted_at(mount: &Path, mount_is_work_tree: bool) -> Result<Self> {
+		let layout = if mount_is_work_tree {
+			let mut layout = gitana_repository_layout::inspect_source(mount).await;
+			if let Ok(layout) = &mut layout {
+				layout.worktree_root = Some(mount.to_path_buf());
+				layout.marker_root = Some(mount.to_path_buf());
+			}
+			layout
+		} else {
+			gitana_repository_layout::inspect_root(mount).await
+		}
+		.with_context(|| format!("{} isn't a git repository", mount.display()))?;
 		Self::open(layout).await
 	}
 

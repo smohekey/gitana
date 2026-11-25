@@ -317,9 +317,14 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   - **Rebase.** The rebase gate now ignores a submodule's unstaged changes, as git's does. It still
     refuses a staged gitlink change up front; git's gate lets that through and its pick fails
     mid-rebase.
+  - **Deinit.** A clean nested submodule no longer blocks `submodule deinit`; a dirty one, at any
+    depth, still does, whatever its ignore settings. Both of deinit's checks probe nested content.
+    Nested `.git` directories are absorbed first, as git's deinit absorbs them, and reported as git's
+    `Migrating git directory` lines (on success only; git prints them before a refusal too).
   - **Tests.** Oracle-tested against git 2.55 in both object formats:
     `gitana-submodule-probe/tests/git_status.rs`, `gta/tests/git_status_submodules.rs`,
-    `gta/tests/git_rebase_submodules.rs`, and `gitana-repo-host/tests/submodules.rs`.
+    `gta/tests/git_rebase_submodules.rs`, `gta/tests/git_deinit_submodules.rs`, and
+    `gitana-repo-host/tests/submodules.rs`.
 - [ ] Give `diff` git's `-dirty` suffix for a submodule with modified or untracked content (it still
   compares the checked-out commit alone).
 - [ ] Give `gta status` git's `--short` and `--porcelain=v2` output; `StatusEntry.submodule` now
@@ -328,6 +333,13 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   also leaves a submodule's untracked content out under them.
 - [ ] Report a type change as `T` in `status`. gitana says `M` where git says `T`, staged or not:
   a file replaced by a symlink, or a gitlink replaced by a file.
+- [ ] Print each deinit refusal once: `gta submodule deinit` renders a preflight refusal twice
+  (`DeinitFailure` displays its source and also returns it as `source()`, and `render_error` joins
+  the chain).
+- [ ] Accept `GIT_CONFIG_GLOBAL=/dev/null` in `gta submodule deinit`, as git does. Its config-input
+  check refuses it ("/dev/null is not a regular file").
+- [ ] Absorb the deinitialized submodule's own `.git` directory, as git's deinit does. gitana refuses
+  it (`ForeignMount`); nested ones are absorbed.
 - [ ] List a submodule with new commits in `ls-files -m` when its `.git` is a directory in the mount.
   git lists it; the routed store reads only a gitfile into `modules/`. (`status` sees it, through the
   probe.)
