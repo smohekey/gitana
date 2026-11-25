@@ -315,7 +315,8 @@ impl<H: HashAlgorithm> Index<H> {
 			.retain(|entry| !entry.path.as_bytes().starts_with(&dir_prefix));
 	}
 
-	/// Parse index bytes (DIRC v2–v4), verifying the trailing checksum.
+	/// Parse index bytes (DIRC v2–v4), verifying the trailing checksum unless git skipped computing it
+	/// (an all-zero trailer, which git writes under `index.skipHash`), as git's `fsck` does.
 	pub fn parse(bytes: &[u8]) -> Result<Self, WorktreeError> {
 		Ok(Self::parse_with_link(bytes)?.0)
 	}
@@ -337,7 +338,13 @@ impl<H: HashAlgorithm> Index<H> {
 		let count = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
 
 		let body_end = bytes.len() - checksum_len;
-		if H::digest(&[&bytes[..body_end]]).as_ref() != &bytes[body_end..] {
+		// Under `index.skipHash` (which `feature.manyFiles` also turns on) git writes an all-zero trailer in
+		// place of the hash, meaning "not computed". git's everyday reads (`status`, `ls-files`) don't check
+		// the trailer at all; its `fsck` does, accepting all zeros and verifying any other value. This follows
+		// `fsck`, so such an index is read unverified.
+		let trailer = &bytes[body_end..];
+		if trailer.iter().any(|&byte| byte != 0) && H::digest(&[&bytes[..body_end]]).as_ref() != trailer
+		{
 			return Err(WorktreeError::ChecksumMismatch);
 		}
 
@@ -776,5 +783,41 @@ mod tests {
 			Index::<Sha256>::parse(&bytes),
 			Err(WorktreeError::ChecksumMismatch)
 		));
+	}
+
+	/// `index` written out with an all-zero trailer, as git writes it under `index.skipHash`.
+	fn with_zero_trailer(index: &Index<Sha256>) -> Vec<u8> {
+		let mut bytes = index.write_v4();
+		let body_end = bytes.len() - Sha256::RAW_LEN;
+		bytes[body_end..].fill(0);
+		bytes
+	}
+
+	#[test]
+	fn accepts_an_all_zero_trailer_as_git_writes_under_skip_hash() {
+		let mut index = Index::<Sha256>::new();
+		index.upsert(entry("README.md", b"c"));
+		index.upsert(entry("src/lib.rs", b"a"));
+		assert_eq!(Index::parse(&with_zero_trailer(&index)).unwrap(), index);
+	}
+
+	#[test]
+	fn rejects_a_trailer_that_is_zero_but_for_one_byte() {
+		let mut index = Index::<Sha256>::new();
+		index.upsert(entry("README.md", b"c"));
+		let zero = with_zero_trailer(&index);
+		let body_end = zero.len() - Sha256::RAW_LEN;
+		for position in [body_end, zero.len() - 1] {
+			let mut bytes = zero.clone();
+			bytes[position] = 1;
+			assert!(
+				matches!(
+					Index::<Sha256>::parse(&bytes),
+					Err(WorktreeError::ChecksumMismatch)
+				),
+				"a non-zero byte at trailer offset {}",
+				position - body_end
+			);
+		}
 	}
 }
