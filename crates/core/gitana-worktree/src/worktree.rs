@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gitana_file_store::{FileStore, FileStoreError, WriteOutcome};
@@ -13,8 +14,8 @@ use crate::ignore::{self, DirIgnore};
 use crate::index_lock::IndexLock;
 use crate::sparse::{SparseCheckout, SparseReapply, SparseSet};
 use crate::{
-	Converter, Index, IndexEntry, LineEndingChange, OutsideAttributes, ResetError, Staged, Status,
-	SwitchError, WorktreeError,
+	Converter, IgnoreSubmodules, Index, IndexEntry, LineEndingChange, OutsideAttributes, ResetError,
+	Staged, Status, SubmoduleProbe, SwitchError, WorktreeError,
 };
 
 /// A commit ready to record, from [`WorkTree::prepare_commit`]: the staged tree, the resolved author
@@ -129,6 +130,11 @@ pub struct WorkTree<F, W, H: HashAlgorithm> {
 	worktree_root: Option<PathBuf>,
 	/// The attributes files from outside the repository, handed in by the frontend.
 	outside_attributes: OutsideAttributes,
+	/// What looks inside submodules for status; without one, a submodule is compared by its
+	/// checked-out commit alone.
+	submodule_probe: Option<Arc<dyn SubmoduleProbe<H>>>,
+	/// The command line's `--ignore-submodules`, which outranks each submodule's own setting.
+	ignore_submodules: Option<IgnoreSubmodules>,
 }
 
 impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
@@ -141,6 +147,8 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			git_dir: git_dir.into(),
 			worktree_root: None,
 			outside_attributes: OutsideAttributes::default(),
+			submodule_probe: None,
+			ignore_submodules: None,
 		}
 	}
 
@@ -162,6 +170,8 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 			git_dir: git_dir.into(),
 			worktree_root: Some(worktree_root.into()),
 			outside_attributes: OutsideAttributes::default(),
+			submodule_probe: None,
+			ignore_submodules: None,
 		}
 	}
 
@@ -176,6 +186,32 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// them.
 	pub(crate) fn outside_attributes(&self) -> &OutsideAttributes {
 		&self.outside_attributes
+	}
+
+	/// This working tree, with `probe` looking inside its submodules, so status reports their
+	/// modified and untracked content as git does. Without one, a submodule is compared by its
+	/// checked-out commit alone.
+	pub fn with_submodule_probe(mut self, probe: Arc<dyn SubmoduleProbe<H>>) -> Self {
+		self.submodule_probe = Some(probe);
+		self
+	}
+
+	/// This working tree, with status leaving out what `ignore` says, as git's
+	/// `--ignore-submodules=<when>` does. It outranks each submodule's own setting, and `All` also
+	/// hides staged gitlink changes, which no setting in config does.
+	pub fn with_ignore_submodules(mut self, ignore: IgnoreSubmodules) -> Self {
+		self.ignore_submodules = Some(ignore);
+		self
+	}
+
+	/// What looks inside submodules, as [`Self::with_submodule_probe`] gave it.
+	pub(crate) fn submodule_probe(&self) -> Option<&dyn SubmoduleProbe<H>> {
+		self.submodule_probe.as_deref()
+	}
+
+	/// The command line's `--ignore-submodules`, as [`Self::with_ignore_submodules`] gave it.
+	pub(crate) fn ignore_submodules(&self) -> Option<IgnoreSubmodules> {
+		self.ignore_submodules
 	}
 
 	/// The underlying repository.
@@ -2175,8 +2211,30 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	/// excludes file (`core.excludesFile`), which the caller resolves because it lives outside the
 	/// worktree; `None` when there is none. `core.ignoreCase` and `.git/info/exclude` are read
 	/// internally (see [`crate::excludes`]).
+	///
+	/// Submodules are looked inside with the probe [`Self::with_submodule_probe`] gave, and the
+	/// [`Self::with_ignore_submodules`] setting applies.
 	pub async fn status(&self, excludes_file: Option<&[u8]>) -> Result<Status, WorktreeError> {
-		crate::status::compute(self, excludes_file).await
+		self
+			.status_with_submodules(
+				excludes_file,
+				self.submodule_probe(),
+				self.ignore_submodules(),
+			)
+			.await
+	}
+
+	/// [`Self::status`], with `probe` looking inside the submodules and `flag` as the command line's
+	/// `--ignore-submodules`, for this status only, in place of what [`Self::with_submodule_probe`]
+	/// and [`Self::with_ignore_submodules`] gave. For a caller that keeps one working tree across
+	/// statuses that each need their own (a probe reads `.gitmodules` once).
+	pub async fn status_with_submodules(
+		&self,
+		excludes_file: Option<&[u8]>,
+		probe: Option<&dyn SubmoduleProbe<H>>,
+		flag: Option<IgnoreSubmodules>,
+	) -> Result<Status, WorktreeError> {
+		crate::status::compute(self, excludes_file, probe, flag).await
 	}
 
 	/// git `ls-files`: list index and/or working-tree paths selected by `opts` and filtered by

@@ -31,6 +31,7 @@ gitana-remote = { workspace = true, features = ["reqwest-transport", "ssh-transp
 gitana-repository-layout.workspace = true
 gitana-repository.workspace = true
 gitana-submodule.workspace = true
+gitana-submodule-probe.workspace = true
 gitana-trust.workspace = true
 gitana-worktree.workspace = true
 # Terminal credential prompting (git-faithful fallback): `rpassword` reads a password from the TTY

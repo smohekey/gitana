@@ -131,6 +131,62 @@ interface ssh-transport {
 		user: option<string>, path: string) -> result<ssh-session, string>;
 }
 
+/// The submodule shapes the host's `submodules` capability and the `porcelain` export share.
+interface submodule-types {
+	/// Which of a submodule's changes status leaves out, as git spells them
+	/// (`--ignore-submodules=<when>`, `submodule.<name>.ignore`, `diff.ignoreSubmodules`).
+	enum ignore-submodules {
+		/// Nothing: new commits, modified content and untracked content all count (git's default).
+		none,
+		/// Untracked content inside the submodule.
+		untracked,
+		/// The submodule's modified and untracked content; new commits still count.
+		dirty,
+		/// All of it, a deleted or replaced mount included; as the status flag, staged gitlink
+		/// changes too.
+		all,
+	}
+}
+
+/// Looking inside a working tree's submodules, granted by the host.
+///
+/// The component's status can't open a submodule's repository: its only authority is the descriptors
+/// the host granted for one repository. So it *imports* this capability, and the **host** looks
+/// inside each submodule natively, as git's `status` does: the mount's `.git` (a gitfile followed
+/// wherever it points, or a directory), the submodule's own config and ignore settings, and the
+/// submodules inside it. A host that grants nothing answers every `report` with `none`, so a
+/// submodule is compared by its checked-out commit alone.
+interface submodules {
+	use submodule-types.{ignore-submodules};
+
+	/// What the host found for one submodule.
+	record submodule-report {
+		/// The submodule's own ignore setting: `submodule.<name>.ignore` in the config, else in
+		/// `.gitmodules`, else `diff.ignoreSubmodules`.
+		ignore: ignore-submodules,
+		/// The commit checked out in it isn't the recorded one.
+		new-commits: bool,
+		/// Its tracked content is changed, or a submodule inside it has new commits or modified
+		/// content.
+		modified-content: bool,
+		/// It, or a submodule inside it, has untracked content (not ignored files).
+		untracked-content: bool,
+	}
+
+	/// One status's look inside the working tree's submodules. The component makes one per
+	/// `status` call, so the host reads `.gitmodules` once per status.
+	resource probe {
+		constructor();
+
+		/// What's inside the submodule mounted at `path` (its git path's bytes, from the work tree's
+		/// root), whose gitlink records `recorded` (hex); `none` when there's nothing to say.
+		/// `ignore-flag` is the status flag, when given: it outranks the submodule's own setting, so
+		/// what it hides isn't looked at. An error fails the status.
+		report: func(path: list<u8>, recorded: string, ignore-flag: option<ignore-submodules>)
+			-> result<option<submodule-report>, string>;
+	}
+}
+
 /// Repository operations over a capability-granted git directory.
 ///
 /// The host passes an **owned** `wasi:filesystem` directory descriptor to
@@ -138,6 +194,7 @@ interface ssh-transport {
 /// authority — there is no preopen-path convention and no ambient access.
 interface porcelain {
 	use wasi:filesystem/types@0.2.12.{descriptor};
+	use submodule-types.{ignore-submodules};
 
 	/// Engine failures surfaced across the component boundary.
 	variant repo-error {
@@ -360,6 +417,21 @@ interface porcelain {
 		index: string,
 		/// The worktree-vs-index code (`Y`), a single-character string.
 		worktree: string,
+		/// For a submodule (a gitlink in `HEAD` or the index, as porcelain v2 marks it `S`), what's
+		/// changed inside it; `none` for any other path.
+		submodule: option<submodule-state>,
+	}
+
+	/// What's changed inside a submodule, as porcelain v2's `S<c><m><u>` shows it: what's left once
+	/// the ignore setting has had its say.
+	record submodule-state {
+		/// The commit checked out in it isn't the one recorded for it (`C`).
+		new-commits: bool,
+		/// Its tracked content is changed, or a submodule inside it has new commits or modified
+		/// content (`M`).
+		modified-content: bool,
+		/// It, or a submodule inside it, has untracked content (`U`).
+		untracked-content: bool,
 	}
 
 	/// One untracked worktree entry. `directory` is true when the default status
@@ -566,8 +638,11 @@ interface porcelain {
 
 		/// The three-way working-tree status: the `HEAD` tree vs the index (staged)
 		/// and the index vs the working tree (unstaged), plus untracked paths —
-		/// `git status --porcelain=v1` as structured data.
-		status: func() -> result<worktree-status, repo-error>;
+		/// `git status --porcelain=v1` as structured data. Submodules are looked inside through the
+		/// host's `submodules` capability; `ignore-submodules` is git's `--ignore-submodules=<when>`,
+		/// which outranks each submodule's own setting (and with `all` hides staged gitlink changes
+		/// too).
+		status: func(ignore-submodules: option<ignore-submodules>) -> result<worktree-status, repo-error>;
 
 		/// Stage `pathspecs` into the index. Each is a working-tree path (`/`
 		/// separators) interpreted relative to `prefix` (a `/`-joined work-tree
@@ -636,6 +711,9 @@ world repo {
 	// spawns `ssh` and bridges its stdio into `wasi:io` streams, the component's only means of reaching an
 	// SSH git remote (it cannot spawn a subprocess itself).
 	import ssh-transport;
+	// The submodule capability for status: the host looks inside each submodule natively, since the
+	// component's descriptors reach only the one repository it was granted.
+	import submodules;
 
 	export porcelain;
 }

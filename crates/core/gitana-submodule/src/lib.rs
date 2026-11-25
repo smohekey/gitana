@@ -5,6 +5,8 @@ fn git_path(path: &str) -> gitana_path::GitPath {
 	gitana_path::GitPath::from_utf8(path).expect("validated UTF-8 submodule path")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+mod absorb_git_dirs;
 mod config_identity;
 mod config_transition;
 mod config_views;
@@ -61,13 +63,15 @@ mod update_target;
 #[cfg(not(target_arch = "wasm32"))]
 mod worktree_mutation_guard;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use self::absorb_git_dirs::absorb_git_dirs;
 pub(crate) use self::config_identity::ConfigIdentity;
 pub use self::declaration::SubmoduleDeclaration;
 pub(crate) use self::declaration::mappings_by_path;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use self::declaration::{declarations_by_path, validate_name, validate_path};
 pub use self::deinit::{
-	DeinitFailure, DeinitOutcome, DeinitReport, DeinitRequest, DeinitSelection,
+	AbsorbedGitDir, DeinitFailure, DeinitOutcome, DeinitReport, DeinitRequest, DeinitSelection,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use self::deinit::{DeinitMountMarker, DurableIdentity};

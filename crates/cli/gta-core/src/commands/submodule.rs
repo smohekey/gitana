@@ -1283,6 +1283,14 @@ fn directory_identity_at(path: &Path, kind: &str) -> Result<EntryIdentity> {
 fn render_deinit(prefix: &str, report: &gitana_submodule::DeinitReport) {
 	for outcome in &report.outcomes {
 		let path = render_relative(prefix, &outcome.path);
+		for absorbed in &outcome.absorbed {
+			eprintln!(
+				"Migrating git directory of '{}' from\n'{}' to\n'{}'",
+				render_relative(prefix, &absorbed.path),
+				absorbed.from.display(),
+				absorbed.to.display()
+			);
+		}
 		if outcome.cleared {
 			println!("Cleared directory '{path}'");
 		}

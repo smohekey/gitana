@@ -15,17 +15,33 @@ use crate::bindings::exports::gitana::repo::porcelain::{
 	WorktreeStatus as WitWorktreeStatus,
 };
 
+use crate::bindings::exports::gitana::repo::porcelain::SubmoduleState as WitSubmoduleState;
+use crate::bindings::gitana::repo::submodule_types::IgnoreSubmodules as WitIgnoreSubmodules;
+
 use super::{
-	HostIdentity, display_path, git_path_into_wit, into_worktree_text, repo_error, worktree_error,
+	HostIdentity, HostSubmodules, display_path, git_path_into_wit, ignore_submodules_from_wit,
+	into_worktree_text, repo_error, worktree_error,
 };
 
 /// The working tree the worktree ops run over — the concrete `W` is the wasm descriptor capability.
 type Tree<H> = WorkTree<WorktreeFileStore, DescriptorWorkDir, H>;
 
-pub(crate) async fn status<H: HashAlgorithm>(wt: &Tree<H>) -> Result<WitWorktreeStatus, RepoError> {
+pub(crate) async fn status<H: HashAlgorithm>(
+	wt: &Tree<H>,
+	ignore_submodules: Option<WitIgnoreSubmodules>,
+) -> Result<WitWorktreeStatus, RepoError> {
 	// The component has no global excludes file (no `$HOME`/XDG in the sandbox), so pass `None`;
 	// `core.ignoreCase` and `.git/info/exclude` are still honoured, read internally from the repo.
-	let status = wt.status(None).await.map_err(worktree_error)?;
+	// The host looks inside the submodules, with a probe made for this status alone.
+	let probe = HostSubmodules::new();
+	let status = wt
+		.status_with_submodules(
+			None,
+			Some(&probe),
+			ignore_submodules.map(ignore_submodules_from_wit),
+		)
+		.await
+		.map_err(worktree_error)?;
 	Ok(WitWorktreeStatus {
 		changed: status
 			.changed
@@ -34,6 +50,11 @@ pub(crate) async fn status<H: HashAlgorithm>(wt: &Tree<H>) -> Result<WitWorktree
 				path: git_path_into_wit(entry.path),
 				index: entry.index.to_string(),
 				worktree: entry.worktree.to_string(),
+				submodule: entry.submodule.map(|state| WitSubmoduleState {
+					new_commits: state.new_commits,
+					modified_content: state.modified_content,
+					untracked_content: state.untracked_content,
+				}),
 			})
 			.collect(),
 		untracked: status

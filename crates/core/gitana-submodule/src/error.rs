@@ -88,6 +88,18 @@ pub enum SubmoduleError {
 	UnsafeName(String),
 	#[error("unsafe submodule path '{0}'")]
 	UnsafePath(String),
+	/// A nested submodule's `.git` directory has no `.gitmodules` declaration to name its place in
+	/// its parent's `modules/`, so deinit can't absorb it (git's message).
+	#[error("could not lookup name for submodule '{0}'")]
+	AbsorbUnnamed(String),
+	/// A nested submodule's `.git` directory can't be absorbed into `to`, which isn't empty (git's
+	/// message).
+	#[error(
+		"could not migrate git directory from '{}' to '{}': Directory not empty",
+		.from.display(),
+		.to.display()
+	)]
+	AbsorbBlocked { from: PathBuf, to: PathBuf },
 	#[error("submodule filesystem error at {path}: {source}")]
 	Io {
 		path: PathBuf,

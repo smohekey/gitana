@@ -13,6 +13,7 @@ use crate::bindings::exports::gitana::repo::porcelain::{
 	ReflogRequest, RepackReport, RepoError, SparseEntry, SparseOutcome, SparsePatterns, TagInfo,
 	TreeBuildEntry, TreeEntry, WorktreeStatus,
 };
+use crate::bindings::gitana::repo::submodule_types::IgnoreSubmodules;
 use crate::block_on::block_on;
 use crate::ops;
 
@@ -363,8 +364,11 @@ impl Inner {
 		dispatch!(self, held => block_on(ops::create_commit(held.repository(), tree, parents, author, committer, message)))
 	}
 
-	pub(crate) fn status(&self) -> Result<WorktreeStatus, RepoError> {
-		dispatch!(self, held => block_on(ops::status(held.worktree()?)))
+	pub(crate) fn status(
+		&self,
+		ignore_submodules: Option<IgnoreSubmodules>,
+	) -> Result<WorktreeStatus, RepoError> {
+		dispatch!(self, held => block_on(ops::status(held.worktree()?, ignore_submodules)))
 	}
 
 	pub(crate) fn add(

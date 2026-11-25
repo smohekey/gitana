@@ -7,6 +7,7 @@ use crate::bindings::exports::gitana::repo::porcelain::{
 	PushOutcome, RefEntry, ReflogRequest, RepackReport, RepoError, Repository, RevisionSpec,
 	SparseEntry, SparseOutcome, SparsePatterns, TagInfo, TreeBuildEntry, TreeEntry, WorktreeStatus,
 };
+use crate::bindings::gitana::repo::submodule_types::IgnoreSubmodules;
 use crate::inner::Inner;
 
 /// The component itself: wires the exported interface to its resource type.
@@ -172,8 +173,11 @@ impl GuestRepository for GitanaRepository {
 			.create_commit(&tree, &parents, &author, &committer, &message)
 	}
 
-	fn status(&self) -> Result<WorktreeStatus, RepoError> {
-		self.inner.status()
+	fn status(
+		&self,
+		ignore_submodules: Option<IgnoreSubmodules>,
+	) -> Result<WorktreeStatus, RepoError> {
+		self.inner.status(ignore_submodules)
 	}
 
 	fn add(&self, pathspecs: Vec<GitPath>, prefix: GitPath, force: bool) -> Result<(), RepoError> {

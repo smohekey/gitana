@@ -1,6 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt as _};
@@ -18,13 +19,14 @@ use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
 use gitana_repository_layout::RepositoryLayout;
-use gitana_worktree::WorkTree;
+use gitana_submodule_probe::NativeSubmoduleProbe;
+use gitana_worktree::{IgnoreSubmodules, WorkTree};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	ConfigurationProvider, DeinitConfigPublication, DeinitConfigTransition, DeinitFailure,
-	DeinitMountMarker, DeinitOutcome, DeinitReport, DeinitRequest, DeinitSelection, DurableIdentity,
-	MarkerTargetResolver, SubmoduleContext, SubmoduleDeclaration, SubmoduleError,
+	AbsorbedGitDir, ConfigurationProvider, DeinitConfigPublication, DeinitConfigTransition,
+	DeinitFailure, DeinitMountMarker, DeinitOutcome, DeinitReport, DeinitRequest, DeinitSelection,
+	DurableIdentity, MarkerTargetResolver, SubmoduleContext, SubmoduleDeclaration, SubmoduleError,
 	SubmoduleMutationLease, declarations_by_path, validate_name, validate_path,
 };
 
@@ -51,6 +53,8 @@ struct Planned {
 	module_identity: Option<DurableIdentity>,
 	module_transition: Option<DeinitConfigTransition>,
 	module_lease: Option<SubmoduleMutationLease>,
+	/// The nested `.git` directories the preflight absorbed.
+	absorbed: Vec<AbsorbedGitDir>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -752,6 +756,7 @@ impl SubmoduleContext {
 					)));
 				}
 			};
+			let mut absorbed = Vec::new();
 			if mounted && !request.force {
 				let mount = mount
 					.as_ref()
@@ -763,10 +768,25 @@ impl SubmoduleContext {
 							source,
 						})
 					})?;
+				// git absorbs the `.git` directories of the submodules inside before it checks the checkout,
+				// and leaves them absorbed even when it then refuses (probed vs git 2.55).
+				absorbed = crate::absorb_git_dirs::<H, C>(
+					&mount,
+					&self.worktree_root().join(&declaration.path),
+					module
+						.as_ref()
+						.expect("a fresh mounted deinit has a module repository"),
+					&module_path,
+					&declaration.path,
+					configuration,
+				)
+				.await
+				.map_err(preflight)?;
 				self
 					.ensure_checkout_clean_with_module::<H, C>(
 						&declaration,
 						mount,
+						&self.worktree_root().join(&declaration.path),
 						module
 							.as_ref()
 							.expect("a fresh mounted deinit has a module repository"),
@@ -788,6 +808,7 @@ impl SubmoduleContext {
 				module_identity,
 				module_transition,
 				module_lease,
+				absorbed,
 			});
 		}
 
@@ -929,7 +950,10 @@ impl SubmoduleContext {
 				.deinit_one::<H, C>(&entry, request.force, configuration, &lock)
 				.await
 			{
-				Ok(outcome) => report.outcomes.push(outcome),
+				Ok(mut outcome) => {
+					outcome.absorbed = entry.absorbed.clone();
+					report.outcomes.push(outcome);
+				}
 				Err(source) => {
 					return Err(DeinitFailure {
 						completed: report,
@@ -1520,6 +1544,7 @@ impl SubmoduleContext {
 			path: intent.path.clone(),
 			cleared: intent.mount_identity.is_some(),
 			unregistered,
+			absorbed: Vec::new(),
 		})
 	}
 
@@ -2472,6 +2497,10 @@ impl SubmoduleContext {
 			.ensure_checkout_clean_with_module::<H, C>(
 				&declaration,
 				mount,
+				&self
+					.worktree_root()
+					.join(&intent.path)
+					.with_file_name(displaced),
 				module,
 				ObjectId::<H>::from_hex(&intent.recorded).map_err(|_| {
 					SubmoduleError::RecoveryRequired(
@@ -2483,10 +2512,16 @@ impl SubmoduleContext {
 			.await
 	}
 
+	/// Refuse to deinitialize a checkout with local changes, as git's deinit does without `-f`: a
+	/// checked-out commit other than `recorded`, tracked or untracked changes, or a submodule inside
+	/// it with new commits or modified or untracked content, at any depth, whatever the ignore
+	/// settings say (probed vs git 2.55). `mount` is the checkout, opened, and `location` where it is
+	/// now: its public path, or the private sibling name deinit moved it to.
 	async fn ensure_checkout_clean_with_module<H: HashAlgorithm, C: ConfigurationProvider>(
 		&self,
 		declaration: &SubmoduleDeclaration,
 		mount: Dir,
+		location: &Path,
 		module: &Dir,
 		recorded: ObjectId<H>,
 		configuration: &C,
@@ -2527,6 +2562,19 @@ impl SubmoduleContext {
 				&mount_path,
 			)
 			.await?;
+		// The submodules inside are opened where the checkout is now, each with its mount as its work
+		// tree: after deinit moves the checkout aside, their `core.worktree` still names where it was.
+		let probe = NativeSubmoduleProbe::<H>::new(
+			RepositoryLayout {
+				bare_and_worktree: false,
+				worktree_root: Some(location.to_path_buf()),
+				marker_root: Some(location.to_path_buf()),
+				git_dir: module_path.clone(),
+				common_dir: module_path.clone(),
+			},
+			config.clone(),
+		)
+		.with_mounts_as_work_trees();
 		repository.set_effective_config(config);
 		if repository.refs().resolve_head().await? != Some(recorded) {
 			return Err(SubmoduleError::LocalModifications(declaration.path.clone()));
@@ -2537,9 +2585,26 @@ impl SubmoduleContext {
 			module_path,
 			mount_path,
 		)
-		.with_outside_attributes(attributes);
+		.with_outside_attributes(attributes)
+		.with_submodule_probe(Arc::new(probe))
+		.with_ignore_submodules(IgnoreSubmodules::None);
 		let status = worktree.status(excludes.as_deref()).await?;
-		let diverged = worktree.diverged_tracked_content_paths().await?;
+		// A populated mount inside is content to keep only when the probe finds it changed, which the
+		// status above says; the hashed re-verification counts any populated mount.
+		let gitlinks: std::collections::HashSet<_> = worktree
+			.load_index()
+			.await?
+			.entries
+			.into_iter()
+			.filter(|entry| entry.mode == 0o160000)
+			.map(|entry| entry.path)
+			.collect();
+		let diverged: Vec<_> = worktree
+			.diverged_tracked_content_paths()
+			.await?
+			.into_iter()
+			.filter(|path| !gitlinks.contains(path))
+			.collect();
 		if !status.changed.is_empty() || !status.untracked.is_empty() || !diverged.is_empty() {
 			return Err(SubmoduleError::LocalModifications(declaration.path.clone()));
 		}

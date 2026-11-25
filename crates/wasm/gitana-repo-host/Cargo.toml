@@ -14,6 +14,16 @@ workspace = true
 # workspace-wide `cargo check --target wasm32-wasip2` compiles this crate to nothing.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 anyhow.workspace = true
+# The `submodules` capability looks inside the granted work tree's submodules natively (gitana's own
+# probe, as gta's status does), so the host opens repositories with cap-std 4.x as the workspace does.
+cap-std.workspace = true
+gitana-config.workspace = true
+gitana-config-native.workspace = true
+gitana-object.workspace = true
+gitana-path.workspace = true
+gitana-repository-layout.workspace = true
+gitana-submodule-probe.workspace = true
+gitana-worktree.workspace = true
 # wasmtime-wasi's `Dir::new` takes the cap-std it was built against (3.x); the gitana
 # workspace itself is on cap-std 4.x, so the host names the compatible major under a
 # distinct import rather than repointing the workspace dependency.
@@ -31,13 +41,10 @@ tokio = { workspace = true, features = ["process"] }
 # axum + gitana-git-http stand up a loopback Smart-HTTP server (gitana's OWN handlers) as the oracle
 # for the remote-porcelain e2e — the same pattern as gta's git_smart_http tests.
 axum.workspace = true
-cap-std.workspace = true
 gitana-file-store.workspace = true
 gitana-file-store-local.workspace = true
 gitana-git-http.workspace = true
-gitana-object.workspace = true
 gitana-object-store.workspace = true
-gitana-path.workspace = true
 gitana-repository.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -10,7 +10,7 @@ mod durable_identity;
 pub use self::deinit_failure::DeinitFailure;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use self::deinit_mount_marker::DeinitMountMarker;
-pub use self::deinit_outcome::DeinitOutcome;
+pub use self::deinit_outcome::{AbsorbedGitDir, DeinitOutcome};
 pub use self::deinit_report::DeinitReport;
 pub use self::deinit_request::{DeinitRequest, DeinitSelection};
 #[cfg(not(target_arch = "wasm32"))]

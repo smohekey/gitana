@@ -90,6 +90,13 @@ pub enum WorktreeError {
 	/// treat the link as the submodule and aborts (probed vs git 2.55: `diff` → this exact message).
 	#[error("expected submodule path '{0}' not to be a symbolic link")]
 	SubmodulePathIsSymlink(GitPath),
+	/// The [`SubmoduleProbe`](crate::SubmoduleProbe) couldn't say what's inside the submodule at
+	/// `path`, so the status can't be told.
+	#[error("couldn't read the status of submodule '{path}': {source}")]
+	Submodule {
+		path: GitPath,
+		source: Box<dyn std::error::Error + Send + Sync>,
+	},
 	/// A tree records a gitlink (mode 160000) with an all-zero object id — not a valid cache entry. git
 	/// refuses to write the index and does not switch branches (probed vs git 2.55: "cache entry has null
 	/// sha1"). A non-null commit gitana does not have locally is fine (an unfetched submodule); only the

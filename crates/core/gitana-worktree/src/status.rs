@@ -13,10 +13,13 @@ use crate::excludes::StandardExcludes;
 use crate::fsmeta::{effective_mode, join_rel, push_gitignore};
 use crate::ignore::{self, DirIgnore};
 use crate::submodule_head_oid;
-use crate::{Conflict, Converter, IndexEntry, WorkTree, WorktreeError};
+use crate::{
+	Conflict, Converter, IgnoreSubmodules, IndexEntry, SubmoduleProbe, WorkTree, WorktreeError,
+};
 
 /// One path's status: an index (staged-vs-HEAD) code and a worktree
-/// (unstaged-vs-index) code, using git's letters (` `, `A`, `M`, `D`, `?`).
+/// (unstaged-vs-index) code, using git's letters (` `, `A`, `M`, `D`, `?`), and for a submodule,
+/// what's changed inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusEntry {
 	/// Repository-relative path.
@@ -25,6 +28,22 @@ pub struct StatusEntry {
 	pub index: char,
 	/// Worktree-vs-index code (the `Y` column).
 	pub worktree: char,
+	/// For a submodule (a gitlink in HEAD or the index, as porcelain v2 marks it `S`), what's
+	/// changed inside it; `None` for any other path.
+	pub submodule: Option<SubmoduleState>,
+}
+
+/// What's changed inside a submodule, as porcelain v2's `S<c><m><u>` shows it: what's left once the
+/// ignore setting has had its say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubmoduleState {
+	/// The commit checked out in it isn't the one recorded for it (`C`).
+	pub new_commits: bool,
+	/// Its tracked content is changed, or a submodule inside it has new commits or modified content
+	/// (`M`).
+	pub modified_content: bool,
+	/// It, or a submodule inside it, has untracked content (`U`).
+	pub untracked_content: bool,
 }
 
 /// The status of a working tree. `changed` holds tracked paths with a non-clean index/worktree code
@@ -76,9 +95,13 @@ impl Status {
 	}
 }
 
+/// The status of `wt`, with `probe` looking inside its submodules and `flag` the command line's
+/// `--ignore-submodules` (see [`WorkTree::status_with_submodules`]).
 pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
 	excludes_file: Option<&[u8]>,
+	probe: Option<&dyn SubmoduleProbe<H>>,
+	flag: Option<IgnoreSubmodules>,
 ) -> Result<Status, WorktreeError> {
 	// `core.fileMode` (git's `trust_executable_bit`): when `false`, an executable-bit-only difference between
 	// the working tree and the index is *not* a modification. Resolved with git's worktree precedence — a
@@ -167,6 +190,13 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		.map(|entry| &entry.path)
 		.collect();
 
+	// The command line's `--ignore-submodules=all` hides staged gitlink changes too, which no
+	// setting in config does: a gitlink added, removed, or moved to another commit. A gitlink
+	// replaced by a file (or the reverse) still shows (probed vs git 2.55).
+	let hide_staged_gitlinks = flag == Some(IgnoreSubmodules::All);
+	let gitlink =
+		|side: Option<&(String, ObjectId<H>)>| side.is_some_and(|(mode, _)| mode == "160000");
+
 	// Index vs HEAD (the X column); unmerged paths are handled separately.
 	let all: BTreeSet<&GitPath> = index_map.keys().chain(head_map.keys()).collect();
 	for path in all {
@@ -178,7 +208,15 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		} else {
 			index_map.get(path)
 		};
-		let code = match (staged, head_map.get(path)) {
+		let head = head_map.get(path);
+		if hide_staged_gitlinks
+			&& match (staged, head) {
+				(Some(_), Some(_)) => gitlink(staged) && gitlink(head),
+				_ => gitlink(staged) || gitlink(head),
+			} {
+			continue;
+		}
+		let code = match (staged, head) {
 			(Some(i), Some(h)) if i != h => 'M',
 			(Some(_), Some(_)) => ' ',
 			(Some(_), None) => 'A',
@@ -194,6 +232,7 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	// file is PRESENT: git ignores the working tree for an omitted (absent) sparse path — so its absence is
 	// not a deletion — but a file the user recreated or edited at that path is reported modified (git clears
 	// the bit when it notices the file; gitana reports it without mutating the index).
+	let mut submodules: HashMap<GitPath, SubmoduleState> = HashMap::new();
 	for entry in index.entries.iter().filter(|e| e.stage == 0) {
 		if entry.skip_worktree && wt.work().lstat(&entry.path)?.is_none() {
 			continue;
@@ -205,28 +244,9 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 				'A'
 			}
 		} else if entry.mode == 0o160000 {
-			// A submodule (gitlink) entry is compared by the path's kind first (probed vs git 2.55): an absent
-			// mount is ` D sub` (deleted), a mount replaced by a file/symlink is ` T sub` (type change), and a
-			// present directory is ` M` iff its checked-out `HEAD` differs from the recorded commit. git ignores
-			// the submodule's own dirty working content by default; an unresolvable submodule (an unhandled
-			// `.git` layout) under a real directory is treated as unchanged, never a false `M` (as `ls-files -m`).
-			// git honours the index trust bits for a gitlink exactly as for a blob: with skip-worktree or
-			// assume-valid set the working tree and the submodule's HEAD are not consulted, so a moved/absent/
-			// type-changed mount is no worktree modification (probed vs git 2.55; matches `ls-files -m`).
-			// skip-worktree + absent already `continue`d above; this also covers skip-worktree + present and
-			// assume-valid.
-			if entry.skip_worktree || entry.assume_valid {
-				' '
-			} else {
-				match wt.work().lstat(&entry.path)? {
-					None => 'D',
-					Some(meta) if !meta.kind.is_dir() => 'T',
-					Some(_) => match submodule_head_oid(wt, &entry.path).await {
-						Some(head) if head != entry.oid => 'M',
-						_ => ' ',
-					},
-				}
-			}
+			let (code, state) = gitlink_change(wt, entry, probe, flag).await?;
+			submodules.insert(entry.path.clone(), state);
+			code
 		} else {
 			worktree_change(&mut checkin, entry, &entry.path, file_mode).await?
 		};
@@ -240,6 +260,27 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		let slot = at(&mut merged, path);
 		slot.index = *x;
 		slot.worktree = *y;
+	}
+
+	// Every reported path that's a gitlink in HEAD or the index (any stage) is a submodule, as
+	// porcelain v2 marks it `S`, whether or not anything inside it changed: staged only, deleted,
+	// replaced, or removed from the index (probed vs git 2.55).
+	let gitlinks_anywhere: HashSet<&GitPath> = index
+		.entries
+		.iter()
+		.filter(|entry| entry.mode == 0o160000)
+		.map(|entry| &entry.path)
+		.chain(
+			head_map
+				.iter()
+				.filter(|(_, (mode, _))| mode == "160000")
+				.map(|(path, _)| path),
+		)
+		.collect();
+	for entry in merged.values_mut() {
+		if gitlinks_anywhere.contains(&entry.path) {
+			entry.submodule = Some(submodules.get(&entry.path).copied().unwrap_or_default());
+		}
 	}
 
 	// Untracked paths are reported separately (git lists them after the tracked changes), so a path
@@ -533,7 +574,78 @@ fn at<'a>(merged: &'a mut BTreeMap<GitPath, StatusEntry>, path: &GitPath) -> &'a
 			path: path.to_owned(),
 			index: ' ',
 			worktree: ' ',
+			submodule: None,
 		})
+}
+
+/// The work-tree column for the stage-0 gitlink `entry`, and what's left changed inside its
+/// submodule once the ignore setting has had its say (all probed vs git 2.55).
+///
+/// - With skip-worktree or assume-valid set, git consults neither the mount nor the submodule, as
+///   for a blob: clean, whatever is there (as `ls-files -m`).
+/// - The setting is the command line's `--ignore-submodules`, else the submodule's own (from the
+///   probe), else `none`. `all` hides everything, a deleted or replaced mount included; `dirty`
+///   hides modified and untracked content; `untracked` hides untracked content.
+/// - An absent mount is ` D`, and one replaced by a file or symlink is ` T`.
+/// - A mounted submodule is ` M` when its checked-out `HEAD` isn't the recorded commit (new
+///   commits), or when the probe found modified or untracked content inside it. New commits are
+///   found here for a gitfile into this checkout's own `modules/`, and by the probe for any other
+///   layout (a `.git` directory in the mount, or a gitfile naming a repository elsewhere). Without
+///   a probe, a `HEAD` that can't be resolved here counts as unchanged, never a false `M`, as in
+///   `ls-files -m`.
+async fn gitlink_change<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+	entry: &IndexEntry<H>,
+	probe: Option<&dyn SubmoduleProbe<H>>,
+	flag: Option<IgnoreSubmodules>,
+) -> Result<(char, SubmoduleState), WorktreeError> {
+	let unchanged = (' ', SubmoduleState::default());
+	if entry.skip_worktree || entry.assume_valid {
+		return Ok(unchanged);
+	}
+	if flag == Some(IgnoreSubmodules::All) {
+		return Ok(unchanged);
+	}
+	let mount = wt.work().lstat(&entry.path)?;
+	let mounted = mount.as_ref().is_some_and(|meta| meta.kind.is_dir());
+	// The probe is asked only when its answer can matter: for the submodule's own setting, unless
+	// the flag outranks it, and otherwise for what's in the mount, when there is one.
+	let ask = flag.is_none() || mounted;
+	let report = match probe {
+		Some(probe) if ask => probe
+			.report(&entry.path, entry.oid, flag)
+			.await
+			.map_err(|source| WorktreeError::Submodule {
+				path: entry.path.clone(),
+				source,
+			})?,
+		_ => None,
+	};
+	let ignore = flag
+		.or(report.map(|report| report.ignore))
+		.unwrap_or_default();
+	if ignore == IgnoreSubmodules::All {
+		return Ok(unchanged);
+	}
+	if mount.is_none() {
+		return Ok(('D', SubmoduleState::default()));
+	}
+	if !mounted {
+		return Ok(('T', SubmoduleState::default()));
+	}
+	let report = report.unwrap_or_default();
+	let state = SubmoduleState {
+		new_commits: report.new_commits
+			|| matches!(
+				submodule_head_oid(wt, &entry.path).await,
+				Some(head) if head != entry.oid
+			),
+		modified_content: report.modified_content
+			&& matches!(ignore, IgnoreSubmodules::None | IgnoreSubmodules::Untracked),
+		untracked_content: report.untracked_content && ignore == IgnoreSubmodules::None,
+	};
+	let changed = state.new_commits || state.modified_content || state.untracked_content;
+	Ok((if changed { 'M' } else { ' ' }, state))
 }
 
 pub(crate) async fn head_entries<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
@@ -989,7 +1101,7 @@ mod tests {
 		index.entries.push(entry("b.txt", b"BBBB"));
 		wt.save_index(&index).await.unwrap();
 		let changed = async || {
-			compute(&wt, None)
+			compute(&wt, None, None, None)
 				.await
 				.unwrap()
 				.changed

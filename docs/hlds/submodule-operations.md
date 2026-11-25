@@ -382,6 +382,19 @@ per-worktree module namespace, and then read the module `HEAD` through the route
 worktree's module movement is therefore visible and stageable without consulting the main
 worktree's shared `.git/modules` directory.
 
+`status` also looks inside a submodule, as git's does, when the caller attaches a `SubmoduleProbe`
+to the `WorkTree` (`gta status` attaches `gitana-submodule-probe`'s `NativeSubmoduleProbe`; the
+`gitana:repo` component imports a host `submodules` capability for it). The probe finds the module
+from the mount as git finds it: the mount's `.git`, a gitfile followed wherever it points (not only
+into `modules/`) or a `.git` directory, failing the status where a broken `.git` fails git's. It
+reports the module's own status (modified and untracked content, recursively through nested
+submodules) and its new commits, for the layouts the routed store can't read. Its ignore setting is
+`submodule.<name>.ignore` in the config, else `.gitmodules` (the work tree's, else the index's, else
+`HEAD`'s, read with git's fatal and warning rules), else `diff.ignoreSubmodules`; the command line's
+`--ignore-submodules` outranks them all, and with `all` hides staged gitlink changes too. `diff`'s
+`-dirty` suffix and `ls-files -m` are unchanged: both still compare the checked-out commit alone, as
+`ls-files -m` does in git.
+
 The module repository's `core.worktree`, its mount marker, its index/worktree checkout, and detached
 `HEAD` are maintained as separate publications. The module repository directory remains
 identity-pinned across all four: config edits resolve `config` and any symlink target from that open
@@ -746,7 +759,20 @@ other half of the ownership proof. Without `--force`, status and `HEAD` are also
 checkout must have `HEAD` at the superproject's recorded gitlink commit
 both before displacement and before retirement; a different or missing `HEAD` is a local
 modification unless `--force` was requested. Status includes visible untracked and staged changes,
-while the
+and the submodules inside the checkout as git's deinit counts them: new commits, modified or
+untracked content, at any depth, whatever their ignore settings say (a `SubmoduleProbe` with
+`--ignore-submodules=none` semantics). Both checks open those nested submodules where the checkout
+is at the time, each with its mount as its work tree: after displacement, their `core.worktree`
+still names the public path. A populated nested mount that the probe finds clean no longer blocks
+deinit; it's retired with the rest of the checkout, as git clears it. Before the preflight check,
+the `.git` directory of each nested submodule that has one is absorbed as git's deinit absorbs it,
+depth first: renamed into its parent's `modules/<name>`, with a gitfile and a relative
+`core.worktree` written after the move, in git's order and with git's crash window (unjournaled).
+It's refused, with git's messages, when no declaration names it or the destination isn't empty.
+What was absorbed stays absorbed even if the deinit then refuses. The top-level checkout's own
+`.git` directory is still refused (`ForeignMount`). Gitfiles naming repositories elsewhere aren't
+moved, as git doesn't move them.
+While the
 retirement proof separately hashes tracked content so stat-cache and skip-worktree edits cannot be
 lost. Worktree-relative `core.excludesFile` paths and absolute paths component-wise beneath the known
 worktree root are read through the opened original or displaced checkout rather than re-resolved

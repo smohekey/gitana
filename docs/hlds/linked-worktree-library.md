@@ -379,8 +379,8 @@ and synchronized as directories rather than treated like file-data targets.
      untracked). `glob_match` now treats `**` as recursive only as a whole path component (`**/`, `/**`,
      `/**/`), matching git; this also corrects `gta status`/`add`/`worktree remove`. (The broader class of
      matcher divergences is why the removal gate does not *trust* the matcher — see preserve-mode above.) The
-     gitlink false-*dirty* gap (a clean submodule worktree reads as dirty → over-refuses; safe) remains
-     deferred in `gitana-worktree` (see "Still deferred").
+     gitlink false-*dirty* gap (a clean submodule worktree read as dirty) is closed: `gitana-worktree` now
+     handles gitlinks faithfully (see "Submodule gitlinks" below).
    - **Ordered deletion + atomic de-registration.** The admin is dropped **only after the checkout is confirmed
      gone** — a failed checkout deletion keeps the registration (a repairable worktree), never an orphaned
      checkout whose `.git` points at a deleted admin. The admin itself is de-registered **atomically**: it is
@@ -773,21 +773,16 @@ pointer-publication hardening:
     clean cone sparse-index worktree removes cleanly — it pulls object reads into the `load_index` hot path, a
     disproportionate change for an exotic, currently-safe case.
 
-  **Still deferred — submodule gitlinks** (mode
-  `160000`): `WorkTree::status` reports an (even uninitialised) submodule directory as modified + untracked,
-  and `WorkTree::checkout` cannot lay a gitlink down — but this is genuinely part of **submodule support**,
-  which gitana does not have (`README.md`), so it stays deferred (a submodule worktree safely over-refuses,
-  matching how the CLI already refuses submodule worktrees).
-- **Submodule gitlinks in checkout *and* status (slice-2 `create`, surfaced again by slice-3 `remove`).** When
-  a commit contains a mode `160000` gitlink, `WorkTree::checkout` (in `gitana-worktree`) fails trying to
-  `read_blob` the submodule commit (git creates the empty submodule dir and records the gitlink), **and**
-  `WorkTree::status` reports an (even uninitialised, empty) submodule directory as both modified and untracked
-  though stock `git status --porcelain` is empty. The status gap now also affects **removal**: routing a
-  removal candidate through the status gate makes a *clean* git-authored worktree containing a gitlink refuse
-  as `ProtectedWithReason::Dirty` (git's own `worktree remove` would succeed for an uninitialised submodule).
-  The behavior is **safe** (a conservative refusal, never data loss) and matches how the CLI already refuses
-  submodule worktrees; the real fix is git-faithful gitlink handling in `gitana-worktree`'s checkout/status
-  (a cross-crate change the CLI's `worktree add`/`status` need too), so it stays deferred there.
+- **Submodule gitlinks in checkout *and* status — resolved.** These were deferred here once (slice-2
+  `create`, surfaced again by slice-3 `remove`): `WorkTree::checkout` couldn't lay a mode `160000` gitlink
+  down, and `WorkTree::status` reported an uninitialised submodule directory as modified and untracked.
+  `gitana-worktree` now handles gitlinks faithfully: checkout creates the mount and records the gitlink, and
+  status compares a mounted submodule's checked-out `HEAD` with the recorded commit, so an uninitialised one
+  is clean, as in `git status --porcelain`. Status can also look *inside* a submodule (its modified and
+  untracked content, recursively, with git's ignore settings) when the caller attaches a `SubmoduleProbe`
+  (`gitana-submodule-probe`, as `gta status` does). Removal doesn't attach one: `worktree remove`/`move`
+  refuse a worktree holding an initialized submodule, as git does (probed vs git 2.55), so its content never
+  decides a removal.
 - **Discover-time git-faithful gitfile parsing (partly closed).** `RepositoryId::discover` delegates
   `.git`/`commondir` parsing to `gitana-repository-layout`, which now reads them **byte-clean** (the
   slice-5 native-path tranche), so a non-UTF-8 admin/common path is rediscoverable. It still **takes the

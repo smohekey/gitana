@@ -42,6 +42,7 @@ gitana-remote = { version = "0.1.0", path = "crates/core/gitana-remote", default
 gitana-repository-layout = { version = "0.1.0", path = "crates/core/gitana-repository-layout" }
 gitana-repository = { version = "0.1.0", path = "crates/core/gitana-repository" }
 gitana-submodule = { version = "0.1.0", path = "crates/core/gitana-submodule" }
+gitana-submodule-probe = { version = "0.1.0", path = "crates/core/gitana-submodule-probe" }
 gitana-trust = { version = "0.1.0", path = "crates/core/gitana-trust" }
 gitana-worktree = { version = "0.1.0", path = "crates/core/gitana-worktree" }
 gta-core = { version = "0.1.0", path = "crates/cli/gta-core" }

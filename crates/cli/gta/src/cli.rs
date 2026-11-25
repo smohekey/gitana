@@ -146,7 +146,19 @@ enum Command {
 		pathspecs: Vec<OsString>,
 	},
 	/// Show the working-tree status (porcelain v1).
-	Status,
+	Status {
+		/// Leave out submodule changes: `none`, `untracked` (untracked content), `dirty` (all content;
+		/// new commits still show), or `all` (the default with no value; staged gitlink changes too).
+		/// It outranks each submodule's own `ignore` setting.
+		#[arg(
+			long = "ignore-submodules",
+			value_name = "when",
+			num_args = 0..=1,
+			default_missing_value = "all",
+			require_equals = true
+		)]
+		ignore_submodules: Option<String>,
+	},
 	/// Record a commit from the staged index.
 	Commit {
 		/// Commit message.
@@ -1035,7 +1047,9 @@ impl Cli {
 					let pathspecs = native_pathspecs(pathspecs)?;
 					commands::add::run(&cwd, &pathspecs, force, gta_core::ResultPathMode::Human).await
 				}
-				Command::Status => commands::status::run(&cwd, gta_core::PathQuoteMode::Config).await,
+				Command::Status { ignore_submodules } => {
+					commands::status::run(&cwd, gta_core::PathQuoteMode::Config, ignore_submodules).await
+				}
 				Command::Commit {
 					message,
 					sign,

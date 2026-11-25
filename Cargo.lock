@@ -1886,6 +1886,8 @@ dependencies = [
  "axum",
  "cap-std 3.4.6",
  "cap-std 4.0.2",
+ "gitana-config",
+ "gitana-config-native",
  "gitana-file-store",
  "gitana-file-store-local",
  "gitana-git-http",
@@ -1893,6 +1895,9 @@ dependencies = [
  "gitana-object-store",
  "gitana-path",
  "gitana-repository",
+ "gitana-repository-layout",
+ "gitana-submodule-probe",
+ "gitana-worktree",
  "tempfile",
  "tokio",
  "wasmtime",
@@ -1946,6 +1951,7 @@ dependencies = [
  "gitana-remote",
  "gitana-repository",
  "gitana-repository-layout",
+ "gitana-submodule-probe",
  "gitana-worktree",
  "rustix",
  "serde",
@@ -1956,6 +1962,25 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "gitana-submodule-probe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cap-std 4.0.2",
+ "gitana-config",
+ "gitana-config-native",
+ "gitana-file-store-local",
+ "gitana-object",
+ "gitana-object-store",
+ "gitana-path",
+ "gitana-repository",
+ "gitana-repository-layout",
+ "gitana-worktree",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -2057,6 +2082,7 @@ dependencies = [
  "gitana-repository",
  "gitana-repository-layout",
  "gitana-submodule",
+ "gitana-submodule-probe",
  "gitana-trust",
  "gitana-worktree",
  "rpassword",

@@ -31,6 +31,8 @@ unicode-normalization.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 gitana-fs-native.workspace = true
+# deinit's cleanliness checks look inside nested submodules as git's deinit does.
+gitana-submodule-probe.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
 [target.'cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "redox", target_os = "tvos", target_os = "visionos", target_os = "watchos"))'.dependencies]

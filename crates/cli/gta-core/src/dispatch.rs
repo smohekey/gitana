@@ -63,6 +63,10 @@ pub trait WorkTreeCommand {
 	/// Retain the effective command directory for operations that spawn configured child processes.
 	fn set_command_directory(&mut self, _path: std::path::PathBuf, _directory: Dir) {}
 
+	/// Retain the discovered repository's layout, for operations that open other repositories
+	/// relative to it (such as its submodules).
+	fn set_layout(&mut self, _layout: &RepositoryLayout) {}
+
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,
@@ -242,6 +246,7 @@ async fn on_discovered_worktree<C: WorkTreeCommand>(
 	.await?;
 	let work = work.ok_or_else(|| anyhow!("this operation must be run in a work tree"))?;
 	command.set_command_directory(command_path, cwd_directory);
+	command.set_layout(&found);
 	if matches!(access, ConfigAccess::Mutation) {
 		repo::ensure_no_pending_deinit_at(&found, &common, &git)?;
 	}

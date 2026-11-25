@@ -9,7 +9,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::Result;
@@ -44,14 +44,18 @@ wasmtime::component::bindgen!({
 		// Our `ssh-transport.ssh-session` resource is represented by the host's own [`SshSession`]
 		// (a running `ssh` child); bindgen still generates the `Host`/`HostSshSession` traits over it.
 		"gitana:repo/ssh-transport.ssh-session": SshSession,
+		// Our `submodules.probe` resource is the host's own [`HostSubmoduleProbe`].
+		"gitana:repo/submodules.probe": HostSubmoduleProbe,
 	},
 });
 
 mod credential_provider;
+mod host_submodule_probe;
 mod ssh_provider;
 mod store_file_credentials;
 
 pub use self::credential_provider::HostCredentialProvider;
+pub use self::host_submodule_probe::HostSubmoduleProbe;
 pub use self::ssh_provider::HostSshProvider;
 pub use self::store_file_credentials::StoreFileCredentials;
 
@@ -65,6 +69,11 @@ pub struct State {
 	table: ResourceTable,
 	credentials: Option<Box<dyn HostCredentialProvider>>,
 	ssh: Option<Box<dyn HostSshProvider>>,
+	/// The work tree whose submodules the guest's `submodules` import looks inside ([`grant_submodules`]);
+	/// `None` = not granted, every `report` has nothing to say.
+	submodules: Option<PathBuf>,
+	/// The warnings git would print, from each `submodules.probe` the guest has dropped, each once.
+	submodule_warnings: Vec<String>,
 }
 
 /// The host representation of the guest's `ssh-transport.ssh-session` resource: a running `ssh`
@@ -145,8 +154,59 @@ pub fn store_with(
 			table: ResourceTable::new(),
 			credentials,
 			ssh,
+			submodules: None,
+			submodule_warnings: Vec::new(),
 		},
 	)
+}
+
+/// Grant the guest's `submodules` import a look inside the submodules of the work tree at
+/// `worktree`: the host opens them natively, as git's `status` does, for the guest's status. This
+/// is the host edge where that ambient authority is exercised; without it, the guest's status
+/// compares each submodule by its checked-out commit alone.
+pub fn grant_submodules(store: &mut Store<State>, worktree: &Path) {
+	store.data_mut().submodules = Some(worktree.to_path_buf());
+}
+
+/// The warnings git would print during the guest's statuses (about `.gitmodules` entries it skips
+/// or values it ignores), each once, without git's `warning: ` prefix.
+pub fn submodule_warnings(store: &Store<State>) -> Vec<String> {
+	store.data().submodule_warnings.clone()
+}
+
+impl gitana::repo::submodule_types::Host for State {}
+
+impl gitana::repo::submodules::Host for State {}
+
+impl gitana::repo::submodules::HostProbe for State {
+	async fn new(&mut self) -> Resource<HostSubmoduleProbe> {
+		let probe = HostSubmoduleProbe::new(self.submodules.as_deref()).await;
+		self
+			.table
+			.push(probe)
+			.expect("the resource table has room for a probe")
+	}
+
+	async fn report(
+		&mut self,
+		probe: Resource<HostSubmoduleProbe>,
+		path: Vec<u8>,
+		recorded: String,
+		ignore_flag: Option<gitana::repo::submodule_types::IgnoreSubmodules>,
+	) -> Result<Option<gitana::repo::submodules::SubmoduleReport>, String> {
+		let probe = self.table.get(&probe).map_err(|error| error.to_string())?;
+		probe.report(path, recorded, ignore_flag).await
+	}
+
+	async fn drop(&mut self, probe: Resource<HostSubmoduleProbe>) -> wasmtime::Result<()> {
+		let probe = self.table.delete(probe)?;
+		for warning in probe.warnings() {
+			if !self.submodule_warnings.contains(&warning) {
+				self.submodule_warnings.push(warning);
+			}
+		}
+		Ok(())
+	}
 }
 
 impl gitana::repo::credentials::Host for State {
@@ -397,6 +457,12 @@ pub async fn instantiate_component(
 	gitana::repo::ssh_transport::add_to_linker::<_, HasSelf<_>>(&mut linker, |state: &mut State| {
 		state
 	})?;
+	// Our own `submodules` import: the host looks inside the granted work tree's submodules.
+	gitana::repo::submodule_types::add_to_linker::<_, HasSelf<_>>(
+		&mut linker,
+		|state: &mut State| state,
+	)?;
+	gitana::repo::submodules::add_to_linker::<_, HasSelf<_>>(&mut linker, |state: &mut State| state)?;
 	Ok(Repo::instantiate_async(store, component, &linker).await?)
 }
 

@@ -110,7 +110,7 @@ async fn worktree_porcelain_round_trip<H: HashAlgorithm>() -> Result<()> {
 	//    not read as dirty even though the component could not set its exec bit — the index records
 	//    the mode the capability reports (`100644`), git's `core.fileMode=false`.
 	let clean = porcelain
-		.call_status(&mut *store, handle)
+		.call_status(&mut *store, handle, None)
 		.await?
 		.map_err(|error| anyhow!("status: {error:?}"))?;
 	assert!(
@@ -139,7 +139,7 @@ async fn worktree_porcelain_round_trip<H: HashAlgorithm>() -> Result<()> {
 
 	// -- status sees the unstaged edit (` M`) and the untracked file.
 	let dirty = porcelain
-		.call_status(&mut *store, handle)
+		.call_status(&mut *store, handle, None)
 		.await?
 		.map_err(|error| anyhow!("status: {error:?}"))?;
 	let hello = dirty
@@ -169,7 +169,7 @@ async fn worktree_porcelain_round_trip<H: HashAlgorithm>() -> Result<()> {
 
 	// -- status now shows both staged (X column), nothing untracked.
 	let staged = porcelain
-		.call_status(&mut *store, handle)
+		.call_status(&mut *store, handle, None)
 		.await?
 		.map_err(|error| anyhow!("status: {error:?}"))?;
 	assert!(staged.untracked.is_empty(), "still untracked: {staged:?}");
@@ -228,7 +228,7 @@ async fn worktree_porcelain_round_trip<H: HashAlgorithm>() -> Result<()> {
 		.await?
 		.map_err(|error| anyhow!("add: {error:?}"))?;
 	let deleted = porcelain
-		.call_status(&mut *store, handle)
+		.call_status(&mut *store, handle, None)
 		.await?
 		.map_err(|error| anyhow!("status: {error:?}"))?;
 	assert_eq!(

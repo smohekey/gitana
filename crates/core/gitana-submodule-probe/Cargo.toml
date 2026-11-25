@@ -1,0 +1,28 @@
+[package]
+description = "Looks inside a work tree's submodules natively, as git's status does, for gitana-worktree's status."
+edition.workspace = true
+license.workspace = true
+name = "gitana-submodule-probe"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+cap-std.workspace = true
+gitana-config.workspace = true
+gitana-config-native.workspace = true
+gitana-file-store-local.workspace = true
+gitana-object.workspace = true
+gitana-object-store.workspace = true
+gitana-path.workspace = true
+gitana-repository.workspace = true
+gitana-repository-layout.workspace = true
+gitana-worktree.workspace = true
+tokio = { workspace = true, features = ["fs", "sync"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

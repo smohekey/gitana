@@ -145,8 +145,9 @@ fn status_reports_submodule_like_git() {
 /// A submodule pointer change must diff like git: git renders a gitlink as a synthetic
 /// `Subproject commit <old>` → `<new>` line, across `diff` (index vs the submodule's checked-out
 /// `HEAD`), `diff --cached` (HEAD tree vs index), and `show` (tree vs tree). The submodule working
-/// tree is kept clean so git emits no `-dirty` suffix — gitana compares only the recorded commit to
-/// the checked-out `HEAD`, matching `status`, which likewise ignores submodule content-dirtiness.
+/// tree is kept clean so git emits no `-dirty` suffix — gitana's `diff` compares only the recorded commit
+/// to the checked-out `HEAD` (as `ls-files -m` does), and doesn't produce that suffix yet. (`status`
+/// looks inside the submodule too, as git's does: see `git_status_submodules.rs`.)
 #[test]
 fn diff_reports_submodule_pointer_change_like_git() {
 	if !git_supports_sha256() {
