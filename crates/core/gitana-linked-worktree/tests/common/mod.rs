@@ -8,9 +8,24 @@ use std::process::Command;
 use gitana_linked_worktree::{RepositoryId, WorktreeContext};
 use gitana_object::HashKind;
 
+/// git's automatic maintenance, off for every command these fixtures run. After a commit, git (2.55)
+/// starts `git maintenance run --auto --detach`, which carries on in the background in the very
+/// repository a test is still working in — its default `worktree-prune` task deletes a linked worktree's
+/// half-built admin folder, and other tasks repack under a running test. `gc.auto=0` covers older gits,
+/// which ran `gc --auto` straight after a commit. Passed per command rather than written into each
+/// repository's config, so repositories a test makes itself (`git clone`, a plain `git init`) are covered.
+const QUIET_MAINTENANCE: [&str; 4] = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"];
+
+/// A `git` command with git's automatic maintenance off (see [`QUIET_MAINTENANCE`]).
+fn git_command() -> Command {
+	let mut command = Command::new("git");
+	command.args(QUIET_MAINTENANCE);
+	command
+}
+
 /// Run `git` with `args`, asserting success, returning stdout.
 pub fn git(args: &[&str]) -> String {
-	let out = Command::new("git").args(args).output().expect("run git");
+	let out = git_command().args(args).output().expect("run git");
 	assert!(
 		out.status.success(),
 		"git {args:?} failed: {}",
@@ -21,14 +36,14 @@ pub fn git(args: &[&str]) -> String {
 
 /// Run `git` with `args`, tolerating a non-zero exit (e.g. a conflicting merge), returning stdout.
 pub fn git_try(args: &[&str]) -> String {
-	let out = Command::new("git").args(args).output().expect("run git");
+	let out = git_command().args(args).output().expect("run git");
 	String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// Run `git` with `args`, returning whether it exited successfully (for oracle refusal checks and
 /// probing optional subcommands like `worktree add --orphan`).
 pub fn git_ok(args: &[&str]) -> bool {
-	Command::new("git")
+	git_command()
 		.args(args)
 		.output()
 		.map(|o| o.status.success())
@@ -50,7 +65,7 @@ pub fn unique_tmp(tag: &str) -> PathBuf {
 /// Whether the local `git` can init a sha256 repository.
 pub fn git_supports_sha256() -> bool {
 	let probe = unique_tmp("probe-sha256");
-	let ok = Command::new("git")
+	let ok = git_command()
 		.args(["init", "--object-format=sha256", probe.to_str().unwrap()])
 		.output()
 		.map(|o| o.status.success())

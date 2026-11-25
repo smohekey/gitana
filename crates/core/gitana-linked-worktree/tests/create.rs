@@ -9,8 +9,9 @@ use std::os::unix::fs::symlink;
 use common::*;
 use gitana_linked_worktree::{
 	BranchName, CheckoutTarget, CreateError, CreateRequest, LinkedWorktreeError, NewWorktreeSetup,
-	Registration, RemovePolicy, RemoveRequest, RepositoryId, Setup, WorktreeClassification,
-	WorktreeObjectId, create, durability_barrier_created, recover_prepared_create, remove,
+	ProtectionReason, Registration, RemovePolicy, RemoveRequest, RepositoryId, Setup,
+	WorktreeClassification, WorktreeObjectId, create, durability_barrier_created,
+	recover_prepared_create, remove,
 };
 
 fn req(work: &std::path::Path, dest: &std::path::Path, target: CheckoutTarget) -> CreateRequest {
@@ -1620,6 +1621,213 @@ async fn the_checkout_asks_for_the_new_worktrees_setup() {
 					if cause.to_string() == "no setup here"
 			),
 			"{fmt}: got {err:?}"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+/// Runs stock `git worktree prune` — with no expiry, git's most eager prune — in the middle of a create, at
+/// the point the create asks for the new worktree's setup (admin layout written, checkout and its `.git`
+/// not yet), and records the admin folder's `locked` marker as it was then.
+#[derive(Clone)]
+struct PruneMidCreate {
+	work: std::path::PathBuf,
+	marker: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl NewWorktreeSetup for PruneMidCreate {
+	fn setup_for(
+		&self,
+		git_dir: &std::path::Path,
+		_worktree: &std::path::Path,
+	) -> impl std::future::Future<Output = Result<Setup, Box<dyn std::error::Error + Send + Sync>>> + Send
+	{
+		*self.marker.lock().unwrap() = std::fs::read_to_string(git_dir.join("locked")).ok();
+		git(&["-C", self.work.to_str().unwrap(), "worktree", "prune"]);
+		std::future::ready(Ok(Setup::default()))
+	}
+}
+
+/// Whether `git worktree list --porcelain` shows a `locked` or `prunable` line.
+fn porcelain_has(listing: &str, word: &str) -> bool {
+	listing
+		.lines()
+		.any(|line| line == word || line.starts_with(&format!("{word} ")))
+}
+
+/// A half-built admin folder looks stale to git, so a concurrent `git worktree prune` — a user's, an
+/// IDE's, or git's own automatic maintenance after a commit — would delete it mid-create. The create holds
+/// git's `locked` (`initializing`) marker while it builds, as `git worktree add` does, and releases it once
+/// the worktree is complete.
+#[tokio::test]
+async fn a_concurrent_git_prune_leaves_a_create_in_progress_alone() {
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-prune-mid-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+		let pruner = PruneMidCreate {
+			work: work.clone(),
+			marker: Default::default(),
+		};
+		create(
+			&req(&work, &wt, CheckoutTarget::Detached { start }),
+			&Setup::default(),
+			&pruner,
+		)
+		.await
+		.unwrap();
+		assert_eq!(
+			pruner.marker.lock().unwrap().as_deref(),
+			Some("initializing\n"),
+			"{fmt}: the admin folder is locked while it is built, as git's add locks it"
+		);
+		assert!(
+			!work.join(".git/worktrees/wt/locked").exists(),
+			"{fmt}: the marker is released once the worktree is complete"
+		);
+		let listing = git(&[
+			"-C",
+			work.to_str().unwrap(),
+			"worktree",
+			"list",
+			"--porcelain",
+		]);
+		assert!(
+			listing.contains(&format!("worktree {}", canonical(&wt).display())),
+			"{fmt}: git still lists the worktree: {listing}"
+		);
+		assert!(
+			!porcelain_has(&listing, "locked") && !porcelain_has(&listing, "prunable"),
+			"{fmt}: neither locked nor prunable: {listing}"
+		);
+		assert_eq!(
+			git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
+			head
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+/// A create that fails after locking its admin folder releases the marker on the way out, leaving the same
+/// partial a failed create always has: `PartialRegistered` to gitana, prunable to git.
+#[tokio::test]
+async fn a_failed_create_releases_its_initializing_lock() {
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-failed-unlocks-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+		let failing = Recorder {
+			fail: true,
+			..Recorder::default()
+		};
+		let request = req(&work, &wt, new_branch("feature", start));
+		create(&request, &Setup::default(), &failing)
+			.await
+			.unwrap_err();
+		assert!(
+			work.join(".git/worktrees/wt").is_dir(),
+			"{fmt}: the partial is kept"
+		);
+		assert!(
+			!work.join(".git/worktrees/wt/locked").exists(),
+			"{fmt}: the marker is released on failure"
+		);
+		let retry = create(&request, &Setup::default(), &Setup::default())
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(
+				retry,
+				CreateError::Refused(WorktreeClassification::PartialRegistered { .. })
+			),
+			"{fmt}: got {retry:?}"
+		);
+		let listing = git(&[
+			"-C",
+			work.to_str().unwrap(),
+			"worktree",
+			"list",
+			"--porcelain",
+		]);
+		assert!(
+			porcelain_has(&listing, "prunable") && !porcelain_has(&listing, "locked"),
+			"{fmt}: git sees a prunable, unlocked partial: {listing}"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+/// A crash mid-create (no unwinding, so the marker is never released) leaves a partial still locked
+/// `initializing`, as a killed `git worktree add` leaves its own: an ordinary create refuses it as locked,
+/// git neither prunes nor reports it prunable, and prepared recovery — which already owns the exact
+/// partial — reclaims it.
+#[tokio::test]
+async fn a_crashed_create_reads_as_locked_and_prepared_recovery_reclaims_it() {
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-crashed-locked-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+		create(
+			&req(&work, &wt, new_branch("feature", start.clone())),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
+
+		// The state a crash after the checkout, before its `.git` and the release, leaves behind.
+		std::fs::remove_file(wt.join(".git")).unwrap();
+		std::fs::write(work.join(".git/worktrees/wt/locked"), "initializing\n").unwrap();
+		let recovery = req(&work, &wt, existing_branch("feature", Some(start)));
+
+		let ordinary = create(&recovery, &Setup::default(), &Setup::default())
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(
+				ordinary,
+				CreateError::Refused(WorktreeClassification::ProtectedWithReason {
+					reason: ProtectionReason::Locked { reason: Some(ref r) }
+				}) if r == "initializing"
+			),
+			"{fmt}: got {ordinary:?}"
+		);
+		let w = work.to_str().unwrap();
+		git(&["-C", w, "worktree", "prune"]);
+		assert!(
+			work.join(".git/worktrees/wt").is_dir(),
+			"{fmt}: git's prune leaves the locked partial"
+		);
+		let listing = git(&["-C", w, "worktree", "list", "--porcelain"]);
+		assert!(
+			listing.lines().any(|line| line == "locked initializing")
+				&& !porcelain_has(&listing, "prunable"),
+			"{fmt}: git sees it locked, not prunable: {listing}"
+		);
+
+		let inspection = recover_prepared_create(&recovery, &Setup::default(), &Setup::default())
+			.await
+			.unwrap();
+		assert!(matches!(
+			inspection.registration,
+			Registration::Present { .. }
+		));
+		assert!(
+			!work.join(".git/worktrees/wt/locked").exists(),
+			"{fmt}: the recovered worktree is not locked"
+		);
+		assert_eq!(
+			git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
+			head
 		);
 		let _ = std::fs::remove_dir_all(&base);
 	}

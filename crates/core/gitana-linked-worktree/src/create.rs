@@ -7,6 +7,11 @@
 //! [`CreateError`]. The write side ports git's admin-layout + reflog + checkout materialisation, ordered
 //! so the checkout's `.git` gitfile (the marker that makes a registration look *live*) is written **last**
 //! — an interrupted create is therefore a `PartialRegistered` half-state, never a false "complete".
+//! While it builds the admin folder the create holds git's `locked` (`initializing`) marker in it, so a
+//! concurrent `git worktree prune` (a user's, an IDE's, or git's own automatic maintenance) cannot delete
+//! the half-built folder; see [`InitializingLock`](crate::InitializingLock). The marker goes on every
+//! exit, so a failed create is still `PartialRegistered`; only a crash leaves it, and that partial then
+//! reads as locked with reason `initializing`, as a killed `git worktree add` does.
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
@@ -22,7 +27,7 @@ mod native {
 	};
 	use gitana_worktree::{Index, WorkTree};
 
-	use crate::{NewWorktreeSetup, Setup};
+	use crate::{InitializingLock, NewWorktreeSetup, Setup};
 
 	use crate::admin_cleanup::{deregister_admin, path_absent, remove_directory_tree};
 	use crate::create_error::CreateError;
@@ -685,7 +690,8 @@ mod native {
 		// worktree is non-bare even when the host repository is bare, so git logs its HEAD unless
 		// `core.logAllRefUpdates` is *explicitly* disabled (not the host's bare default of off).
 		let log_head = head_reflog_enabled(&config);
-		let admin = write_admin_layout(&admin, destination, &head, start, &committer, log_head)?;
+		let (admin, initializing) =
+			write_admin_layout(&admin, destination, &head, start, &committer, log_head)?;
 		// git copies the invoking worktree's `config.worktree` into the new one, before the checkout, when
 		// per-worktree config is on: all but `core.bare` (when true) and `core.worktree`.
 		if let Some(bytes) = &request.worktree_config
@@ -738,6 +744,9 @@ mod native {
 				.map_err(LinkedWorktreeError::Worktree)?,
 		}
 		write_checkout_gitfile(destination, &admin)?;
+		// The worktree is complete: drop the `initializing` marker before the caller's re-inspection, which
+		// would otherwise read the new worktree as locked. (On any earlier exit the guard's `Drop` removes it.)
+		initializing.release()?;
 		Ok(history_lease)
 	}
 
@@ -875,9 +884,6 @@ mod native {
 	// `write_file_atomic` (and its `temp_sibling`/`write_and_sync` helpers) live in `crate::pointers`, shared
 	// with `relocate`, since both publish pointer files atomically.
 
-	/// Write git's admin layout for the new worktree — the admin's `gitdir` back-pointer, `commondir`,
-	/// `HEAD`, and (for a non-orphan) `ORIG_HEAD` plus a seeded `logs/HEAD` — returning the canonical admin
-	/// path. The **checkout's** `.git` gitfile is *not* written here (see [`write_checkout_gitfile`]).
 	/// A worktree's `config.worktree` as git copies it into a new worktree: without `core.bare` when
 	/// it's true, and without `core.worktree`. `None` for a file that isn't UTF-8 config, which isn't
 	/// copied.
@@ -890,6 +896,13 @@ mod native {
 		Some(config.render())
 	}
 
+	/// Write git's admin layout for the new worktree — the admin's `gitdir` back-pointer, `commondir`,
+	/// `HEAD`, and (for a non-orphan) `ORIG_HEAD` plus a seeded `logs/HEAD` — returning the canonical admin
+	/// path. The **checkout's** `.git` gitfile is *not* written here (see [`write_checkout_gitfile`]).
+	///
+	/// The admin folder is locked (`initializing`) before anything else is written into it, as git does,
+	/// and the held marker is returned with the path: the caller releases it once the worktree is
+	/// complete, and an error anywhere before that (here or later) drops it.
 	fn write_admin_layout<H: HashAlgorithm>(
 		admin: &Path,
 		destination: &Path,
@@ -897,9 +910,11 @@ mod native {
 		start: Option<ObjectId<H>>,
 		committer: &str,
 		log_head: bool,
-	) -> Result<PathBuf, LinkedWorktreeError> {
+	) -> Result<(PathBuf, InitializingLock), LinkedWorktreeError> {
 		std::fs::create_dir_all(admin)
 			.map_err(|e| LinkedWorktreeError::io("creating admin dir", admin, e))?;
+		// Lock the half-built folder so a concurrent prune leaves it alone (git's `add_worktree` order).
+		let initializing = InitializingLock::acquire(admin)?;
 		std::fs::create_dir_all(destination)
 			.map_err(|e| LinkedWorktreeError::io("creating checkout dir", destination, e))?;
 
@@ -927,7 +942,7 @@ mod native {
 				write_head_reflog(&admin, head, start, committer)?;
 			}
 		}
-		Ok(admin)
+		Ok((admin, initializing))
 	}
 
 	/// Write the checkout's `.git` gitfile — **last**, after the checkout has materialised — so a partial

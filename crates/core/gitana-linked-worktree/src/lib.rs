@@ -56,6 +56,8 @@ mod durability;
 #[cfg(not(target_arch = "wasm32"))]
 mod head;
 #[cfg(not(target_arch = "wasm32"))]
+mod initializing_lock;
+#[cfg(not(target_arch = "wasm32"))]
 mod pointers;
 #[cfg(not(target_arch = "wasm32"))]
 mod registration_lock;
@@ -89,6 +91,8 @@ pub use setup::Setup;
 pub use status::{CheckoutSafety, UnpushedRef, WorktreeStatusReport};
 pub use worktree_context::WorktreeContext;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use self::initializing_lock::InitializingLock;
 #[cfg(not(target_arch = "wasm32"))]
 pub use create::{create, recover_prepared_create};
 #[cfg(not(target_arch = "wasm32"))]

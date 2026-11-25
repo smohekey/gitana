@@ -253,6 +253,30 @@ effect and (b) every partial state being classifiable by `inspect`/`classify`. S
 so this is realized in the create/remove slices; full registration-level CAS + native-`OsStr` polish
 is the final hardening slice.
 
+**A concurrent prune (found 2026-11-25).** A half-built admin folder looks stale to git's
+`should_prune_worktree` — no `gitdir` yet, or a `gitdir` whose checkout `.git` does not exist yet and no
+recent `index` — so any concurrent `git worktree prune` deletes it mid-create, and the create fails
+(`publishing admin file`/`opening git dir` NotFound). That prune is not only a user's or an IDE's: git
+2.55's default maintenance strategy (`geometric`) includes a `worktree-prune` task, and every `git commit`
+starts `git maintenance run --auto --detach`, whose prune check runs *after* it detaches (probed: a commit in
+the main worktree during a gitana create traced `git worktree prune --expire 3.months.ago` and removed the
+folder). This was the long-standing "flaky" `create` tests. git protects its own adds by writing
+`<admin>/locked` (`initializing`) right after creating the folder and removing it when done
+(`builtin/worktree.c`, `add_worktree`); a locked entry is never pruned. `create` now does the same
+(`InitializingLock`): the marker is written exclusively right after the admin `mkdir`, before any other
+admin file, and released after the checkout `.git` is written, before the post-write re-inspection (the
+created-durability barrier's admin-tree flush covers the release). It is released on **every** exit — a
+`Drop` guard covers an error, a panic, or a dropped future — so a failed create still leaves the ordinary
+`PartialRegistered` partial. Only a **crash** leaves it behind, and that partial then reads as
+`ProtectedWithReason::Locked { reason: "initializing" }`, exactly as a killed `git worktree add` leaves its
+own: an ordinary `create` refuses it, `remove` needs the double force, git neither prunes nor reports it
+prunable, and `git worktree unlock` clears it. `recover_prepared_create` reclaims such a partial unchanged,
+since it already authorizes on the exact partial and does not consult the lock. Deliberately **not** done:
+treating an `initializing` marker as "not really locked" — gitana cannot tell its own leftover from a
+`git worktree add` still running, which writes the same word. (The gap between the `mkdir` and the marker
+remains, as in git.) The test fixtures also turn git's automatic maintenance off for every command they run,
+so a background maintenance process never races the repository a test is still using.
+
 Durable consumers add an explicit completion boundary rather than treating atomic visibility as
 power-loss durability. `durability_barrier_created` validates the exact completed request, flushes the
 checkout and admin trees, then their checkout-parent and `worktrees` namespaces, and revalidates the
@@ -618,7 +642,9 @@ pointer-publication hardening:
   non-empty partial.**
   ✅ (slice 3). git writes the checkout `.git` gitfile **first** (probed), so a mid-checkout failure leaves a
   *registered, dirty* worktree that `git worktree remove --force` recovers. gitana writes the gitfile **last**,
-  so an interrupted-*before*-checkout create is cleanly `PartialRegistered`. Slice 3 makes an **absent-or-empty**
+  so an interrupted-*before*-checkout create is cleanly `PartialRegistered` (a create that *fails*; one that
+  *crashes* leaves its `initializing` lock behind and reads as locked — see *A concurrent prune* under
+  *Concurrency interpretation*). Slice 3 makes an **absent-or-empty**
   such partial classify as `PartialRegistered` (a prune-and-retry state) in both `classify` and `create::decide`,
   and `remove` cleans it (drops the admin, removes the empty leftover with `remove_dir`) so a retry proceeds.
   **What it deliberately does *not* do:** auto-delete a *non-empty* leftover directory. Three codex rounds
