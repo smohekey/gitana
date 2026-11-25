@@ -46,4 +46,4 @@ winx.workspace = true
 # integration test is its own crate, so it names the type directly rather than through the library's deps.
 gitana-config.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }

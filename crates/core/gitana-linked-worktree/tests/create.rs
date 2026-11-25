@@ -769,10 +769,110 @@ async fn cancelling_prepared_recovery_does_not_abandon_the_owned_partial() {
 	}
 }
 
+/// Pauses a create where it asks for the new worktree's setup. By then it holds the repository's history
+/// gate and its registration lock, and has written the admin folder, locked `initializing`; the checkout
+/// and its `.git` come after. `reached` is signalled there, and the create waits for `resume`.
+#[derive(Clone, Default)]
+struct PauseAtSetup {
+	reached: std::sync::Arc<tokio::sync::Notify>,
+	resume: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl NewWorktreeSetup for PauseAtSetup {
+	fn setup_for(
+		&self,
+		_git_dir: &std::path::Path,
+		_worktree: &std::path::Path,
+	) -> impl std::future::Future<Output = Result<Setup, Box<dyn std::error::Error + Send + Sync>>> + Send
+	{
+		let (reached, resume) = (self.reached.clone(), self.resume.clone());
+		async move {
+			reached.notify_one();
+			resume.notified().await;
+			Ok(Setup::default())
+		}
+	}
+}
+
+/// Cancelling a create in the middle of publishing (history gate and registration lock held, admin folder
+/// written) lets go of neither lock and abandons nothing: the create's retained task finishes the worktree,
+/// and only then releases them.
 #[tokio::test]
 async fn cancelling_create_does_not_release_or_abandon_history_gated_publication() {
 	for (fmt, kind) in formats() {
 		let base = unique_tmp(&format!("create-history-cancelled-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+		let locks = [
+			(work.join(".git/gitana-history.lock"), "the history gate"),
+			(work.join(".git/worktrees.lock"), "the registration lock"),
+		];
+		let admin = work.join(".git/worktrees/wt");
+
+		let pause = PauseAtSetup::default();
+		let request = req(&work, &wt, CheckoutTarget::Detached { start });
+		let (retained_request, retained_pause) = (request.clone(), pause.clone());
+		let mut caller =
+			tokio::spawn(
+				async move { create(&retained_request, &Setup::default(), &retained_pause).await },
+			);
+		tokio::select! {
+			() = pause.reached.notified() => {}
+			result = &mut caller => panic!("{fmt}: create ended before asking for its setup: {result:?}"),
+		}
+		let mid_publication = |when: &str| {
+			for (lock, what) in &locks {
+				assert!(lock.is_file(), "{fmt}: {what} is held {when}");
+			}
+			assert_eq!(
+				std::fs::read_to_string(admin.join("locked"))
+					.ok()
+					.as_deref(),
+				Some("initializing\n"),
+				"{fmt}: the admin folder is written and marked {when}"
+			);
+			assert!(
+				!wt.join(".git").exists(),
+				"{fmt}: the checkout isn't committed {when}"
+			);
+		};
+		mid_publication("while the create is paused");
+
+		caller.abort();
+		assert!(caller.await.unwrap_err().is_cancelled());
+		mid_publication("after its caller is cancelled");
+
+		pause.resume.notify_one();
+		await_retained_work(fmt, "create", &request).await;
+		assert_eq!(
+			git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
+			head
+		);
+		for (lock, what) in &locks {
+			assert!(
+				!lock.exists(),
+				"{fmt}: {what} is released once the create finishes"
+			);
+		}
+		assert!(
+			!admin.join("locked").exists(),
+			"{fmt}: the `initializing` marker is gone once the create finishes"
+		);
+		durability_barrier_created(&request).await.unwrap();
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+/// While another holder keeps the repository's history gate, a create publishes nothing: no admin folder,
+/// no checkout. Once the gate's bounded wait runs out it fails with `HistoryLocked` (the error is how the
+/// test knows the create got as far as the gate) and lets go of its registration lock.
+#[tokio::test]
+async fn create_publishes_nothing_while_the_history_gate_is_held() {
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-history-held-{fmt}"));
 		let work = base.join("repo");
 		init_repo(&work, fmt);
 		let head = commit_file(&work, "a.txt", "1\n", "init");
@@ -785,34 +885,35 @@ async fn cancelling_create_does_not_release_or_abandon_history_gated_publication
 			.open(&history_lock)
 			.unwrap();
 
-		let request = req(&work, &wt, CheckoutTarget::Detached { start });
-		let retained_request = request.clone();
-		let caller =
-			tokio::spawn(
-				async move { create(&retained_request, &Setup::default(), &Setup::default()).await },
-			);
-		for _ in 0..8 {
-			tokio::task::yield_now().await;
-		}
+		let error = create(
+			&req(&work, &wt, CheckoutTarget::Detached { start }),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
-			!caller.is_finished(),
-			"{fmt}: create must wait for the repository history gate"
+			matches!(
+				error,
+				CreateError::Failed(LinkedWorktreeError::Repository(
+					gitana_repository::RepositoryError::HistoryLocked
+				))
+			),
+			"{fmt}: got {error:?}"
 		);
 		assert!(
 			!work.join(".git/worktrees").exists(),
-			"{fmt}: no admin history root may publish before acquiring the gate"
+			"{fmt}: no admin folder is published without the gate"
 		);
-
-		caller.abort();
-		assert!(caller.await.unwrap_err().is_cancelled());
-		std::fs::remove_file(&history_lock).unwrap();
-
-		await_retained_work(fmt, "create", &request).await;
-		assert_eq!(
-			git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
-			head
+		assert!(!wt.exists(), "{fmt}: nor any checkout");
+		assert!(
+			!work.join(".git/worktrees.lock").exists(),
+			"{fmt}: the registration lock is released"
 		);
-		durability_barrier_created(&request).await.unwrap();
+		assert!(
+			history_lock.is_file(),
+			"{fmt}: the other holder's gate is left alone"
+		);
 		let _ = std::fs::remove_dir_all(&base);
 	}
 }
