@@ -61,8 +61,17 @@ pub async fn rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 		bail!("cannot rebase an unborn branch");
 	};
 	// git requires a clean work tree to rebase: no staged or unstaged tracked changes (untracked files
-	// are allowed, unless the checkout to the base would overwrite one — caught below).
-	if !wt.status(None).await?.changed.is_empty() {
+	// are allowed, unless the checkout to the base would overwrite one — caught below). A submodule's
+	// unstaged changes don't count: git's gate ignores new commits, modified or untracked content, and
+	// a deleted or replaced mount (probed vs git 2.55). Its gate ignores a staged gitlink change too,
+	// but the pick then fails ("your local changes would be overwritten by rebase") with the rebase
+	// left in progress; gitana refuses that up front instead, before anything moves.
+	let status = wt.status(None).await?;
+	if status
+		.changed
+		.iter()
+		.any(|entry| entry.submodule.is_none() || entry.index != ' ')
+	{
 		bail!("cannot rebase: you have uncommitted changes; commit or stash them before rebasing");
 	}
 

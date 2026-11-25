@@ -314,9 +314,12 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
     (the work tree's, the index's or `HEAD`'s, read with git's fatal and warning rules), and
     `diff.ignoreSubmodules`. `gta status --ignore-submodules[=<when>]` outranks them, and `all` also
     hides staged gitlink changes.
+  - **Rebase.** The rebase gate now ignores a submodule's unstaged changes, as git's does. It still
+    refuses a staged gitlink change up front; git's gate lets that through and its pick fails
+    mid-rebase.
   - **Tests.** Oracle-tested against git 2.55 in both object formats:
-    `gitana-submodule-probe/tests/git_status.rs`, `gta/tests/git_status_submodules.rs`, and
-    `gitana-repo-host/tests/submodules.rs`.
+    `gitana-submodule-probe/tests/git_status.rs`, `gta/tests/git_status_submodules.rs`,
+    `gta/tests/git_rebase_submodules.rs`, and `gitana-repo-host/tests/submodules.rs`.
 - [ ] Give `diff` git's `-dirty` suffix for a submodule with modified or untracked content (it still
   compares the checked-out commit alone).
 - [ ] Give `gta status` git's `--short` and `--porcelain=v2` output; `StatusEntry.submodule` now
