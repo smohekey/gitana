@@ -5,13 +5,14 @@
 mod common;
 
 use std::os::unix::fs::symlink;
+use std::time::{Duration, Instant};
 
 use common::*;
 use gitana_linked_worktree::{
 	BranchName, CheckoutTarget, CreateError, CreateRequest, LinkedWorktreeError, NewWorktreeSetup,
 	ProtectionReason, Registration, RemovePolicy, RemoveRequest, RepositoryId, Setup,
-	WorktreeClassification, WorktreeObjectId, create, durability_barrier_created,
-	recover_prepared_create, remove,
+	WorktreeClassification, WorktreeObjectId, WorktreeQuery, create, durability_barrier_created,
+	inspect, recover_prepared_create, remove,
 };
 
 fn req(work: &std::path::Path, dest: &std::path::Path, target: CheckoutTarget) -> CreateRequest {
@@ -619,6 +620,56 @@ async fn prepared_recovery_recreates_an_exact_nonempty_checkout_missing_partial(
 	}
 }
 
+/// Wait for the work a cancelled create (or recovery) kept running to end, then check that it
+/// established the worktree.
+///
+/// A cancelled create carries on as a task of its own, and that task's result goes nowhere, so a test
+/// can't see its error. So this waits for the task itself to end, whatever its outcome: until the test's
+/// runtime has no task left alive (each `#[tokio::test]` has a runtime of its own). It doesn't wait for
+/// a file to appear. A failure is reported as soon as the work ends, with the state it left; the
+/// deadline only matters if it hangs.
+async fn await_retained_work(fmt: &str, what: &str, request: &CreateRequest) {
+	const DEADLINE: Duration = Duration::from_secs(30);
+	let metrics = tokio::runtime::Handle::current().metrics();
+	let started = Instant::now();
+	while metrics.num_alive_tasks() > 0 {
+		if started.elapsed() >= DEADLINE {
+			panic!(
+				"{fmt}: retained {what} still running after {DEADLINE:?}; {}",
+				retained_state(request).await
+			);
+		}
+		tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(10)))
+			.await
+			.unwrap();
+	}
+	if !request.destination.join(".git").is_file() {
+		panic!(
+			"{fmt}: retained {what} ended without establishing the worktree; {}",
+			retained_state(request).await
+		);
+	}
+}
+
+/// What a retained create left behind, for a failure message: the lock files still present in the
+/// common dir, and the destination's inspection.
+async fn retained_state(request: &CreateRequest) -> String {
+	let common = request.repo.common_dir();
+	let held: Vec<&str> = ["worktrees.lock", "gitana-history.lock"]
+		.into_iter()
+		.filter(|name| common.join(name).exists())
+		.collect();
+	let query = WorktreeQuery {
+		repo: request.repo.clone(),
+		destination: request.destination.clone(),
+		expected_branch: None,
+		start: None,
+		with_status: false,
+	};
+	let inspection = inspect(&query, &Setup::default()).await;
+	format!("lock files still present: {held:?}; inspection: {inspection:#?}")
+}
+
 #[tokio::test]
 async fn cancelling_prepared_recovery_does_not_abandon_the_owned_partial() {
 	for (fmt, kind) in formats() {
@@ -659,19 +710,7 @@ async fn cancelling_prepared_recovery_does_not_abandon_the_owned_partial() {
 		assert!(caller.await.unwrap_err().is_cancelled());
 		std::fs::remove_file(&lock).unwrap();
 
-		let mut recovered = false;
-		for _ in 0..100 {
-			if wt.join(".git").is_file() {
-				recovered = true;
-				break;
-			}
-			tokio::task::spawn_blocking(|| {
-				std::thread::sleep(std::time::Duration::from_millis(10));
-			})
-			.await
-			.unwrap();
-		}
-		assert!(recovered, "{fmt}: retained recovery did not finish");
+		await_retained_work(fmt, "recovery", &recovery).await;
 		assert_eq!(
 			git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
 			head
@@ -719,19 +758,7 @@ async fn cancelling_create_does_not_release_or_abandon_history_gated_publication
 		assert!(caller.await.unwrap_err().is_cancelled());
 		std::fs::remove_file(&history_lock).unwrap();
 
-		let mut established = false;
-		for _ in 0..100 {
-			if wt.join(".git").is_file() {
-				established = true;
-				break;
-			}
-			tokio::task::spawn_blocking(|| {
-				std::thread::sleep(std::time::Duration::from_millis(10));
-			})
-			.await
-			.unwrap();
-		}
-		assert!(established, "{fmt}: retained create did not finish");
+		await_retained_work(fmt, "create", &request).await;
 		assert_eq!(
 			git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
 			head
