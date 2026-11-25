@@ -67,7 +67,9 @@ impl CommitParts {
 /// `ISO-8859-1` (by any of the names iconv knows it by: `latin1`, `latin-1`, `l1`, `cp819`, ...)
 /// each byte the character of the same number; `ISO-8859-9`, `ISO-8859-11` and `TIS-620` with
 /// bytes 80-9F as control characters, though the WHATWG reads these names as windows-1254 and
-/// windows-874; ASCII by its names (`US-ASCII`, `ASCII`, ...) refusing any byte over 7F. Other
+/// windows-874 (`TIS-620` as macOS's iconv reads it, like `ISO-8859-11`: glibc's leaves its bytes
+/// 80-A0 undefined, so git on Linux doesn't convert a commit with them at all); ASCII by its names
+/// (`US-ASCII`, `ASCII`, ...) refusing any byte over 7F. Other
 /// encodings are read by [`encoding_rs`], by the WHATWG's names and tables (`Shift_JIS`, `EUC-JP`,
 /// `GBK`, `Big5`, `EUC-KR`, `KOI8-R`, `ISO-8859-15`, `windows-1252`, ...; and `CP932` as Microsoft's
 /// Shift_JIS). For the Chinese, Japanese and Korean encodings those tables aren't quite iconv's:

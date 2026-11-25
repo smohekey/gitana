@@ -28,7 +28,7 @@ fn output(command: &mut Command) -> Vec<u8> {
 #[test]
 fn a_commit_git_writes_in_another_encoding_is_decoded_as_git_log_shows_it() {
 	// (encoding, a name in it, a message in it)
-	let cases: [(&str, &[u8], &[u8]); 6] = [
+	let cases: [(&str, &[u8], &[u8]); 7] = [
 		(
 			"ISO-8859-1",
 			b"Andr\xe9",
@@ -43,7 +43,11 @@ fn a_commit_git_writes_in_another_encoding_is_decoded_as_git_log_shows_it() {
 		("KOI8-R", b"\xf0\xc5\xd4\xd2", b"\xf0\xd2\xc9\xd7\xc5\xd4\n"),
 		// Names the WHATWG reads as Windows tables: their bytes 80-9F are controls, as iconv reads them.
 		("ISO-8859-9", b"\xdeen", b"\x80 \xd0\xdd\xfe\n"),
-		("TIS-620", b"\xa1", b"\x80\xa1\xd0\n"),
+		("ISO-8859-11", b"\xa1", b"\x80\xa1\xd0\n"),
+		// macOS's iconv reads TIS-620's bytes 80-A0 as ISO-8859-11's, as gitana does; glibc's leaves
+		// them undefined, so git there doesn't convert such a commit at all (measured with glibc 2.36
+		// and 2.39). Only the bytes both read alike are compared.
+		("TIS-620", b"\xa1", b"\xa1\xd0\n"),
 	];
 	for (encoding, name, message) in cases {
 		let dir = tempfile::tempdir().expect("temporary repository");
