@@ -98,7 +98,9 @@ pub(crate) fn merge_split_index<H: HashAlgorithm>(
 	// Additions: the split index's entries after the replacements.
 	entries.extend(split.entries.into_iter().skip(replace_positions.len()));
 	entries.sort_by(entry_cmp);
-	Ok(Index { entries })
+	let merged = Index { entries };
+	merged.refuse_root_entries()?;
+	Ok(merged)
 }
 
 const SIGNATURE: &[u8; 4] = b"DIRC";
@@ -317,8 +319,29 @@ impl<H: HashAlgorithm> Index<H> {
 
 	/// Parse index bytes (DIRC v2–v4), verifying the trailing checksum unless git skipped computing it
 	/// (an all-zero trailer, which git writes under `index.skipHash`), as git's `fsck` does.
+	///
+	/// An entry with an empty path is refused ([`WorktreeError::Malformed`]), except in a split index's delta
+	/// part, which this returns unmerged (see `refuse_root_entries`).
 	pub fn parse(bytes: &[u8]) -> Result<Self, WorktreeError> {
 		Ok(Self::parse_with_link(bytes)?.0)
+	}
+
+	/// Refuse an entry at the worktree root (an empty path), which an index git acts on can't hold. git reads
+	/// such an entry (it writes one itself only when a split index meets `index.skipHash`) and then commits
+	/// the empty tree, so refusing the index keeps every command from acting on it or writing it back. Only a
+	/// split index's delta part may carry empty names: a replacement entry with one keeps the shared entry's
+	/// name, which the merge resolves, so a split index is checked once merged.
+	fn refuse_root_entries(&self) -> Result<(), WorktreeError> {
+		if self
+			.entries
+			.iter()
+			.any(|entry| entry.path.as_bytes().is_empty())
+		{
+			return Err(WorktreeError::Malformed(
+				"index entry with an empty path".to_owned(),
+			));
+		}
+		Ok(())
 	}
 
 	/// Parse index bytes, additionally returning the **split-index** `link` extension when present (its shared
@@ -452,7 +475,15 @@ impl<H: HashAlgorithm> Index<H> {
 			cursor = payload_end;
 		}
 
-		Ok((Index { entries }, link))
+		let index = Index { entries };
+		// A split index's delta part is checked once merged (`merge_split_index`); any other index now.
+		if link
+			.as_ref()
+			.is_none_or(|link| is_null_oid(&link.shared_oid))
+		{
+			index.refuse_root_entries()?;
+		}
+		Ok((index, link))
 	}
 
 	/// Serialise to index version 4 (prefix-compressed paths) with an `H` trailer.
@@ -782,6 +813,114 @@ mod tests {
 		assert!(matches!(
 			Index::<Sha256>::parse(&bytes),
 			Err(WorktreeError::ChecksumMismatch)
+		));
+	}
+
+	/// A version-2 index of `(mode, name)` entries with zeroed stat data and a placeholder id, and its trailer.
+	fn v2_index(entries: &[(u32, &[u8])]) -> Vec<u8> {
+		v2_index_with_link(entries, None)
+	}
+
+	/// [`v2_index`], with a split-index `link` extension carrying `link` as its payload.
+	fn v2_index_with_link(entries: &[(u32, &[u8])], link: Option<Vec<u8>>) -> Vec<u8> {
+		let mut bytes = b"DIRC".to_vec();
+		bytes.extend_from_slice(&2u32.to_be_bytes());
+		bytes.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+		for (mode, name) in entries {
+			let start = bytes.len();
+			for field in [0, 0, 0, 0, 0, 0, *mode, 0, 0, 0u32] {
+				bytes.extend_from_slice(&field.to_be_bytes());
+			}
+			bytes.extend_from_slice(oid(b"x").as_bytes());
+			bytes.extend_from_slice(&(name.len() as u16).to_be_bytes());
+			bytes.extend_from_slice(name);
+			bytes.push(0);
+			while !(bytes.len() - start).is_multiple_of(8) {
+				bytes.push(0);
+			}
+		}
+		if let Some(payload) = link {
+			bytes.extend_from_slice(b"link");
+			bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+			bytes.extend_from_slice(&payload);
+		}
+		let checksum = Sha256::digest(&[&bytes]);
+		bytes.extend_from_slice(checksum.as_ref());
+		bytes
+	}
+
+	#[test]
+	fn refuses_an_entry_with_an_empty_path() {
+		let ok = v2_index(&[(0o100644, b"a.txt")]);
+		assert_eq!(Index::<Sha256>::parse(&ok).unwrap().entries.len(), 1);
+		// An empty name, and a sparse directory entry named `/` (its trailing `/` is stripped), would
+		// each be an entry at the worktree root.
+		for (mode, name) in [(0o100644, &b""[..]), (0o040000, &b"/"[..])] {
+			let bytes = v2_index(&[(mode, name), (0o100644, b"a.txt")]);
+			assert!(
+				matches!(Index::<Sha256>::parse(&bytes), Err(WorktreeError::Malformed(ref message)) if message.contains("empty path")),
+				"mode {mode:o}, name {name:?}"
+			);
+		}
+	}
+
+	/// A `link` payload naming the shared index `shared` (all zero: none), with `replace` as the replace
+	/// bitmap and nothing deleted.
+	fn link_payload(shared: u8, replace: &[u32]) -> Vec<u8> {
+		let mut payload = vec![shared; Sha256::RAW_LEN];
+		payload.extend(split_index_ewah(&[]));
+		payload.extend(split_index_ewah(replace));
+		payload
+	}
+
+	/// An EWAH bitmap of `bits` sized to its highest bit + 1 rather than to whole words (`encode_ewah`), so
+	/// it passes the merge's bound of the shared index's entry count.
+	fn split_index_ewah(bits: &[u32]) -> Vec<u8> {
+		use gitana_object::{EwahBitmap, encode_ewah};
+		let mut bytes = encode_ewah(&EwahBitmap::from_set_bits(bits.iter().copied()));
+		let size = bits.iter().max().map_or(0, |highest| highest + 1);
+		bytes[0..4].copy_from_slice(&size.to_be_bytes());
+		bytes
+	}
+
+	/// In a split index's delta part an empty name is a replacement that keeps the shared entry's name, so it
+	/// parses, and merges to that name; an empty name left after the merge (an addition), or in an index whose
+	/// `link` names no shared index (git's split index with `index.skipHash`), is refused.
+	#[test]
+	fn a_split_indexs_delta_may_carry_empty_names_until_merged() {
+		let replaced = (0o100644, &b""[..]);
+		let delta = v2_index_with_link(&[replaced], Some(link_payload(1, &[0])));
+		let parsed = Index::<Sha256>::parse(&delta).unwrap();
+		assert!(
+			parsed.entries[0].path.as_bytes().is_empty(),
+			"the delta is returned unmerged"
+		);
+
+		let mut base = Index::<Sha256>::new();
+		base.upsert(entry("a.txt", b"old"));
+		base.upsert(entry("b.txt", b"b"));
+		let (split, link) = Index::<Sha256>::parse_with_link(&delta).unwrap();
+		let merged = merge_split_index(base.clone(), split, &link.unwrap()).unwrap();
+		let paths: Vec<&[u8]> = merged.entries.iter().map(|e| e.path.as_bytes()).collect();
+		assert_eq!(paths, [&b"a.txt"[..], b"b.txt"]);
+		assert_eq!(
+			merged.entries[0].oid,
+			oid(b"x"),
+			"a.txt took the replacement's id"
+		);
+
+		let with_addition =
+			v2_index_with_link(&[replaced, (0o100644, b"")], Some(link_payload(1, &[0])));
+		let (split, link) = Index::<Sha256>::parse_with_link(&with_addition).unwrap();
+		assert!(matches!(
+			merge_split_index(base, split, &link.unwrap()),
+			Err(WorktreeError::Malformed(ref message)) if message.contains("empty path")
+		));
+
+		let no_shared = v2_index_with_link(&[replaced], Some(link_payload(0, &[0])));
+		assert!(matches!(
+			Index::<Sha256>::parse(&no_shared),
+			Err(WorktreeError::Malformed(ref message)) if message.contains("empty path")
 		));
 	}
 
