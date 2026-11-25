@@ -66,6 +66,51 @@ fn existing_branch(name: &str, expected_start: Option<WorktreeObjectId>) -> Chec
 	}
 }
 
+/// The fixtures' git reads no config file from the machine, global or system (see `git_command`).
+///
+/// Entries are judged by git's own scope label: `command` is what a fixture passes, and `local` or
+/// `worktree` belong to whatever repository git finds (one above the temp dir, when that sits inside a
+/// checkout), which isn't what this guards; any other scope fails. Only scopes, origins and key names are
+/// listed, so a failure never prints a developer's config values. On a machine with no global or system
+/// config this passes either way; it guards the isolation where there is some. (The default global
+/// ignore and attributes files aren't config, so this doesn't see them.)
+#[test]
+fn fixtures_read_no_machine_config() {
+	let empty = unique_tmp("no-machine-config");
+	let out = git_command()
+		.arg("-C")
+		.arg(&empty)
+		.args([
+			"config",
+			"--list",
+			"--show-scope",
+			"--show-origin",
+			"--name-only",
+		])
+		.output()
+		.expect("run git");
+	assert!(
+		out.status.success(),
+		"git config --list failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	let listing = String::from_utf8_lossy(&out.stdout);
+	let from_machine: Vec<&str> = listing
+		.lines()
+		.filter(|line| {
+			!matches!(
+				line.split('\t').next(),
+				Some("command" | "local" | "worktree")
+			)
+		})
+		.collect();
+	assert!(
+		from_machine.is_empty(),
+		"the fixtures' git read config from the machine: {from_machine:?}"
+	);
+	let _ = std::fs::remove_dir_all(&empty);
+}
+
 #[tokio::test]
 async fn creates_a_new_branch_worktree_that_git_accepts() {
 	for (fmt, kind) in formats() {
@@ -1458,7 +1503,7 @@ async fn accepts_a_non_utf8_destination_and_round_trips() {
 			.is_ok(),
 			"{fmt}: idempotent re-create over the non-UTF-8 pointers"
 		);
-		let out = std::process::Command::new("git")
+		let out = git_command()
 			.arg("-C")
 			.arg(&dest)
 			.args(["rev-parse", "HEAD"])
