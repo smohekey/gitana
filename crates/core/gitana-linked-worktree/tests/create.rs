@@ -1905,6 +1905,121 @@ async fn a_crashed_create_reads_as_locked_and_prepared_recovery_reclaims_it() {
 	}
 }
 
+/// What a worktree's `locked` marker is: a symlink's target, or a file's contents.
+fn describe_lock(marker: &std::path::Path) -> String {
+	match std::fs::read_link(marker) {
+		Ok(target) => format!("symlink to {target:?}"),
+		Err(_) => format!("{:?}", std::fs::read_to_string(marker)),
+	}
+}
+
+/// Prepared recovery honours a lock that isn't the `initializing` marker a crashed create leaves: a
+/// user's lock with a reason, one without, or one whose reason can't be read (a symlinked marker, never
+/// followed, even when its target says `initializing`). A missing checkout is also what a locked
+/// worktree on an unplugged drive looks like, so recovery refuses the partial as locked, as ordinary
+/// `create` does, and leaves it and the lock alone.
+#[tokio::test]
+async fn prepared_recovery_preserves_a_user_locked_partial() {
+	type Lock = fn(&std::path::Path, &std::path::Path, &std::path::Path);
+	let cases: [(&str, Lock, Option<&str>); 3] = [
+		(
+			"with a reason",
+			|work, wt, _| {
+				git(&[
+					"-C",
+					work.to_str().unwrap(),
+					"worktree",
+					"lock",
+					"--reason",
+					"on a removable drive",
+					wt.to_str().unwrap(),
+				]);
+			},
+			Some("on a removable drive"),
+		),
+		(
+			"without a reason",
+			|work, wt, _| {
+				git(&[
+					"-C",
+					work.to_str().unwrap(),
+					"worktree",
+					"lock",
+					wt.to_str().unwrap(),
+				]);
+			},
+			Some(""),
+		),
+		(
+			"symlinked to an initializing marker",
+			|work, _, base| {
+				let target = base.join("elsewhere");
+				std::fs::write(&target, "initializing\n").unwrap();
+				symlink(&target, work.join(".git/worktrees/wt/locked")).unwrap();
+			},
+			None,
+		),
+	];
+	for (fmt, kind) in formats() {
+		for (label, lock, expected) in cases {
+			let base = unique_tmp(&format!("create-recover-user-locked-{fmt}"));
+			let work = base.join("repo");
+			init_repo(&work, fmt);
+			let head = commit_file(&work, "a.txt", "1\n", "init");
+			let wt = base.join("wt");
+			let start = WorktreeObjectId::parse(kind, &head).unwrap();
+			create(
+				&req(&work, &wt, new_branch("feature", start.clone())),
+				&Setup::default(),
+				&Setup::default(),
+			)
+			.await
+			.unwrap();
+			lock(&work, &wt, &base);
+			std::fs::remove_file(wt.join(".git")).unwrap();
+			let admin = work.join(".git/worktrees/wt");
+			let marker_before = describe_lock(&admin.join("locked"));
+
+			let result = recover_prepared_create(
+				&req(&work, &wt, existing_branch("feature", Some(start))),
+				&Setup::default(),
+				&Setup::default(),
+			)
+			.await;
+			assert!(
+				matches!(
+					&result,
+					Err(CreateError::Refused(WorktreeClassification::ProtectedWithReason {
+						reason: ProtectionReason::Locked { reason }
+					})) if reason.as_deref() == expected
+				),
+				"{fmt}, {label}: recovery must refuse the locked partial, got {result:?}"
+			);
+			assert_eq!(
+				describe_lock(&admin.join("locked")),
+				marker_before,
+				"{fmt}, {label}: the lock is left alone"
+			);
+			assert!(
+				admin.join("HEAD").is_file() && !wt.join(".git").exists(),
+				"{fmt}, {label}: the partial is left alone"
+			);
+			let listing = git(&[
+				"-C",
+				work.to_str().unwrap(),
+				"worktree",
+				"list",
+				"--porcelain",
+			]);
+			assert!(
+				porcelain_has(&listing, "locked"),
+				"{fmt}, {label}: git still sees it locked: {listing}"
+			);
+			let _ = std::fs::remove_dir_all(&base);
+		}
+	}
+}
+
 /// The admin folder whose `gitdir` points at `checkout`'s `.git`, by name.
 fn admin_name_for(work: &std::path::Path, checkout: &std::path::Path) -> Option<String> {
 	let want = canonical(checkout).join(".git");

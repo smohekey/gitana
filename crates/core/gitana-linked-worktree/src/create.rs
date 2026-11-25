@@ -75,7 +75,11 @@ mod native {
 	/// adds that missing authority: it accepts only an [`CheckoutTarget::ExistingBranch`] with an exact
 	/// `expected_start`, and discards the partial only when the retained admin `HEAD`, shared branch,
 	/// repository, destination, and baseline all match that request. The checkout must still lack its
-	/// final `.git` marker. Every mismatch follows ordinary fail-closed create behavior.
+	/// final `.git` marker, and the registration must be unlocked or hold only the `initializing` marker
+	/// a crashed create leaves (gitana's, or an English-language git's): any other lock — a user's, with
+	/// or without a reason, or one whose reason can't be read — is honoured, so the partial is refused as
+	/// `ProtectedWithReason::Locked` and left alone, as ordinary `create` refuses it. Every mismatch
+	/// follows ordinary fail-closed create behavior.
 	pub async fn recover_prepared_create<P: NewWorktreeSetup + Clone + 'static>(
 		request: &CreateRequest,
 		setup: &Setup,
@@ -175,6 +179,10 @@ mod native {
 		if inspection.destination != request.destination
 			|| !crate::pointers::canonical_eq(&inspection.common_dir, request.repo.common_dir())
 			|| inspection.identity_conflict.is_some()
+			// A user's lock says "keep this", and a missing checkout is what a locked worktree on an
+			// unplugged drive looks like too. Only the marker a crashed create leaves is reclaimable: a
+			// stock add still running has already written the checkout's `.git` by then (checked below).
+			|| !(inspection.lock == LockState::Unlocked || InitializingLock::is_marker(&inspection.lock))
 			|| inspection.cross_pointers != CrossPointerHealth::NotApplicable
 			|| !matches!(
 				inspection.destination_kind,

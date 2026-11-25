@@ -270,10 +270,11 @@ created-durability barrier's admin-tree flush covers the release). It is release
 `PartialRegistered` partial. Only a **crash** leaves it behind, and that partial then reads as
 `ProtectedWithReason::Locked { reason: "initializing" }`, exactly as a killed `git worktree add` leaves its
 own: an ordinary `create` refuses it, `remove` needs the double force, git neither prunes nor reports it
-prunable, and `git worktree unlock` clears it. `recover_prepared_create` reclaims such a partial unchanged,
-since it already authorizes on the exact partial and does not consult the lock. Deliberately **not** done:
-treating an `initializing` marker as "not really locked" — gitana cannot tell its own leftover from a
-`git worktree add` still running, which writes the same word. (The gap between the `mkdir` and the marker
+prunable, and `git worktree unlock` clears it. `recover_prepared_create` reclaims such a partial: it is
+the one lock recovery may override (see the "Recoverable mid-checkout state" bullet under *Slice-5 create
+hardening*). Deliberately **not** done:
+treating an `initializing` marker as "not really locked" in an ordinary `create` — gitana cannot tell its
+own leftover from a `git worktree add` still running, which writes the same word. (The gap between the `mkdir` and the marker
 remains, as in git.) The test fixtures also turn git's automatic maintenance off for every command they run,
 so a background maintenance process never races the repository a test is still using.
 
@@ -676,7 +677,17 @@ pointer-publication hardening:
   sole physical admin, missing final `.git` marker, admin `HEAD`, shared branch, and baseline under the
   registration lock; only that complete match authorizes deleting the intent-owned partial and recreating
   it. Any mismatch falls back to the ordinary fail-closed refusal, so a registration alone still never
-  grants authority over a reused directory. Recovery itself is retained to completion after caller
+  grants authority over a reused directory. **A lock is part of that match (2026-11-26).** The partial must
+  be unlocked or hold exactly the `initializing` marker a crashed create leaves (gitana's, or an
+  English-language git's; a translated one is refused, the safe direction). Any other lock — a user's,
+  with or without a reason, or one whose reason can't be read, such as a symlinked marker, which is never
+  followed — is honoured: recovery refuses the partial as `ProtectedWithReason::Locked`, as ordinary
+  `create` does, and leaves it and the lock alone. A missing checkout is also what a locked worktree on an
+  unplugged drive looks like, and git's own `add` refuses a missing but locked path without a double
+  `--force`. Reclaiming `initializing` stays safe though plain `create` refuses it, because recovery also
+  demands the checkout's `.git` be missing: a stock `git worktree add` still running has already written
+  it by the time it checks out (probed with a slowed checkout), and gitana's own creates are kept out by the
+  registration lock. Recovery itself is retained to completion after caller
   cancellation, and recursive checkout/admin cleanup is offloaded while the registration lock remains
   held, so neither cancellation nor a large tree releases ownership ahead of the destructive work.
   Removal durability resolves a destination component-by-component before cleanup; consequently a
