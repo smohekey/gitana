@@ -1832,3 +1832,99 @@ async fn a_crashed_create_reads_as_locked_and_prepared_recovery_reclaims_it() {
 		let _ = std::fs::remove_dir_all(&base);
 	}
 }
+
+/// The admin folder whose `gitdir` points at `checkout`'s `.git`, by name.
+fn admin_name_for(work: &std::path::Path, checkout: &std::path::Path) -> Option<String> {
+	let want = canonical(checkout).join(".git");
+	std::fs::read_dir(work.join(".git/worktrees"))
+		.unwrap()
+		.flatten()
+		.find(|entry| {
+			std::fs::read_to_string(entry.path().join("gitdir"))
+				.is_ok_and(|gitdir| std::path::Path::new(gitdir.trim()) == want)
+		})
+		.map(|entry| entry.file_name().to_string_lossy().into_owned())
+}
+
+/// A second worktree whose basename is already an admin name takes git's next one (`wt1`), as a second
+/// stock `git worktree add` does, and the first worktree is left exactly as git made it.
+#[tokio::test]
+async fn a_taken_basename_gets_gits_next_admin_name() {
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-taken-name-{fmt}"));
+
+		// The oracle: two stock adds of the same basename.
+		let git_work = base.join("gitrepo");
+		init_repo(&git_work, fmt);
+		let git_head = commit_file(&git_work, "a.txt", "1\n", "init");
+		let gw = git_work.to_str().unwrap();
+		let (git_first, git_second) = (base.join("g1/wt"), base.join("g2/wt"));
+		for checkout in [&git_first, &git_second] {
+			git(&[
+				"-C",
+				gw,
+				"worktree",
+				"add",
+				"--detach",
+				"-q",
+				checkout.to_str().unwrap(),
+				&git_head,
+			]);
+		}
+		let git_name = admin_name_for(&git_work, &git_second);
+
+		// Ours: a stock add, then gitana's create of the same basename.
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		let (first, second) = (base.join("o1/wt"), base.join("o2/wt"));
+		git(&[
+			"-C",
+			w,
+			"worktree",
+			"add",
+			"--detach",
+			"-q",
+			first.to_str().unwrap(),
+			&head,
+		]);
+		create(
+			&req(
+				&work,
+				&second,
+				CheckoutTarget::Detached {
+					start: WorktreeObjectId::parse(kind, &head).unwrap(),
+				},
+			),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(git_name.as_deref(), Some("wt1"), "{fmt}: git's second add");
+		assert_eq!(
+			admin_name_for(&work, &second),
+			git_name,
+			"{fmt}: the same admin name git gives it"
+		);
+		assert_eq!(
+			admin_name_for(&work, &first).as_deref(),
+			Some("wt"),
+			"{fmt}: the first worktree keeps its admin"
+		);
+		let listing = git(&["-C", w, "worktree", "list", "--porcelain"]);
+		for checkout in [&first, &second] {
+			assert!(
+				listing.contains(&format!("worktree {}\n", canonical(checkout).display())),
+				"{fmt}: git lists {checkout:?}: {listing}"
+			);
+		}
+		assert!(
+			git_ok(&["-C", first.to_str().unwrap(), "status", "--porcelain"]),
+			"{fmt}: the first worktree still works"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
