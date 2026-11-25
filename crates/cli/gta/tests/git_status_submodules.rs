@@ -202,5 +202,18 @@ fn prints_git_s_warnings_and_refuses_what_git_refuses() {
 		);
 		Fixture::new(format, "g config submodule.sub.ignore bogus")
 			.check("submodule.sub.ignore=bogus", &[]);
+		// The submodule's own setting: its status refuses, so the superproject's does, unless the
+		// setting in effect doesn't look inside it.
+		for when in ["", "none", "untracked", "dirty", "all"] {
+			let flag = format!("--ignore-submodules={when}");
+			let args: &[&str] = if when.is_empty() { &[] } else { &[&flag] };
+			for set in [
+				"g -C sub config diff.ignoreSubmodules bogus",
+				r"printf '[diff]\n\tignoreSubmodules\n' >> .git/modules/sub/config",
+			] {
+				Fixture::new(format, &format!("echo y >> sub/f; {set}"))
+					.check(&format!("{set}, {args:?}"), args);
+			}
+		}
 	}
 }

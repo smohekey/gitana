@@ -560,6 +560,45 @@ async fn refuses_a_sparse_index_worktree_honestly() {
 }
 
 #[tokio::test]
+async fn refuses_a_bad_diff_ignore_submodules_as_git_does() {
+	// git's `worktree remove` runs `git status` in the worktree, which refuses a bad
+	// `diff.ignoreSubmodules`, so the removal does; `--force` runs no status and removes it (probed vs
+	// git 2.55).
+	for (fmt, _kind) in formats() {
+		let base = unique_tmp(&format!("remove-bad-diff-setting-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		std::fs::write(work.join("f.txt"), b"1\n").unwrap();
+		let w = work.to_str().unwrap();
+		git(&["-C", w, "add", "."]);
+		git(&["-C", w, "commit", "-q", "-m", "init"]);
+		let wt = base.join("wt");
+		git_add_worktree(&work, &wt, &["-b", "feature"], &[]);
+		git(&["-C", w, "config", "diff.ignoreSubmodules", "bogus"]);
+
+		let err = remove(&rreq(&work, &wt, Some("feature")), &Setup::default())
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(err, RemoveError::Failed(_))
+				&& err
+					.to_string()
+					.contains("bad --ignore-submodules argument: bogus"),
+			"{fmt}: a bad setting must refuse as git's does, got {err:?}"
+		);
+		assert!(wt.exists(), "{fmt}: the checkout is preserved");
+
+		let forced = RemoveRequest {
+			policy: RemovePolicy::GitCompat { force: 1 },
+			..rreq(&work, &wt, Some("feature"))
+		};
+		remove(&forced, &Setup::default()).await.unwrap();
+		assert!(!wt.exists(), "{fmt}: --force removes it");
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+#[tokio::test]
 async fn removes_a_detached_worktree() {
 	for (fmt, _kind) in formats() {
 		let base = unique_tmp(&format!("remove-detached-{fmt}"));

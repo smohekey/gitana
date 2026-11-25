@@ -545,3 +545,87 @@ async fn reads_a_linked_worktree_s_module_store_as_git_does() {
 			.await;
 	}
 }
+
+#[tokio::test]
+async fn refuses_the_submodule_s_own_bad_setting_as_git_does() {
+	// The submodule's own status refuses a bad `diff.ignoreSubmodules` in its config, so the
+	// superproject's fails, unless the setting in effect doesn't look inside (probed vs git 2.55).
+	for format in ["sha1", "sha256"] {
+		for (setting, set, refusal) in [
+			(
+				"bad",
+				"g -C sub config diff.ignoreSubmodules bogus",
+				"bad --ignore-submodules argument: bogus",
+			),
+			(
+				"valueless",
+				"printf '[diff]\\n\\tignoreSubmodules\\n' >> .git/modules/sub/config",
+				"missing value for 'diff.ignoresubmodules'",
+			),
+		] {
+			for (when, refused) in [
+				(None, true),
+				(Some("none"), true),
+				(Some("untracked"), true),
+				(Some("dirty"), false),
+				(Some("all"), false),
+			] {
+				let args: Vec<String> = when
+					.map(|when| format!("--ignore-submodules={when}"))
+					.into_iter()
+					.collect();
+				let args: Vec<&str> = args.iter().map(String::as_str).collect();
+				let label = format!("the submodule's own {setting} setting, {args:?}");
+				let fixture = Fixture::new(format);
+				fixture
+					.check(&label, &format!("echo x >> sub/f; {set}"), &args)
+					.await;
+				let ours = fixture
+					.gitana_status(&fixture.superproject(), flag(&args))
+					.await;
+				match ours {
+					Err(error) => assert!(
+						refused && error.contains(refusal),
+						"{label} ({format}): {error}"
+					),
+					Ok(_) => assert!(!refused, "{label} ({format})"),
+				}
+			}
+		}
+	}
+}
+
+#[tokio::test]
+async fn refuses_a_submodule_with_a_sparse_index() {
+	// git reads a sparse index; gitana's status can't, so it refuses where git reports, unless the
+	// setting in effect doesn't look inside the submodule. That's a deliberate difference.
+	let sparse = "mkdir sub/d; echo d > sub/d/f; g -C sub add -A; g -C sub commit -q -m d; \
+		g -C sub sparse-checkout set --cone --sparse-index";
+	for format in ["sha1", "sha256"] {
+		let fixture = Fixture::new(format);
+		fixture.sh(&fixture.superproject(), sparse);
+		let git = fixture.git_status(&fixture.superproject(), &[]);
+		assert_eq!(
+			String::from_utf8_lossy(&git.stdout),
+			" M sub\n",
+			"{format}: git reads it"
+		);
+		let error = fixture
+			.gitana_status(&fixture.superproject(), None)
+			.await
+			.unwrap_err();
+		assert!(
+			error.contains("submodule 'sub'") && error.contains("sparse index"),
+			"{format}: {error}"
+		);
+		// `dirty` doesn't look at the submodule's content, so its status isn't read.
+		let fixture = Fixture::new(format);
+		fixture
+			.check(
+				"a sparse index under --ignore-submodules=dirty",
+				sparse,
+				&["--ignore-submodules=dirty"],
+			)
+			.await;
+	}
+}

@@ -69,6 +69,30 @@ fn clean_commit_from_a_sparse_index_preserves_directory_entries() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// gitana's status doesn't unfold a sparse index's folder entries, so `gta status` refuses one rather
+/// than report false changes, where git reads it.
+#[test]
+fn status_refuses_a_sparse_index() {
+	if !git_supports_sha256() {
+		return;
+	}
+	let work = repo("gta-sparse-index-status");
+	let w = work.to_str().unwrap();
+	git(w, &["sparse-checkout", "init", "--cone", "--sparse-index"]);
+	git(w, &["sparse-checkout", "set", "a"]);
+	assert_eq!(git(w, &["status", "--porcelain"]), "", "git reads it");
+	let error = gta_fail(w, &["status"]);
+	assert!(
+		error.contains("the index is a sparse index, which gitana's status can't read yet"),
+		"stderr: {error}"
+	);
+	// Without a sparse index, the same sparse checkout reads as git reads it.
+	git(w, &["sparse-checkout", "set", "--no-sparse-index", "a"]);
+	assert_eq!(gta(w, &["status"], b""), "");
+
+	std::fs::remove_dir_all(&work).ok();
+}
+
 /// git rejects a cone argument that names a tracked *file* (a cone set takes directories); there is no
 /// `--skip-checks` in gta.
 #[test]

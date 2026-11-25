@@ -256,3 +256,33 @@ async fn keeps_git_s_warnings_and_fails_where_git_fails() -> Result<()> {
 	}
 	Ok(())
 }
+
+#[tokio::test]
+async fn refuses_a_bad_diff_ignore_submodules_as_git_does() -> Result<()> {
+	// git's status refuses a bad `diff.ignoreSubmodules`, with or without the flag, and so does the
+	// component's, the submodule's own setting included (probed vs git 2.55).
+	for format in ["sha1", "sha256"] {
+		for (place, change) in [
+			("the superproject", "g config diff.ignoreSubmodules bogus"),
+			(
+				"the submodule",
+				"g -C sub config diff.ignoreSubmodules bogus",
+			),
+		] {
+			let fixture = Fixture::new(format, change);
+			assert_eq!(fixture.git_status(&[]).status.code(), Some(128), "{format}");
+			let (status, _) = fixture.component_status(true, None).await?;
+			let error = status.expect_err("a bad setting fails the status");
+			assert!(
+				error.contains("bad --ignore-submodules argument: bogus"),
+				"{place} ({format}): {error}"
+			);
+		}
+		let fixture = Fixture::new(format, "g config diff.ignoreSubmodules bogus");
+		let (status, _) = fixture
+			.component_status(true, Some(IgnoreSubmodules::None))
+			.await?;
+		assert!(status.is_err(), "{format}: the flag doesn't excuse it");
+	}
+	Ok(())
+}

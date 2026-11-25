@@ -172,8 +172,10 @@ pub struct WorktreeInspection {
 	/// The live checkout's working-tree status — populated only when the query set
 	/// [`with_status`](crate::WorktreeQuery::with_status) **and** the destination is a present,
 	/// cross-pointer-consistent linked-worktree checkout (a missing/partial/foreign checkout has no status to
-	/// compute). `None` otherwise. A status *failure* is a hard error from `inspect`, never a silent `None`
-	/// (which `classify` would read as clean).
+	/// compute). `None` otherwise, and also for a checkout whose index is a sparse index, which status
+	/// refuses to read: then [`sparse_index`](Self::sparse_index) is `Some(true)`, and removal refuses on
+	/// that first. Any other status *failure* is a hard error from `inspect`, never a silent `None` (which
+	/// `classify` would read as clean).
 	pub status: Option<crate::WorktreeStatusReport>,
 	/// The live checkout's **residual** (untracked *or* ignored) working-tree paths — files on disk with no
 	/// index entry, from a matcher-independent scan (see
@@ -608,7 +610,9 @@ mod native {
 		// Working-tree status — computed only when the caller asked for it (a removal/cleanup decision) **and**
 		// the destination is a present, cross-pointer-consistent live checkout: a missing/partial checkout has
 		// no working tree to scan, and a foreign one must never be opened. A status *failure* propagates as a
-		// hard error (never a silent `None`, which `classify` would read as clean).
+		// hard error (never a silent `None`, which `classify` would read as clean). The one `None` for a
+		// statusable checkout is a sparse index, which status refuses: `sparse_index` is then `Some(true)`, and
+		// `decide_remove` and `classify` both refuse on it before they read status.
 		let statusable = query.with_status
 			&& matches!(registration, Registration::Present { .. })
 			&& cross_pointers == CrossPointerHealth::Consistent
@@ -621,13 +625,18 @@ mod native {
 			// matcher-independent scan for residual untracked/ignored content (the conservative delete gate), a
 			// content re-verification of every present tracked file (hashing, not the stat cache — catches edits
 			// `status` can miss and skip-worktree edits it omits), and whether the index is a sparse index (whose
-			// collapsed directory entries make that status unreliable).
-			let status = crate::status::status_at(admin, common, destination, setup).await?;
+			// collapsed directory entries status refuses to read). The sparse index is asked first, so that one
+			// is refused in removal's own words rather than as a status error.
+			let sparse = crate::status::is_sparse_index(admin, common, destination).await?;
+			let status = if sparse {
+				None
+			} else {
+				Some(crate::status::status_at(admin, common, destination, setup).await?)
+			};
 			let residual = crate::status::residual_untracked_paths(admin, common, destination).await?;
 			let diverged =
 				crate::status::diverged_tracked_content_paths(admin, common, destination, setup).await?;
-			let sparse = crate::status::is_sparse_index(admin, common, destination).await?;
-			(Some(status), Some(residual), Some(diverged), Some(sparse))
+			(status, Some(residual), Some(diverged), Some(sparse))
 		} else {
 			(None, None, None, None)
 		};

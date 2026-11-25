@@ -1,3 +1,7 @@
+use gitana_config::GitConfig;
+
+use crate::WorktreeError;
+
 /// Which of a submodule's changes status leaves out: git's `--ignore-submodules=<when>`,
 /// `submodule.<name>.ignore` and `diff.ignoreSubmodules`.
 ///
@@ -30,6 +34,22 @@ impl IgnoreSubmodules {
 			"all" => Some(Self::All),
 			_ => None,
 		}
+	}
+
+	/// The `diff.ignoreSubmodules` setting in `config`, refused as git refuses it. git checks every
+	/// entry as it reads the config, so a bad or valueless one fails even with a valid one after it.
+	/// An empty value is a bad one, not a missing one. The last entry wins (probed vs git 2.55).
+	pub fn from_diff_config(config: &GitConfig) -> Result<Option<Self>, WorktreeError> {
+		let mut setting = None;
+		for value in config.get_all_raw("diff", None, "ignoresubmodules") {
+			let value = value.ok_or(WorktreeError::MissingIgnoreSubmodulesValue)?;
+			setting = Some(
+				Self::parse(value).ok_or_else(|| WorktreeError::BadIgnoreSubmodules {
+					value: value.to_owned(),
+				})?,
+			);
+		}
+		Ok(setting)
 	}
 }
 

@@ -766,9 +766,12 @@ pointer-publication hardening:
     entry, so `bit_size` cannot exceed its count, and a crafted header is rejected before allocating.
   - **Sparse *index* (`git sparse-checkout --sparse-index`) is refused honestly, expansion deferred.** A sparse
     index collapses out-of-cone directories into single `040000` sparse-directory entries that gitana does not
-    expand, so a status computed over it reports spurious add/delete pairs (a misleading `Dirty`). Removal
-    detects such an index (`WorkTree::is_sparse_index`) and refuses *before* the status-derived gates with
-    `ProtectionReason::SparseIndexUnsupported` (a conservative unsupported-state refusal, never data loss).
+    expand, so `WorkTree::status` refuses one (`WorktreeError::SparseIndex`) rather than report spurious
+    add/delete pairs. Removal asks first (`WorkTree::is_sparse_index`), skips the status, and refuses *before*
+    the status-derived gates with `ProtectionReason::SparseIndexUnsupported` (a conservative unsupported-state
+    refusal, never data loss); `WorktreeInspection.status` is then `None`, with `sparse_index` `Some(true)`.
+    `status` and `checkout_safety` fail on one. Removal also fails, as git's does, on a bad
+    `diff.ignoreSubmodules`, which the status refuses (git's `worktree remove` runs `git status`).
     **Deferred:** expanding sparse-directory entries (reading their trees into skip-worktree blob entries) so a
     clean cone sparse-index worktree removes cleanly — it pulls object reads into the `load_index` hot path, a
     disproportionate change for an exotic, currently-safe case.

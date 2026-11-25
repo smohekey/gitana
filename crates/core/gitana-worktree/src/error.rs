@@ -97,6 +97,18 @@ pub enum WorktreeError {
 		path: GitPath,
 		source: Box<dyn std::error::Error + Send + Sync>,
 	},
+	/// `diff.ignoreSubmodules` has a value git doesn't know (it knows `none`, `untracked`, `dirty` and
+	/// `all`, case-sensitively). git's status refuses it, as do the commands that read diff settings
+	/// (probed vs git 2.55).
+	#[error("bad --ignore-submodules argument: {value}")]
+	BadIgnoreSubmodules { value: String },
+	/// `diff.ignoreSubmodules` is given with no value, which git refuses where it refuses a bad one.
+	#[error("missing value for 'diff.ignoresubmodules'")]
+	MissingIgnoreSubmodulesValue,
+	/// The index is a sparse index: it folds folders outside the sparse checkout into single entries,
+	/// which gitana's status doesn't unfold, so what it said would be wrong. git reads these.
+	#[error("the index is a sparse index, which gitana's status can't read yet")]
+	SparseIndex,
 	/// A tree records a gitlink (mode 160000) with an all-zero object id — not a valid cache entry. git
 	/// refuses to write the index and does not switch branches (probed vs git 2.55: "cache entry has null
 	/// sha1"). A non-null commit gitana does not have locally is fine (an unfetched submodule); only the

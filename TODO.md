@@ -343,6 +343,29 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [ ] List a submodule with new commits in `ls-files -m` when its `.git` is a directory in the mount.
   git lists it; the routed store reads only a gitfile into `modules/`. (`status` sees it, through the
   probe.)
+- [x] Refuse a bad or valueless `diff.ignoreSubmodules` where git's status does (probed vs git 2.55).
+  - **In the library's status** (`WorkTree::status`), so every caller gets it:
+    - `gta status`;
+    - `worktree remove` (git's runs `git status` in the worktree; `--force` runs none);
+    - the status the probe runs in each submodule, which reads the submodule's own config;
+    - deinit's check;
+    - the wasm component;
+    - cargo-opinionate.
+  - **Every entry is checked,** as git checks them while it reads the config: a bad value a valid one
+    overrides still refuses. `config.worktree` counts, and so do includes when the frontend installs
+    the config.
+  - **`WorkTree::status_without_diff_check`** skips it, for rebase's gate: git's rebase proceeds.
+- [x] Refuse a sparse index in status (`WorktreeError::SparseIndex`), rather than report false
+  add/delete pairs. Worktree remove still refuses one in its own words (`SparseIndexUnsupported`).
+- [ ] Read a sparse index in status, as git does: unfold each folder entry against the tree it
+  names. Until then, status refuses one, a submodule with one included, where git reads it.
+- [ ] Refuse a bad `diff.ignoreSubmodules` a submodule's status would see in `stash push`. git's
+  `stash push` looks inside submodules that aren't `ignore=all`, so it refuses one given with `-c`,
+  in the global config or in the submodule's own config (probed vs git 2.55). gitana's stash leaves
+  submodules aside altogether. What git's stash does with a dirty submodule needs measuring first.
+- [ ] Refuse a bad `diff.ignoreSubmodules` in the commands whose git counterparts read diff settings
+  (`commit`, `merge`, `log`, `show`, `switch`, `checkout`, `restore`, `diff`, `pull`, `stash list`
+  and `show`); only status refuses it so far.
 - [x] Add capability-safe submodule consumer operations and recursive clone integration.
   `gta submodule` supports status, init, update (checkout/merge strategy, remote/no-fetch, shallow
   policy, recursion), deinit, set-branch, set-url, and recursive sync; clone can publish and then
