@@ -2380,6 +2380,35 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		crate::commit::run(self, message, identity).await
 	}
 
+	/// Replace the last commit, `expected`, with one made from the staged index, with `message`, as
+	/// `git commit --amend -m` does: the same parents (none at the shallow boundary, as git sees
+	/// them), the replaced commit's author and other headers (not its signature, nor its
+	/// `encoding`), `identity` as committer; the ref at the end of `chain` (or `HEAD` itself,
+	/// detached) moved from `expected` by compare-and-set, with git's reflog line
+	/// `commit (amend): <subject>` on it and each symbolic ref on the way.
+	///
+	/// `chain` and `expected` are `HEAD` as the caller saw it: the way it led
+	/// ([`RefStore::symbolic_chain`](gitana_repository::RefStore::symbolic_chain) of `"HEAD"`) and the
+	/// commit there. Should `HEAD` lead another way (switched to another branch, even one at the same
+	/// commit) or to another commit, when the amend starts or when the ref moves, it's refused as
+	/// [`Moved`](crate::AmendError::Moved): the commit amended is the one the caller meant, on the
+	/// branch they meant.
+	///
+	/// Refused, before anything is written and before `identity` is asked: as git refuses (an
+	/// operation in progress, unmerged paths, no commit to amend, a commit of one parent or none that
+	/// would be empty: its parent's tree, or with none an empty one; there's no `--allow-empty`), and
+	/// if `HEAD` isn't as the caller saw it. `ORIG_HEAD` is left as it is, as git leaves it. Returns
+	/// the new commit's id.
+	pub async fn amend(
+		&self,
+		chain: &[String],
+		expected: ObjectId<H>,
+		message: &str,
+		identity: &impl gitana_identity::Identity,
+	) -> Result<ObjectId<H>, crate::AmendError> {
+		crate::amend::run(self, chain, expected, message, identity).await
+	}
+
 	/// [`commit`](Self::commit)'s refusals and preparation, without recording: the tree to commit,
 	/// the identity lines and the message. For a caller that records the commit its own way (signed,
 	/// in porcelain).

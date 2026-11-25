@@ -10,7 +10,8 @@ use gitana_object::Sha256;
 use gitana_object_store::ObjectStore;
 use gitana_repository::{BranchError, BranchName, Operation, Repository};
 use gitana_worktree::{
-	CommitError, ResetError, ResetMode, SwitchError, SwitchOptions, WorkTree, WorktreeError,
+	AmendError, CommitError, ResetError, ResetMode, SwitchError, SwitchOptions, WorkTree,
+	WorktreeError,
 };
 
 type Tree = WorkTree<LocalFileStore, CapWorkDir, Sha256>;
@@ -52,10 +53,18 @@ fn repository(tag: &str) -> Option<(PathBuf, String)> {
 	let work = unique_tmp(tag);
 	let w = work.to_str().unwrap().to_owned();
 	git(&["init", "--object-format=sha256", "-q", "-b", "main", &w]);
+	quiet(&w);
 	std::fs::write(work.join("a.txt"), b"A\n").unwrap();
 	git(&["-C", &w, "add", "."]);
 	commit(&w, "one");
 	Some((work, w))
+}
+
+/// No maintenance started in the background by git's commands in the repository at `w`, which
+/// would be changing `.git` while a test copies it.
+fn quiet(w: &str) {
+	git(&["-C", w, "config", "maintenance.auto", "false"]);
+	git(&["-C", w, "config", "gc.auto", "0"]);
 }
 
 /// A merge left in conflict on `a.txt`, from a branch `side`.
@@ -111,6 +120,636 @@ async fn commit_records_what_is_staged_and_refuses_while_a_merge_is_in_progress(
 		Err(CommitError::InProgress(Operation::Merge))
 	));
 	assert!(work.join(".git/MERGE_HEAD").exists());
+}
+
+/// The commit `HEAD` leads to.
+async fn head(wt: &Tree) -> gitana_object::ObjectId<Sha256> {
+	wt.repository()
+		.refs()
+		.resolve_head()
+		.await
+		.unwrap()
+		.expect("a commit")
+}
+
+/// The way HEAD leads, as an amend is told it.
+async fn chain(wt: &Tree) -> Vec<String> {
+	wt.repository().refs().symbolic_chain("HEAD").await.unwrap()
+}
+
+/// The commit `HEAD` leads to, or any id where there's none.
+async fn head_or_any(wt: &Tree) -> gitana_object::ObjectId<Sha256> {
+	wt.repository()
+		.refs()
+		.resolve_head()
+		.await
+		.unwrap()
+		.unwrap_or_else(|| gitana_object::ObjectId::from_hex(&"0".repeat(64)).unwrap())
+}
+
+/// `HEAD`'s commit object as git writes it out, but for its committer line (whose time differs).
+fn raw_head(w: &str) -> String {
+	git(&["-C", w, "cat-file", "commit", "HEAD"])
+		.lines()
+		.filter(|line| !line.starts_with("committer "))
+		.map(|line| format!("{line}\n"))
+		.collect()
+}
+
+/// Write `text` as a commit object, git checking nothing of it, and point `main` at it.
+fn planted(w: &str, text: &[u8]) -> String {
+	let mut child = Command::new("git")
+		.args([
+			"-C",
+			w,
+			"hash-object",
+			"-t",
+			"commit",
+			"-w",
+			"--literally",
+			"--stdin",
+		])
+		.stdin(std::process::Stdio::piped())
+		.stdout(std::process::Stdio::piped())
+		.spawn()
+		.unwrap();
+	std::io::Write::write_all(&mut child.stdin.take().unwrap(), text).unwrap();
+	let out = child.wait_with_output().unwrap();
+	assert!(out.status.success());
+	let id = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+	git(&["-C", w, "update-ref", "refs/heads/main", &id]);
+	id
+}
+
+/// git's amend of a copy of the repository, as `amend` is about to amend it: the commit it makes.
+fn git_amends(work: &Path, message: &str) -> String {
+	let copy = work.with_extension("git-amend");
+	let _ = std::fs::remove_dir_all(&copy);
+	let copied = Command::new("cp")
+		.arg("-R")
+		.arg(work)
+		.arg(&copy)
+		.status()
+		.unwrap();
+	assert!(copied.success());
+	let c = copy.to_str().unwrap();
+	git(&[
+		"-C",
+		c,
+		"-c",
+		"user.name=C O Mitter",
+		"-c",
+		"user.email=committer@example.com",
+		"-c",
+		"core.hooksPath=/dev/null",
+		"commit",
+		"-q",
+		"--amend",
+		"-m",
+		message,
+	]);
+	let made = git(&["-C", c, "log", "-1", "--format=%T %P|%an <%ae> %ad|%B"]);
+	std::fs::remove_dir_all(&copy).unwrap();
+	made
+}
+
+/// As `git commit --amend -m`: the last commit replaced by one with its parent, the staged tree and
+/// its author (what git's amend of a copy makes), `identity` as committer; the branch moved with
+/// git's reflog line, mirrored into `HEAD`'s, the replaced commit still in the reflog, `ORIG_HEAD`
+/// left alone. A message-only amend is one too.
+#[tokio::test]
+async fn amend_replaces_the_last_commit_as_git_commit_amend_does() {
+	let Some((work, w)) = repository("amend") else {
+		return;
+	};
+	std::fs::write(work.join("b.txt"), b"B\n").unwrap();
+	commit_all(&w, "two");
+	let replaced = git(&["-C", &w, "rev-parse", "HEAD"]).trim().to_owned();
+	std::fs::write(work.join("c.txt"), b"C\n").unwrap();
+	git(&["-C", &w, "add", "c.txt"]);
+	let by_git = git_amends(&work, "Two, with c");
+	let wt = make_repo(&work);
+	let id = wt
+		.amend(
+			&chain(&wt).await,
+			head(&wt).await,
+			"Two, with c",
+			&TestIdentity,
+		)
+		.await
+		.unwrap();
+	assert_eq!(git(&["-C", &w, "rev-parse", "HEAD"]).trim(), id.to_hex());
+	assert_eq!(
+		git(&["-C", &w, "log", "-1", "--format=%T %P|%an <%ae> %ad|%B"]),
+		by_git
+	);
+	assert_eq!(
+		git(&["-C", &w, "log", "-1", "--format=%cn <%ce>"]).trim(),
+		"C O Mitter <committer@example.com>"
+	);
+	for reflog in ["main", "HEAD"] {
+		assert_eq!(
+			git(&["-C", &w, "reflog", "-1", "--format=%gs", reflog]).trim(),
+			"commit (amend): Two, with c"
+		);
+	}
+	assert_eq!(git(&["-C", &w, "rev-parse", "main@{1}"]).trim(), replaced);
+	assert!(!work.join(".git/ORIG_HEAD").exists());
+	// Only the message this time: the tree and parent as they were.
+	let tree = git(&["-C", &w, "rev-parse", "HEAD^{tree}"]);
+	let by_git = git_amends(&work, "Two, reworded");
+	let again = wt
+		.amend(
+			&chain(&wt).await,
+			head(&wt).await,
+			"Two, reworded",
+			&TestIdentity,
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		git(&["-C", &w, "log", "-1", "--format=%T %P|%an <%ae> %ad|%B"]),
+		by_git
+	);
+	assert_eq!(git(&["-C", &w, "rev-parse", "HEAD^{tree}"]), tree);
+	assert_eq!(git(&["-C", &w, "rev-parse", "HEAD"]).trim(), again.to_hex());
+}
+
+/// On a detached `HEAD`, as git: only `HEAD` moves, with git's reflog line; the branch stays.
+#[tokio::test]
+async fn amend_on_a_detached_head_moves_only_head() {
+	let Some((work, w)) = repository("amend-detached") else {
+		return;
+	};
+	std::fs::write(work.join("b.txt"), b"B\n").unwrap();
+	commit_all(&w, "two");
+	let main = git(&["-C", &w, "rev-parse", "main"]);
+	git(&["-C", &w, "switch", "-q", "--detach", "main"]);
+	std::fs::write(work.join("c.txt"), b"C\n").unwrap();
+	git(&["-C", &w, "add", "c.txt"]);
+	let wt = make_repo(&work);
+	let id = wt
+		.amend(
+			&chain(&wt).await,
+			head(&wt).await,
+			"Detached, amended",
+			&TestIdentity,
+		)
+		.await
+		.unwrap();
+	assert_eq!(git(&["-C", &w, "rev-parse", "HEAD"]).trim(), id.to_hex());
+	assert_eq!(git(&["-C", &w, "rev-parse", "main"]), main);
+	assert_eq!(
+		git(&["-C", &w, "reflog", "-1", "--format=%gs", "HEAD"]).trim(),
+		"commit (amend): Detached, amended"
+	);
+}
+
+/// With `HEAD` leading through a chain (`HEAD` → `alias` → `main`), as git: `main` moves, both
+/// symbolic refs stay as they are, and each of the three logs the amend.
+#[tokio::test]
+async fn amend_through_a_symbolic_chain_moves_the_branch_it_ends_at() {
+	let Some((work, w)) = repository("amend-chain") else {
+		return;
+	};
+	git(&[
+		"-C",
+		&w,
+		"symbolic-ref",
+		"refs/heads/alias",
+		"refs/heads/main",
+	]);
+	git(&["-C", &w, "symbolic-ref", "HEAD", "refs/heads/alias"]);
+	std::fs::write(work.join("b.txt"), b"B\n").unwrap();
+	git(&["-C", &w, "add", "b.txt"]);
+	let wt = make_repo(&work);
+	let id = wt
+		.amend(
+			&chain(&wt).await,
+			head(&wt).await,
+			"Via alias",
+			&TestIdentity,
+		)
+		.await
+		.unwrap();
+	assert_eq!(git(&["-C", &w, "rev-parse", "main"]).trim(), id.to_hex());
+	assert_eq!(
+		std::fs::read_to_string(work.join(".git/refs/heads/alias")).unwrap(),
+		"ref: refs/heads/main\n"
+	);
+	assert_eq!(
+		std::fs::read_to_string(work.join(".git/HEAD")).unwrap(),
+		"ref: refs/heads/alias\n"
+	);
+	for reflog in ["main", "alias", "HEAD"] {
+		assert_eq!(
+			git(&["-C", &w, "reflog", "-1", "--format=%gs", reflog]).trim(),
+			"commit (amend): Via alias",
+			"{reflog}"
+		);
+	}
+}
+
+/// In a shallow clone, as git: the commit at the boundary amended without reading its absent
+/// parent, and (as git's amend does) made with none.
+#[tokio::test]
+async fn amend_in_a_shallow_clone_makes_what_git_makes() {
+	let Some((source, s)) = repository("amend-shallow-source") else {
+		return;
+	};
+	std::fs::write(source.join("b.txt"), b"B\n").unwrap();
+	commit_all(&s, "two");
+	let work = unique_tmp("amend-shallow");
+	std::fs::remove_dir_all(&work).unwrap();
+	let w = work.to_str().unwrap().to_owned();
+	git(&[
+		"-c",
+		"protocol.file.allow=always",
+		"clone",
+		"-q",
+		"--depth",
+		"1",
+		&format!("file://{s}"),
+		&w,
+	]);
+	quiet(&w);
+	std::fs::write(work.join("c.txt"), b"C\n").unwrap();
+	git(&["-C", &w, "add", "c.txt"]);
+	let by_git = git_amends(&work, "Two, shallow");
+	let wt = make_repo(&work);
+	wt.amend(
+		&chain(&wt).await,
+		head(&wt).await,
+		"Two, shallow",
+		&TestIdentity,
+	)
+	.await
+	.unwrap();
+	assert_eq!(
+		git(&["-C", &w, "log", "-1", "--format=%T %P|%an <%ae> %ad|%B"]),
+		by_git
+	);
+	assert_eq!(git(&["-C", &w, "log", "-1", "--format=%P"]).trim(), "");
+}
+
+/// A merge whose tree is its first parent's (`-s ours`) isn't empty, as git says: a message-only
+/// amend keeps both parents.
+#[tokio::test]
+async fn amend_of_a_merge_keeping_its_first_parent_s_tree_is_allowed() {
+	let Some((work, w)) = repository("amend-ours") else {
+		return;
+	};
+	git(&["-C", &w, "switch", "-q", "-c", "side"]);
+	std::fs::write(work.join("s.txt"), b"S\n").unwrap();
+	commit_all(&w, "side");
+	git(&["-C", &w, "switch", "-q", "main"]);
+	git(&[
+		"-C",
+		&w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"merge",
+		"-q",
+		"-s",
+		"ours",
+		"side",
+		"-m",
+		"merge ours",
+	]);
+	let by_git = git_amends(&work, "Merge ours, reworded");
+	let wt = make_repo(&work);
+	wt.amend(
+		&chain(&wt).await,
+		head(&wt).await,
+		"Merge ours, reworded",
+		&TestIdentity,
+	)
+	.await
+	.unwrap();
+	assert_eq!(
+		git(&["-C", &w, "log", "-1", "--format=%T %P|%an <%ae> %ad|%B"]),
+		by_git
+	);
+}
+
+/// A commit's other headers are kept, as git's amend keeps them (a merged signed tag's `mergetag`),
+/// but not its signature, nor its `encoding` when the new message is UTF-8; and a message in
+/// another encoding (Latin-1) can be replaced.
+#[tokio::test]
+async fn amend_keeps_other_headers_and_replaces_a_message_in_another_encoding() {
+	let Some((work, w)) = repository("amend-headers") else {
+		return;
+	};
+	let tree = git(&["-C", &w, "rev-parse", "HEAD^{tree}"]);
+	let one = git(&["-C", &w, "rev-parse", "HEAD"]);
+	let mut text = format!(
+		"tree {}\nparent {}\nauthor A U Thor <author@example.com> 1700000000 +0000\ncommitter A U \
+		 Thor <author@example.com> 1700000000 +0000\nmergetag object {}\n type commit\n tag v1\n \
+		 tagger T <t@e> 1700000000 +0000\n \n signed\ngpgsig -----BEGIN SSH SIGNATURE-----\n abc\n \
+		 -----END SSH SIGNATURE-----\nencoding ISO-8859-1\n\n",
+		tree.trim(),
+		one.trim(),
+		one.trim()
+	)
+	.into_bytes();
+	text.extend_from_slice(b"caf\xe9\n");
+	planted(&w, &text);
+	std::fs::write(work.join("b.txt"), b"B\n").unwrap();
+	git(&["-C", &w, "add", "b.txt"]);
+	let copy = work.with_extension("raw-copy");
+	let copied = Command::new("cp")
+		.arg("-R")
+		.arg(&work)
+		.arg(&copy)
+		.status()
+		.unwrap();
+	assert!(copied.success());
+	let c = copy.to_str().unwrap();
+	git(&[
+		"-C",
+		c,
+		"-c",
+		"user.name=C O Mitter",
+		"-c",
+		"user.email=committer@example.com",
+		"commit",
+		"-q",
+		"--amend",
+		"-m",
+		"Now UTF-8",
+	]);
+	let by_git = raw_head(c);
+	std::fs::remove_dir_all(&copy).unwrap();
+	let wt = make_repo(&work);
+	wt.amend(
+		&chain(&wt).await,
+		head(&wt).await,
+		"Now UTF-8",
+		&TestIdentity,
+	)
+	.await
+	.unwrap();
+	assert_eq!(raw_head(&w), by_git);
+	assert!(by_git.contains("\nmergetag object "), "{by_git}");
+	assert!(
+		!by_git.contains("gpgsig") && !by_git.contains("encoding"),
+		"{by_git}"
+	);
+}
+
+/// A commit whose parent's text isn't UTF-8 (a Latin-1 message under git's `encoding` header) is
+/// amended as git amends it: the check for an empty result reads only the parent's tree.
+#[tokio::test]
+async fn amend_of_a_commit_whose_parent_s_text_isn_t_utf8_runs() {
+	let Some((work, w)) = repository("amend-latin1-parent") else {
+		return;
+	};
+	std::fs::write(work.join("b.txt"), b"B\n").unwrap();
+	git(&["-C", &w, "add", "b.txt"]);
+	std::fs::write(work.join("msg"), b"caf\xe9\n").unwrap();
+	git(&[
+		"-C",
+		&w,
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@e",
+		"-c",
+		"i18n.commitEncoding=ISO-8859-1",
+		"commit",
+		"-q",
+		"-F",
+		"msg",
+	]);
+	std::fs::write(work.join("c.txt"), b"C\n").unwrap();
+	commit_all(&w, "three");
+	let by_git = git_amends(&work, "Three, reworded");
+	let wt = make_repo(&work);
+	wt.amend(
+		&chain(&wt).await,
+		head(&wt).await,
+		"Three, reworded",
+		&TestIdentity,
+	)
+	.await
+	.unwrap();
+	assert_eq!(
+		git(&["-C", &w, "log", "-1", "--format=%T %P|%an <%ae> %ad|%B"]),
+		by_git
+	);
+}
+
+/// An identity that mustn't be asked: for a refusal made, as promised, before it is.
+struct UnaskedIdentity;
+
+impl gitana_identity::Identity for UnaskedIdentity {
+	async fn author(&self) -> anyhow::Result<String> {
+		panic!("the author was asked for")
+	}
+	async fn committer(&self) -> anyhow::Result<String> {
+		panic!("the committer was asked for")
+	}
+	async fn committer_or_default(&self) -> anyhow::Result<String> {
+		panic!("the committer was asked for")
+	}
+}
+
+/// An identity whose committer is asked for while `HEAD` is switched, under it, to `other`, a
+/// branch at the same commit: what a concurrent `git switch` would do mid-amend.
+struct SwitchingIdentity(String);
+
+impl gitana_identity::Identity for SwitchingIdentity {
+	async fn author(&self) -> anyhow::Result<String> {
+		TestIdentity.author().await
+	}
+	async fn committer(&self) -> anyhow::Result<String> {
+		git(&["-C", &self.0, "symbolic-ref", "HEAD", "refs/heads/other"]);
+		TestIdentity.committer().await
+	}
+	async fn committer_or_default(&self) -> anyhow::Result<String> {
+		self.committer().await
+	}
+}
+
+/// Should `HEAD` be switched to another branch at the same commit while an amend runs, nothing is
+/// amended: the branch HEAD led to when it began is the one it would move, and it's refused.
+#[tokio::test]
+async fn amend_refuses_if_head_is_switched_while_it_runs() {
+	let Some((work, w)) = repository("amend-switched") else {
+		return;
+	};
+	git(&["-C", &w, "branch", "other"]);
+	let tip = git(&["-C", &w, "rev-parse", "HEAD"]);
+	std::fs::write(work.join("b.txt"), b"B\n").unwrap();
+	git(&["-C", &w, "add", "b.txt"]);
+	let wt = make_repo(&work);
+	assert!(matches!(
+		wt.amend(
+			&chain(&wt).await,
+			head(&wt).await,
+			"x",
+			&SwitchingIdentity(w.clone())
+		)
+		.await,
+		Err(AmendError::Moved)
+	));
+	for branch in ["main", "other"] {
+		assert_eq!(git(&["-C", &w, "rev-parse", branch]), tip, "{branch}");
+	}
+}
+
+/// HEAD switched, after the caller saw it, to another branch at the same commit: refused before
+/// the committer is asked, neither branch moved; the amend is of the branch the caller saw.
+#[tokio::test]
+async fn amend_refuses_once_head_leads_to_another_branch() {
+	let Some((work, w)) = repository("amend-other-branch") else {
+		return;
+	};
+	git(&["-C", &w, "branch", "other"]);
+	let tip = git(&["-C", &w, "rev-parse", "HEAD"]);
+	let wt = make_repo(&work);
+	let (seen, at) = (chain(&wt).await, head(&wt).await);
+	git(&["-C", &w, "symbolic-ref", "HEAD", "refs/heads/other"]);
+	std::fs::write(work.join("b.txt"), b"B\n").unwrap();
+	git(&["-C", &w, "add", "b.txt"]);
+	assert!(matches!(
+		wt.amend(&seen, at, "x", &UnaskedIdentity).await,
+		Err(AmendError::Moved)
+	));
+	for branch in ["main", "other"] {
+		assert_eq!(git(&["-C", &w, "rev-parse", branch]), tip, "{branch}");
+	}
+}
+
+/// The commit the caller meant to amend no longer `HEAD`'s: refused before the committer is asked,
+/// nothing changed.
+#[tokio::test]
+async fn amend_refuses_once_head_has_moved() {
+	let Some((work, w)) = repository("amend-moved") else {
+		return;
+	};
+	let wt = make_repo(&work);
+	let seen = head(&wt).await;
+	std::fs::write(work.join("b.txt"), b"B\n").unwrap();
+	commit_all(&w, "two");
+	let now = git(&["-C", &w, "rev-parse", "HEAD"]);
+	assert!(matches!(
+		wt.amend(&chain(&wt).await, seen, "x", &UnaskedIdentity)
+			.await,
+		Err(AmendError::Moved)
+	));
+	assert_eq!(git(&["-C", &w, "rev-parse", "HEAD"]), now);
+}
+
+/// Refused where git refuses, before anything is written: no commit yet, an amend that would leave
+/// the commit empty (its parent's tree again, or for a first commit no files), and a merge in
+/// progress.
+#[tokio::test]
+async fn amend_refuses_where_git_refuses() {
+	let amend_args = |w: &str| {
+		vec![
+			"-C".to_owned(),
+			w.to_owned(),
+			"-c".to_owned(),
+			"user.name=T".to_owned(),
+			"-c".to_owned(),
+			"user.email=t@e".to_owned(),
+			"commit".to_owned(),
+			"--amend".to_owned(),
+			"-m".to_owned(),
+			"x".to_owned(),
+		]
+	};
+	let refused = |w: &str| {
+		let args = amend_args(w);
+		git_refuses(&args.iter().map(String::as_str).collect::<Vec<_>>())
+	};
+	// No commit yet.
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let unborn = unique_tmp("amend-unborn");
+	let u = unborn.to_str().unwrap().to_owned();
+	git(&["init", "--object-format=sha256", "-q", "-b", "main", &u]);
+	assert!(refused(&u).contains("You have nothing to amend."));
+	assert!(matches!(
+		{
+			let wt = make_repo(&unborn);
+			wt.amend(
+				&chain(&wt).await,
+				head_or_any(&wt).await,
+				"x",
+				&TestIdentity,
+			)
+			.await
+		},
+		Err(AmendError::NothingToAmend)
+	));
+	// Undoing all a commit did.
+	let Some((work, w)) = repository("amend-empty") else {
+		return;
+	};
+	std::fs::write(work.join("b.txt"), b"B\n").unwrap();
+	commit_all(&w, "two");
+	let head = git(&["-C", &w, "rev-parse", "HEAD"]);
+	git(&["-C", &w, "rm", "-q", "b.txt"]);
+	assert!(refused(&w).contains("would make\nit empty"));
+	assert!(matches!(
+		{
+			let wt = make_repo(&work);
+			wt.amend(
+				&chain(&wt).await,
+				head_or_any(&wt).await,
+				"x",
+				&TestIdentity,
+			)
+			.await
+		},
+		Err(AmendError::WouldBeEmpty)
+	));
+	assert_eq!(git(&["-C", &w, "rev-parse", "HEAD"]), head);
+	// A first commit left with no files.
+	let Some((root, r)) = repository("amend-root-empty") else {
+		return;
+	};
+	git(&["-C", &r, "rm", "-q", "a.txt"]);
+	assert!(refused(&r).contains("would make\nit empty"));
+	assert!(matches!(
+		{
+			let wt = make_repo(&root);
+			wt.amend(
+				&chain(&wt).await,
+				head_or_any(&wt).await,
+				"x",
+				&TestIdentity,
+			)
+			.await
+		},
+		Err(AmendError::WouldBeEmpty)
+	));
+	// A merge in progress.
+	let Some((merging, m)) = repository("amend-merging") else {
+		return;
+	};
+	conflicted_merge(&m, &merging);
+	assert!(refused(&m).contains("cannot amend"));
+	assert!(matches!(
+		{
+			let wt = make_repo(&merging);
+			wt.amend(
+				&chain(&wt).await,
+				head_or_any(&wt).await,
+				"x",
+				&TestIdentity,
+			)
+			.await
+		},
+		Err(AmendError::InProgress(Operation::Merge))
+	));
+	assert!(merging.join(".git/MERGE_HEAD").exists());
 }
 
 /// As git: a path through a symlink in the work tree (here one to `.git`) is "beyond a symbolic

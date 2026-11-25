@@ -1189,6 +1189,151 @@ async fn refs_with_names_git_rejects_are_not_listed() {
 	std::fs::remove_dir_all(&work).ok();
 }
 
+/// A commit whose text isn't UTF-8 (a Latin-1 message and author under git's `encoding` header) has
+/// its tree read, and history walked through it, as git reads them: none of it needs its text.
+/// Unix only: the Latin-1 name is passed to git in an environment variable as bytes.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_commit_s_tree_and_history_are_read_whatever_its_text_s_encoding() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("latin1-history");
+	git_dated(
+		&work,
+		0,
+		&["init", "-q", "--object-format=sha256", "-b", "main"],
+	);
+	git_dated(
+		&work,
+		1_700_000_000,
+		&["commit", "-q", "--allow-empty", "-m", "one"],
+	);
+	std::fs::write(work.join("a.txt"), b"A\n").unwrap();
+	git_dated(&work, 0, &["add", "a.txt"]);
+	std::fs::write(work.join("msg"), b"caf\xe9\n").unwrap();
+	let made = Command::new("git")
+		.arg("-C")
+		.arg(&work)
+		.env(
+			"GIT_AUTHOR_NAME",
+			<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"Andr\xe9"),
+		)
+		.env("GIT_AUTHOR_EMAIL", "a@e")
+		.env("GIT_AUTHOR_DATE", "@1700000060 +0000")
+		.env("GIT_COMMITTER_DATE", "@1700000060 +0000")
+		.args([
+			"-c",
+			"user.name=T",
+			"-c",
+			"user.email=t@e",
+			"-c",
+			"i18n.commitEncoding=ISO-8859-1",
+		])
+		.args(["commit", "-q", "-F", "msg"])
+		.output()
+		.unwrap();
+	assert!(made.status.success(), "{made:?}");
+	git_dated(
+		&work,
+		1_700_000_120,
+		&["commit", "-q", "--allow-empty", "-m", "three"],
+	);
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(work.join(".git")),
+	)));
+	let latin1 = repo.rev_parse("HEAD~1").await.unwrap();
+	let tree = git_dated(&work, 0, &["rev-parse", "HEAD~1^{tree}"]);
+	assert_eq!(
+		repo.commit_tree(latin1).await.unwrap().to_hex(),
+		tree.trim()
+	);
+	assert_eq!(
+		repo.peel_to_tree(latin1).await.unwrap().to_hex(),
+		tree.trim()
+	);
+	let three = repo.rev_parse("HEAD").await.unwrap();
+	let one = repo.rev_parse("HEAD~2").await.unwrap();
+	let listed: Vec<String> = repo
+		.rev_list_excluding(&[three], &[one])
+		.await
+		.unwrap()
+		.iter()
+		.map(|id| id.to_hex())
+		.collect();
+	let by_git: Vec<String> = git_dated(&work, 0, &["rev-list", "HEAD", "^HEAD~2"])
+		.lines()
+		.map(str::to_owned)
+		.collect();
+	assert_eq!(listed, by_git);
+	assert_eq!(
+		repo.reachable_among(&[three], &[latin1]).await.unwrap(),
+		std::collections::HashMap::from([(latin1, 0)])
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
+/// An update along the chain HEAD had is refused once HEAD leads another way, even to a branch at
+/// the same commit, so neither branch moves; along the chain HEAD still has, the branch at its end
+/// moves.
+#[tokio::test]
+async fn an_update_along_a_chain_is_refused_once_head_leads_another_way() {
+	if !git_supports_sha256() {
+		eprintln!("skipping: git without --object-format=sha256");
+		return;
+	}
+	let work = unique_tmp("update-along");
+	git_dated(
+		&work,
+		0,
+		&["init", "-q", "--object-format=sha256", "-b", "main"],
+	);
+	git_dated(
+		&work,
+		1_700_000_000,
+		&["commit", "-q", "--allow-empty", "-m", "one"],
+	);
+	git_dated(
+		&work,
+		1_700_000_060,
+		&["commit", "-q", "--allow-empty", "-m", "two"],
+	);
+	git_dated(&work, 0, &["branch", "other"]);
+	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
+		open_dir(work.join(".git")),
+	)));
+	let chain = repo.refs().symbolic_chain("HEAD").await.unwrap();
+	assert_eq!(chain, ["HEAD", "refs/heads/main"]);
+	let one = repo.rev_parse("HEAD~1").await.unwrap();
+	let two = repo.rev_parse("HEAD").await.unwrap();
+	git_dated(&work, 0, &["symbolic-ref", "HEAD", "refs/heads/other"]);
+	assert!(matches!(
+		repo
+			.refs()
+			.update_ref_along(&chain, one, Some(two), ReflogIntent::Skip)
+			.await,
+		Err(gitana_repository::RepositoryError::RefMoved { .. })
+	));
+	for branch in ["main", "other"] {
+		assert_eq!(
+			git_dated(&work, 0, &["rev-parse", branch]).trim(),
+			two.to_hex()
+		);
+	}
+	git_dated(&work, 0, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+	repo
+		.refs()
+		.update_ref_along(&chain, one, Some(two), ReflogIntent::Skip)
+		.await
+		.unwrap();
+	assert_eq!(
+		git_dated(&work, 0, &["rev-parse", "main"]).trim(),
+		one.to_hex()
+	);
+	std::fs::remove_dir_all(&work).ok();
+}
+
 /// A symbolic ref written `ref:` with no space after it, which git accepts, is read as symbolic.
 #[tokio::test]
 async fn a_symbolic_ref_without_the_space_is_read_as_git_reads_it() {

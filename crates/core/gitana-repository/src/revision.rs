@@ -8,11 +8,14 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use gitana_file_store::FileStore;
 use gitana_object::{
-	Commit, HashAlgorithm, ObjectId, ObjectKind, Signature, parse_commit, parse_tag, parse_tree,
+	Commit, HashAlgorithm, ObjectId, ObjectKind, parse_commit, parse_tag, parse_tree,
 };
 use gitana_path::{GitPath, GitPathspec};
 
-use crate::{Repository, RepositoryError};
+use crate::{
+	Repository, RepositoryError,
+	commit_links::{CommitLinks, commit_links},
+};
 
 enum Op {
 	/// `^n` — the nth parent (`^0` peels to the commit itself).
@@ -137,7 +140,8 @@ pub(crate) async fn peel_to_tree<H: HashAlgorithm>(
 		let (kind, payload) = repo.objects().read_object(&id).await?;
 		match kind {
 			ObjectKind::Tree => return Ok(id),
-			ObjectKind::Commit => return Ok(parse_commit::<H>(&payload)?.tree),
+			// From its bytes: a commit's text needn't be UTF-8 for its tree to be read.
+			ObjectKind::Commit => return Ok(commit_links::<H>(&payload)?.tree),
 			ObjectKind::Tag => id = parse_tag::<H>(&payload)?.object,
 			ObjectKind::Blob => {
 				return Err(RepositoryError::InvalidRef(format!(
@@ -189,14 +193,13 @@ async fn date_and_parents<H: HashAlgorithm>(
 	id: ObjectId<H>,
 	shallow: &HashSet<ObjectId<H>>,
 ) -> Result<(i64, Vec<ObjectId<H>>), RepositoryError> {
-	let commit = read_commit(repo, id).await?;
-	let date = Signature::parse(&commit.committer)?.seconds;
+	let links = read_links(repo, id).await?;
 	let parents = if shallow.contains(&id) {
 		Vec::new()
 	} else {
-		commit.parents
+		links.parents
 	};
-	Ok((date, parents))
+	Ok((links.committer_seconds, parents))
 }
 
 /// The commits `include` reaches that `exclude` doesn't — git's `rev-list <include> ^<exclude>` —
@@ -418,7 +421,7 @@ pub(crate) async fn commit_parents<H: HashAlgorithm>(
 	if shallow.contains(&id) {
 		return Ok(Vec::new());
 	}
-	Ok(read_commit(repo, id).await?.parents)
+	Ok(read_links(repo, id).await?.parents)
 }
 
 /// The repository's shallow boundary as a set, for the ancestry walks (empty for a complete repo).
@@ -518,6 +521,19 @@ async fn resolve_abbrev<H: HashAlgorithm>(
 		[] => Err(RepositoryError::UnknownRevision(hex.to_owned())),
 		_ => Err(RepositoryError::AmbiguousRevision(hex.to_owned())),
 	}
+}
+
+/// The commit `id`'s tree, parents and committer time, read from its bytes: what the history walks
+/// need, its text not decoded (it needn't be UTF-8).
+async fn read_links<H: HashAlgorithm>(
+	repo: &Repository<impl FileStore, H>,
+	id: ObjectId<H>,
+) -> Result<CommitLinks<H>, RepositoryError> {
+	let (kind, payload) = repo.objects().read_object(&id).await?;
+	if kind != ObjectKind::Commit {
+		return Err(RepositoryError::InvalidRef(format!("{id} is not a commit")));
+	}
+	Ok(commit_links::<H>(&payload)?)
 }
 
 pub(crate) async fn read_commit<H: HashAlgorithm>(
@@ -645,8 +661,7 @@ pub(crate) async fn committer_seconds<H: HashAlgorithm>(
 	repo: &Repository<impl FileStore, H>,
 	id: ObjectId<H>,
 ) -> Result<i64, RepositoryError> {
-	let commit = read_commit(repo, id).await?;
-	Ok(Signature::parse(&commit.committer)?.seconds)
+	Ok(read_links(repo, id).await?.committer_seconds)
 }
 
 fn is_hex(s: &str) -> bool {

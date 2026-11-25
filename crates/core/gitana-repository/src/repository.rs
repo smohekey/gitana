@@ -1,5 +1,5 @@
 use gitana_file_store::{FileStore, FileStoreError};
-use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit, parse_commit};
+use gitana_object::{Commit, HashAlgorithm, ObjectId, ObjectKind, encode_commit};
 use gitana_object_store::ObjectStore;
 
 use crate::tree::{FlatEntry, RawFlatEntry, build_tree};
@@ -281,7 +281,8 @@ where
 				"{commit} is not a commit"
 			)));
 		}
-		Ok(parse_commit::<H>(&payload)?.tree)
+		// From its bytes: a commit's text needn't be UTF-8 for its tree to be read.
+		Ok(crate::commit_links::commit_links::<H>(&payload)?.tree)
 	}
 
 	/// Write a commit object (no ref update), returning its id. `author` and

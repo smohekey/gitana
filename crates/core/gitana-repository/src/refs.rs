@@ -551,7 +551,7 @@ where
 			match tokio::spawn(async move {
 				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
 				store
-					.update_ref_following_symbolic_inline(&name, new, expected, reflog.borrow())
+					.update_ref_following_symbolic_inline(&name, None, new, expected, reflog.borrow())
 					.await
 			})
 			.await
@@ -563,13 +563,67 @@ where
 
 		#[cfg(target_arch = "wasm32")]
 		self
-			.update_ref_following_symbolic_inline(name, new, expected, reflog)
+			.update_ref_following_symbolic_inline(name, None, new, expected, reflog)
 			.await
 	}
 
+	/// The symbolic chain from `name` to the ref it ends at, that ref last: `["HEAD",
+	/// "refs/heads/alias", "refs/heads/main"]`, `["HEAD", "refs/heads/main"]`, or `["HEAD"]` for a
+	/// detached `HEAD`. The last may not exist yet (an unborn branch). For
+	/// [`update_ref_along`](Self::update_ref_along), so a caller moves the ref it found.
+	pub async fn symbolic_chain(&self, name: &str) -> Result<Vec<String>, RepositoryError> {
+		Ok(self.symbolic_ref_resolution(name).await?.chain)
+	}
+
+	/// [`update_ref_following_symbolic`](Self::update_ref_following_symbolic), but only along `chain`,
+	/// the [`symbolic_chain`](Self::symbolic_chain) from its first ref as the caller found it: with
+	/// every hop locked, refused with [`RepositoryError::RefMoved`] if that ref now leads any other
+	/// way (`HEAD` switched to another branch, say, even one at the same commit), so the ref moved is
+	/// the one the caller meant. The hops are logged as there.
+	pub async fn update_ref_along(
+		&self,
+		chain: &[String],
+		new: ObjectId<H>,
+		expected: Option<ObjectId<H>>,
+		reflog: ReflogIntent<'_>,
+	) -> Result<(), RepositoryError> {
+		let Some(name) = chain.first() else {
+			return Err(RepositoryError::InvalidRef(
+				"an empty symbolic chain".into(),
+			));
+		};
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			let files = self.files.shared_handle();
+			let effective = self.effective.cloned();
+			let name = name.clone();
+			let chain = chain.to_vec();
+			let reflog = OwnedReflogIntent::from(reflog);
+			match tokio::spawn(async move {
+				let store = RefStore::<_, H>::new(&files).with_effective_config(effective.as_ref());
+				store
+					.update_ref_following_symbolic_inline(&name, Some(&chain), new, expected, reflog.borrow())
+					.await
+			})
+			.await
+			{
+				Ok(result) => result,
+				Err(error) => Err(RepositoryError::RetainedTask(error.to_string())),
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		self
+			.update_ref_following_symbolic_inline(name, Some(chain), new, expected, reflog)
+			.await
+	}
+
+	/// The update along `name`'s chain as it is when locked; with `pinned`, only if that chain is
+	/// `pinned`.
 	async fn update_ref_following_symbolic_inline(
 		&self,
 		name: &str,
+		pinned: Option<&[String]>,
 		new: ObjectId<H>,
 		expected: Option<ObjectId<H>>,
 		reflog: ReflogIntent<'_>,
@@ -577,6 +631,13 @@ where
 		let _history_lease = HistoryMutationLease::acquire(self.files).await?;
 		let policy = self.reflog_policy().await?;
 		let planned = self.symbolic_ref_resolution(name).await?;
+		// The chain the caller found, or nothing moves: the observed chain is checked against this
+		// one again once every hop is locked.
+		if pinned.is_some_and(|pinned| planned.chain != pinned) {
+			return Err(RepositoryError::RefMoved {
+				name: name.to_owned(),
+			});
+		}
 		let head_target = self.read_symbolic("HEAD").await?;
 		let cascade = planned.terminal.starts_with("refs/heads/")
 			&& head_target.as_deref() == Some(planned.terminal.as_str());

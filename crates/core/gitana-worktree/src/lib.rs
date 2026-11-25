@@ -5,6 +5,8 @@
 //! and `checkout` (see docs/hlds/working-tree.md). From-scratch — no `gix`/`git2`.
 //! This phase is the index codec.
 
+mod amend;
+mod amend_error;
 mod attr_direction;
 mod attr_file;
 mod attr_state;
@@ -51,6 +53,7 @@ mod switch_error;
 mod text_stats;
 mod worktree;
 
+pub use amend_error::AmendError;
 pub(crate) use attr_direction::AttrDirection;
 pub(crate) use attr_file::AttrFile;
 pub(crate) use attr_state::AttrState;
