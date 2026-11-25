@@ -106,13 +106,15 @@ impl RepositoryId {
 /// opens a store — is native-only; the pure types and classification stay available everywhere.
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-	use super::*;
+	use std::path::Path;
 
 	use cap_std::ambient_authority;
 	use cap_std::fs::Dir;
 	use gitana_file_store_local::{CapWorkDir, WorktreeFileStore};
 	use gitana_object::HashKind;
 	use gitana_repository::{Config, RepositoryError, detect_hash_kind};
+
+	use crate::LinkedWorktreeError;
 
 	/// Detect the repository's object format, mapping an unsupported format to the documented
 	/// [`LinkedWorktreeError::UnsupportedObjectFormat`] variant (the raw `detect_hash_kind` returns a
@@ -338,7 +340,7 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::{
+pub(crate) use self::native::{
 	detect_kind, detect_kind_at, open_store_raw, open_work_dir, reject_unsupported_repository_format,
 	validate_repository_structure,
 };

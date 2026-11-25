@@ -19,8 +19,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::LinkedWorktreeError;
-use crate::facts::LockState;
+use crate::{LinkedWorktreeError, LockState};
 
 /// The marker's contents, as git writes them (`write_file` appends the newline).
 const REASON: &[u8] = b"initializing\n";

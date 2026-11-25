@@ -88,4 +88,4 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::RegistrationLock;
+pub(crate) use self::native::RegistrationLock;

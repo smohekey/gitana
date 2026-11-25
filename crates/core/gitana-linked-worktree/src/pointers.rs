@@ -53,7 +53,7 @@ pub(crate) fn read_worktree_admins(common: &Path) -> Result<Vec<PathBuf>, Linked
 	let dir = common.join("worktrees");
 	if is_leaf_symlink(&dir) {
 		return Err(LinkedWorktreeError::MalformedPointer {
-			kind: crate::error::PointerKind::AdminGitdir,
+			kind: crate::PointerKind::AdminGitdir,
 			path: dir,
 		});
 	}
@@ -104,7 +104,7 @@ pub(crate) fn is_listed_admin(admin: &Path) -> Result<bool, LinkedWorktreeError>
 	match std::fs::metadata(&gitdir) {
 		Ok(meta) if meta.is_file() => Ok(true),
 		Ok(_) => Err(LinkedWorktreeError::MalformedPointer {
-			kind: crate::error::PointerKind::AdminGitdir,
+			kind: crate::PointerKind::AdminGitdir,
 			path: gitdir,
 		}),
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -512,7 +512,7 @@ pub(crate) fn worktree_path_of(git_dir: &Path) -> Result<PathBuf, LinkedWorktree
 				path_from_bytes(strip_eol_bytes(&bytes)).filter(|p| !p.as_os_str().is_empty())
 			else {
 				return Err(LinkedWorktreeError::MalformedPointer {
-					kind: crate::error::PointerKind::AdminGitdir,
+					kind: crate::PointerKind::AdminGitdir,
 					path: gitdir,
 				});
 			};
@@ -524,7 +524,7 @@ pub(crate) fn worktree_path_of(git_dir: &Path) -> Result<PathBuf, LinkedWorktree
 			match git_file.parent() {
 				Some(parent) => Ok(parent.to_path_buf()),
 				None => Err(LinkedWorktreeError::MalformedPointer {
-					kind: crate::error::PointerKind::AdminGitdir,
+					kind: crate::PointerKind::AdminGitdir,
 					path: gitdir,
 				}),
 			}
@@ -637,7 +637,7 @@ pub(crate) enum RefSource<'a> {
 	/// *initial* argument is an [`InvalidRequestedBranch`] — a bad argument, never blamed on the healthy
 	/// `HEAD`, and the name being the caller's own discloses nothing. A malformation *after* a symref hop is
 	/// on-disk corruption in a repository ref file (a valid branch whose symref target is broken/cyclic),
-	/// reported as a [`MalformedPointer`] of kind [`Ref`](crate::error::PointerKind::Ref) naming the branch's
+	/// reported as a [`MalformedPointer`] of kind [`Ref`](crate::PointerKind::Ref) naming the branch's
 	/// root ref file — not the caller and not a read target name.
 	///
 	/// [`InvalidRequestedBranch`]: LinkedWorktreeError::InvalidRequestedBranch
@@ -683,14 +683,14 @@ pub(crate) fn resolve_ref_terminal(
 	// corruption discovered after following a symref hop.
 	let malformed = |first: bool| match source {
 		RefSource::Head => LinkedWorktreeError::MalformedPointer {
-			kind: crate::error::PointerKind::Head,
+			kind: crate::PointerKind::Head,
 			path: git_dir.join("HEAD"),
 		},
 		RefSource::RequestedBranch(name) if first => {
 			LinkedWorktreeError::InvalidRequestedBranch(name.to_owned())
 		}
 		RefSource::RequestedBranch(_) => LinkedWorktreeError::MalformedPointer {
-			kind: crate::error::PointerKind::Ref,
+			kind: crate::PointerKind::Ref,
 			path: branch_root(),
 		},
 	};
@@ -1052,7 +1052,7 @@ pub(crate) fn gitfile_target(gitfile: &Path) -> Result<Option<PathBuf>, LinkedWo
 		return Ok(None);
 	}
 	let malformed = || LinkedWorktreeError::MalformedPointer {
-		kind: crate::error::PointerKind::GitFile,
+		kind: crate::PointerKind::GitFile,
 		path: gitfile.to_path_buf(),
 	};
 	let content =

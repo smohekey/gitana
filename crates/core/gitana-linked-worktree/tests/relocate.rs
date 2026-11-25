@@ -4,11 +4,14 @@
 
 mod common;
 
-use common::*;
+use std::path::PathBuf;
+
 use gitana_linked_worktree::{
 	BranchName, DestinationKind, LinkedWorktreeError, ProtectionReason, RelocateError,
 	RelocateOutcome, RelocateRequest, WorktreeClassification, relocate,
 };
+
+use self::common::{canonical, commit_file, formats, git, git_ok, init_repo, rid_at, unique_tmp};
 
 /// `git`, trimmed — the shared `common::git` returns raw stdout (trailing newline), so trim for value
 /// comparisons against hashes/refs.
@@ -1655,8 +1658,6 @@ async fn relocate_reports_lock_first_through_a_symlinked_source() {
 		"got {err:?}"
 	);
 }
-
-use std::path::PathBuf;
 
 /// Build a repo + one worktree, append `config_fragment` to the common `.git/config` (bumping the format
 /// version to 1 first so extensions are read), and return `(work, from, to)`.

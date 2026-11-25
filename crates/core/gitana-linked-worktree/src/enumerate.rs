@@ -4,8 +4,7 @@
 
 use std::path::PathBuf;
 
-use crate::WorktreeObjectId;
-use crate::facts::{HeadKind, LockState};
+use crate::{HeadKind, LockState, WorktreeObjectId};
 
 /// A worktree's role in the repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,8 +49,6 @@ pub struct WorktreeListing {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-	use super::*;
-
 	use std::path::Path;
 
 	use gitana_config::GitConfig;
@@ -59,17 +56,14 @@ mod native {
 	use gitana_object_store::ObjectStore;
 	use gitana_repository::{HeadState, Repository};
 
-	use crate::head::{read_head, read_lock_reason};
-	use crate::object_id::IntoWorktreeObjectId;
-	use crate::pointers::{
-		RefSource, SYMREF_MAXDEPTH, admin_checkout_missing, canonical, ignorecase, is_bare,
-		linked_admin_dirs, main_worktree_path, resolve_ref_terminal, worktree_path_of,
+	use super::{WorktreeEntry, WorktreeListing, WorktreeRole};
+	use crate::{
+		HeadKind, IntoWorktreeObjectId, LinkedWorktreeError, LockState, RefSource, SYMREF_MAXDEPTH,
+		WorktreeContext, WorktreeObjectId, admin_checkout_missing, canonical, detect_kind_at,
+		ignorecase, is_bare, linked_admin_dirs, main_worktree_path, open_store_raw, read_head,
+		read_lock_reason, reject_unsupported_repository_format, resolve_ref_terminal,
+		validate_repository_structure, worktree_path_of,
 	};
-	use crate::repo_id::{
-		detect_kind_at, open_store_raw, reject_unsupported_repository_format,
-		validate_repository_structure,
-	};
-	use crate::{LinkedWorktreeError, WorktreeContext};
 
 	/// Enumerate the worktrees of the repository `cx` names.
 	///
@@ -207,4 +201,4 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::enumerate;
+pub use self::native::enumerate;

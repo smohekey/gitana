@@ -27,21 +27,13 @@ mod native {
 	};
 	use gitana_worktree::{Index, WorkTree};
 
-	use crate::{InitializingLock, NewWorktreeSetup, Setup};
-
-	use crate::admin_cleanup::{deregister_admin, path_absent, remove_directory_tree};
-	use crate::create_error::CreateError;
-	use crate::facts::{HeadKind, LockState};
-	use crate::inspect::{
-		CrossPointerHealth, DestinationKind, Registration, RequestedBranch, inspect,
+	use crate::{
+		CheckoutTarget, CreateError, CreateRequest, CrossPointerHealth, DestinationKind, HeadKind,
+		InitializingLock, IntoWorktreeObjectId, LinkedWorktreeError, LockState, NewWorktreeSetup,
+		Registration, RegistrationLock, RequestedBranch, Setup, WorktreeClassification,
+		WorktreeInspection, WorktreeObjectId, WorktreeQuery, deregister_admin, detect_kind, inspect,
+		open_store_raw, open_work_dir, path_absent, remove_directory_tree, write_file_atomic,
 	};
-	use crate::object_id::IntoWorktreeObjectId;
-	use crate::pointers::write_file_atomic;
-	use crate::query::WorktreeQuery;
-	use crate::registration_lock::RegistrationLock;
-	use crate::repo_id::{detect_kind, open_store_raw, open_work_dir};
-	use crate::request::{CheckoutTarget, CreateRequest};
-	use crate::{LinkedWorktreeError, WorktreeClassification, WorktreeInspection, WorktreeObjectId};
 
 	/// What the create should do, decided from the inspection against the requested target.
 	enum Action {
@@ -177,7 +169,7 @@ mod native {
 			return None;
 		};
 		if inspection.destination != request.destination
-			|| !crate::pointers::canonical_eq(&inspection.common_dir, request.repo.common_dir())
+			|| !crate::canonical_eq(&inspection.common_dir, request.repo.common_dir())
 			|| inspection.identity_conflict.is_some()
 			// A user's lock says "keep this", and a missing checkout is what a locked worktree on an
 			// unplugged drive looks like too. Only the marker a crashed create leaves is reclaimable: a
@@ -194,7 +186,7 @@ mod native {
 		let expected_admin_parent = request.repo.common_dir().join("worktrees");
 		if !admin_dir
 			.parent()
-			.is_some_and(|parent| crate::pointers::canonical_eq(parent, &expected_admin_parent))
+			.is_some_and(|parent| crate::canonical_eq(parent, &expected_admin_parent))
 		{
 			return None;
 		}
@@ -614,10 +606,8 @@ mod native {
 		// the pointers, so reject it **up front** — before the branch/admin/checkout are written — rather than
 		// mutate then fail the post-write inspection. A no-op on Unix (the pointers are byte-clean there). The
 		// unsuffixed admin path stands for whichever suffix is claimed: the suffix is ASCII digits.
-		crate::pointers::ensure_representable_path(destination)?;
-		crate::pointers::ensure_representable_path(
-			&worktrees.join(crate::pointers::os_string_from_bytes(&admin_name)),
-		)?;
+		crate::ensure_representable_path(destination)?;
+		crate::ensure_representable_path(&worktrees.join(crate::os_string_from_bytes(&admin_name)))?;
 
 		// Create the branch through the transactional ref layer. Strict `-b` requires the ref be absent
 		// (`expected: None`, git's create CAS). git `-B` (`force_reset`) resets an existing *direct* branch:
@@ -809,9 +799,9 @@ mod native {
 	/// basename keeps its high bytes — and maps only refname-invalid ASCII; the admin `gitdir` still records
 	/// the *real* (unsanitized) destination path, byte-clean.
 	fn admin_name(destination: &Path) -> Result<Vec<u8>, LinkedWorktreeError> {
-		Ok(sanitize_worktree_name(&crate::pointers::path_to_bytes(
-			Path::new(admin_base_name(destination)?),
-		)))
+		Ok(sanitize_worktree_name(&crate::path_to_bytes(Path::new(
+			admin_base_name(destination)?,
+		))))
 	}
 
 	/// Claim the new worktree's admin directory: `<worktrees>/<name>`, or on collision `<name>1`, `<name>2`,
@@ -829,7 +819,7 @@ mod native {
 			if let Some(n) = suffix {
 				name.extend_from_slice(n.to_string().as_bytes());
 			}
-			worktrees.join(crate::pointers::os_string_from_bytes(&name))
+			worktrees.join(crate::os_string_from_bytes(&name))
 		};
 		for suffix in std::iter::once(None).chain((1..=u32::MAX).map(Some)) {
 			let path = candidate(suffix);
@@ -960,7 +950,7 @@ mod native {
 		write(admin.join("commondir"), "../..\n".to_owned())?;
 		// `gitdir` records the checkout's real `.git` path, serialized **byte-clean** so a non-UTF-8
 		// destination round-trips exactly (`Path::display()` would lose a non-UTF-8 byte).
-		let mut gitdir_bytes = crate::pointers::path_to_bytes(&gitfile);
+		let mut gitdir_bytes = crate::path_to_bytes(&gitfile);
 		gitdir_bytes.push(b'\n');
 		write_file_atomic(&admin.join("gitdir"), &gitdir_bytes)?;
 		write(admin.join("HEAD"), head.render())?;
@@ -1007,7 +997,7 @@ mod native {
 		};
 		// Byte-clean serialization of the admin path, so a non-UTF-8 admin path round-trips exactly.
 		let mut content = b"gitdir: ".to_vec();
-		content.extend_from_slice(&crate::pointers::path_to_bytes(admin));
+		content.extend_from_slice(&crate::path_to_bytes(admin));
 		content.push(b'\n');
 		file
 			.write_all(&content)
@@ -1262,6 +1252,6 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{create, recover_prepared_create};
+pub use self::native::{create, recover_prepared_create};
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::{matches_target, request_query};
+pub(crate) use self::native::{matches_target, request_query};

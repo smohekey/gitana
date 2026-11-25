@@ -4,11 +4,14 @@
 
 mod common;
 
-use common::*;
 use gitana_linked_worktree::{
 	BranchName, DestinationKind, IdentityConflict, ProtectionReason, RemoveError, RemoveOutcome,
 	RemovePolicy, RemoveRequest, Setup, WorktreeClassification, WorktreeQuery, classify,
 	durability_barrier_removed, inspect, remove,
+};
+
+use self::common::{
+	canonical, commit_file, formats, git, git_ok, init_repo, rid_at, rid_bare, unique_tmp,
 };
 
 fn rreq(work: &std::path::Path, dest: &std::path::Path, branch: Option<&str>) -> RemoveRequest {

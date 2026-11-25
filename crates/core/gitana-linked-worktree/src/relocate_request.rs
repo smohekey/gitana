@@ -2,8 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::RepositoryId;
-use crate::query::BranchName;
+use crate::{BranchName, RepositoryId};
 
 /// A request to move the linked worktree at `from` to `to`, within `repo` — mirroring `git worktree move`.
 ///

@@ -256,9 +256,12 @@ pub(crate) fn path_absent(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
 	#[cfg(unix)]
-	use std::os::unix::fs::symlink;
+	use std::path::PathBuf;
 
-	use super::*;
+	use super::{path_absent, remove_directory_tree};
+
+	#[cfg(unix)]
+	use std::os::unix::fs::symlink;
 
 	#[cfg(unix)]
 	#[test]

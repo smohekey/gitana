@@ -7,12 +7,16 @@ mod common;
 use std::os::unix::fs::symlink;
 use std::time::{Duration, Instant};
 
-use common::*;
 use gitana_linked_worktree::{
 	BranchName, CheckoutTarget, CreateError, CreateRequest, LinkedWorktreeError, NewWorktreeSetup,
 	ProtectionReason, Registration, RemovePolicy, RemoveRequest, RepositoryId, Setup,
 	WorktreeClassification, WorktreeObjectId, WorktreeQuery, create, durability_barrier_created,
 	inspect, recover_prepared_create, remove,
+};
+
+use self::common::{
+	canonical, commit_file, formats, git, git_command, git_ok, init_repo, rid_at, rid_bare,
+	unique_tmp,
 };
 
 fn req(work: &std::path::Path, dest: &std::path::Path, target: CheckoutTarget) -> CreateRequest {

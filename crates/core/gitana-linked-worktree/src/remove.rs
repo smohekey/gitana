@@ -21,25 +21,15 @@ mod native {
 
 	use gitana_repository::RefName;
 
-	use crate::admin_cleanup::{deregister_admin, path_absent};
-	use crate::facts::{HeadKind, LockState};
-	use crate::head::{read_lock_reason, structural_head_branch};
-	use crate::inspect::{
-		CrossPointerHealth, DestinationKind, IdentityConflict, Registration, WorktreeInspection,
-		inspect,
+	use crate::{
+		CrossPointerHealth, DestinationKind, HeadKind, IdentityConflict, LinkedWorktreeError,
+		LockState, ProtectionReason, RefSource, Registration, RegistrationLock, RemoveError,
+		RemoveOutcome, RemovePolicy, RemoveRequest, SYMREF_MAXDEPTH, Setup, WorktreeClassification,
+		WorktreeInspection, WorktreeQuery, admin_dirs_for, admin_gitdir_target, canonical_eq,
+		checkout_gitfile_names, deregister_admin, detect_kind, inspect, is_bare, is_leaf_symlink,
+		main_checkout_identifies_common, open_store_raw, path_absent, read_lock_reason,
+		reject_unsupported_repository_format, resolve_ref_terminal, structural_head_branch,
 	};
-	use crate::pointers::{
-		RefSource, SYMREF_MAXDEPTH, admin_dirs_for, admin_gitdir_target, canonical_eq,
-		checkout_gitfile_names, is_bare, is_leaf_symlink, main_checkout_identifies_common,
-		resolve_ref_terminal,
-	};
-	use crate::query::WorktreeQuery;
-	use crate::registration_lock::RegistrationLock;
-	use crate::remove_error::RemoveError;
-	use crate::remove_outcome::RemoveOutcome;
-	use crate::remove_request::RemoveRequest;
-	use crate::repo_id::{detect_kind, open_store_raw, reject_unsupported_repository_format};
-	use crate::{LinkedWorktreeError, ProtectionReason, RemovePolicy, Setup, WorktreeClassification};
 
 	/// What a removal should do, decided from the inspection.
 	#[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,7 +481,7 @@ mod native {
 		// `canonical` resolves via the OS (following symlinks the real way, so a `..` pops the *resolved*
 		// location) and tolerates an already-absent leaf, so both the deletion and the post-check act on the
 		// actual target. Identity/enclosure/status were judged by inspection, which compares canonically already.
-		let destination = crate::pointers::resolved_path(&request.destination);
+		let destination = crate::resolved_path(&request.destination);
 		match action {
 			RemoveAction::RemoveFull { .. } => {
 				// A live, pristine checkout (only tracked files — verified before this) — remove all of it.
@@ -536,10 +526,10 @@ mod native {
 	/// too, not just an exact-string prefix. `None` when the common dir is safely outside the checkout (the
 	/// norm).
 	fn common_dir_within(destination: &Path, common: &Path) -> Option<std::path::PathBuf> {
-		let common_real = crate::pointers::canonical(common);
+		let common_real = crate::canonical(common);
 		let mut ancestor: &Path = &common_real;
 		loop {
-			if crate::pointers::canonical_eq(ancestor, destination) {
+			if crate::canonical_eq(ancestor, destination) {
 				return Some(common_real.clone());
 			}
 			ancestor = ancestor.parent()?;
@@ -908,4 +898,4 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::remove;
+pub use self::native::remove;

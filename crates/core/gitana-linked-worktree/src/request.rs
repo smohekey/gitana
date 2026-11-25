@@ -2,8 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::query::BranchName;
-use crate::{RepositoryId, WorktreeObjectId};
+use crate::{BranchName, RepositoryId, WorktreeObjectId};
 
 /// What a new linked worktree should check out. Every field is explicit — the caller (not this crate)
 /// resolves any DWIM before asking. The four variants map 1:1 to git's `worktree add` modes, and each

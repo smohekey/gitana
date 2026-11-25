@@ -75,7 +75,9 @@ impl IntoWorktreeObjectId for ObjectId<Sha256> {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
+	use gitana_object::HashKind;
+
+	use super::WorktreeObjectId;
 
 	#[test]
 	fn parse_round_trips_both_algorithms() {

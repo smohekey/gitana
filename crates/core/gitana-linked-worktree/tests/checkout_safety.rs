@@ -4,8 +4,9 @@
 
 mod common;
 
-use common::*;
 use gitana_linked_worktree::{Setup, checkout_safety};
+
+use self::common::{canonical, commit_file, formats, git, git_try, init_repo, rid_at, unique_tmp};
 
 #[tokio::test]
 async fn a_clean_checkout_holds_no_local_only_state() {

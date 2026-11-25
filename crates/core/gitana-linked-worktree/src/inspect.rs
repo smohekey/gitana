@@ -6,9 +6,7 @@
 
 use std::path::PathBuf;
 
-use crate::WorktreeObjectId;
-use crate::facts::{HeadKind, LockState};
-use crate::query::BranchName;
+use crate::{BranchName, HeadKind, LockState, WorktreeObjectId};
 
 /// What sits at the destination path on disk. A symlink is never followed, and a non-directory is never a
 /// completion candidate.
@@ -260,7 +258,7 @@ pub(crate) fn classify_destination(
 	// A linked-worktree checkout's `.git` is a regular-file gitfile (`gitfile_target` returns `None` for a
 	// `.git` directory or symlink, and errors on a malformed regular gitfile — git rejects those).
 	let git = destination.join(".git");
-	Ok(if crate::pointers::gitfile_target(&git)?.is_some() {
+	Ok(if crate::gitfile_target(&git)?.is_some() {
 		DestinationKind::LinkedWorktreeCheckout
 	} else {
 		DestinationKind::UnrelatedContent
@@ -269,22 +267,21 @@ pub(crate) fn classify_destination(
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-	use super::*;
-
 	use gitana_object::{HashAlgorithm, HashKind, ObjectId, Sha1, Sha256};
 	use gitana_object_store::ObjectStore;
 	use gitana_repository::{HeadState, Repository};
 
-	use crate::head::{read_head, read_lock_reason, structural_head_branch_for_move};
-	use crate::object_id::IntoWorktreeObjectId;
-	use crate::pointers::{
-		RefSource, SYMREF_MAXDEPTH, admin_dirs_for, admin_gitdir_target, admin_owned_by,
-		branch_checkout_location, canonical_eq, checkout_gitfile_names, gitfile_target,
-		resolve_ref_terminal,
+	use super::{
+		CrossPointerHealth, DestinationKind, HeadFacts, IdentityConflict, Registration,
+		RequestedBranch, StartRelation, WorktreeInspection, classify_destination,
 	};
-	use crate::query::WorktreeQuery;
-	use crate::repo_id::{detect_kind, open_store_raw};
-	use crate::{LinkedWorktreeError, Setup};
+	use crate::{
+		HeadKind, IntoWorktreeObjectId, LinkedWorktreeError, LockState, RefSource, SYMREF_MAXDEPTH,
+		Setup, WorktreeQuery, admin_dirs_for, admin_gitdir_target, admin_owned_by,
+		branch_checkout_location, canonical_eq, checkout_gitfile_names, detect_kind, gitfile_target,
+		open_store_raw, read_head, read_lock_reason, resolve_ref_terminal,
+		structural_head_branch_for_move,
+	};
 
 	/// Inspect one destination. Opens the repository store (native mint), detects the object format, and
 	/// dispatches to the monomorphized body.
@@ -622,11 +619,11 @@ mod native {
 			// content re-verification of every present tracked file (hashing, not the stat cache — catches edits
 			// `status` can miss and skip-worktree edits it omits), and whether the index is a sparse index (whose
 			// collapsed directory entries make that status unreliable).
-			let status = crate::status::status_at(admin, common, destination, setup).await?;
-			let residual = crate::status::residual_untracked_paths(admin, common, destination).await?;
+			let status = crate::status_at(admin, common, destination, setup).await?;
+			let residual = crate::residual_untracked_paths(admin, common, destination).await?;
 			let diverged =
-				crate::status::diverged_tracked_content_paths(admin, common, destination, setup).await?;
-			let sparse = crate::status::is_sparse_index(admin, common, destination).await?;
+				crate::diverged_tracked_content_paths(admin, common, destination, setup).await?;
+			let sparse = crate::is_sparse_index(admin, common, destination).await?;
 			(Some(status), Some(residual), Some(diverged), Some(sparse))
 		} else {
 			(None, None, None, None)
@@ -649,7 +646,7 @@ mod native {
 					.is_some_and(|b| b.starts_with("refs/heads/"));
 				h.object.as_ref().filter(|_| !anchored_by_shared_branch)
 			});
-			crate::status::first_unreachable_admin_anchor(admin, common, head_at_risk).await?
+			crate::first_unreachable_admin_anchor(admin, common, head_at_risk).await?
 		} else {
 			None
 		};
@@ -660,7 +657,7 @@ mod native {
 		let partial_staged_changes = if query.with_status
 			&& let Registration::PresentCheckoutMissing { admin_dir } = &registration
 		{
-			Some(crate::status::partial_has_staged_changes(admin_dir, common).await?)
+			Some(crate::partial_has_staged_changes(admin_dir, common).await?)
 		} else {
 			None
 		};
@@ -690,6 +687,6 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::inspect;
+pub use self::native::inspect;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::inspect_structural_head;
+pub(crate) use self::native::inspect_structural_head;
