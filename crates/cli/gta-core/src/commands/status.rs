@@ -47,6 +47,13 @@ struct Status {
 }
 
 impl WorkTreeCommand for Status {
+	/// git's status refuses a `diff.ignoreSubmodules` it can't read, whether or not there's a
+	/// submodule or a flag to outrank it, before anything else (probed vs git 2.55). The library's
+	/// status checks too; this keeps git's order, ahead of `core.quotePath` and the excludes file.
+	fn reads_diff_settings(&self) -> bool {
+		true
+	}
+
 	/// The directory the command runs in once the repository is held: the work tree's top when run
 	/// from where `.git` is while `core.worktree` puts the work tree elsewhere, as git changes into it,
 	/// so a relative excludes file is found there.

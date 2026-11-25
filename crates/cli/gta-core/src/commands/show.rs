@@ -31,6 +31,12 @@ struct Show {
 }
 
 impl ObjectCommand for Show {
+	/// git's show refuses a bad `diff.ignoreSubmodules`, in a bare repository too, before it resolves
+	/// the revision (probed vs git 2.55).
+	fn reads_diff_settings(&self) -> bool {
+		true
+	}
+
 	async fn run<H: HashAlgorithm>(
 		self,
 		repo: Repository<Backend, H>,

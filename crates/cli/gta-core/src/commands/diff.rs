@@ -24,6 +24,11 @@ struct Diff {
 }
 
 impl WorkTreeCommand for Diff {
+	/// git's diff refuses a bad `diff.ignoreSubmodules`, with `--cached` too (probed vs git 2.55).
+	fn reads_diff_settings(&self) -> bool {
+		true
+	}
+
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,

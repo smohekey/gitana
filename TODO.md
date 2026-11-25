@@ -343,7 +343,8 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [ ] List a submodule with new commits in `ls-files -m` when its `.git` is a directory in the mount.
   git lists it; the routed store reads only a gitfile into `modules/`. (`status` sees it, through the
   probe.)
-- [x] Refuse a bad or valueless `diff.ignoreSubmodules` where git's status does (probed vs git 2.55).
+- [x] Refuse a bad or valueless `diff.ignoreSubmodules` where git does (probed vs git 2.55, command
+  by command, in `gta/tests/git_diff_settings.rs`).
   - **In the library's status** (`WorkTree::status`), so every caller gets it:
     - `gta status`;
     - `worktree remove` (git's runs `git status` in the worktree; `--force` runs none);
@@ -355,6 +356,10 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
     overrides still refuses. `config.worktree` counts, and so do includes when the frontend installs
     the config.
   - **`WorkTree::status_without_diff_check`** skips it, for rebase's gate: git's rebase proceeds.
+  - **In gta's porcelain commands** whose git counterparts read diff settings: `commit`, `merge`,
+    `log`, `show`, `switch`, `checkout`, `restore`, `diff`, `stash list` and `stash show`, and
+    `pull` after its fetch. They declare it (`reads_diff_settings`), and the dispatcher refuses as
+    soon as the repository is open, before any other work.
 - [x] Refuse a sparse index in status (`WorktreeError::SparseIndex`), rather than report false
   add/delete pairs. Worktree remove still refuses one in its own words (`SparseIndexUnsupported`).
 - [ ] Read a sparse index in status, as git does: unfold each folder entry against the tree it
@@ -363,9 +368,8 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   `stash push` looks inside submodules that aren't `ignore=all`, so it refuses one given with `-c`,
   in the global config or in the submodule's own config (probed vs git 2.55). gitana's stash leaves
   submodules aside altogether. What git's stash does with a dirty submodule needs measuring first.
-- [ ] Refuse a bad `diff.ignoreSubmodules` in the commands whose git counterparts read diff settings
-  (`commit`, `merge`, `log`, `show`, `switch`, `checkout`, `restore`, `diff`, `pull`, `stash list`
-  and `show`); only status refuses it so far.
+- [ ] Refuse the other `diff.*` settings git validates as it reads its config (`diff.algorithm` and
+  others), in the commands that read diff settings.
 - [x] Add capability-safe submodule consumer operations and recursive clone integration.
   `gta submodule` supports status, init, update (checkout/merge strategy, remote/no-fetch, shallow
   policy, recursion), deinit, set-branch, set-url, and recursive sync; clone can publish and then

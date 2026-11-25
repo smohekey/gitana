@@ -15,6 +15,12 @@ pub async fn run(cwd: &Path) -> Result<()> {
 struct Log;
 
 impl RepoCommand for Log {
+	/// git's log reads diff settings, even without `-p` and in a bare repository, so it refuses a bad
+	/// `diff.ignoreSubmodules` (probed vs git 2.55).
+	fn reads_diff_settings(&self) -> bool {
+		true
+	}
+
 	async fn run<H: HashAlgorithm>(self, repo: Repository<Backend, H>) -> Result<()> {
 		let Some(head) = repo.refs().resolve_head().await? else {
 			return Ok(()); // unborn branch — no commits

@@ -237,8 +237,10 @@ Implemented command groups:
 	gitfile followed wherever it points, or a directory), and its ignore setting is the `ignore` key,
 	`submodule.<name>.ignore` in the config, else in `.gitmodules` (`none`, `untracked`, `dirty` or
 	`all`), else `diff.ignoreSubmodules`. `--ignore-submodules[=<when>]` outranks them. A bad or
-	valueless `diff.ignoreSubmodules` is refused where git's status refuses it, in a submodule's own
-	status too. `status` refuses a sparse index, which git reads.
+	valueless `diff.ignoreSubmodules` is refused where git refuses it: by every status (the one a
+	submodule's own status reads included), and by the commands that read diff settings (`commit`,
+	`merge`, `log`, `show`, `switch`, `checkout`, `restore`, `diff`, `pull`, `stash list` and `show`).
+	`status` refuses a sparse index, which git reads.
 - Repository setup: `config`, scoped like git — `--local` (the repository `.git/config`, the default
   for writes), `--global` (`$GIT_CONFIG_GLOBAL`, else `~/.gitconfig` / the XDG file), and `--system`
   (`$GIT_CONFIG_SYSTEM`, else `/etc/gitconfig`). An unscoped read resolves across git's whole

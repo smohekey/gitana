@@ -64,6 +64,12 @@ struct Merge {
 }
 
 impl WorkTreeCommand for Merge {
+	/// git's merge refuses a bad `diff.ignoreSubmodules` in every case: a fast-forward, up to date, or
+	/// a true merge (probed vs git 2.55).
+	fn reads_diff_settings(&self) -> bool {
+		true
+	}
+
 	fn set_command_directory(&mut self, path: std::path::PathBuf, directory: Dir) {
 		self.cwd = path;
 		self.cwd_directory = Some(directory);

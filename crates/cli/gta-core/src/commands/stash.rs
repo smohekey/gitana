@@ -156,6 +156,14 @@ fn fail(errors: &[String], then: &[String]) -> anyhow::Error {
 const KEPT: &str = "The stash entry is kept in case you need it again.";
 
 impl WorkTreeCommand for Stash {
+	/// git's `stash list` and `stash show` refuse a bad `diff.ignoreSubmodules`; its push, apply, pop
+	/// and drop don't read diff settings (probed vs git 2.55). Its push still refuses one a
+	/// submodule's own status would see, since it looks inside submodules, which gitana's stash
+	/// doesn't (TODO.md).
+	fn reads_diff_settings(&self) -> bool {
+		matches!(self.action, Action::List | Action::Show { .. })
+	}
+
 	/// The directory the command runs in once the repository is held: the work tree's top when run
 	/// from where `.git` is while `core.worktree` puts the work tree elsewhere, as git changes into it,
 	/// so a relative excludes file is found there.

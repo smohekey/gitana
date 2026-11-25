@@ -41,6 +41,11 @@ struct Restore {
 }
 
 impl WorkTreeCommand for Restore {
+	/// git's restore refuses a bad `diff.ignoreSubmodules`, with `--staged` too (probed vs git 2.55).
+	fn reads_diff_settings(&self) -> bool {
+		true
+	}
+
 	async fn run<H: HashAlgorithm>(
 		self,
 		worktree: WorkTree<Backend, crate::WorkDir, H>,

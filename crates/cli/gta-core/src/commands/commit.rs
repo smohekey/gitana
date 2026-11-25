@@ -46,6 +46,12 @@ struct Commit<'a> {
 }
 
 impl WorkTreeCommand for Commit<'_> {
+	/// git's commit reads diff settings, so it refuses a bad `diff.ignoreSubmodules`, even with nothing
+	/// to commit (probed vs git 2.55).
+	fn reads_diff_settings(&self) -> bool {
+		true
+	}
+
 	fn set_command_directory(&mut self, path: PathBuf, directory: Dir) {
 		self.cwd = path;
 		self.cwd_directory = Some(directory);
