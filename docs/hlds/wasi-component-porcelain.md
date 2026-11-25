@@ -244,6 +244,9 @@ Findings from this slice:
    Only `gitana-worktree` was pulled in — `commit`'s orchestration is reimplemented over
    `Repository::commit_on_head` so `gitana-porcelain`'s `reqwest` never reaches the reactor. `merge`
    (conflict lifecycle) is the remaining worktree export.
+   `status` later learned to look inside submodules: it imports a host `submodules` capability (a
+   `probe` resource per status, answered natively by `gitana-submodule-probe` in the host), and takes
+   git's `--ignore-submodules` as an argument; see `docs/hlds/submodule-operations.md`.
 4. **`wasi:http` transport trait** for `gitana-remote` so fetch/clone/push work in-component.
 5. ~~**Retire `StdBackend`/`from_root`**~~ — done: `wasm-object-db` takes its preopen as a
    descriptor (`preopens#get-directories` → `from_descriptor`); the descriptor backend is the

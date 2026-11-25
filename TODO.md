@@ -297,11 +297,37 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   switch, restore, add, rm, sparse checkout, worktree removal, and three-way conflicts.
   `FileMode::Gitlink` now round-trips mode `160000` without treating its commit id as a blob;
   checkouts materialize/reuse mount directories without descending into initialized submodules;
-  status/diff compare the mounted module's `HEAD` (including linked-worktree module stores); and
+  status/diff compare the mounted module's `HEAD` (including linked-worktree module stores), and
+  status also looks inside the module when a `SubmoduleProbe` is attached (see the next item); and
   divergent pointers record `160000` conflict stages while preserving populated mounts. The
   stock-Git oracle matrix in `git_submodule.rs` covers clean/moved/absent/retyped mounts, D/F and
   case-fold collisions, null OIDs, special nodes, sparse paths, populated conflicts, add/rm
   opacity, and retained checkout reuse. `e28ed2bf` plus the subsequent gitlink hardening series.
+- [x] Report a submodule's own state in `status`, as git does. `gta status`, and the `gitana:repo`
+  component's `status` (through a host `submodules` capability), now report a submodule's new commits,
+  modified content and untracked content, recursively through nested submodules, as ` M sub`.
+  `StatusEntry.submodule` carries porcelain v2's `S<c><m><u>` flags.
+  - **The probe.** A `SubmoduleProbe` attached to the `WorkTree` (natively, `gitana-submodule-probe`'s
+    `NativeSubmoduleProbe`) opens each module as git does: any gitfile target, or a `.git` directory.
+    It fails the status where a broken `.git` fails git's.
+  - **Ignore settings.** It honours `submodule.<name>.ignore`, from the config and then `.gitmodules`
+    (the work tree's, the index's or `HEAD`'s, read with git's fatal and warning rules), and
+    `diff.ignoreSubmodules`. `gta status --ignore-submodules[=<when>]` outranks them, and `all` also
+    hides staged gitlink changes.
+  - **Tests.** Oracle-tested against git 2.55 in both object formats:
+    `gitana-submodule-probe/tests/git_status.rs`, `gta/tests/git_status_submodules.rs`, and
+    `gitana-repo-host/tests/submodules.rs`.
+- [ ] Give `diff` git's `-dirty` suffix for a submodule with modified or untracked content (it still
+  compares the checked-out commit alone).
+- [ ] Give `gta status` git's `--short` and `--porcelain=v2` output; `StatusEntry.submodule` now
+  carries what v2's `S<c><m><u>` field needs.
+- [ ] Honour `status.showUntrackedFiles` / `-uno` in `status`. gitana's status has neither, and git
+  also leaves a submodule's untracked content out under them.
+- [ ] Report a type change as `T` in `status`. gitana says `M` where git says `T`, staged or not:
+  a file replaced by a symlink, or a gitlink replaced by a file.
+- [ ] List a submodule with new commits in `ls-files -m` when its `.git` is a directory in the mount.
+  git lists it; the routed store reads only a gitfile into `modules/`. (`status` sees it, through the
+  probe.)
 - [x] Add capability-safe submodule consumer operations and recursive clone integration.
   `gta submodule` supports status, init, update (checkout/merge strategy, remote/no-fetch, shallow
   policy, recursion), deinit, set-branch, set-url, and recursive sync; clone can publish and then

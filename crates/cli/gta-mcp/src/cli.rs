@@ -186,7 +186,13 @@ enum Command {
 		pathspecs: Vec<McpGitPath>,
 	},
 	/// Show the working-tree status (porcelain v1).
-	Status,
+	Status {
+		/// Leave out submodule changes: `none`, `untracked` (untracked content), `dirty` (all content;
+		/// new commits still show), or `all` (staged gitlink changes too). It outranks each
+		/// submodule's own `ignore` setting.
+		#[arg(long = "ignore-submodules", value_name = "when")]
+		ignore_submodules: Option<String>,
+	},
 	/// Record a commit from the staged index.
 	Commit {
 		/// Commit message.
@@ -1118,7 +1124,9 @@ impl Cli {
 					)
 					.await
 				}
-				Command::Status => commands::status::run(&cwd, gta_core::PathQuoteMode::Always).await,
+				Command::Status { ignore_submodules } => {
+					commands::status::run(&cwd, gta_core::PathQuoteMode::Always, ignore_submodules).await
+				}
 				Command::Commit {
 					message,
 					sign,

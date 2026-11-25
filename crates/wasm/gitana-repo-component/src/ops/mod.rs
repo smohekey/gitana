@@ -5,6 +5,7 @@
 mod error;
 mod git_path;
 mod host_identity;
+mod host_submodules;
 mod include_resolver;
 mod objects;
 mod refs;
@@ -21,6 +22,7 @@ pub(crate) use self::{
 		into_worktree_text, revision_from_wit, tree_path_into_wit,
 	},
 	host_identity::HostIdentity,
+	host_submodules::{HostSubmodules, from_wit as ignore_submodules_from_wit},
 	include_resolver::FileStoreIncludeResolver,
 	objects::{
 		create_commit, ls_tree, read_blob, read_commit, read_object, read_tag, write_blob, write_tree,

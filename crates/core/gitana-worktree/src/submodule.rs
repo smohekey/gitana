@@ -1,7 +1,9 @@
 //! Resolving a checked-out submodule's `HEAD` commit, so a gitlink (mode `160000`) index entry can be
-//! compared against the commit actually checked out in the submodule. Shared by `ls-files` (`-m`) and
-//! `status`: a submodule is "modified" iff this differs from the recorded commit (git ignores the
-//! submodule's own dirty content by default).
+//! compared against the commit actually checked out in the submodule. Shared by `ls-files` (`-m`),
+//! which lists a submodule only when this differs from the recorded commit, and `status`, for which
+//! that's the "new commits" part. `status` learns about the submodule's own modified and untracked
+//! content from a [`SubmoduleProbe`](crate::SubmoduleProbe), as git's `status` reports it; `ls-files -m`
+//! ignores that content, as git's does (probed vs git 2.55).
 
 use std::path::{Component, Path, PathBuf};
 

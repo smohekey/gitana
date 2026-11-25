@@ -1079,7 +1079,12 @@ fn synth_section(section: &str, subsection: Option<&str>) -> Section {
 	}
 }
 
-pub(crate) fn interpret_bool(value: Option<&str>) -> Result<bool, ConfigError> {
+/// A config value read with git's boolean grammar: a valueless variable (`None`) and `true`, `yes`
+/// or `on` are true; `false`, `no`, `off` and the empty string are false (all case-insensitively);
+/// any other value must be a 32-bit integer, optionally with a `k`/`m`/`g` multiplier, true unless
+/// it's zero. Anything else is [`ConfigError::NotBool`]. Exported as `parse_bool`, for a value that
+/// takes more than a boolean (git's `fetchRecurseSubmodules` also takes `on-demand`).
+pub fn interpret_bool(value: Option<&str>) -> Result<bool, ConfigError> {
 	match value {
 		None => Ok(true),
 		Some(v) => match v.to_ascii_lowercase().as_str() {

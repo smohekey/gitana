@@ -36,7 +36,8 @@ What works today:
 - Revision resolution for common forms such as `HEAD`, branch/tag names,
   abbreviated object IDs, `~`, `^`, and `^{type}`.
 - A Git-compatible index (including conflict stages / unmerged paths), `.gitignore`
-  handling, `status` (reporting `UU`/`AA`/`DD`/etc. conflict codes), `add`, `rm`,
+  handling, `status` (reporting `UU`/`AA`/`DD`/etc. conflict codes, and a submodule's new
+  commits, modified content and untracked content, nested submodules included, as git does), `add`, `rm`,
   `mv`, checkout, path restore (working-tree and staged), soft/mixed/hard and
   path-limited reset, and staged/unstaged diff support.
 - Smart HTTP advertisement, fetch/upload-pack, receive-pack, push reports, and
@@ -63,7 +64,9 @@ What works today:
   CVE-2017-1000117 option-injection guard, remote-command quoting, and protocol v0),
   so the granted capability cannot spawn an arbitrary process. The component's only
   filesystem authority is the `wasi:filesystem` directory descriptors passed in by
-  the host (no preopens, no ambient access).
+  the host (no preopens, no ambient access). Its `status` looks inside submodules through a
+  host-granted `submodules` capability (the host opens them natively, as `gta status` does); a host
+  that grants none leaves each submodule compared by its checked-out commit.
   `crates/wasm/gitana-repo-host` embeds it under wasmtime; see
   `docs/hlds/wasi-component-porcelain.md` and `docs/hlds/wasi-http-transport.md`.
 - A trust and signing subsystem (`docs/hlds/secure-git-trust-signing.md`) that makes
@@ -199,7 +202,7 @@ Implemented command groups:
 - Plumbing: `hash-object`, `cat-file`, `ls-tree`, `rev-parse`, `rev-list`,
   `merge-base`, `ls-files`.
 - Ref operations: `update-ref`, `symbolic-ref`, `branch`, `tag`.
-- Working-tree porcelain: `add`, `rm`, `mv`, `status`, `commit`, `merge`, `log`,
+- Working-tree porcelain: `add`, `rm`, `mv`, `status [--ignore-submodules[=<when>]]`, `commit`, `merge`, `log`,
   `show`, `switch`, `checkout`, `restore`, `reset`, `diff`, `sparse-checkout`
   (`init`, `set`, `add`, `list`, `disable`, `reapply`; cone by default, `--no-cone`
   for full patterns).
@@ -230,6 +233,10 @@ Implemented command groups:
 	Add `--shallow-submodules` for depth-one module history or `--remote-submodules` to select remote
 	branch tips; the matching `--no-*` forms cancel those clone policies and the last occurrence wins.
 	A root `clone --depth N` alone does not change submodule depth.
+	`status` looks inside each submodule as git's does: the module is found from the mount's `.git` (a
+	gitfile followed wherever it points, or a directory), and its ignore setting is the `ignore` key,
+	`submodule.<name>.ignore` in the config, else in `.gitmodules` (`none`, `untracked`, `dirty` or
+	`all`), else `diff.ignoreSubmodules`. `--ignore-submodules[=<when>]` outranks them.
 - Repository setup: `config`, scoped like git — `--local` (the repository `.git/config`, the default
   for writes), `--global` (`$GIT_CONFIG_GLOBAL`, else `~/.gitconfig` / the XDG file), and `--system`
   (`$GIT_CONFIG_SYSTEM`, else `/etc/gitconfig`). An unscoped read resolves across git's whole
@@ -313,6 +320,8 @@ Implemented command groups:
 - `crates/core/gitana-submodule`: One-level submodule declaration, status, initialization, update,
 	URL synchronization, deinitialization, and crash-recovery state machines over injected configuration and transport
 	capabilities.
+- `crates/core/gitana-submodule-probe`: Native look inside a work tree's submodules, as git's
+	`status` does, for `gitana-worktree`'s status (the `SubmoduleProbe` gta and the wasm host attach).
 - `crates/core/gitana-config`: Git config parser.
 - `crates/core/gitana-diff`: Myers line diff and diff3 three-way line merge.
 - `crates/core/gitana-git-http`: Transport-agnostic Smart HTTP protocol helpers.
