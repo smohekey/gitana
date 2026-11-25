@@ -98,6 +98,28 @@ impl GitConfigBytes {
 			.get_int_validated(section, subsection.as_deref(), name)
 	}
 
+	/// Validates every occurrence as a git `int`, as git's `git_config_int` reads one: its integer grammar
+	/// (sign, base prefix, `k`/`m`/`g` unit), and a value that fits in 32 bits. Returns the effective value.
+	/// An occurrence out of range is [`ConfigError::NotInt`], as one that doesn't parse is.
+	pub fn get_i32_validated(
+		&self,
+		section: &str,
+		subsection: Option<&[u8]>,
+		name: &str,
+	) -> Result<Option<i32>, ConfigError> {
+		let subsection = subsection.map(encode);
+		let mut effective = None;
+		for raw in self
+			.config
+			.get_all_raw(section, subsection.as_deref(), name)
+		{
+			let raw = raw.unwrap_or("");
+			let value = crate::source::interpret_int(raw)?;
+			effective = Some(i32::try_from(value).map_err(|_| ConfigError::NotInt(raw.to_owned()))?);
+		}
+		Ok(effective)
+	}
+
 	/// Returns every dotted key and value in file order.
 	pub fn entries(&self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
 		self
@@ -149,6 +171,30 @@ mod tests {
 				Some(b"/last\t\xff".to_vec())
 			]
 		);
+	}
+
+	#[test]
+	fn a_32_bit_int_is_checked_at_every_occurrence() {
+		let int = |text: &str| {
+			GitConfigBytes::parse(text.as_bytes())
+				.unwrap()
+				.get_i32_validated("core", None, "n")
+		};
+		assert_eq!(int("[core]\n\tn = -2147483648\n").unwrap(), Some(i32::MIN));
+		assert_eq!(int("[core]\n\tn = 2147483647\n").unwrap(), Some(i32::MAX));
+		assert_eq!(int("[core]\n\tn = -1k\n").unwrap(), Some(-1024));
+		assert_eq!(int("[core]\n\tother = 1\n").unwrap(), None);
+		for bad in ["-2147483649", "2147483648", "2g", "1x"] {
+			assert!(
+				matches!(
+					int(&format!("[core]\n\tn = {bad}\n")),
+					Err(ConfigError::NotInt(_))
+				),
+				"{bad}"
+			);
+		}
+		// A bad occurrence fails even when a later good one shadows it.
+		assert!(int("[core]\n\tn = 2147483648\n\tn = 1\n").is_err());
 	}
 
 	#[test]

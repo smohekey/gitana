@@ -36,11 +36,12 @@ pub(crate) async fn detect_algorithm_at(common: &Dir, common_dir: &Path) -> Resu
 	detect_algorithm_text(text)
 }
 
+/// The repository's hash algorithm, once its config passes the shared repository-format check
+/// (`Config::parse`), which refuses a format gitana can't read or write correctly.
 fn detect_algorithm_text(text: &str) -> Result<HashKind> {
-	let config = gitana_config::GitConfig::parse(text).map_err(|error| anyhow!("{error}"))?;
-	match config
-		.get_string("extensions", None, "objectformat")
-		.unwrap_or("sha1")
+	match gitana_repository::Config::parse(text)?
+		.object_format
+		.as_str()
 	{
 		"sha256" => Ok(HashKind::Sha256),
 		"sha1" => Ok(HashKind::Sha1),

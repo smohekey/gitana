@@ -84,8 +84,9 @@ pub enum LinkedWorktreeError {
 	#[error(transparent)]
 	Worktree(#[from] gitana_worktree::WorktreeError),
 
-	/// The repository declares an object format gitana does not support.
-	#[error("unsupported object format: {0}")]
+	/// The repository declares a format gitana does not support: an object format, or a format version or
+	/// extension the shared repository-format check refuses (the variant's name predates the latter).
+	#[error("unsupported repository format: {0}")]
 	UnsupportedObjectFormat(String),
 
 	/// A hex object id could not be parsed for the requested algorithm (wrong length / non-hex).
