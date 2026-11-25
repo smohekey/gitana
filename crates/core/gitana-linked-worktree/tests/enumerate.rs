@@ -3,9 +3,12 @@
 
 mod common;
 
-use common::*;
 use gitana_linked_worktree::{
 	HeadKind, LinkedWorktreeError, LockState, RepositoryId, WorktreeContext, WorktreeRole, enumerate,
+};
+
+use self::common::{
+	canonical, commit_file, ctx_at, ctx_bare, formats, git, git_ok, init_repo, rid_at, unique_tmp,
 };
 
 #[tokio::test]
@@ -99,6 +102,160 @@ async fn enumeration_matches_git_on_unsupported_repository_formats() {
 		);
 		let _ = std::fs::remove_dir_all(&base);
 	}
+}
+
+/// The repository-format check enumeration shares with every entry point agrees with git across format
+/// versions: at version 0 git honours a few extensions, refuses the version-1-only ones and ignores unknown
+/// names; with no version it applies no extension at all; and some configs it accepts are accepted here
+/// too. Two are refused here although git accepts them: gitana's own `submodulePathConfig` refusal, and
+/// (in the reftable test) `refStorage = reftable`.
+#[tokio::test]
+async fn enumeration_matches_git_on_extensions_across_format_versions() {
+	// (tag, version: "" = no version line, extension line, git accepts, gitana accepts)
+	let cases: &[(&str, &str, &str, bool, bool)] = &[
+		("v1-refstorage-files", "1", "refStorage = files", true, true),
+		("v1-noop-v1", "1", "noop-v1 = anything", true, true),
+		(
+			"v1-submodulepathconfig-false",
+			"1",
+			"submodulePathConfig = false",
+			true,
+			true,
+		),
+		(
+			"v1-submodulepathconfig-true",
+			"1",
+			"submodulePathConfig = true",
+			true,
+			false,
+		),
+		(
+			"v0-preciousobjects",
+			"0",
+			"preciousObjects = true",
+			true,
+			true,
+		),
+		("v0-partialclone", "0", "partialClone = origin", true, true),
+		(
+			"v0-refstorage-files",
+			"0",
+			"refStorage = files",
+			false,
+			false,
+		),
+		(
+			"v0-objectformat-sha1",
+			"0",
+			"objectFormat = sha1",
+			false,
+			false,
+		),
+		(
+			"v0-relativeworktrees",
+			"0",
+			"relativeWorktrees = true",
+			false,
+			false,
+		),
+		("v0-noop-v1", "0", "noop-v1 = true", false, false),
+		(
+			"v0-refstorage-bogus",
+			"0",
+			"refStorage = bogus",
+			false,
+			false,
+		),
+		(
+			"unversioned-refstorage-reftable",
+			"",
+			"refStorage = reftable",
+			true,
+			true,
+		),
+		(
+			"unversioned-bad-bool",
+			"",
+			"worktreeConfig = notabool",
+			false,
+			false,
+		),
+	];
+	for (tag, version, extension, git_accepts, gitana_accepts) in cases {
+		let base = unique_tmp(&format!("enum-versions-{tag}"));
+		let work = base.join("repo");
+		init_repo(&work, "sha1");
+		let config_path = work.join(".git/config");
+		let config = std::fs::read_to_string(&config_path).unwrap();
+		let config = match *version {
+			"" => config.replace("\trepositoryformatversion = 0\n", ""),
+			version => config.replace(
+				"repositoryformatversion = 0",
+				&format!("repositoryformatversion = {version}"),
+			),
+		};
+		std::fs::write(
+			&config_path,
+			format!("{config}\n[extensions]\n\t{extension}\n"),
+		)
+		.unwrap();
+
+		let name = extension.split(" = ").next().unwrap();
+		if git_knows_extension(name) {
+			assert_eq!(
+				git_ok(&[
+					"-C",
+					work.to_str().unwrap(),
+					"worktree",
+					"list",
+					"--porcelain"
+				]),
+				*git_accepts,
+				"{tag}: git's verdict"
+			);
+		} else {
+			eprintln!("{tag}: this git doesn't know extensions.{name}; checking gitana's verdict only");
+		}
+		let result = enumerate(&ctx_at(&work)).await;
+		if *gitana_accepts {
+			assert!(result.is_ok(), "{tag}: got {result:?}");
+		} else {
+			assert!(
+				matches!(result, Err(LinkedWorktreeError::UnsupportedObjectFormat(_))),
+				"{tag}: got {result:?}"
+			);
+		}
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+/// Whether the installed git knows `extensions.<name>`: it accepts a version-1 repository declaring it
+/// with a valid value. Older gits don't know the newer extensions (`refStorage`, `relativeWorktrees`,
+/// `submodulePathConfig`) and refuse them as unknown, so a row about one checks git's verdict only where
+/// git knows it.
+fn git_knows_extension(name: &str) -> bool {
+	let value = match name {
+		"refStorage" => "files",
+		"partialClone" => "origin",
+		"objectFormat" => "sha1",
+		"noop-v1" => "anything",
+		_ => "true",
+	};
+	let base = unique_tmp(&format!("enum-knows-{name}"));
+	let work = base.join("repo");
+	init_repo(&work, "sha1");
+	let config_path = work.join(".git/config");
+	let config = std::fs::read_to_string(&config_path)
+		.unwrap()
+		.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+	std::fs::write(
+		&config_path,
+		format!("{config}\n[extensions]\n\t{name} = {value}\n"),
+	)
+	.unwrap();
+	let known = git_ok(&["-C", work.to_str().unwrap(), "rev-parse", "--git-dir"]);
+	let _ = std::fs::remove_dir_all(&base);
+	known
 }
 
 #[tokio::test]

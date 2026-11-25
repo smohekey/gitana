@@ -33,6 +33,12 @@ What works today:
   otherwise-history-free repository with no linked-worktree administration and
   retains the history gate through the ref durability barrier. Sibling libraries
   can participate in the same gate through an opaque history-mutation lease.
+- Repository format versions 0 and 1, with the files ref backend. Every entry point (`gta`, the
+  `gitana:repo` wasm component, the linked-worktree library) checks a repository's format as git does
+  on opening it (`core.repositoryformatversion` and git's `extensions.*` rules), and refuses up front
+  what gitana can't yet handle: reftable ref storage (`extensions.refStorage = reftable`, which needs
+  a second ref backend, still to come), `extensions.compatObjectFormat`, and
+  `extensions.submodulePathConfig`.
 - Revision resolution for common forms such as `HEAD`, branch/tag names,
   abbreviated object IDs, `~`, `^`, and `^{type}`.
 - A Git-compatible index (including conflict stages / unmerged paths), `.gitignore`

@@ -140,9 +140,7 @@ pub struct UnpushedRef {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-	use super::*;
-
-	use std::path::Path;
+	use std::path::{Path, PathBuf};
 
 	use gitana_file_store::FileStore;
 	use gitana_object::{HashAlgorithm, HashKind, ObjectId, ObjectKind, Sha1, Sha256, parse_tag};
@@ -150,14 +148,12 @@ mod native {
 	use gitana_repository::{HeadState, Repository};
 	use gitana_worktree::WorkTree;
 
-	use crate::WorktreeObjectId;
-
-	use crate::pointers::{
-		admin_dirs_for, canonical_eq, checkout_gitfile_names, is_bare, is_leaf_symlink,
-		main_checkout_identifies_common,
+	use super::{CheckoutSafety, UnpushedRef, WorktreeStatusReport};
+	use crate::{
+		LinkedWorktreeError, RepositoryId, Setup, WorktreeObjectId, admin_dirs_for, canonical_eq,
+		checkout_gitfile_names, detect_kind, is_bare, is_leaf_symlink, main_checkout_identifies_common,
+		open_store_raw, open_work_dir,
 	};
-	use crate::repo_id::{detect_kind, open_store_raw, open_work_dir};
-	use crate::{LinkedWorktreeError, RepositoryId, Setup};
 
 	/// `repo`, reading `setup`'s merged config when it has one.
 	fn set_up<F: FileStore, H: HashAlgorithm>(
@@ -593,9 +589,9 @@ mod native {
 		head: Option<&WorktreeObjectId>,
 	) -> Result<Option<WorktreeObjectId>, LinkedWorktreeError>
 	where
-		ObjectId<H>: crate::object_id::IntoWorktreeObjectId,
+		ObjectId<H>: crate::IntoWorktreeObjectId,
 	{
-		use crate::object_id::IntoWorktreeObjectId;
+		use crate::IntoWorktreeObjectId;
 		// Reachability roots (shared refs + objects) come from a store rooted wholly at `common`; the admin's own
 		// per-worktree refs are read from a routing store rooted at `git_dir`.
 		let shared = Repository::<_, H>::new(ObjectStore::new(open_store_raw(common, common)?));
@@ -846,9 +842,9 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{checkout_safety, status, unpushed_refs};
+pub use self::native::{checkout_safety, status, unpushed_refs};
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::{
+pub(crate) use self::native::{
 	diverged_tracked_content_paths, first_unreachable_admin_anchor, is_sparse_index,
 	partial_has_staged_changes, residual_untracked_paths, status_at,
 };

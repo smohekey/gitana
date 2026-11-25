@@ -270,12 +270,30 @@ created-durability barrier's admin-tree flush covers the release). It is release
 `PartialRegistered` partial. Only a **crash** leaves it behind, and that partial then reads as
 `ProtectedWithReason::Locked { reason: "initializing" }`, exactly as a killed `git worktree add` leaves its
 own: an ordinary `create` refuses it, `remove` needs the double force, git neither prunes nor reports it
-prunable, and `git worktree unlock` clears it. `recover_prepared_create` reclaims such a partial unchanged,
-since it already authorizes on the exact partial and does not consult the lock. Deliberately **not** done:
-treating an `initializing` marker as "not really locked" — gitana cannot tell its own leftover from a
-`git worktree add` still running, which writes the same word. (The gap between the `mkdir` and the marker
+prunable, and `git worktree unlock` clears it. `recover_prepared_create` reclaims such a partial: it is
+the one lock recovery may override (see the "Recoverable mid-checkout state" bullet under *Slice-5 create
+hardening*). Deliberately **not** done:
+treating an `initializing` marker as "not really locked" in an ordinary `create` — gitana cannot tell its
+own leftover from a `git worktree add` still running, which writes the same word. (The gap between the `mkdir` and the marker
 remains, as in git.) The test fixtures also turn git's automatic maintenance off for every command they run,
 so a background maintenance process never races the repository a test is still using.
+
+**A concurrent add of the same basename (found 2026-11-25).** `create` used to pick the admin name by
+probing `worktrees/<name>`, `<name>1`, … for a free path, then create it with `create_dir_all` only after the
+branch transaction and the history gate. `create_dir_all` accepts a folder that already exists, and
+`RegistrationLock` excludes only gitana, so a stock `git worktree add` with the same basename that claimed
+the name in that gap had its admin taken over (probed: gitana's create reported success, git's worktree
+dropped out of `git worktree list`, and both checkouts shared one admin folder — one `HEAD`, one `index`).
+git claims the name with an exclusive `mkdir` loop (`add_worktree`), so its choice and claim are one step;
+`create` now does the same (`claim_admin_dir`, at the point the folder was created before, still after the
+history gate): `<name>`, then `<name>1`, `<name>2`, …, each tried with a plain `mkdir`, any existing entry —
+a file, a folder, a dangling symlink — moving on to the next suffix. Only the unsuffixed path is checked by
+the up-front representability preflight; the suffix is ASCII digits. (On Windows, a base name occupied by a
+symlink to a non-UTF-8 target could make that preflight refuse a create that would have claimed `<name>1`;
+pathological, left as is.) The exact gitana-vs-git race has no permanent test: the only point a create can
+be parked between choosing and claiming a name was the history gate, which gives up after ~500 ms, so such a
+test would fail under load. The claim is tested directly instead (sixteen threads racing for one name each
+get their own folder) and against git's suffixing.
 
 Durable consumers add an explicit completion boundary rather than treating atomic visibility as
 power-loss durability. `durability_barrier_created` validates the exact completed request, flushes the
@@ -622,7 +640,7 @@ pointer-publication hardening:
   write; the residual "an interrupted create leaves an empty `.git`" window is git-parity, and the
   gitfile-last ordering keeps it a `PartialRegistered`-class partial (the *recoverable-mid-checkout* item
   below covers making such partials cleanly retryable).
-- **git-faithful worktree-name sanitization (`unique_admin_dir`).** ✅ Slice 5. The admin name is sanitized
+- **git-faithful worktree-name sanitization (`admin_name`; claimed by `claim_admin_dir`).** ✅ Slice 5. The admin name is sanitized
   from the destination basename's bytes exactly as git does (probed vs git 2.50.1): refname-invalid bytes
   (control, space, DEL, `* : ? [ \ ^ ~`) → `-`, a leading `.` neutralised, a `..` run collapsed, an `@{`
   sequence broken, a bare `@` → `-`, a trailing `.lock` stripped; valid multi-byte (≥ 0x80) sequences pass
@@ -659,7 +677,17 @@ pointer-publication hardening:
   sole physical admin, missing final `.git` marker, admin `HEAD`, shared branch, and baseline under the
   registration lock; only that complete match authorizes deleting the intent-owned partial and recreating
   it. Any mismatch falls back to the ordinary fail-closed refusal, so a registration alone still never
-  grants authority over a reused directory. Recovery itself is retained to completion after caller
+  grants authority over a reused directory. **A lock is part of that match (2026-11-26).** The partial must
+  be unlocked or hold exactly the `initializing` marker a crashed create leaves (gitana's, or an
+  English-language git's; a translated one is refused, the safe direction). Any other lock — a user's,
+  with or without a reason, or one whose reason can't be read, such as a symlinked marker, which is never
+  followed — is honoured: recovery refuses the partial as `ProtectedWithReason::Locked`, as ordinary
+  `create` does, and leaves it and the lock alone. A missing checkout is also what a locked worktree on an
+  unplugged drive looks like, and git's own `add` refuses a missing but locked path without a double
+  `--force`. Reclaiming `initializing` stays safe though plain `create` refuses it, because recovery also
+  demands the checkout's `.git` be missing: a stock `git worktree add` still running has already written
+  it by the time it checks out (probed with a slowed checkout), and gitana's own creates are kept out by the
+  registration lock. Recovery itself is retained to completion after caller
   cancellation, and recursive checkout/admin cleanup is offloaded while the registration lock remains
   held, so neither cancellation nor a large tree releases ownership ahead of the destructive work.
   Removal durability resolves a destination component-by-component before cleanup; consequently a

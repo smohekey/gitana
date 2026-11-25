@@ -8,7 +8,8 @@ pub enum WorktreeError {
 	/// The index bytes were structurally invalid.
 	#[error("malformed index: {0}")]
 	Malformed(String),
-	/// The trailing index checksum did not match its content.
+	/// The trailing index checksum did not match its content. (An all-zero trailer, which git writes under
+	/// `index.skipHash`, is "not computed" and accepted.)
 	#[error("index checksum mismatch")]
 	ChecksumMismatch,
 	/// `.git/index.lock` already exists — another process holds the index.

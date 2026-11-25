@@ -27,23 +27,15 @@
 mod native {
 	use std::path::{Path, PathBuf};
 
-	use crate::facts::LockState;
-	use crate::head::read_lock_reason;
-	use crate::inspect::{
-		CrossPointerHealth, DestinationKind, Registration, WorktreeInspection, inspect_structural_head,
+	use crate::{
+		CrossPointerHealth, DestinationKind, LinkedWorktreeError, LockState, ProtectionReason,
+		Registration, RegistrationLock, RelocateError, RelocateOutcome, RelocateRequest,
+		WorktreeClassification, WorktreeInspection, WorktreeQuery, admin_dirs_for, canonical,
+		canonical_eq, classify, ensure_representable_path, inspect_structural_head, is_bare,
+		is_leaf_symlink, is_listed_admin, main_checkout_identifies_common, path_from_bytes,
+		path_to_bytes, read_lock_reason, read_worktree_admins, reject_unsupported_repository_format,
+		strip_eol_bytes, update_file_in_place, worktree_path_of,
 	};
-	use crate::pointers::{
-		admin_dirs_for, canonical, canonical_eq, ensure_representable_path, is_bare, is_leaf_symlink,
-		is_listed_admin, main_checkout_identifies_common, path_from_bytes, path_to_bytes,
-		read_worktree_admins, strip_eol_bytes, update_file_in_place, worktree_path_of,
-	};
-	use crate::query::WorktreeQuery;
-	use crate::registration_lock::RegistrationLock;
-	use crate::relocate_error::RelocateError;
-	use crate::relocate_outcome::RelocateOutcome;
-	use crate::relocate_request::RelocateRequest;
-	use crate::repo_id::reject_unsupported_repository_format;
-	use crate::{LinkedWorktreeError, ProtectionReason, WorktreeClassification, classify};
 
 	/// Move the linked worktree at `request.from` to `request.to`. See the module docs for the safety
 	/// contract. Returns [`RelocateOutcome::Relocated`] on success or [`RelocateOutcome::AlreadyAt`] when the
@@ -661,4 +653,4 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::relocate;
+pub use self::native::relocate;

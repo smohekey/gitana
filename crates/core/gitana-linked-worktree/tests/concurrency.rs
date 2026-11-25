@@ -5,11 +5,12 @@
 
 mod common;
 
-use common::*;
 use gitana_linked_worktree::{
 	CheckoutTarget, CreateError, CreateRequest, LinkedWorktreeError, RemovePolicy, RemoveRequest,
 	RepositoryId, Setup, WorktreeObjectId, create, remove,
 };
+
+use self::common::{commit_file, formats, git, init_repo, rid_at, unique_tmp};
 
 fn detached(start: WorktreeObjectId) -> CheckoutTarget {
 	CheckoutTarget::Detached { start }

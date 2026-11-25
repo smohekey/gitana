@@ -2,8 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::query::BranchName;
-use crate::{RemovePolicy, RepositoryId};
+use crate::{BranchName, RemovePolicy, RepositoryId};
 
 /// A request to remove one linked worktree at `destination` from `repo`.
 ///

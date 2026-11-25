@@ -3,8 +3,11 @@
 
 mod common;
 
-use common::*;
 use gitana_linked_worktree::{RepositoryId, Setup, status};
+
+use self::common::{
+	canonical, commit_file, formats, git, git_try, init_repo, rid_at, rid_bare, unique_tmp,
+};
 
 fn sorted(porcelain: &str) -> Vec<String> {
 	let mut lines: Vec<String> = porcelain.lines().map(str::to_owned).collect();

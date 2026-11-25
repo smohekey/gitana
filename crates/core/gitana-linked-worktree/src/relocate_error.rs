@@ -2,8 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::inspect::DestinationKind;
-use crate::{LinkedWorktreeError, WorktreeClassification, WorktreeInspection};
+use crate::{DestinationKind, LinkedWorktreeError, WorktreeClassification, WorktreeInspection};
 
 /// Why a [`relocate`](crate::relocate) did not move the requested worktree.
 ///

@@ -5,13 +5,18 @@
 mod common;
 
 use std::os::unix::fs::symlink;
+use std::time::{Duration, Instant};
 
-use common::*;
 use gitana_linked_worktree::{
 	BranchName, CheckoutTarget, CreateError, CreateRequest, LinkedWorktreeError, NewWorktreeSetup,
 	ProtectionReason, Registration, RemovePolicy, RemoveRequest, RepositoryId, Setup,
-	WorktreeClassification, WorktreeObjectId, create, durability_barrier_created,
-	recover_prepared_create, remove,
+	WorktreeClassification, WorktreeObjectId, WorktreeQuery, create, durability_barrier_created,
+	inspect, recover_prepared_create, remove,
+};
+
+use self::common::{
+	canonical, commit_file, formats, git, git_command, git_ok, init_repo, rid_at, rid_bare,
+	unique_tmp,
 };
 
 fn req(work: &std::path::Path, dest: &std::path::Path, target: CheckoutTarget) -> CreateRequest {
@@ -63,6 +68,51 @@ fn existing_branch(name: &str, expected_start: Option<WorktreeObjectId>) -> Chec
 		name: BranchName::new(name),
 		expected_start,
 	}
+}
+
+/// The fixtures' git reads no config file from the machine, global or system (see `git_command`).
+///
+/// Entries are judged by git's own scope label: `command` is what a fixture passes, and `local` or
+/// `worktree` belong to whatever repository git finds (one above the temp dir, when that sits inside a
+/// checkout), which isn't what this guards; any other scope fails. Only scopes, origins and key names are
+/// listed, so a failure never prints a developer's config values. On a machine with no global or system
+/// config this passes either way; it guards the isolation where there is some. (The default global
+/// ignore and attributes files aren't config, so this doesn't see them.)
+#[test]
+fn fixtures_read_no_machine_config() {
+	let empty = unique_tmp("no-machine-config");
+	let out = git_command()
+		.arg("-C")
+		.arg(&empty)
+		.args([
+			"config",
+			"--list",
+			"--show-scope",
+			"--show-origin",
+			"--name-only",
+		])
+		.output()
+		.expect("run git");
+	assert!(
+		out.status.success(),
+		"git config --list failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	let listing = String::from_utf8_lossy(&out.stdout);
+	let from_machine: Vec<&str> = listing
+		.lines()
+		.filter(|line| {
+			!matches!(
+				line.split('\t').next(),
+				Some("command" | "local" | "worktree")
+			)
+		})
+		.collect();
+	assert!(
+		from_machine.is_empty(),
+		"the fixtures' git read config from the machine: {from_machine:?}"
+	);
+	let _ = std::fs::remove_dir_all(&empty);
 }
 
 #[tokio::test]
@@ -619,6 +669,56 @@ async fn prepared_recovery_recreates_an_exact_nonempty_checkout_missing_partial(
 	}
 }
 
+/// Wait for the work a cancelled create (or recovery) kept running to end, then check that it
+/// established the worktree.
+///
+/// A cancelled create carries on as a task of its own, and that task's result goes nowhere, so a test
+/// can't see its error. So this waits for the task itself to end, whatever its outcome: until the test's
+/// runtime has no task left alive (each `#[tokio::test]` has a runtime of its own). It doesn't wait for
+/// a file to appear. A failure is reported as soon as the work ends, with the state it left; the
+/// deadline only matters if it hangs.
+async fn await_retained_work(fmt: &str, what: &str, request: &CreateRequest) {
+	const DEADLINE: Duration = Duration::from_secs(30);
+	let metrics = tokio::runtime::Handle::current().metrics();
+	let started = Instant::now();
+	while metrics.num_alive_tasks() > 0 {
+		if started.elapsed() >= DEADLINE {
+			panic!(
+				"{fmt}: retained {what} still running after {DEADLINE:?}; {}",
+				retained_state(request).await
+			);
+		}
+		tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(10)))
+			.await
+			.unwrap();
+	}
+	if !request.destination.join(".git").is_file() {
+		panic!(
+			"{fmt}: retained {what} ended without establishing the worktree; {}",
+			retained_state(request).await
+		);
+	}
+}
+
+/// What a retained create left behind, for a failure message: the lock files still present in the
+/// common dir, and the destination's inspection.
+async fn retained_state(request: &CreateRequest) -> String {
+	let common = request.repo.common_dir();
+	let held: Vec<&str> = ["worktrees.lock", "gitana-history.lock"]
+		.into_iter()
+		.filter(|name| common.join(name).exists())
+		.collect();
+	let query = WorktreeQuery {
+		repo: request.repo.clone(),
+		destination: request.destination.clone(),
+		expected_branch: None,
+		start: None,
+		with_status: false,
+	};
+	let inspection = inspect(&query, &Setup::default()).await;
+	format!("lock files still present: {held:?}; inspection: {inspection:#?}")
+}
+
 #[tokio::test]
 async fn cancelling_prepared_recovery_does_not_abandon_the_owned_partial() {
 	for (fmt, kind) in formats() {
@@ -659,19 +759,7 @@ async fn cancelling_prepared_recovery_does_not_abandon_the_owned_partial() {
 		assert!(caller.await.unwrap_err().is_cancelled());
 		std::fs::remove_file(&lock).unwrap();
 
-		let mut recovered = false;
-		for _ in 0..100 {
-			if wt.join(".git").is_file() {
-				recovered = true;
-				break;
-			}
-			tokio::task::spawn_blocking(|| {
-				std::thread::sleep(std::time::Duration::from_millis(10));
-			})
-			.await
-			.unwrap();
-		}
-		assert!(recovered, "{fmt}: retained recovery did not finish");
+		await_retained_work(fmt, "recovery", &recovery).await;
 		assert_eq!(
 			git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
 			head
@@ -681,10 +769,110 @@ async fn cancelling_prepared_recovery_does_not_abandon_the_owned_partial() {
 	}
 }
 
+/// Pauses a create where it asks for the new worktree's setup. By then it holds the repository's history
+/// gate and its registration lock, and has written the admin folder, locked `initializing`; the checkout
+/// and its `.git` come after. `reached` is signalled there, and the create waits for `resume`.
+#[derive(Clone, Default)]
+struct PauseAtSetup {
+	reached: std::sync::Arc<tokio::sync::Notify>,
+	resume: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl NewWorktreeSetup for PauseAtSetup {
+	fn setup_for(
+		&self,
+		_git_dir: &std::path::Path,
+		_worktree: &std::path::Path,
+	) -> impl std::future::Future<Output = Result<Setup, Box<dyn std::error::Error + Send + Sync>>> + Send
+	{
+		let (reached, resume) = (self.reached.clone(), self.resume.clone());
+		async move {
+			reached.notify_one();
+			resume.notified().await;
+			Ok(Setup::default())
+		}
+	}
+}
+
+/// Cancelling a create in the middle of publishing (history gate and registration lock held, admin folder
+/// written) lets go of neither lock and abandons nothing: the create's retained task finishes the worktree,
+/// and only then releases them.
 #[tokio::test]
 async fn cancelling_create_does_not_release_or_abandon_history_gated_publication() {
 	for (fmt, kind) in formats() {
 		let base = unique_tmp(&format!("create-history-cancelled-{fmt}"));
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let wt = base.join("wt");
+		let start = WorktreeObjectId::parse(kind, &head).unwrap();
+		let locks = [
+			(work.join(".git/gitana-history.lock"), "the history gate"),
+			(work.join(".git/worktrees.lock"), "the registration lock"),
+		];
+		let admin = work.join(".git/worktrees/wt");
+
+		let pause = PauseAtSetup::default();
+		let request = req(&work, &wt, CheckoutTarget::Detached { start });
+		let (retained_request, retained_pause) = (request.clone(), pause.clone());
+		let mut caller =
+			tokio::spawn(
+				async move { create(&retained_request, &Setup::default(), &retained_pause).await },
+			);
+		tokio::select! {
+			() = pause.reached.notified() => {}
+			result = &mut caller => panic!("{fmt}: create ended before asking for its setup: {result:?}"),
+		}
+		let mid_publication = |when: &str| {
+			for (lock, what) in &locks {
+				assert!(lock.is_file(), "{fmt}: {what} is held {when}");
+			}
+			assert_eq!(
+				std::fs::read_to_string(admin.join("locked"))
+					.ok()
+					.as_deref(),
+				Some("initializing\n"),
+				"{fmt}: the admin folder is written and marked {when}"
+			);
+			assert!(
+				!wt.join(".git").exists(),
+				"{fmt}: the checkout isn't committed {when}"
+			);
+		};
+		mid_publication("while the create is paused");
+
+		caller.abort();
+		assert!(caller.await.unwrap_err().is_cancelled());
+		mid_publication("after its caller is cancelled");
+
+		pause.resume.notify_one();
+		await_retained_work(fmt, "create", &request).await;
+		assert_eq!(
+			git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
+			head
+		);
+		for (lock, what) in &locks {
+			assert!(
+				!lock.exists(),
+				"{fmt}: {what} is released once the create finishes"
+			);
+		}
+		assert!(
+			!admin.join("locked").exists(),
+			"{fmt}: the `initializing` marker is gone once the create finishes"
+		);
+		durability_barrier_created(&request).await.unwrap();
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+/// While another holder keeps the repository's history gate, a create publishes nothing: no admin folder,
+/// no checkout. Once the gate's bounded wait runs out it fails with `HistoryLocked` (the error is how the
+/// test knows the create got as far as the gate) and lets go of its registration lock.
+#[tokio::test]
+async fn create_publishes_nothing_while_the_history_gate_is_held() {
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-history-held-{fmt}"));
 		let work = base.join("repo");
 		init_repo(&work, fmt);
 		let head = commit_file(&work, "a.txt", "1\n", "init");
@@ -697,46 +885,35 @@ async fn cancelling_create_does_not_release_or_abandon_history_gated_publication
 			.open(&history_lock)
 			.unwrap();
 
-		let request = req(&work, &wt, CheckoutTarget::Detached { start });
-		let retained_request = request.clone();
-		let caller =
-			tokio::spawn(
-				async move { create(&retained_request, &Setup::default(), &Setup::default()).await },
-			);
-		for _ in 0..8 {
-			tokio::task::yield_now().await;
-		}
+		let error = create(
+			&req(&work, &wt, CheckoutTarget::Detached { start }),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap_err();
 		assert!(
-			!caller.is_finished(),
-			"{fmt}: create must wait for the repository history gate"
+			matches!(
+				error,
+				CreateError::Failed(LinkedWorktreeError::Repository(
+					gitana_repository::RepositoryError::HistoryLocked
+				))
+			),
+			"{fmt}: got {error:?}"
 		);
 		assert!(
 			!work.join(".git/worktrees").exists(),
-			"{fmt}: no admin history root may publish before acquiring the gate"
+			"{fmt}: no admin folder is published without the gate"
 		);
-
-		caller.abort();
-		assert!(caller.await.unwrap_err().is_cancelled());
-		std::fs::remove_file(&history_lock).unwrap();
-
-		let mut established = false;
-		for _ in 0..100 {
-			if wt.join(".git").is_file() {
-				established = true;
-				break;
-			}
-			tokio::task::spawn_blocking(|| {
-				std::thread::sleep(std::time::Duration::from_millis(10));
-			})
-			.await
-			.unwrap();
-		}
-		assert!(established, "{fmt}: retained create did not finish");
-		assert_eq!(
-			git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
-			head
+		assert!(!wt.exists(), "{fmt}: nor any checkout");
+		assert!(
+			!work.join(".git/worktrees.lock").exists(),
+			"{fmt}: the registration lock is released"
 		);
-		durability_barrier_created(&request).await.unwrap();
+		assert!(
+			history_lock.is_file(),
+			"{fmt}: the other holder's gate is left alone"
+		);
 		let _ = std::fs::remove_dir_all(&base);
 	}
 }
@@ -1431,7 +1608,7 @@ async fn accepts_a_non_utf8_destination_and_round_trips() {
 			.is_ok(),
 			"{fmt}: idempotent re-create over the non-UTF-8 pointers"
 		);
-		let out = std::process::Command::new("git")
+		let out = git_command()
 			.arg("-C")
 			.arg(&dest)
 			.args(["rev-parse", "HEAD"])
@@ -1828,6 +2005,217 @@ async fn a_crashed_create_reads_as_locked_and_prepared_recovery_reclaims_it() {
 		assert_eq!(
 			git(&["-C", wt.to_str().unwrap(), "rev-parse", "HEAD"]).trim(),
 			head
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+}
+
+/// What a worktree's `locked` marker is: a symlink's target, or a file's contents.
+fn describe_lock(marker: &std::path::Path) -> String {
+	match std::fs::read_link(marker) {
+		Ok(target) => format!("symlink to {target:?}"),
+		Err(_) => format!("{:?}", std::fs::read_to_string(marker)),
+	}
+}
+
+/// Prepared recovery honours a lock that isn't the `initializing` marker a crashed create leaves: a
+/// user's lock with a reason, one without, or one whose reason can't be read (a symlinked marker, never
+/// followed, even when its target says `initializing`). A missing checkout is also what a locked
+/// worktree on an unplugged drive looks like, so recovery refuses the partial as locked, as ordinary
+/// `create` does, and leaves it and the lock alone.
+#[tokio::test]
+async fn prepared_recovery_preserves_a_user_locked_partial() {
+	type Lock = fn(&std::path::Path, &std::path::Path, &std::path::Path);
+	let cases: [(&str, Lock, Option<&str>); 3] = [
+		(
+			"with a reason",
+			|work, wt, _| {
+				git(&[
+					"-C",
+					work.to_str().unwrap(),
+					"worktree",
+					"lock",
+					"--reason",
+					"on a removable drive",
+					wt.to_str().unwrap(),
+				]);
+			},
+			Some("on a removable drive"),
+		),
+		(
+			"without a reason",
+			|work, wt, _| {
+				git(&[
+					"-C",
+					work.to_str().unwrap(),
+					"worktree",
+					"lock",
+					wt.to_str().unwrap(),
+				]);
+			},
+			Some(""),
+		),
+		(
+			"symlinked to an initializing marker",
+			|work, _, base| {
+				let target = base.join("elsewhere");
+				std::fs::write(&target, "initializing\n").unwrap();
+				symlink(&target, work.join(".git/worktrees/wt/locked")).unwrap();
+			},
+			None,
+		),
+	];
+	for (fmt, kind) in formats() {
+		for (label, lock, expected) in cases {
+			let base = unique_tmp(&format!("create-recover-user-locked-{fmt}"));
+			let work = base.join("repo");
+			init_repo(&work, fmt);
+			let head = commit_file(&work, "a.txt", "1\n", "init");
+			let wt = base.join("wt");
+			let start = WorktreeObjectId::parse(kind, &head).unwrap();
+			create(
+				&req(&work, &wt, new_branch("feature", start.clone())),
+				&Setup::default(),
+				&Setup::default(),
+			)
+			.await
+			.unwrap();
+			lock(&work, &wt, &base);
+			std::fs::remove_file(wt.join(".git")).unwrap();
+			let admin = work.join(".git/worktrees/wt");
+			let marker_before = describe_lock(&admin.join("locked"));
+
+			let result = recover_prepared_create(
+				&req(&work, &wt, existing_branch("feature", Some(start))),
+				&Setup::default(),
+				&Setup::default(),
+			)
+			.await;
+			assert!(
+				matches!(
+					&result,
+					Err(CreateError::Refused(WorktreeClassification::ProtectedWithReason {
+						reason: ProtectionReason::Locked { reason }
+					})) if reason.as_deref() == expected
+				),
+				"{fmt}, {label}: recovery must refuse the locked partial, got {result:?}"
+			);
+			assert_eq!(
+				describe_lock(&admin.join("locked")),
+				marker_before,
+				"{fmt}, {label}: the lock is left alone"
+			);
+			assert!(
+				admin.join("HEAD").is_file() && !wt.join(".git").exists(),
+				"{fmt}, {label}: the partial is left alone"
+			);
+			let listing = git(&[
+				"-C",
+				work.to_str().unwrap(),
+				"worktree",
+				"list",
+				"--porcelain",
+			]);
+			assert!(
+				porcelain_has(&listing, "locked"),
+				"{fmt}, {label}: git still sees it locked: {listing}"
+			);
+			let _ = std::fs::remove_dir_all(&base);
+		}
+	}
+}
+
+/// The admin folder whose `gitdir` points at `checkout`'s `.git`, by name.
+fn admin_name_for(work: &std::path::Path, checkout: &std::path::Path) -> Option<String> {
+	let want = canonical(checkout).join(".git");
+	std::fs::read_dir(work.join(".git/worktrees"))
+		.unwrap()
+		.flatten()
+		.find(|entry| {
+			std::fs::read_to_string(entry.path().join("gitdir"))
+				.is_ok_and(|gitdir| std::path::Path::new(gitdir.trim()) == want)
+		})
+		.map(|entry| entry.file_name().to_string_lossy().into_owned())
+}
+
+/// A second worktree whose basename is already an admin name takes git's next one (`wt1`), as a second
+/// stock `git worktree add` does, and the first worktree is left exactly as git made it.
+#[tokio::test]
+async fn a_taken_basename_gets_gits_next_admin_name() {
+	for (fmt, kind) in formats() {
+		let base = unique_tmp(&format!("create-taken-name-{fmt}"));
+
+		// The oracle: two stock adds of the same basename.
+		let git_work = base.join("gitrepo");
+		init_repo(&git_work, fmt);
+		let git_head = commit_file(&git_work, "a.txt", "1\n", "init");
+		let gw = git_work.to_str().unwrap();
+		let (git_first, git_second) = (base.join("g1/wt"), base.join("g2/wt"));
+		for checkout in [&git_first, &git_second] {
+			git(&[
+				"-C",
+				gw,
+				"worktree",
+				"add",
+				"--detach",
+				"-q",
+				checkout.to_str().unwrap(),
+				&git_head,
+			]);
+		}
+		let git_name = admin_name_for(&git_work, &git_second);
+
+		// Ours: a stock add, then gitana's create of the same basename.
+		let work = base.join("repo");
+		init_repo(&work, fmt);
+		let head = commit_file(&work, "a.txt", "1\n", "init");
+		let w = work.to_str().unwrap();
+		let (first, second) = (base.join("o1/wt"), base.join("o2/wt"));
+		git(&[
+			"-C",
+			w,
+			"worktree",
+			"add",
+			"--detach",
+			"-q",
+			first.to_str().unwrap(),
+			&head,
+		]);
+		create(
+			&req(
+				&work,
+				&second,
+				CheckoutTarget::Detached {
+					start: WorktreeObjectId::parse(kind, &head).unwrap(),
+				},
+			),
+			&Setup::default(),
+			&Setup::default(),
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(git_name.as_deref(), Some("wt1"), "{fmt}: git's second add");
+		assert_eq!(
+			admin_name_for(&work, &second),
+			git_name,
+			"{fmt}: the same admin name git gives it"
+		);
+		assert_eq!(
+			admin_name_for(&work, &first).as_deref(),
+			Some("wt"),
+			"{fmt}: the first worktree keeps its admin"
+		);
+		let listing = git(&["-C", w, "worktree", "list", "--porcelain"]);
+		for checkout in [&first, &second] {
+			assert!(
+				listing.contains(&format!("worktree {}\n", canonical(checkout).display())),
+				"{fmt}: git lists {checkout:?}: {listing}"
+			);
+		}
+		assert!(
+			git_ok(&["-C", first.to_str().unwrap(), "status", "--porcelain"]),
+			"{fmt}: the first worktree still works"
 		);
 		let _ = std::fs::remove_dir_all(&base);
 	}

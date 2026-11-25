@@ -27,21 +27,13 @@ mod native {
 	};
 	use gitana_worktree::{Index, WorkTree};
 
-	use crate::{InitializingLock, NewWorktreeSetup, Setup};
-
-	use crate::admin_cleanup::{deregister_admin, path_absent, remove_directory_tree};
-	use crate::create_error::CreateError;
-	use crate::facts::{HeadKind, LockState};
-	use crate::inspect::{
-		CrossPointerHealth, DestinationKind, Registration, RequestedBranch, inspect,
+	use crate::{
+		CheckoutTarget, CreateError, CreateRequest, CrossPointerHealth, DestinationKind, HeadKind,
+		InitializingLock, IntoWorktreeObjectId, LinkedWorktreeError, LockState, NewWorktreeSetup,
+		Registration, RegistrationLock, RequestedBranch, Setup, WorktreeClassification,
+		WorktreeInspection, WorktreeObjectId, WorktreeQuery, deregister_admin, detect_kind, inspect,
+		open_store_raw, open_work_dir, path_absent, remove_directory_tree, write_file_atomic,
 	};
-	use crate::object_id::IntoWorktreeObjectId;
-	use crate::pointers::write_file_atomic;
-	use crate::query::WorktreeQuery;
-	use crate::registration_lock::RegistrationLock;
-	use crate::repo_id::{detect_kind, open_store_raw, open_work_dir};
-	use crate::request::{CheckoutTarget, CreateRequest};
-	use crate::{LinkedWorktreeError, WorktreeClassification, WorktreeInspection, WorktreeObjectId};
 
 	/// What the create should do, decided from the inspection against the requested target.
 	enum Action {
@@ -75,7 +67,11 @@ mod native {
 	/// adds that missing authority: it accepts only an [`CheckoutTarget::ExistingBranch`] with an exact
 	/// `expected_start`, and discards the partial only when the retained admin `HEAD`, shared branch,
 	/// repository, destination, and baseline all match that request. The checkout must still lack its
-	/// final `.git` marker. Every mismatch follows ordinary fail-closed create behavior.
+	/// final `.git` marker, and the registration must be unlocked or hold only the `initializing` marker
+	/// a crashed create leaves (gitana's, or an English-language git's): any other lock — a user's, with
+	/// or without a reason, or one whose reason can't be read — is honoured, so the partial is refused as
+	/// `ProtectedWithReason::Locked` and left alone, as ordinary `create` refuses it. Every mismatch
+	/// follows ordinary fail-closed create behavior.
 	pub async fn recover_prepared_create<P: NewWorktreeSetup + Clone + 'static>(
 		request: &CreateRequest,
 		setup: &Setup,
@@ -173,8 +169,12 @@ mod native {
 			return None;
 		};
 		if inspection.destination != request.destination
-			|| !crate::pointers::canonical_eq(&inspection.common_dir, request.repo.common_dir())
+			|| !crate::canonical_eq(&inspection.common_dir, request.repo.common_dir())
 			|| inspection.identity_conflict.is_some()
+			// A user's lock says "keep this", and a missing checkout is what a locked worktree on an
+			// unplugged drive looks like too. Only the marker a crashed create leaves is reclaimable: a
+			// stock add still running has already written the checkout's `.git` by then (checked below).
+			|| !(inspection.lock == LockState::Unlocked || InitializingLock::is_marker(&inspection.lock))
 			|| inspection.cross_pointers != CrossPointerHealth::NotApplicable
 			|| !matches!(
 				inspection.destination_kind,
@@ -186,7 +186,7 @@ mod native {
 		let expected_admin_parent = request.repo.common_dir().join("worktrees");
 		if !admin_dir
 			.parent()
-			.is_some_and(|parent| crate::pointers::canonical_eq(parent, &expected_admin_parent))
+			.is_some_and(|parent| crate::canonical_eq(parent, &expected_admin_parent))
 		{
 			return None;
 		}
@@ -595,15 +595,19 @@ mod native {
 			None => None,
 		};
 
-		// Choose the admin directory. The pointer files (admin `gitdir` → the checkout `.git`, checkout
-		// `.git` → the admin) are serialized **byte-clean** (see `pointers::path_to_bytes`), so a non-UTF-8
-		// identity path round-trips exactly — native paths are accepted without UTF-8 conversion, as required.
-		let admin = unique_admin_dir(common, destination)?;
+		// Name the admin directory; the folder itself is claimed later, exclusively, once the history gate is
+		// held (see `claim_admin_dir`), so a name taken in the meantime moves on to the next suffix. The pointer
+		// files (admin `gitdir` → the checkout `.git`, checkout `.git` → the admin) are serialized
+		// **byte-clean** (see `pointers::path_to_bytes`), so a non-UTF-8 identity path round-trips exactly —
+		// native paths are accepted without UTF-8 conversion, as required.
+		let worktrees = common.join("worktrees");
+		let admin_name = admin_name(destination)?;
 		// On a platform without byte-clean pointer I/O (non-Unix), a non-representable path can't round-trip
 		// the pointers, so reject it **up front** — before the branch/admin/checkout are written — rather than
-		// mutate then fail the post-write inspection. A no-op on Unix (the pointers are byte-clean there).
-		crate::pointers::ensure_representable_path(destination)?;
-		crate::pointers::ensure_representable_path(&admin)?;
+		// mutate then fail the post-write inspection. A no-op on Unix (the pointers are byte-clean there). The
+		// unsuffixed admin path stands for whichever suffix is claimed: the suffix is ASCII digits.
+		crate::ensure_representable_path(destination)?;
+		crate::ensure_representable_path(&worktrees.join(crate::os_string_from_bytes(&admin_name)))?;
 
 		// Create the branch through the transactional ref layer. Strict `-b` requires the ref be absent
 		// (`expected: None`, git's create CAS). git `-B` (`force_reset`) resets an existing *direct* branch:
@@ -690,8 +694,15 @@ mod native {
 		// worktree is non-bare even when the host repository is bare, so git logs its HEAD unless
 		// `core.logAllRefUpdates` is *explicitly* disabled (not the host's bare default of off).
 		let log_head = head_reflog_enabled(&config);
-		let (admin, initializing) =
-			write_admin_layout(&admin, destination, &head, start, &committer, log_head)?;
+		let (admin, initializing) = write_admin_layout(
+			&worktrees,
+			&admin_name,
+			destination,
+			&head,
+			start,
+			&committer,
+			log_head,
+		)?;
 		// git copies the invoking worktree's `config.worktree` into the new one, before the checkout, when
 		// per-worktree config is on: all but `core.bare` (when true) and `core.worktree`.
 		if let Some(bytes) = &request.worktree_config
@@ -783,41 +794,47 @@ mod native {
 		})
 	}
 
-	/// The admin directory for a new worktree, named after the destination's basename — *sanitized* the way
-	/// git sanitizes it (see [`sanitize_worktree_name`]) and uniquified against the existing
-	/// `<common>/worktrees/*` (git appends `1`, `2`, … to the sanitized name on collision).
-	fn unique_admin_dir(common: &Path, destination: &Path) -> Result<PathBuf, LinkedWorktreeError> {
-		// Sanitize the basename's bytes into a refname-safe admin name (git keeps bytes ≥ 0x80 — so a
-		// non-UTF-8 basename keeps its high bytes — and maps only refname-invalid ASCII); the admin `gitdir`
-		// still records the *real* (unsanitized) destination path, byte-clean.
-		let base = sanitize_worktree_name(&crate::pointers::path_to_bytes(Path::new(admin_base_name(
-			destination,
-		)?)));
-		let worktrees = common.join("worktrees");
-		// A candidate is free only when *nothing* — not even a dangling symlink — sits at the path, so
-		// probe with non-following `symlink_metadata`: `Path::exists()` reports a broken symlink as absent
-		// and we would then pick an occupied name and fail `create_dir_all` *after* publishing the branch.
-		let occupied = |path: &Path| path.symlink_metadata().is_ok();
-		// git appends the numeric suffix to the *sanitized* name (digits are always refname-safe). Build the
-		// name in bytes so a non-UTF-8 sanitized name is preserved.
+	/// The admin directory name for a new worktree: the destination's basename, *sanitized* the way git
+	/// sanitizes it (see [`sanitize_worktree_name`]), as bytes. git keeps bytes ≥ 0x80 — so a non-UTF-8
+	/// basename keeps its high bytes — and maps only refname-invalid ASCII; the admin `gitdir` still records
+	/// the *real* (unsanitized) destination path, byte-clean.
+	fn admin_name(destination: &Path) -> Result<Vec<u8>, LinkedWorktreeError> {
+		Ok(sanitize_worktree_name(&crate::path_to_bytes(Path::new(
+			admin_base_name(destination)?,
+		))))
+	}
+
+	/// Claim the new worktree's admin directory: `<worktrees>/<name>`, or on collision `<name>1`, `<name>2`,
+	/// … — git's `add_worktree` loop, digits appended to the sanitized name. Each candidate is made with a
+	/// plain, **exclusive** `mkdir`, so choosing the name and claiming it are one step: anything already at a
+	/// candidate (a directory, a file, even a dangling symlink — `mkdir` refuses them all with `EEXIST`)
+	/// moves on to the next suffix, and a concurrent claimant of the same name — a stock `git worktree add`,
+	/// which `RegistrationLock` does not exclude — can never end up sharing a folder with this create.
+	fn claim_admin_dir(worktrees: &Path, name: &[u8]) -> Result<PathBuf, LinkedWorktreeError> {
+		std::fs::create_dir_all(worktrees)
+			.map_err(|e| LinkedWorktreeError::io("creating worktrees dir", worktrees, e))?;
+		// Build the name in bytes so a non-UTF-8 sanitized name is preserved.
 		let candidate = |suffix: Option<u32>| -> PathBuf {
-			let mut name = base.clone();
+			let mut name = name.to_vec();
 			if let Some(n) = suffix {
 				name.extend_from_slice(n.to_string().as_bytes());
 			}
-			worktrees.join(crate::pointers::os_string_from_bytes(&name))
+			worktrees.join(crate::os_string_from_bytes(&name))
 		};
-		let first = candidate(None);
-		if !occupied(&first) {
-			return Ok(first);
-		}
-		for suffix in 1u32.. {
-			let c = candidate(Some(suffix));
-			if !occupied(&c) {
-				return Ok(c);
+		for suffix in std::iter::once(None).chain((1..=u32::MAX).map(Some)) {
+			let path = candidate(suffix);
+			match std::fs::create_dir(&path) {
+				Ok(()) => return Ok(path),
+				Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+				Err(e) => return Err(LinkedWorktreeError::io("creating admin dir", &path, e)),
 			}
 		}
-		unreachable!("a free worktree admin name always exists")
+		// git dies on the same counter overflow.
+		Err(LinkedWorktreeError::io(
+			"creating admin dir",
+			candidate(None),
+			std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+		))
 	}
 
 	/// The destination's basename as a native `OsStr` — **no UTF-8 requirement** (it becomes the sanitized
@@ -900,28 +917,29 @@ mod native {
 	/// `HEAD`, and (for a non-orphan) `ORIG_HEAD` plus a seeded `logs/HEAD` — returning the canonical admin
 	/// path. The **checkout's** `.git` gitfile is *not* written here (see [`write_checkout_gitfile`]).
 	///
-	/// The admin folder is locked (`initializing`) before anything else is written into it, as git does,
-	/// and the held marker is returned with the path: the caller releases it once the worktree is
+	/// The admin folder is claimed as `<worktrees>/<admin_name>` (or the next free suffix; see
+	/// [`claim_admin_dir`]) and locked (`initializing`) before anything else is written into it, as git
+	/// does; the held marker is returned with the path: the caller releases it once the worktree is
 	/// complete, and an error anywhere before that (here or later) drops it.
 	fn write_admin_layout<H: HashAlgorithm>(
-		admin: &Path,
+		worktrees: &Path,
+		admin_name: &[u8],
 		destination: &Path,
 		head: &HeadState<H>,
 		start: Option<ObjectId<H>>,
 		committer: &str,
 		log_head: bool,
 	) -> Result<(PathBuf, InitializingLock), LinkedWorktreeError> {
-		std::fs::create_dir_all(admin)
-			.map_err(|e| LinkedWorktreeError::io("creating admin dir", admin, e))?;
+		let admin = claim_admin_dir(worktrees, admin_name)?;
 		// Lock the half-built folder so a concurrent prune leaves it alone (git's `add_worktree` order).
-		let initializing = InitializingLock::acquire(admin)?;
+		let initializing = InitializingLock::acquire(&admin)?;
 		std::fs::create_dir_all(destination)
 			.map_err(|e| LinkedWorktreeError::io("creating checkout dir", destination, e))?;
 
 		// Absolute cross-pointer, so each side resolves regardless of the process cwd.
 		let admin = admin
 			.canonicalize()
-			.map_err(|e| LinkedWorktreeError::io("resolving admin dir", admin, e))?;
+			.map_err(|e| LinkedWorktreeError::io("resolving admin dir", &admin, e))?;
 		let destination = destination
 			.canonicalize()
 			.map_err(|e| LinkedWorktreeError::io("resolving checkout dir", destination, e))?;
@@ -932,7 +950,7 @@ mod native {
 		write(admin.join("commondir"), "../..\n".to_owned())?;
 		// `gitdir` records the checkout's real `.git` path, serialized **byte-clean** so a non-UTF-8
 		// destination round-trips exactly (`Path::display()` would lose a non-UTF-8 byte).
-		let mut gitdir_bytes = crate::pointers::path_to_bytes(&gitfile);
+		let mut gitdir_bytes = crate::path_to_bytes(&gitfile);
 		gitdir_bytes.push(b'\n');
 		write_file_atomic(&admin.join("gitdir"), &gitdir_bytes)?;
 		write(admin.join("HEAD"), head.render())?;
@@ -979,7 +997,7 @@ mod native {
 		};
 		// Byte-clean serialization of the admin path, so a non-UTF-8 admin path round-trips exactly.
 		let mut content = b"gitdir: ".to_vec();
-		content.extend_from_slice(&crate::pointers::path_to_bytes(admin));
+		content.extend_from_slice(&crate::path_to_bytes(admin));
 		content.push(b'\n');
 		file
 			.write_all(&content)
@@ -1088,6 +1106,113 @@ mod native {
 	}
 
 	#[cfg(test)]
+	mod claim_tests {
+		use std::collections::BTreeSet;
+		use std::path::{Path, PathBuf};
+		use std::sync::{Arc, Barrier};
+
+		use super::claim_admin_dir;
+
+		/// A fresh, empty `worktrees` folder for one test.
+		fn fresh_worktrees(tag: &str) -> PathBuf {
+			let root = std::env::temp_dir().join(format!("gitana-lw-claim-{tag}-{}", std::process::id()));
+			let _ = std::fs::remove_dir_all(&root);
+			let worktrees = root.join("worktrees");
+			std::fs::create_dir_all(&worktrees).unwrap();
+			worktrees
+		}
+
+		fn names(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<String> {
+			paths
+				.into_iter()
+				.map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+				.collect()
+		}
+
+		/// Claims racing for one name each get a folder of their own — the property a stock `git worktree
+		/// add` of the same basename relies on, since `RegistrationLock` does not exclude it. (Probing for a
+		/// free name and then creating it would hand several of them the same folder.)
+		#[test]
+		fn concurrent_claims_of_one_name_never_share_a_folder() {
+			const CLAIMANTS: usize = 16;
+			let worktrees = fresh_worktrees("concurrent");
+			let start = Arc::new(Barrier::new(CLAIMANTS));
+			let claimants: Vec<_> = (0..CLAIMANTS)
+				.map(|_| {
+					let worktrees = worktrees.clone();
+					let start = Arc::clone(&start);
+					std::thread::spawn(move || {
+						start.wait();
+						claim_admin_dir(&worktrees, b"wt").unwrap()
+					})
+				})
+				.collect();
+			let claimed: Vec<PathBuf> = claimants.into_iter().map(|t| t.join().unwrap()).collect();
+			let expected: BTreeSet<String> = std::iter::once("wt".to_owned())
+				.chain((1..CLAIMANTS).map(|n| format!("wt{n}")))
+				.collect();
+			assert_eq!(
+				names(claimed.clone()),
+				expected,
+				"every claimant got its own folder"
+			);
+			assert_eq!(claimed.len(), CLAIMANTS);
+			assert!(claimed.iter().all(|p| p.is_dir()));
+			let _ = std::fs::remove_dir_all(worktrees.parent().unwrap());
+		}
+
+		/// Whatever already sits at the name — a file, a folder (empty, or a stock add's mid-flight one
+		/// holding its `locked`), a dangling symlink — moves the claim on to the next suffix, untouched.
+		#[test]
+		fn a_taken_name_moves_to_the_next_suffix_and_is_left_alone() {
+			type Prepare = fn(&Path);
+			type Verify = fn(&Path);
+			let cases: Vec<(&str, Prepare, Verify)> = vec![
+				(
+					"file",
+					|p| std::fs::write(p, b"not a dir").unwrap(),
+					|p| assert_eq!(std::fs::read(p).unwrap(), b"not a dir"),
+				),
+				(
+					"empty-dir",
+					|p| std::fs::create_dir(p).unwrap(),
+					|p| assert_eq!(std::fs::read_dir(p).unwrap().count(), 0),
+				),
+				(
+					"adding",
+					|p| {
+						std::fs::create_dir(p).unwrap();
+						std::fs::write(p.join("locked"), b"initializing\n").unwrap();
+					},
+					|p| {
+						assert_eq!(std::fs::read(p.join("locked")).unwrap(), b"initializing\n");
+						assert_eq!(std::fs::read_dir(p).unwrap().count(), 1);
+					},
+				),
+				#[cfg(unix)]
+				(
+					"dangling-symlink",
+					|p| std::os::unix::fs::symlink(p.with_file_name("nowhere"), p).unwrap(),
+					|p| {
+						assert!(p.symlink_metadata().unwrap().file_type().is_symlink());
+						assert_eq!(std::fs::read_link(p).unwrap(), p.with_file_name("nowhere"));
+					},
+				),
+			];
+			for (tag, prepare, verify) in cases {
+				let worktrees = fresh_worktrees(tag);
+				let taken = worktrees.join("wt");
+				prepare(&taken);
+				let claimed = claim_admin_dir(&worktrees, b"wt").unwrap();
+				assert_eq!(claimed, worktrees.join("wt1"), "{tag}");
+				assert!(claimed.is_dir(), "{tag}");
+				verify(&taken);
+				let _ = std::fs::remove_dir_all(worktrees.parent().unwrap());
+			}
+		}
+	}
+
+	#[cfg(test)]
 	mod cleanup_tests {
 		use std::sync::Arc;
 		use std::sync::atomic::{AtomicBool, Ordering};
@@ -1127,6 +1252,6 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{create, recover_prepared_create};
+pub use self::native::{create, recover_prepared_create};
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::{matches_target, request_query};
+pub(crate) use self::native::{matches_target, request_query};

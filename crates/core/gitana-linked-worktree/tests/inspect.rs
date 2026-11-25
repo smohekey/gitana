@@ -5,10 +5,13 @@ mod common;
 
 use std::os::unix::fs::symlink;
 
-use common::*;
 use gitana_linked_worktree::{
 	BranchName, DestinationKind, HeadKind, IdentityConflict, Registration, RequestedBranch, Setup,
 	WorktreeClassification, WorktreeObjectId, WorktreeQuery, classify, inspect, status,
+};
+
+use self::common::{
+	canonical, commit_file, ctx_at, formats, git, git_ok, init_repo, rid_at, unique_tmp,
 };
 
 /// A pure-inspection query (no expected branch), for classifying externally-created worktrees.

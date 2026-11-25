@@ -4,8 +4,9 @@
 
 mod common;
 
-use common::*;
 use gitana_linked_worktree::unpushed_refs;
+
+use self::common::{commit_file, formats, git, init_repo, rid_at, unique_tmp};
 
 /// Point a remote-tracking ref at `commit`, standing in for a completed fetch of the origin.
 fn set_remote(work: &std::path::Path, refname: &str, commit: &str) {

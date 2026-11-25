@@ -5,11 +5,10 @@ use std::path::Path;
 use gitana_file_store::{DurabilityTarget, FileStore};
 use gitana_file_store_local::LocalFileStore;
 
-use crate::admin_cleanup::{open_directory_nofollow, path_absent, remove_empty_directory};
-use crate::create::{matches_target, request_query};
 use crate::{
 	CreateError, CreateRequest, CrossPointerHealth, DestinationKind, LinkedWorktreeError,
 	Registration, RemoveError, RemoveRequest, Setup, WorktreeInspection, WorktreeQuery, inspect,
+	matches_target, open_directory_nofollow, path_absent, remove_empty_directory, request_query,
 };
 
 /// Flush a complete created worktree's checkout and administration before a caller records its
@@ -63,7 +62,7 @@ pub async fn durability_barrier_created(
 /// An otherwise-idempotent empty destination is removed as part of this explicit cleanup boundary.
 /// Success requires both the registration and checkout to remain absent after the directory syncs.
 pub async fn durability_barrier_removed(request: &RemoveRequest) -> Result<(), RemoveError> {
-	let destination = crate::pointers::resolved_path(&request.destination);
+	let destination = crate::resolved_path(&request.destination);
 	let query = WorktreeQuery {
 		repo: request.repo.clone(),
 		destination: request.destination.clone(),

@@ -16,10 +16,33 @@ use gitana_object::HashKind;
 /// repository's config, so repositories a test makes itself (`git clone`, a plain `git init`) are covered.
 const QUIET_MAINTENANCE: [&str; 4] = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"];
 
-/// A `git` command with git's automatic maintenance off (see [`QUIET_MAINTENANCE`]).
-fn git_command() -> Command {
+/// A `git` command that behaves the same on every machine, with git's automatic maintenance off (see
+/// [`QUIET_MAINTENANCE`]). Every git these fixtures run goes through it.
+///
+/// The fixtures build repositories with stock git and check gitana's results against it, so nothing
+/// from the machine may reach that git:
+/// - No global or system config file (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`). A
+///   developer's `core.hooksPath`, `init.defaultRefFormat`, `index.skipHash` or
+///   `status.showUntrackedFiles` otherwise changes what the fixtures build or what git reports.
+/// - No default global ignore or attributes file (`XDG_CONFIG_HOME=/dev/null`): git reads
+///   `~/.config/git/ignore` and `attributes` even with no global config.
+/// - No inherited `GIT_*` variable but `GIT_TRACE*`. git exports `GIT_DIR` and friends to its hooks,
+///   and an inherited `GIT_DIR` beats `-C`, so a suite run from a hook would commit into the outer
+///   repository; `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT` would add config. The trace variables
+///   stay, so what the fixtures' git does can still be traced.
+pub fn git_command() -> Command {
 	let mut command = Command::new("git");
-	command.args(QUIET_MAINTENANCE);
+	for (name, _) in std::env::vars_os() {
+		let spelled = name.to_string_lossy();
+		if spelled.starts_with("GIT_") && !spelled.starts_with("GIT_TRACE") {
+			command.env_remove(&name);
+		}
+	}
+	command
+		.env("GIT_CONFIG_GLOBAL", "/dev/null")
+		.env("GIT_CONFIG_NOSYSTEM", "1")
+		.env("XDG_CONFIG_HOME", "/dev/null")
+		.args(QUIET_MAINTENANCE);
 	command
 }
 

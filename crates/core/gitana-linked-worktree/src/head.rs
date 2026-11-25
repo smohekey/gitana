@@ -9,10 +9,7 @@ use std::path::Path;
 use gitana_object::HashAlgorithm;
 use gitana_repository::HeadState;
 
-use crate::LinkedWorktreeError;
-use crate::error::PointerKind;
-use crate::facts::LockState;
-use crate::pointers::strip_eol_bytes;
+use crate::{LinkedWorktreeError, LockState, PointerKind, strip_eol_bytes};
 
 /// Parse `<git_dir>/HEAD`. `Ok(None)` when the file is absent (no checkout / not a git dir). A **legacy
 /// symlink** HEAD (`.git/HEAD -> refs/heads/main`) is symbolic — git resolves it that way — so its link

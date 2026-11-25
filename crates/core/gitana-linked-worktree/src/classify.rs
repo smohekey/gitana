@@ -3,11 +3,9 @@
 //! *observation*, never an error; it is what a create/remove caller matches on to decide safe-to-act
 //! vs. conflict. `classify` performs no I/O.
 
-use crate::WorktreeObjectId;
-use crate::facts::{HeadKind, LockState};
-use crate::inspect::{
-	CrossPointerHealth, DestinationKind, IdentityConflict, Registration, RequestedBranch,
-	StartRelation, WorktreeInspection,
+use crate::{
+	CrossPointerHealth, DestinationKind, HeadKind, IdentityConflict, LockState, Registration,
+	RequestedBranch, StartRelation, WorktreeInspection, WorktreeObjectId,
 };
 
 /// Why a destination is protected from an automatic effect.
@@ -417,11 +415,15 @@ fn requested_checked_out_elsewhere(requested: &RequestedBranch) -> Option<&std::
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use crate::HeadKind;
-	use crate::inspect::HeadFacts;
-	use gitana_object::HashKind;
 	use std::path::PathBuf;
+
+	use gitana_object::HashKind;
+
+	use super::{ProtectionReason, WorktreeClassification, classify};
+	use crate::{
+		CrossPointerHealth, DestinationKind, HeadFacts, HeadKind, IdentityConflict, LockState,
+		Registration, RequestedBranch, StartRelation, WorktreeInspection, WorktreeObjectId,
+	};
 
 	fn oid(hex: &str) -> WorktreeObjectId {
 		WorktreeObjectId::parse(HashKind::Sha1, hex).unwrap()

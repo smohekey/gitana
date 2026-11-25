@@ -19,7 +19,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::LinkedWorktreeError;
+use crate::{LinkedWorktreeError, LockState};
 
 /// The marker's contents, as git writes them (`write_file` appends the newline).
 const REASON: &[u8] = b"initializing\n";
@@ -51,6 +51,16 @@ impl InitializingLock {
 			.write_all(REASON)
 			.map_err(|e| LinkedWorktreeError::io("locking new admin dir", &lock.path, e))?;
 		Ok(lock)
+	}
+
+	/// Whether `lock` is this marker as inspection reads it back: locked, with the reason readable and
+	/// exactly `initializing`. A lock with any other reason, no reason, or an unreadable one (a symlinked
+	/// marker is never followed) is not, so it can't be told from a user's lock.
+	pub(crate) fn is_marker(lock: &LockState) -> bool {
+		matches!(
+			lock,
+			LockState::Locked { reason: Some(reason) } if reason.as_bytes() == REASON.trim_ascii()
+		)
 	}
 
 	/// Remove the marker now that the worktree is complete, reporting a failure: a marker left behind
