@@ -55,6 +55,13 @@ pub trait RepoCommand {
 	/// Retain the effective command directory for operations that spawn configured child processes.
 	fn set_command_directory(&mut self, _path: std::path::PathBuf, _directory: Dir) {}
 
+	/// Whether git's counterpart of this command (in this mode) reads diff settings, and so refuses a
+	/// bad or valueless `diff.ignoreSubmodules` before doing anything else (probed vs git 2.55). The
+	/// dispatcher checks it as soon as the repository is open.
+	fn reads_diff_settings(&self) -> bool {
+		false
+	}
+
 	async fn run<H: HashAlgorithm>(self, repo: Repository<Backend, H>) -> Result<()>;
 }
 
@@ -67,6 +74,13 @@ pub trait WorkTreeCommand {
 	/// Retain the discovered repository's layout, for operations that open other repositories
 	/// relative to it (such as its submodules).
 	fn set_layout(&mut self, _layout: &RepositoryLayout) {}
+
+	/// Whether git's counterpart of this command (in this mode) reads diff settings, and so refuses a
+	/// bad or valueless `diff.ignoreSubmodules` before doing anything else (probed vs git 2.55). The
+	/// dispatcher checks it as soon as the repository is open.
+	fn reads_diff_settings(&self) -> bool {
+		false
+	}
 
 	async fn run<H: HashAlgorithm>(
 		self,
@@ -147,6 +161,9 @@ async fn on_discovered_repo<C: RepoCommand>(
 		HashKind::Sha1 => {
 			let repository =
 				open_for_config_command::<Sha1>(&found, &setup, retain_config_lease, common, git).await?;
+			if command.reads_diff_settings() {
+				refuse_bad_diff_settings(&repository).await?;
+			}
 			run_with_config_lease(
 				setup,
 				retain_config_lease,
@@ -157,6 +174,9 @@ async fn on_discovered_repo<C: RepoCommand>(
 		HashKind::Sha256 => {
 			let repository =
 				open_for_config_command::<Sha256>(&found, &setup, retain_config_lease, common, git).await?;
+			if command.reads_diff_settings() {
+				refuse_bad_diff_settings(&repository).await?;
+			}
 			run_with_config_lease(
 				setup,
 				retain_config_lease,
@@ -269,6 +289,9 @@ async fn on_discovered_worktree<C: WorkTreeCommand>(
 					found.git_dir,
 					worktree_root,
 				);
+				if command.reads_diff_settings() {
+					refuse_bad_diff_settings(wt.repository()).await?;
+				}
 				let wt = crate::attributes::with_outside_attributes(wt, &root).await?;
 				run_with_config_lease(
 					setup,
@@ -291,6 +314,9 @@ async fn on_discovered_worktree<C: WorkTreeCommand>(
 					found.git_dir,
 					worktree_root,
 				);
+				if command.reads_diff_settings() {
+					refuse_bad_diff_settings(wt.repository()).await?;
+				}
 				let wt = crate::attributes::with_outside_attributes(wt, &root).await?;
 				run_with_config_lease(
 					setup,
@@ -370,6 +396,13 @@ async fn open_for_worktree_config_command<H: HashAlgorithm>(
 /// over the repo's hash algorithm. The dispatcher resolves the spec (including the
 /// index-relative `:<path>` forms, which need the work tree) before handing over the id.
 pub trait ObjectCommand {
+	/// Whether git's counterpart of this command (in this mode) reads diff settings, and so refuses a
+	/// bad or valueless `diff.ignoreSubmodules` before doing anything else (probed vs git 2.55). The
+	/// dispatcher checks it as soon as the repository is open.
+	fn reads_diff_settings(&self) -> bool {
+		false
+	}
+
 	async fn run<H: HashAlgorithm>(
 		self,
 		repo: Repository<Backend, H>,
@@ -385,16 +418,43 @@ pub async fn on_object<C: ObjectCommand>(cwd: &Path, spec: &[u8], command: C) ->
 	let (setup, common, git, work) = repo::command_setup_lease(&found, identity).await?;
 	match detect_algorithm_at(&common, &found.common_dir).await? {
 		HashKind::Sha1 => {
-			let (repo, oid) = resolve_object::<Sha1>(&found, spec, common, git, work).await?;
+			let (repo, oid) = resolve_object::<Sha1>(
+				&found,
+				spec,
+				common,
+				git,
+				work,
+				command.reads_diff_settings(),
+			)
+			.await?;
 			drop(setup);
 			command.run(repo, oid).await
 		}
 		HashKind::Sha256 => {
-			let (repo, oid) = resolve_object::<Sha256>(&found, spec, common, git, work).await?;
+			let (repo, oid) = resolve_object::<Sha256>(
+				&found,
+				spec,
+				common,
+				git,
+				work,
+				command.reads_diff_settings(),
+			)
+			.await?;
 			drop(setup);
 			command.run(repo, oid).await
 		}
 	}
+}
+
+/// Refuse a bad or valueless `diff.ignoreSubmodules` in `repository`'s effective config, as git's
+/// commands that read diff settings do, every scope and `-c` included
+/// ([`IgnoreSubmodules::from_diff_config`](gitana_worktree::IgnoreSubmodules::from_diff_config)).
+pub(crate) async fn refuse_bad_diff_settings<H: HashAlgorithm>(
+	repository: &Repository<Backend, H>,
+) -> Result<()> {
+	let config = repository.effective_config().await?;
+	gitana_worktree::IgnoreSubmodules::from_diff_config(&config)?;
+	Ok(())
 }
 
 /// Resolve `spec` to `(repository, oid)` under `H`. An index-relative spec (`:<path>`)
@@ -406,6 +466,7 @@ async fn resolve_object<H: HashAlgorithm>(
 	common: Dir,
 	git: Dir,
 	work: Option<Dir>,
+	reads_diff_settings: bool,
 ) -> Result<(Repository<Backend, H>, ObjectId<H>)> {
 	let resolve_common = common
 		.try_clone()
@@ -415,6 +476,10 @@ async fn resolve_object<H: HashAlgorithm>(
 		.map_err(|error| anyhow!("opening {}: {error}", found.git_dir.display()))?;
 	let repo =
 		repo::open_generic_from_dirs::<H>(common, git, &found.git_dir, &found.common_dir).await?;
+	// git reads its config before it resolves a revision, so a bad setting is reported first.
+	if reads_diff_settings {
+		refuse_bad_diff_settings(&repo).await?;
+	}
 	let oid = if spec.starts_with(b":") {
 		let worktree_root = found
 			.worktree_root

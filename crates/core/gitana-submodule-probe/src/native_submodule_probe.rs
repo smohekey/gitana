@@ -166,11 +166,9 @@ impl<H: HashAlgorithm> NativeSubmoduleProbe<H> {
 				return Ok(ignore);
 			}
 		}
-		match self.config.get_raw("diff", None, "ignoresubmodules") {
-			Some(Some(value)) => flag_value(value),
-			Some(None) => bail!("missing value for 'diff.ignoresubmodules'"),
-			None => Ok(IgnoreSubmodules::None),
-		}
+		// Every entry is checked, as git checks them; `submodule.<name>.ignore` above is last-value-only,
+		// as git reads it (probed vs git 2.55).
+		Ok(IgnoreSubmodules::from_diff_config(&self.config)?.unwrap_or_default())
 	}
 
 	async fn read_declarations(&self) -> Result<Declarations> {

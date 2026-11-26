@@ -40,6 +40,12 @@ struct Switch<'a> {
 }
 
 impl WorkTreeCommand for Switch<'_> {
+	/// git's switch, and checkout of a branch (which runs this), refuse a bad `diff.ignoreSubmodules`
+	/// (probed vs git 2.55).
+	fn reads_diff_settings(&self) -> bool {
+		true
+	}
+
 	/// The directory the command runs in once the repository is held: the work tree's top when run
 	/// from where `.git` is while `core.worktree` puts the work tree elsewhere, as git changes into it,
 	/// so a relative excludes file is found there.

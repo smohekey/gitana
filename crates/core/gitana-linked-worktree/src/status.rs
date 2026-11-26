@@ -172,6 +172,9 @@ mod native {
 	///
 	/// Files are compared with the index as `setup` says they'd be stored (its config's line endings and
 	/// the attributes files).
+	///
+	/// It fails where gitana's status does ([`WorkTree::status`](gitana_worktree::WorkTree::status)):
+	/// on a bad or valueless `diff.ignoreSubmodules`, as git's status does, and on a sparse index.
 	pub async fn status(
 		repo: &RepositoryId,
 		destination: &Path,
@@ -241,7 +244,8 @@ mod native {
 	/// be a live worktree of `repo` (its main worktree or a registered linked worktree); otherwise this
 	/// is a hard error, never a silently-clean readout. See [`CheckoutSafety`].
 	///
-	/// Files are compared with the index as `setup` says they'd be stored.
+	/// Files are compared with the index as `setup` says they'd be stored. It fails where
+	/// [`status`] does: on a bad or valueless `diff.ignoreSubmodules`, and on a sparse index.
 	pub async fn checkout_safety(
 		repo: &RepositoryId,
 		destination: &Path,

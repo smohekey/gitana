@@ -96,13 +96,19 @@ impl Status {
 }
 
 /// The status of `wt`, with `probe` looking inside its submodules and `flag` the command line's
-/// `--ignore-submodules` (see [`WorkTree::status_with_submodules`]).
+/// `--ignore-submodules` (see [`WorkTree::status_with_submodules`]). With `check_diff_settings`, a
+/// bad `diff.ignoreSubmodules` is refused first, as git's status refuses it
+/// ([`WorkTree::status_without_diff_check`] passes `false`). A sparse index is always refused.
 pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	wt: &WorkTree<F, W, H>,
 	excludes_file: Option<&[u8]>,
 	probe: Option<&dyn SubmoduleProbe<H>>,
 	flag: Option<IgnoreSubmodules>,
+	check_diff_settings: bool,
 ) -> Result<Status, WorktreeError> {
+	if check_diff_settings {
+		refuse_bad_diff_settings(wt).await?;
+	}
 	// `core.fileMode` (git's `trust_executable_bit`): when `false`, an executable-bit-only difference between
 	// the working tree and the index is *not* a modification. Resolved with git's worktree precedence — a
 	// per-worktree override in `config.worktree` (when `extensions.worktreeConfig` is set) wins over the common
@@ -111,6 +117,10 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 	let file_mode = worktree_file_mode(wt).await;
 	let index_time = wt.index_time().await?;
 	let index = wt.load_index().await?;
+	// A sparse index's folder entries aren't unfolded here, so what this said would be wrong.
+	if index.has_sparse_directories() {
+		return Err(WorktreeError::SparseIndex);
+	}
 	// Working files are compared with the index as they'd be stored, as git compares them.
 	let mut checkin = Converter::check_in(wt, &index, index_time).await?;
 	let index_map: HashMap<GitPath, (String, ObjectId<H>)> = index
@@ -463,6 +473,51 @@ pub(crate) async fn has_staged_changes<F: FileStore, W: WorkDirFs, H: HashAlgori
 		.map(|e| (e.path.clone(), (format!("{:o}", e.mode), e.oid)))
 		.collect();
 	Ok(index_map != head_entries(wt).await?)
+}
+
+/// Refuse a bad or valueless `diff.ignoreSubmodules` ([`IgnoreSubmodules::from_diff_config`]) where
+/// git's status would. The config is the effective one the frontend installed (every scope, and the
+/// command line's `-c`). Without one, it's the local config and, when `extensions.worktreeConfig` is
+/// on, `config.worktree`, as [`worktree_file_mode`] reads them. A missing file is no settings, as
+/// git takes it; any other read or parse error fails, as git's would.
+async fn refuse_bad_diff_settings<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+) -> Result<(), WorktreeError> {
+	let repository = wt.repository();
+	if repository.has_effective_config() {
+		IgnoreSubmodules::from_diff_config(&repository.effective_config().await?)?;
+		return Ok(());
+	}
+	let common = match repository.read_config().await {
+		Ok(config) => config,
+		Err(gitana_repository::RepositoryError::FileStore(FileStoreError::NotFound)) => {
+			return Ok(());
+		}
+		Err(error) => return Err(error.into()),
+	};
+	IgnoreSubmodules::from_diff_config(&common)?;
+	// An invalid `extensions.worktreeConfig` is left to what reads it; this only adds the override.
+	let per_worktree = common
+		.get_bool("extensions", None, "worktreeconfig")
+		.ok()
+		.flatten()
+		.unwrap_or(false);
+	if per_worktree {
+		match repository
+			.objects()
+			.file_store()
+			.read_path("config.worktree")
+			.await
+		{
+			Ok(bytes) => {
+				let over = gitana_config::GitConfig::parse(&String::from_utf8_lossy(&bytes))?;
+				IgnoreSubmodules::from_diff_config(&over)?;
+			}
+			Err(FileStoreError::NotFound) => {}
+			Err(error) => return Err(error.into()),
+		}
+	}
+	Ok(())
 }
 
 /// The effective `core.fileMode` for this worktree, honouring git's worktree-config precedence: a
@@ -1101,7 +1156,7 @@ mod tests {
 		index.entries.push(entry("b.txt", b"BBBB"));
 		wt.save_index(&index).await.unwrap();
 		let changed = async || {
-			compute(&wt, None, None, None)
+			compute(&wt, None, None, None, true)
 				.await
 				.unwrap()
 				.changed

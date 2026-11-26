@@ -415,8 +415,10 @@ async fn status_fails_closed_on_worktree_config_include() {
 #[tokio::test]
 async fn status_fails_closed_on_malformed_worktree_config() {
 	// With extensions.worktreeConfig, common fileMode=false, and a *malformed* config.worktree, we cannot
-	// establish false — fail closed to true (honour the exec bit). git errors here; the key point is that we do
-	// not silently fall back to the common false and treat a modified checkout as clean.
+	// establish false. git errors here ("bad config line 1 in file .git/config.worktree", probed vs git 2.55),
+	// and so does `status`, which reads that file for `diff.ignoreSubmodules`. The status that skips that
+	// check fails closed to true (honour the exec bit). Either way, a modified checkout is never taken as
+	// clean by silently falling back to the common false.
 	use std::os::unix::fs::PermissionsExt;
 	if !git_supports_sha256() {
 		eprintln!("skipping: git without --object-format=sha256");
@@ -453,9 +455,15 @@ async fn status_fails_closed_on_malformed_worktree_config() {
 	let repo = Repository::new(ObjectStore::<_, Sha256>::new(LocalFileStore::from_dir(
 		open_dir(&git_dir),
 	)));
+	let tree = WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir);
+	let error = tree.status(None).await.unwrap_err();
+	assert!(
+		matches!(error, gitana_worktree::WorktreeError::Config(_)),
+		"a malformed config.worktree fails the status, as git's: {error:?}"
+	);
 	let ours = sorted(
-		&WorkTree::new(repo, CapWorkDir::from_dir(open_dir(&work)), &git_dir)
-			.status(None)
+		&tree
+			.status_without_diff_check(None)
 			.await
 			.unwrap()
 			.porcelain_v1(),

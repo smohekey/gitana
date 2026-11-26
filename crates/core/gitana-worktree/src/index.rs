@@ -193,6 +193,16 @@ impl<H: HashAlgorithm> Index<H> {
 		self.entry(path).is_some_and(|entry| entry.skip_worktree)
 	}
 
+	/// Whether this is a **sparse index**: one with a sparse-directory entry, a `040000` (tree) mode
+	/// entry standing for a whole collapsed folder outside the sparse checkout. A normal index never
+	/// has one.
+	pub(crate) fn has_sparse_directories(&self) -> bool {
+		self
+			.entries
+			.iter()
+			.any(|entry| entry.mode & 0o170000 == 0o040000)
+	}
+
 	/// Insert or replace the entry for its path, keeping the entries sorted. Any other stages for the
 	/// path (a recorded conflict) are dropped, so staging a resolved file collapses it to stage 0.
 	pub fn upsert(&mut self, entry: IndexEntry<H>) {

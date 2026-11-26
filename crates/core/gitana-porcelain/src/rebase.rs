@@ -73,8 +73,10 @@ pub async fn rebase<F: FileStore, W: WorkDirFs, H: HashAlgorithm, S: Signer>(
 	// unstaged changes don't count: git's gate ignores new commits, modified or untracked content, and
 	// a deleted or replaced mount (probed vs git 2.55). Its gate ignores a staged gitlink change too,
 	// but the pick then fails ("your local changes would be overwritten by rebase") with the rebase
-	// left in progress; gitana refuses that up front instead, before anything moves.
-	let status = wt.status(None).await?;
+	// left in progress; gitana refuses that up front instead, before anything moves. git's rebase
+	// doesn't read diff settings, so a bad `diff.ignoreSubmodules` doesn't stop it (probed vs git
+	// 2.55), and the gate's status doesn't check it.
+	let status = wt.status_without_diff_check(None).await?;
 	if status
 		.changed
 		.iter()

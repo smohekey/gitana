@@ -53,6 +53,7 @@ pub struct WorktreeQuery {
 	/// `classify` can report a dirty/conflicted worktree as `ProtectedWithReason::Dirty`. `false` (the
 	/// default for a pure inspection) skips the scan — status is only needed before a cleanup decision
 	/// (removal), so a plain `inspect` stays cheap. Only a present, cross-pointer-consistent live checkout is
-	/// statused; a missing/partial checkout has no status to compute.
+	/// statused; a missing/partial checkout has no status to compute, and one with a sparse index is
+	/// reported by [`WorktreeInspection::sparse_index`](crate::WorktreeInspection::sparse_index) instead.
 	pub with_status: bool,
 }

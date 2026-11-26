@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{Backend, PathQuoteMode};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use gitana_object::HashAlgorithm;
 use gitana_repository_layout::RepositoryLayout;
 use gitana_submodule_probe::NativeSubmoduleProbe;
@@ -47,6 +47,13 @@ struct Status {
 }
 
 impl WorkTreeCommand for Status {
+	/// git's status refuses a `diff.ignoreSubmodules` it can't read, whether or not there's a
+	/// submodule or a flag to outrank it, before anything else (probed vs git 2.55). The library's
+	/// status checks too; this keeps git's order, ahead of `core.quotePath` and the excludes file.
+	fn reads_diff_settings(&self) -> bool {
+		true
+	}
+
 	/// The directory the command runs in once the repository is held: the work tree's top when run
 	/// from where `.git` is while `core.worktree` puts the work tree elsewhere, as git changes into it,
 	/// so a relative excludes file is found there.
@@ -68,15 +75,6 @@ impl WorkTreeCommand for Status {
 		// outside the worktree, so resolve its content here and pass it in. `core.ignoreCase` and
 		// `.git/info/exclude` are read inside the worktree crate.
 		let config = worktree.repository().effective_config().await?;
-		// git's status refuses a `diff.ignoreSubmodules` it can't read, whether or not there's a
-		// submodule or a flag to outrank it (probed vs git 2.55).
-		match config.get_raw("diff", None, "ignoresubmodules") {
-			Some(Some(value)) if IgnoreSubmodules::parse(value).is_none() => {
-				bail!("bad --ignore-submodules argument: {value}");
-			}
-			Some(None) => bail!("missing value for 'diff.ignoresubmodules'"),
-			_ => {}
-		}
 		let configured_quote_path = config
 			.get_bool_validated("core", None, "quotepath")?
 			.unwrap_or(true);

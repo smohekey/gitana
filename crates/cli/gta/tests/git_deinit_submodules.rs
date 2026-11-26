@@ -249,3 +249,48 @@ fn refuses_what_git_cannot_absorb() {
 		);
 	}
 }
+
+#[test]
+fn refuses_a_bad_setting_the_submodule_s_status_sees_as_git_does() {
+	// git's deinit runs the submodule's status, which reads the submodule's own config and the global
+	// one, but not the superproject's (probed vs git 2.55).
+	for format in ["sha1", "sha256"] {
+		for (label, change, refused) in [
+			(
+				"in the submodule's config",
+				"g -C sub config diff.ignoreSubmodules bogus",
+				true,
+			),
+			(
+				"valueless, in the submodule's config",
+				r"printf '[diff]\n\tignoreSubmodules\n' >> .git/modules/sub/config",
+				true,
+			),
+			(
+				"in the global config",
+				r#"printf '[diff]\n\tignoreSubmodules = bogus\n' >> "$HOME/gitconfig""#,
+				true,
+			),
+			(
+				"in the superproject's config",
+				"g config diff.ignoreSubmodules bogus",
+				false,
+			),
+		] {
+			let (git, gta) = compare(format, label, "inner", change);
+			assert_eq!(
+				!git.status.success(),
+				refused,
+				"{label} ({format}): git {git:?}"
+			);
+			if refused {
+				let stderr = String::from_utf8_lossy(&gta.stderr);
+				assert!(
+					stderr.contains("bad --ignore-submodules argument: bogus")
+						|| stderr.contains("missing value for 'diff.ignoresubmodules'"),
+					"{label} ({format}): {gta:?}"
+				);
+			}
+		}
+	}
+}

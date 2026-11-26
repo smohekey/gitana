@@ -395,6 +395,13 @@ submodules) and its new commits, for the layouts the routed store can't read. It
 `-dirty` suffix and `ls-files -m` are unchanged: both still compare the checked-out commit alone, as
 `ls-files -m` does in git.
 
+The module's own status is `WorkTree::status`, so it refuses what that refuses: a bad or valueless
+`diff.ignoreSubmodules` in the module's config (with `-c` and the global config), as the status git
+runs in a submodule refuses one, and a sparse index, which git reads but gitana's status can't.
+Either fails the superproject's status, naming the submodule, unless the setting in effect is `dirty`
+or `all`, which don't look inside. Deinit's check is the same status, so a bad setting the
+submodule's status sees refuses deinit too, as git's does.
+
 The module repository's `core.worktree`, its mount marker, its index/worktree checkout, and detached
 `HEAD` are maintained as separate publications. The module repository directory remains
 identity-pinned across all four: config edits resolve `config` and any symlink target from that open

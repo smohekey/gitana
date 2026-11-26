@@ -2214,6 +2214,12 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 	///
 	/// Submodules are looked inside with the probe [`Self::with_submodule_probe`] gave, and the
 	/// [`Self::with_ignore_submodules`] setting applies.
+	///
+	/// It refuses what git's status refuses: a bad or valueless `diff.ignoreSubmodules`
+	/// ([`IgnoreSubmodules::from_diff_config`]), in the installed effective config or, without one, in
+	/// the local config and `config.worktree`. It also refuses a sparse index, which git reads but
+	/// gitana's status can't ([`WorktreeError::SparseIndex`]). For a caller whose git command doesn't
+	/// read diff settings, there's [`Self::status_without_diff_check`].
 	pub async fn status(&self, excludes_file: Option<&[u8]>) -> Result<Status, WorktreeError> {
 		self
 			.status_with_submodules(
@@ -2234,7 +2240,25 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 		probe: Option<&dyn SubmoduleProbe<H>>,
 		flag: Option<IgnoreSubmodules>,
 	) -> Result<Status, WorktreeError> {
-		crate::status::compute(self, excludes_file, probe, flag).await
+		crate::status::compute(self, excludes_file, probe, flag, true).await
+	}
+
+	/// [`Self::status`] without refusing a bad or valueless `diff.ignoreSubmodules`, for a caller
+	/// whose git command doesn't read diff settings: git's `rebase`, `cherry-pick`, `revert`, `reset`,
+	/// `add` and `stash apply` proceed where its `status` refuses (probed vs git 2.55). It still
+	/// refuses a sparse index, since what it said would be wrong either way.
+	pub async fn status_without_diff_check(
+		&self,
+		excludes_file: Option<&[u8]>,
+	) -> Result<Status, WorktreeError> {
+		crate::status::compute(
+			self,
+			excludes_file,
+			self.submodule_probe(),
+			self.ignore_submodules(),
+			false,
+		)
+		.await
 	}
 
 	/// git `ls-files`: list index and/or working-tree paths selected by `opts` and filtered by
@@ -2318,13 +2342,12 @@ impl<F: FileStore, W: WorkDirFs, H: HashAlgorithm> WorkTree<F, W, H> {
 
 	/// Whether the index is a **sparse index** (`git sparse-checkout --cone --sparse-index`): it carries a
 	/// *sparse-directory entry* — a `040000` (tree) mode entry that stands in for a whole collapsed out-of-cone
-	/// directory instead of its individual blobs. gitana does not expand these, so `status()` would compare the
-	/// collapsed directory against the expanded HEAD tree and report spurious add/delete pairs. Callers that
-	/// must reason about the working tree (e.g. safe removal) use this to refuse honestly rather than trust that
-	/// bogus status. A normal index never contains a `040000` entry, so this is a reliable discriminator.
+	/// directory instead of its individual blobs. gitana does not expand these, so [`Self::status`] refuses
+	/// one ([`WorktreeError::SparseIndex`]) rather than report spurious add/delete pairs. A caller that wants
+	/// to refuse in its own words (e.g. safe removal) asks this first. A normal index never contains a
+	/// `040000` entry, so this is a reliable discriminator.
 	pub async fn is_sparse_index(&self) -> Result<bool, WorktreeError> {
-		let index = self.load_index().await?;
-		Ok(index.entries.iter().any(|e| e.mode & 0o170000 == 0o040000))
+		Ok(self.load_index().await?.has_sparse_directories())
 	}
 
 	/// Content changes between the index and the working tree (`git diff`).

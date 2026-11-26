@@ -302,6 +302,9 @@ async fn pull_into<H: HashAlgorithm>(
 	// lease while a detached config or checkout worker can still observe the Windows publication gap.
 	let (worktree, command_path, cwd_directory, mutation_guard) =
 		open_merge_worktree::<H>(found, identity, &work, command_directory).await?;
+	// git's pull fetches, then its merge refuses a bad `diff.ignoreSubmodules`, with the fetch kept
+	// (probed vs git 2.55).
+	crate::dispatch::refuse_bad_diff_settings(worktree.repository()).await?;
 	let identity = CliIdentity::new(worktree.repository());
 
 	// A pull's merge commit is signed when git config requests it, like a plain `gta merge`.
