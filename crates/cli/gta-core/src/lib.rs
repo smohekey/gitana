@@ -26,6 +26,8 @@ mod ssh;
 mod submodule_configuration;
 mod submodule_transfer;
 mod submodule_update_strategy;
+#[cfg(test)]
+mod test_wait;
 mod url_rewrite;
 
 pub(crate) use clone_destination::CloneDestination;

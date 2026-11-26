@@ -2979,13 +2979,35 @@ fn lock_file(file: &File, path: &Path, wait: bool) -> Result<(), SubmoduleError>
 			source,
 		})
 	} else {
-		File::try_lock(file).map_err(|error| match error {
+		try_lock_with_grace(|| File::try_lock(file)).map_err(|error| match error {
 			std::fs::TryLockError::WouldBlock => SubmoduleError::UpdateLocked,
 			std::fs::TryLockError::Error(source) => SubmoduleError::Io {
 				path: path.to_owned(),
 				source,
 			},
 		})
+	}
+}
+
+/// How long a nonblocking lock keeps trying before it reports contention. A lock just released can
+/// look held for a moment: a child process this program starts on another thread keeps a copy of
+/// its descriptor until it execs. Measured: of 20,000 immediate re-locks with processes spawning
+/// alongside, 112 blocked on macOS (the longest for 5 ms) and 4 on Linux (1.1 ms); waiting cleared
+/// every one. A lock someone really holds is still refused, this much later.
+const CONTENTION_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// `attempt`, retried while it would block, until [`CONTENTION_GRACE`] has passed.
+fn try_lock_with_grace(
+	attempt: impl Fn() -> Result<(), std::fs::TryLockError>,
+) -> Result<(), std::fs::TryLockError> {
+	let deadline = std::time::Instant::now() + CONTENTION_GRACE;
+	loop {
+		match attempt() {
+			Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+				std::thread::sleep(std::time::Duration::from_millis(1));
+			}
+			result => return result,
+		}
 	}
 }
 
@@ -3128,7 +3150,7 @@ fn lock_file_shared(file: &File, path: &Path, wait: bool) -> Result<(), Submodul
 			source,
 		})
 	} else {
-		File::try_lock_shared(file).map_err(|error| match error {
+		try_lock_with_grace(|| File::try_lock_shared(file)).map_err(|error| match error {
 			std::fs::TryLockError::WouldBlock => SubmoduleError::UpdateLocked,
 			std::fs::TryLockError::Error(source) => SubmoduleError::Io {
 				path: path.to_owned(),

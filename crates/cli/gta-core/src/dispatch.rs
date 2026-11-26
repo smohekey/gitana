@@ -507,6 +507,24 @@ async fn resolve_object<H: HashAlgorithm>(
 	Ok((repo, oid))
 }
 
+/// Take `file`'s lock once it's free, failing if it isn't within five seconds. A lock just
+/// released can look held for a moment: a child process another test starts then keeps a copy of
+/// its descriptor until it execs. Measured: of 20,000 immediate re-locks with a thread spawning
+/// processes alongside, 5 blocked on Linux and 163 on macOS; none without.
+#[cfg(all(test, any(unix, windows)))]
+fn lock_once_released(file: &std::fs::File) {
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+	loop {
+		match file.try_lock() {
+			Ok(()) => return,
+			Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+				std::thread::sleep(std::time::Duration::from_millis(1));
+			}
+			Err(error) => panic!("the lock wasn't released: {error:?}"),
+		}
+	}
+}
+
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
 	use std::fs::{OpenOptions, TryLockError};
@@ -514,7 +532,7 @@ mod tests {
 	use cap_std::{ambient_authority, fs::Dir};
 	use gitana_submodule::acquire_submodule_config_mutation_lease;
 
-	use super::run_with_config_lease;
+	use super::{lock_once_released, run_with_config_lease};
 
 	#[tokio::test]
 	async fn config_lease_runner_retains_or_releases_serialization_as_requested() {
@@ -554,7 +572,7 @@ mod tests {
 					.write(true)
 					.open(&lock_path)
 					.unwrap();
-				competing.try_lock().unwrap();
+				lock_once_released(&competing);
 				Ok(())
 			}),
 		)
@@ -582,8 +600,8 @@ mod worktree_tests {
 	use gitana_worktree::WorkTree;
 
 	use super::{
-		ConfigAccess, RepoCommand, WorkTreeCommand, detect_algorithm_at, on_discovered_repo,
-		on_discovered_worktree, on_worktree,
+		ConfigAccess, RepoCommand, WorkTreeCommand, detect_algorithm_at, lock_once_released,
+		on_discovered_repo, on_discovered_worktree, on_worktree,
 	};
 	use crate::repo;
 	use crate::{Backend, RetainedCommandDirectory, WorkDir};
@@ -802,12 +820,7 @@ mod worktree_tests {
 			},
 		);
 		let inspect = async {
-			for _ in 0..100_000 {
-				if entered.load(Ordering::SeqCst) {
-					break;
-				}
-				tokio::task::yield_now().await;
-			}
+			crate::test_wait::yield_until(|| entered.load(Ordering::SeqCst)).await;
 			assert!(entered.load(Ordering::SeqCst));
 
 			let competing = OpenOptions::new().read(true).open(&refs).unwrap();
@@ -820,7 +833,7 @@ mod worktree_tests {
 		};
 		let (result, competing) = tokio::join!(operation, inspect);
 		result.unwrap();
-		competing.try_lock().unwrap();
+		lock_once_released(&competing);
 	}
 
 	#[tokio::test]

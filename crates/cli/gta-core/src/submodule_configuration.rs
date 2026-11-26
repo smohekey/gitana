@@ -2247,12 +2247,7 @@ mod tests {
 				)
 				.await
 		});
-		for _ in 0..100_000 {
-			if entered.load(Ordering::SeqCst) {
-				break;
-			}
-			tokio::task::yield_now().await;
-		}
+		crate::test_wait::yield_until(|| entered.load(Ordering::SeqCst)).await;
 		assert!(entered.load(Ordering::SeqCst));
 
 		let displaced = temporary_root.join("displaced");
@@ -2358,15 +2353,7 @@ mod tests {
 				)
 				.await
 		});
-		for _ in 0..100_000 {
-			if entered.load(Ordering::SeqCst) {
-				break;
-			}
-			if task.is_finished() {
-				break;
-			}
-			tokio::task::yield_now().await;
-		}
+		crate::test_wait::yield_until(|| entered.load(Ordering::SeqCst) || task.is_finished()).await;
 		if !entered.load(Ordering::SeqCst) {
 			panic!(
 				"set-url finished before module publication: {:?}",
@@ -2641,12 +2628,7 @@ mod tests {
 				.marker_target_matches(&mount, "alias", expected)
 				.await
 		});
-		for _ in 0..100_000 {
-			if entered.load(Ordering::SeqCst) {
-				break;
-			}
-			tokio::task::yield_now().await;
-		}
+		crate::test_wait::yield_until(|| entered.load(Ordering::SeqCst)).await;
 		assert!(entered.load(Ordering::SeqCst));
 
 		std::fs::remove_file(&alias).unwrap();
@@ -2992,15 +2974,7 @@ mod tests {
 				)
 				.await
 		});
-		for _ in 0..100_000 {
-			if entered.load(Ordering::SeqCst) {
-				break;
-			}
-			if task.is_finished() {
-				break;
-			}
-			tokio::task::yield_now().await;
-		}
+		crate::test_wait::yield_until(|| entered.load(Ordering::SeqCst) || task.is_finished()).await;
 		if !entered.load(Ordering::SeqCst) {
 			panic!(
 				"sync completed before terminal validation: {:?}",
@@ -3161,12 +3135,7 @@ mod tests {
 				.init(&InitRequest::default(), running_configuration.as_ref())
 				.await
 		});
-		for _ in 0..100_000 {
-			if entered.load(Ordering::SeqCst) {
-				break;
-			}
-			tokio::task::yield_now().await;
-		}
+		crate::test_wait::yield_until(|| entered.load(Ordering::SeqCst)).await;
 		assert!(entered.load(Ordering::SeqCst));
 
 		task.abort();
@@ -3318,12 +3287,7 @@ mod tests {
 				)
 				.await
 		});
-		for _ in 0..100_000 {
-			if entered.load(Ordering::SeqCst) {
-				break;
-			}
-			tokio::task::yield_now().await;
-		}
+		crate::test_wait::yield_until(|| entered.load(Ordering::SeqCst)).await;
 		assert!(entered.load(Ordering::SeqCst));
 		std::fs::remove_file(temporary.path().join("alias")).unwrap();
 		symlink("foreign", temporary.path().join("alias")).unwrap();
