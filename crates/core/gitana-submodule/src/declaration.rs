@@ -247,7 +247,7 @@ mod tests {
 			 [submodule \"unselected\"]\n\tshallow = invalid\n\tshallow = false\n",
 		)
 		.unwrap_err();
-		assert!(error.to_string().contains("not a boolean"));
+		assert!(crate::error::with_causes(&error).contains("not a boolean"));
 	}
 
 	#[test]

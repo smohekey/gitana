@@ -22,22 +22,23 @@ impl SyncFailure {
 	}
 }
 
+/// With a module, its own context ("synchronizing submodule '<m>'"), the inner error following as its
+/// [`source`](std::error::Error::source), as chain printers show it. Without one, the inner error's
+/// message, the wrapper passing on the inner error's own source: each message once in the chain.
 impl fmt::Display for SyncFailure {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		if let Some(module) = &self.module {
-			write!(
-				formatter,
-				"synchronizing submodule '{module}': {}",
-				self.source
-			)
-		} else {
-			fmt::Display::fmt(&self.source, formatter)
+		match &self.module {
+			Some(module) => write!(formatter, "synchronizing submodule '{module}'"),
+			None => fmt::Display::fmt(&self.source, formatter),
 		}
 	}
 }
 
 impl std::error::Error for SyncFailure {
 	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-		Some(&self.source)
+		match self.module {
+			Some(_) => Some(&self.source),
+			None => std::error::Error::source(&self.source),
+		}
 	}
 }

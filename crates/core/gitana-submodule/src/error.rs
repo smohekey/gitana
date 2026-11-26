@@ -3,23 +3,27 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 /// A structured failure from a submodule consumer operation.
+///
+/// A variant wrapping another error says only its own context; the wrapped error is its
+/// [`source`](std::error::Error::source), so a chain printer (gta's, anyhow's `{:#}`) shows each
+/// message once. A plain `{}` shows the context alone.
 #[derive(Debug, Error)]
 pub enum SubmoduleError {
 	#[error("submodule operations require a working tree")]
 	BareRepository,
-	#[error("opening {path}: {source}")]
+	#[error("opening {path}")]
 	Open {
 		path: PathBuf,
 		#[source]
 		source: std::io::Error,
 	},
-	#[error("reading submodule metadata: {0}")]
+	#[error("reading submodule metadata")]
 	Worktree(#[from] gitana_worktree::WorktreeError),
-	#[error("reading repository metadata: {0}")]
+	#[error("reading repository metadata")]
 	Repository(#[from] gitana_repository::RepositoryError),
-	#[error("reading repository objects: {0}")]
+	#[error("reading repository objects")]
 	ObjectStore(#[from] gitana_object_store::ObjectStoreError),
-	#[error("invalid .gitmodules: {0}")]
+	#[error("invalid .gitmodules")]
 	Config(#[from] gitana_config::ConfigError),
 	#[error("accessing superproject configuration: {0}")]
 	Configuration(String),
@@ -100,10 +104,111 @@ pub enum SubmoduleError {
 		.to.display()
 	)]
 	AbsorbBlocked { from: PathBuf, to: PathBuf },
-	#[error("submodule filesystem error at {path}: {source}")]
+	#[error("submodule filesystem error at {path}")]
 	Io {
 		path: PathBuf,
 		#[source]
 		source: std::io::Error,
 	},
+}
+
+/// `error`'s message followed by each of its sources', joined as a chain printer joins them: for an
+/// error frozen into a string, which keeps no source of its own to show the rest.
+pub(crate) fn with_causes(error: &(dyn std::error::Error + 'static)) -> String {
+	let mut text = error.to_string();
+	let mut source = error.source();
+	while let Some(cause) = source {
+		text.push_str(": ");
+		text.push_str(&cause.to_string());
+		source = cause.source();
+	}
+	text
+}
+
+#[cfg(test)]
+mod tests {
+	use super::SubmoduleError;
+	use crate::{DeinitFailure, SyncFailure, UpdateFailure};
+
+	/// `error`'s message and each of its sources', as a chain printer shows them.
+	fn chain(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
+		let mut messages = vec![error.to_string()];
+		let mut source = error.source();
+		while let Some(cause) = source {
+			messages.push(cause.to_string());
+			source = cause.source();
+		}
+		messages
+	}
+
+	fn io() -> SubmoduleError {
+		SubmoduleError::Io {
+			path: "/p".into(),
+			source: std::io::Error::other("boom"),
+		}
+	}
+
+	#[test]
+	fn a_wrapping_variant_says_only_its_context_and_passes_on_the_rest() {
+		assert_eq!(chain(&io()), ["submodule filesystem error at /p", "boom"]);
+		let open = SubmoduleError::Open {
+			path: "/p".into(),
+			source: std::io::Error::other("boom"),
+		};
+		assert_eq!(chain(&open), ["opening /p", "boom"]);
+		let parse = gitana_config::GitConfig::parse("[").unwrap_err();
+		let config = SubmoduleError::from(gitana_config::GitConfig::parse("[").unwrap_err());
+		assert_eq!(
+			chain(&config),
+			["invalid .gitmodules".to_owned(), parse.to_string()]
+		);
+	}
+
+	#[test]
+	fn each_failure_says_each_message_once() {
+		let inner = ["submodule filesystem error at /p", "boom"];
+		let named = |context: &str| {
+			std::iter::once(context.to_owned())
+				.chain(inner.map(str::to_owned))
+				.collect::<Vec<_>>()
+		};
+		let deinit = DeinitFailure {
+			completed: Default::default(),
+			module: Some("m".into()),
+			source: io(),
+		};
+		assert_eq!(chain(&deinit), named("deinitializing submodule 'm'"));
+		let update = UpdateFailure {
+			completed: Default::default(),
+			module: Some("m".into()),
+			source: io(),
+		};
+		assert_eq!(chain(&update), named("updating submodule 'm'"));
+		let sync = SyncFailure {
+			completed: Default::default(),
+			module: Some("m".into()),
+			source: io(),
+		};
+		assert_eq!(chain(&sync), named("synchronizing submodule 'm'"));
+
+		// Without a module, a failure is the inner error itself.
+		let preflight = DeinitFailure {
+			completed: Default::default(),
+			module: None,
+			source: io(),
+		};
+		assert_eq!(chain(&preflight), inner);
+		let update = UpdateFailure {
+			completed: Default::default(),
+			module: None,
+			source: io(),
+		};
+		assert_eq!(chain(&update), inner);
+		let sync = SyncFailure {
+			completed: Default::default(),
+			module: None,
+			source: io(),
+		};
+		assert_eq!(chain(&sync), inner);
+	}
 }

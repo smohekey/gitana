@@ -336,9 +336,15 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   gitlink and a file or symlink either way, and a folder holding a repository with a commit where a
   file was. A file whose path is now any other folder is ` D`, and the folder isn't listed as
   untracked. `ls-files -m` and `-d` are unchanged, as git's are.
-- [ ] Print each deinit refusal once: `gta submodule deinit` renders a preflight refusal twice
-  (`DeinitFailure` displays its source and also returns it as `source()`, and `render_error` joins
-  the chain).
+- [x] Print each submodule refusal once. `DeinitFailure`, `UpdateFailure` and `SyncFailure`, and
+  `SubmoduleError`'s `Open`, `Io`, `Worktree`, `Repository`, `ObjectStore` and `Config`, each
+  displayed their inner error and also returned it from `source()`, so a chain printer showed it
+  twice. Now each says only its own context and passes the rest on as its source.
+- [ ] Say each message once in the other crates' errors, which display an inner error and also
+  return it from `source()`. For example, `WorktreeError::Repository` is "repository error: {0}" and
+  also `#[from]`. gta's `render_error` stops at several of these types, but an anyhow `{:#}` of them
+  repeats the reason. `gta submodule update`'s transfer failure still reads "object store error:
+  object not found: object not found".
 - [x] Accept `/dev/null` in `gta submodule deinit`'s strict config read, as git does: as the global
   config, the system config, or an include, and through a symlink to it. Any other file that isn't a
   regular one (another device, say) is still refused.

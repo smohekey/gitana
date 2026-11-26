@@ -1053,8 +1053,7 @@ impl SetUrlConfigurationProvider for WorktreeConfiguration {
 				if config_fingerprint(config) != transition.before_fingerprint {
 					bail!("config changed after set-url was planned");
 				}
-				set_single_url(config, &section, &subsection, &url)
-					.map_err(|error| anyhow::anyhow!(error.to_string()))?;
+				set_single_url(config, &section, &subsection, &url).map_err(anyhow::Error::from)?;
 				if config_fingerprint(config) != transition.after_fingerprint {
 					bail!("set-url config transition did not produce its planned fingerprint");
 				}
@@ -2894,8 +2893,7 @@ mod tests {
 			.unwrap_err();
 
 		assert!(
-			error
-				.to_string()
+			format!("{:#}", anyhow::Error::from(error))
 				.contains("stop after observing serialized configuration")
 		);
 		assert_eq!(observations.load(Ordering::SeqCst), 2);
@@ -2987,11 +2985,12 @@ mod tests {
 		std::fs::write(worktree.join(".gitmodules"), modules).unwrap();
 		release.store(true, Ordering::SeqCst);
 
-		let error = task.await.unwrap().unwrap_err();
+		let error = format!(
+			"{:#}",
+			anyhow::Error::from(task.await.unwrap().unwrap_err())
+		);
 		assert!(
-			error
-				.to_string()
-				.contains("config changed after set-url was planned"),
+			error.contains("config changed after set-url was planned"),
 			"unexpected error: {error}"
 		);
 		assert!(!git_dir.join("gitana-submodule-set-url").exists());

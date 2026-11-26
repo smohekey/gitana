@@ -2557,7 +2557,9 @@ impl SubmoduleContext {
 				.await
 			{
 				return Err(SubmoduleError::RecoveryRequired(format!(
-					"mount publication failed ({error}); restoring core.worktree failed ({rollback})"
+					"mount publication failed ({}); restoring core.worktree failed ({})",
+					crate::error::with_causes(&error),
+					crate::error::with_causes(&rollback)
 				)));
 			}
 			return Err(error);
