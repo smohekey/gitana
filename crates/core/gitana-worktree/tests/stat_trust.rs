@@ -5,7 +5,6 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -20,6 +19,7 @@ use gitana_object::Sha256;
 use gitana_object_store::ObjectStore;
 use gitana_path::{GitPath, GitPathComponent};
 use gitana_repository::Repository;
+use gitana_test_git::git_command;
 use gitana_worktree::WorkTree;
 
 /// On a capability that reports only a file's size (no times or identity, as on non-Unix hosts),
@@ -243,11 +243,10 @@ async fn stash_push_holds_head_through_its_clean_up() {
 			.await
 			.is_err()
 	);
-	let moved = Command::new("git")
+	let moved = git_command()
 		.arg("-C")
 		.arg(&work)
 		.args(["update-ref", "refs/heads/main", other.trim()])
-		.env("GIT_CONFIG_NOSYSTEM", "1")
 		.output()
 		.unwrap();
 	assert!(
@@ -1126,7 +1125,7 @@ impl WorkDirFs for InterferingWorkDir {
 /// make sha256 repositories.
 fn repository(tag: &str) -> Option<PathBuf> {
 	let work = unique_tmp(tag);
-	let probe = Command::new("git")
+	let probe = git_command()
 		.args(["init", "--object-format=sha256", "-q", "-b", "main"])
 		.arg(&work)
 		.output()
@@ -1159,11 +1158,10 @@ fn open_dir(path: impl AsRef<Path>) -> cap_std::fs::Dir {
 }
 
 fn git(work: &Path, args: &[&str]) -> String {
-	let out = Command::new("git")
+	let out = git_command()
 		.arg("-C")
 		.arg(work)
 		.args(args)
-		.env("GIT_CONFIG_NOSYSTEM", "1")
 		.output()
 		.expect("run git");
 	assert!(

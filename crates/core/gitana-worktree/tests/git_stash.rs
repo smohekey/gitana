@@ -12,6 +12,7 @@ use gitana_object::Sha1;
 use gitana_object_store::ObjectStore;
 use gitana_path::{GitPath, GitPathspec};
 use gitana_repository::Repository;
+use gitana_test_git::git_command;
 use gitana_worktree::{StashPush, StashPushError, WorkTree};
 
 type Tree = WorkTree<LocalFileStore, CapWorkDir, Sha1>;
@@ -58,11 +59,9 @@ fn unique_tmp(tag: &str) -> PathBuf {
 }
 
 fn git_raw(dir: &Path, args: &[&str]) -> std::process::Output {
-	Command::new("git")
+	git_command()
 		.args(["-C", dir.to_str().unwrap()])
 		.args(args)
-		.env("HOME", dir.parent().unwrap())
-		.env("GIT_CONFIG_NOSYSTEM", "1")
 		.env("GIT_AUTHOR_NAME", "A")
 		.env("GIT_AUTHOR_EMAIL", "a@e")
 		.env("GIT_COMMITTER_NAME", "C")
@@ -1413,11 +1412,9 @@ async fn keeps_the_skip_worktree_bit_the_merge_reaches_as_git_does() {
 /// `git args`, with `input` on its standard input; its output, trimmed.
 fn git_input(dir: &Path, args: &[&str], input: &[u8]) -> String {
 	use std::io::Write;
-	let mut child = Command::new("git")
+	let mut child = git_command()
 		.args(["-C", dir.to_str().unwrap()])
 		.args(args)
-		.env("HOME", dir.parent().unwrap())
-		.env("GIT_CONFIG_NOSYSTEM", "1")
 		.env("GIT_AUTHOR_NAME", "A")
 		.env("GIT_AUTHOR_EMAIL", "a@e")
 		.env("GIT_COMMITTER_NAME", "C")

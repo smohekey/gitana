@@ -190,19 +190,16 @@ pub(crate) fn to_worktree(blob: &[u8], action: CrlfAction) -> Cow<'_, [u8]> {
 #[cfg(all(test, unix))]
 mod tests {
 	use std::path::Path;
-	use std::process::{Command, Output};
+	use std::process::Output;
+
+	use gitana_test_git::git_command;
 
 	use super::*;
 	use crate::AttrFile;
 
 	fn run(dir: &Path, config: &[&str], args: &[&str]) -> Output {
-		let mut command = Command::new("git");
-		command
-			.arg("-C")
-			.arg(dir)
-			.env("GIT_CONFIG_NOSYSTEM", "1")
-			.env("GIT_CONFIG_GLOBAL", "/dev/null")
-			.env("GIT_ATTR_NOSYSTEM", "1");
+		let mut command = git_command();
+		command.arg("-C").arg(dir);
 		for setting in config {
 			command.args(["-c", setting]);
 		}

@@ -280,18 +280,15 @@ fn fill(
 
 #[cfg(all(test, unix))]
 mod tests {
-	use std::process::Command;
+	use gitana_test_git::git_command;
 
 	use super::*;
 
 	fn git(dir: &std::path::Path, args: &[&str]) -> String {
-		let out = Command::new("git")
+		let out = git_command()
 			.arg("-C")
 			.arg(dir)
 			.args(args)
-			.env("GIT_CONFIG_NOSYSTEM", "1")
-			.env("GIT_CONFIG_GLOBAL", "/dev/null")
-			.env("GIT_ATTR_NOSYSTEM", "1")
 			.output()
 			.unwrap();
 		assert!(

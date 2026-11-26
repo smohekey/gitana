@@ -9,6 +9,7 @@ use gitana_file_store_local::{CapWorkDir, LocalFileStore, WorktreeFileStore};
 use gitana_object::Sha256;
 use gitana_object_store::ObjectStore;
 use gitana_repository::{BranchError, BranchName, Operation, Repository};
+use gitana_test_git::git_command;
 use gitana_worktree::{
 	AmendError, CommitError, ResetError, ResetMode, SwitchError, SwitchOptions, WorkTree,
 	WorktreeError,
@@ -75,7 +76,7 @@ fn conflicted_merge(w: &str, work: &Path) {
 	git(&["-C", w, "switch", "-q", "main"]);
 	std::fs::write(work.join("a.txt"), b"main\n").unwrap();
 	commit_all(w, "main");
-	let _ = Command::new("git")
+	let _ = git_command()
 		.args([
 			"-C",
 			w,
@@ -158,7 +159,7 @@ fn raw_head(w: &str) -> String {
 
 /// Write `text` as a commit object, git checking nothing of it, and point `main` at it.
 fn planted(w: &str, text: &[u8]) -> String {
-	let mut child = Command::new("git")
+	let mut child = git_command()
 		.args([
 			"-C",
 			w,
@@ -1095,7 +1096,7 @@ async fn reset_saves_a_merge_s_autostash_as_git_does() {
 		std::fs::write(work.join("a.txt"), b"main\n").unwrap();
 		commit_all(&w, "main");
 		std::fs::write(work.join("b.txt"), b"my edit\n").unwrap();
-		let _ = Command::new("git")
+		let _ = git_command()
 			.args([
 				"-C",
 				&w,
@@ -1193,7 +1194,7 @@ async fn a_reset_that_cannot_save_the_autostash_changes_nothing() {
 	std::fs::write(work.join("a.txt"), b"main\n").unwrap();
 	commit_all(&w, "main");
 	std::fs::write(work.join("b.txt"), b"my edit\n").unwrap();
-	let _ = Command::new("git")
+	let _ = git_command()
 		.args([
 			"-C",
 			&w,
@@ -1249,7 +1250,7 @@ async fn a_hard_reset_that_cannot_save_the_autostash_keeps_the_resolution() {
 	std::fs::write(work.join("a.txt"), b"main\n").unwrap();
 	commit_all(&w, "main");
 	std::fs::write(work.join("b.txt"), b"my edit\n").unwrap();
-	let _ = Command::new("git")
+	let _ = git_command()
 		.args([
 			"-C",
 			&w,
@@ -1732,7 +1733,7 @@ async fn switch_replaces_an_ignored_folder_only_when_nothing_untracked_is_in_it(
 				std::fs::write(work.join(junk), b"mine\n").unwrap();
 			}
 			let refused = if tool == "git" {
-				!Command::new("git")
+				!git_command()
 					.args(["-C", &w, "switch", "-q", "--no-overwrite-ignore", "other"])
 					.output()
 					.unwrap()
@@ -1793,7 +1794,7 @@ async fn switch_keeps_ignored_files_in_a_kept_submodule_folder_as_git_does() {
 		]);
 		commit(&w, "submodule");
 		// Away to a branch without it: git leaves the submodule's folder where it is.
-		let _ = Command::new("git")
+		let _ = git_command()
 			.args(["-C", &w, "switch", "-q", "other"])
 			.output()
 			.unwrap();
@@ -1840,7 +1841,7 @@ async fn switch_with_no_index_keeps_an_ignored_file_s_changes_as_git_does() {
 		std::fs::write(work.join(".env"), b"local edit\n").unwrap();
 		std::fs::remove_file(work.join(".git/index")).unwrap();
 		let refused = if tool == "git" {
-			!Command::new("git")
+			!git_command()
 				.args(["-C", &w, "switch", "-q", "--no-overwrite-ignore", "other"])
 				.output()
 				.unwrap()
@@ -1908,12 +1909,7 @@ async fn switch_keeps_a_nested_repository_in_a_folder_it_would_replace_as_git_do
 					args.push("--no-overwrite-ignore");
 				}
 				args.push("other");
-				!Command::new("git")
-					.args(&args)
-					.output()
-					.unwrap()
-					.status
-					.success()
+				!git_command().args(&args).output().unwrap().status.success()
 			} else {
 				let other = BranchName::parse("other").unwrap();
 				match make_repo(&work)
@@ -2106,7 +2102,7 @@ async fn add_resolves_a_conflicted_tracked_file_inside_a_nested_repository() {
 	git(&["-C", &w, "switch", "-q", "main"]);
 	std::fs::write(work.join("vendor/file"), b"ours\n").unwrap();
 	commit_all(&w, "ours");
-	let _ = Command::new("git")
+	let _ = git_command()
 		.args([
 			"-C",
 			&w,
@@ -2158,7 +2154,7 @@ async fn switch_finds_a_branch_in_a_linked_worktree_whose_name_is_not_utf8() {
 		return;
 	};
 	let linked = unique_tmp("switch-raw-name-linked").join(OsStr::from_bytes(b"wt-\xff"));
-	let added = Command::new("git")
+	let added = git_command()
 		.arg("-C")
 		.arg(&work)
 		.args(["worktree", "add", "-q", "-b", "taken"])
@@ -2213,7 +2209,7 @@ async fn switch_passes_over_a_stray_file_among_the_worktrees_as_git_does() {
 		std::fs::write(work.join(".git/worktrees/.DS_Store"), b"").unwrap();
 		let (free, taken) = if tool == "git" {
 			let switch = |branch: &str| {
-				Command::new("git")
+				git_command()
 					.args(["-C", &w, "switch", "-q", branch])
 					.output()
 					.unwrap()
@@ -2332,7 +2328,7 @@ fn commit_allow_empty(work: &str, msg: &str) {
 }
 
 fn git(args: &[&str]) -> String {
-	let out = Command::new("git").args(args).output().expect("run git");
+	let out = git_command().args(args).output().expect("run git");
 	assert!(
 		out.status.success(),
 		"git {args:?} failed: {}",
@@ -2343,7 +2339,7 @@ fn git(args: &[&str]) -> String {
 
 /// Runs git, expecting it to refuse; its error output.
 fn git_refuses(args: &[&str]) -> String {
-	let out = Command::new("git").args(args).output().expect("run git");
+	let out = git_command().args(args).output().expect("run git");
 	assert!(!out.status.success(), "git {args:?} didn't refuse");
 	String::from_utf8_lossy(&out.stderr).into_owned()
 }
@@ -2366,7 +2362,7 @@ fn git_supports_sha256() -> bool {
 	static SUPPORTED: OnceLock<bool> = OnceLock::new();
 	*SUPPORTED.get_or_init(|| {
 		let probe = unique_tmp("probe-operations");
-		let ok = Command::new("git")
+		let ok = git_command()
 			.args(["init", "--object-format=sha256", probe.to_str().unwrap()])
 			.output()
 			.map(|o| o.status.success())

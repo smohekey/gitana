@@ -10,13 +10,13 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_path::GitPath;
 use gitana_repository::Repository;
+use gitana_test_git::git_command;
 use gitana_worktree::{IndexEntry, SparseSet, Stat, WorkTree, WorktreeError};
 
 mod support;
@@ -520,7 +520,7 @@ async fn fast_forward_refuses_divergent_staged_content_at_excluded_path() {
 	);
 
 	// Oracle: stock git also refuses to switch branches from this state.
-	let out = Command::new("git")
+	let out = git_command()
 		.args(["-C", w, "checkout", "other"])
 		.output()
 		.expect("run git checkout");
@@ -2412,7 +2412,7 @@ fn commit(work: &str, msg: &str) {
 }
 
 fn git(args: &[&str]) -> String {
-	let out = Command::new("git").args(args).output().expect("run git");
+	let out = git_command().args(args).output().expect("run git");
 	assert!(
 		out.status.success(),
 		"git {args:?} failed: {}",
@@ -2439,7 +2439,7 @@ fn git_supports_sha256() -> bool {
 	static SUPPORTED: OnceLock<bool> = OnceLock::new();
 	*SUPPORTED.get_or_init(|| {
 		let probe = unique_tmp("probe-sparse");
-		let ok = Command::new("git")
+		let ok = git_command()
 			.args(["init", "--object-format=sha256", probe.to_str().unwrap()])
 			.output()
 			.map(|o| o.status.success())

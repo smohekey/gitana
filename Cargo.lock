@@ -1775,6 +1775,7 @@ dependencies = [
  "gitana-path",
  "gitana-repository",
  "gitana-repository-layout",
+ "gitana-test-git",
  "gitana-worktree",
  "libc",
  "tempfile",
@@ -1984,6 +1985,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitana-test-git"
+version = "0.1.0"
+
+[[package]]
 name = "gitana-trust"
 version = "0.1.0"
 dependencies = [
@@ -2013,6 +2018,7 @@ dependencies = [
  "gitana-object-store",
  "gitana-path",
  "gitana-repository",
+ "gitana-test-git",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
