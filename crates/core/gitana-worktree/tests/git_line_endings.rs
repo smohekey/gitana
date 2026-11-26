@@ -6,13 +6,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::{ObjectId, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_path::GitPath;
 use gitana_repository::Repository;
+use gitana_test_git::git_command;
 use gitana_worktree::{
 	LineEndingChange, OutsideAttributes, ResetError, ResetMode, WorkTree, WorktreeError,
 };
@@ -1150,14 +1151,10 @@ fn commit_all(side: &Path, message: &str) {
 }
 
 fn git_out(side: &Path, args: &[&str]) -> Output {
-	Command::new("git")
+	git_command()
 		.arg("-C")
 		.arg(side)
 		.args(args)
-		.env("GIT_ATTR_NOSYSTEM", "1")
-		.env("GIT_CONFIG_NOSYSTEM", "1")
-		.env("HOME", side.parent().unwrap())
-		.env("XDG_CONFIG_HOME", side.parent().unwrap().join("xdg"))
 		.output()
 		.expect("run git")
 }
@@ -1173,11 +1170,7 @@ fn git_ok(side: &Path, args: &[&str]) -> Output {
 }
 
 fn git(args: &[&str]) -> String {
-	let out = Command::new("git")
-		.args(args)
-		.env("GIT_CONFIG_NOSYSTEM", "1")
-		.output()
-		.expect("run git");
+	let out = git_command().args(args).output().expect("run git");
 	assert!(
 		out.status.success(),
 		"git {args:?} failed: {}",
@@ -1204,7 +1197,7 @@ fn git_supports_sha256() -> bool {
 	static SUPPORTED: OnceLock<bool> = OnceLock::new();
 	*SUPPORTED.get_or_init(|| {
 		let probe = unique_tmp("probe");
-		let ok = Command::new("git")
+		let ok = git_command()
 			.args(["init", "--object-format=sha256", probe.to_str().unwrap()])
 			.output()
 			.map(|o| o.status.success())

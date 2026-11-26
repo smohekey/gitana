@@ -4,20 +4,18 @@
 //! asked for `status_without_diff_check`; and a sparse index, always.
 
 use std::path::Path;
-use std::process::Command;
 
 use gitana_config::GitConfig;
 use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::{HashAlgorithm, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
+use gitana_test_git::git_command;
 use gitana_worktree::{WorkTree, WorktreeError};
 
 fn git(dir: &Path, args: &[&str]) {
-	let out = Command::new("git")
+	let out = git_command()
 		.current_dir(dir)
-		.env("GIT_CONFIG_NOSYSTEM", "1")
-		.env("GIT_CONFIG_GLOBAL", "/dev/null")
 		.args([
 			"-c",
 			"user.name=T",

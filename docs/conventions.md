@@ -75,3 +75,18 @@ default; a caller that needs one builds it.
 - **Cancellation is first-class.** Futures must be cancellation-safe — dropping one before
   completion must leave no half-applied state. This underpins handle cancellation and timeouts.
 - **Async traits use native `async fn`** (edition 2024), not the `async_trait` macro.
+
+## Tests that run git
+
+Oracle tests build repositories with stock git and check gitana against it, so their results must
+not depend on the machine running them. A developer's global config (a `core.hooksPath`, an
+`init.defaultRefFormat`, `core.autocrlf`), git's default global ignore and attributes files, or an
+inherited `GIT_DIR` otherwise changes what git builds or reports.
+
+- **Spawn git only through `gitana_test_git::git_command()`**, never `Command::new("git")`. It
+  reads no global or system config, no system or default global attributes and ignore files, and
+  drops inherited `GIT_*` variables except `GIT_TRACE*`. A test adds the arguments and settings it
+  relies on (identity, `-c` flags) explicitly.
+- **Each crate moved onto it has a guard test** (`tests/git_spawns.rs`) calling
+  `gitana_test_git::assert_git_spawned_only_through_git_command`, which fails on a direct spawn in
+  the crate's `src/` or `tests/`. So far: gitana-worktree and gitana-linked-worktree.

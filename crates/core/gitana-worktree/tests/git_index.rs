@@ -1,10 +1,10 @@
 use std::path::PathBuf;
-use std::process::Command;
 
 use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::{HashAlgorithm, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
+use gitana_test_git::git_command;
 use gitana_worktree::{Index, WorkTree};
 
 #[test]
@@ -89,7 +89,8 @@ fn round_trips_a_skip_worktree_entry() {
 /// Under `index.skipHash`, which `feature.manyFiles` also turns on, git writes all zeros where the
 /// index's trailing hash goes. We read such an index as git does, and git reads our rewrite of it.
 ///
-/// Its git is [`isolated_git`]: an explicit `index.skipHash=false` in the machine's config would beat the
+/// Its git, like the rest of this file's, reads nothing from the machine (`gitana_test_git::git_command`): an
+/// explicit `index.skipHash=false` in the machine's config would otherwise beat the
 /// `feature.manyFiles` default this relies on. And it needs git 2.40 or later, where `index.skipHash`
 /// arrived (an older git ignores it and writes the hash). That's checked by version rather than by asking
 /// git to skip the hash, so a git that ought to skip it and doesn't is a failure, not a skip.
@@ -116,19 +117,19 @@ fn reads_an_index_without_its_trailing_hash<H: HashAlgorithm>(format: &str) {
 		let work = unique_tmp("index-skip-hash");
 		let w = work.to_str().unwrap();
 		let git_listing = || -> Vec<String> {
-			isolated_git(&["-C", w, "ls-files", "--stage"])
+			git(&["-C", w, "ls-files", "--stage"])
 				.lines()
 				.map(str::to_owned)
 				.collect()
 		};
-		isolated_git(&["init", &format!("--object-format={format}"), "-q", w]);
+		git(&["init", &format!("--object-format={format}"), "-q", w]);
 		std::fs::write(work.join("README.md"), b"readme\n").unwrap();
 		std::fs::create_dir_all(work.join("src")).unwrap();
 		std::fs::write(work.join("src/lib.rs"), b"lib\n").unwrap();
 		std::fs::write(work.join("untracked.txt"), b"u\n").unwrap();
-		isolated_git(&["-C", w, "-c", setting, "add", "README.md", "src"]);
+		git(&["-C", w, "-c", setting, "add", "README.md", "src"]);
 		// With `feature.manyFiles`, status also records its untracked cache as an index extension.
-		isolated_git(&["-C", w, "-c", setting, "status", "--porcelain"]);
+		git(&["-C", w, "-c", setting, "status", "--porcelain"]);
 		let bytes = std::fs::read(work.join(".git/index")).unwrap();
 		assert!(
 			bytes[bytes.len() - H::RAW_LEN..]
@@ -306,7 +307,7 @@ fn ls_files(work: &str) -> Vec<String> {
 }
 
 fn git(args: &[&str]) -> String {
-	let out = Command::new("git").args(args).output().expect("run git");
+	let out = git_command().args(args).output().expect("run git");
 	assert!(
 		out.status.success(),
 		"git {args:?} failed: {}",
@@ -315,37 +316,10 @@ fn git(args: &[&str]) -> String {
 	String::from_utf8(out.stdout).expect("git stdout utf8")
 }
 
-/// A `git` that reads nothing from the machine, as gitana-linked-worktree's fixtures run it: no global or
-/// system config file, no default global ignore or attributes file, and no inherited `GIT_*` variable but
-/// `GIT_TRACE*` (an inherited `GIT_DIR` would beat `-C`; `GIT_CONFIG_PARAMETERS` would add config). Only
-/// some of this file's tests use it so far; the rest use [`git`].
-fn isolated_git(args: &[&str]) -> String {
-	let mut command = Command::new("git");
-	for (name, _) in std::env::vars_os() {
-		let spelled = name.to_string_lossy();
-		if spelled.starts_with("GIT_") && !spelled.starts_with("GIT_TRACE") {
-			command.env_remove(&name);
-		}
-	}
-	let out = command
-		.env("GIT_CONFIG_GLOBAL", "/dev/null")
-		.env("GIT_CONFIG_NOSYSTEM", "1")
-		.env("XDG_CONFIG_HOME", "/dev/null")
-		.args(args)
-		.output()
-		.expect("run git");
-	assert!(
-		out.status.success(),
-		"git {args:?} failed: {}",
-		String::from_utf8_lossy(&out.stderr)
-	);
-	String::from_utf8(out.stdout).expect("git stdout utf8")
-}
-
-/// The isolated git's `(major, minor)` version, from `git --version` (`git version 2.50.1 (Apple Git-155)`,
+/// git's `(major, minor)` version, from `git --version` (`git version 2.50.1 (Apple Git-155)`,
 /// `git version 2.45.1.windows.1`).
 fn git_version() -> (u32, u32) {
-	let reported = isolated_git(&["--version"]);
+	let reported = git(&["--version"]);
 	let parsed = reported.split_whitespace().nth(2).and_then(|version| {
 		let mut parts = version.split('.').map(|part| part.parse::<u32>().ok());
 		Some((parts.next()??, parts.next()??))
@@ -371,7 +345,7 @@ fn unique_tmp(tag: &str) -> PathBuf {
 
 fn git_supports_sha256() -> bool {
 	let probe = unique_tmp("probe");
-	let ok = Command::new("git")
+	let ok = git_command()
 		.args(["init", "--object-format=sha256", probe.to_str().unwrap()])
 		.output()
 		.map(|o| o.status.success())

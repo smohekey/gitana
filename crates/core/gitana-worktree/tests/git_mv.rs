@@ -2,13 +2,13 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::process::Command;
 
 use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::Sha256;
 use gitana_object_store::ObjectStore;
 use gitana_path::{GitPath, GitPathspec};
 use gitana_repository::Repository;
+use gitana_test_git::git_command;
 use gitana_worktree::{IndexEntry, Stat, WorkTree, WorktreeError};
 
 mod support;
@@ -141,7 +141,7 @@ fn commit(work: &str, msg: &str) {
 }
 
 fn git(args: &[&str]) -> String {
-	let out = Command::new("git").args(args).output().expect("run git");
+	let out = git_command().args(args).output().expect("run git");
 	assert!(
 		out.status.success(),
 		"git {args:?} failed: {}",
@@ -168,7 +168,7 @@ fn git_supports_sha256() -> bool {
 	static SUPPORTED: OnceLock<bool> = OnceLock::new();
 	*SUPPORTED.get_or_init(|| {
 		let probe = unique_tmp("probe-mv");
-		let ok = Command::new("git")
+		let ok = git_command()
 			.args(["init", "--object-format=sha256", probe.to_str().unwrap()])
 			.output()
 			.map(|o| o.status.success())

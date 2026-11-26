@@ -45,5 +45,6 @@ winx.workspace = true
 # The injected-config tests build a `GitConfig` to hand to `WorktreeContext::with_effective_config`. An
 # integration test is its own crate, so it names the type directly rather than through the library's deps.
 gitana-config.workspace = true
+gitana-test-git.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }

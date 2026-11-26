@@ -2,13 +2,13 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::Command;
 
 use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::Sha256;
 use gitana_object_store::ObjectStore;
 use gitana_path::GitPath;
 use gitana_repository::Repository;
+use gitana_test_git::git_command;
 use gitana_worktree::{AddOutcome, IndexEntry, Stat, WorkTree, WorktreeError};
 
 fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
@@ -1792,7 +1792,7 @@ async fn add_trailing_slash_requires_a_directory() {
 			wt.add(&[spec], "", false, None).await,
 			Err(gitana_worktree::WorktreeError::PathspecMatch(_))
 		));
-		let git_ok = Command::new("git")
+		let git_ok = git_command()
 			.args(["-C", w, "add", spec])
 			.output()
 			.unwrap()
@@ -2032,7 +2032,7 @@ fn ls_files(work: &str) -> Vec<String> {
 }
 
 fn git(args: &[&str]) -> String {
-	let out = Command::new("git").args(args).output().expect("run git");
+	let out = git_command().args(args).output().expect("run git");
 	assert!(
 		out.status.success(),
 		"git {args:?} failed: {}",
@@ -2063,7 +2063,7 @@ fn git_supports_sha256() -> bool {
 	static SUPPORTED: OnceLock<bool> = OnceLock::new();
 	*SUPPORTED.get_or_init(|| {
 		let probe = unique_tmp("probe-add");
-		let ok = Command::new("git")
+		let ok = git_command()
 			.args(["init", "--object-format=sha256", probe.to_str().unwrap()])
 			.output()
 			.map(|o| o.status.success())

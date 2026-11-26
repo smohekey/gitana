@@ -8,7 +8,6 @@ use std::error::Error;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +16,7 @@ use gitana_object::{HashAlgorithm, ObjectId, ObjectKind, Sha1, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_path::GitPath;
 use gitana_repository::Repository;
+use gitana_test_git::git_command;
 use gitana_worktree::{
 	IgnoreSubmodules, Status, SubmoduleProbe, SubmoduleReport, SubmoduleState, WorkTree,
 	WorktreeError,
@@ -122,10 +122,8 @@ impl<H: HashAlgorithm> Drop for Fixture<H> {
 }
 
 fn git_at(work: &std::path::Path, args: &[&str]) -> std::process::Output {
-	Command::new("git")
+	git_command()
 		.current_dir(work)
-		.env("GIT_CONFIG_NOSYSTEM", "1")
-		.env("GIT_CONFIG_GLOBAL", "/dev/null")
 		.args([
 			"-c",
 			"user.name=T",

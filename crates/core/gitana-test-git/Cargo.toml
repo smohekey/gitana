@@ -1,0 +1,11 @@
+[package]
+description = "Run stock git in gitana's oracle tests without reading the machine's configuration."
+edition.workspace = true
+license.workspace = true
+name = "gitana-test-git"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true

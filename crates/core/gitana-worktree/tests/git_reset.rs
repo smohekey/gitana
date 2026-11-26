@@ -1,12 +1,12 @@
 #![cfg(unix)]
 
 use std::path::PathBuf;
-use std::process::Command;
 
 use gitana_file_store_local::{CapWorkDir, LocalFileStore};
 use gitana_object::{ObjectId, ObjectKind, Sha256};
 use gitana_object_store::ObjectStore;
 use gitana_repository::Repository;
+use gitana_test_git::git_command;
 use gitana_worktree::WorkTree;
 
 fn open_dir(path: impl AsRef<std::path::Path>) -> cap_std::fs::Dir {
@@ -115,7 +115,7 @@ fn commit(work: &str, msg: &str) {
 }
 
 fn git(args: &[&str]) -> String {
-	let out = Command::new("git").args(args).output().expect("run git");
+	let out = git_command().args(args).output().expect("run git");
 	assert!(
 		out.status.success(),
 		"git {args:?} failed: {}",
@@ -142,7 +142,7 @@ fn git_supports_sha256() -> bool {
 	static SUPPORTED: OnceLock<bool> = OnceLock::new();
 	*SUPPORTED.get_or_init(|| {
 		let probe = unique_tmp("probe-reset");
-		let ok = Command::new("git")
+		let ok = git_command()
 			.args(["init", "--object-format=sha256", probe.to_str().unwrap()])
 			.output()
 			.map(|o| o.status.success())
