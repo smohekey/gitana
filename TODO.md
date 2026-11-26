@@ -339,8 +339,9 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
 - [ ] Print each deinit refusal once: `gta submodule deinit` renders a preflight refusal twice
   (`DeinitFailure` displays its source and also returns it as `source()`, and `render_error` joins
   the chain).
-- [ ] Accept `GIT_CONFIG_GLOBAL=/dev/null` in `gta submodule deinit`, as git does. Its config-input
-  check refuses it ("/dev/null is not a regular file").
+- [x] Accept `/dev/null` in `gta submodule deinit`'s strict config read, as git does: as the global
+  config, the system config, or an include, and through a symlink to it. Any other file that isn't a
+  regular one (another device, say) is still refused.
 - [ ] Absorb the deinitialized submodule's own `.git` directory, as git's deinit does. gitana refuses
   it (`ForeignMount`); nested ones are absorbed.
 - [ ] List a submodule with new commits in `ls-files -m` when its `.git` is a directory in the mount.

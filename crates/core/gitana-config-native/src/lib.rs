@@ -1154,11 +1154,40 @@ fn read_config_input_sync(
 	guard: &ConfigInputGuard,
 ) -> Result<Option<(Vec<u8>, PathBuf)>> {
 	let pinned = pin_config_target(directory, path, display_path)?;
+	// git reads `/dev/null` as an empty config, which is what `GIT_CONFIG_GLOBAL=/dev/null` and
+	// `GIT_CONFIG_SYSTEM=/dev/null` are for (probed vs git 2.55). Every other file that isn't a
+	// regular one is still refused below.
+	if is_null_device(&pinned.target) {
+		ensure_config_input_outside(guard, &pinned, display_path)?;
+		ensure_config_symlinks_unchanged(&pinned, display_path)?;
+		return Ok(Some((Vec::new(), pinned.resolved_path)));
+	}
 	let (bytes, state) = read_pinned_config_bytes(&pinned.target, display_path)?;
 	ensure_config_input_outside(guard, &pinned, display_path)?;
 	ensure_config_symlinks_unchanged(&pinned, display_path)?;
 	ensure_config_target_unchanged(&pinned.target, &state, display_path)?;
 	Ok(bytes.map(|bytes| (bytes, pinned.resolved_path)))
+}
+
+/// Whether `target` is the null device: a character device with `/dev/null`'s device number, whether
+/// named `/dev/null` or reached through a symlink to it.
+#[cfg(unix)]
+fn is_null_device(target: &PinnedConfigTarget) -> bool {
+	use cap_std::fs::{FileTypeExt as _, MetadataExt as _};
+	use std::os::unix::fs::MetadataExt as _;
+	let Ok(null) = std::fs::metadata("/dev/null") else {
+		return false;
+	};
+	target
+		.directory
+		.symlink_metadata(&target.name)
+		.is_ok_and(|metadata| metadata.file_type().is_char_device() && metadata.rdev() == null.rdev())
+}
+
+/// There's no `/dev/null` to read away from Unix.
+#[cfg(not(unix))]
+fn is_null_device(_target: &PinnedConfigTarget) -> bool {
+	false
 }
 
 fn config_input_is_not_found(error: &anyhow::Error) -> bool {
@@ -3237,6 +3266,57 @@ mod tests {
 		for_worktree_at_excluding(common, git, &module, &module, vec![checkout_dir])
 			.await
 			.expect("a missing include parent remains an absent input");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn guarded_effective_config_reads_dev_null_as_empty_and_refuses_other_devices() {
+		// git reads `/dev/null` as an empty config, given as the global config, as an include, or
+		// through a symlink to it (probed vs git 2.55). Any other device stays refused, as a file that
+		// isn't a regular one: `/dev/zero`, say, which would never end.
+		let temporary = tempfile::tempdir().unwrap();
+		let module = temporary.path().join("module");
+		let checkout = temporary.path().join("checkout");
+		std::fs::create_dir(&module).unwrap();
+		std::fs::create_dir(&checkout).unwrap();
+		let linked = temporary.path().join("linked-null");
+		std::os::unix::fs::symlink("/dev/null", &linked).unwrap();
+		let guarded = |include: &Path| {
+			std::fs::write(
+				module.join("config"),
+				format!(
+					"[core]\n\trepositoryformatversion = 0\n[user]\n\tname = Local\n[include]\n\tpath = {}\n",
+					include.display()
+				),
+			)
+			.unwrap();
+			let common = Dir::open_ambient_dir(&module, ambient_authority()).unwrap();
+			let git = common.try_clone().unwrap();
+			let checkout_dir = Dir::open_ambient_dir(&checkout, ambient_authority()).unwrap();
+			for_worktree_at_excluding(common, git, &module, &module, vec![checkout_dir])
+		};
+		let environment = |global: &str| crate::Environment {
+			home: Some(temporary.path().to_path_buf()),
+			xdg_config_home: Some(temporary.path().to_path_buf()),
+			config_global: Some(std::path::PathBuf::from(global)),
+			config_nosystem: true,
+			attr_nosystem: true,
+		};
+
+		for include in [Path::new("/dev/null"), linked.as_path()] {
+			let config = crate::with_environment(environment("/dev/null"), guarded(include))
+				.await
+				.unwrap_or_else(|error| panic!("{}: {error:#}", include.display()));
+			assert_eq!(config.get_raw("user", None, "name"), Some(Some("Local")));
+		}
+
+		let error = crate::with_environment(environment("/dev/null"), guarded(Path::new("/dev/zero")))
+			.await
+			.unwrap_err();
+		assert!(
+			format!("{error:#}").contains("is not a regular file"),
+			"unexpected error: {error:#}"
+		);
 	}
 
 	#[cfg(unix)]

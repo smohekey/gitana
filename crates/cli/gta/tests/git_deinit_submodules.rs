@@ -43,7 +43,7 @@ impl Fixture {
 			format,
 		};
 		std::fs::create_dir_all(fixture.home()).unwrap();
-		// gta's deinit reads its config inputs as regular files, so the global one is an empty file.
+		// The global config is a file, which a test adds to; `/dev/null` has a test of its own.
 		std::fs::write(fixture.home().join("gitconfig"), "").unwrap();
 		fixture.sh(fixture.base.path(), &format!("NAME={name}; {FIXTURE}"));
 		fixture.sh(&fixture.superproject(), change);
@@ -85,12 +85,18 @@ impl Fixture {
 	}
 
 	fn deinit(&self, program: &str) -> Output {
+		self.deinit_with(program, |_| {})
+	}
+
+	/// The deinit, with `environment` adjusting the isolated environment first.
+	fn deinit_with(&self, program: &str, environment: impl Fn(&mut Command)) -> Output {
 		let mut command = if program == "gta" {
 			Command::new(assert_cmd::cargo::cargo_bin("gta"))
 		} else {
 			Command::new("git")
 		};
 		self.isolated(&mut command);
+		environment(&mut command);
 		command
 			.current_dir(self.superproject())
 			.args(["submodule", "deinit", "sub"])
@@ -291,6 +297,41 @@ fn refuses_a_bad_setting_the_submodule_s_status_sees_as_git_does() {
 					"{label} ({format}): {gta:?}"
 				);
 			}
+		}
+	}
+}
+
+#[test]
+fn reads_dev_null_as_an_empty_config_as_git_does() {
+	// git reads `/dev/null` as an empty config, as the global config, as the system config, or as an
+	// include, and its deinit goes ahead (probed vs git 2.55).
+	let global = |command: &mut Command| {
+		command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+	};
+	let system = |command: &mut Command| {
+		command
+			.env_remove("GIT_CONFIG_NOSYSTEM")
+			.env("GIT_CONFIG_SYSTEM", "/dev/null");
+	};
+	let none = |_: &mut Command| {};
+	for format in ["sha1", "sha256"] {
+		for (label, change, environment) in [
+			(
+				"as the global config",
+				"true",
+				&global as &dyn Fn(&mut Command),
+			),
+			("as the system config", "true", &system),
+			("as an include", "g config include.path /dev/null", &none),
+		] {
+			let label = format!("{label} ({format})");
+			let git = Fixture::new(format, "inner", change);
+			let git_out = git.deinit_with("git", environment);
+			assert!(git_out.status.success(), "{label}: git {git_out:?}");
+			let gta = Fixture::new(format, "inner", change);
+			let gta_out = gta.deinit_with("gta", environment);
+			assert!(gta_out.status.success(), "{label}: gta {gta_out:?}");
+			assert_eq!(gta.state(), git.state(), "{label}: what's left");
 		}
 	}
 }
