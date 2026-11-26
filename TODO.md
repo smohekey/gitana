@@ -331,8 +331,11 @@ Post-initial-commit checklist for growing `gta` toward broader Git parity.
   carries what v2's `S<c><m><u>` field needs.
 - [ ] Honour `status.showUntrackedFiles` / `-uno` in `status`. gitana's status has neither, and git
   also leaves a submodule's untracked content out under them.
-- [ ] Report a type change as `T` in `status`. gitana says `M` where git says `T`, staged or not:
-  a file replaced by a symlink, or a gitlink replaced by a file.
+- [x] Report a type change as `T` in `status`, staged or not, as git does (probed vs git 2.55, in
+  `gta/tests/git_status_type_changes.rs`). That covers a file replaced by a symlink or the reverse, a
+  gitlink and a file or symlink either way, and a folder holding a repository with a commit where a
+  file was. A file whose path is now any other folder is ` D`, and the folder isn't listed as
+  untracked. `ls-files -m` and `-d` are unchanged, as git's are.
 - [ ] Print each deinit refusal once: `gta submodule deinit` renders a preflight refusal twice
   (`DeinitFailure` displays its source and also returns it as `source()`, and `render_error` joins
   the chain).

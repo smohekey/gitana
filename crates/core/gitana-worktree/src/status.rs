@@ -18,8 +18,8 @@ use crate::{
 };
 
 /// One path's status: an index (staged-vs-HEAD) code and a worktree
-/// (unstaged-vs-index) code, using git's letters (` `, `A`, `M`, `D`, `?`), and for a submodule,
-/// what's changed inside it.
+/// (unstaged-vs-index) code, using git's letters (` `, `A`, `M`, `D`, `T` for a type change, `?`),
+/// and for a submodule, what's changed inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusEntry {
 	/// Repository-relative path.
@@ -156,7 +156,7 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 		.map(|path| fold_key(&path, fold))
 		.collect();
 	// Tracked submodule (gitlink) paths, folded — a gitlink's on-disk directory is git's to track, never
-	// listed untracked (unlike a tracked file replaced by an untracked directory). Built from ALL index
+	// listed untracked (as a tracked file replaced by a directory isn't either). Built from ALL index
 	// entries, not just stage 0: an unmerged (conflicted) gitlink has only stage 1/2/3 entries, and its
 	// mount directory must still be excluded from untracked so status shows `UU sub`, never `?? sub/`.
 	// EXCLUDE a gitlink path that ALSO has tracked CHILDREN (`sub/f`) — a mixed subtree-vs-gitlink conflict
@@ -227,6 +227,8 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			continue;
 		}
 		let code = match (staged, head) {
+			// Another kind of object (a file, a symlink, a gitlink) is a type change, as git says.
+			(Some(i), Some(h)) if object_type(&i.0) != object_type(&h.0) => 'T',
 			(Some(i), Some(h)) if i != h => 'M',
 			(Some(_), Some(_)) => ' ',
 			(Some(_), None) => 'A',
@@ -258,7 +260,10 @@ pub(crate) async fn compute<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
 			submodules.insert(entry.path.clone(), state);
 			code
 		} else {
-			worktree_change(&mut checkin, entry, &entry.path, file_mode).await?
+			match worktree_change(&mut checkin, entry, &entry.path, file_mode).await? {
+				'M' => type_change(wt, &checkin, entry).await?,
+				code => code,
+			}
 		};
 		if code != ' ' {
 			at(&mut merged, &entry.path).worktree = code;
@@ -747,9 +752,14 @@ fn collect_untracked<W: WorkDirFs>(
 		}
 		// A directory that is itself a tracked SUBMODULE (a gitlink) is git's to track — never listed
 		// untracked, and not descended into (its contents belong to the submodule). Its status is the
-		// tracked Y-column comparison above. (A tracked *file* replaced by a directory is NOT a gitlink and
-		// falls through to the normal untracked handling.)
+		// tracked Y-column comparison above.
 		if is_dir && gitlinks.contains(&fold_key(&rel, fold)) {
+			continue;
+		}
+		// A directory where the index has a file or a symlink: git reports that entry (` D`, or ` T` for
+		// a repository with a commit) and, in its default untracked mode, lists nothing of the folder
+		// (probed vs git 2.55).
+		if is_dir && tracked.contains(&fold_key(&rel, fold)) {
 			continue;
 		}
 		// Membership is checked case-folded under `core.ignoreCase` (the `tracked` keys are already
@@ -876,6 +886,86 @@ pub(crate) async fn worktree_change<F: FileStore, W: WorkDirFs, H: HashAlgorithm
 		}
 		_ => Ok('M'),
 	}
+}
+
+/// The object type a mode string names (`100644` and `100755` alike are a file, `120000` a symlink,
+/// `160000` a gitlink), for telling a type change from a change of content or of the exec bit.
+fn object_type(mode: &str) -> Option<u32> {
+	u32::from_str_radix(mode, 8)
+		.ok()
+		.map(|mode| mode & 0o170000)
+}
+
+/// What a worktree `M` for the tracked `entry` is in git's status (probed vs git 2.55). `T` when the
+/// path holds another kind of object: a symlink for a file or the reverse (as the file would be staged,
+/// so a `core.symlinks=false` placeholder stays a symlink), or a repository with a commit. `D` when it's
+/// any other folder. Else `M`. `ls-files -m` keeps `M` for all of these, as git's does, so this is
+/// status's alone.
+async fn type_change<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+	checkin: &Converter<'_, F, W, H>,
+	entry: &IndexEntry<H>,
+) -> Result<char, WorktreeError> {
+	let Some(meta) = wt.work().lstat(&entry.path)? else {
+		return Ok('M');
+	};
+	if meta.kind.is_dir() {
+		return Ok(if repository_with_commit(wt, &entry.path).await {
+			'T'
+		} else {
+			'D'
+		});
+	}
+	let staged = checkin.staged_file_mode(Some(entry.mode), crate::fsmeta::mode_of(&meta));
+	Ok(if staged & 0o170000 == entry.mode & 0o170000 {
+		'M'
+	} else {
+		'T'
+	})
+}
+
+/// Whether the folder at `path` is a repository whose `HEAD` names a commit, as git's
+/// `resolve_gitlink_ref` decides for a folder where a file was: a `.git` folder with a detached `HEAD`
+/// or a ref it holds (loose or packed), or a gitfile into this repository's `modules/`. One with an
+/// unborn `HEAD` isn't. A gitfile naming a repository elsewhere is out of gitana's reach, so that
+/// folder reads as one that isn't.
+async fn repository_with_commit<F: FileStore, W: WorkDirFs, H: HashAlgorithm>(
+	wt: &WorkTree<F, W, H>,
+	path: &GitPath,
+) -> bool {
+	if !crate::ls_files::is_embedded_repo(wt.work(), path) {
+		return submodule_head_oid(wt, path).await.is_some();
+	}
+	let read = |name: &str| -> Option<Vec<u8>> {
+		let mut at = path.join(&GitPathComponent::from_utf8(".git").ok()?);
+		for part in name.split('/') {
+			at = at.join(&GitPathComponent::from_utf8(part).ok()?);
+		}
+		wt.work().read(&at).ok()
+	};
+	let Some(head) = read("HEAD") else {
+		return false;
+	};
+	let Ok(head) = std::str::from_utf8(&head) else {
+		return false;
+	};
+	let head = head.trim();
+	let Some(name) = head.strip_prefix("ref:").map(str::trim) else {
+		return ObjectId::<H>::from_hex(head).is_ok();
+	};
+	if let Some(bytes) = read(name)
+		&& let Ok(text) = std::str::from_utf8(&bytes)
+		&& ObjectId::<H>::from_hex(text.trim()).is_ok()
+	{
+		return true;
+	}
+	read("packed-refs").is_some_and(|bytes| {
+		String::from_utf8_lossy(&bytes).lines().any(|line| {
+			line
+				.split_once(' ')
+				.is_some_and(|(oid, ref_name)| ref_name == name && ObjectId::<H>::from_hex(oid).is_ok())
+		})
+	})
 }
 
 /// Whether a working-tree mode matches the indexed mode. With `file_mode` (`core.fileMode=true`) the modes

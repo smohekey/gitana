@@ -58,13 +58,14 @@ impl WorktreeStatusReport {
 			.any(|e| !self.is_conflict(e) && e.index != ' ' && e.index != '?')
 	}
 
-	/// Whether any tracked path has unstaged (worktree-vs-index) modifications.
+	/// Whether any tracked path has unstaged (worktree-vs-index) modifications, a type change (`T`)
+	/// included.
 	pub fn has_unstaged(&self) -> bool {
 		self
 			.status
 			.changed
 			.iter()
-			.any(|e| !self.is_conflict(e) && e.worktree == 'M')
+			.any(|e| !self.is_conflict(e) && matches!(e.worktree, 'M' | 'T'))
 	}
 
 	/// Whether there are any untracked paths.
@@ -77,7 +78,8 @@ impl WorktreeStatusReport {
 		self.status.changed.iter().any(|e| self.is_conflict(e))
 	}
 
-	/// Whether any tracked path is missing from the working tree (deleted, not staged as a deletion).
+	/// Whether any tracked path is missing from the working tree (deleted, or replaced by a folder, as
+	/// git says, and not staged as a deletion).
 	pub fn has_missing(&self) -> bool {
 		self
 			.status

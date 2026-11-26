@@ -408,7 +408,7 @@ interface porcelain {
 	/// One path's working-tree status, as `git status --porcelain=v1` reports it: an
 	/// index code (staged, index-vs-HEAD — the `X` column) and a worktree code
 	/// (unstaged, worktree-vs-index — the `Y` column). Each code is a single git
-	/// porcelain letter (` `, `A`, `M`, `D`, `R`, …); an unmerged path carries its
+	/// porcelain letter (` `, `A`, `M`, `D`, `T`, `R`, …); an unmerged path carries its
 	/// conflict letter (`U`/`A`/`D`) in both.
 	record status-entry {
 		/// Repository-relative path (`/` separators).
